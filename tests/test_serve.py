@@ -92,12 +92,6 @@ def test_dao_is_read_only(file_db: Path):
     conn.close()
 
 
-def test_dao_write_methods_declared_but_unimplemented(file_db: Path):
-    store = SqliteStore(file_db)
-    with pytest.raises(NotImplementedError):
-        store.record_result(object())
-
-
 # ── Daemon (serve_app) ────────────────────────────────────────────────────────
 
 def test_serve_endpoints(file_db: Path, valid_config_path: Path):

@@ -1,16 +1,29 @@
-"""Storage-agnostic data-access layer for the coordinator board (#584/#589).
+"""Read-only data-access layer for the coordinator board (#584/#589).
 
-``CoordStore`` is the seam that lets the ``coord serve`` daemon front the board
-without callers knowing the storage engine — and makes a future Postgres backend
-(#282) a contained swap rather than a rewrite.  This module implements the
-**read** side fully (the portable control center's read path) and declares the
-**write** side for #590.
+``CoordStore`` is the seam that lets the ``coord serve`` daemon front the
+board's **read** path without callers knowing the storage engine.  It
+abstracts the daemon's board projection — ``GET /board`` and the point reads
+the detail endpoints serve — and nothing else.
 
-``SqliteStore`` is the concrete SQLite implementation.  It owns its *own*
-read-only connection (NOT ``coord.db``'s read/write singleton): it opens the DB
-with ``mode=ro`` + ``PRAGMA query_only`` and never runs schema/migration DDL, so
-it is safe to point at a live ``coord.db`` that the coordinator process is
-writing in WAL mode.
+The write path is **not** here.  Routing writes through the daemon landed in
+``coord.state`` + ``coord.board_service`` (#590), not in this module: every
+public write in ``coord.state`` resolves ``board_service`` and either POSTs to
+the daemon or falls through to a ``_*_local()`` SQL function.  That
+``_*_local()`` family (the ``_record_*_local`` / ``_update_*_local`` /
+``_mark_*_local`` functions in ``coord/state.py``, plus the ``issue_store`` and
+``commands/acceptance`` analogues) is the single write choke point — #1036
+hooked the audit log there for exactly that reason — and is the portability
+seam a future Postgres backend (#282/#828) would actually swap.  DB-API 2.0
+already abstracts ``sqlite3`` vs ``psycopg`` at the connection layer, so the
+port keeps the raw-SQL shape and swaps the connection rather than rewriting the
+call sites into store methods; a ``CoordStore``-style write interface would buy
+a cleaner API, not portability that is otherwise missing.
+
+``SqliteStore`` is the concrete SQLite implementation of this read contract.
+It owns its *own* read-only connection (NOT ``coord.db``'s read/write
+singleton): it opens the DB with ``mode=ro`` + ``PRAGMA query_only`` and never
+runs schema/migration DDL, so it is safe to point at a live ``coord.db`` that
+the coordinator process is writing in WAL mode.
 
 All SQLite idioms (``sqlite3.Row``, JSON-encoded TEXT columns, the ``mode=ro``
 URI) are encapsulated here: read methods return plain Python dicts with JSON
@@ -107,14 +120,18 @@ _DROP_COLUMNS: dict[str, set[str]] = {
 
 @runtime_checkable
 class CoordStore(Protocol):
-    """Read/write interface over coordinator board state.
+    """Read interface over coordinator board state.
 
-    The read methods are implemented today.  The write methods are declared so
-    #590 (route writes through the daemon) lands as an implementation, not an
-    interface change.
+    This is the read contract the ``coord serve`` daemon's board projection
+    serves — the ``list_*`` collection reads, the point reads the detail
+    endpoints use, and the ``board_projection`` snapshot.  Writes are not part
+    of this protocol: they live in ``coord.state``'s ``_*_local()`` family (see
+    the module docstring) and route through ``coord.board_service``.
+    ``SqliteStore`` implements every method below; none raise
+    ``NotImplementedError``.
     """
 
-    # ── reads (implemented now) ──────────────────────────────────────────────
+    # ── reads ────────────────────────────────────────────────────────────────
     def list_assignments(self) -> list[dict]: ...
     def list_machines(self) -> list[dict]: ...
     def list_merge_queue(self) -> list[dict]: ...
@@ -131,11 +148,6 @@ class CoordStore(Protocol):
     # ── point reads (#1336/#1337: detail endpoints) ──────────────────────────
     def get_assignment(self, assignment_id: str) -> dict | None: ...
     def get_issue(self, repo_name: str, number: int) -> dict | None: ...
-
-    # ── writes (declared; implemented in #590) ───────────────────────────────
-    def record_result(self, record: Any) -> Any: ...
-    def record_completion(self, record: Any) -> Any: ...
-    def record_dispatched(self, assignment: Any) -> None: ...
 
 
 def compute_board_keep_ids(
@@ -477,20 +489,3 @@ class SqliteStore:
                 # retention cap; `after_json` arrives decoded as a real list.
                 "drive_queue": self._table(conn, "drive_queue", order="position"),
             }
-
-    # ── writes (deferred to #590) ────────────────────────────────────────────────
-    def _not_yet(self, name: str) -> NotImplementedError:
-        return NotImplementedError(
-            f"{name}: writing through the daemon is part of #590 (route writes "
-            "through the daemon). The read-path slice (#594) serves reads only; "
-            "dispatch/record still run on the host."
-        )
-
-    def record_result(self, record: Any) -> Any:  # noqa: ARG002
-        raise self._not_yet("record_result")
-
-    def record_completion(self, record: Any) -> Any:  # noqa: ARG002
-        raise self._not_yet("record_completion")
-
-    def record_dispatched(self, assignment: Any) -> None:  # noqa: ARG002
-        raise self._not_yet("record_dispatched")
