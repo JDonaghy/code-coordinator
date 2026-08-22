@@ -838,6 +838,36 @@ def _issue_header_re(issue_number: int) -> re.Pattern[str]:
     return re.compile(rf"^(\s*)['\"]?{issue_number}['\"]?\s*:\s*(#.*)?$")
 
 
+def _parse_list_item_scalar(line: str) -> str | None:
+    """Resolve one YAML block-sequence item line (``- ...``) to its parsed
+    scalar value — the same value :func:`parse_manifest_text` would produce
+    for it — rather than the raw text as written. #2296: a Playwright test id
+    always starts with ``[chromium]``, so its manifest entry is *always*
+    quoted (an unquoted leading ``[`` is a YAML flow sequence, not a string);
+    comparing the raw scalar against the parsed id then never matches. Going
+    through :mod:`yaml` here instead handles double- and single-quoted
+    scalars (incl. the ``''`` embedded-quote escape) and, since YAML's own
+    comment rule applies, a ``#`` inside a quoted scalar is correctly treated
+    as data rather than truncated as a comment.
+
+    Returns ``None`` for anything that isn't a well-formed single-item
+    sequence line (blank/comment-only, flow-style, malformed YAML, or a
+    non-string value) so the caller leaves such lines untouched rather than
+    risk misclassifying them.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("-"):
+        return None
+    try:
+        parsed = yaml.safe_load(stripped)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, list) or len(parsed) != 1:
+        return None
+    value = parsed[0]
+    return value if isinstance(value, str) else None
+
+
 def _strip_cleared_ids_from_issue_block(
     body: "list[str]", issue_number: int, cleared_ids: "set[str]",
 ) -> "tuple[list[str], bool]":
@@ -871,9 +901,8 @@ def _strip_cleared_ids_from_issue_block(
             i += 1
         new_sub = []
         for sub_line in sub:
-            code = sub_line.split("#", 1)[0].strip()
-            item_m = re.match(r"^-\s*(.+?)\s*$", code)
-            if item_m and item_m.group(1) in cleared_ids:
+            item = _parse_list_item_scalar(sub_line)
+            if item is not None and item in cleared_ids:
                 changed = True
                 continue
             new_sub.append(sub_line)
@@ -1286,7 +1315,12 @@ def clear_expected_red_via_pr(
 
     new_text = clear_expected_red_entries(text, issue_number, ids)
     if new_text is None:
-        return "expected_red text unchanged (nothing matched)"
+        # #2296: ids were passed in and none matched — that's a defect in
+        # the text surgery (or a manifest that no longer has this issue's
+        # block), not a benign no-op. Prefix `warning:` so it's greppable
+        # and so `coord acceptance expected-red --clear` doesn't report a
+        # clean sweep over an operation that actually did nothing.
+        return "warning: expected_red text unchanged (nothing matched)"
 
     get_head = getattr(ops, "get_default_branch_head", None)
     create_branch = getattr(ops, "create_remote_branch", None)
