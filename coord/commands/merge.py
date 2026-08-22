@@ -11,7 +11,7 @@ import click
 
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
-from coord.models import WORK_LIKE_TYPES
+from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 
 def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
@@ -734,13 +734,17 @@ def verify_merge(
         # #2545: a `type="test-author"`/`"mock-author"` merge entry's
         # `issue_number` is always the milestone's TRACKING issue (every JIT
         # slice for one milestone shares a branch/PR), but its commit
-        # correctly cites the slice's OWN child issue in `for_issue_number`
-        # — see `_foreign_issue_refs`'s `extra_allowed` docstring. Ordinary
-        # `work` assignments never set `for_issue_number` (or set it equal
-        # to `issue_number`), so this is a no-op for them.
-        _for_issue = getattr(work, "for_issue_number", None)
+        # correctly cites the slice's OWN child issue — resolved via the
+        # canonical `effective_issue_number` helper (built for exactly this
+        # tracking-vs-slice distinction, #1553) rather than reading
+        # `for_issue_number` directly, so this stays in sync with the other
+        # callers of that helper (e.g. `merge_queue._test_author_effective_
+        # issue_number`) instead of drifting as an independent copy. Ordinary
+        # `work` assignments have no `for_issue_number`, so this resolves to
+        # `issue_num` itself — already in the "home" set, a harmless no-op.
+        _for_issue = effective_issue_number(work)
         extra_allowed = (
-            frozenset({int(_for_issue)}) if _for_issue else frozenset()
+            frozenset({_for_issue}) if _for_issue and _for_issue != issue_num else frozenset()
         )
 
     repo_cfg = cfg.repo(repo_name)

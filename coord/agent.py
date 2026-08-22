@@ -1344,6 +1344,17 @@ def resolve_closed_issue_numbers(
     Returns an empty frozenset immediately when *repo_github* is falsy or
     *foreign_commits* is empty, so callers can skip the second verify pass
     entirely (``if closed: ...``) without an extra branch.
+
+    Deliberately does **not** accept an ``extra_allowed_issue_numbers``
+    parameter to thread through to :func:`_foreign_issue_refs` (#2545
+    review): *foreign_commits* here is always the ``.foreign`` list a prior,
+    ``extra_allowed``-aware :func:`verify_merge_branch` pass already
+    produced, and ``_foreign_issue_refs`` treats any overlap with the "home"
+    set (``{issue_number} | extra_allowed``) as voiding a commit's foreign
+    status entirely — so no subject surviving into *foreign_commits* can
+    reference an ``extra_allowed`` issue in the first place. If a future
+    caller ever feeds this something other than a prior pass's ``.foreign``,
+    re-check this assumption before relying on it.
     """
     foreign_commits = list(foreign_commits)
     if not repo_github or not foreign_commits:

@@ -3357,15 +3357,22 @@ def _dispatch_merge_of(
 
     # #2545: a `type="test-author"`/`"mock-author"` work row's `issue_number`
     # (== `issue` above) is always the milestone's TRACKING issue, but its
-    # commit correctly cites the slice's OWN child issue — carried in
-    # `for_issue_number` (see `coord.models.Assignment.for_issue_number`'s
-    # docstring). Without allowing that too, the #604 FOREIGN check below
-    # flags every JIT slice's own, correctly-labeled commit on every single
-    # verify. Ordinary `work` assignments never set `for_issue_number`, so
-    # this is a no-op for them.
-    _mg_for_issue = getattr(work, "for_issue_number", None)
+    # commit correctly cites the slice's OWN child issue — resolved via the
+    # canonical `coord.models.effective_issue_number` helper (built for
+    # exactly this tracking-vs-slice distinction, #1553) rather than reading
+    # `for_issue_number` directly, so this stays in sync with the other
+    # callers of that helper (e.g. `merge_queue._test_author_effective_
+    # issue_number`) instead of drifting as an independent copy. Without
+    # allowing the resolved issue too, the #604 FOREIGN check below flags
+    # every JIT slice's own, correctly-labeled commit on every single verify.
+    # Ordinary `work` assignments have no `for_issue_number`, so this
+    # resolves to `issue` itself — already in the "home" set, a harmless
+    # no-op.
+    from coord.models import effective_issue_number as _mg_effective_issue_number  # noqa: PLC0415
+
+    _mg_for_issue = _mg_effective_issue_number(work)
     _mg_extra_allowed = (
-        frozenset({int(_mg_for_issue)}) if _mg_for_issue else frozenset()
+        frozenset({_mg_for_issue}) if _mg_for_issue and _mg_for_issue != issue else frozenset()
     )
 
     resolved_model = model if model else cfg.models.default
