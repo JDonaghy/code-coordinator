@@ -1433,10 +1433,28 @@ class TestRemoteFixWorktreeCollision:
 # ── #1007: --merge-of on a REMOTE machine ─────────────────────────────────────
 
 
-def _seed_merge_board(work_id: str, branch: str) -> None:
-    """Seed a completed+approved work assignment for `--merge-of` tests."""
-    from coord.models import Assignment, Board, Repo
-    from coord.state import save_board
+def _seed_merge_board(
+    work_id: str,
+    branch: str,
+    *,
+    assignment_type: str = "work",
+    for_issue_number: int | None = None,
+) -> None:
+    """Seed a completed+approved work assignment for `--merge-of` tests.
+
+    *assignment_type* / *for_issue_number* (#2545): a ``type="test-author"``
+    JIT-slice work row carries its own child issue in ``for_issue_number``,
+    distinct from ``issue_number`` (which stays the milestone's tracking
+    issue) — see ``Assignment.for_issue_number``'s docstring.
+
+    Uses ``record_dispatched_assignment`` (not the whole-board
+    ``save_board``) because ``save_board``'s bulk UPSERT statement doesn't
+    include the ``for_issue_number`` column at all — only the single-row
+    dispatch writer does — so a plain ``Board(...); save_board(...)`` seed
+    would silently drop it and defeat any test that needs it set.
+    """
+    from coord.models import Assignment
+    from coord.state import get_connection, record_dispatched_assignment
 
     work = Assignment(
         machine_name="precision",
@@ -1444,19 +1462,20 @@ def _seed_merge_board(work_id: str, branch: str) -> None:
         issue_number=1,
         issue_title="Fix bug",
         assignment_id=work_id,
-        status="done",
+        status="running",
         branch=branch,
-        type="work",
+        type=assignment_type,
+        for_issue_number=for_issue_number,
         dispatched_at=0.0,
-        finished_at=1.0,
     )
-    board = Board(
-        repos=[Repo(name="api", github="acme/api", default_branch="main")],
-        machines=[],
-        active=[],
-        completed=[work],
-    )
-    save_board(board)
+    record_dispatched_assignment(assignment=work, repo_github="acme/api")
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "UPDATE assignments SET status='done', branch=?, finished_at=1.0 "
+            "WHERE assignment_id=?",
+            (branch, work_id),
+        )
 
 
 class TestRemoteMergeOf:
@@ -1539,6 +1558,47 @@ class TestRemoteMergeOf:
         assert captured_kwargs[0]["verify_merge"] is True
         assert captured_kwargs[0]["ssh_target"] == "precision.tailnet"
         assert captured_kwargs[0]["branch"] == "issue-1-fix-bug"
+        # #2545: an ordinary `type="work"` row has no `for_issue_number` —
+        # nothing extra to allow.
+        assert captured_kwargs[0]["extra_allowed_issue_numbers"] == frozenset()
+
+    def test_remote_merge_of_allows_test_author_slices_own_issue(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """#2545: a `type="test-author"` merge entry's `issue_number` is the
+        milestone's TRACKING issue, but its own commit correctly cites the
+        JIT slice's child issue (`for_issue_number`). The remote finalize
+        call must thread that through as `extra_allowed_issue_numbers` so
+        the #604 FOREIGN check doesn't flag every slice's own commit."""
+        _seed_merge_board(
+            "work-mg2-ta", "issue-1-slice-132",
+            assignment_type="test-author", for_issue_number=132,
+        )
+
+        captured_kwargs: list[dict[str, Any]] = []
+
+        def _fake_finalize(**kwargs: Any) -> Any:
+            captured_kwargs.append(kwargs)
+            return _make_finalize_result(push_ok=True)
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.launch_human_attended_interactive") as mock_local, \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   side_effect=_fake_finalize):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--merge-of", "work-mg2-ta"],
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_local.assert_not_called()
+        assert len(captured_kwargs) == 1
+        assert captured_kwargs[0]["extra_allowed_issue_numbers"] == frozenset({132})
 
     def test_local_merge_of_still_uses_local_tty(
         self, config_file: Path, coord_dir: Path,
@@ -1571,6 +1631,45 @@ class TestRemoteMergeOf:
         assert result.exit_code == 0, result.output
         mock_local.assert_called_once()
         mock_remote.assert_not_called()
+
+    def test_local_merge_of_allows_test_author_slices_own_issue(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """#2545 local counterpart: the LOCAL finalize call must also thread
+        the JIT slice's own child issue through as
+        `extra_allowed_issue_numbers`, not just the remote path."""
+        _seed_merge_board(
+            "work-mg3-ta", "issue-1-slice-130",
+            assignment_type="test-author", for_issue_number=130,
+        )
+
+        captured_kwargs: list[dict[str, Any]] = []
+
+        def _fake_finalize(**kwargs: Any) -> Any:
+            captured_kwargs.append(kwargs)
+            return _make_finalize_result(push_ok=True)
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.agent.setup_interactive_worktree",
+                   return_value=(Path("/tmp/wt"), "issue-1-slice-130")), \
+             patch("coord.interactive.launch_human_attended_interactive",
+                   return_value=0), \
+             patch("coord.interactive._launch_via_tmux"), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   side_effect=_fake_finalize):
+            result = CliRunner().invoke(
+                main,
+                ["assign", _LOCAL_HOST, "api", "1",
+                 "--config", str(config_file),
+                 "--interactive", "--merge-of", "work-mg3-ta"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert len(captured_kwargs) == 1
+        assert captured_kwargs[0]["extra_allowed_issue_numbers"] == frozenset({130})
 
 
 # ── #1280: merge-prep prompt — FOREIGN decision procedure ────────────────────

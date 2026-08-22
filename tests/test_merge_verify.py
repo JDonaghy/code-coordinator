@@ -158,6 +158,68 @@ class TestVerifyMergeBranch:
         assert mv.foreign == []
         assert mv.ok is True
 
+    # ── #2545 regression tests ───────────────────────────────────────────────
+
+    def test_2545_test_author_slice_own_issue_flagged_foreign_without_fix(
+        self, local_repo: Path
+    ) -> None:
+        """Reproduces #2545: a ``type="test-author"`` merge entry's
+        ``issue_number`` is the milestone's TRACKING issue (122 here), but
+        its own commit correctly cites the JIT slice's child issue (#132),
+        not the tracking issue. Without ``extra_allowed_issue_numbers``, this
+        was flagged FOREIGN on every single verify, regardless of whether the
+        rebase was clean — this pins that OLD (broken) behaviour so a future
+        change can't silently regress it back."""
+        _git(local_repo, "checkout", "-b", "issue-122-slice")
+        _commit(local_repo, "test(ms-4): extend acceptance suite — slice #132")
+
+        mv = verify_merge_branch(local_repo, base="main", issue_number=122)
+
+        assert mv.ok is False
+        assert len(mv.foreign) == 1
+
+    def test_2545_extra_allowed_issue_numbers_excludes_slice_own_commit(
+        self, local_repo: Path
+    ) -> None:
+        """The actual fix: passing the slice's own issue (#132) as
+        ``extra_allowed_issue_numbers`` alongside the tracking issue (#122)
+        stops the slice's own, correctly-labeled commit from being flagged
+        foreign."""
+        _git(local_repo, "checkout", "-b", "issue-122-slice")
+        _commit(local_repo, "test(ms-4): extend acceptance suite — slice #132")
+
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=122,
+            extra_allowed_issue_numbers=frozenset({132}),
+        )
+
+        assert mv.foreign == []
+        assert mv.ok is True
+
+    def test_2545_extra_allowed_does_not_whitelist_unrelated_issues(
+        self, local_repo: Path
+    ) -> None:
+        """Allowing the slice's own issue must not blanket-allow every other
+        foreign issue — a genuinely dragged-in commit for a THIRD, unrelated
+        issue still blocks."""
+        _git(local_repo, "checkout", "-b", "issue-122-slice")
+        _commit(local_repo, "test(ms-4): extend acceptance suite — slice #132")
+        _commit(local_repo, "fix(#999): unrelated already-merged work")
+
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=122,
+            extra_allowed_issue_numbers=frozenset({132}),
+        )
+
+        assert len(mv.foreign) == 1
+        _, subj = mv.foreign[0]
+        assert "#999" in subj
+        assert mv.ok is False
+
     def test_missing_base_ref_is_not_ok(self, local_repo: Path) -> None:
         """An unresolvable base ref → default_ahead None → NOT ok (conservative)."""
         mv = verify_merge_branch(
@@ -683,6 +745,27 @@ class TestRemoteVerifyMergeBranch:
         assert "#514" in subj
         assert mv.ok is False
 
+    def test_2545_extra_allowed_issue_numbers_excludes_slice_own_commit(self) -> None:
+        """#2545 remote variant: a test-author slice's own commit citing its
+        child issue (#132), not the tracking issue (#122) passed as
+        ``issue_number``, must not be flagged foreign when #132 is supplied
+        via ``extra_allowed_issue_numbers``."""
+        from coord.interactive import _remote_verify_merge_branch
+
+        stdout = (
+            "__DEFAULT_AHEAD=0\n"
+            "__ADDED=aaa1111\ttest(ms-4): extend acceptance suite — slice #132\n"
+        )
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg-ta",
+                base="main", issue_number=122,
+                extra_allowed_issue_numbers=frozenset({132}),
+            )
+        assert mv.foreign == []
+        assert mv.ok is True
+
     def test_ref_missing_is_not_ok(self) -> None:
         """The remote worktree can't resolve origin/<base> OR <base> → the
         same conservative 'unverifiable ⇒ not ok' fallback as the local
@@ -1063,6 +1146,58 @@ class TestVerifyMergeCli:
         assert "✓ merge-ready" in result.output
         assert "issue-681-fix" in result.output  # branch name from the assignment
 
+    def test_2545_test_author_slice_own_issue_passed_as_extra_allowed(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """#2545: for a ``type="test-author"`` work row, ``coord verify-merge``
+        must resolve ``for_issue_number`` (the JIT slice's own child issue,
+        distinct from ``issue_number`` which stays the milestone's tracking
+        issue) and pass it through to ``verify_merge_branch`` as
+        ``extra_allowed_issue_numbers`` — the actual front door for the bug
+        report's reproduction (coord-portal#122's ms-4 slices #130/#132)."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=122,  # the milestone's TRACKING issue
+            issue_title="[test-author] ms-4 slice #132",
+            assignment_id="mg-ta-132",
+            status="running",
+            branch="issue-122-ms-4-acceptance-suite",
+            type="test-author",
+            for_issue_number=132,  # the slice's own child issue
+        )
+        remote_board = Board(active=[work], completed=[])
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+        )
+        monkeypatch.setattr(cc, "fetch_remote_board", lambda *a, **k: remote_board)
+        monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: config_file)
+
+        captured: dict = {}
+
+        def fake_verify(wt_path, *, base, issue_number, extra_allowed_issue_numbers=frozenset(), **_kw):
+            captured["issue_number"] = issue_number
+            captured["extra_allowed_issue_numbers"] = extra_allowed_issue_numbers
+            from coord.agent import MergeVerify
+            return MergeVerify(default_ahead=0, added=[], foreign=[])
+
+        with patch("coord.agent.verify_merge_branch", side_effect=fake_verify):
+            result = CliRunner().invoke(
+                main,
+                ["verify-merge", "mg-ta-132", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["issue_number"] == 122
+        assert captured["extra_allowed_issue_numbers"] == frozenset({132})
+
     def test_explicit_flags_bypass_empty_board(
         self, config_file: Path, monkeypatch
     ) -> None:
@@ -1080,7 +1215,7 @@ class TestVerifyMergeCli:
 
         captured: dict = {}
 
-        def fake_verify(wt_path, *, base, issue_number):
+        def fake_verify(wt_path, *, base, issue_number, **_kw):
             captured["base"] = base
             captured["issue_number"] = issue_number
             from coord.agent import MergeVerify
@@ -1122,7 +1257,9 @@ class TestVerifyMergeCli:
         foreign_commit = ("deadbeef", "fix(#514): unrelated already-merged work")
         calls: list[dict] = []
 
-        def fake_verify(wt_path, *, base, issue_number, closed_issue_numbers=frozenset()):
+        def fake_verify(
+            wt_path, *, base, issue_number, closed_issue_numbers=frozenset(), **_kw
+        ):
             calls.append({"closed_issue_numbers": closed_issue_numbers})
             if not closed_issue_numbers:
                 return MergeVerify(
@@ -1198,7 +1335,7 @@ class TestVerifyMergeCli:
 
         captured: dict = {}
 
-        def fake_verify(wt_path, *, base, issue_number):
+        def fake_verify(wt_path, *, base, issue_number, **_kw):
             captured["base"] = base
             from coord.agent import MergeVerify
             return MergeVerify(default_ahead=0, added=[], foreign=[])
@@ -1241,7 +1378,7 @@ class TestVerifyMergeCli:
 
         captured: dict = {}
 
-        def fake_verify(wt_path, *, base, issue_number):
+        def fake_verify(wt_path, *, base, issue_number, **_kw):
             captured["base"] = base
             from coord.agent import MergeVerify
             return MergeVerify(default_ahead=0, added=[], foreign=[])

@@ -726,10 +726,22 @@ def verify_merge(
                 err=True,
             )
             sys.exit(2)
+        extra_allowed: frozenset[int] = frozenset()
     else:
         repo_name = work.repo_name
         issue_num = int(work.issue_number)
         branch_display = work.branch or "(unknown)"
+        # #2545: a `type="test-author"`/`"mock-author"` merge entry's
+        # `issue_number` is always the milestone's TRACKING issue (every JIT
+        # slice for one milestone shares a branch/PR), but its commit
+        # correctly cites the slice's OWN child issue in `for_issue_number`
+        # — see `_foreign_issue_refs`'s `extra_allowed` docstring. Ordinary
+        # `work` assignments never set `for_issue_number` (or set it equal
+        # to `issue_number`), so this is a no-op for them.
+        _for_issue = getattr(work, "for_issue_number", None)
+        extra_allowed = (
+            frozenset({int(_for_issue)}) if _for_issue else frozenset()
+        )
 
     repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
@@ -747,14 +759,23 @@ def verify_merge(
     repo_github = repo_cfg.github if repo_cfg else None
     wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
-    mv = verify_merge_branch(wt_path, base=base, issue_number=issue_num)
+    mv = verify_merge_branch(
+        wt_path,
+        base=base,
+        issue_number=issue_num,
+        extra_allowed_issue_numbers=extra_allowed,
+    )
     # #1279: only worth a `gh` round-trip when the cheap git-only pass above
     # actually found blocking foreign commits — corroborate against GitHub's
     # closed-issue state and re-verify with the downgrade signal populated.
     closed = resolve_closed_issue_numbers(repo_github, mv.foreign, issue_num)
     if closed:
         mv = verify_merge_branch(
-            wt_path, base=base, issue_number=issue_num, closed_issue_numbers=closed
+            wt_path,
+            base=base,
+            issue_number=issue_num,
+            extra_allowed_issue_numbers=extra_allowed,
+            closed_issue_numbers=closed,
         )
 
     click.echo(f"branch:        {branch_display}")

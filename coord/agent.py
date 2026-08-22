@@ -1110,14 +1110,36 @@ def _pushed_commits_ahead(repo_path: Path, base: str, branch: str) -> int | None
 _ISSUE_REF_RE = re.compile(r"#(\d+)")
 
 
-def _foreign_issue_refs(subject: str, issue_number: int) -> frozenset[int]:
+def _foreign_issue_refs(
+    subject: str,
+    issue_number: int,
+    extra_allowed: frozenset[int] = frozenset(),
+) -> frozenset[int]:
     """Return the set of *foreign* issue numbers referenced in *subject* —
-    those that are not *issue_number*.  Empty if the subject doesn't reference
-    any foreign issue."""
+    those that are neither *issue_number* nor in *extra_allowed*.  Empty if
+    the subject doesn't reference any foreign issue.
+
+    *extra_allowed* (#2545): for a ``type="test-author"``/``"mock-author"``
+    merge entry, *issue_number* is the milestone's TRACKING issue (every JIT
+    slice for one milestone shares a single branch/PR — see
+    ``Assignment.for_issue_number``'s docstring), but the slice's own commit
+    correctly and necessarily cites its OWN child issue
+    (``test(ms-4): ... slice #132``). Without this, every such commit was
+    flagged FOREIGN on every single verify, regardless of whether the rebase
+    was actually clean. Callers resolve the slice's own issue number (e.g.
+    via ``coord.models.effective_issue_number``) and pass it here so a
+    reference to *either* the tracking issue or the resolved slice issue
+    counts as home, not foreign. Defaults to empty, preserving the original
+    all-blocking-except-``issue_number`` behaviour for ordinary ``work``
+    assignments.
+    """
     refs = {int(m) for m in _ISSUE_REF_RE.findall(subject)}
-    if not refs or issue_number in refs:
+    if not refs:
         return frozenset()
-    return frozenset(refs - {issue_number})
+    home = {issue_number} | extra_allowed
+    if refs & home:
+        return frozenset()
+    return frozenset(refs - home)
 
 
 def _resolve_base_ref(wt_path: Path, base: str) -> str | None:
@@ -1218,6 +1240,7 @@ def verify_merge_branch(
     *,
     base: str,
     issue_number: int,
+    extra_allowed_issue_numbers: frozenset[int] = frozenset(),
     closed_issue_numbers: frozenset[int] = frozenset(),
 ) -> MergeVerify:
     """Verify a ``--merge-of`` branch before its terminal ``done`` is recorded.
@@ -1233,10 +1256,17 @@ def verify_merge_branch(
     ``claude``, no PTY — so the gate runs as a fast local-only test fixture.
 
     Args:
+        extra_allowed_issue_numbers: Additional issue numbers, besides
+            *issue_number*, that a commit subject may legitimately reference
+            without being flagged foreign (#2545) — see
+            :func:`_foreign_issue_refs`'s ``extra_allowed`` for why a
+            ``test-author``/``mock-author`` merge entry needs this (its own
+            slice issue, not just the milestone's tracking issue).
         closed_issue_numbers: Issue numbers that are known to be closed/merged
             in the upstream repo.  When a commit's subject references *only*
-            issues in this set (and not ``issue_number``), it is downgraded
-            from a **blocking** foreign finding to an **advisory** one (#1279).
+            issues in this set (and not ``issue_number`` or
+            ``extra_allowed_issue_numbers``), it is downgraded from a
+            **blocking** foreign finding to an **advisory** one (#1279).
             The rationale: a commit referencing a *closed* issue cannot be
             live rebase-pollution — it is almost certainly a worker typo in the
             commit subject.  Pass the empty frozenset (default) to preserve the
@@ -1271,7 +1301,9 @@ def verify_merge_branch(
     foreign: list[tuple[str, str]] = []
     advisory_foreign: list[tuple[str, str]] = []
     for sha, subj in added:
-        foreign_refs = _foreign_issue_refs(subj, issue_number)
+        foreign_refs = _foreign_issue_refs(
+            subj, issue_number, extra_allowed=extra_allowed_issue_numbers
+        )
         if not foreign_refs:
             continue  # not flagged — own work or bare message
         # #1279: downgrade to advisory when ALL referenced foreign issues are

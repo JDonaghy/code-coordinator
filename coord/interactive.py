@@ -3057,6 +3057,7 @@ def finalize_interactive_exit(
     repo_path: str | None = None,
     artifact_paths: list[str] | None = None,
     verify_merge: bool = False,
+    extra_allowed_issue_numbers: frozenset[int] = frozenset(),
     ssh_target: str | None = None,
     branch: str | None = None,
     smoke_repo_path: str | None = None,
@@ -3116,6 +3117,12 @@ def finalize_interactive_exit(
     session, with no structured block, no transcript floor, and no fallback
     if that command never ran (#1351). ``None`` (every non-smoke caller)
     makes this an unconditional no-op.
+
+    *extra_allowed_issue_numbers* (#2545): forwarded to
+    :func:`coord.agent.verify_merge_branch`'s parameter of the same name —
+    additional issue numbers a merge-prep commit subject may legitimately
+    reference (besides *issue_number*) without tripping the #604 FOREIGN
+    check. Only meaningful when *verify_merge* is set; ignored otherwise.
     """
     _effective_patterns = list(artifact_paths or [])
 
@@ -3197,7 +3204,10 @@ def finalize_interactive_exit(
             )
 
             merge_verify = verify_merge_branch(
-                wt_v, base=base_branch, issue_number=issue_number
+                wt_v,
+                base=base_branch,
+                issue_number=issue_number,
+                extra_allowed_issue_numbers=extra_allowed_issue_numbers,
             )
             # #1279: corroborate blocking foreign commits against GitHub's
             # closed-issue state before deciding — a typo'd reference to an
@@ -3210,6 +3220,7 @@ def finalize_interactive_exit(
                     wt_v,
                     base=base_branch,
                     issue_number=issue_number,
+                    extra_allowed_issue_numbers=extra_allowed_issue_numbers,
                     closed_issue_numbers=closed,
                 )
             if not merge_verify.ok:
@@ -3915,6 +3926,7 @@ def _remote_verify_merge_branch(
     base: str,
     issue_number: int,
     timeout: float = 30.0,
+    extra_allowed_issue_numbers: frozenset[int] = frozenset(),
     closed_issue_numbers: frozenset[int] = frozenset(),
 ) -> MergeVerify:
     """Remote (over ssh) analogue of :func:`coord.agent.verify_merge_branch`
@@ -3935,6 +3947,11 @@ def _remote_verify_merge_branch(
     same conservative "unverifiable ⇒ not ok" fallback as the local function.
 
     Args:
+        extra_allowed_issue_numbers: Mirrors the same parameter in
+            :func:`coord.agent.verify_merge_branch` (#2545) — additional
+            issue numbers, besides *issue_number*, that a commit subject may
+            legitimately reference without being flagged foreign (a
+            ``test-author``/``mock-author`` slice's own child issue).
         closed_issue_numbers: Mirrors the same parameter in
             :func:`coord.agent.verify_merge_branch` — issue numbers known to
             be closed/merged.  Foreign-subject commits referencing only
@@ -3990,7 +4007,9 @@ def _remote_verify_merge_branch(
     foreign: list[tuple[str, str]] = []
     advisory_foreign: list[tuple[str, str]] = []
     for sha, subj in added:
-        foreign_refs = _foreign_issue_refs(subj, issue_number)
+        foreign_refs = _foreign_issue_refs(
+            subj, issue_number, extra_allowed=extra_allowed_issue_numbers
+        )
         if not foreign_refs:
             continue
         if closed_issue_numbers and foreign_refs.issubset(closed_issue_numbers):
@@ -4088,6 +4107,7 @@ def finalize_remote_interactive_exit(
     started_at: float | None = None,
     artifact_paths: list[str] | None = None,
     verify_merge: bool = False,
+    extra_allowed_issue_numbers: frozenset[int] = frozenset(),
 ) -> InteractiveFinalizeResult:
     """Remote (#486d) analog of :func:`finalize_interactive_exit` for a remote
     interactive FIX (and, since #1007, a remote ``--merge-of``).
@@ -4116,6 +4136,12 @@ def finalize_remote_interactive_exit(
     self-report, so a botched remote rebase is never silently accepted as
     ``done``.  This check runs FIRST, before the ``_assignment_already_recorded``
     fast path below — do NOT reorder it after that check.
+
+    ``extra_allowed_issue_numbers`` (#2545): mirrors the same parameter on
+    :func:`finalize_interactive_exit` — forwarded to
+    :func:`_remote_verify_merge_branch` so a ``test-author``/``mock-author``
+    slice's own child-issue commit doesn't trip the FOREIGN check just
+    because *issue_number* here is the milestone's tracking issue.
     """
     _effective_patterns = list(artifact_paths or [])
 
@@ -4130,6 +4156,7 @@ def finalize_remote_interactive_exit(
         merge_verify = _remote_verify_merge_branch(
             ssh_target, remote_worktree_sh,
             base=base_branch, issue_number=issue_number,
+            extra_allowed_issue_numbers=extra_allowed_issue_numbers,
         )
         # #1279: same corroboration as the local finalize path — re-verify
         # with the closed-issue downgrade signal only when the first (cheap,
@@ -4141,6 +4168,7 @@ def finalize_remote_interactive_exit(
             merge_verify = _remote_verify_merge_branch(
                 ssh_target, remote_worktree_sh,
                 base=base_branch, issue_number=issue_number,
+                extra_allowed_issue_numbers=extra_allowed_issue_numbers,
                 closed_issue_numbers=closed,
             )
         if not merge_verify.ok:
