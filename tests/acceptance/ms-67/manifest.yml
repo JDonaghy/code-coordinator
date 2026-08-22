@@ -11,9 +11,13 @@
 # root by `tui/tests/acceptance.rs` (the sealed driver entrypoint).
 #
 # Merged (never clobbered) across issues by coord.acceptance.load_manifest —
-# #2531 and #2533 append their own entries here when their slices are authored
-# just-in-time. #2531 (contract §2) is config-only and has no screen surface,
-# so its slice, if any, will be a `cli-pytest` one, not a tui-tuidriver one.
+# this file carries only #2532's already-landed entries plus the
+# milestone-level blocks (#2543: per-issue slices now land in their own
+# `manifest.d/<issue>.yml` fragment instead of appending here — see
+# `manifest.d/2533.yml`). #2531 (contract §2) is config-only and has no
+# screen surface, so its slice, if any, will be a `cli-pytest` one, not a
+# tui-tuidriver one — it may land as its own `manifest.d/2531.yml` fragment
+# too.
 
 tests:
   # ── #2532 (PB-2) — "Approved work items" panel (contract §3) ─────────────

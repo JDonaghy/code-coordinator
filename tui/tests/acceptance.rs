@@ -47,3 +47,4 @@ include!("../../tests/acceptance/ms-65/tabs_discoverability_2287.rs");
 include!("../../tests/acceptance/ms-65/tabs_persistence_2286.rs");
 include!("../../tests/acceptance/ms-65/board_split_2288.rs");
 include!("../../tests/acceptance/ms-67/approved_items_2532.rs");
+include!("../../tests/acceptance/ms-67/pull_decomposition_2533.rs");
