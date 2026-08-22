@@ -69,10 +69,22 @@ def _open(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
-    _ensure_schema(conn)
-    _maybe_migrate_json(conn)
-    _migrate_gate_order(conn)
-    _backfill_orphaned_review_verdicts(conn)
+    # #2598: _ensure_schema/_maybe_migrate_json/_migrate_gate_order/
+    # _backfill_orphaned_review_verdicts are convergent one-time operations,
+    # not per-open invariants — but every one of them ran unconditionally on
+    # every process's DB open, so a read-only command (`coord status`) began
+    # a write transaction (and, for the unconstrained schema_version table,
+    # left a junk row behind — 45,708 of them observed in the field) purely
+    # to open a connection it only ever intended to read from. Gate the
+    # whole block on a cheap read-only version check: a database already at
+    # _DB_SCHEMA_VERSION does none of this work, so opening it issues no
+    # write at all. See _read_schema_version's docstring for why this read
+    # is correct against both the pre-#2598 and post-#2598 table shapes.
+    if _read_schema_version(conn) < _DB_SCHEMA_VERSION:
+        _ensure_schema(conn)
+        _maybe_migrate_json(conn)
+        _migrate_gate_order(conn)
+        _backfill_orphaned_review_verdicts(conn)
     return conn
 
 
@@ -143,13 +155,94 @@ def retry_on_locked(
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
+# #2598: bumped from the original unversioned "1" written by every process
+# forever. Read by _read_schema_version()/_open() as the target a database
+# must reach before _open() can skip its write path entirely. Whoever adds
+# the NEXT one-shot migration (another _migrate_* or _backfill_* function
+# meant to run once per database, not once per process) must bump this too
+# — otherwise an already-caught-up database (version == _DB_SCHEMA_VERSION)
+# will never run it, because the whole write path is gated on this compare.
+_DB_SCHEMA_VERSION = 2
+
+
+def _read_schema_version(conn: sqlite3.Connection) -> int:
+    """Cheap, read-only probe of how caught-up *conn*'s database is (#2598).
+
+    A plain ``SELECT`` — never begins a write transaction, so calling this
+    to decide whether _open() needs to do any write work cannot itself take
+    the write lock.
+
+    Returns 0 when ``schema_version`` doesn't exist yet (brand-new database)
+    or is empty. Otherwise returns the highest stored value, which reads
+    correctly against *either* table shape: the pre-#2598 unconstrained
+    table (every row holds the same value, so MAX is that value — junk rows
+    don't change the answer) or the post-#2598 constrained table (exactly
+    one row). A pre-#2598 database therefore reads as version 1, which is
+    ``< _DB_SCHEMA_VERSION`` (2) — so it takes the write path exactly once
+    more, which is what collapses its schema_version duplicates and applies
+    the PRIMARY KEY (see _fix_schema_version_table). Every open after that
+    reads 2 and skips the write path entirely.
+    """
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    except sqlite3.OperationalError:
+        return 0  # table doesn't exist yet
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
+
+
+def _fix_schema_version_table(conn: sqlite3.Connection) -> None:
+    """Collapse the pre-#2598 unconstrained ``schema_version`` table.
+
+    The original table declared no ``PRIMARY KEY``/``UNIQUE`` constraint, so
+    ``INSERT OR IGNORE INTO schema_version VALUES (1)`` — meant to be a
+    once-per-database no-op — actually succeeded on every single process
+    open, leaving one junk row per open (45,708 observed in the field).
+    This rebuilds the table with a real ``PRIMARY KEY`` on ``version`` so
+    that no longer happens, collapsing any existing duplicate rows down to
+    their distinct values in the process.
+
+    Safe to call against any existing shape: the old broken table (any
+    number of duplicate rows, no constraint), the new constrained table
+    (already migrated — a no-op), or no table at all (fresh database).
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    if row is not None and "PRIMARY KEY" in (row[0] or ""):
+        return  # already the constrained post-#2598 shape
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+        CREATE TABLE schema_version_new (version INTEGER PRIMARY KEY);
+        INSERT OR IGNORE INTO schema_version_new
+            SELECT DISTINCT version FROM schema_version;
+        DROP TABLE schema_version;
+        ALTER TABLE schema_version_new RENAME TO schema_version;
+        """
+    )
+    conn.commit()
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    """Overwrite ``schema_version`` with a single row holding *version*.
+
+    ``schema_version`` holds exactly one fact — how caught-up this database
+    is — so a version bump DELETEs the old row rather than accumulating one
+    row per version ever seen (which ``INSERT OR IGNORE``/``INSERT OR
+    REPLACE`` would do here, since they only dedupe on a *matching* primary
+    key, and a version bump's whole point is that the key changes).
+    """
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+    conn.commit()
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all tables and indexes if they don't already exist."""
+    _fix_schema_version_table(conn)
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS assignments (
             assignment_id TEXT PRIMARY KEY,
             machine_name TEXT NOT NULL,
@@ -686,13 +779,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON portal_outbox(state, submission_id, seq);
         CREATE INDEX IF NOT EXISTS idx_portal_events_submission
             ON portal_events(submission_id);
-
-        INSERT OR IGNORE INTO schema_version VALUES (1);
     """)
     conn.commit()
     # Column-level migrations for existing databases.  SQLite does not support
     # "ADD COLUMN IF NOT EXISTS", so we catch OperationalError instead.
     _migrate_add_columns(conn)
+    _set_schema_version(conn, _DB_SCHEMA_VERSION)
 
 
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:

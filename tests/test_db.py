@@ -59,7 +59,7 @@ class TestSchemaCreation:
     def test_schema_version_row_inserted(self, isolated_conn: sqlite3.Connection) -> None:
         row = isolated_conn.execute("SELECT version FROM schema_version").fetchone()
         assert row is not None
-        assert row["version"] == 1
+        assert row["version"] == db_mod._DB_SCHEMA_VERSION
 
     def test_indexes_exist(self, isolated_conn: sqlite3.Connection) -> None:
         rows = isolated_conn.execute(
@@ -1320,3 +1320,125 @@ class TestBackfillOrphanedReviewVerdicts:
 
     def test_empty_db_is_a_noop(self, isolated_conn: sqlite3.Connection) -> None:
         assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+
+
+# ── schema_version write-gate (#2598) ───────────────────────────────────────
+#
+# Every DB open ran the full _ensure_schema/_maybe_migrate_json/
+# _migrate_gate_order/_backfill_orphaned_review_verdicts write path
+# unconditionally, and did so against an unconstrained schema_version table
+# — so INSERT OR IGNORE never actually ignored anything (45,708 duplicate
+# rows observed in the field) and a read-only `coord status` took the write
+# lock at startup for no reason. This section is the regression net: the
+# table stays constrained to one row, an up-to-date database's open issues
+# no write at all, and an existing on-disk database with junk rows converges
+# back to one on its next open.
+
+
+class TestSchemaVersionGate:
+    def test_ensure_schema_produces_exactly_one_schema_version_row(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        rows = isolated_conn.execute("SELECT version FROM schema_version").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+
+    def test_ensure_schema_collapses_preexisting_duplicate_rows(self) -> None:
+        """The exact field shape: an unconstrained table with many identical
+        rows, the way every pre-#2598 process's INSERT OR IGNORE left it."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.executemany("INSERT INTO schema_version VALUES (?)", [(1,)] * 500)
+        conn.commit()
+        count_before = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        assert count_before == 500
+
+        db_mod._ensure_schema(conn)
+
+        rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+        conn.close()
+
+    def test_schema_version_table_is_actually_constrained_after_the_fix(self) -> None:
+        """Once fixed, a duplicate insert of the current version is a true
+        no-op (PRIMARY KEY conflict, ignored) rather than a second row —
+        the constraint that was missing is the entire bug."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        db_mod._ensure_schema(conn)
+        version = db_mod._DB_SCHEMA_VERSION
+
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (?)", (version,))
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (?)", (version,))
+
+        rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        assert len(rows) == 1
+        conn.close()
+
+    def test_read_schema_version_is_read_only(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        before = isolated_conn.total_changes
+        db_mod._read_schema_version(isolated_conn)
+        assert isolated_conn.total_changes == before
+
+    def test_read_schema_version_reads_zero_before_any_table_exists(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        assert db_mod._read_schema_version(conn) == 0
+        conn.close()
+
+    def test_open_on_up_to_date_database_issues_no_write(self, tmp_path: Path) -> None:
+        """Black-box acceptance check: opening an already-migrated database
+        a second time performs zero writes — the defect this issue reports
+        (a write transaction, and a junk row, on every single open)."""
+        db_path = tmp_path / "coord.db"
+        first = db_mod._open(db_path)
+        assert first.total_changes > 0  # the initializing open does write
+        first.close()
+
+        second = db_mod._open(db_path)
+        try:
+            assert second.total_changes == 0
+            rows = second.execute("SELECT version FROM schema_version").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+        finally:
+            second.close()
+
+    def test_open_on_a_fresh_database_still_initializes_it(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "coord.db"
+        conn = db_mod._open(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            names = {r["name"] for r in rows}
+            assert "assignments" in names
+            assert "schema_version" in names
+        finally:
+            conn.close()
+
+    def test_open_migrates_an_existing_on_disk_database_with_duplicate_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The migration acceptance criterion: a real on-disk database with
+        N duplicate schema_version rows (45,708 observed in the field)
+        collapses to one on its next open — without a caller doing anything
+        special to trigger it."""
+        db_path = tmp_path / "coord.db"
+        raw = sqlite3.connect(str(db_path))
+        raw.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        raw.executemany("INSERT INTO schema_version VALUES (?)", [(1,)] * 200)
+        raw.commit()
+        raw.close()
+
+        conn = db_mod._open(db_path)
+        try:
+            rows = conn.execute("SELECT version FROM schema_version").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+        finally:
+            conn.close()
