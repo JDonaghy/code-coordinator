@@ -1258,6 +1258,14 @@ pub(crate) enum ContextMenuTarget {
         /// disabled_because`).
         is_pinned: bool,
     },
+    /// #2533 (ms-67 contract §4a): right-click on an Approved-work-items row.
+    /// Carries only the submission id — the menu builder
+    /// (`context_menu_items_for_approved_row`) re-resolves the row from
+    /// `self.data.approved_submissions` at build/dispatch time rather than
+    /// caching its mapped-repo state here, so a `/board` poll that changes
+    /// the mapping between right-click and click can't leave a stale
+    /// enabled/disabled decision baked into the target.
+    ApprovedRow { submission_id: String },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click

@@ -5185,6 +5185,27 @@ impl CoordApp {
                             }
                         }
                     }
+                    // #2533 (ms-67 contract §4a): the Approved-work-items
+                    // list is a MAIN-panel `ListView`, not a `DataTable`, so
+                    // it needs its own hit-test (`approved_row_at`) rather
+                    // than `reports_table_hit`/`queue_table_hit`'s cached
+                    // layout. Pre-selects the row under the cursor first
+                    // (mirrors Queue/Plans below) so the menu the operator
+                    // sees always matches the row they actually clicked,
+                    // never whatever was selected before this click.
+                    if self.active_view == SidebarView::Approved {
+                        let main_b = ctx.main_bounds();
+                        let lh = backend.line_height();
+                        if let Some(idx) = self.approved_row_at(pos, main_b, lh) {
+                            self.approved_sel = idx;
+                            if let Some(target) = self.approved_context_target() {
+                                let anchor = self.approved_context_menu_anchor(pos, main_b);
+                                if self.open_context_menu(anchor, target) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     if self.active_view == SidebarView::Plans && !self.plans_detail_open {
                         // #1122: while the detail pane is open the roster
                         // list isn't painted at all, so `plans_row_at`

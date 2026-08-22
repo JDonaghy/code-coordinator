@@ -655,6 +655,12 @@ pub(crate) fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "stop" => Some("■"),
         "open-pr" => Some("↗"),
         "bounce" => Some("↺"),
+        // #2533 (ms-67 contract §4a): a fresh glyph, deliberately NOT `⌨`
+        // (which this table already spends on the `InteractiveLaunchMode`
+        // PTY family above) — this action dispatches a stream-json chat
+        // session, not a PTY, and reusing `⌨` would misleadingly imply
+        // otherwise (contract §1/§4c).
+        "pull-into-decomposition-session" => Some("⇢"),
         // Panel-level verbs (`toolbar:<verb>` keys after the prefix).
         "notify" => Some("ⓘ"),
         "retry" => Some("↻"),
