@@ -159,6 +159,121 @@ impl CoordApp {
         }
     }
 
+    /// Contract §4a: right-click / keyboard-menu target for the current
+    /// selection — mirrors `queue_context_target()`. `None` on an empty
+    /// list (no row to act on).
+    pub(crate) fn approved_context_target(&self) -> Option<ContextMenuTarget> {
+        self.approved_selected().map(|e| ContextMenuTarget::ApprovedRow {
+            submission_id: e.submission_id.clone(),
+        })
+    }
+
+    /// Contract §4a: the one-item context menu for an approved-work-items
+    /// row — "Pull into decomposition session", disabled (present, greyed,
+    /// inert) when the row's `repos` resolved empty (the same "— no mapping
+    /// —" condition §3c renders). Re-resolves `submission_id` against the
+    /// current `approved_submissions()` rather than trusting a cached flag
+    /// on the target, so a `/board` poll that changes the mapping between
+    /// right-click and click can't leave a stale decision baked in.
+    pub(crate) fn context_menu_items_for_approved_row(
+        &self,
+        submission_id: &str,
+    ) -> Vec<ContextMenuItem> {
+        let mapped = self
+            .approved_submissions()
+            .iter()
+            .find(|e| e.submission_id == submission_id)
+            .map(|e| !e.repos.is_empty())
+            .unwrap_or(false);
+        let item = ContextMenuItem::action(
+            "pull-into-decomposition-session",
+            "Pull into decomposition session",
+        );
+        vec![if mapped {
+            item
+        } else {
+            item.disabled_because("no repo mapping")
+        }]
+    }
+
+    /// Row index (into `approved_submissions()`) under `pos`, or `None` when
+    /// `pos` misses the row list entirely — the pinned header row, empty
+    /// space below a short list, or (when open) the detail region below the
+    /// list. Reproduces `render_approved_panel`'s own rect math exactly
+    /// (header consumes its own one-row rect; the list only gets what
+    /// remains above any open detail pane) — same "hit-test mirrors render"
+    /// posture `plans_row_at` documents for its own panel.
+    pub(crate) fn approved_row_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<usize> {
+        let entries = self.approved_submissions();
+        if entries.is_empty() || lh <= 0.0 {
+            return None;
+        }
+        let list_natural_h = ((entries.len() + 1) as f32 * lh).min(main_b.height);
+        let list_rect = if self.approved_detail_open {
+            let min_detail_h = (lh * APPROVED_DETAIL_MIN_ROWS).min(main_b.height * 0.5);
+            let detail_h = (main_b.height - list_natural_h)
+                .max(min_detail_h)
+                .min(main_b.height);
+            let list_h = (main_b.height - detail_h).max(0.0);
+            Rect::new(main_b.x, main_b.y, main_b.width, list_h)
+        } else {
+            main_b
+        };
+        let header_h = lh.min(list_rect.height);
+        let rows_y0 = list_rect.y + header_h;
+        if pos.y < rows_y0
+            || pos.x < list_rect.x
+            || pos.x >= list_rect.x + list_rect.width
+            || pos.y >= list_rect.y + list_rect.height
+        {
+            return None;
+        }
+        let row_in_window = ((pos.y - rows_y0) / lh).floor() as usize;
+        let idx = self.approved_scroll + row_in_window;
+        (idx < entries.len()).then_some(idx)
+    }
+
+    /// Contract §4a: anchor for a right-clicked row's context menu.
+    /// Deliberately NOT the clicked position itself, for two reasons:
+    ///
+    /// 1. This panel's sidebar aggregate lines and its own row list are
+    ///    both short (a handful of rows), so a menu anchored near an EARLY
+    ///    row would have its own border — or the real content either side
+    ///    of its bounded width — collide with another row's own text (e.g.
+    ///    the disabled item's "no repo mapping" hint must never eclipse the
+    ///    very row it describes, and this panel's menu is never wide enough
+    ///    to blank a whole terminal row on its own).
+    /// 2. quadraui's TUI `ContextMenuLayout` paints the popup's border one
+    ///    cell above a *rounded* anchor Y but hit-tests against the
+    ///    *unrounded* one (see `dialogs.rs`'s Board-doc-tab right-click arm
+    ///    for the fuller explanation) — a fractional anchor (a raw click
+    ///    position always is, since rows are hit-test in whole cells but
+    ///    reported as cell centers) leaves the painted item and its actual
+    ///    clickable region up to half a row apart. A whole-number anchor
+    ///    makes the two agree.
+    ///
+    /// So this opens just below the LAST populated row of whichever of
+    /// {sidebar aggregate lines, main row list} is taller, at a whole-number
+    /// Y — never on top of anything else this panel paints, and never
+    /// fractional.
+    pub(crate) fn approved_context_menu_anchor(&self, pos: Point, main_b: Rect) -> Point {
+        // Sidebar: the panel's title is painted twice — once as the shell's
+        // own panel-title chrome, once again as `approved_sidebar()`'s own
+        // `ListView.title` (the same `title: Some(...)` convention
+        // `queue_sidebar()` uses) — so its aggregate content occupies those
+        // 2 title rows plus the "N ready to pull" line plus (conditionally)
+        // the "missing a repo mapping" line.
+        let sidebar_rows = 2 + 1 + usize::from(self.approved_missing_mapping_count() > 0);
+        // Main: the pinned header row (contract §3c) plus one row per
+        // submission actually painted (never more than the panel shows).
+        let main_rows = 1 + self
+            .approved_submissions()
+            .len()
+            .min(main_b.height.max(0.0) as usize + 1);
+        let below = sidebar_rows.max(main_rows) as f32;
+        Point::new(pos.x, main_b.y + below + 1.0)
+    }
+
     /// #1094-style scroll follow: keep `approved_sel` inside the visible
     /// window. Must be called after every keyboard nav that moves
     /// `approved_sel` (`j`/`k`/`Down`/`Up`/`Home`/`End` in `events.rs`) —
@@ -583,6 +698,118 @@ mod tests {
             driver.screen_contains("received:"),
             "the last detail field must be visible on a short list:\n{}",
             driver.screen(),
+        );
+    }
+
+    // ── #2533 (ms-67 contract §4) — coverage beyond the sealed slice ────────
+    //
+    // `tests/acceptance/ms-67/pull_decomposition_2533.rs` is sealed
+    // (read-only/run-only) and drives everything reachable through mouse
+    // right-click. It deliberately does not exercise: the menu-builder in
+    // isolation (harness note 4 hands `icon_for_action` to an in-crate test
+    // — see `app::tests::pull_into_decomposition_session_has_a_fresh_icon_
+    // not_the_pty_glyph` — and the disabled/enabled decision has no other
+    // in-crate coverage either), the keyboard-equivalent-of-right-click path
+    // (`.` / Menu / Shift+F10, `context_menu_target_for_selection`), or the
+    // actual dispatched command (`command_runner.spawned_calls`, which the
+    // sealed slice's `no_spawn` fixture never inspects). These tests close
+    // those gaps.
+
+    fn one_approved_row(submission_id: &str, repos: Vec<String>) -> ApprovedSubmission {
+        ApprovedSubmission {
+            submission_id: submission_id.to_string(),
+            client: "Acme".to_string(),
+            project_id: "proj_1".to_string(),
+            project_label: "Project One".to_string(),
+            outcome: "Outcome".to_string(),
+            audience: "Audience".to_string(),
+            done_definition: "Done".to_string(),
+            constraints: "None".to_string(),
+            repos,
+            received_at: "2026-08-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Contract §4a: the menu builder itself — enabled on a mapped row,
+    /// `disabled_because` on an unmapped one. Unit-level, no driver/render
+    /// needed; the sealed slice only ever observes the *consequence*
+    /// (clicking is a no-op), never this struct-level fact directly.
+    #[test]
+    fn context_menu_items_for_approved_row_gates_on_mapping() {
+        let app = make_test_app(BoardData {
+            approved_submissions: vec![
+                one_approved_row("sub_mapped", vec!["claude-coordinator".to_string()]),
+                one_approved_row("sub_unmapped", vec![]),
+            ],
+            ..BoardData::default()
+        });
+
+        let mapped_items = app.context_menu_items_for_approved_row("sub_mapped");
+        assert_eq!(mapped_items.len(), 1);
+        assert!(!mapped_items[0].disabled, "mapped row's item must be enabled");
+        assert_eq!(
+            mapped_items[0].action_id.as_deref(),
+            Some("pull-into-decomposition-session"),
+        );
+
+        let unmapped_items = app.context_menu_items_for_approved_row("sub_unmapped");
+        assert_eq!(unmapped_items.len(), 1);
+        assert!(
+            unmapped_items[0].disabled,
+            "unmapped row's item must be disabled, not omitted"
+        );
+    }
+
+    /// Contract §4a via the KEYBOARD path (`.` / Menu / Shift+F10) rather
+    /// than mouse right-click — `context_menu_target_for_selection`'s
+    /// `SidebarView::Approved` arm, unreached by the sealed slice.
+    #[test]
+    fn keyboard_menu_key_opens_the_pull_item_for_the_selected_row() {
+        let mut driver = approved_driver(1);
+        // `approved_driver` leaves `approved_sel` at its default (0) — the
+        // one row, mapped to "claude-coordinator" (see `approved_rows`).
+        driver.type_char('.');
+        driver.render();
+        assert!(
+            driver.screen_contains("Pull into decomposition session"),
+            "the '.' keyboard trigger must open the same menu right-click \
+             does, for whatever row is currently selected:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Contract §4a/§4c: dispatching the (enabled) item actually shells
+    /// `coord portal decompose-chat <submission_id>` — the one fact the
+    /// sealed slice's `no_spawn` fixture never inspects (it only reads the
+    /// resulting toast/screen, never `spawned_calls`). Calls the dispatch
+    /// method directly on a plain `CoordApp` rather than through a
+    /// `TuiDriver` — `driver_with_shell` wraps the app in an opaque
+    /// `ShellAdapter` that doesn't expose `command_runner` (see the many
+    /// `driver.app() isn't CoordApp` notes elsewhere in this crate's
+    /// tests) — the full event→handle→dispatch chain is already proven
+    /// live by the sealed slice's own `pull_action_fires_the_chat_ready_
+    /// toast` (it only observes the toast, not the argv).
+    #[test]
+    fn pull_action_spawns_the_decompose_chat_command() {
+        let mut app = make_test_app(BoardData {
+            approved_submissions: vec![one_approved_row(
+                "sub_0000",
+                vec!["claude-coordinator".to_string()],
+            )],
+            ..BoardData::default()
+        });
+
+        app.dispatch_approved_pull_into_decomposition("sub_0000");
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "portal".to_string(),
+                "decompose-chat".to_string(),
+                "sub_0000".to_string(),
+            ]],
+            "the pull action must shell exactly `coord portal decompose-chat \
+             <submission_id>` (contract §4c)",
         );
     }
 }

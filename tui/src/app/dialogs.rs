@@ -1322,6 +1322,12 @@ impl CoordApp {
             // surfaces. Reached by the keyboard menu key here; the mouse
             // path pre-selects the row under the cursor first (`events.rs`).
             SidebarView::Queue => self.queue_context_target(),
+            // #2533 (ms-67 contract §4a): the Approved-panel selected row —
+            // same shape as Queue above (persistent `approved_sel`, no
+            // mouse position needed). Reached by the keyboard menu key here;
+            // the mouse path pre-selects the row under the cursor first
+            // (`events.rs`).
+            SidebarView::Approved => self.approved_context_target(),
             _ => None,
         }
     }
@@ -1428,6 +1434,10 @@ impl CoordApp {
             // #2287 (ms-65 §8c): right-click on a Board document tab.
             ContextMenuTarget::BoardDocTab { is_pinned, .. } => {
                 self.context_menu_items_for_board_doc_tab(*is_pinned)
+            }
+            // #2533 (ms-67 contract §4a): right-click on an Approved-work-items row.
+            ContextMenuTarget::ApprovedRow { submission_id } => {
+                self.context_menu_items_for_approved_row(submission_id)
             }
         };
         if items.is_empty() {
@@ -5104,6 +5114,185 @@ impl CoordApp {
         true
     }
 
+    // ── #2533 Decomposition-chat dispatch + bind (ms-67 contract §4c/§4d) ────
+
+    /// Contract §4a/§4c: shell `coord portal decompose-chat <submission_id>`
+    /// and arm `pending_decomposition_chat` so the next tick can bind the
+    /// chat overlay once the `type="decomposition-chat"` assignment appears.
+    ///
+    /// Unlike `dispatch_board_chat_new_issue` / the milestone-chat dispatch
+    /// entries, the "chat ready — type to start" toast fires HERE, at
+    /// dispatch time, not from the bind function below — contract §4d pins
+    /// it as firing "immediately on dispatch... within one tick", ahead of
+    /// (and independent from) the later Board/[Chat] redirect that only
+    /// happens once the polled assignment actually appears.
+    pub(crate) fn dispatch_approved_pull_into_decomposition(&mut self, submission_id: &str) {
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self
+            .command_runner
+            .spawn_queued(&["portal", "decompose-chat", submission_id]);
+        if outcome == SpawnQueuedOutcome::Deduped {
+            // Already running or queued for this submission — don't
+            // overwrite the pending state or re-toast (same guard the two
+            // sibling dispatchers use).
+            return;
+        }
+        self.pending_decomposition_chat = Some(PendingDecompositionChat {
+            submission_id: submission_id.to_string(),
+            dispatched_at: Instant::now(),
+        });
+        // #2533 (ms-67 contract §4d): the toast body the contract quotes
+        // verbatim — "{submission_id}: chat ready — type to start." — is 38
+        // characters wide once a real submission id is substituted in; the
+        // TUI `ToastStack`'s box is a *fixed* 40 cols (quadraui's
+        // `TUI_TOAST_WIDTH`, sealed — not this crate's to change), and its
+        // dismiss button + 1-cell padding always reserve 4 of those,
+        // leaving exactly 36 usable — 2 short. One toast physically cannot
+        // show the id-prefixed sentence AND its own unclipped tail at once.
+        // Two toasts split the content instead of clipping it: the first is
+        // the contract-quoted sentence verbatim (its tail may clip for a
+        // long id, same as any fixed-width toast); the second restates just
+        // the "chat ready" clause in full, guaranteed to fit (27 of 36
+        // cols) — so the operator can always read the complete phrase
+        // somewhere, never a mid-word cutoff.
+        self.push_toast(
+            "Decomposition chat",
+            &format!("{submission_id}: chat ready — type to start."),
+            ToastSeverity::Info,
+        );
+        self.push_toast(
+            "Decomposition chat",
+            "chat ready — type to start.",
+            ToastSeverity::Info,
+        );
+    }
+
+    /// Called each tick while `pending_decomposition_chat` is armed. Looks
+    /// for the freshly-dispatched `type="decomposition-chat"` assignment in
+    /// `self.data.assignments`. Contract §4c leaves the exact match key
+    /// unpinned (no `submission_id` column exists on `Assignment`), so this
+    /// module's own choice — matched nowhere else, safe to revisit — is
+    /// `issue_title == "decomposition: {submission_id}"`, the sentinel
+    /// `dispatch_new_issue_chat`'s "(new issue draft)" convention already
+    /// established for a chat type with no real issue number yet
+    /// (`coord/decomposition_chat.py`'s dispatcher sets it). On hit, adds it
+    /// to `watch_pool`, focuses it, and — mirroring
+    /// `maybe_bind_pending_milestone_chat` — routes to the Board panel's
+    /// Chat sub-tab with an empty-transcript `ChatController` overlay. No
+    /// second toast: contract §4d's "chat ready" toast already fired at
+    /// dispatch time above. Returns true when the overlay was opened.
+    pub(crate) fn maybe_bind_pending_decomposition_chat(&mut self) -> bool {
+        let pending = match &self.pending_decomposition_chat {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_decomposition_chat = None;
+            self.push_toast(
+                "Decomposition chat timed out",
+                &format!(
+                    "No decomposition-chat assignment appeared for {} within {}s.",
+                    pending.submission_id,
+                    REFINEMENT_BIND_TIMEOUT.as_secs(),
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        let want_title = format!("decomposition: {}", pending.submission_id);
+        let pick = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_title == want_title)
+            .filter(|a| a.assignment_type.as_deref() == Some("decomposition-chat"))
+            .filter(|a| a.status == "running")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        let Some(asg) = pick else {
+            return false;
+        };
+
+        let aid = asg.id.clone();
+        if !self.watch_pool.contains_key(&aid) {
+            let state = WatchState {
+                assignment_id: aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: 0,
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
+                    .unwrap_or_else(|| "decomposition-chat".to_string()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&aid)
+                }
+            } else {
+                make_local_sse_state(&aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self
+                    .watch_pool
+                    .iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(
+                aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
+                    last_focused_at: Instant::now(),
+                },
+            );
+        }
+        self.watch_focused = Some(aid.clone());
+
+        let mut chat = ChatController::new("decomposition-chat");
+        chat.set_status(StyledText::plain(format!(
+            "  Decomposition chat → {}  (Ctrl+S/Alt+Enter = send · Esc = close)",
+            pending.submission_id
+        )));
+        chat.set_transcript(Vec::new());
+        self.inject_chat = Some(chat);
+
+        // Route to the Board Chat tab — same redirect every sibling chat
+        // family performs regardless of which panel dispatched it, since
+        // `inject_chat` is one shared overlay slot (contract §4d).
+        self.switch_active_view(SidebarView::Board);
+        self.board_detail_tab = BoardDetailTab::Chat;
+
+        self.pending_decomposition_chat = None;
+        true
+    }
+
     /// #314 Phase B: shell `coord test-chat <work_assignment_id>` and arm
     /// `pending_test_chat` so the next tick can bind the chat overlay to the
     /// new assignment row when it appears in the DB.
@@ -6456,6 +6645,11 @@ impl CoordApp {
                         .get(*idx)
                         .map(|(_, number)| *number)
                         .unwrap_or(0),
+                    // #2533: an approved-work-items row carries a portal
+                    // submission id, not a GitHub issue number — "Copy issue
+                    // #…" isn't one of this menu's items, same rationale as
+                    // MachineRow/TerminalRow above.
+                    ContextMenuTarget::ApprovedRow { .. } => 0,
                 };
                 // #1374: the actual clipboard write happens in the two
                 // direct UI callers (`handle_context_menu_click` /
@@ -6628,6 +6822,19 @@ impl CoordApp {
                 {
                     let (repo, issue) = (repo_name.clone(), *issue_number);
                     self.jump_to_board(&repo, issue);
+                }
+                true
+            }
+            // #2533 (ms-67 contract §4a/§4c): "Pull into decomposition
+            // session" on an Approved-work-items row. The menu already
+            // gates this item on the row having ≥1 mapped repo
+            // (`context_menu_items_for_approved_row`'s `disabled_because`) —
+            // a disabled item never reaches `handle_context_menu_click`'s
+            // leaf-action dispatch, so this arm can dispatch unconditionally
+            // once it resolves a row.
+            "pull-into-decomposition-session" => {
+                if let ContextMenuTarget::ApprovedRow { submission_id } = target {
+                    self.dispatch_approved_pull_into_decomposition(submission_id);
                 }
                 true
             }

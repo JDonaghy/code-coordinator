@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import textwrap
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -270,6 +271,59 @@ def test_link_rejects_unknown_repo(config_path):
     result = run("portal", "link", "--config", config_path, "nope", "3", "sub_1")
     assert result.exit_code != 0
     assert "unknown repo" in result.output
+
+
+# ── #2533 (ms-67 PB-3): pull an approved submission into a decomposition chat ──
+
+
+def test_decompose_chat_is_registered():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "decompose-chat" in result.output
+
+
+def test_decompose_chat_prints_assignment_id(config_path):
+    with patch(
+        "coord.decomposition_chat.dispatch_decomposition_chat",
+        return_value=("asg-789", "dellserver"),
+    ) as mock_dispatch:
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c"
+        )
+    assert result.exit_code == 0, result.output
+    assert "asg-789" in result.output
+    assert mock_dispatch.call_count == 1
+    assert mock_dispatch.call_args.args[0] == "sub_2f6a1c"
+
+
+def test_decompose_chat_honours_machine_override(config_path):
+    with patch(
+        "coord.decomposition_chat.dispatch_decomposition_chat",
+        return_value=("asg-789", "elitebook"),
+    ) as mock_dispatch:
+        result = run(
+            "portal",
+            "decompose-chat",
+            "--config",
+            config_path,
+            "sub_2f6a1c",
+            "--machine",
+            "elitebook",
+        )
+    assert result.exit_code == 0, result.output
+    assert mock_dispatch.call_args.kwargs["machine_override"] == "elitebook"
+
+
+def test_decompose_chat_reports_a_dispatch_failure_cleanly(config_path):
+    with patch(
+        "coord.decomposition_chat.dispatch_decomposition_chat",
+        side_effect=RuntimeError("no single machine claims every repo"),
+    ):
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c"
+        )
+    assert result.exit_code != 0
+    assert "no single machine claims every repo" in result.output
 
 
 # ── #1982: the sync loop's operator surface ─────────────────────────────────
@@ -661,6 +715,7 @@ def thin_client(monkeypatch):
         ("portal", "enqueue-question", "sub_1", "why?"),
         ("portal", "requeue", "sub_1", "1"),
         ("portal", "publish-mocks", "coord", "3"),
+        ("portal", "decompose-chat", "sub_1"),
     ],
 )
 def test_state_touching_commands_refuse_on_a_thin_client(thin_client, args):

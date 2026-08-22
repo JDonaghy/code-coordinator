@@ -18461,6 +18461,27 @@
     }
 
     #[test]
+    fn pull_into_decomposition_session_has_a_fresh_icon_not_the_pty_glyph() {
+        // #2533 (ms-67 contract §4a/§6.3): the sealed acceptance slice
+        // (tests/acceptance/ms-67/pull_decomposition_2533.rs, harness note
+        // 4) deliberately does NOT assert this action's icon glyph on the
+        // context-menu grid — `mocks/approved-items-context-menu.screen`
+        // draws the item as a bare label with no icon, so a `screen`
+        // assertion would contradict the mock it indexes. It explicitly
+        // leaves the *action-table*-level fact ("`icon_for_action` maps
+        // this id to `⇢`, contract §4a") to an in-crate unit test — this one.
+        assert_eq!(
+            icon_for_action("pull-into-decomposition-session"),
+            Some("⇢"),
+        );
+        // Contract §4c/§1: this dispatches a stream-json chat session, not
+        // the `InteractiveLaunchMode` PTY family — reusing `⌨` (the glyph
+        // every PTY-launch action already uses) would misleadingly imply
+        // otherwise.
+        assert_ne!(icon_for_action("pull-into-decomposition-session"), Some("⌨"));
+    }
+
+    #[test]
     fn pipeline_row_offers_bounce_when_review_requested_changes() {
         // When a review came back as request-changes, the action bar
         // surfaces "Address review findings" so the user can dispatch

@@ -833,6 +833,31 @@ struct PendingMilestoneChat {
     dispatched_at: Instant,
 }
 
+/// #2533 (ms-67 contract §4c/§4d): pending decomposition-chat dispatch.
+/// Armed by `dispatch_approved_pull_into_decomposition` right after `coord
+/// portal decompose-chat <submission_id>` is shelled out; cleared on bind or
+/// timeout. Same poll+bind lifecycle as `PendingBoardChat`/
+/// `PendingMilestoneChat` — the backend records a `type="decomposition-chat"`
+/// stream-json session and prints its assignment id, so the TUI can attach
+/// the live chat overlay to it once the assignment appears.
+///
+/// Unlike its two siblings, the "chat ready — type to start" toast fires at
+/// ARM time, not at bind time (contract §4d: "a toast fires immediately on
+/// dispatch") — `dispatch_approved_pull_into_decomposition` pushes it
+/// directly rather than leaving it to `maybe_bind_pending_decomposition_chat`.
+#[derive(Clone)]
+struct PendingDecompositionChat {
+    /// The portal submission id being decomposed — the match key
+    /// `maybe_bind_pending_decomposition_chat` looks for on the freshly
+    /// dispatched assignment (contract §4c leaves the exact bind key
+    /// unpinned; this module picks `assignment.repo` carrying the
+    /// submission id as a sentinel-free, session-scoped value — see that
+    /// function's own doc comment).
+    submission_id: String,
+    /// Wall-clock dispatch instant — bounds the wait at `REFINEMENT_BIND_TIMEOUT`.
+    dispatched_at: Instant,
+}
+
 /// #353: pending repo picker for the [Add] button on the Board panel.
 /// When multiple repos exist, this shows a numeric picker (1, 2, …) for
 /// the user to select which repo to open a refine-board chat for.
@@ -2864,6 +2889,13 @@ pub struct CoordApp {
     /// overlay to the new `type="milestone-chat"` session so the operator can
     /// converse in it (the #1017 review fix — previously fire-and-forget).
     pending_milestone_chat: Option<PendingMilestoneChat>,
+    /// #2533: pending decomposition-chat dispatch — armed when the operator
+    /// pulls an Approved-work-items row into a decomposition session
+    /// (`dispatch_approved_pull_into_decomposition`). Polled each tick; on
+    /// bind we attach the live chat overlay to the new
+    /// `type="decomposition-chat"` session, same lifecycle as
+    /// `pending_board_chat` / `pending_milestone_chat`.
+    pending_decomposition_chat: Option<PendingDecompositionChat>,
     /// #353: pending repo picker for the [Add] button on the Board panel.
     /// Armed when the user clicks [Add] and multiple repos exist. The picker
     /// intercepts numeric keys (1, 2, …) to select a repo, or Esc to cancel.
@@ -3986,6 +4018,7 @@ impl CoordApp {
             finalise_after_notes_post: false,
             pending_board_chat: None,
             pending_milestone_chat: None,
+            pending_decomposition_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
             pending_new_terminal_picker: None,

@@ -3600,6 +3600,112 @@ MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(coord assign *)",
 ]
 
+DECOMPOSITION_CHAT_SYSTEM_PROMPT = """\
+You are a decomposition steward for a customer's APPROVED portal submission \
+that an operator just pulled into this session from the TUI's "Approved \
+work items" panel (#2533, ms-67 contract §4). Unlike `milestone-chat` above \
+(which proposes and waits for confirmation before writing anything), this \
+session's WHOLE JOB is to actually decompose the submission into real \
+coordinator work — there is no separate confirm-then-write step here \
+because pulling the row into this session already IS the operator's \
+confirmation.
+
+The first user message carries: the submission's OUTCOME, AUDIENCE, DONE \
+DEFINITION, and CONSTRAINTS (the four fields the customer described); its \
+mapped repo(s); and `coordinator.yml` topology context for those repo(s) \
+(depends_on, which machines claim each repo).
+
+Your job, in order:
+1. Decide whether this is ORACLE-LOOP-SHAPED work (docs/ORACLE_LOOP.md) — \
+big or cross-cutting enough to warrant a Gate-A contract + independent \
+test-author, or small enough to skip straight to normal dispatch. Discuss \
+this with the operator if it's not obvious; you don't need to wait for \
+explicit confirmation before filing, but flag your reasoning.
+2. Produce one or more GitHub issues describing the work, using:
+
+    coord issue create <repo> --title '<title>' --body '<body>'
+
+   (or `--body-file` for long markdown — never raw `gh issue create`, this \
+repo's own house rule). If the decomposition is milestone-shaped, file an \
+epic/tracking issue first (`coord milestone create <repo> --title '<title>'`) \
+and file the sub-issues, then `coord milestone add-child <repo> <epic> \
+<issue>` each of them onto it.
+3. Queue every filed issue via:
+
+    coord drive-queue add <repo> <issue>
+
+   — NEVER `coord assign` or `coord drive --tmux` (this repo's own standing \
+preference: always go through the drive queue, never ad-hoc dispatch).
+4. Record the portal link so downstream tooling can find this submission's \
+work again (2026-08-22 briefing amendment — this is NOT optional):
+
+    coord portal link <repo> <milestone_number> <submission_id>
+
+   Use the SUBMISSION_ID from your first user message and the milestone \
+number `coord milestone create` printed. If `coord portal link` fails (bad \
+repo, bad milestone number, daemon-host guard), that is a FAILURE of this \
+step — say so explicitly to the operator, do not silently move on.
+
+   **If your decomposition produced a single one-off issue with no \
+milestone/epic** (not a milestone-shaped decomposition): `coord portal \
+link` has NO non-milestone form today — it requires a `milestone_number`, \
+which a one-off issue doesn't have. Do NOT invent one or skip the link \
+silently. Say so explicitly in your final summary to the operator (e.g. \
+"this submission has no recorded portal link — coord portal link only \
+covers milestones, and #2533's own dispatcher found no equivalent for a \
+one-off issue"), so the gap is visible rather than silently lost.
+
+Rules:
+- Do NOT run raw `gh issue create`/`gh issue edit`/`gh pr *`/`gh api -X \
+POST|PATCH|DELETE` or any other mutating `gh` command — the write paths \
+above (`coord issue create`, `coord milestone create/add-child`, `coord \
+drive-queue add`, `coord portal link`) are the only ones you may use.
+- Do NOT run `coord assign <machine> <repo> <issue>` or `coord drive \
+--tmux` — always `coord drive-queue add`.
+- Do NOT run `coord approve` or `coord merge` — outside this session's job.
+- Do NOT run `git push`, `git commit`, or any command that writes to a repo \
+checkout — this session files issues and queues work, it does not touch code.
+- Keep the operator informed: summarize your decomposition plan before \
+filing, and report back what you filed/queued/linked (and any link gap) \
+when done.\
+"""
+
+# Deny list applied to decomposition-chat workers (#2533). Unlike
+# milestone-chat, this type's WHOLE job is to write (issue create /
+# milestone create+add-child / drive-queue add / portal link), so this list
+# is deliberately narrow — it blocks raw `gh` mutations, repo-write git
+# commands, destructive git ops, and the three unrelated `coord` write
+# commands (approve/merge/assign) explicitly out of scope, while every write
+# path this session actually needs (`coord issue create`, `coord milestone
+# create`/`add-child`, `coord drive-queue add`, `coord portal link`) is
+# allowed by omission.
+DECOMPOSITION_CHAT_DENY_COMMANDS: list[str] = [
+    "Bash(gh issue edit *)",
+    "Bash(gh issue create *)",
+    "Bash(gh issue delete *)",
+    "Bash(gh issue close *)",
+    "Bash(gh api -X PATCH *)",
+    "Bash(gh api -X POST *)",
+    "Bash(gh api -X DELETE *)",
+    "Bash(gh pr *)",
+    "Bash(gh repo *)",
+    "Bash(gh milestone *)",
+    "Bash(git push *)",
+    "Bash(git commit *)",
+    "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
+    "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
+    "Bash(git checkout -- .)",
+    "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
+    "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
+    "Bash(coord approve *)",
+    "Bash(coord merge *)",
+    "Bash(coord assign *)",
+]
+
 MOCK_AUTHOR_SYSTEM_PROMPT = """\
 You are an independent mock-author agent for Gate A of a milestone \
 (#930, docs/ORACLE_LOOP.md) — the pre-work architecture gate. You have \
@@ -4195,6 +4301,20 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
         allowed_tools = "Read,Bash"
+    elif spec.type == "decomposition-chat":
+        # #2533 (ms-67 contract §4c): pull an approved portal submission
+        # into a briefed session that decides oracle-loop-shaped-or-not,
+        # files issue(s) via `coord issue create`, queues them via `coord
+        # drive-queue add`, and records `coord portal link` — a mutating
+        # chat type like milestone-chat above, with its own narrow deny
+        # list (see DECOMPOSITION_CHAT_DENY_COMMANDS) rather than
+        # new-issue-chat's blanket one, since this session's whole job is
+        # to write via those specific `coord` commands.
+        system_prompt = (
+            spec.system_prompt if spec.system_prompt else DECOMPOSITION_CHAT_SYSTEM_PROMPT
+        )
+        system_prompt += build_deny_prompt(DECOMPOSITION_CHAT_DENY_COMMANDS)
+        allowed_tools = "Read,Bash"
     elif spec.type == "mock-author":
         # #930 (docs/ORACLE_LOOP.md, Gate A): an independent mock-author
         # agent renders a viewable mock + writes `contract.md` under
@@ -4392,12 +4512,17 @@ def _user_message_line(text: str) -> bytes:
 # a non-closes-issue original (test-author/mock-author/...) — it gets a
 # worktree and runs `gh pr create`, the same GitHub-mutating shape as
 # `type="work"` had before #1142 gave it its own type, so it must stay here.
+# ``decomposition-chat`` (#2533) is a chat too — no git worktree — but its
+# whole job is to mutate GitHub (`coord issue create` / `coord milestone
+# create`/`add-child`) and the drive queue (`coord drive-queue add`), the
+# same "no worktree, but real mutation" shape ``milestone-chat`` has above.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
     "smoke",
     "conflict-fix",
     "milestone-chat",
+    "decomposition-chat",
     "mock-author",
     "test-author",
     "pr-helper",

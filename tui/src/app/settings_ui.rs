@@ -712,6 +712,16 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #2533: bind a pending decomposition-chat dispatch ("Pull into
+        // decomposition session" on an Approved-work-items row) to its
+        // `type="decomposition-chat"` assignment row when it appears in the
+        // DB, same poll+bind lifecycle as the two chat families above.
+        if self.pending_decomposition_chat.is_some()
+            && self.maybe_bind_pending_decomposition_chat()
+        {
+            needs_redraw = true;
+        }
+
         // #314 Phase B: bind a pending test-chat dispatch to its new assignment row.
         if self.pending_test_chat.is_some() && self.maybe_bind_pending_test_chat() {
             needs_redraw = true;

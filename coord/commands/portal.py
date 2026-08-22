@@ -284,6 +284,56 @@ def portal_link(
     )
 
 
+# ── #2533 (ms-67 PB-3): pull an approved submission into a decomposition chat ──
+
+
+@portal_group.command("decompose-chat")
+@_CONFIG_OPTION
+@click.argument("submission_id")
+@click.option(
+    "--machine",
+    "machine_override",
+    default=None,
+    help="Force a specific machine (must claim every repo the submission maps to).",
+)
+def portal_decompose_chat(config_path, submission_id: str, machine_override: str | None) -> None:
+    """Dispatch a ``type="decomposition-chat"`` session for SUBMISSION_ID (#2533).
+
+    The TUI's "Pull into decomposition session" action (ms-67 contract §4a/
+    §4c) shells this out, exactly the way `coord new-issue-chat` / `coord
+    milestone chat` already work — prints the new assignment id to stdout,
+    which the TUI binds a `ChatController` overlay to once it appears in the
+    board poll.
+
+    Briefs the session with SUBMISSION_ID's outcome / audience / done-
+    definition / constraints, its mapped repo(s), and `coordinator.yml`
+    topology context for those repo(s) (:mod:`coord.decomposition_chat`).
+    The session's own job — deciding whether the work is oracle-loop-shaped,
+    filing issue(s) via `coord issue create`, queueing them via `coord
+    drive-queue add`, and recording `coord portal link` — is described in its
+    system prompt (`coord.agent.DECOMPOSITION_CHAT_SYSTEM_PROMPT`), not here.
+
+    Reads through :func:`coord.approved_work.approved_submissions`, which
+    (like every other portal-bridge reader) resolves state out of this
+    machine's own ``~/.coord/coord.db`` — a daemon-host command, same as
+    ``link``/``publish-mocks`` above.
+    """
+    _refuse_if_thin_client("decompose-chat")
+
+    from coord.decomposition_chat import dispatch_decomposition_chat
+
+    cfg = _load_config(config_path)
+    try:
+        assignment_id, machine = dispatch_decomposition_chat(
+            submission_id, cfg, machine_override=machine_override
+        )
+    except RuntimeError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(1) from exc
+    click.echo(assignment_id)
+    click.echo(f"# dispatched to {machine}", err=True)
+
+
 # ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────
 
 

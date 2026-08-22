@@ -207,6 +207,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         finalise_after_notes_post: false,
         pending_board_chat: None,
         pending_milestone_chat: None,
+        pending_decomposition_chat: None,
         pending_repo_picker: None,
         pending_machine_picker: None,
         pending_new_terminal_picker: None,
