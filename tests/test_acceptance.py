@@ -571,6 +571,94 @@ class TestClearExpectedRedEntries:
         assert clear_expected_red_entries("tests:\n  a: 1\n", 1, {"a"}) is None
 
 
+class TestClearExpectedRedEntriesQuotedIds:
+    """#2296: every Playwright manifest id is double-quoted (an unquoted
+    leading `[chromium]` would parse as a YAML flow sequence, not a string),
+    so the clearer must compare the *parsed* scalar, not the raw line text,
+    or it can never match a real web-playwright manifest."""
+
+    PLAYWRIGHT_ID = "[chromium] ms-1/84-front-door.spec.ts › placeholder"
+
+    def test_double_quoted_id_is_cleared(self) -> None:
+        text = (
+            "expected_red:\n"
+            f'  84:\n    - "{self.PLAYWRIGHT_ID}"\n'
+        )
+        result = clear_expected_red_entries(text, 84, {self.PLAYWRIGHT_ID})
+        assert result is not None
+        assert "expected_red" not in result
+        data = parse_manifest_text(text)
+        assert data.expected_red == {84: frozenset({self.PLAYWRIGHT_ID})}
+
+    def test_single_quoted_id_is_cleared(self) -> None:
+        text = "expected_red:\n  1:\n    - 'plain single quoted'\n"
+        result = clear_expected_red_entries(text, 1, {"plain single quoted"})
+        assert result is not None
+        assert "expected_red" not in result
+
+    def test_single_quoted_id_with_embedded_quote_escape_is_cleared(self) -> None:
+        # YAML's single-quote escape for an embedded `'` is `''`.
+        text = "expected_red:\n  1:\n    - 'it''s red'\n"
+        data = parse_manifest_text(text)
+        assert data.expected_red == {1: frozenset({"it's red"})}
+        result = clear_expected_red_entries(text, 1, {"it's red"})
+        assert result is not None
+        assert "expected_red" not in result
+
+    def test_plain_unquoted_id_still_clears(self) -> None:
+        """The unquoted case already worked before #2296 — must keep working."""
+        text = "expected_red:\n  1:\n    - plain_unquoted_id\n"
+        result = clear_expected_red_entries(text, 1, {"plain_unquoted_id"})
+        assert result is not None
+        assert "expected_red" not in result
+
+    def test_id_containing_a_hash_is_cleared_not_truncated_as_a_comment(self) -> None:
+        """Inside a quoted scalar, `#` is data, not a comment delimiter —
+        `sub_line.split("#", 1)` would truncate the id and miss it."""
+        id_with_hash = "issue #84 regression check"
+        text = f'expected_red:\n  1:\n    - "{id_with_hash}"\n'
+        data = parse_manifest_text(text)
+        assert data.expected_red == {1: frozenset({id_with_hash})}
+        result = clear_expected_red_entries(text, 1, {id_with_hash})
+        assert result is not None
+        assert "expected_red" not in result
+
+    def test_quoted_id_with_trailing_comment_is_still_cleared(self) -> None:
+        text = (
+            "expected_red:\n"
+            f'  84:\n    - "{self.PLAYWRIGHT_ID}"  # flaky, see #91\n'
+        )
+        result = clear_expected_red_entries(text, 84, {self.PLAYWRIGHT_ID})
+        assert result is not None
+        assert "expected_red" not in result
+
+    def test_mixed_quoted_and_plain_partial_clear_preserves_the_other(self) -> None:
+        text = (
+            "expected_red:\n"
+            "  84:\n"
+            f'    - "{self.PLAYWRIGHT_ID}"\n'
+            "    - plain_id_stays\n"
+        )
+        result = clear_expected_red_entries(text, 84, {self.PLAYWRIGHT_ID})
+        assert result is not None
+        assert "plain_id_stays" in result
+        data = parse_manifest_text(result)
+        assert data.expected_red == {84: frozenset({"plain_id_stays"})}
+
+    def test_playwright_manifest_reproduction(self) -> None:
+        """The exact reproduction from #2296: a manifest with several
+        double-quoted Playwright ids has ALL of them cleared and returns
+        updated (non-None) text."""
+        ids = [f"[chromium] ms-1/84-front-door.spec.ts › case {i}" for i in range(6)]
+        body = "\n".join(f'    - "{i}"' for i in ids)
+        text = f"expected_red:\n  84:\n{body}\n"
+        parsed_ids = parse_manifest_text(text).expected_red[84]
+        assert len(parsed_ids) == 6
+        result = clear_expected_red_entries(text, 84, parsed_ids)
+        assert result is not None
+        assert "expected_red" not in result
+
+
 class _FakeApiGhOps:
     """Stub for the GitHub-API-only surface #2164's post-merge clearing
     sweep needs — no `gh` subprocess, no local checkout. Mirrors
@@ -861,6 +949,26 @@ class TestClearExpectedRedViaPr:
         msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
         assert "no expected_red entries found" in msg
 
+    def test_no_match_in_text_surgery_is_reported_as_a_warning(self) -> None:
+        """#2296: when ids were resolved from the parsed manifest but the
+        text-surgery pass finds nothing to remove (e.g. a flow-style
+        `944: [ms01::a]` entry the block-style-only text surgery doesn't
+        understand — see `_issue_header_re`'s docstring), that is a defect,
+        not a benign no-op, and must be `warning:`-prefixed so
+        `classify_expected_red_clear_result` reads it as "failed" rather
+        than a clean sweep."""
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": (
+                "tests:\n  ms01::a: 944\n"
+                "expected_red:\n  944: [ms01::a]\n"
+            ),
+        })
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert msg.startswith("warning:")
+        assert "nothing matched" in msg
+        assert classify_expected_red_clear_result(msg) == "failed"
+        assert not ops.created_prs
+
     def test_clears_a_per_issue_fragment_file(self) -> None:
         """#2543: clearing an issue whose expected_red lives in its OWN
         manifest.d/<issue>.yml fragment edits exactly that file, and the
@@ -927,7 +1035,7 @@ class TestClassifyExpectedRedClearResult:
 
     def test_unchanged_text_is_a_failure(self) -> None:
         assert classify_expected_red_clear_result(
-            "expected_red text unchanged (nothing matched)"
+            "warning: expected_red text unchanged (nothing matched)"
         ) == "failed"
 
 
