@@ -67,6 +67,7 @@ from coord.drive_queue import (
     QueueError,
     RollPending,
     TickPlan,
+    add_preflight_notice,
     build_board_view,
     diagnose_blocked_after,
     entries_from_rows,
@@ -331,6 +332,64 @@ def drive_queue_add(
         f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}"
         f"{scope_downgrade_warning}{overlap_note}"
     )
+
+    # #2339: say out loud when this add cannot possibly accomplish anything —
+    # a terminal ADVISORY work row that only `coord retry` clears, and/or an
+    # upsert onto a `blocked`/`failed` entry whose run state `enqueue`
+    # deliberately leaves alone. Emitted AFTER the `queued ...` line and never
+    # fatal: the write already happened, and #2247's posture (order/advise,
+    # never refuse) applies here for the same reason.
+    aid, status, work_machine = _latest_work_assignment(repo, issue)
+    notice = add_preflight_notice(
+        repo,
+        issue,
+        previous,
+        work_aid=aid,
+        work_status=status,
+        work_machine=work_machine,
+    )
+    if notice:
+        click.echo(notice)
+
+
+def _latest_work_assignment(repo: str, issue: int) -> tuple[str, str, str]:
+    """``(assignment_id, status, machine)`` of *repo*#*issue*'s newest
+    work-like row, or ``("", "", "")`` (#2339).
+
+    Fail-open at every layer, exactly like :func:`_issue_body` above: `add`
+    is an interactive command whose whole job is the write it already did, so
+    an unreachable daemon, a missing board, or a shape this version does not
+    recognise must degrade to "no preflight notice", never an error.
+
+    Reads the same ``BoardFetcher`` projection `tick` uses (daemon HTTP when
+    a `board_service` is configured, the local DB otherwise) and applies
+    ``coord.drive_state``'s own "latest by ``dispatched_at``, restricted to
+    ``WORK_LIKE``" rule — the same row `coord drive`'s `_decide_advisory`
+    branches on, so the two cannot disagree about which assignment is
+    current. Deliberately NO GitHub leg: confirming a *genuine* zero-commit
+    advisory is `coord retry`'s job, and it does that itself.
+    """
+    try:
+        from coord.drive_state import BoardFetcher  # noqa: PLC0415
+
+        payload = BoardFetcher().fetch()
+        rows = [
+            a
+            for a in (payload.get("assignments") or [])
+            if a.get("repo_name") == repo
+            and a.get("issue_number") == issue
+            and a.get("type") in WORK_LIKE
+        ]
+        if not rows:
+            return ("", "", "")
+        latest = max(rows, key=lambda r: r.get("dispatched_at") or 0.0)
+        return (
+            str(latest.get("assignment_id") or ""),
+            str(latest.get("status") or ""),
+            str(latest.get("machine_name") or ""),
+        )
+    except Exception:  # noqa: BLE001 — see docstring
+        return ("", "", "")
 
 
 # ── #2247: predicted file-overlap ordering ───────────────────────────────────
