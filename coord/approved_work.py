@@ -41,6 +41,60 @@ be a guess this module has no basis for), or any status this module has
 never heard of. That is the same "never suppress a row you cannot explain"
 posture the unmapped-``repos`` case below already has.
 
+**#2661 — widening entry into the panel beyond sign-off.** Until this
+change, the ONLY way onto this list was :func:`approved_submission_ids`: a
+request nobody has acted on — no design round, no sign-off, nothing — was
+invisible here for its *entire* life, which is the opposite of what
+"Approved work items" and its "N ready to pull" line both promise (two real
+submissions were observed going ``describing`` all the way to ``shipped``
+without ever appearing on the panel). #2661's issue body posed two options:
+widen the panel to also carry never-touched submissions, or leave it as-is
+and treat coord-portal's own "Start work" override
+(``coord-portal``#132, which synthesizes a ``signoff.approved``-shaped
+event) as the only entry point. This module takes the first — a FIFO
+backlog of "not started yet" is not credible if most of "not started yet"
+stays invisible until an operator remembers a button on a different
+system.
+
+The rule: a submission with **no signoff event of any kind, ever**
+(tracked by :func:`_fold_signoff_verdicts`, which folds every submission id
+that has *ever* appeared in :func:`coord.portal_store.signoff_events`, not
+just the approved ones) and whose ``last_status`` is still in
+:data:`_UNACTIONED_STATUSES` (``""`` or ``"describing"``) is admitted with
+``row["signoff_status"] == "new"``, alongside the existing rows (now
+``"approved"``). Both conditions matter:
+
+* "No signoff event, ever" excludes a submission that already went through
+  a design round and came back ``changes_requested`` — that one has
+  already been looked at and is mid-flight, not "nobody has acted on
+  this", so it correctly stays off the list exactly as it did before this
+  change.
+* ``last_status`` of ``""``/``"describing"`` (rather than ``"in-design"``
+  / ``"awaiting-signoff"`` / ``"needs-input"`` / ``"on-hold"``) excludes a
+  submission an operator has already started a design round against, even
+  though the customer has not signed off yet — that is "in progress", not
+  "unactioned".
+
+``""`` and ``"describing"`` are treated identically because nothing in
+this codebase today ever writes the literal string ``"describing"`` into
+``last_status`` — only :func:`coord.portal_sync.fold_status_for_milestone`
+writes that column, and only *after* a milestone link exists, i.e. after a
+design round has already shipped. ``""`` is the column's own SQL default
+(``coord/db.py``'s ``portal_submissions`` table) and is, in practice, the
+value a genuinely brand-new submission carries. Both spellings are
+accepted so the rule keeps working unchanged if a future sync ever starts
+echoing ``"describing"`` back explicitly.
+
+**Rendering the distinction is not this module's job.**
+``row["signoff_status"]`` is new wire data
+(``ApprovedSubmission``, ``tui/src/app/types.rs`` — an unrecognised extra
+JSON key is silently ignored by serde today, so older/newer clients do not
+break either way). This module's responsibility ends at making "approved"
+and "new" rows *computably* distinguishable, per the issue's explicit
+requirement that they must never render as the same state. Actually
+painting that distinction on screen (a badge, a colour) is TUI work for a
+follow-up, not this change.
+
 **Field-name honesty (contract §6.9).** coord-portal's submission schema
 lives in a separate repo, so the intake fields (outcome / audience /
 done-definition / constraints, plus client and project identity) are read out
@@ -117,6 +171,15 @@ _TEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 #: the rule it encodes.
 _PULLED_STATUSES = frozenset({"planned", "in-progress", "quality-check", "shipped"})
 
+#: ``portal_submissions.last_status`` values that mean "intake happened,
+#: nothing else has" — the #2661 "brand new, nobody has acted on this yet"
+#: state. See the module docstring's "#2661 — widening entry into the
+#: panel beyond sign-off" section for why both spellings are accepted and
+#: why `"in-design"` / `"awaiting-signoff"` / `"needs-input"` / `"on-hold"`
+#: are deliberately NOT included here (each of those means someone already
+#: acted).
+_UNACTIONED_STATUSES = frozenset({"", "describing"})
+
 
 def _first_str(mirror: dict[str, Any], keys: tuple[str, ...]) -> str:
     """The first non-blank string *mirror* has under *keys*, else ``""``.
@@ -155,14 +218,20 @@ def _iso8601(epoch: Any) -> str:
         return ""
 
 
-def approved_submission_ids() -> set[str]:
-    """Submission ids whose LATEST sign-off verdict is ``approved``.
+def _fold_signoff_verdicts() -> dict[str, str]:
+    """One folded, normalized verdict per submission id — LATEST wins.
 
-    Folds :func:`coord.portal_store.signoff_events` (oldest first) into one
-    verdict per submission, so a walked-back approval drops out. Reuses
+    Folds :func:`coord.portal_store.signoff_events` (oldest first), so a
+    walked-back approval drops to whatever came after it. Reuses
     :mod:`coord.portal_sync`'s own verdict readers rather than re-deriving
     them: the portal's sign-off event shape is not fully pinned down, and two
     independent guesses at it would drift.
+
+    Shared foundation for :func:`approved_submission_ids` (verdict ==
+    ``"approved"``) and #2661's "brand new" test in
+    :func:`approved_submissions` (submission id present in this dict AT ALL,
+    regardless of verdict, means a design round has gone through sign-off at
+    least once — see the module docstring).
     """
     from coord import portal_store  # noqa: PLC0415 — avoid import cycle
     from coord.portal_sync import (  # noqa: PLC0415
@@ -179,7 +248,12 @@ def approved_submission_ids() -> set[str]:
         if verdict is None:
             continue
         latest[submission_id] = _normalize_verdict(verdict)
-    return {sid for sid, verdict in latest.items() if verdict == "approved"}
+    return latest
+
+
+def approved_submission_ids() -> set[str]:
+    """Submission ids whose LATEST sign-off verdict is ``approved``."""
+    return {sid for sid, verdict in _fold_signoff_verdicts().items() if verdict == "approved"}
 
 
 def approved_submissions(config: "Config") -> list[dict[str, Any]]:
@@ -197,25 +271,46 @@ def approved_submissions(config: "Config") -> list[dict[str, Any]]:
     normal state, not an error, so it never suppresses the row: an operator
     who cannot see the unmapped submission cannot know to map it.
 
-    A submission is additionally dropped once its ``last_status`` is in
-    :data:`_PULLED_STATUSES` — an approved sign-off that has already been
-    pulled into decomposition and delivery is no longer "ready to pull"
-    (#2660). See the module docstring for the exact rule and why the other
-    statuses stay on the list.
+    Two, and only two, kinds of row are admitted (``row["signoff_status"]``
+    tags which):
+
+    * ``"approved"`` — the latest sign-off verdict is ``approved``
+      (:func:`approved_submission_ids`) AND ``last_status`` is not in
+      :data:`_PULLED_STATUSES` — an approved sign-off that has already been
+      pulled into decomposition and delivery is no longer "ready to pull"
+      (#2660).
+    * ``"new"`` — #2661: no signoff event of any kind has ever been
+      recorded for this submission AND ``last_status`` is in
+      :data:`_UNACTIONED_STATUSES`. See the module docstring's "#2661"
+      section for the full reasoning and why the other pre-decomposition
+      statuses (``in-design``, ``awaiting-signoff``, ``needs-input``,
+      ``on-hold``) do NOT qualify.
+
+    Everything else — a submission with a ``changes_requested`` (or other
+    non-approved) verdict, or one whose design round is underway but not
+    yet signed off — is neither "ready to pull" nor "nobody has acted on
+    this", so it is omitted, exactly as before #2661.
     """
     from coord import portal_store  # noqa: PLC0415 — avoid import cycle
 
-    approved = approved_submission_ids()
-    if not approved:
-        return []
+    folded = _fold_signoff_verdicts()
+    approved = {sid for sid, verdict in folded.items() if verdict == "approved"}
 
     portal = getattr(config, "portal", None)
     rows: list[dict[str, Any]] = []
     for record in portal_store.list_submissions():
-        if record.submission_id not in approved:
+        if record.submission_id in approved:
+            if record.last_status in _PULLED_STATUSES:
+                continue
+            signoff_status = "approved"
+        elif (
+            record.submission_id not in folded
+            and record.last_status in _UNACTIONED_STATUSES
+        ):
+            signoff_status = "new"
+        else:
             continue
-        if record.last_status in _PULLED_STATUSES:
-            continue
+
         mirror = record.customer if isinstance(record.customer, dict) else {}
         row: dict[str, Any] = {"submission_id": record.submission_id}
         for wire_key, aliases in _TEXT_FIELD_ALIASES.items():
@@ -224,5 +319,6 @@ def approved_submissions(config: "Config") -> list[dict[str, Any]]:
             portal.repos_for_project(row["project_id"]) if portal is not None else []
         )
         row["received_at"] = _iso8601(record.first_seen_at)
+        row["signoff_status"] = signoff_status
         rows.append(row)
     return rows

@@ -18,6 +18,14 @@ same `GET /board` endpoint a thin client uses:
    verdict is still `approved` (#2660) — it has already been pulled.
    Everything else (pre-decomposition statuses, operator-set interrupts, an
    empty/unset status, anything unrecognised) stays on the list.
+5. #2661: a submission that has NEVER had a signoff event of any kind also
+   reaches the panel, tagged `signoff_status == "new"`, as long as its
+   `last_status` is still `""`/`describing` — but NOT once a design round
+   is underway (`in-design`/`awaiting-signoff`) or an operator has parked
+   it (`needs-input`/`on-hold`), and NOT once it has ANY signoff history
+   (a `changes_requested` submission stays off the list exactly as before
+   #2661). An `"approved"` row is now also explicitly tagged
+   `signoff_status == "approved"` so a client can tell the two states apart.
 """
 
 from __future__ import annotations
@@ -336,6 +344,9 @@ class TestBoardWiring:
         assert row["repos"] == ["api", "shared"]
         # ISO-8601 Z, the shape tui/src/app/data.rs parses.
         assert row["received_at"] == "2025-08-18T06:54:00Z"
+        # #2661: a signed-off row is explicitly tagged, so a client can tell
+        # it apart from a never-touched "new" row.
+        assert row["signoff_status"] == "approved"
 
     def test_the_real_coord_portal_146_identity_shape_resolves_end_to_end(
         self, detail_db, portal_config_path, rw_db
@@ -390,6 +401,8 @@ class TestBoardWiring:
             assert key in row, key
         assert row["client"] == ""
         assert row["outcome"] == ""
+        # #2661: new wire field, always present alongside the rest.
+        assert row["signoff_status"] == "approved"
 
     def test_an_unmapped_project_is_listed_with_no_repos(
         self, detail_db, portal_config_path, rw_db
@@ -511,3 +524,135 @@ class TestPulledSubmissionsDropOff:
 
         rows = _board(detail_db, portal_config_path)["approved_submissions"]
         assert [r["submission_id"] for r in rows] == ["sub_still_waiting"]
+
+
+# ── 5. #2661 — a request nobody has acted on reaches the panel too ──────────
+
+
+def _seed_unsignoffed(
+    submission_id: str, *, project_id: str, first_seen_at: float, **facts
+) -> None:
+    """A submission with intake done and NO signoff event of any kind —
+    the #2661 "nobody has acted on this yet" case. Deliberately does not
+    call `record_events` at all (unlike `_seed_submission`), so
+    `_fold_signoff_verdicts()` never sees this submission id."""
+    from coord import portal_store
+
+    portal_store.mirror_customer_facts(
+        submission_id, {"project_id": project_id, **facts}, now=first_seen_at
+    )
+
+
+class TestNewUnactionedSubmissions:
+    def test_a_never_touched_submission_with_no_status_pushed_is_listed_as_new(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """The common real-world case: `last_status` is still `""` (the
+        schema default — nothing has ever confirmed-pushed a status for
+        this submission) and no signoff event exists at all."""
+        _seed_unsignoffed(
+            "sub_brand_new", project_id="proj_9f2a", first_seen_at=1.0
+        )
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert row["submission_id"] == "sub_brand_new"
+        assert row["signoff_status"] == "new"
+
+    def test_a_never_touched_submission_at_describing_is_listed_as_new(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """`last_status == "describing"` is treated the same as `""` — see
+        the module docstring for why nothing today ever writes the literal
+        string, but the rule accepts it anyway."""
+        _seed_unsignoffed(
+            "sub_describing", project_id="proj_9f2a", first_seen_at=1.0
+        )
+        _set_last_status("sub_describing", "describing", now=2.0)
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert row["submission_id"] == "sub_describing"
+        assert row["signoff_status"] == "new"
+
+    @pytest.mark.parametrize(
+        "status",
+        ["in-design", "awaiting-signoff", "needs-input", "on-hold"],
+    )
+    def test_a_never_touched_submission_past_describing_is_not_listed(
+        self, detail_db, portal_config_path, rw_db, status
+    ) -> None:
+        """Once `last_status` has moved past intake — a design round is
+        underway, or an operator has parked it with a question/hold — an
+        operator (or the process) has already acted, so this is no longer
+        "nobody has acted on this" even though it was never signed off."""
+        _seed_unsignoffed(
+            "sub_in_flight", project_id="proj_9f2a", first_seen_at=1.0
+        )
+        _set_last_status("sub_in_flight", status, now=2.0)
+
+        assert _board(detail_db, portal_config_path)["approved_submissions"] == []
+
+    def test_a_changes_requested_submission_never_reads_as_new(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """A submission that already went through a design round and came
+        back `changes_requested` has been looked at — it must not be
+        mistaken for "brand new" just because `last_status` happens to
+        still be `""`/`describing` (#2661 must not resurrect the pre-#2660
+        "was ever touched" reading for a different field)."""
+        from coord import portal_store
+
+        _seed_unsignoffed(
+            "sub_changes_requested", project_id="proj_9f2a", first_seen_at=1.0
+        )
+        portal_store.record_events(
+            [_signoff("e1", "sub_changes_requested", "changes_requested")],
+            now=1.0,
+        )
+
+        assert _board(detail_db, portal_config_path)["approved_submissions"] == []
+
+    def test_new_and_approved_rows_interleave_oldest_first(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """The panel is one FIFO backlog across both kinds of row, not two
+        separate lists — an old "new" row must outrank a younger "approved"
+        one, and vice versa."""
+        _seed_unsignoffed(
+            "sub_new_oldest", project_id="proj_9f2a", first_seen_at=1.0
+        )
+        _seed_submission("sub_approved_middle", project_id="proj_9f2a", first_seen_at=2.0)
+        _seed_unsignoffed(
+            "sub_new_newest", project_id="proj_9f2a", first_seen_at=3.0
+        )
+
+        rows = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert [r["submission_id"] for r in rows] == [
+            "sub_new_oldest",
+            "sub_approved_middle",
+            "sub_new_newest",
+        ]
+        assert [r["signoff_status"] for r in rows] == ["new", "approved", "new"]
+
+    def test_a_new_row_still_carries_every_required_wire_field(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """Same wire contract as an approved row (#2532 point 3) — a "new"
+        row must not be a stripped-down shape a client has to special-case."""
+        _seed_unsignoffed("sub_bare_new", project_id="proj_9f2a", first_seen_at=1.0)
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+        for key in (
+            "submission_id",
+            "client",
+            "project_id",
+            "project_label",
+            "outcome",
+            "audience",
+            "done_definition",
+            "constraints",
+            "repos",
+            "received_at",
+            "signoff_status",
+        ):
+            assert key in row, key
+        assert row["repos"] == ["api", "shared"]
