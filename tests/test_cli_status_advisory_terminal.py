@@ -139,3 +139,154 @@ def test_advisory_terminal_check_is_cached_per_invocation(
 
     assert output.count("#1472: Some fixed issue [api]") == 2, output
     assert len(calls) == 1, calls
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2595: a host cordoned past its drain deadline with ZERO active work is a
+# distinct CRIT state on both `coord status` and `coord doctor` — not the
+# ordinary "CORDONED: DRAINING FOR..." label a normal in-progress roll gets.
+# Black-box: seed a cordon + an empty board (no active assignments at all,
+# the default `coord_db` state) and assert both commands say so.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _cordon_server_past_deadline(monkeypatch, tmp_path) -> None:
+    """Isolate the cordon store under *tmp_path* (same isolation
+    `tests/test_release_cordon_2101.py`'s `tmp_home` fixture uses — the
+    store lives at ``$HOME/.coord/paused_machines.json``) and cordon
+    ``server`` (from ``VALID_CONFIG``) well past the default 90-minute
+    drain deadline."""
+    import time as _time
+
+    from coord import machine_pause as mp
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".coord").mkdir(exist_ok=True)
+    mp.local_set_cordon(
+        "server", target_version="0.5.232",
+        created_at=_time.time() - 7200, ttl_seconds=3600,
+    )
+
+
+def test_status_shows_a_distinct_crit_for_a_cordoned_idle_host(
+    valid_config_path, monkeypatch, coord_db, tmp_path,
+) -> None:
+    _cordon_server_past_deadline(monkeypatch, tmp_path)
+
+    def _fake_check_all(machines, timeout=3.0, **kw):
+        return [MachineStatus(machine=m, state="online", latency_ms=1.0) for m in machines]
+
+    monkeypatch.setattr(network_mod, "check_all", _fake_check_all)
+    monkeypatch.setattr(
+        network_mod, "fetch_status",
+        lambda *a, **k: StatusResult(data={"active": [], "completed": []}),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        status_cmd,
+        ["--config", str(valid_config_path), "--no-reconcile"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    # The ordinary cordon label is still there (still true: it IS cordoned)...
+    assert "CORDONED: DRAINING FOR V0.5.232" in result.output
+    # ...but a plain "online • idle" cordon label alone is exactly the
+    # failure #2595 names — this line is what makes it unmistakable.
+    assert "CRIT: server is cordoned and IDLE" in result.output
+    assert "coord agent update --machine server" in result.output
+    assert "coord release cordon --clear server" in result.output
+
+
+def test_doctor_reports_crit_for_a_cordoned_idle_host(
+    valid_config_path, monkeypatch, coord_db, tmp_path,
+) -> None:
+    from coord.commands.status import doctor as doctor_cmd
+
+    _cordon_server_past_deadline(monkeypatch, tmp_path)
+
+    def _fake_check_all(machines, timeout=3.0, **kw):
+        return [
+            MachineStatus(
+                machine=m, state="online", latency_ms=1.0,
+                health={"version": "0.5.210"},
+            )
+            for m in machines
+        ]
+
+    monkeypatch.setattr(network_mod, "check_all", _fake_check_all)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        doctor_cmd,
+        ["--config", str(valid_config_path), "--no-pypi", "--expected", "0.5.232"],
+        catch_exceptions=False,
+    )
+
+    assert "release cordons (coord release cordon):" in result.output
+    assert "CRIT: server is cordoned and IDLE" in result.output
+    assert "22 releases behind" in result.output
+    assert result.exit_code == 1, result.output
+
+
+def test_status_shows_outside_reach_crit_advisories(
+    valid_config_path, monkeypatch, coord_db, tmp_path,
+) -> None:
+    """#2595: a CRIT `gate.advisory` finding (a lane `coord release
+    propagate` could not roll at all, e.g. a stale `~/.coord-cli-venv`)
+    already carries the exact host/lane/remedy (#2403) — it just never
+    reached anywhere but the timer's own stderr. `coord status` is that
+    destination."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".coord").mkdir(exist_ok=True)
+
+    from coord import release_propagate as rp
+    from coord.commands.release import _state_dir
+
+    record = rp.PropagationRecord(
+        started_at=1.0,
+        target_version="0.5.232",
+        gate={
+            "severity": "ok",
+            "blocking": [],
+            "advisory": [
+                {
+                    "host": "server",
+                    "lane": "~/.coord-cli-venv (server)",
+                    "severity": "crit",
+                    "summary": "on 0.5.210, expected 0.5.232",
+                },
+            ],
+            "unrollable": [],
+        },
+    )
+    rp.append_record(_state_dir(), record)
+
+    def _fake_check_all(machines, timeout=3.0, **kw):
+        return [MachineStatus(machine=m, state="online", latency_ms=1.0) for m in machines]
+
+    monkeypatch.setattr(network_mod, "check_all", _fake_check_all)
+    monkeypatch.setattr(
+        network_mod, "fetch_status",
+        lambda *a, **k: StatusResult(data={"active": [], "completed": []}),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        status_cmd,
+        ["--config", str(valid_config_path), "--no-reconcile"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "CRIT: ~/.coord-cli-venv (server): on 0.5.210, expected 0.5.232 "
+        "— outside propagation's reach, fix by hand — run `coord agent "
+        "update --machine server` then `coord release cordon --clear "
+        "server`" in result.output
+    ), result.output
+    # Never attributed to the wrong machine.
+    assert "laptop" in result.output
+    laptop_section = result.output.split("server", 1)[0]
+    assert "outside propagation's reach" not in laptop_section
