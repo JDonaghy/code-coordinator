@@ -961,6 +961,8 @@ def test_concurrency_defaults() -> None:
     cfg = _parse_concurrency(None)
     assert cfg.bash_wrap_spawn is True
     assert cfg.first_output_timeout == 600.0
+    # #2638: generous 6h default, matching `coord.agent._DEFAULT_RUNTIME_CEILING_S`.
+    assert cfg.runtime_ceiling_s == 6.0 * 60.0 * 60.0
 
 
 def test_concurrency_bash_wrap_spawn_parses() -> None:
@@ -987,6 +989,24 @@ def test_concurrency_first_output_timeout_rejects_negative() -> None:
 def test_concurrency_first_output_timeout_rejects_bool() -> None:
     with pytest.raises(ConfigError, match="first_output_timeout must be a non-negative number"):
         _parse_concurrency({"first_output_timeout": True})
+
+
+# ── concurrency: wall-clock runtime ceiling (#2638) ───────────────────────────
+
+def test_concurrency_runtime_ceiling_s_parses() -> None:
+    assert _parse_concurrency({"runtime_ceiling_s": 0}).runtime_ceiling_s == 0
+    assert _parse_concurrency({"runtime_ceiling_s": 3600}).runtime_ceiling_s == 3600
+    assert _parse_concurrency({"runtime_ceiling_s": 1800.5}).runtime_ceiling_s == 1800.5
+
+
+def test_concurrency_runtime_ceiling_s_rejects_negative() -> None:
+    with pytest.raises(ConfigError, match="runtime_ceiling_s must be a non-negative number"):
+        _parse_concurrency({"runtime_ceiling_s": -1})
+
+
+def test_concurrency_runtime_ceiling_s_rejects_bool() -> None:
+    with pytest.raises(ConfigError, match="runtime_ceiling_s must be a non-negative number"):
+        _parse_concurrency({"runtime_ceiling_s": True})
 
 
 # ── run_cmd per repo (#296) ────────────────────────────────────────────────────

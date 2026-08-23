@@ -338,8 +338,8 @@ def _resolve_agent_startup(
             "dispatch, no restart needed (#2299). providers.definitions "
             "changes apply to the NEXT dispatch of that provider name — an "
             "in-flight assignment keeps the definition it started with. "
-            "RESTART-ONLY: concurrency (bash_wrap_spawn/first_output_timeout) "
-            "and the bind host/port."
+            "RESTART-ONLY: concurrency (bash_wrap_spawn/first_output_timeout/"
+            "runtime_ceiling_s) and the bind host/port."
         )
     else:
         notices.append(
@@ -401,6 +401,11 @@ def _start_agent_server(
         repo_paths=machine.repo_paths,
         bash_wrap_spawn=concurrency.bash_wrap_spawn,
         first_output_timeout=concurrency.first_output_timeout,
+        # #2638: fleet-configurable wall-clock runtime ceiling — was
+        # previously hardcoded to `AgentServer`'s own default regardless of
+        # what `coordinator.yml` set, unlike its `first_output_timeout`
+        # sibling right above.
+        runtime_ceiling_s=concurrency.runtime_ceiling_s,
         artifact_paths=startup.artifact_paths,
         build_commands=startup.build_commands,
         providers=startup.providers,

@@ -664,10 +664,21 @@ def _wait_for_proc_or_result(
         # every other watchdog: it is the more specific diagnosis, and
         # explains why a leg might otherwise look TTFT-silent or ceiling-
         # breached.
+        #
+        # Gated on `result_seen_at is None` for the identical reason the
+        # runtime ceiling and #2131's spend ceiling both are: once the
+        # worker has logically finished, the grace-period teardown below
+        # owns the outcome. Without this gate, a suspend/resume straddling
+        # that short post-result teardown window would kill and mislabel an
+        # already-finished leg as a host-sleep kill instead of letting it
+        # land DONE.
         mono_delta = now_mono - last_mono
         wall_delta = now_wall - last_wall
         last_mono, last_wall = now_mono, now_wall
-        if wall_delta - mono_delta >= sleep_divergence_s:
+        if (
+            result_seen_at is None
+            and wall_delta - mono_delta >= sleep_divergence_s
+        ):
             _append_log_line(
                 log_path,
                 "# reap: SIGKILL — host sleep detected (wall clock advanced "
@@ -8886,9 +8897,13 @@ class AgentServer:
                 with open(log_path, "rb") as _f:
                     _f.seek(max(0, os.path.getsize(log_path) - 4096))
                     _tail = _f.read()
+                # `-?` on both groups: an NTP backward step could in theory
+                # make either delta format as negative (`f"{-1.0:.0f}"` ==
+                # `"-1"`) — match it anyway rather than silently falling back
+                # to the less-precise defaults below.
                 _match = re.search(
-                    rb"host sleep detected \(wall clock advanced (\d+)s vs "
-                    rb"(\d+)s monotonic",
+                    rb"host sleep detected \(wall clock advanced (-?\d+)s vs "
+                    rb"(-?\d+)s monotonic",
                     _tail,
                 )
                 if _match:

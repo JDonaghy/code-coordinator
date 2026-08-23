@@ -263,6 +263,59 @@ def test_push_failure_reason_propagated_from_agent_entry() -> None:
     assert rec.calls[0]["failure_reason"] == "Invalid username or token."
 
 
+def test_runtime_ceiling_reason_propagated_from_agent_entry() -> None:
+    """#2638: a wall-clock runtime-ceiling kill (AgentServer._reap stamps
+    `runtime_ceiling_reason`) must be forwarded to `_update_local_state` as
+    `failure_reason` exactly like `usage_limit_reason`/`api_error_reason`/
+    `push_failure_reason` — otherwise a suspended-host kill lands FAILED with
+    no diagnostic at all, invisible to `coord status`, `coord retry`, and the
+    GitHub failure comment."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "w1", "status": "failed",
+                "runtime_ceiling_reason": (
+                    "runtime ceiling — ran 6.02h, past the 6.00h ceiling (#2638)"
+                ),
+            },
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] == (
+        "runtime ceiling — ran 6.02h, past the 6.00h ceiling (#2638)"
+    )
+
+
+def test_host_sleep_reason_propagated_from_agent_entry() -> None:
+    """#2638: a host-sleep-detection kill (AgentServer._reap stamps
+    `host_sleep_reason`) must be forwarded to `_update_local_state` as
+    `failure_reason` exactly like the other reap-time diagnostics — this is
+    the exact "nothing said the word asleep" gap #2638 exists to close."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "w1", "status": "failed",
+                "host_sleep_reason": (
+                    "host sleep detected — wall clock advanced 37800s while "
+                    "only 5s of monotonic time elapsed; the host likely "
+                    "suspended mid-leg (#2638)"
+                ),
+            },
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] == (
+        "host sleep detected — wall clock advanced 37800s while only 5s of "
+        "monotonic time elapsed; the host likely suspended mid-leg (#2638)"
+    )
+
+
 def test_usage_limit_reason_preferred_over_api_error_reason() -> None:
     """The two are mutually exclusive by construction (see
     `AgentServer._reap`), but if an entry somehow carried both,
