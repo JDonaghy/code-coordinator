@@ -1978,6 +1978,19 @@ NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
 #: read as a clean pass either. `test_reason` carries the full story for
 #: `coord log`/`coord status`/the GitHub comment; this constant is only the
 #: board-column value.
+#:
+#: Visibility (#2579 review): a `test_state` value that no display site
+#: recognizes is worse than "failed", not better — it falls through to
+#: whatever default that site uses for "nothing has happened yet". So this
+#: value is explicitly threaded through every "is this test verdict bad"
+#: rendering site alongside "failed": `coord.stage_projection.
+#: test_stage_status_for` (and its Rust mirror, `tui/src/app/pipeline.rs::
+#: test_stage_status_for`, shared by the TUI board and the web dashboard)
+#: map it to the same red FAILED badge as a plain failure, and `coord status`
+#: (`coord/commands/status.py`) gives it its own tag distinct from both
+#: "[✗ test FAILED — needs fix]" and the review-state tags it would
+#: otherwise fall through to (`"[review done]"` being the actively
+#: misleading one for this issue's own scenario).
 TEST_STATE_CONTESTED = "contested"
 
 

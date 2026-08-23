@@ -10137,6 +10137,23 @@
     }
 
     #[test]
+    fn test_stage_failed_when_contested_verdict() {
+        // #2579: "contested" (coord.notify.TEST_STATE_CONTESTED) — an
+        // independent #2464 re-run refuted a pass claim whose review had
+        // already approved it. Deliberately distinct from the literal
+        // "failed" so no automatic fix-dispatch door mistakes it for an
+        // ordinary Test-stage failure, but it must still render as a red
+        // Failed badge here, not fall through to a neutral Pending one that
+        // would look like nothing had happened yet.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("contested")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Failed);
+    }
+
+    #[test]
     fn test_stage_pending_when_work_not_done() {
         let mut app = make_pipeline_app_with_test_gate();
         app.data

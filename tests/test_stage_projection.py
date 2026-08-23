@@ -228,6 +228,18 @@ def test_test_stage_failed_verdict_is_failed():
     assert sp.test_stage_status_for(a, is_closed=False, require_plan=False) == sp.FAILED
 
 
+def test_test_stage_contested_verdict_is_failed():
+    """#2579: "contested" (coord.notify.TEST_STATE_CONTESTED) — an
+    independent #2464 re-run refuted a pass claim whose review had already
+    approved it. Deliberately distinct from the literal "failed" string so
+    no automatic fix-dispatch door mistakes it for an ordinary Test-stage
+    failure, but by this module's own #1672 rule it IS a statement about the
+    branch, so it must render as a red Failed badge here — not fall through
+    to PENDING, which would look like nothing had happened yet."""
+    a = [_work(status="done", test_state="contested")]
+    assert sp.test_stage_status_for(a, is_closed=False, require_plan=False) == sp.FAILED
+
+
 def test_test_stage_active_smoke_session_overrides_prior_pass():
     """#585: an in-flight manual smoke session keeps Test Active even over a
     prior passed verdict."""
