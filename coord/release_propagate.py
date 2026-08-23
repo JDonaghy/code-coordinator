@@ -85,6 +85,41 @@ documented 405. The shell (`coord/commands/release.py`) enforces this by
 deferring the whole run only in that one case; every other combination of
 busy hosts rolls whatever it can and defers only what it can't.
 
+#2618 INVESTIGATED THE *REASON* THIS ONE CASE IS "OCCUPIED == DEFER" AT ALL
+----------------------------------------------------------------------------
+Rolling the daemon host's python lane restarts `coord-serve` — a fleet-wide
+event, not a local one — and "the fleet must be quiescent for it" was
+inferred (never confirmed against the retry code) from two daemon-dependent
+things a drive does: poll the board, and write to it. #2618 checked both.
+
+The POLL path was already fine: `coord.drive.Driver.read_state()` swallows
+every exception `BoardFetcher.fetch()` can raise, including a connection
+refusal, and returns `None` — `Driver._loop` just sleeps `--poll` and tries
+again next cycle. A `coord-serve` restart (systemd, single-digit seconds)
+landing inside one poll interval was already invisible there, restart or
+not.
+
+The WRITE path was not: every RUN action (`coord assign`/`retry`/`fix`/
+`test`/`merge --only`/...) is a `coord` subprocess making exactly one
+unretried `httpx` call to the daemon. Land one in the restart's
+connection-refused window and the whole drive died — a real in-flight
+drive genuinely could not survive the restart, which is why "is anything
+running anywhere" was the only safe question to ask before rolling the
+daemon host. `coord.drive.Driver._spawn` now retries that one shape (a
+clean connection refusal — the daemon never received the request, so
+retrying is unambiguous; see its own comment for why a reset or timeout
+mid-request is deliberately NOT retried the same way) across a bounded,
+few-attempt window sized to ride out an ordinary restart.
+
+That means an in-flight `coord drive` is no longer inherently unable to
+survive a `coord-serve` restart — which is the premise "occupied anywhere
+defers the daemon host" was built on. This module's `assess_quiescence`
+and `Quiescence.busy_hosts()`/`fleet_wide_busy` are unchanged by #2618 on
+purpose: the daemon-host gate itself (`daemon_name in busy_hosts` in
+`coord/commands/release.py`, plus the cordon "blocked behind daemon host"
+message in `coord/release_cordon.py`) lives outside this module and needs
+its own look before any loosening — this is the finding, not the fix.
+
 LANE ORDER ANSWERS THE SKEW QUESTION
 ------------------------------------
 #1835 asks whether a fleet mid-roll — hosts at two versions — is safe for

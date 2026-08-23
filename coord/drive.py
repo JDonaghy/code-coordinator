@@ -269,6 +269,72 @@ def _bounded_tail(text: str, limit: int = _CAPTURED_OUTPUT_LIMIT) -> str:
     return f"…[{dropped} chars truncated]…{text[-limit:]}"
 
 
+# ── #2618: surviving a `coord-serve` restart mid-drive ──────────────────────
+#
+# Investigated before building anything, per the issue: is a `coord-serve`
+# restart actually unsurvivable for an in-flight `coord drive`, or merely
+# unretried? Answer is split by call shape.
+#
+# The READ path (`BoardFetcher.fetch()`, one `httpx.get` per poll) was
+# already fine — `Driver.read_state()` catches every exception, including a
+# connection refusal, and returns `None`; `_loop` just sleeps `--poll` and
+# tries again next cycle. A `coord-serve` restart (a few seconds) sitting
+# inside one poll interval is invisible there.
+#
+# The WRITE path was not: every RUN action (`coord assign`/`retry`/`fix`/
+# `test`/`merge --only`/`review`/`escalate record`/`acceptance author`/
+# `record`) is a `coord` subprocess that POSTs to the daemon exactly once,
+# through `coord.client`'s bare `httpx` calls — no retry anywhere in that
+# chain. Land one of those in the restart's connection-refused window and
+# `_spawn` returned it to `_loop` as an ordinary failure, which (`on_error`
+# defaulting to "die") raised `DriveError` and killed the WHOLE drive —
+# not a blip survived, a drive lost. That is what forced `coord release
+# propagate` to hold the daemon-host roll for FLEET-WIDE quiescence rather
+# than the daemon host's own busy state (`release_propagate.py`'s "if the
+# daemon host itself is occupied" rule): every other in-flight drive
+# anywhere had to be presumed unable to survive the restart, because until
+# now none of them could.
+#
+# The fix below closes exactly that gap, and only that gap: retry a RUN
+# action's subprocess when its captured output carries a clean "connection
+# refused" signature — the OS rejecting the connection because nothing is
+# listening yet, which means the request never reached the daemon at all.
+# Deliberately NOT retried for a reset or timeout mid-request: those are
+# genuinely ambiguous (the daemon may have already processed the request
+# before the restart killed it), and blindly retrying an ambiguous `coord
+# assign`/`coord retry` reproduces the #476/#477 duplicate-dispatch shape.
+# A refusal carries no such ambiguity, so retrying it is safe.
+_DAEMON_CONN_REFUSED_MARKERS = (
+    "connection refused",
+    "failed to establish a new connection",
+    # httpx's own wording for the same underlying `ConnectionRefusedError`
+    # (seen wrapped in `httpx.ConnectError`'s `str()`).
+    "connecterror",
+)
+
+#: Bounded — this is riding out a systemd restart (single-digit seconds),
+#: not standing in for a real outage. `_DAEMON_CONN_REFUSED_DELAY_SECS *
+#: _DAEMON_CONN_REFUSED_RETRIES` comfortably covers a `coord-serve` restart
+#: while still giving up (and reporting a real failure) against a daemon
+#: that is genuinely down.
+_DAEMON_CONN_REFUSED_RETRIES = 4
+_DAEMON_CONN_REFUSED_DELAY_SECS = 5.0
+
+
+def _looks_like_daemon_connection_refused(output: str) -> bool:
+    """Does *output* carry the OS-level "nothing is listening" signature —
+    as opposed to a timeout, a reset, or an ordinary command failure?
+
+    Matched on lowercased substring against a short, specific allow-list
+    (mirrors `coord.failure_class`'s own "positive, specific signal, never a
+    blanket 'any error' catch" posture) — a bare non-zero exit with an
+    unrelated traceback must never be mistaken for a restart window, or a
+    genuine bug would get silently retried and its evidence discarded.
+    """
+    lowered = output.lower()
+    return any(marker in lowered for marker in _DAEMON_CONN_REFUSED_MARKERS)
+
+
 # ── options ──────────────────────────────────────────────────────────────────
 
 
@@ -3966,8 +4032,32 @@ class Driver:
         return self._spawn(argv)
 
     def _spawn(self, argv: list[str]) -> int:
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
-        combined = (proc.stdout or "") + (proc.stderr or "")
+        attempt = 1
+        while True:
+            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            combined = (proc.stdout or "") + (proc.stderr or "")
+            # #2618: a clean connection refusal (nothing was listening —
+            # never a partially-processed request) is the one failure shape
+            # safe to retry transparently. Bounded and logged, not silent:
+            # an operator reading the pane sees exactly why this command
+            # took an extra 20s instead of a drive dying for no visible
+            # reason.
+            if (
+                proc.returncode != 0
+                and attempt <= _DAEMON_CONN_REFUSED_RETRIES
+                and _looks_like_daemon_connection_refused(combined)
+            ):
+                self.warn(
+                    f"daemon connection refused (attempt {attempt}/"
+                    f"{_DAEMON_CONN_REFUSED_RETRIES + 1}, likely a "
+                    "coord-serve restart, #2618) — retrying "
+                    f"{argv[-1] if argv else '<coord>'} in "
+                    f"{_DAEMON_CONN_REFUSED_DELAY_SECS:g}s"
+                )
+                self.sleeper(_DAEMON_CONN_REFUSED_DELAY_SECS)
+                attempt += 1
+                continue
+            break
         if combined:
             print(combined.rstrip("\n"), file=self.out, flush=True)
         self._append_run_log(combined)  # unbounded — the full bytes, on disk
