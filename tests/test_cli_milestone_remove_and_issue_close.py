@@ -599,3 +599,18 @@ class TestIssueCloseCli:
         assert result.exit_code == 1
         assert "open children" in result.output.lower()
         assert "#1039" in result.output
+
+    def test_unknown_repo_errors_cleanly_without_reaching_gh(
+        self, config_file: Path
+    ) -> None:
+        # #2655: an unresolvable local name must never fall through to
+        # `close_issue` (and, through it, `gh`) verbatim.
+        with patch("coord.github_ops.close_issue") as mock_close:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "close", "code-coordinator", "42", "--config", str(config_file)],
+            )
+        assert result.exit_code != 0
+        assert "unknown repo 'code-coordinator'" in result.output
+        assert "coordinator.yml" in result.output
+        mock_close.assert_not_called()

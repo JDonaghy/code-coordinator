@@ -120,6 +120,39 @@ class TestIssueView:
         assert result.exit_code == 1
         assert "error" in result.output.lower()
 
+    def test_view_unknown_repo_errors_cleanly_without_reaching_gh(
+        self, config_file: Path
+    ) -> None:
+        """#2655: an unresolvable local name must never fall through to
+        `gh` — it must fail with the same clean seam-level error
+        `coord plans` already uses, naming the bad input and coordinator.yml,
+        and the forge backend must never be invoked."""
+        with patch("coord.github_ops.get_issue") as mock_get:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "view", "code-coordinator", "42", "--config", str(config_file)],
+            )
+        assert result.exit_code != 0
+        assert "unknown repo 'code-coordinator'" in result.output
+        assert "coordinator.yml" in result.output
+        mock_get.assert_not_called()
+
+    def test_view_raw_slug_fallback_still_works(self, config_file: Path) -> None:
+        """A value that already looks like an OWNER/REPO slug (contains
+        '/') is a deliberate escape hatch for a repo not tracked in
+        coordinator.yml at all — #2655 must not remove it."""
+        issue_data = {
+            "number": 9, "title": "T", "state": "OPEN", "body": "b", "labels": [],
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_data) as mock_get, \
+             patch("coord.github_ops.get_issue_comments", return_value=[]):
+            result = CliRunner().invoke(
+                main,
+                ["issue", "view", "JDonaghy/code-coordinator", "9", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("JDonaghy/code-coordinator", 9)
+
 
 # ── coord issue list ─────────────────────────────────────────────────────
 
@@ -192,3 +225,32 @@ class TestIssueList:
             )
         assert result.exit_code == 1
         assert "error" in result.output.lower()
+
+    def test_list_unknown_repo_errors_cleanly_without_reaching_gh(
+        self, config_file: Path
+    ) -> None:
+        """#2655 repro: `coord issue list code-coordinator` against a
+        coordinator.yml whose repo is named 'api' (here) / 'claude-coordinator'
+        (real fleet) must not leak a raw gh invocation error — it must name
+        the bad input and coordinator.yml, and never call the backend."""
+        with patch("coord.github_ops.search_issues") as mock_search:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "list", "code-coordinator", "--config", str(config_file)],
+            )
+        assert result.exit_code != 0
+        assert "unknown repo 'code-coordinator'" in result.output
+        assert "coordinator.yml" in result.output
+        mock_search.assert_not_called()
+
+    def test_list_raw_slug_fallback_still_works(self, config_file: Path) -> None:
+        with patch("coord.github_ops.search_issues", return_value=[]) as mock_search:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "list", "JDonaghy/code-coordinator", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_search.assert_called_once_with(
+            "JDonaghy/code-coordinator",
+            state="open", search=None, milestone=None, label=None, limit=100,
+        )

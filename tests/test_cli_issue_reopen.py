@@ -234,18 +234,35 @@ class TestIssueReopenCli:
         assert result.exit_code == 1
         assert "error" in result.output.lower()
 
-    def test_unknown_repo_falls_back_to_repo_name_as_slug(
+    def test_unknown_repo_name_errors_cleanly_without_reaching_gh(
         self, config_file: Path
     ) -> None:
-        # Mirrors `coord issue close`'s behavior: an unrecognized REPO isn't
-        # a hard CLI error here (unlike `milestone remove`) — it's passed
-        # straight through as the GitHub slug.
+        # #2655: an unrecognized REPO that doesn't look like an OWNER/REPO
+        # slug must fail with the clean seam-level error (naming the bad
+        # input + coordinator.yml) instead of falling through to `gh`
+        # verbatim and leaking a raw backend error.
         with patch("coord.state.reopen_issue") as mock_reopen:
             result = CliRunner().invoke(
                 main,
                 ["issue", "reopen", "nope", "42", "--config", str(config_file)],
             )
+        assert result.exit_code != 0
+        assert "unknown repo 'nope'" in result.output
+        assert "coordinator.yml" in result.output
+        mock_reopen.assert_not_called()
+
+    def test_unknown_repo_raw_slug_still_falls_through(
+        self, config_file: Path
+    ) -> None:
+        # The deliberate escape hatch: a value that already looks like an
+        # OWNER/REPO slug (contains '/') is accepted as-is even though it's
+        # not a coordinator.yml-local name.
+        with patch("coord.state.reopen_issue") as mock_reopen:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "reopen", "someone/nope", "42", "--config", str(config_file)],
+            )
         assert result.exit_code == 0, result.output
         mock_reopen.assert_called_once_with(
-            "nope", 42, comment=None, repo_github="nope"
+            "someone/nope", 42, comment=None, repo_github="someone/nope"
         )

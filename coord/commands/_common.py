@@ -348,6 +348,33 @@ def _not_implemented(name: str) -> None:
     sys.exit(1)
 
 
+def _resolve_repo_slug(config: Config, repo: str) -> str:
+    """Resolve *repo* (a coordinator.yml-local name, or a raw ``OWNER/REPO``
+    slug) to the GitHub slug the forge backend expects.
+
+    This is the shared fix for #2655: ``coord issue <sub>`` used to fall
+    back to the raw *repo* string whenever it wasn't a known local name —
+    including typos and near-misses — and hand that straight to ``gh``,
+    which then failed with a leaky, gh-flavored error
+    (``expected the "[HOST/]OWNER/REPO" format, got "..."``) that names
+    nothing about coordinator.yml. The fallback itself is intentional and
+    must keep working for a real slug like ``JDonaghy/code-coordinator``
+    (a repo not tracked in coordinator.yml at all) — so it's validated
+    here instead of removed: accepted only when it looks like a slug
+    (contains ``/``), otherwise rejected with the same clean seam-level
+    error ``coord plans`` already uses (coord/commands/plans.py:74) naming
+    the bad input and pointing at coordinator.yml. The forge backend is
+    never reached with an unresolvable name.
+    """
+    repo_entry = config.repo(repo)
+    if repo_entry is not None:
+        return repo_entry.github
+    if "/" in repo:
+        return repo
+    click.echo(f"error: unknown repo {repo!r} (not in coordinator.yml)", err=True)
+    sys.exit(2)
+
+
 def _apply_label_change(
     repo: str,
     issue: int,
