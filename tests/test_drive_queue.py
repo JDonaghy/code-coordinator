@@ -2849,6 +2849,38 @@ def test_a_blocked_entry_with_no_gate_evidence_stays_blocked_untouched():
     assert plan.launch is None
 
 
+def test_a_blocked_entry_with_the_2273_dispatch_failure_text_still_resumes_on_a_clear_gate():
+    """#2635: `_reconcile_blocked`'s own resume mechanism (`_blocked_gate_
+    reading` + `live_blocked_gate`) never consulted `is_pre_dispatch_block_
+    reason`/`is_dispatch_failure_reason` in the first place — only
+    `is_permanent_block_reason` gates it. Pinning that explicitly, with the
+    EXACT #2273 wording named in the claude-coordinator#2569 incident, so a
+    future change cannot accidentally wire that text classification into
+    this mechanical resume path and re-strand a live entry: the bug #2635
+    reports is confined to `coord.commands.drive_queue`'s `list` rendering,
+    never this reconcile."""
+    entries = [
+        _blocked_entry(
+            2569,
+            position=3,
+            last_reason=(
+                "drive exited for claude-coordinator#2569 (exit_code=3): "
+                "deadline of 240m exceeded (2/2 attempts) — giving up — no "
+                "assignment was ever created for this run (#2273): likely "
+                "an infrastructure/dispatch-layer failure, not a code defect"
+            ),
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 2569): False}
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert plan.launch is not None and plan.launch.issue == 2569
+
+
 def test_a_permanently_refused_blocked_entry_is_never_resumed():
     """#1844: even a live gate reading of 'clear now' must not resume a
     permanent refusal — relaunching a deterministic guard refusal changes

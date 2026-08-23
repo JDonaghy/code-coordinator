@@ -62,14 +62,42 @@ def cli(config_file: Path):
 
 @pytest.fixture
 def seed(coord_db):
-    """Write an `issues` row the tick will actually read back."""
+    """Write `issues` / `assignments` rows the tick will actually read back.
 
-    def _seed(*, issues: dict[int, str] | None = None, repo: str = REPO) -> None:
+    *assignments* mirrors `test_cli_drive_queue.py`'s own `seed` fixture
+    (#2635 needs the same board-assignment seeding that file's #2602 tests
+    already established) — a list of dicts with at least `issue_number` and
+    `status`; `type` defaults to `"work"`.
+    """
+
+    def _seed(
+        *,
+        issues: dict[int, str] | None = None,
+        assignments: list[dict[str, Any]] | None = None,
+        repo: str = REPO,
+    ) -> None:
         for number, issue_state in (issues or {}).items():
             coord_db.execute(
                 "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
                 "VALUES (?, ?, ?, ?)",
                 (repo, number, f"issue {number}", issue_state),
+            )
+        for index, row in enumerate(assignments or []):
+            coord_db.execute(
+                "INSERT INTO assignments "
+                "(assignment_id, repo_name, issue_number, issue_title, "
+                " machine_name, type, status, dispatched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("assignment_id", f"a-{repo}-{index}"),
+                    repo,
+                    row["issue_number"],
+                    f"issue {row['issue_number']}",
+                    "dellserver",
+                    row.get("type", "work"),
+                    row["status"],
+                    100.0 + index,
+                ),
             )
         coord_db.commit()
 
@@ -208,6 +236,174 @@ def test_a_dispatch_failure_blocked_row_also_renders_terminal(cli, seed):
     assert "NEEDS OPERATOR" in block
     assert "re-checked against the merge gate automatically (#2230)" not in block
     assert "no merge gate to re-check" in block
+
+
+# ── #2635: a per-run reason must not be read as "nothing ever happened for
+# this entry" when the entry has real evidence otherwise ───────────────────
+
+
+def test_a_dispatch_failure_row_with_a_board_assignment_is_not_needs_operator(
+    cli, seed
+):
+    """claude-coordinator#2569's exact shape: attempt 2's OWN launch
+    dispatched nothing new only because attempt 1's work was still in
+    flight (claim detection doing its job) — not an infrastructure
+    failure. A completed board assignment from that earlier attempt is
+    positive evidence #2230's sweep has something to act on; the row must
+    render as an ordinary re-checkable `blocked`, not NEEDS OPERATOR."""
+    seed(
+        issues={2569: "open"},
+        assignments=[{"issue_number": 2569, "status": "failed"}],
+    )
+    cli("add", REPO, "2569")
+    own_reason = (
+        "drive exited for claude-coordinator#2569 (exit_code=3): deadline "
+        "of 240m exceeded (2/2 attempts) — giving up — no assignment was "
+        "ever created for this run (#2273): likely an infrastructure/"
+        "dispatch-layer failure, not a code defect"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 2569, state="blocked", last_reason=own_reason, attempts=2
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    block = _block_for(result.output, f"{REPO}#2569", None)
+    row = _row_for(result.output, f"{REPO}#2569")
+
+    assert "NEEDS OPERATOR" not in row
+    assert "NEEDS OPERATOR" not in block
+    assert "re-checked against the merge gate automatically (#2230)" in block
+
+
+def test_a_dispatch_failure_row_with_only_a_remote_branch_is_not_needs_operator(
+    cli, seed, monkeypatch
+):
+    """The board hasn't caught up yet (no `assignments` row at all) but the
+    remote already has the `issue-{N}-*` branch a prior attempt pushed —
+    the same positive-liveness signal `coord.claim` and
+    `coord.issue_store` already trust. Must still override the terminal
+    verdict, via the live remote-branch fallback."""
+    seed(issues={2570: "open"})
+    cli("add", REPO, "2570")
+    own_reason = (
+        "drive session died without landing the work (2/2 attempts) — "
+        "giving up — no assignment was ever created for this run (#2273): "
+        "likely an infrastructure/dispatch-layer failure, not a code defect"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 2570, state="blocked", last_reason=own_reason, attempts=2
+    )
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "list_remote_branch_names",
+        lambda repo: {"issue-2570-some-fix", "main"},
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    block = _block_for(result.output, f"{REPO}#2570", None)
+
+    assert "NEEDS OPERATOR" not in block
+    assert "re-checked against the merge gate automatically (#2230)" in block
+
+
+def test_a_dispatch_failure_row_with_no_evidence_anywhere_stays_needs_operator(
+    cli, seed, monkeypatch
+):
+    """The genuine #2273 case this classification was built for: nothing on
+    the board, nothing on the remote either. Must stay exactly as before —
+    the live lookup finding nothing is not license to resume."""
+    seed(issues={2571: "open"})
+    cli("add", REPO, "2571")
+    own_reason = (
+        "drive session died without landing the work (2/2 attempts) — "
+        "giving up — no assignment was ever created for this run (#2273): "
+        "likely an infrastructure/dispatch-layer failure, not a code defect"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 2571, state="blocked", last_reason=own_reason, attempts=2
+    )
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    block = _block_for(result.output, f"{REPO}#2571", None)
+
+    assert "NEEDS OPERATOR" in block
+    assert "no merge gate to re-check" in block
+
+
+def test_a_dispatch_failure_row_with_a_failed_live_lookup_stays_needs_operator(
+    cli, seed, monkeypatch
+):
+    """#2602's fail-soft direction: a lookup that could not complete (an
+    unreadable `gh`, a network blip) must fall through to TODAY's
+    behaviour, never to a false "re-checkable" — the opposite of the #2602
+    `after=` recovery, which fails open toward evidence. Here, absence of
+    evidence (including a broken lookup) means the terminal note stays."""
+    seed(issues={2572: "open"})
+    cli("add", REPO, "2572")
+    own_reason = (
+        "drive session died without landing the work (2/2 attempts) — "
+        "giving up — no assignment was ever created for this run (#2273): "
+        "likely an infrastructure/dispatch-layer failure, not a code defect"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 2572, state="blocked", last_reason=own_reason, attempts=2
+    )
+
+    import coord.github_ops as github_ops
+
+    def _boom(repo):
+        raise RuntimeError("gh: not authenticated")
+
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", _boom)
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    block = _block_for(result.output, f"{REPO}#2572", None)
+
+    assert "NEEDS OPERATOR" in block
+    assert "no merge gate to re-check" in block
+
+
+def test_an_empty_branch_death_row_with_a_board_assignment_still_renders_terminal(
+    cli, seed
+):
+    """Deliberately NOT the same fix as the dispatch-failure shape above:
+    `is_empty_branch_death_reason` is already anchored to a LIVE check of
+    the actual branch at the moment the drive exited (`branch_has_commits`),
+    so a stale board row from a superseded attempt must not resurrect it —
+    see `_fetch_live_dispatch_evidence`'s docstring. A board assignment
+    existing for the issue must not change this row's rendering at all."""
+    seed(
+        issues={2573: "open"},
+        assignments=[{"issue_number": 2573, "status": "advisory"}],
+    )
+    cli("add", REPO, "2573")
+    own_reason = (
+        "drive exited (exit_code=1): acceptance author 8e5acd6b589f exited "
+        "ADVISORY with no commits on its branch — nothing was authored, so "
+        "there is no slice to land."
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 2573, state="blocked", last_reason=own_reason, attempts=6
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    block = _block_for(result.output, f"{REPO}#2573", None)
+
+    assert "NEEDS OPERATOR" in block
+    assert "no merge gate to re-check" in block
+    assert "re-checked against the merge gate automatically (#2230)" not in block
 
 
 def test_an_ordinary_blocked_row_still_gets_the_2230_note_unchanged(cli, seed):

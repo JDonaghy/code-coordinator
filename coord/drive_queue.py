@@ -2327,6 +2327,19 @@ def _is_empty_branch_death_reason(reason: str | None) -> bool:
     dispatch anything further for a terminal, already-observed board row
     (#2334's own bounded in-session retry already spent its dispatch
     attempts before reaching it); it did not fail to dispatch.
+
+    #2635: audited for the SAME per-run/per-entry confusion #2273's sibling
+    classifier (`is_dispatch_failure_reason`) turned out to have, and found
+    NOT vulnerable — deliberately, so `is_pre_dispatch_block_reason`'s
+    caller does not also need a live re-check for this shape. The "no
+    commits" verdict this matches comes from `Driver.branch_has_commits`, a
+    LIVE `git fetch` + `rev-list` against the branch's actual current state
+    at the moment the drive exited — not a cached timestamp comparison. A
+    retry reuses the SAME deterministic branch name and checks it out at
+    the remote tip (`agent.py`'s `setup_interactive_worktree`), so if an
+    earlier attempt had pushed real commits, THIS check would have seen
+    them and never produced this reason at all. There is no run/entry gap
+    to close here the way there was for `is_dispatch_failure_reason`.
     """
     if not reason:
         return False
@@ -2396,6 +2409,20 @@ def is_pre_dispatch_block_reason(reason: str | None) -> bool:
     the cheaper, always-available approximation: a `last_reason` naming
     either shape could ever ONLY have reached `blocked` via dispatch-time
     failure, so there is nothing for a later tick to have learned since.
+
+    #2635: that approximation is scoped to the RUN this `last_reason` was
+    stamped for, never widen it to the ENTRY. `is_dispatch_failure_reason`
+    in particular can be true on a retry whose OWN launch dispatched
+    nothing purely because an earlier attempt's work was still in flight
+    (claim detection doing its job) — a board assignment or a pushed branch
+    from that earlier attempt is real, positive evidence #2230's sweep has
+    something to act on, even though this text match alone cannot see it. A
+    caller with a live board MUST check for that evidence before treating a
+    `True` here as "terminal, no operator escape" — see
+    `coord.commands.drive_queue._fetch_live_dispatch_evidence`, the only
+    caller today. `is_empty_branch_death_reason` does not carry the same
+    risk (see its own docstring) so this note is deliberately not repeated
+    there.
     """
     return is_empty_branch_death_reason(reason) or is_dispatch_failure_reason(reason)
 
@@ -2406,6 +2433,15 @@ def is_dispatch_failure_reason(reason: str | None) -> bool:
     Same convention as ``is_empty_branch_death_reason``: the classifier is
     shared with `coord.commands.drive_queue`'s `list` rendering, so it gets a
     non-underscored name rather than a second copy of the text match.
+
+    #2635: text-matched against ONE run's exit reason, so a `True` here
+    means "this launch dispatched nothing" — never "nothing was ever
+    dispatched for this issue, across every attempt this entry has made".
+    The two coincide for a genuinely-never-dispatched entry (the case this
+    was built for) and diverge the moment a retry follows a real, earlier
+    dispatch — see `is_pre_dispatch_block_reason`'s docstring and
+    `coord.commands.drive_queue._fetch_live_dispatch_evidence` for the
+    caller-side check that tells them apart.
     """
     return _is_dispatch_failure_reason(reason)
 

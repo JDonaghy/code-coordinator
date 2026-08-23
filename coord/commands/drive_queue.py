@@ -75,6 +75,7 @@ from coord.drive_queue import (
     entry_key,
     find_cycle,
     fired_holds,
+    is_dispatch_failure_reason,
     is_permanent_block_reason,
     is_pre_dispatch_block_reason,
     is_unsatisfiable_prereq_reason,
@@ -955,16 +956,29 @@ _BLOCKED_GATE_NOTE = (
 # distinct sentences (never "a live gate, confirmed clear" — this predicate
 # fires when there never WAS a gate) so `attempts=N/N` reads as the headline
 # it is, not a suffix the operator has to go hunting for.
+#
+# #2635: `pre_dispatch_terminal` (the row's caller) only reaches these two
+# strings once `_fetch_live_dispatch_evidence` has already had its chance to
+# override the dispatch-failure shape with positive proof otherwise (a board
+# assignment or a remote branch a prior attempt left behind) — so by the
+# time either note prints, "no branch/PR was ever created" is either an
+# actual live-checked finding or, for the empty-branch shape (deliberately
+# not live-re-checked here — see that function's docstring for why it
+# doesn't need to be), the drive's own `branch_has_commits` verdict at exit
+# time. Worded as "found" rather than "ever created": an honest report of
+# what was looked for and not seen, not a metaphysical claim about all of
+# history — the same posture #2273's own dispatch-failure note (in
+# `coord.drive_queue._reconcile_running`) already takes for the per-run case.
 _BLOCKED_TERMINAL_NOTE = (
     "NEEDS OPERATOR — attempts {attempts}/{attempts} exhausted, and this "
-    "cause has no merge gate to re-check (#2589): no branch/PR was ever "
-    "created for this run, so #2230's automatic re-check has no evidence to "
+    "cause has no merge gate to re-check (#2589): no branch/PR was found "
+    "for this issue, so #2230's automatic re-check has no evidence to "
     "act on and never will. `coord drive-queue remove` + `add` only helps "
     "once the underlying cause is actually fixed."
 )
 _BLOCKED_TERMINAL_NOTE_NO_ATTEMPTS = (
     "NEEDS OPERATOR — this cause has no merge gate to re-check (#2589): no "
-    "branch/PR was ever created for this run, so #2230's automatic "
+    "branch/PR was found for this issue, so #2230's automatic "
     "re-check has no evidence to act on and never will. `coord drive-queue "
     "remove` + `add` only helps once the underlying cause is actually "
     "fixed."
@@ -1027,7 +1041,29 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     needs_diagnosis = any(
         e.state in _DIAGNOSABLE_STATES and e.after for e in entries
     )
-    board = _board_for_list_diagnosis() if needs_diagnosis else None
+    # #2635: a `blocked` row whose `last_reason` carries #2273's dispatch-
+    # failure marker needs the SAME live board read `needs_diagnosis` above
+    # already triggers for an `after=` diagnosis — see
+    # `_fetch_live_dispatch_evidence`'s docstring for why a per-run reason
+    # string alone cannot tell "this entry never dispatched anything, ever"
+    # apart from "this LAUNCH dispatched nothing because an earlier attempt's
+    # work was still in flight". Scoped tightly (dispatch-failure rows only,
+    # never every `blocked` row) so a queue with none of this shape costs
+    # nothing extra here, same posture as `needs_diagnosis` itself.
+    needs_dispatch_evidence = any(
+        e.state == STATE_BLOCKED and is_dispatch_failure_reason(e.last_reason)
+        for e in entries
+    )
+    board = (
+        _board_for_list_diagnosis()
+        if (needs_diagnosis or needs_dispatch_evidence)
+        else None
+    )
+    dispatch_evidence = (
+        _fetch_live_dispatch_evidence(entries, board, config_path)
+        if needs_dispatch_evidence
+        else {}
+    )
     states = {e.key: e.state for e in all_entries}
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
@@ -1054,9 +1090,17 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         # terminal, not as "just blocked", the moment an operator sees it —
         # `attempts=N/N` is the fact that matters, not a suffix buried after
         # `deferrals=`) and for which remedy note prints.
+        #
+        # #2635: `dispatch_evidence` overrides the text-only verdict when
+        # THIS entry (not just this run) has positive proof otherwise — a
+        # board assignment or a remote branch a prior attempt already left
+        # behind. See `_fetch_live_dispatch_evidence`'s docstring for why
+        # this is scoped to the dispatch-failure shape only, never the
+        # empty-branch one.
         pre_dispatch_terminal = entry.state == STATE_BLOCKED and (
             not is_permanent_block_reason(entry.last_reason)
             and is_pre_dispatch_block_reason(entry.last_reason)
+            and not dispatch_evidence.get(entry.key, False)
         )
 
         # A diagnosed row whose block is NOT (or no longer) caused by its
@@ -3047,6 +3091,108 @@ def _fetch_live_prereq_terminal(
         except Exception:  # noqa: BLE001 — leave this one dep to the fallback
             continue
     return out
+
+
+def _fetch_live_dispatch_evidence(
+    entries: list, board: BoardView | None, config_path: Path | None
+) -> dict[str, bool]:
+    """``{entry_key: True}`` for every `blocked` entry whose `last_reason`
+    carries #2273's "no assignment was ever created for this run" marker
+    but which actually has positive evidence to the contrary (#2635) — the
+    per-run/per-entry confusion :func:`coord.drive_queue.is_dispatch_failure_reason`
+    cannot tell apart on its own: a retry's `last_reason` only ever
+    describes what THAT launch dispatched, never what an EARLIER attempt on
+    the SAME entry already left behind (a board assignment, a pushed
+    branch). The claude-coordinator#2569 incident this closes: attempt 2
+    dispatched nothing new only because attempt 1's work/test/smoke legs
+    were still in flight — claim detection doing its job, not an
+    infrastructure failure — yet the entry rendered NEEDS OPERATOR forever.
+
+    Two sources, cheapest first, the same bounded/fail-soft posture as
+    :func:`_fetch_live_prereq_terminal` just above:
+
+    * the board itself (`board.facts(key)`, already fetched this call for
+      `list`'s `after=` diagnosis, or fetched here on purpose when only
+      this check needs it) — `active_work` (a live work-like row right
+      now), `merged`, or `last_dispatched_at is not None` (SOME work-like
+      assignment was ever dispatched for this issue, whatever launch
+      created it — see `IssueFacts.last_dispatched_at`'s own docstring for
+      why it is a high-water mark rather than scoped to the current run).
+      Free: no extra I/O beyond a board this command may already hold.
+    * a live remote-branch lookup (`coord.github_ops.list_remote_branch_names`,
+      filtered to the `issue-{N}-*` prefix — the same positive-liveness
+      shape `coord.claim`'s claim detection and `coord.issue_store`'s
+      branch-fallback already trust), consulted only when the board itself
+      shows nothing — so a `/board` read that has not yet caught up with a
+      `coord assign` that just ran does not still read as "nothing was
+      ever dispatched".
+
+    Deliberately NOT computed for :func:`coord.drive_queue.is_empty_branch_death_reason`
+    rows. Unlike the dispatch-failure marker, that one is already anchored
+    to a LIVE check of the actual branch (`Driver.branch_has_commits`, a
+    fresh `git fetch` + `rev-list` against the default branch at the moment
+    the drive exited) rather than a per-run timestamp comparison, so it
+    cannot go stale the same way: a retry can only ever produce that reason
+    when the branch it just checked out genuinely carried zero commits,
+    real prior-attempt commits and all (retries reuse the same deterministic
+    branch name and check it out at the remote tip — see `agent.py`'s
+    `setup_interactive_worktree`). Treating `last_dispatched_at` (a mere "an
+    assignment existed at some point") as a rebuttal for THAT reason would
+    be wrong in the other direction — a stale board row for a now-superseded
+    attempt is not evidence of anything left for #2230's sweep to re-check.
+
+    Fail-soft, same direction as #2602: any setup failure (no config, no
+    ``gh``, an API error) returns whatever was already resolved from board
+    facts alone — never invents evidence, never trusts a lookup it could
+    not complete. Bounded the same way too: only entries actually reaching
+    #2635's rendering with nothing already found do a live lookup at all.
+    """
+    evidence: dict[str, bool] = {}
+    if board is None:
+        return evidence
+
+    targets: list = []
+    for e in entries:
+        if e.state != STATE_BLOCKED or is_permanent_block_reason(e.last_reason):
+            continue
+        if not is_dispatch_failure_reason(e.last_reason):
+            continue
+        facts = board.facts(e.key)
+        if facts.known and (
+            facts.active_work or facts.merged or facts.last_dispatched_at is not None
+        ):
+            evidence[e.key] = True
+            continue
+        targets.append(e)
+
+    if not targets:
+        return evidence
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        github_by_repo = {r.name: r.github for r in cfg.repos}
+    except Exception:  # noqa: BLE001 — see docstring: fail soft to board-only evidence
+        return evidence
+
+    for e in targets:
+        parsed = parse_key(e.key)
+        if parsed is None:
+            continue
+        repo_name, issue_number = parsed
+        repo_github = github_by_repo.get(repo_name)
+        if not repo_github:
+            continue
+        try:
+            names = _gh_ops.list_remote_branch_names(repo_github)
+        except Exception:  # noqa: BLE001 — leave this one entry to the fallback
+            continue
+        prefix = f"issue-{issue_number}-"
+        if any(name.startswith(prefix) for name in names):
+            evidence[e.key] = True
+    return evidence
 
 
 def _fetch_merge_only_ready(
