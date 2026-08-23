@@ -398,6 +398,105 @@ def test_an_inferred_edge_never_fails_an_add_it_would_cycle(cli, declare):
     assert queued(306)["after_json"] == []
 
 
+# ── #2601: fanout warning + fresh-body re-read ───────────────────────────────
+
+
+def test_a_bare_directory_declaration_warns_about_high_fanout(cli, declare):
+    # `tests/` matches every one of these disjoint, precisely-declared files —
+    # a real match under #2247's directory rule (still ORDERED, never
+    # refused), but a signal-free one that deserves a warning, not silence.
+    for i, number in enumerate((401, 402, 403, 404)):
+        declare(number, f"tests/test_worker_{i}.py")
+        assert cli("add", REPO, str(number)).exit_code == 0
+
+    declare(405, "tests/")
+    result = cli("add", REPO, "405")
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" in result.output
+    assert "`tests/`" in result.output
+    assert "4 entries" in result.output
+    # ORDER, never REFUSE — every one of the four is still applied.
+    assert len(queued(405)["after_json"]) == 4
+
+
+def test_a_directory_declaration_under_the_fanout_threshold_does_not_warn(cli, declare):
+    declare(410, "tests/test_a.py")
+    declare(411, "tests/test_b.py")
+    assert cli("add", REPO, "410").exit_code == 0
+    assert cli("add", REPO, "411").exit_code == 0
+
+    declare(412, "tests/")
+    result = cli("add", REPO, "412")
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" not in result.output
+
+
+def test_editing_the_issue_live_narrows_a_stale_bare_directory_declaration(
+    cli, declare, monkeypatch,
+):
+    # #2601: the cache still holds the old, bare `tests/` declaration — but
+    # the author has since edited the issue directly on the tracker (`gh
+    # issue edit`, which never mirrors into coord's cache) to a specific file
+    # that touches neither #510 nor #511. A re-`add` must predict from the
+    # LIVE body, not the stale cached one that would otherwise chain it
+    # behind both.
+    declare(510, "tests/test_a.py")
+    declare(511, "tests/test_b.py")
+    assert cli("add", REPO, "510").exit_code == 0
+    assert cli("add", REPO, "511").exit_code == 0
+
+    declare(512, "tests/")
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue",
+        lambda repo, number: {"body": "## Files\n- `coord/only_mine.py`\n"},
+    )
+
+    result = cli("add", REPO, "512")
+
+    assert result.exit_code == 0, result.output
+    assert queued(512)["after_json"] == []
+    assert "predicted file overlap" not in result.output
+    assert "warning:" not in result.output
+    # The live body is mirrored into the cache, not just used for this call.
+    from coord.db import get_connection
+
+    row = get_connection().execute(
+        "SELECT body FROM issues WHERE repo_name = ? AND number = ?", (REPO, 512),
+    ).fetchone()
+    assert "only_mine.py" in row["body"]
+
+
+def test_a_live_refresh_failure_falls_back_to_cache_with_a_staleness_note(
+    cli, declare, monkeypatch,
+):
+    declare(520, "coord/only_mine.py")
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue",
+        lambda repo, number: (_ for _ in ()).throw(RuntimeError("gh unreachable")),
+    )
+
+    result = cli("add", REPO, "520")
+
+    assert result.exit_code == 0, result.output
+    assert "note: predicted from a cached issue body" in result.output
+
+
+def test_an_issue_with_no_cached_declaration_never_triggers_a_live_fetch(
+    cli, monkeypatch,
+):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue",
+        lambda repo, number: calls.append(number) or {"body": ""},
+    )
+    # No `## Files` block at all — the common case #2247's docstring is
+    # built around; this must stay a pure cache read with zero GitHub calls.
+    assert cli("add", REPO, "521").exit_code == 0
+    assert calls == []
+
+
 def test_overlap_report_scores_a_prediction_against_the_real_diffs(
     cli, declare, seed, branch_diff,
 ):

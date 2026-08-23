@@ -1127,6 +1127,7 @@ def milestone_dispatch_cmd(
         _predict_overlap,
         _record_overlap_prediction,
     )
+    from coord.overlap_predict import fanout_warnings  # noqa: PLC0415
     from coord.drive_queue import (  # noqa: PLC0415
         QueueError,
         entries_from_rows,
@@ -1150,7 +1151,7 @@ def milestone_dispatch_cmd(
             click.echo(f"  {key}: not queued: {exc}", err=True)
             failures += 1
             continue
-        prediction = _predict_overlap(
+        prediction, staleness_note = _predict_overlap(
             config_path, repo_entry.name, qe.issue_number, existing
         )
         auto_after = _applicable_auto_after(
@@ -1163,7 +1164,16 @@ def milestone_dispatch_cmd(
                 repo_entry.name, qe.issue_number, prediction, auto_after
             )
         suffix = f" after {', '.join(after)}" if after else ""
-        overlap_note = f"\n     {prediction.reason}" if auto_after else ""
+        # #2601: same notes `drive-queue add` surfaces — the applied reason,
+        # any high-fanout directory-token warning, and a staleness note when
+        # this entry's own body could only be read from cache.
+        notes = []
+        if auto_after:
+            notes.append(prediction.reason)
+        notes.extend(fanout_warnings(prediction))
+        if staleness_note:
+            notes.append(staleness_note)
+        overlap_note = ("\n     " + "\n     ".join(notes)) if notes else ""
         click.echo(f"  queued {key}{suffix}{overlap_note}")
         queued += 1
 
