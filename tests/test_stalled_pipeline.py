@@ -611,7 +611,10 @@ class TestTerminalGuard:
             notify_mod.detect_stalled_pipeline(
                 config, board=board, merge_queue_items=[], terminal_cache=cache
             )
-        assert cache == {("acme/vimcode", 602, "issue-602-fix"): False}
+        # #2639: the cache key now also carries `trust_issue_closed` (default
+        # True for this call site — `type='work'`, where `issue_number` is
+        # the row's own deliverable).
+        assert cache == {("acme/vimcode", 602, "issue-602-fix", True): False}
 
 
 # ── Idempotency via the notified ledger ─────────────────────────────────────

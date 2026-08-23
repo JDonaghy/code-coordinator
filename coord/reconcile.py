@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING
 
 from coord.config import INTERACTIVE_SESSION_TYPES, Config
 from coord.dispatch import AGENT_PORT
-from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
+from coord.models import (
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Machine,
+)
 
 if TYPE_CHECKING:
     from coord.merge_queue import QueuedMerge
@@ -2938,10 +2944,30 @@ def reconcile_board_merges(
         # are deliberately excluded (they never set provider_name='claude-pty').
         # `type='review'` rows never reach this point at all — they aren't in
         # `candidates` (sweep (a) above is also WORK_LIKE_TYPES-scoped).
+        # #2639: a `test-author`/`mock-author` row's `issue_number` is always
+        # the milestone's *tracking* issue (per-slice issue lives in
+        # `for_issue_number`), never something this row's own branch
+        # resolves — SEALED_PATH_AUTHOR_TYPES is the exact set for which
+        # that's true (see CLOSES_ISSUE_TYPES/SEALED_PATH_AUTHOR_TYPES in
+        # coord/models.py). Trusting `issue_is_closed` for those rows means
+        # a tracking epic that's closed for most of its life (while slices
+        # are still being authored against it) reports EVERY such row
+        # terminal the instant the epic closes — regardless of whether this
+        # row's own branch ever landed — silently evaporating the pushed
+        # slice into `status='merged'` with nothing on GitHub to show for
+        # it. Only `pr_is_merged` (branch/commit-scoped, #1150) may decide
+        # for these rows; every other work-like type (chiefly `type='work'`,
+        # where `issue_number` genuinely is the row's own deliverable) keeps
+        # the #522 issue-closed fast path so a manually-closed issue still
+        # retires it here.
         if (
             a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a)
         ) and github_ops.work_is_terminal(
-            repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
+            repo_cfg.github,
+            a.issue_number,
+            a.branch,
+            cache=terminal_cache,
+            trust_issue_closed=a.type not in SEALED_PATH_AUTHOR_TYPES,
         ):
             actions.append(
                 f"mark merged {a.assignment_id} "
