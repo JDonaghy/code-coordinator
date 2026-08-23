@@ -80,6 +80,40 @@ NO_AGENT_RECORD_REASON = (
 # docstring for why an agent restart does not produce a mass reap.
 _NO_RECORD_GRACE_SECONDS = 120.0
 
+# #2547: substring common to both `NO_AGENT_RECORD_REASON` and
+# `_no_agent_record_branch_reason`'s output — the only thing distinguishing a
+# `_reconcile_no_agent_record` GUESS from any other way a row goes terminal
+# (a real agent-reported completion, a `coord diagnose --reset`, ...). Used by
+# `reconcile_late_agent_reports` below to find rows this arm guessed at,
+# without a schema migration. If either reason string above changes, this
+# must change with it.
+_NO_AGENT_RECORD_GUESS_MARKER = (
+    "agent has no record of this assignment (present in neither its"
+)
+
+# #2547: how long after a `_reconcile_no_agent_record` GUESS a late,
+# authoritative agent completion report is still allowed to correct it.
+# `_reap` itself can run for minutes after the worker subprocess exits (git
+# push, cleanup, its own status classification) — long enough for the
+# no-record arm's positive disproof ("in neither `active` nor `completed`")
+# to catch the assignment mid-reap and guess wrong, exactly like
+# coord-portal#129 / claude-coordinator#2547's assignment `c2120f7206ec`.
+# Six hours is generous margin over any real reap duration while still being
+# bounded — this correction pass must never become an unbounded full-history
+# rescan.
+_LATE_REPORT_CORRECTION_WINDOW_SECONDS = 6 * 3600.0
+
+# The only statuses `reconcile_late_agent_reports` will ever correct a guess
+# INTO. `done` is deliberately excluded — exactly like
+# `_reconcile_no_agent_record` itself never writes `done` (see its
+# docstring): promoting an already-terminal row straight to `done` here would
+# skip every side effect a real completion normally goes through (the #1616
+# notify drain, review-verdict capture, Test-stage propagation), which this
+# passive correction pass has no business doing. A row whose real status
+# turns out to be `done` is left on its (safe, conservative) `failed`/
+# `advisory` guess — a human or `coord notify` can still promote it.
+_LATE_REPORT_SAFE_TARGETS = frozenset({"failed", "advisory", "refused_policy"})
+
 
 def is_attended_session(a: object) -> bool:
     """True when *a* is a human-attended session, not an agent subprocess (#2275).
@@ -691,6 +725,150 @@ def _reconcile_no_agent_record(
             "reason": reason,
         }
     )
+
+
+def reconcile_late_agent_reports(
+    config: Config,
+    *,
+    board: Board | None = None,
+    agent_status_fn=_query_agent,
+    update_state_fn=None,
+    now: float | None = None,
+) -> list[dict]:
+    """#2547: let a late-arriving, authoritative agent completion correct a
+    stale :func:`_reconcile_no_agent_record` GUESS.
+
+    ``_reconcile_no_agent_record`` fires on a positive disproof — the
+    assignment id is in NEITHER the agent's ``active`` nor its ``completed``
+    list — but that disproof has a real gap: ``AgentServer._reap`` runs as a
+    background thread AFTER the worker subprocess exits (push, cleanup,
+    classifying the terminal status) and only appends to ``completed`` once
+    it finishes. An assignment mid-reap is, for that window, in neither
+    list — exactly the shape the no-record arm's grace period is meant to
+    absorb, except the grace period is sized for a *dispatch-time* race
+    (:data:`_NO_RECORD_GRACE_SECONDS`, 2 minutes), not a reap that can run for
+    several minutes doing real network I/O.
+
+    When that race is lost, the no-record arm guesses a terminal status from
+    weaker evidence (a branch's commit count) than the reap's own, complete
+    verdict — and because :func:`reconcile_completed_assignments` only ever
+    looks at rows still ``status == "running"``, once the guess lands the row
+    is terminal and NOTHING ever revisits it. The correct verdict can sit in
+    the agent's own ``/status`` ``completed`` history — reachable, complete,
+    machine-readable — for as long as it stays in the 25-entry cap, and
+    coord's board would never look again. This is the "two subsystems reached
+    two different terminal states and the wrong one won" gap
+    claude-coordinator#2547 was filed for (coord-portal#129, assignment
+    ``c2120f7206ec``: the agent's own reap correctly logged ``status set to
+    advisory``, but the board was left on a guessed ``failed``).
+
+    This is a SEPARATE, later pass rather than folded into the no-record arm
+    above, because its input set is the opposite: rows already terminal
+    (``failed``/``advisory``) whose ``failure_reason`` carries
+    :data:`_NO_AGENT_RECORD_GUESS_MARKER` — the only rows this pass has any
+    business touching, found without a schema migration.
+
+    Bounded three ways, deliberately narrower than the sibling arm:
+
+    1. **Age** — only rows still inside
+       :data:`_LATE_REPORT_CORRECTION_WINDOW_SECONDS` of their own
+       ``finished_at``. This is a correction window for a specific race, not
+       a standing full-history rescan.
+    2. **Target status** — only ever corrects INTO
+       :data:`_LATE_REPORT_SAFE_TARGETS` (never ``done``), for the same
+       reason the sibling arm never writes ``done``: promoting straight to
+       ``done`` here would skip the #1616 notify drain and every side effect
+       a real completion goes through. A row whose real status is ``done``
+       stays on its safer guess; a human or ``coord notify`` can still
+       promote it.
+    3. **No-op guard** — skipped when the recomputed status agrees with the
+       existing guess (the common case once #2553 made the guess itself
+       branch-aware) or the row's current status isn't one this arm could
+       have produced (:data:`_LATE_REPORT_SAFE_TARGETS` again — never touches
+       a row a human already reset).
+
+    Kept passive per this module's #1616 contract, same as its sibling: it
+    writes state through ``update_state_fn`` and dispatches nothing.
+
+    Returns one dict per corrected assignment (empty when nothing changed).
+    """
+    if update_state_fn is None:
+        from coord.issue_store import _update_local_state  # noqa: PLC0415
+
+        update_state_fn = _update_local_state
+
+    if board is None:
+        from coord.state import build_board  # noqa: PLC0415
+
+        board = build_board()
+
+    if now is None:
+        now = time.time()
+
+    hosts = {m.name: m.host for m in config.machines}
+    status_by_host: dict[str, dict | None] = {}  # poll each agent at most once
+    corrected: list[dict] = []
+
+    for a in board.completed:
+        aid = a.assignment_id
+        if not aid:
+            continue
+        if a.status not in _LATE_REPORT_SAFE_TARGETS:
+            continue  # not a status this arm could have guessed — never touch it
+        reason = a.failure_reason or ""
+        if _NO_AGENT_RECORD_GUESS_MARKER not in reason:
+            continue  # terminal for a real reason — nothing to correct
+        finished_at = a.finished_at
+        if not finished_at or (now - finished_at) > _LATE_REPORT_CORRECTION_WINDOW_SECONDS:
+            continue  # past the correction window — never revisit forever
+
+        host = hosts.get(a.machine_name)
+        if not host:
+            continue
+        if host not in status_by_host:
+            status_by_host[host] = agent_status_fn(host)
+        status = status_by_host[host]
+        if not status:
+            continue  # agent unreachable → leave the guess, retry next tick
+
+        entry = next(
+            (e for e in status.get("completed", []) if e.get("id") == aid),
+            None,
+        )
+        if entry is None:
+            continue  # still no record — nothing to correct with yet
+
+        terminal = _AGENT_TERMINAL_STATUS.get(effective_agent_status(entry))
+        if terminal not in _LATE_REPORT_SAFE_TARGETS or terminal == a.status:
+            continue  # agrees with the guess, or would need the `done` path
+
+        corrected_reason = (
+            f"corrected a stale no-agent-record guess ({a.status!r}) — the "
+            f"agent's own completed record for this assignment has since "
+            f"arrived and reports {entry.get('status')!r} (#2547)"
+        )
+        update_state_fn(
+            assignment_id=aid,
+            terminal_status=terminal,
+            branch=a.branch or entry.get("branch"),
+            review_state=None,
+            failure_reason=corrected_reason,
+            exit_code=entry.get("exit_code"),
+        )
+
+        corrected.append(
+            {
+                "assignment_id": aid,
+                "issue_number": a.issue_number,
+                "repo": a.repo_name,
+                "type": a.type,
+                "from_status": a.status,
+                "to_status": terminal,
+                "reason": corrected_reason,
+            }
+        )
+
+    return corrected
 
 
 def propagate_smoke_terminal_failure(

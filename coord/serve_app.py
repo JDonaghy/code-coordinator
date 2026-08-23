@@ -330,11 +330,22 @@ def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
     / ``_sync_issues_tick``, #775) run in ``_tick_loop`` on a separate timer and
     are tested via those helpers directly.
     """
-    from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
+    from coord.reconcile import (  # noqa: PLC0415
+        reconcile_completed_assignments,
+        reconcile_late_agent_reports,
+    )
     from coord import merge_queue as mq  # noqa: PLC0415
 
     reconciled = reconcile_completed_assignments(config)
     _audit_reconciled(reconciled)
+    # #2547: let a late-arriving, authoritative agent completion correct a
+    # stale `_reconcile_no_agent_record` guess (see that function's
+    # docstring). Folded into `reconciled`/the audit trail the same way —
+    # from the caller's perspective this is just more rows the passive tick
+    # flipped.
+    corrected = reconcile_late_agent_reports(config)
+    _audit_reconciled(corrected)
+    reconciled = reconciled + corrected
     enqueued = mq.enqueue_approved_work(config)  # loads its own board snapshot
     _audit_enqueued(enqueued)
     return reconciled, enqueued
@@ -6947,7 +6958,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             from coord.audit import (  # noqa: PLC0415
                 flush_lock_contention_summary as _flush_audit_lock_contention_summary,
             )
-            from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
+            from coord.reconcile import (  # noqa: PLC0415
+                reconcile_completed_assignments,
+                reconcile_late_agent_reports,
+            )
             from coord import merge_queue as _mq  # noqa: PLC0415
 
             while True:
@@ -6993,6 +7007,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         _audit_reconciled(reconciled)
                 except Exception:  # noqa: BLE001 — a tick must never crash the daemon
                     log.warning("passive reconcile tick failed", exc_info=True)
+                # Step 1a: #2547 — correct a stale `_reconcile_no_agent_record`
+                # guess once the agent's own, authoritative completion report
+                # arrives late (see `reconcile_late_agent_reports`'
+                # docstring). Independent try/except, same reasoning as
+                # step 1 above.
+                try:
+                    corrected = await run_in_threadpool(
+                        reconcile_late_agent_reports, config
+                    )
+                    if corrected:
+                        log.info(
+                            "late agent report correction: %d assignment(s) "
+                            "→ terminal (%s)",
+                            len(corrected),
+                            ", ".join(
+                                f"#{r['issue_number']}:{r['from_status']}->{r['to_status']}"
+                                for r in corrected
+                            ),
+                        )
+                        _audit_reconciled(corrected)
+                except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                    log.warning("late agent report correction tick failed", exc_info=True)
                 # Step 1b: #1616 — THE PIPELINE'S CLOCK.  Runs immediately after
                 # the passive reconcile (which just flipped agent-finished rows
                 # to `done`/`finalizing` but, by contract, posted nothing and
