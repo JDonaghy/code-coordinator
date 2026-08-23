@@ -511,6 +511,54 @@ def test_signoff_via_payload_envelope_does_not_wipe_the_intake_text():
     assert record.customer["verdict"] == "approved"
 
 
+def test_client_and_project_identity_survive_a_later_signoff_event():
+    """#2586, coord-portal#146: `client_id`/`project_id` are set once on
+    `submission.created` and must not be clobbered by a later `signoff.*`
+    event that only carries verdict fields — the same merge-not-replace
+    protection #2585 proved for the intake text, exercised here for the two
+    identity fields `coord/approved_work.py` reads to render the "Approved
+    work items" panel and resolve `portal.project_repos`."""
+    created_page = {
+        "events": [
+            {
+                "id": "e1",
+                "submission_id": SUB,
+                "type": "submission.created",
+                "revision": 1,
+                "payload": {
+                    "outcome": "a stick figure website",
+                    "client_id": "cli_9f2a",
+                    "project_id": "proj_9f2a",
+                },
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+    signoff_page = {
+        "events": [
+            {
+                "id": "e2",
+                "submission_id": SUB,
+                "type": "signoff.approved",
+                "revision": 2,
+                "payload": {"verdict": "approved", "round": 1, "comment": None},
+            }
+        ],
+        "cursor": "c2",
+        "has_more": False,
+    }
+
+    sync_tick(client=FakeClient(pages=[created_page]))
+    sync_tick(client=FakeClient(pages=[signoff_page]))
+
+    record = portal_store.get_submission(SUB)
+    assert record is not None
+    assert record.customer["client_id"] == "cli_9f2a"
+    assert record.customer["project_id"] == "proj_9f2a"
+    assert record.customer["verdict"] == "approved"
+
+
 def test_mirror_merges_rather_than_clobbers_across_events():
     sync_tick(
         client=FakeClient(
