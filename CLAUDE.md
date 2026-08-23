@@ -220,10 +220,13 @@ versus keep in the coordinator session) are in
   still route issue/PR/milestone reads and writes through the `coord` seam wherever a subcommand
   covers it — that's what keeps the backend-agnostic forge seam
   ([`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md)) actually exercised instead of quietly
-  bypassed by the one class of session most likely to reach for `gh` out of habit. Where no `coord`
-  subcommand covers what's needed — a real gap as of 2026-08 (e.g. #2484: `coord issue` has no
-  `list`/`view`) — falling back to `gh` for that one read is fine, but say so and treat it as a gap
-  to flag or file, not a silent workaround.
+  bypassed by the one class of session most likely to reach for `gh` out of habit. Reads are
+  covered too — `coord issue list` and `coord issue view` shipped in #2484, so a plain issue
+  listing/search or an issue-plus-comments lookup has no excuse to reach for `gh`. Where no
+  `coord` subcommand covers what's needed — still a real gap in places as of 2026-08 (e.g. #2643:
+  `coord issue` can create/edit/label/close but cannot post a plain comment on an issue that stays
+  open) — falling back to `gh` for that one call is fine, but say so and treat it as a gap to flag
+  or file, not a silent workaround.
 
 ## Testing — black-box coverage is the acceptance bar
 
