@@ -5502,7 +5502,8 @@ _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
-    "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at"
+    "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
+    "max_fix_rounds"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -5583,6 +5584,7 @@ def enqueue_drive_queue(
     hold_reason: str = "",
     resume_when: str = "",
     hold_scope: str = "entry",
+    max_fix_rounds: int | None = None,
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -5605,6 +5607,16 @@ def enqueue_drive_queue(
     read side fails the same way, so a malformed value can never silently
     become a fleet-wide stop from either direction.
 
+    ``max_fix_rounds`` (#2604) is a per-entry override of the tick's
+    ``coord drive --tmux --max-fix-rounds`` value — see
+    ``coord.drive_queue.effective_max_fix_rounds`` for the full resolution
+    order. ``None`` (the default) means "no override": the tick falls back to
+    ``pipeline.max_fix_rounds`` / its own built-in default, exactly as before
+    this column existed. Like ``machine``/``after``/the ``hold_*`` fields,
+    this is fully replaced on every ``enqueue`` call for an already-queued
+    entry — omitting the flag on a later ``add`` reverts to the fleet
+    default, it does not leave a previous override in place.
+
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
     routed.
@@ -5625,6 +5637,7 @@ def enqueue_drive_queue(
             "hold_reason": hold_reason,
             "resume_when": resume_when,
             "hold_scope": normalized_scope,
+            "max_fix_rounds": max_fix_rounds,
         },
     )
     if resp is not None:
@@ -5639,6 +5652,7 @@ def enqueue_drive_queue(
         hold_reason=hold_reason,
         resume_when=resume_when,
         hold_scope=normalized_scope,
+        max_fix_rounds=max_fix_rounds,
     )
 
 
@@ -5653,6 +5667,7 @@ def _enqueue_drive_queue_local(
     hold_reason: str = "",
     resume_when: str = "",
     hold_scope: str = "entry",
+    max_fix_rounds: int | None = None,
 ) -> int:
     conn = get_connection()
     now = time.time()
@@ -5669,6 +5684,13 @@ def _enqueue_drive_queue_local(
     # daemon handler) gets the same fail-closed-to-`entry` guarantee as the
     # public `enqueue_drive_queue` above, not just callers that went through it.
     hold_scope = "fleet" if str(hold_scope or "") == "fleet" else "entry"
+    # #2604: a non-positive override is nonsensical (a drive that fixes
+    # nothing is indistinguishable from one that never got a fix round) and
+    # would otherwise silently coerce to "no fix rounds at all" — normalize
+    # it to "no override" instead, the same fail-closed-to-default posture
+    # `_normalize_hold_scope` uses for a malformed `hold_scope`.
+    if max_fix_rounds is not None and int(max_fix_rounds) < 1:
+        max_fix_rounds = None
     existing = conn.execute(
         "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
@@ -5680,11 +5702,13 @@ def _enqueue_drive_queue_local(
         # column set, written via `update_drive_queue_entry`.  The gate is the
         # exception, because `hold_state`/`hold_probes` are derived from the
         # operator-declared `hold_after` and would otherwise survive their own
-        # declaration being withdrawn.
+        # declaration being withdrawn. `max_fix_rounds` (#2604) is fully
+        # replaced too, same as `machine`/`after` — see the public
+        # `enqueue_drive_queue`'s docstring.
         conn.execute(
             "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
             "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
-            "hold_scope = ? WHERE id = ?",
+            "hold_scope = ?, max_fix_rounds = ? WHERE id = ?",
             (
                 machine,
                 after_json,
@@ -5693,6 +5717,7 @@ def _enqueue_drive_queue_local(
                 resume_when,
                 hold_state,
                 hold_scope,
+                max_fix_rounds,
                 existing["id"],
             ),
         )
@@ -5706,8 +5731,9 @@ def _enqueue_drive_queue_local(
         cur = conn.execute(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
-            " hold_after, hold_reason, resume_when, hold_state, hold_scope) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
+            " max_fix_rounds) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -5720,6 +5746,7 @@ def _enqueue_drive_queue_local(
                 resume_when,
                 hold_state,
                 hold_scope,
+                max_fix_rounds,
             ),
         )
         conn.commit()

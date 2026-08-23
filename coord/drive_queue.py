@@ -310,6 +310,20 @@ RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 # an unsatisfiable pre-req.
 DEFAULT_MAX_ATTEMPTS = 2
 
+# #2604: the `--max-fix-rounds` a TICK-LAUNCHED drive gets when neither the
+# entry (`QueueEntry.max_fix_rounds`) nor `pipeline.max_fix_rounds` names one
+# — deliberately LOWER than `coord drive`'s own interactive default of 3
+# (`coord.commands.drive.drive`'s `--max-fix-rounds` Click option). The
+# economics genuinely differ: an attended third round costs a human a few
+# minutes of noticing nothing changed; an unattended one costs a queue slot
+# for however long that round runs, with the model already escalated to opus
+# by round two. The #2604 incident this closes was exactly a false-red
+# confirmation-suite kill burning a 20-minute opus round on an already-green
+# branch, unwatched, before a human happened to look. See
+# :func:`effective_max_fix_rounds` for the full resolution order and
+# `docs/DRIVE_QUEUE.md` for the operator-facing note on the divergence.
+DEFAULT_TICK_MAX_FIX_ROUNDS = 2
+
 # #2363: the WIDER ceiling for one specific drive-death signature — an
 # acceptance-author or plain work session that exited DONE/ADVISORY claiming
 # success while its branch carried zero commits (see
@@ -662,6 +676,13 @@ class QueueEntry:
     # for an entry that has never died — treated identically to
     # `attempts <= 0` by `_retry_backoff_reason` (no backoff yet).
     retry_backoff_at: float | None = None
+    # #2604: operator override of the `--max-fix-rounds` THIS entry's
+    # tick-launched drive gets — see `effective_max_fix_rounds` for the full
+    # resolution order (this field, then `pipeline.max_fix_rounds`, then
+    # `DEFAULT_TICK_MAX_FIX_ROUNDS`). `None` for every row predating this
+    # column and for any entry enqueued without `--max-fix-rounds` — reads
+    # identically to "no override", never as "zero fix rounds".
+    max_fix_rounds: int | None = None
 
     @property
     def key(self) -> str:
@@ -741,6 +762,11 @@ class QueueEntry:
                 if row.get("retry_backoff_at") is None
                 else float(row.get("retry_backoff_at"))
             ),
+            max_fix_rounds=(
+                None
+                if row.get("max_fix_rounds") is None
+                else int(row.get("max_fix_rounds"))
+            ),
         )
 
 
@@ -749,6 +775,33 @@ def entries_from_rows(rows: Iterable[Mapping[str, Any]]) -> list[QueueEntry]:
     return sorted(
         (QueueEntry.from_row(r) for r in rows), key=lambda e: (e.position, e.key)
     )
+
+
+def effective_max_fix_rounds(
+    entry: QueueEntry, config_default: int | None
+) -> int:
+    """The ``--max-fix-rounds`` value the tick launches *entry* with (#2604).
+
+    Resolution order, most specific wins:
+
+    1. ``entry.max_fix_rounds`` — this entry's own ``coord drive-queue add
+       --max-fix-rounds`` override.
+    2. ``config_default`` — the fleet's ``pipeline.max_fix_rounds``, when set.
+    3. :data:`DEFAULT_TICK_MAX_FIX_ROUNDS` — deliberately lower than
+       ``coord drive``'s own interactive default (3): see that constant's
+       docstring for why an unattended round costs more than an attended one.
+
+    Never returns a value below 1 — a non-positive ``config_default`` (which
+    :func:`coord.config._parse_pipeline` already rejects at load time, but a
+    hand-built ``PipelineConfig`` in a test is not obligated to) falls back to
+    :data:`DEFAULT_TICK_MAX_FIX_ROUNDS` rather than producing a drive that
+    cannot spend even one fix round.
+    """
+    if entry.max_fix_rounds is not None and entry.max_fix_rounds >= 1:
+        return entry.max_fix_rounds
+    if config_default is not None and config_default >= 1:
+        return config_default
+    return DEFAULT_TICK_MAX_FIX_ROUNDS
 
 
 # ── aggregate summary (#2428 DQW-1) ───────────────────────────────────────────

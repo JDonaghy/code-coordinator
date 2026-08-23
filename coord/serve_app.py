@@ -3277,6 +3277,15 @@ def _openapi_spec() -> dict:
                                         "type": "integer", "nullable": True,
                                         "description": "enqueue: omit to append at the tail",
                                     },
+                                    "max_fix_rounds": {
+                                        "type": "integer", "nullable": True,
+                                        "description": (
+                                            "#2604: per-entry `--max-fix-rounds` "
+                                            "override for the tick's launch; "
+                                            "null/omitted falls back to "
+                                            "pipeline.max_fix_rounds"
+                                        ),
+                                    },
                                     "to_position": {
                                         "type": "integer",
                                         "description": "move: destination slot (clamped)",
@@ -5961,6 +5970,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     # normalizes that to `entry`, same as every other
                     # unrecognised value.
                     hold_scope=body.get("hold_scope") or "entry",
+                    # #2604: per-entry `--max-fix-rounds` override. Absent key
+                    # (a client predating this feature) means "no override",
+                    # same as an explicit `null`.
+                    max_fix_rounds=body.get("max_fix_rounds"),
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":
