@@ -365,6 +365,56 @@ class TestWorkIsTerminal:
 
         assert calls["n"] == 2
 
+    # ── #2639: trust_issue_closed=False for tracking-issue rows ────────────
+    #
+    # A `test-author`/`mock-author` row's `issue_number` is always the
+    # milestone's *tracking* issue, never something its own branch resolves.
+    # A closed tracking epic must not report every slice booked against it
+    # "terminal" regardless of whether that slice's own branch ever landed.
+
+    def test_issue_closed_ignored_when_trust_issue_closed_is_false(self) -> None:
+        with patch("coord.github_ops.issue_is_closed", return_value=True), \
+             patch("coord.github_ops.pr_is_merged", return_value=False):
+            assert _REAL_WORK_IS_TERMINAL(
+                "acme/api", 16, "test-author-ms-1-slice-10",
+                trust_issue_closed=False,
+            ) is False
+
+    def test_pr_merged_still_wins_when_trust_issue_closed_is_false(self) -> None:
+        # The branch itself is the only thing that may decide for these rows —
+        # and it still can, via pr_is_merged (branch/commit-scoped, #1150).
+        with patch("coord.github_ops.issue_is_closed", return_value=True), \
+             patch("coord.github_ops.pr_is_merged", return_value=True):
+            assert _REAL_WORK_IS_TERMINAL(
+                "acme/api", 16, "test-author-ms-1-slice-10",
+                trust_issue_closed=False,
+            ) is True
+
+    def test_trust_issue_closed_defaults_true_preserving_522_flood_guard(
+        self,
+    ) -> None:
+        # Every existing caller that doesn't pass the new kwarg — chiefly
+        # type='work', where issue_number IS the row's own deliverable — must
+        # keep today's behaviour: a manually-closed issue alone is terminal.
+        with patch("coord.github_ops.issue_is_closed", return_value=True), \
+             patch("coord.github_ops.pr_is_merged", return_value=False):
+            assert _REAL_WORK_IS_TERMINAL("acme/api", 349, "issue-349-fix") is True
+
+    def test_trust_issue_closed_is_part_of_the_cache_key(self) -> None:
+        # A True and a False probe for the same (repo, issue, branch) must not
+        # collapse onto each other's cached verdict.
+        cache: dict = {}
+        with patch("coord.github_ops.issue_is_closed", return_value=True), \
+             patch("coord.github_ops.pr_is_merged", return_value=False):
+            trusted = _REAL_WORK_IS_TERMINAL(
+                "acme/api", 16, "b", cache=cache, trust_issue_closed=True
+            )
+            untrusted = _REAL_WORK_IS_TERMINAL(
+                "acme/api", 16, "b", cache=cache, trust_issue_closed=False
+            )
+        assert trusted is True
+        assert untrusted is False
+
 
 # ── close-invariant chokepoint (#1196) ──────────────────────────────────────
 

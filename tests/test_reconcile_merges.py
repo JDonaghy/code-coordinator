@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import pytest
 
+from coord import github_ops
 from coord.config import Config
 from coord.models import Assignment, Board, Repo
 from coord.reconcile import close_stale_prs, reconcile_board_merges
+
+# Captured at import time, before the autouse `_non_terminal_work` conftest
+# fixture (tests/conftest.py) stubs `github_ops.work_is_terminal` to always
+# return False for the duration of each test. The #2639 tests below restore
+# this real reference so they exercise the actual issue_is_closed/
+# pr_is_merged decision, not the blanket non-terminal default.
+_REAL_WORK_IS_TERMINAL = github_ops.work_is_terminal
 
 
 @pytest.fixture
@@ -59,7 +67,7 @@ def _patch_probes(
     )
     monkeypatch.setattr(
         github_ops, "work_is_terminal",
-        lambda repo, issue, branch, cache=None: terminal,
+        lambda repo, issue, branch, cache=None, trust_issue_closed=True: terminal,
     )
     # Suppress the stale-PR sweep for tests that don't need it.
     monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
@@ -441,6 +449,82 @@ def test_mock_author_marked_merged_by_sweep_b(monkeypatch, config) -> None:
 
     assert a.status == "merged"
     assert ("merged", "ma1") in writes
+
+
+def test_test_author_not_marked_merged_when_tracking_issue_closed_but_branch_unmerged(
+    monkeypatch, config,
+) -> None:
+    """#2639 repro: a `test-author` row's `issue_number` is always the
+    milestone's *tracking* issue (`for_issue_number` carries the real
+    per-slice issue) — a tracking issue is closed for most of a milestone's
+    life while slices are still being authored against it. Before this fix,
+    sweep (b) trusted `issue_is_closed` for these rows exactly like it does
+    for `type='work'`, so a closed epic alone flipped the row to
+    `status='merged'` regardless of whether ITS OWN branch ever landed,
+    silently evaporating the pushed slice (live case: row `b57cc3748a91`,
+    `test-author-ms-1-slice-10`). Exercises the REAL `work_is_terminal` ->
+    `issue_is_closed`/`pr_is_merged` chain, not a stubbed return, so it
+    proves the fix at the actual decision point."""
+    from coord import state  # noqa: PLC0415
+
+    a = _done_work(assignment_id="ta-epic", issue_number=16, branch="test-author-ms-1-slice-10")
+    a.type = "test-author"
+    a.review_state = "pending"
+    board = Board(completed=[a])
+
+    # Restore the REAL work_is_terminal (the autouse conftest fixture stubs
+    # it to always-False) so this test exercises the actual decision.
+    monkeypatch.setattr(github_ops, "work_is_terminal", _REAL_WORK_IS_TERMINAL)
+    # The tracking epic is closed...
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+    # ...but THIS row's own branch never merged.
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: False)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    writes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        state, "mark_assignment_merged",
+        lambda aid: writes.append(("merged", aid)),
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "done", "the pushed slice must stay drivable, not evaporate"
+    assert writes == []
+    assert not any("mark merged" in s for s in actions)
+
+
+def test_work_row_still_marked_merged_when_issue_closed_manually(
+    monkeypatch, config,
+) -> None:
+    """Counterpart to the repro above: `type='work'` must keep trusting
+    `issue_is_closed` on its own — the #522 flood guard this fix must not
+    weaken. For `type='work'`, `issue_number` genuinely IS the row's own
+    deliverable (`coord.models.CLOSES_ISSUE_TYPES`), so a manually-closed
+    issue alone is still terminal even with no PR ever merged."""
+    from coord import state  # noqa: PLC0415
+
+    a = _done_work(assignment_id="w-closed", issue_number=349, branch="issue-349-fix")
+    board = Board(completed=[a])
+
+    monkeypatch.setattr(github_ops, "work_is_terminal", _REAL_WORK_IS_TERMINAL)
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: False)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    writes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        state, "mark_assignment_merged",
+        lambda aid: writes.append(("merged", aid)),
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert ("merged", "w-closed") in writes
+    assert any("mark merged" in s for s in actions)
 
 
 def test_test_author_review_state_not_settled_by_sweep_b(monkeypatch, config) -> None:
@@ -1171,7 +1255,7 @@ def test_sibling_already_merged_branch_used_for_terminality(monkeypatch, config)
 
     from coord import github_ops, state  # noqa: PLC0415
 
-    def _track_terminal(repo, issue, branch, cache=None):
+    def _track_terminal(repo, issue, branch, cache=None, trust_issue_closed=True):
         probed_branches.append(branch)
         return True  # always terminal for this test
 

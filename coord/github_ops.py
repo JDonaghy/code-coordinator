@@ -886,6 +886,7 @@ def work_is_terminal(
     branch: str | None,
     *,
     cache: dict | None = None,
+    trust_issue_closed: bool = True,
 ) -> bool:
     """True when work is already done on GitHub: **issue closed OR PR merged**.
 
@@ -897,19 +898,43 @@ def work_is_terminal(
     transient GitHub/CLI failure never blocks a legitimate dispatch.
 
     *cache* — optional ``dict`` shared across a single ``notify`` run, keyed by
-    ``(repo_github, issue_number, branch)``, so a burst of transitions for the
-    same merged issue costs **one** ``gh`` round-trip, not one per call.
+    ``(repo_github, issue_number, branch, trust_issue_closed)``, so a burst of
+    transitions for the same merged issue costs **one** ``gh`` round-trip, not
+    one per call.
+
+    *trust_issue_closed* — set ``False`` when *issue_number* is not this row's
+    own deliverable — e.g. a ``test-author``/``mock-author`` row, whose
+    ``issue_number`` is always the milestone's *tracking* issue, never the
+    per-slice issue it's actually writing (:data:`coord.models.
+    SEALED_PATH_AUTHOR_TYPES`; the real one lives in ``for_issue_number``).
+    A tracking issue is closed for most of a milestone's life while slices
+    are still being authored against it, so trusting ``issue_is_closed`` here
+    reports *every* such row "terminal" the moment the epic closes —
+    regardless of whether THIS row's own branch ever landed — and a
+    conservative caller like :func:`coord.reconcile.reconcile_board_merges`
+    then permanently flips it to ``status='merged'`` with nothing on GitHub
+    to show for it (#2639). With this ``False``, only ``pr_is_merged``
+    (branch/commit-scoped since #1150) decides — exactly right for a row
+    whose own landed-ness can only be answered by its own branch. Defaults to
+    ``True`` so every other caller (chiefly ``type='work'``, where
+    ``issue_number`` *is* the row's own deliverable — :data:`coord.models.
+    CLOSES_ISSUE_TYPES`) keeps today's behaviour, including the #522 flood
+    guard: manually closing a ``type='work'`` issue must still retire it here.
     """
     if not repo_github:
         return False
 
-    key = (repo_github, issue_number, branch)
+    key = (repo_github, issue_number, branch, trust_issue_closed)
     if cache is not None and key in cache:
         return cache[key]
 
     terminal = False
     try:
-        if issue_number and issue_is_closed(repo_github, issue_number):
+        if (
+            trust_issue_closed
+            and issue_number
+            and issue_is_closed(repo_github, issue_number)
+        ):
             terminal = True
         elif branch and pr_is_merged(repo_github, branch):
             terminal = True
