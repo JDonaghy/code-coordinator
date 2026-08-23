@@ -464,11 +464,19 @@ class CordonedIdle:
         minutes = self.waited_seconds / 60.0
         limit = self.deadline_seconds / 60.0
         version = f"v{self.target_version}" if self.target_version else "the release"
-        behind = (
-            f", {self.drift} release{'s' if self.drift != 1 else ''} behind"
-            if self.drift
-            else ""
-        )
+        if self.drift == CROSS_SERIES_DRIFT:
+            # #2595 review: CROSS_SERIES_DRIFT (9999) is a sentinel meaning
+            # "different major/minor series, no patch-count comparison is
+            # possible" — not an actual release count. Rendering the raw
+            # number verbatim (this is the first caller that renders
+            # `version_drift()`'s output at all) would print a nonsensical
+            # "9999 releases behind" for a host stuck across a minor-version
+            # boundary (this fleet's own history has crossed 0.4.x -> 0.5.x).
+            behind = ", a major/minor version behind"
+        elif self.drift:
+            behind = f", {self.drift} release{'s' if self.drift != 1 else ''} behind"
+        else:
+            behind = ""
         return (
             f"{self.machine} is cordoned and IDLE — {minutes:.0f}m past the "
             f"{limit:.0f}m drain deadline with nothing left to drain "
