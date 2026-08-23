@@ -2248,6 +2248,39 @@ def get_milestone(repo: str, milestone_number: int) -> dict:
     return _gh_json("api", f"repos/{repo}/milestones/{milestone_number}", default={})
 
 
+def search_issues(
+    repo: str,
+    *,
+    state: str = "open",
+    search: str | None = None,
+    milestone: str | None = None,
+    label: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """General-purpose issue listing/search (#2484).
+
+    The read-side counterpart to `create_issue` — wraps ``gh issue list``
+    with the filters an interactive/coordinator session actually reaches for
+    (``--search``, ``--milestone``, ``--label``) behind one function, rather
+    than requiring a bespoke wrapper per filter combination the way
+    ``get_open_issues``/``get_closed_epics``/``get_milestone_issues`` do.
+    Backs ``coord issue list`` so a plain issue search never needs to fall
+    back to raw ``gh issue list --search``.
+    """
+    args = [
+        "issue", "list", "--repo", repo, "--state", state,
+        "--json", "number,title,state,labels,milestone,assignees",
+        "--limit", str(limit),
+    ]
+    if search:
+        args.extend(["--search", search])
+    if milestone:
+        args.extend(["--milestone", milestone])
+    if label:
+        args.extend(["--label", label])
+    return _gh_json(*args, default=[])
+
+
 def get_milestone_issues(
     repo: str, milestone_title: str, *, state: str = "all"
 ) -> list[dict]:

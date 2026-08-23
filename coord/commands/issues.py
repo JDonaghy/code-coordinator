@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -72,6 +73,146 @@ def issue_group() -> None:
     bare-DB later) so callers — notably the chat-about-issue session — never
     touch `gh` directly.
     """
+
+
+@issue_group.command(
+    "view",
+    help=(
+        "View an issue's title, state, labels, milestone, and body, plus "
+        "its comments (#2484). REPO is the local repo name from "
+        "coordinator.yml; ISSUE is the GH issue number. Read-side "
+        "counterpart to `edit`/`close`/`reopen` — so a plain issue lookup "
+        "never has to fall back to `gh issue view`."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--comments/--no-comments", "show_comments", default=True,
+    help="Include issue comments (default: on).",
+)
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Print raw JSON (issue fields plus a `comments` list) instead of formatted text.",
+)
+@_CONFIG_OPTION
+def issue_view_cmd(
+    repo: str,
+    issue: int,
+    show_comments: bool,
+    as_json: bool,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        data = github_ops.get_issue(slug, issue)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue view failed: {e}", err=True)
+        sys.exit(1)
+    if not data:
+        click.echo(f"error: #{issue} ({slug}) not found", err=True)
+        sys.exit(1)
+
+    comments: list[dict] = []
+    if show_comments:
+        try:
+            comments = github_ops.get_issue_comments(slug, issue)
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"warning: failed to fetch comments: {e}", err=True)
+
+    if as_json:
+        click.echo(json.dumps({**data, "comments": comments}, indent=2))
+        return
+
+    state = data.get("state", "?")
+    title = data.get("title", "")
+    labels = ", ".join(lbl.get("name", "") for lbl in (data.get("labels") or []))
+    milestone = (data.get("milestone") or {}).get("title")
+    click.echo(f"#{issue} ({slug}) [{state}] {title}")
+    if labels:
+        click.echo(f"labels: {labels}")
+    if milestone:
+        click.echo(f"milestone: {milestone}")
+    click.echo("")
+    click.echo(data.get("body") or "(no body)")
+    if show_comments:
+        click.echo("")
+        click.echo(f"── {len(comments)} comment(s) ──")
+        for c in comments:
+            author = (c.get("author") or {}).get("login", "?")
+            created = c.get("createdAt", "")
+            click.echo("")
+            click.echo(f"[{created}] {author}:")
+            click.echo(c.get("body", ""))
+
+
+@issue_group.command(
+    "list",
+    help=(
+        "List issues in REPO through the backend-agnostic seam (#2484) — "
+        "read-side counterpart to `create`, so a plain issue listing/search "
+        "never has to fall back to `gh issue list`. Defaults to open "
+        "issues; combine --state/--search/--milestone/--label to narrow."
+    ),
+)
+@click.argument("repo")
+@click.option(
+    "--state", type=click.Choice(["open", "closed", "all"]), default="open",
+    help="Issue state filter (default: open).",
+)
+@click.option("--search", default=None, help="Free-text search (gh's --search).")
+@click.option(
+    "--milestone", "milestone_title", default=None,
+    help="Filter to issues in this milestone (by title, not number).",
+)
+@click.option("--label", "label_filter", default=None, help="Filter to issues carrying this label.")
+@click.option("--limit", type=int, default=100, help="Max issues to return (default: 100).")
+@click.option("--json", "as_json", is_flag=True, help="Print raw JSON instead of a table.")
+@_CONFIG_OPTION
+def issue_list_cmd(
+    repo: str,
+    state: str,
+    search: str | None,
+    milestone_title: str | None,
+    label_filter: str | None,
+    limit: int,
+    as_json: bool,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        issues = github_ops.search_issues(
+            slug,
+            state=state,
+            search=search,
+            milestone=milestone_title,
+            label=label_filter,
+            limit=limit,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue list failed: {e}", err=True)
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(issues, indent=2))
+        return
+    if not issues:
+        click.echo(f"no issues ({slug}, state={state})")
+        return
+    for i in issues:
+        labels = ",".join(lbl.get("name", "") for lbl in (i.get("labels") or []))
+        line = f"#{i.get('number')}\t{(i.get('state') or state).lower()}\t{i.get('title', '')}"
+        if labels:
+            line += f"\t[{labels}]"
+        click.echo(line)
 
 
 @issue_group.command(
