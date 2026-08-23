@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -21,6 +22,20 @@ from coord import github_ops
 # interchangeably to patch it.
 _REAL_SUBPROCESS_RUN = subprocess.run
 _REAL_GH = github_ops._gh
+
+# #2615: ``$HOME`` as it stood when THIS conftest was first imported — i.e.
+# before any test's own fixture has had a chance to redirect it. On a
+# developer's own machine that is the real home directory; under
+# ``scripts/run_tests_in_populated_home.sh`` (#2170) it is the one throwaway
+# thin-client directory the wrapper script exports for the WHOLE pytest
+# session. Either way, it is "the ambient value nobody's individual test
+# fixture is responsible for" — which is exactly what ``_no_real_pause_store``
+# below needs to recognise and redirect away from. See that fixture's
+# docstring for why a plain ``pwd``-based "real home" check (the pre-#2615
+# version of this) doesn't cover the populated-home case.
+_AMBIENT_HOME_AT_COLLECTION = Path(
+    os.environ.get("HOME") or os.path.expanduser("~")
+).resolve()
 
 
 @pytest.fixture(autouse=True)
@@ -369,30 +384,54 @@ def _no_real_pause_store(monkeypatch, tmp_path):
     with nothing in their own diffs to explain it.
 
     A machine-state file that a test can write is a machine-state file a test
-    WILL write. This redirects the store to a per-test tmp file whenever the
-    resolved path would land in the real home directory, and leaves it alone
-    for the tests that already point ``$HOME`` at their own tmp dir (which
-    keeps `test_machine_pause.py`'s and #2101's own on-disk assertions
-    meaningful).
+    WILL write. This redirects the store to a per-test tmp file whenever
+    ``$HOME`` is *still* whatever it was when this ambient value was
+    snapshotted (see ``_AMBIENT_HOME_AT_COLLECTION`` above) — i.e. nobody's
+    own fixture has claimed responsibility for it — and leaves it alone for
+    the tests that already point ``$HOME`` at their own tmp dir (which keeps
+    `test_machine_pause.py`'s and #2101's own on-disk assertions meaningful).
+
+    #2615: this used to compare the resolved state-file path against the
+    OS-level real home directory (``pwd.getpwuid(os.getuid()).pw_dir``)
+    instead. That is indistinguishable from "no redirect needed" on a
+    developer's own machine, where the two are the same path — but under
+    ``scripts/run_tests_in_populated_home.sh`` (#2170), ``$HOME`` is a
+    throwaway thin-client directory shared by the WHOLE pytest session, not
+    the real pwd home, so the old check never fired: the store silently
+    became session state, and a real (unmocked)
+    ``machine_pause.set_cordon("laptop", ...)`` call anywhere in the suite
+    (``tests/test_drive_queue_roll_pending.py``, added by #2607) poisoned
+    every test that ran after it in the same session — 70 failures across
+    unrelated modules (`test_model_tiering`, `test_plan_only`,
+    `test_reconcile`, `test_test_author`, `test_milestone_dispatch`, …), each
+    asking "is `laptop` paused?" and getting a stale "yes" from a cordon some
+    earlier, unrelated test wrote for real.
+
+    Comparing the *current* ``$HOME`` env var against the collection-time
+    snapshot (rather than checking whether the resolved path descends from
+    it) matters too: `run_tests_in_populated_home.sh` also nests `$TMPDIR`
+    (and so every fixture's `tmp_path`) *inside* that same throwaway
+    ``$HOME`` (#2170's own knob 3). A "does the resolved path descend from
+    the ambient home" check would then also catch — and wrongly override —
+    a test's own ``tmp_home``-style fixture, since that fixture's `tmp_path`-
+    based `$HOME` is itself a descendant of the ambient one in that mode.
+    Exact equality of ``$HOME`` sidesteps that: once a test has pointed
+    ``$HOME`` anywhere else, this backs off unconditionally, wherever that
+    elsewhere is.
     """
-    import os  # noqa: PLC0415
-
     from coord import machine_pause  # noqa: PLC0415
-
-    try:
-        import pwd  # noqa: PLC0415
-
-        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-    except Exception:  # noqa: BLE001 — no pwd (Windows), or an odd uid
-        real_home = Path(os.path.expanduser("~")).resolve()
 
     original = machine_pause._state_path
     sandbox = tmp_path / "pause-store"
 
     def _guarded() -> Path:
         resolved = original()
+        current_home = os.environ.get("HOME")
         try:
-            if real_home in resolved.resolve().parents:
+            if (
+                current_home is not None
+                and Path(current_home).resolve() == _AMBIENT_HOME_AT_COLLECTION
+            ):
                 sandbox.mkdir(parents=True, exist_ok=True)
                 return sandbox / resolved.name
         except OSError:
