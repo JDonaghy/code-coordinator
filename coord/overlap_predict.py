@@ -76,6 +76,22 @@ candidate before trusting its diff. Not ancestry (broken by squash-merge,
 above); not widening :data:`LANDED_STATUSES` to include ``"done"`` (that
 would also exclude the finished-but-unmerged case this module exists to
 catch — see that constant's own docstring).
+
+#2603: a prediction that only ever shows its CONCLUSION is indistinguishable
+from a stale one at the one moment an operator can act on it — enqueue time.
+The inputs were always computed (this module has carried them since #2247)
+but never carried past the point they were used, so :class:`Footprint` and
+:class:`Overlap` now also record ``head_sha`` (the branch compare's actual
+commit, from :func:`inflight_footprints`'s new ``head_sha_fetcher`` seam),
+``synced_at`` (when a ``declared`` footprint's cached body was last synced —
+wired up by the caller, since only it has the DB connection to answer that),
+and ``liveness_checked`` (whether #2602's terminal check actually RAN, vs.
+raised and fell open to "still in flight" — the one case where "not excluded"
+does not mean "confirmed open"). :meth:`Overlap.describe` renders the branch
+detail because it is pure data with no wall-clock dependency; the cached-body
+age is a relative-time string and is therefore the CLI layer's job (see
+``coord.commands.drive_queue``), the same split that module already draws
+for the candidate's own staleness note.
 """
 
 from __future__ import annotations
@@ -247,13 +263,33 @@ def parse_declared_files(body: str | None) -> list[str]:
 
 @dataclass(frozen=True)
 class Footprint:
-    """One side of a comparison: whose files these are and how we know."""
+    """One side of a comparison: whose files these are and how we know.
+
+    ``head_sha`` / ``synced_at`` / ``liveness_checked`` are #2603's
+    provenance fields — none of them change what a footprint MATCHES, only
+    what a later reader can tell about how current the match was. All three
+    default to "unknown"/"assume current" so every existing caller that
+    builds a ``Footprint`` by hand (mostly tests) keeps working unchanged.
+    """
 
     key: str
     issue_number: int
     files: tuple[str, ...]
     source: str = SOURCE_DECLARED
     branch: str = ""
+    # #2603: the branch compare's actual commit — set only for `branch`
+    # footprints, and only when the fetch succeeds (fails open to "").
+    head_sha: str = ""
+    # #2603: unix timestamp the `declared` footprint's cached issue body was
+    # last synced, or `None` when the caller didn't wire one up (or the body
+    # was never synced). Only ever set for `declared` footprints — a
+    # `branch` footprint's freshness is the head SHA above, not a body sync.
+    synced_at: float | None = None
+    # #2603: whether #2602's terminal (closed/merged) check actually RAN for
+    # this branch, as opposed to raising and falling open to "still in
+    # flight". `True` by default — a `declared` footprint never runs that
+    # check at all, so "checked" is vacuously true for it.
+    liveness_checked: bool = True
 
 
 @dataclass(frozen=True)
@@ -264,12 +300,32 @@ class Overlap:
     source: str
     files: tuple[str, ...]
     branch: str = ""
+    head_sha: str = ""
+    synced_at: float | None = None
+    liveness_checked: bool = True
 
     def describe(self) -> str:
         shown = ", ".join(f"`{f}`" for f in self.files[:3])
         if len(self.files) > 3:
             shown += f" (+{len(self.files) - 3} more)"
-        return f"{self.key} [{self.source}]: {shown}"
+        return f"{self.key} [{self.source}]{self._provenance()}: {shown}"
+
+    def _provenance(self) -> str:
+        """#2603: what a `[branch]` edge actually compared, appended AFTER
+        the `[source]` tag rather than inside it — `[branch]` / `[declared]`
+        is matched verbatim as the whole tag by existing callers (and their
+        tests); this is additive detail, not a tag rename.
+
+        Declared-source freshness (the cached body's age) needs a wall
+        clock this pure module deliberately doesn't touch — see the module
+        docstring — so it isn't rendered here; the CLI layer adds it as a
+        separate note from `synced_at` when it's set.
+        """
+        if self.source != SOURCE_BRANCH or not self.branch:
+            return ""
+        sha = f"@{self.head_sha[:7]}" if self.head_sha else ""
+        stale = ", liveness check failed" if not self.liveness_checked else ""
+        return f" ({self.branch}{sha}{stale})"
 
 
 @dataclass(frozen=True)
@@ -292,13 +348,21 @@ class Prediction:
 
         Names the files AND the other entry, because "ordered after #123" with
         no cause is exactly the kind of unexplained sequencing an operator
-        deletes at 2am.
+        deletes at 2am. #2603: also names the CANDIDATE's own declared files,
+        because "these collide" is only checkable when both sides of the
+        claim are visible — before this, `predicted_files` was computed and
+        persisted (`audit_details`) but never shown to the operator reading
+        this line.
         """
         if not self.overlaps:
             return ""
+        own = ", ".join(f"`{f}`" for f in self.predicted_files[:3])
+        if len(self.predicted_files) > 3:
+            own += f" (+{len(self.predicted_files) - 3} more)"
         return (
             "predicted file overlap (#2247) — ordered --after "
             + "; ".join(o.describe() for o in self.overlaps)
+            + f" | this entry's own declared files: {own}"
         )
 
     def audit_details(self) -> dict[str, Any]:
@@ -307,6 +371,10 @@ class Prediction:
         Carries both sides' file lists, not just the verdict: scoring the
         prediction later (:func:`classify_outcome`) needs to know what was
         claimed, and a verdict with no claim behind it cannot be checked.
+        #2603: also carries each overlap's provenance (head SHA / cache
+        sync time / liveness-check success) so a later reader — a human
+        auditing an old prediction, or a future `overlap-report` extension —
+        can tell how current the claim was, not just what it claimed.
         """
         return {
             "predicted_files": list(self.predicted_files),
@@ -315,6 +383,9 @@ class Prediction:
                     "key": o.key,
                     "source": o.source,
                     "branch": o.branch,
+                    "head_sha": o.head_sha,
+                    "synced_at": o.synced_at,
+                    "liveness_checked": o.liveness_checked,
                     "files": list(o.files),
                 }
                 for o in self.overlaps
@@ -371,7 +442,15 @@ def predict_overlap(
         hits = _intersect(files, fp.files)
         if hits:
             overlaps.append(
-                Overlap(key=fp.key, source=fp.source, files=hits, branch=fp.branch)
+                Overlap(
+                    key=fp.key,
+                    source=fp.source,
+                    files=hits,
+                    branch=fp.branch,
+                    head_sha=fp.head_sha,
+                    synced_at=fp.synced_at,
+                    liveness_checked=fp.liveness_checked,
+                )
             )
     return Prediction(predicted_files=files, overlaps=tuple(overlaps))
 
@@ -428,6 +507,10 @@ BodyFetcher = Callable[[str, int], "str | None"]
 # (issue closed OR PR merged) — #2602's positive liveness test, injectable
 # for tests the same way ``DiffFilesFetcher`` is.
 TerminalChecker = Callable[[str, int, str], bool]
+# ``(repo_github, branch) -> the branch's current HEAD sha, or None`` — #2603:
+# the compare's OWN provenance, so a later reader can tell WHAT was compared,
+# not just that a compare happened. Injectable the same way as the others.
+HeadShaFetcher = Callable[[str, str], "str | None"]
 
 
 def _default_diff_fetcher(repo_github: str, base: str, head: str) -> list[str] | None:
@@ -440,6 +523,12 @@ def _default_terminal_checker(repo_github: str, issue_number: int, branch: str) 
     from coord import github_ops  # noqa: PLC0415
 
     return github_ops.work_is_terminal(repo_github, issue_number, branch)
+
+
+def _default_head_sha_fetcher(repo_github: str, branch: str) -> str | None:
+    from coord import github_ops  # noqa: PLC0415
+
+    return github_ops.get_branch_sha(repo_github, branch)
 
 
 def inflight_assignments(
@@ -501,6 +590,7 @@ def inflight_footprints(
     exclude_issue_number: int | None = None,
     diff_files_fetcher: DiffFilesFetcher | None = None,
     terminal_checker: TerminalChecker | None = None,
+    head_sha_fetcher: HeadShaFetcher | None = None,
 ) -> list[Footprint]:
     """GROUND TRUTH: the real diff of every in-flight branch in *repo_name*.
 
@@ -516,7 +606,16 @@ def inflight_footprints(
     but permanently stale, diff forever — see the module docstring. A
     checker that raises, like every other fetch here, fails OPEN: the
     candidate is treated as still in flight, which is at worst today's
-    latency cost, never a missed real collision (design rule 1).
+    latency cost, never a missed real collision (design rule 1) — but that
+    fallback is now recorded on the resulting :class:`Footprint` as
+    ``liveness_checked=False`` (#2603), so a reader downstream can tell
+    "confirmed still open" apart from "couldn't tell, assumed open".
+
+    #2603: also records the branch's actual HEAD sha via ``head_sha_fetcher``
+    (default :func:`_default_head_sha_fetcher`) — the compare's own
+    provenance. A fetch failure leaves ``head_sha`` empty rather than
+    dropping the footprint; the sha is detail on top of a real diff, not a
+    precondition for trusting it.
     """
     try:
         if board is None:
@@ -531,14 +630,17 @@ def inflight_footprints(
 
     check_terminal = terminal_checker or _default_terminal_checker
     fetch = diff_files_fetcher or _default_diff_fetcher
+    fetch_head_sha = head_sha_fetcher or _default_head_sha_fetcher
     out: list[Footprint] = []
     seen: set[str] = set()
     for a in assignments:
+        liveness_checked = True
         try:
             if check_terminal(repo_github, int(a.issue_number), str(a.branch or "")):
                 continue  # #2602: already landed on GitHub — not a candidate
         except Exception:  # noqa: BLE001 — an unreadable liveness check must
-            pass  # not sink a real candidate; fall through, still in flight
+            liveness_checked = False  # not sink a real candidate; fall
+            # through, still in flight — but say we couldn't confirm it (#2603)
         try:
             files = fetch(repo_github, base_branch, a.branch)
         except Exception:  # noqa: BLE001 — one bad branch, not all of them
@@ -549,6 +651,10 @@ def inflight_footprints(
         if key in seen:
             continue
         seen.add(key)
+        try:
+            head_sha = fetch_head_sha(repo_github, str(a.branch or "")) or ""
+        except Exception:  # noqa: BLE001 — the sha is detail, not load-bearing
+            head_sha = ""
         out.append(
             Footprint(
                 key=key,
@@ -556,9 +662,17 @@ def inflight_footprints(
                 files=tuple(dict.fromkeys(files)),
                 source=SOURCE_BRANCH,
                 branch=str(a.branch or ""),
+                head_sha=str(head_sha or ""),
+                liveness_checked=liveness_checked,
             )
         )
     return out
+
+
+# ``(repo_name, issue_number) -> the cached body's sync timestamp, or None``
+# — #2603. Left unwired (``None``) by default: the module itself has no DB
+# handle, only the caller does (see ``coord.commands.drive_queue``).
+SyncedAtFetcher = Callable[[str, int], "float | None"]
 
 
 def declared_footprints(
@@ -566,6 +680,7 @@ def declared_footprints(
     body_fetcher: BodyFetcher,
     *,
     exclude_keys: Iterable[str] = (),
+    synced_at_fetcher: SyncedAtFetcher | None = None,
 ) -> list[Footprint]:
     """Declared footprints for already-queued ``(repo, issue)`` pairs.
 
@@ -573,6 +688,13 @@ def declared_footprints(
     branch yet, where there is no ground truth to check against and the
     alternative is no prediction at all. Both sides are the authors' own
     words, never inferred from prose.
+
+    #2603: *synced_at_fetcher*, when given, stamps each footprint with when
+    ITS OWN cached body was last synced — so a later `declared` overlap can
+    say how old the OTHER side of the claim is, not just the candidate's
+    (which `_candidate_body` in `coord.commands.drive_queue` already
+    live-refreshes). ``None`` (the default) leaves every footprint's
+    ``synced_at`` unset, identical to pre-#2603 behaviour.
     """
     skip = {str(k) for k in exclude_keys}
     out: list[Footprint] = []
@@ -586,12 +708,19 @@ def declared_footprints(
         except Exception:  # noqa: BLE001 — one unreadable body, not all of them
             files = []
         if files:
+            synced_at: float | None = None
+            if synced_at_fetcher is not None:
+                try:
+                    synced_at = synced_at_fetcher(repo, int(issue))
+                except Exception:  # noqa: BLE001 — the timestamp is detail only
+                    synced_at = None
             out.append(
                 Footprint(
                     key=key,
                     issue_number=int(issue),
                     files=tuple(files),
                     source=SOURCE_DECLARED,
+                    synced_at=synced_at,
                 )
             )
     return out
@@ -729,6 +858,14 @@ def predictions_from_audit(entries: Iterable[Mapping[str, Any]]) -> list[dict[st
                     "other_key": str(overlap.get("key") or ""),
                     "source": str(overlap.get("source") or ""),
                     "files": [str(f) for f in (overlap.get("files") or ())],
+                    # #2603: carried through for provenance, unused by
+                    # `classify_outcome`/`tally` today — a later reader (or a
+                    # future `overlap-report` extension) can still ask how
+                    # current a PAST prediction's inputs were.
+                    "branch": str(overlap.get("branch") or ""),
+                    "head_sha": str(overlap.get("head_sha") or ""),
+                    "synced_at": overlap.get("synced_at"),
+                    "liveness_checked": bool(overlap.get("liveness_checked", True)),
                 }
             )
     return out
