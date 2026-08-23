@@ -257,20 +257,42 @@ def _probe_events(
                 )
             )
 
-    # 4. Total elapsed vs baseline — weakest, fires last, catches "grinding
-    #    but going nowhere".
-    if elapsed is not None and elapsed >= base.duration_threshold:
+    # 4. Total elapsed vs baseline — gated on output silence (#2609).
+    #
+    #    Duration alone is NOT evidence nobody is coming: a p90 threshold
+    #    fires on 10% of ALL healthy work by construction (that is what a
+    #    ninetieth percentile means), and a worker still emitting output
+    #    past its baseline is slow, not abandoned — it contradicts the
+    #    notifier's own contract ("nobody is coming, and nothing else").
+    #    So this no longer fires on elapsed time by itself; it additionally
+    #    requires the SAME quiet-past-threshold test probe 3 already
+    #    applies.  Concretely that means whenever this condition holds,
+    #    probe 3 already held too and — being ranked stronger — is what
+    #    `evaluate()` actually reports; over_baseline is a substitute for
+    #    silence no longer, only ever corroborating detail once silence has
+    #    already earned the page.  A pure duration signal with no silence
+    #    gate belongs in the digest / `coord status`, never this push
+    #    predicate (#2609 scope item 2).
+    quiet_for = None if probe.last_output_at is None else max(0.0, now - probe.last_output_at)
+    if (
+        elapsed is not None
+        and elapsed >= base.duration_threshold
+        and quiet_for is not None
+        and quiet_for >= base.silence_threshold
+    ):
         out.append(
             mk(
                 CONDITION_OVER_BASELINE,
                 f"{probe.type} has been running {_fmt_duration(elapsed)}, past "
-                f"{_fmt_duration(base.duration_threshold)} — {base.basis()}.",
+                f"{_fmt_duration(base.duration_threshold)} — {base.basis()}. "
+                f"Also silent for {_fmt_duration(quiet_for)}.",
                 {
                     "duration_threshold_secs": base.duration_threshold,
                     "baseline_cold": base.cold,
                     "baseline_samples": base.samples,
                     "baseline_median_secs": base.median_secs,
                     "baseline_p2x_median_secs": base.p2x_median_secs,
+                    "quiet_for_secs": quiet_for,
                 },
             )
         )

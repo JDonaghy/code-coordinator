@@ -203,28 +203,50 @@ def test_silence_outranks_elapsed_for_the_same_worker():
     assert [e.condition for e in events] == [CONDITION_OUTPUT_SILENCE]
 
 
-# ── probe 4: total elapsed vs baseline ───────────────────────────────────
+# ── probe 4: total elapsed vs baseline, gated on silence (#2609) ─────────
 
 
-def test_elapsed_over_baseline_is_the_weakest_probe_and_still_fires():
-    snap = PipelineSnapshot(now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR)])
-    events = evaluate(snap, warm_baselines(secs=600.0))
-    assert [e.condition for e in events] == [CONDITION_OVER_BASELINE]
-    assert "p90 of 10 comparable" in events[0].body
-    assert events[0].detail["baseline_cold"] is False
+def test_over_baseline_alone_does_not_page_while_output_keeps_coming():
+    """#2609: the reported bug.  20 minutes into a p90-19m stratum, still
+    emitting output — this is a worker running long, not one that stopped.
+    Duration past baseline must never page on its own."""
+    baselines = warm_baselines(secs=600.0)  # p90 duration threshold -> 600s
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 10.0)],
+    )
+    assert evaluate(snap, baselines) == []
+
+
+def test_over_baseline_plus_silence_fires_exactly_once_as_output_silence():
+    """The same leg, now ALSO quiet past its silence threshold: exactly one
+    notification, and it is the silence probe (ranked stronger) that
+    reports it — over_baseline no longer wins on its own once gated."""
+    baselines = warm_baselines(secs=600.0)  # silence threshold -> 600s (floor-clamped from 300s)
+    quiet_snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 20 * 60.0)],
+    )
+    events = evaluate(quiet_snap, baselines)
+    assert len(events) == 1
+    assert events[0].condition == CONDITION_OUTPUT_SILENCE
 
 
 def test_cold_stratum_says_so_in_the_notification_text():
     """Under N samples there is no baseline — fall back to a generous
     absolute ceiling AND say so, because "over the ceiling for a stratum we
-    have never measured" is a much weaker claim."""
-    snap = PipelineSnapshot(now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR)])
+    have never measured" is a much weaker claim. Reached via the silence
+    probe now that over_baseline is gated on it (#2609)."""
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 40 * 60.0)],
+    )
     thin = build_baselines([
         {"repo_name": "coord", "type": "work", "issue_number": 1, "status": "done",
          "dispatched_at": 0.0, "finished_at": 60.0}
     ])
     events = evaluate(snap, thin)
-    assert [e.condition for e in events] == [CONDITION_OVER_BASELINE]
+    assert [e.condition for e in events] == [CONDITION_OUTPUT_SILENCE]
     assert "no baseline yet" in events[0].body
     assert events[0].detail["baseline_cold"] is True
 
@@ -233,6 +255,21 @@ def test_cold_stratum_does_not_fire_below_the_generous_ceiling():
     """Cold start must not become a de-facto fixed 10-minute timeout."""
     snap = PipelineSnapshot(now=NOW, probes=[probe(dispatched_at=NOW - HOUR)])
     assert evaluate(snap, {}) == []
+
+
+def test_over_baseline_never_wins_even_when_its_own_gate_is_satisfied():
+    """Structural check: because over_baseline's gate reuses the exact same
+    quiet-past-threshold test the silence probe applies, whenever the gate
+    is satisfied the silence probe was already satisfied too — and, being
+    ranked stronger, that is what a caller of `evaluate()` sees. This pins
+    the dominance relationship the #2609 fix relies on rather than the
+    (much weaker) "just check the count" assertion above."""
+    baselines = warm_baselines(secs=600.0)
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 20 * 60.0)],
+    )
+    assert CONDITION_OVER_BASELINE not in [e.condition for e in evaluate(snap, baselines)]
 
 
 # ── terminal conditions ───────────────────────────────────────────────────
@@ -291,7 +328,10 @@ def test_deep_link_degrades_to_none_without_a_configured_web_url():
 def test_events_are_returned_strongest_first():
     snap = PipelineSnapshot(
         now=NOW,
-        probes=[probe(assignment_id="slow", dispatched_at=NOW - 10 * HOUR)],
+        probes=[
+            probe(assignment_id="slow", dispatched_at=NOW - 10 * HOUR,
+                  last_output_at=NOW - 20 * 60.0)
+        ],
         halted=[HaltedDrive(repo="coord", issue=9)],
         parked=[ParkedGate(repo="coord", issue=8)],
     )
@@ -303,7 +343,10 @@ def test_events_are_returned_strongest_first():
 
 
 def test_fires_once_per_subject_per_condition():
-    snap = PipelineSnapshot(now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR)])
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 20 * 60.0)],
+    )
     events = evaluate(snap, warm_baselines())
     ledger: dict = {}
 
@@ -337,9 +380,13 @@ def test_a_state_change_to_terminal_escalates_once_carrying_context():
 def test_a_weaker_condition_after_a_stronger_one_is_silence():
     ledger = {"a1:stuck": {"subject": "a1", "condition": CONDITION_STUCK, "fired_at": NOW}}
     slow = evaluate(
-        PipelineSnapshot(now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR)]),
+        PipelineSnapshot(
+            now=NOW,
+            probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 20 * 60.0)],
+        ),
         warm_baselines(),
     )
+    assert [e.condition for e in slow] == [CONDITION_OUTPUT_SILENCE]
     assert select_deliverable(slow, ledger) == []
 
 
