@@ -63,6 +63,18 @@ class WorkerProbe:
     collector could not tell, and the silence probe then declines to fire
     rather than guessing: a quiet pane is not evidence of progress (#1593),
     but "we failed to look" is not evidence of silence either.
+
+    ``agent_reachable`` (#2657) disambiguates *why* ``last_output_at`` is
+    ``None``: the owning machine's agent either never answered ``/status``
+    (``False``), or it answered and simply did not list this assignment as
+    running (``True`` — the collector already dropped a probe entirely for
+    an assignment the agent reports ``completed``; a probe that reaches the
+    predicate with ``last_output_at is None`` and ``agent_reachable is
+    True`` is some other kind of gap, not evidence of a dead agent).
+    ``None`` means the collector never asked at all — no configured host for
+    that machine. Only ``agent_reachable is False`` may justify the "agent
+    unreachable" wording; a reachable-but-silent-on-this-id agent must never
+    be reported as unreachable.
     """
 
     assignment_id: str
@@ -74,6 +86,7 @@ class WorkerProbe:
     issue_title: str = ""
     dispatched_at: float | None = None
     last_output_at: float | None = None
+    agent_reachable: bool | None = None
     stuck_message: str | None = None
     #: When `drive`'s stall nudge last fired for this stage, if ever.  This
     #: is the reuse seam demanded by #1632 rule 5 — the notifier does not
@@ -257,7 +270,10 @@ def _probe_events(
                 )
             )
 
-    # 4. Total elapsed vs baseline — gated on output silence (#2609).
+    # 4. Total elapsed vs baseline — gated on output silence (#2609), and
+    #    that gate's "silence unconfirmable" escape hatch is itself gated on
+    #    a CONFIRMED-unreachable agent (#2657), not merely an absent
+    #    `last_output_at`.
     #
     #    Duration alone is NOT evidence nobody is coming: a p90 threshold
     #    fires on 10% of ALL healthy work by construction (that is what a
@@ -266,32 +282,39 @@ def _probe_events(
     #    notifier's own contract ("nobody is coming, and nothing else").
     #    So this no longer fires on elapsed time by itself; it additionally
     #    requires the SAME quiet-past-threshold test probe 3 already
-    #    applies — with one deliberate exception.  ``quiet_for is None``
-    #    means the collector could not read `last_output_at` at all, which
-    #    happens when the owning agent is unreachable (collect.py: "an
-    #    unreachable agent leaves both `None`").  That is the single
-    #    scenario the notifier's contract names most literally — nobody is
-    #    coming because there is no agent left to come — and treating
-    #    "we don't know" the same as "definitely still talking" would
-    #    silently swallow it forever, since STUCK and OUTPUT_SILENCE both
-    #    also require agent-status data that a dead agent can't supply.  So
-    #    "unknown" is treated the same as "silent", not the same as
-    #    "confirmed recent output": fire when either the leg has gone quiet
-    #    past the silence threshold, or quietness could not be confirmed at
-    #    all (#2609 review iteration 1).
+    #    applies — with one deliberate exception, and that exception is
+    #    narrower than it looks.  ``quiet_for is None`` merely means the
+    #    collector had no `last_output_at` to read, and there are two very
+    #    different reasons for that: the owning agent never answered
+    #    `/status` at all (`agent_reachable is False`), or the agent
+    #    answered fine and simply does not list this assignment as running
+    #    any more — which the collector already treats as strong positive
+    #    evidence the leg finished, not as silence (collect.py suppresses a
+    #    probe entirely once the agent reports the id `completed`; a probe
+    #    that reaches here with `last_output_at is None` and a reachable
+    #    agent is some other benign gap, e.g. a `/status` payload that
+    #    raced a dispatch). Only the FIRST case is what the notifier's
+    #    contract names most literally — nobody is coming because there is
+    #    no agent left to come — and only that case gets treated as "unknown
+    #    == silent" rather than "unknown == fine".  #2609 review iteration 1
+    #    still holds for it: STUCK and OUTPUT_SILENCE both also require
+    #    agent-status data a dead agent can't supply, so a confirmed-
+    #    unreachable agent must still page here or the fleet goes silent
+    #    forever on that leg (#2657 must not regress that).
     #
     #    Whenever `last_output_at` IS known and quiet, probe 3 already fired
     #    on it too and — being ranked stronger — is what `evaluate()`
     #    actually reports for that case; this condition only surfaces on
-    #    its own for the "duration exceeded, output unknown" case where
-    #    probe 3 declined to guess.
+    #    its own for the "duration exceeded, agent confirmed unreachable"
+    #    case where probe 3 declined to guess.
     quiet_for = None if probe.last_output_at is None else max(0.0, now - probe.last_output_at)
+    unreachable = quiet_for is None and probe.agent_reachable is False
     if (
         elapsed is not None
         and elapsed >= base.duration_threshold
-        and (quiet_for is None or quiet_for >= base.silence_threshold)
+        and (unreachable or (quiet_for is not None and quiet_for >= base.silence_threshold))
     ):
-        if quiet_for is None:
+        if unreachable:
             silence_clause = "Output could not be confirmed (agent unreachable)."
         else:
             silence_clause = f"Also silent for {_fmt_duration(quiet_for)}."

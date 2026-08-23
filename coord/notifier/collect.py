@@ -114,13 +114,23 @@ def running_probes(
     agent_status: AgentStatusFn | None = None,
     active: Sequence[Any] | None = None,
 ) -> list[WorkerProbe]:
-    """One :class:`WorkerProbe` per in-flight assignment.
+    """One :class:`WorkerProbe` per in-flight assignment — but NOT for an
+    assignment the owning agent itself reports ``completed`` (#2657): that
+    is positive proof the leg finished, stronger than anything a probe
+    could conclude from silence, so no probe is emitted for it at all and
+    the stale board row (reconciled on the next ``coord notify`` run) never
+    gets to page.
 
     ``stuck_message`` and ``last_output_at`` come from the owning machine's
     agent ``/status`` — the coordinator cannot stat a log file on another
     host, so an unreachable agent leaves both ``None`` and the silence and
     STUCK probes simply decline to fire for that worker.  "We failed to
-    look" must never be reported as "it went quiet".
+    look" must never be reported as "it went quiet".  ``agent_reachable``
+    (#2657) records *why* ``last_output_at`` came back ``None`` — the agent
+    never answered (``False``), or it answered and simply does not list
+    this id as running (``True``) — so the predicate can tell "we failed to
+    look" apart from "we looked, and it is not there" instead of collapsing
+    both into an "agent unreachable" claim the collector never established.
     """
     labels_by_issue = labels_by_issue or {}
     agent_status = agent_status or _default_agent_status
@@ -133,6 +143,7 @@ def running_probes(
     hosts = {m.name: m.host for m in getattr(config, "machines", []) or []}
     wanted = {str(getattr(a, "machine_name", "")) for a in rows}
     statuses: dict[str, dict] = {}
+    reachable: dict[str, bool] = {}
     for machine in sorted(n for n in wanted if n):
         host = hosts.get(machine)
         if not host:
@@ -142,19 +153,38 @@ def running_probes(
         except Exception as exc:  # noqa: BLE001
             log.debug("notifier: agent %s unreachable (%s)", machine, exc)
             payload = None
+        # A machine we actually asked gets a definite True/False here even
+        # when the payload is empty — `reachable` answers "did the agent
+        # answer at all", not "did it have anything to say".  A machine
+        # with no configured host is never asked and stays out of this
+        # dict entirely, which the predicate reads as "unknown", not
+        # "unreachable" (#2657) — see `WorkerProbe.agent_reachable`.
+        reachable[machine] = payload is not None
         if payload:
             statuses[machine] = payload
 
     by_id: dict[str, dict] = {}
+    completed_by_id: dict[str, dict] = {}
     for payload in statuses.values():
         for entry in payload.get("active") or []:
             if isinstance(entry, dict) and entry.get("id"):
                 by_id[str(entry["id"])] = entry
+        for entry in payload.get("completed") or []:
+            if isinstance(entry, dict) and entry.get("id"):
+                completed_by_id[str(entry["id"])] = entry
 
     probes: list[WorkerProbe] = []
     for assignment in rows:
         aid = str(getattr(assignment, "assignment_id", "") or "")
         if not aid:
+            continue
+        if aid in completed_by_id:
+            # The owning agent has already moved this id to its `completed`
+            # list — the leg exited, and the board's `in_progress` row just
+            # has not been reconciled yet (up to two notifier ticks land in
+            # that gap, #2657).  This is stronger evidence than any probe
+            # below could produce, so skip the assignment entirely rather
+            # than let a stale board row page.
             continue
         repo = str(getattr(assignment, "repo_name", "") or "")
         issue = getattr(assignment, "for_issue_number", None) or getattr(
@@ -165,6 +195,7 @@ def running_probes(
         except (TypeError, ValueError):
             continue
 
+        machine = str(getattr(assignment, "machine_name", "") or "")
         entry = by_id.get(aid) or {}
         progress = entry.get("progress") or {}
         stuck = progress.get("stuck") if isinstance(progress, dict) else None
@@ -182,10 +213,11 @@ def running_probes(
                 issue=issue,
                 type=str(getattr(assignment, "type", "work") or "work"),
                 tier=tier_from_labels(labels_by_issue.get((repo, issue))) or UNTIERED,
-                machine=str(getattr(assignment, "machine_name", "") or ""),
+                machine=machine,
                 issue_title=str(getattr(assignment, "issue_title", "") or ""),
                 dispatched_at=getattr(assignment, "dispatched_at", None),
                 last_output_at=last_output_at,
+                agent_reachable=reachable.get(machine),
                 stuck_message=str(stuck) if stuck else None,
                 nudged_at=nudge.get("at"),
                 stalled_for=nudge.get("stalled_for"),

@@ -67,12 +67,16 @@ def test_probe_carries_stuck_and_last_output_from_the_agent():
     assert len(probes) == 1
     assert probes[0].stuck_message == "need a decision"
     assert probes[0].last_output_at == NOW - 120.0
+    assert probes[0].agent_reachable is True
 
 
 def test_an_unreachable_agent_leaves_the_probe_blind_rather_than_absent():
     """A machine that will not answer must not silently look like a worker
     that went quiet — both fields stay None so the silence and STUCK probes
-    decline to fire, while the elapsed probe still works off the board."""
+    decline to fire, while the elapsed probe still works off the board.
+    ``agent_reachable`` records the confirmed failure (#2657) so the
+    elapsed probe's "agent unreachable" escape hatch can tell this apart
+    from a reachable agent that just does not list the id."""
     probes = collect.running_probes(
         CONFIG,
         now=NOW,
@@ -84,6 +88,75 @@ def test_an_unreachable_agent_leaves_the_probe_blind_rather_than_absent():
     assert probes[0].last_output_at is None
     assert probes[0].stuck_message is None
     assert probes[0].dispatched_at == NOW - 600.0
+    assert probes[0].agent_reachable is False
+
+
+def test_a_reachable_agent_that_does_not_list_the_id_is_marked_reachable():
+    """#2657: the collector's fix for the false-page bug. The agent answers
+    `/status` — payload has BOTH an empty `active` and an empty
+    `completed` for this id (e.g. a payload that raced a fresh dispatch) —
+    so `last_output_at` is still `None`, but `agent_reachable` is `True`,
+    not `False`. That is what lets the predicate distinguish "we failed to
+    look" from "we looked, and it just is not there"."""
+    probes = collect.running_probes(
+        CONFIG,
+        now=NOW,
+        notifier_state=NotifierState(),
+        active=[assignment()],
+        agent_status=lambda host: {"active": [], "completed": []},
+    )
+    assert len(probes) == 1
+    assert probes[0].last_output_at is None
+    assert probes[0].agent_reachable is True
+
+
+def test_an_assignment_the_agent_reports_completed_produces_no_probe():
+    """#2657 root cause: the board row can still say `running` for up to
+    two notifier ticks after the agent has already moved the id to
+    `completed` (the reconcile gap `coord-notify.timer`'s 5-minute cadence
+    leaves open). The agent's own `completed` list is positive proof the
+    leg finished — stronger than anything a probe could conclude from
+    silence — so no probe must be produced for it at all, regardless of
+    what the board still says."""
+    status = {
+        "active": [],
+        "completed": [{"id": "a1", "status": "done", "exit_code": 0}],
+    }
+    probes = collect.running_probes(
+        CONFIG,
+        now=NOW,
+        notifier_state=NotifierState(),
+        active=[assignment()],
+        agent_status=lambda host: status,
+    )
+    assert probes == []
+
+
+def test_replay_the_two_observed_false_pages_yields_zero_events():
+    """#2657 acceptance: replay the incident shape verbatim — a leg
+    dispatched 19 minutes ago whose owning agent answers with an empty
+    `active` list and the id present in `completed` with `exit_code: 0`.
+    Before this fix this produced an `over_baseline` page blaming "agent
+    unreachable" 3m49s / 5s after the leg had already exited 0; after the
+    fix it must produce zero probes and therefore zero events end to end."""
+    from coord.notifier.baseline import build_baselines
+    from coord.notifier.predicate import PipelineSnapshot, evaluate
+
+    status = {
+        "active": [],
+        "completed": [{"id": "a1", "status": "done", "exit_code": 0}],
+    }
+    probes = collect.running_probes(
+        CONFIG,
+        now=NOW,
+        notifier_state=NotifierState(),
+        active=[assignment(dispatched_at=NOW - 19 * 60.0)],
+        agent_status=lambda host: status,
+    )
+    assert probes == []
+
+    events = evaluate(PipelineSnapshot(now=NOW, probes=probes), build_baselines([]))
+    assert events == []
 
 
 def test_an_agent_that_raises_does_not_abort_the_sweep():
