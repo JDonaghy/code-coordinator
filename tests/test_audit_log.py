@@ -173,6 +173,24 @@ class _FlakyConn:
         return getattr(self._real, name)
 
 
+class _TrimLockedConn:
+    """Wraps a real connection so every ``INSERT`` succeeds normally but
+    every ``DELETE`` (the opportunistic ``audit.max_rows`` trim) hits
+    sustained lock contention — isolates a trim-only failure from the
+    INSERT that already committed successfully above it."""
+
+    def __init__(self, real_conn) -> None:
+        self._real = real_conn
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().upper().startswith("DELETE"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 class TestRecordAuditRetriesLockContention:
     """#2597: record_audit's write previously had zero retry protection at
     all — 1,804 audit rows/24h were measured lost to ordinary, momentary
@@ -280,6 +298,68 @@ class TestLockContentionLossCounter:
         # ONE aggregated line, not one per lost write.
         assert len(matches) == 1
         assert str(losses_before_flush) in matches[0].getMessage()
+
+    def test_trim_only_failure_does_not_count_as_a_lost_write(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2597-review: `_maybe_trim`'s DELETE is opportunistic
+        housekeeping over rows the INSERT above it already committed
+        durably. A trim that hits sustained lock contention must not be
+        misclassified by the loss counter as a *lost audit write* — the row
+        made it into audit_log just fine; only the retention cap didn't run
+        this pass. Over-counting here would undercut the whole point of the
+        counter (a trustworthy loss rate)."""
+        from coord.audit import audit_lock_contention_losses
+
+        monkeypatch.setattr("coord.audit._resolve_max_rows", lambda: 5)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        proxy = _TrimLockedConn(coord_db)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+        baseline = audit_lock_contention_losses()
+
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="row written, trim contended",
+        )
+
+        # The row itself made it in...
+        rows = _audit_rows(coord_db)
+        assert any(
+            r["summary"] == "row written, trim contended" for r in rows
+        )
+        # ...and the loss counter must not blame it for the trim's failure.
+        assert audit_lock_contention_losses() == baseline
+
+    def test_flush_lock_contention_summary_public_wrapper(
+        self, coord_db, monkeypatch, caplog
+    ) -> None:
+        """#2597-review: `flush_lock_contention_summary` is the public
+        entry point meant to be called on a periodic cadence by a
+        long-running process (`coord serve`'s tick loop) rather than only
+        at `atexit` — it must actually flush the pending count and log the
+        aggregate, identical to the internal function it wraps."""
+        from coord.audit import (
+            audit_lock_contention_losses,
+            flush_lock_contention_summary,
+        )
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        proxy = _FlakyConn(coord_db, fail_times=None)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="lost",
+        )
+        assert audit_lock_contention_losses() >= 1
+
+        with caplog.at_level(logging.WARNING, logger="coord.audit"):
+            flush_lock_contention_summary()
+
+        assert audit_lock_contention_losses() == 0
+        assert any(
+            "writes lost to lock contention" in r.message for r in caplog.records
+        )
 
 
 class TestAuditLevel:

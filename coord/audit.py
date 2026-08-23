@@ -25,6 +25,8 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import sqlite3
+import threading
 import time
 from typing import Any
 
@@ -36,6 +38,7 @@ __all__ = [
     "record_audit",
     "query_audit_log",
     "audit_lock_contention_losses",
+    "flush_lock_contention_summary",
 ]
 
 # Valid values are documented in the issue but not enforced here — callers
@@ -163,7 +166,25 @@ def _record_audit_unsafe(
     # load-bearing write in this codebase already gets before falling
     # through to record_audit's best-effort swallow.
     retry_on_locked(_write)
-    _maybe_trim(conn)
+    # #2597-review: the trim below is opportunistic housekeeping over rows
+    # that are already durably committed above — isolate its own retry/
+    # failure from the insert's. Left unguarded, a `DELETE` that hits lock
+    # contention here would propagate out to `record_audit`'s except clause
+    # and get classified (by `is_lock_contention_error` alone, with no way
+    # to tell "the row itself didn't write" apart from "the row wrote fine
+    # but the trim afterward didn't run") as a *lost audit write* — over-
+    # counting genuine data loss for a row that made it into audit_log just
+    # fine. Give the trim the same retry budget as any other write, but
+    # keep a trim-only failure from ever touching that counter.
+    try:
+        retry_on_locked(lambda: _maybe_trim(conn))
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.debug(
+            "record_audit: audit_log trim skipped due to lock contention "
+            "(row itself was already written): %s", exc,
+        )
 
 
 # ── Lock-contention loss counter (#2597) ────────────────────────────────────
@@ -181,6 +202,13 @@ def _record_audit_unsafe(
 
 _lock_contention_losses = 0
 _summary_flush_registered = False
+# #2597-review: `coord serve` calls `record_audit` from multiple
+# threads/greenlets (the tick loop's `run_in_threadpool` calls, concurrent
+# request handlers) — a bare `+= 1` on a module global can lose increments
+# under concurrent contention (read-modify-write race). The counter is
+# purely diagnostic (never gates a decision), but the whole point of it is
+# to make the loss rate trustworthy, so it should not itself be lossy.
+_lock_contention_lock = threading.Lock()
 
 
 def _record_lock_contention_loss() -> None:
@@ -188,9 +216,11 @@ def _record_lock_contention_loss() -> None:
     to be reported once this process exits (see
     :func:`_flush_lock_contention_summary`)."""
     global _lock_contention_losses, _summary_flush_registered
-    _lock_contention_losses += 1
-    if not _summary_flush_registered:
+    with _lock_contention_lock:
+        _lock_contention_losses += 1
+        register = not _summary_flush_registered
         _summary_flush_registered = True
+    if register:
         atexit.register(_flush_lock_contention_summary)
 
 
@@ -206,11 +236,11 @@ def _flush_lock_contention_summary() -> None:
     without waiting for process exit).
     """
     global _lock_contention_losses
-    if _lock_contention_losses:
-        _log.warning(
-            "audit: %d writes lost to lock contention", _lock_contention_losses
-        )
+    with _lock_contention_lock:
+        pending = _lock_contention_losses
         _lock_contention_losses = 0
+    if pending:
+        _log.warning("audit: %d writes lost to lock contention", pending)
 
 
 def audit_lock_contention_losses() -> int:
@@ -220,7 +250,24 @@ def audit_lock_contention_losses() -> int:
     Exposed for tests and diagnostics — advisory only, like the rest of the
     audit log; nothing gates dispatch/review/merge decisions on this value.
     """
-    return _lock_contention_losses
+    with _lock_contention_lock:
+        return _lock_contention_losses
+
+
+def flush_lock_contention_summary() -> None:
+    """Public entry point for :func:`_flush_lock_contention_summary`.
+
+    #2597-review: the `atexit` registration above is the right default for
+    a short-lived CLI invocation (`coord merge`, `coord notify`) — it always
+    fires exactly once, at exit. It is a much weaker guarantee for a
+    long-running process (`coord serve`), which the code's own comment
+    already conceded only flushes "if it ever shuts down cleanly" — for a
+    daemon that runs for days between restarts, losses can accumulate for
+    its entire uptime with zero visibility. Call this on a periodic cadence
+    (e.g. once per daemon tick) to close that gap; it is a no-op cost-wise
+    when there is nothing pending (see :func:`_flush_lock_contention_summary`).
+    """
+    _flush_lock_contention_summary()
 
 
 def _maybe_trim(conn) -> None:

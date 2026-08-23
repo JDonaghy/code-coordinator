@@ -2130,6 +2130,14 @@ def merge(
     open_by_repo, known_by_repo = _load_issue_states()
 
     auto_enqueued: list[str] = []
+    # #2597-review: assignments whose enqueue write is still locked after
+    # `retry_on_locked` exhausts its budget. Collected here instead of
+    # raised in place — one contended assignment must not abort the scan
+    # for every other assignment still waiting in this batch (that's the
+    # exact #1353 regression this file already fixed once, resurrected for
+    # lock contention specifically). The whole run still fails loudly: once
+    # every assignment has had its turn, a non-zero exit is raised below.
+    lock_contention_failures: list[tuple[str, sqlite3.OperationalError]] = []
     # Per-repo cache of branches that still exist on origin.  Lets us skip
     # re-enqueuing done-work whose branch was already merged-and-deleted — the
     # dominant merge-queue clog source.  A done assignment for a closed issue
@@ -2312,9 +2320,20 @@ def merge(
                     # mergeable assignment out of the scan on that basis is
                     # the exact correctness bug #2597 reported (a skipped
                     # entry here is silent — nothing re-scans it until the
-                    # next `coord merge` invocation). Fail the whole run
-                    # loudly instead of adding a line to the summary below.
-                    raise
+                    # next `coord merge` invocation). This is a hard
+                    # failure, not the soft "skipped" outcome below — but
+                    # (per review) it must not abort the rest of the batch
+                    # either. Record it and keep scanning; a clearly-flagged
+                    # line goes into the summary and the run still fails
+                    # loudly (non-zero exit, real exception) once every
+                    # other assignment has had its turn.
+                    lock_contention_failures.append((a.assignment_id, exc))
+                    auto_enqueued.append(
+                        f"  LOCK CONTENTION: {a.repo_name} #{a.issue_number} "
+                        f"(assignment {a.assignment_id}) — auto-enqueue write "
+                        f"still locked after exhausting retries: {exc!r}"
+                    )
+                    continue
                 auto_enqueued.append(
                     f"  skipped: {a.repo_name} #{a.issue_number} "
                     f"(assignment {a.assignment_id}) — auto-enqueue scan "
@@ -2328,6 +2347,20 @@ def merge(
                 )
     for line in auto_enqueued:
         click.echo(line)
+
+    if lock_contention_failures:
+        # #2597-review: every assignment in the batch has now had its turn
+        # — including the ones after the first contended write, and their
+        # results (if any) are already printed above. Surface the
+        # contention loudly now: a real `sqlite3.OperationalError`
+        # propagating out of this command (not a swallowed summary line)
+        # so `coord merge` exits non-zero and the failure is impossible to
+        # miss, same as any other genuinely unrecoverable write failure.
+        assignment_ids = ", ".join(aid for aid, _exc in lock_contention_failures)
+        raise sqlite3.OperationalError(
+            "database is locked — auto-enqueue write(s) still locked after "
+            f"exhausting retries for assignment(s): {assignment_ids}"
+        ) from lock_contention_failures[-1][1]
 
     # #1477: re-test any parked CONFLICT entry against GitHub's own
     # mergeability computation before the pending scan below — a branch
