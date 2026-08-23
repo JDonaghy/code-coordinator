@@ -1111,6 +1111,79 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
         click.echo("alert: (none)")
 
 
+@drive_queue_group.command("cancel-roll")
+@click.option("--json", "output_json", is_flag=True, default=False,
+              help="Emit the cancelled marker (and any cordons cleared with it) as JSON.")
+def drive_queue_cancel_roll(output_json: bool) -> None:
+    """Cancel a #2587 roll-pending marker so the queue resumes launching now.
+
+    #2607: every OTHER queue-blocking state has an operator override — a
+    held deploy gate has `coord drive-queue resume`, a release cordon has
+    `coord release cordon --clear` — but the roll-pending marker had none.
+    It is supposed to be self-bounding (a TTL / deferral ceiling —
+    `RollPending.expired`), but a marker that keeps getting RE-ARMED before
+    it ever expires never reaches that bound on its own (the defect #2607
+    fixed at the write sites); this command is the escape hatch for while
+    that marker is still live, and for any future case a re-arm loop is not
+    yet ruled out for. Also clears any release cordon still open for the
+    SAME target — the cordon a stalled `coord release propagate`/
+    `nightly-window` run can leave behind — so cancelling actually frees the
+    queue rather than trading one hold for another.
+
+    Does NOT change the target: the next `coord release propagate`/
+    `nightly-window` run re-arms a marker from scratch if the fleet is still
+    behind. This only stops the CURRENT wait.
+    """
+    from coord.machine_pause import clear_cordon, cordons as read_cordons  # noqa: PLC0415
+
+    pending = read_roll_pending()
+    cleared_cordons: list[str] = []
+    if pending is not None:
+        try:
+            active_cordons = read_cordons()
+        except Exception:  # noqa: BLE001 — best-effort; the marker clear below is load-bearing
+            active_cordons = {}
+        for name, cordon in active_cordons.items():
+            if getattr(cordon, "target_version", None) != pending.target_version:
+                continue
+            try:
+                if clear_cordon(name):
+                    cleared_cordons.append(name)
+            except Exception:  # noqa: BLE001 — best-effort; never block the marker clear on this
+                pass
+        clear_roll_pending()
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "cancelled": pending.to_dict() if pending is not None else None,
+                    "cleared_cordons": sorted(cleared_cordons),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+
+    if pending is None:
+        click.echo("no roll-pending marker to cancel — the queue is not held for a roll")
+        return
+    click.echo(
+        f"cancelled {pending.describe()} — the drive-queue tick resumes "
+        "launching immediately"
+    )
+    if cleared_cordons:
+        click.echo(
+            "also cleared cordon(s) still open for this target: "
+            + ", ".join(sorted(cleared_cordons))
+        )
+    click.echo(
+        "note: this only stops the current wait — the next `coord release "
+        "propagate`/`nightly-window` run re-arms a fresh marker if the "
+        "fleet is still behind"
+    )
+
+
 # ── block-log (#2235 Phase 0) ────────────────────────────────────────────────
 
 

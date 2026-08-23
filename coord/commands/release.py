@@ -595,14 +595,22 @@ def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
     :class:`coord.drive_queue.RollPending`'s docstring for the mechanism
     this feeds.
 
-    Never overwrites an existing marker for the SAME target — resetting
-    ``set_at``/``deferrals`` every few minutes while this timer keeps
-    finding the fleet busy would make the TTL bound
-    (:meth:`~coord.drive_queue.RollPending.expired`) unreachable in
-    practice, exactly the "never actually bounded" failure #2587's own
-    bound exists to prevent. A marker for a DIFFERENT (stale) target IS
-    replaced — the newly resolved version is the one that should roll.
+    Never overwrites an existing marker's ``set_at``/``deferrals`` — for the
+    SAME target this is a plain no-op (unchanged from before #2607); for a
+    DIFFERENT target the target/reason are updated in place but the clock
+    and deferral count carry over unchanged. #2607: PyPI's "latest" climbs on
+    every merge (`Auto-release on merge to main`), so a busy fleet's target
+    had almost always moved by the time this timer re-fired — treating that
+    as a "new" roll and resetting ``set_at``/``deferrals`` made the TTL/
+    deferral bound (:meth:`~coord.drive_queue.RollPending.expired`)
+    unreachable in practice, exactly the "never actually bounded" failure
+    #2587's own bound exists to prevent, and exactly how #2607's queue froze
+    for good. A re-arm — same target or not — is a continuation of the SAME
+    stuck roll, not a new operator request; only a marker set from scratch
+    (no existing one at all, e.g. right after `coord drive-queue
+    cancel-roll`) starts a new clock.
     """
+    import dataclasses as _dataclasses  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     from coord.commands.drive_queue import read_roll_pending, write_roll_pending  # noqa: PLC0415
@@ -610,6 +618,11 @@ def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
 
     existing = read_roll_pending()
     if existing is not None and existing.target_version == target_version:
+        return
+    if existing is not None:
+        write_roll_pending(
+            _dataclasses.replace(existing, target_version=target_version, reason=reason)
+        )
         return
     write_roll_pending(
         RollPending(target_version=target_version, set_at=_time.time(), reason=reason)
@@ -2799,6 +2812,7 @@ def release_nightly_window(
     genuinely idle is a fine moment to roll immediately. A still-busy fleet
     just leaves the marker exactly as it was for the tick to keep watching.
     """
+    import dataclasses as _dataclasses  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
 
@@ -3002,18 +3016,35 @@ def release_nightly_window(
             _finish(rw.STATUS_PROPAGATE_FAILED, prop_exit or 1)
 
     # ── 3. set (or refresh) the marker and return immediately (#2587) ─────
+    # #2607: a marker already pending for a DIFFERENT target is updated in
+    # place — target_version/reason move, but set_at/deferrals carry over
+    # unchanged. This is the exact site the incident traced back to: PyPI's
+    # "latest" climbs on every merge, so by the time this nightly timer
+    # re-fired the target had almost always moved, and writing a brand new
+    # `RollPending` here reset the TTL/deferral escape hatch on every single
+    # re-arm — the queue froze because the bound that was supposed to save it
+    # could never be reached. Only a genuinely fresh marker (no existing one
+    # at all) gets a new clock.
     if existing is not None:
         click.echo(
             f"replacing stale roll-pending marker ({existing.describe()}) "
-            f"with v{record.target_version}"
+            f"with v{record.target_version} — preserving its original "
+            f"set_at/deferrals (#2607: a re-arm is a continuation of the "
+            f"same stuck roll, not a new request)"
         )
-    write_roll_pending(
-        RollPending(
-            target_version=record.target_version,
-            set_at=time.time(),
-            reason="nightly-window",
+        write_roll_pending(
+            _dataclasses.replace(
+                existing, target_version=record.target_version, reason="nightly-window",
+            )
         )
-    )
+    else:
+        write_roll_pending(
+            RollPending(
+                target_version=record.target_version,
+                set_at=time.time(),
+                reason="nightly-window",
+            )
+        )
     click.echo(
         f"roll pending: v{record.target_version} — the drive-queue tick will "
         f"fire `coord release propagate` at the next inter-drive gap "

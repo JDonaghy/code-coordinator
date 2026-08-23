@@ -629,6 +629,31 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 if live_error:
                     click.echo(f"      error: {live_error}")
 
+    # #2607: the #2587 roll-pending marker — while it is live the drive-queue
+    # tick refuses to launch anything, and #2607 found a re-arm path that
+    # could reset its own TTL/deferral escape hatch on every attempt, freezing
+    # the queue with no operator-visible sign anywhere OTHER than `coord
+    # drive-queue status`. Surfaced here too so an operator staring at plain
+    # `coord status` — the first thing anyone reaches for — sees it without
+    # having to know the marker exists. Host-local (same file the daemon
+    # host's own `coord-drive-queue.timer` reads), so skipped on a thin
+    # client exactly like the merge queue above.
+    if not svc:
+        import time as _time
+
+        from coord.commands.drive_queue import read_roll_pending
+
+        roll_pending = read_roll_pending()
+        if roll_pending is not None:
+            age = _time.time() - roll_pending.set_at
+            click.echo("")
+            click.echo(
+                f"⏸ {roll_pending.describe()} — set {age:.0f}s ago, "
+                f"{roll_pending.deferrals}/{roll_pending.max_deferrals} "
+                "deferrals — drive queue launches nothing until it fires or "
+                "expires. Cancel with `coord drive-queue cancel-roll`."
+            )
+
     # #920: sibling-overlap warnings — approved (PENDING) queue entries that
     # touch overlapping files and have been aging.  Mirrors the merge-queue
     # skip above: the queue is host-local, so this is a no-op on a thin
@@ -1363,6 +1388,28 @@ def doctor(
             click.echo(line)
             if is_problem:
                 any_problem = True
+
+    # #2607: name the #2587 roll-pending marker here too, not just in `coord
+    # drive-queue status` — an operator running `coord doctor` to ask "why
+    # isn't the fleet doing anything" must see this without already knowing
+    # the marker exists. Host-local (the file the daemon host's own
+    # `coord-drive-queue.timer` reads), so this only has something to say
+    # when run ON that host — same caveat as the release-verify section
+    # above resolving PyPI locally.
+    from coord.commands.drive_queue import read_roll_pending  # noqa: PLC0415
+
+    roll_pending = read_roll_pending()
+    if roll_pending is not None:
+        import time as _time  # noqa: PLC0415
+
+        age = _time.time() - roll_pending.set_at
+        click.echo("")
+        click.echo(
+            f"⏸ {roll_pending.describe()} — set {age:.0f}s ago, "
+            f"{roll_pending.deferrals}/{roll_pending.max_deferrals} deferrals "
+            "— the drive queue on this host launches nothing until it fires "
+            "or expires. Escape hatch: `coord drive-queue cancel-roll`."
+        )
 
     # #1862: a quiet-hours window that removes the only machine with a
     # capability makes matching work silently unroutable (`dispatch_smoke`

@@ -214,6 +214,8 @@ def test_drive_queue_is_registered_with_every_verb():
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
         "overlap-report", "block-log", "diagnose", "log-intervention",
+        # #2607: the roll-pending marker's operator escape hatch.
+        "cancel-roll",
     }
 
 
