@@ -93,6 +93,16 @@ def fix_graph(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     rather than trusting *result*, which may predate the last commit/rebuild
     on this checkout by the time ``--fix`` actually runs; this is also what
     makes a second ``--fix`` pass a no-op once the rebuild has landed.
+
+    #2581 review: also re-derives the verdict a SECOND time after the
+    subprocess exits 0, and only reports ``applied`` when that fresh check
+    confirms the graph is actually ``present`` and not ``stale`` — a 0
+    exit code from ``graphify update`` is evidence the process ran cleanly,
+    not evidence the graph it produced is current. Unconfirmed success is a
+    defect per this repo's own review bar; this mirrors the still-open gap
+    in ``coord.graph_health.apply_local_graph_fix``'s ``build`` step, which
+    this PR does not touch (that call site is `coord repo doctor --fix`'s,
+    not this one's, per #2581's own scope).
     """
     from coord.graph_health import graph_status  # noqa: PLC0415
 
@@ -140,9 +150,18 @@ def fix_graph(ctx: HealthContext, result: CheckResult) -> FixOutcome:
             message=f"`graphify update {path}` exited {proc.returncode}",
             error=tail,
         )
+
+    verified = graph_status(Path(path), default_branch)
+    if verified.present and not verified.stale:
+        return FixOutcome(
+            check_id="graph", subject=name, status="applied",
+            message=f"ran `graphify update {path}`; graph confirmed fresh on re-check",
+        )
     return FixOutcome(
-        check_id="graph", subject=name, status="applied",
-        message=f"ran `graphify update {path}`",
+        check_id="graph", subject=name, status="error",
+        message=f"ran `graphify update {path}` (exit 0) but the graph still "
+        "reads as absent/stale on re-check",
+        error=verified.unknown_reason or "graph_status did not confirm fresh after update",
     )
 
 

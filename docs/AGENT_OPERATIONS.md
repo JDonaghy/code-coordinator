@@ -1084,9 +1084,18 @@ checked at two granularities: the whole `CheckResult` row (`"graph"` or
 `"graph:claude-coordinator"`, either suppresses that finding), and, for a
 check whose one row can bundle several independently-repairable items
 (`index_lock`'s several stale locks, `worktrees`'s several stale worktrees),
-per item — using the exact same keys `scripts/fleet_watchdog.py` uses for the
-identical condition (`stale-git-lock:<path>`, `<assignment_id>` /
-`orphaned-worktree:<assignment_id>`), so one sentinel entry covers both tools.
+per item. `worktrees` checks the exact same key pair
+`scripts/fleet_watchdog.py` uses for the identical condition
+(`<assignment_id>`, `orphaned-worktree:<assignment_id>`), so one sentinel
+entry covers both tools there. `index_lock` checks `stale-git-lock:<path>`
+plus the lock's bare directory name — a strict superset of
+`fleet_watchdog.py`'s own key for that condition (just
+`stale-git-lock:<path>`, since its `check_stale_git_lock` finding doesn't
+set `suppress_keys` and so defaults to its signature alone). The extra key
+only *widens* what a `fleet_watchdog`-authored sentinel entry can suppress
+here, never narrows it, so a `stale-git-lock:<path>` entry from either tool
+still covers both — it's just not, strictly, "the exact same keys" for this
+one check.
 
 **Idempotent by construction.** `apply_fixes` skips every `OK` row outright —
 fix a finding once, the next `coord health` reports it `OK`, and a second
