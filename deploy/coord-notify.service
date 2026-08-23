@@ -9,8 +9,14 @@
 # needs-attention threshold (the same non-destructive recovery `coord
 # diagnose --reset` performs by hand; see
 # docs/AGENT_OPERATIONS.md → "Periodic coord notify" for the guardrails, and
-# `pipeline.auto_heal_phantom_rows` in coordinator.yml to opt out). Install
-# ONLY on the box that owns
+# `pipeline.auto_heal_phantom_rows` in coordinator.yml to opt out). #2570: the
+# phantom-row heal ALSO runs independently from inside coord-serve's own
+# process (coord/serve_app.py's `_phantom_heal_loop`, COORD_PHANTOM_HEAL_INTERVAL)
+# — this unit and that daemon exec from the same ~/.coord-venv, so if that venv
+# ever breaks, this unit's `coord notify` subprocess dies with it and the heal
+# would otherwise die at the exact moment it's needed to recover the wreckage.
+#
+# Install ONLY on the box that owns
 # ~/.coord/coord.db (dellserver in production — the same host that runs
 # coord-serve/coord-web) — it must NOT run on a thin-client machine, since
 # `coord notify` there would just re-route itself back over HTTP to the

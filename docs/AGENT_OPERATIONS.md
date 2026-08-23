@@ -849,6 +849,24 @@ unlike most other auto-dispatch flags in this file — see
 `PipelineConfig`'s docstring in `coord/config.py` for why); set it `false`
 to go back to requiring a human to run `--reset` by hand.
 
+**#2570: this sweep also runs from inside `coord-serve` itself, independent
+of this timer.** On 2026-08-22, `coord-notify.timer` and
+`coord-drive-queue.service` both `ExecStart` from `~/.coord-venv` and both
+died with `ModuleNotFoundError` for 11 hours when that venv broke — the
+phantom-row heal, whose whole job is recovering a stuck queue, shared a
+failure domain with the queue itself and bought nothing. `coord serve` is
+`Type=simple`, not a re-exec'd oneshot: once running, it keeps
+`coord.notify`/`coord.diagnose` already imported in its own interpreter, so
+its own tick loop (`_phantom_heal_loop` in `coord/serve_app.py`, default
+cadence 300s — `COORD_PHANTOM_HEAL_INTERVAL`, `0` disables) keeps calling
+the identical sweep (`_phantom_heal_tick`) for as long as the daemon process
+itself stays up, even after `~/.coord-venv` breaks under it — exactly the
+property that let `coord-serve` keep serving `/board`/`/status` through the
+entire 11h outage while both venv-dependent units were down. This does not
+replace `coord-notify.timer` (still the sanctioned driver for completion/
+failure/review notifications) — it just gives the phantom-row heal
+specifically a second, independent path.
+
 ## Periodic `coord drive-queue tick` (`coord-drive-queue` timer, #1756)
 
 Same shape as the `coord-notify` timer above — a `Type=oneshot` unit fired on

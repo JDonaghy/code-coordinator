@@ -3668,6 +3668,18 @@ def _sweep_phantom_rows(config: Config) -> list["PhantomRowHeal"]:
     (already durably written by the time this posts) — it just means the
     GitHub comment is missing, which a future manual `coord diagnose` can
     still explain.
+
+    **#2570: not this function's only caller anymore.** ``coord notify``
+    (via :func:`run`) is one caller; ``coord.serve_app._phantom_heal_tick``
+    is the other, invoked from that daemon's own long-lived tick loop
+    (``_phantom_heal_loop``) so the sweep survives a ``~/.coord-venv``
+    corruption that also takes out the ``coord notify``/``coord
+    drive-queue tick`` subprocesses that share that venv — see
+    ``coord/serve_app.py``'s ``_phantom_heal_tick`` docstring and
+    ``docs/AGENT_OPERATIONS.md``'s "Periodic coord notify" section for the
+    full incident. This function itself needed no change for that: it was
+    already a pure, idempotent, board-scanning sweep with no dependency on
+    which process calls it.
     """
     if not config.pipeline.auto_heal_phantom_rows:
         return []

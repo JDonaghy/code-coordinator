@@ -4,6 +4,18 @@
 # fronts the one shared ~/.coord/coord.db so any Tailscale machine renders/drives
 # the same board. Install on the always-on box that owns the DB (dellserver).
 #
+# #2570: this is also, independently of coord-notify.timer, one of the two
+# places the #2536 phantom-row auto-heal runs from (coord/serve_app.py's
+# `_phantom_heal_loop`, default cadence 300s — COORD_PHANTOM_HEAL_INTERVAL,
+# 0 disables). Type=simple, not a re-exec'd oneshot: once started, this
+# process keeps coord.notify/coord.diagnose already imported in memory, so
+# its own tick loop keeps healing phantom rows for as long as the process
+# stays up even if ~/.coord-venv breaks under it afterward — unlike
+# coord-notify.timer, which re-execs `~/.coord-venv/bin/coord notify` from
+# that same venv on every fire and dies with it. See
+# docs/AGENT_OPERATIONS.md → "Periodic coord notify" (the #2570 note) for
+# the incident this closes.
+#
 # Install:
 #   mkdir -p ~/.config/systemd/user
 #   cp deploy/coord-serve.service ~/.config/systemd/user/

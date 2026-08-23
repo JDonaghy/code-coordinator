@@ -476,6 +476,36 @@ def _notify_drain_tick(config: Config):  # noqa: ANN201 — coord.notify.DrainRe
     return result
 
 
+def _phantom_heal_tick(config: Config) -> list:  # noqa: ANN201 — list[PhantomRowHeal]
+    """Run the #2536 phantom-row auto-heal sweep for one daemon tick (#2570).
+
+    Thin wrapper around :func:`coord.notify._sweep_phantom_rows` — extracted
+    as a module-level function, mirroring ``_notify_drain_tick`` /
+    ``_reap_merged_sessions_tick`` etc., so tests can call it directly
+    without wiring up the async loop.
+
+    **Why this exists at all, alongside the identical call `coord notify`
+    already makes:** #2570 is the 2026-08-22 incident where
+    `coord-notify.timer` and `coord-drive-queue.service` both exec from
+    `~/.coord-venv` and both died with `ModuleNotFoundError` for 11 hours —
+    the #2536 phantom-row heal, which exists specifically to recover a stuck
+    queue, shared a failure domain with the thing it was designed to
+    recover, and so bought nothing. `coord-serve` is a long-lived process
+    (`Type=simple`, not the timer's oneshot re-exec) that, once started,
+    keeps `coord.notify`/`coord.diagnose` already imported in its own
+    interpreter — the exact reason it kept serving `/board` and `/status`
+    the whole 11h outage while both timers were down. Calling the sweep
+    from *this* process's own tick loop (`_phantom_heal_loop` below) gives
+    the heal a second, independent path that survives a `~/.coord-venv`
+    break the timer doesn't, without touching `coord-notify.timer` itself
+    (still the sanctioned driver for completion/failure/review
+    notifications — see its own docstring).
+    """
+    from coord.notify import _sweep_phantom_rows  # noqa: PLC0415
+
+    return _sweep_phantom_rows(config)
+
+
 def _audit_housekeeping_sweep(swept: dict) -> None:
     """One operational row summarizing a housekeeping archival sweep
     (#762's ``housekeeping.sweep()``, #1038's audit).  Called only when the
@@ -6965,6 +6995,47 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("fleet-health refresh failed", exc_info=True)
 
+        # #2570: the #2536 phantom-row auto-heal, run a SECOND time from
+        # inside this long-lived process rather than relying solely on
+        # `coord-notify.timer`'s oneshot `~/.coord-venv/bin/coord notify`
+        # subprocess. That timer re-execs from the venv on every fire, so a
+        # corrupted `~/.coord-venv` (a bad editable install — #2569 — a
+        # partial wheel, a disk error) silently takes out the heal at the
+        # exact same instant it takes out the drive-queue tick the heal
+        # exists to recover from; a watchdog sharing a failure domain with
+        # its subject is not a watchdog. This daemon is `Type=simple`, not
+        # a re-exec'd oneshot: once running, it keeps `coord.notify` /
+        # `coord.diagnose` already imported in memory, so this loop keeps
+        # healing phantom rows for as long as the process itself stays up
+        # — exactly the property that let `coord-serve` keep serving
+        # `/board`/`/status` for the entire 2026-08-22 11h outage while
+        # both venv-dependent timers were down. Own loop (not a `_tick_loop`
+        # step) for the same reason as `_health_refresh_loop` just above:
+        # the sweep's liveness check can fan out an HTTP `/status` call or
+        # an SSH/tmux probe per aged `running` row, plus a GitHub comment
+        # per row healed — it must never be held up behind, or hold up,
+        # the reconcile/enqueue/drain steps below. Best-effort per pass —
+        # mirrors every other refresh loop here. Default cadence matches
+        # `coord-notify.timer`'s own 5-minute fire; 0 disables (falling
+        # back to relying on the timer alone, i.e. pre-#2570 behaviour).
+        # Governed the same as the timer's own sweep by
+        # `pipeline.auto_heal_phantom_rows` (checked inside
+        # `_sweep_phantom_rows` itself, not duplicated here).
+        try:
+            phantom_heal_interval = float(
+                os.environ.get("COORD_PHANTOM_HEAL_INTERVAL", "300")
+            )
+        except ValueError:
+            phantom_heal_interval = 300.0
+
+        async def _phantom_heal_loop() -> None:
+            while True:
+                await asyncio.sleep(phantom_heal_interval)
+                try:
+                    await run_in_threadpool(_phantom_heal_tick, config)
+                except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                    log.warning("phantom-row heal tick failed", exc_info=True)
+
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             nonlocal last_notify_drain, last_notifier, last_portal_sync
@@ -7440,10 +7511,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 if interval > 0 and health_poll_interval > 0
                 else None
             )
+            phantom_heal_task = (
+                asyncio.create_task(_phantom_heal_loop())
+                if interval > 0 and phantom_heal_interval > 0
+                else None
+            )
             try:
                 yield
             finally:
-                for t in (task, gate_task, health_task):
+                for t in (task, gate_task, health_task, phantom_heal_task):
                     if t is not None:
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
