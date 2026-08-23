@@ -2700,6 +2700,41 @@ class TestConfirmedPassVerdictSignalKill:
         assert "REFUTED" not in reason
         assert "UNCONFIRMED" in reason
 
+    def test_exit_127_confirmation_is_also_unconfirmed_not_failed(self) -> None:
+        """#2596's acceptance explicitly names exit 127 alongside SIGTERM: a
+        missing toolchain (`command not found`) is `KIND_INFRA`, and
+        `_confirmed_pass_verdict` must treat it exactly like `KIND_SIGNAL` —
+        fall back to the worker's claim, never flip the gate to `failed`."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        missing_toolchain = ct.ConfirmationResult(
+            kind=ct.KIND_INFRA,
+            reason=(
+                "confirmation could not run the suite command (exit 127): "
+                "the toolchain is missing on this machine, so the suite "
+                "never executed and NOTHING was learned about the branch — "
+                "falling back to the worker's own claim (#1814)"
+            ),
+            returncode=127,
+        )
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with patch(
+            "coord.notify._run_pass_confirmation", return_value=missing_toolchain,
+        ):
+            state, reason = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed", (
+            f"exit 127 never ran the suite — it must fall back to the "
+            f"worker's own claim, not fail closed (got state={state!r}, "
+            f"reason={reason!r})"
+        )
+        assert "REFUTED" not in reason
+        assert "UNCONFIRMED" in reason
+
 
 class _FakeAssignClient:
     """Minimal agent stand-in for `dispatch_smoke`: /health has no

@@ -363,6 +363,58 @@ class TestConfirmBranch:
             "attempted, same as a real build failure"
         )
 
+    def test_permission_denied_exit_is_inconclusive_not_a_refutation(
+        self, checkout: Path
+    ) -> None:
+        """#2596: exit 126 ("found but not executable") is the same
+        toolchain-problem shape as 127's "not found" — a permission bit
+        dropped on a build script, not a real branch failure.
+        """
+        runner = _ScriptedRunner(
+            default=_FakeProc(126, stderr="run-the-suite: Permission denied")
+        )
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == KIND_INFRA, result.reason
+        assert result.refuted is False
+        assert result.inconclusive is True
+
+    def test_nonzero_exit_with_no_captured_output_is_inconclusive(
+        self, checkout: Path
+    ) -> None:
+        """#2596: a command that ran to completion, returned nonzero, and
+        captured NOTHING (no stdout, no stderr) has no evidence behind it —
+        a crash with no message, an OOM-kill, a runner that swallowed its
+        own output. Refuting a pass claim on zero bytes of evidence is
+        exactly the shape #2532's acceptance driver hit (a bare non-zero
+        exit folded into a false-red trust gate with an empty reason
+        string) — this must not become a `coord fix` briefing with nothing
+        in it to fix.
+        """
+        runner = _ScriptedRunner(default=_FakeProc(1, stdout="", stderr=""))
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == ct.KIND_NO_OUTPUT, result.reason
+        assert result.refuted is False
+        assert result.inconclusive is True
+        assert result.returncode == 1
+
+    def test_nonzero_exit_with_whitespace_only_output_is_also_no_output(
+        self, checkout: Path
+    ) -> None:
+        """Whitespace is not evidence either — guards against a runner that
+        prints only blank lines before dying."""
+        runner = _ScriptedRunner(default=_FakeProc(1, stdout="\n\n  \n"))
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == ct.KIND_NO_OUTPUT, result.reason
+
     def test_every_kind_the_module_emits_lands_in_exactly_one_bucket(
         self,
     ) -> None:
@@ -382,6 +434,7 @@ class TestConfirmBranch:
             KIND_INFRA,
             KIND_TIMEOUT,
             ct.KIND_SIGNAL,
+            ct.KIND_NO_OUTPUT,
             KIND_BASELINE_RED,
             KIND_BUILD,
             KIND_SUITE,
@@ -417,6 +470,11 @@ class TestConfirmBranch:
             "a kind that both refutes and is inconclusive makes the verdict "
             "depend on which property notify.py happens to test first"
         )
+
+    def test_no_output_is_inconclusive_and_never_refuting(self) -> None:
+        """#2596's version of the #2527 pin above, for the other new kind."""
+        assert ct.KIND_NO_OUTPUT in ct.INCONCLUSIVE_KINDS
+        assert ct.KIND_NO_OUTPUT not in ct.REFUTING_KINDS
 
     def test_refuting_kinds_is_exactly_build_and_suite(self) -> None:
         """Deliberately a change-detector.
@@ -574,7 +632,8 @@ class TestConfirmBranchLocking:
         config = _StubConfig(repo_path=str(checkout))
 
         first = ct.confirm_branch(
-            "api", BRANCH, config, runner=_ScriptedRunner(default=_FakeProc(1)),
+            "api", BRANCH, config,
+            runner=_ScriptedRunner(default=_FakeProc(1, stdout="1 failed")),
         )
         assert first.refuted
 
