@@ -1,0 +1,27 @@
+# Fires coord-fleet-watchdog.service hourly — the "broad net" cadence from
+# #2580 (the "tripwire" cadence is the `OnFailure=` chaining on
+# coord-drive-queue.service / coord-notify.service instead; see those units).
+# See coord-fleet-watchdog.service's header for the full rationale.
+#
+# Hourly, not tighter: this is a sweep over conditions that, by design, take
+# hours to matter (a stale git lock, an orphaned worktree, a unit stuck
+# failed) — the minutes-scale response for the one condition that doesn't
+# tolerate an hour of delay (a dead venv breaking the pipeline drivers) comes
+# from the OnFailure= tripwire, not this timer.
+#
+# Persistent=true: if the host was down/rebooted when a fire was missed, the
+# next boot catches it up immediately rather than waiting up to an hour.
+#
+# Install: see deploy/coord-fleet-watchdog.service's header.
+
+[Unit]
+Description=Hourly fleet watchdog sweep (#2580)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

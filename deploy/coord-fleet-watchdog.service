@@ -1,0 +1,83 @@
+# coord-fleet-watchdog.service — the repair half of #2580, paired with
+# coord-fleet-watchdog.timer (hourly) and, since #2580, chained via
+# `OnFailure=` off coord-drive-queue.service / coord-notify.service (see
+# those units' [Unit] sections) as an immediate tripwire rather than waiting
+# up to an hour for the next scheduled sweep.
+#
+# Runs scripts/fleet_watchdog.py under **/usr/bin/python3** — the
+# root-owned system interpreter, NEVER ~/.coord-venv/bin/python. That is the
+# entire reason this unit exists: on 2026-08-22 the fleet was dead for 11h
+# because ~/.coord-venv became an editable install pointing at a deleted
+# worktree, and every existing recovery path — the tick, `coord notify`
+# (carrying #2536's phantom-row auto-heal), `coord notifier` — execs from
+# that exact venv and died with it (#2569/#2570/#2572). This watchdog is
+# stdlib-only and never imports `coord` (enforced by
+# tests/test_fleet_watchdog.py), so it stays alive through the one failure
+# class that took everything else down with it.
+#
+# scripts/fleet_watchdog.py's own module docstring is the source of truth
+# for what it checks and repairs (Tier 1, auto-repaired, precondition
+# re-checked at repair time) versus what it only detects and escalates
+# (Tier 2 — never repaired; see the "Timer disabled / inactive" trap in
+# CLAUDE.md's issue history before "fixing" that). A declarative sentinel at
+# ~/.coord/watchdog-suppress.json keeps it from undoing a deliberate
+# operator decision (e.g. coord-release-propagate.timer being disabled on
+# purpose); a small state file at ~/.coord/watchdog-state.json rate-limits
+# repeated repairs of the identical condition so a recurring fault gets
+# escalated instead of silently patched forever (see #2314 -> #2569).
+#
+# Install ONLY on the boxes this watchdog should sweep — in practice every
+# machine that execs `coord`/`coord-agent` out of ~/.coord-venv, i.e. every
+# agent host, not just the daemon host. Each machine's ~/.coord-venv,
+# ~/.local/bin/coord and ~/.coord/worktrees are its own local state.
+#
+# Install:
+#   mkdir -p ~/.local/bin ~/.config/systemd/user
+#   cp scripts/fleet_watchdog.py scripts/coord-venv-rollback.sh ~/.local/bin/
+#   chmod +x ~/.local/bin/fleet_watchdog.py ~/.local/bin/coord-venv-rollback.sh
+#   cp deploy/coord-fleet-watchdog.service deploy/coord-fleet-watchdog.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-fleet-watchdog.timer
+#
+# This is a Type=oneshot service, fired BY THE TIMER (and by the two
+# OnFailure= units above) — do not `systemctl --user enable
+# coord-fleet-watchdog.service` directly (no [Install] section here; the
+# timer unit is what you enable).
+#
+# --board-url defaults to http://localhost:7435, which is only correct on
+# the box that itself runs `coord serve`. On every other agent machine,
+# override it via ~/.config/coord/fleet-watchdog.env (plain KEY=VALUE, no
+# YAML, no coord — same shape as coord-failure-notify.service's env file):
+#
+#   COORD_BOARD_URL=http://dellserver:7435
+#
+# Without a reachable board, the one Tier-1 check that needs it (orphaned
+# worktrees, #2580 item 6) degrades to "never repair" rather than guessing —
+# see scripts/fleet_watchdog.py's `_query_board_live_assignment`.
+#
+# See docs/AGENT_OPERATIONS.md → "Fleet watchdog (coord-fleet-watchdog)".
+
+[Unit]
+Description=Fleet watchdog — stdlib-only, coord-independent repair sweep (#2580)
+Documentation=https://github.com/JDonaghy/code-coordinator/issues/2580
+
+[Service]
+Type=oneshot
+# Default, overridable by the env file below. systemd ExecStart= supports
+# plain $VAR/${VAR} substitution but NOT bash's ${VAR:-default} syntax, so
+# the default has to be its own Environment= line, applied before (and
+# therefore overridable by) EnvironmentFile= — later declarations win for
+# the same key.
+Environment=COORD_BOARD_URL=http://localhost:7435
+# `-` prefix: a missing env file is not an error — the default above still
+# applies. This is unit-local (systemd does not share `Environment=` across
+# units — see deploy/coord-web.service's #2095 note for the incident that
+# taught that lesson the hard way), so it is scoped to exactly this unit.
+EnvironmentFile=-%h/.config/coord/fleet-watchdog.env
+ExecStart=/usr/bin/python3 %h/.local/bin/fleet_watchdog.py --board-url ${COORD_BOARD_URL}
+# Generous relative to a normal sweep (a handful of subprocess calls plus
+# one optional HTTP GET per stale worktree candidate), well below the
+# timer's hourly cadence — same posture as every other oneshot unit in this
+# directory (coord-drive-queue.service, coord-db-backup.service).
+TimeoutStartSec=600
