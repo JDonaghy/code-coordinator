@@ -2736,6 +2736,143 @@ class TestConfirmedPassVerdictSignalKill:
         assert "UNCONFIRMED" in reason
 
 
+class TestConfirmedPassVerdictPostApprovalReconcile:
+    """#2579: a #2464 confirmation that REFUTES a pass claim on a work row
+    whose review has *already* rendered a terminal ``"approve"`` verdict must
+    not be recorded as a plain ``"failed"`` — every automatic fix-dispatch
+    door (`coord/drive.py`'s ``_decide_test``, `coord/commands/
+    plan_followup.py`'s `fix` gate) keys off that literal string, so a plain
+    ``"failed"`` here is indistinguishable from an ordinary Test-stage
+    failure and gets silently bounced to a fix worker as if a human reviewer
+    hadn't already signed off on the exact code being refuted (the #2528
+    race: review dispatch is gated on `test_state`, not on this out-of-band
+    confirmation, so approval can land before the confirmation does).
+
+    A row with no review verdict yet, or a non-terminal / `request-changes`
+    verdict, must keep exactly today's behaviour — plain `"failed"` — so
+    this must not widen into a general suppression of refutations.
+    """
+
+    def _transition(self):
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        return Transition(
+            assignment_id="smoke-1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def _record_work(self, assignment_id: str) -> None:
+        from coord.models import Assignment
+        from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+        work = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Fix thing",
+            type="work",
+            status="done",
+            branch="issue-42-fix-thing",
+        )
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    def _refuted_result(self):
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        return ct.ConfirmationResult(
+            kind=ct.KIND_SUITE,
+            reason="the independently-run suite command FAILED (exit 1)",
+            returncode=1,
+        )
+
+    def test_refutation_after_an_approved_review_is_not_recorded_failed(
+        self, coord_db,
+    ) -> None:
+        from coord.notify import (  # noqa: PLC0415
+            TEST_STATE_CONTESTED,
+            _confirmed_pass_verdict,
+        )
+        from coord.state import record_work_review_verdict  # noqa: PLC0415
+
+        self._record_work("work-1")
+        record_work_review_verdict("work-1", "approve")
+
+        with patch(
+            "coord.notify._run_pass_confirmation",
+            return_value=self._refuted_result(),
+        ):
+            state, reason = _confirmed_pass_verdict(
+                self._transition(), {"branch": "issue-42-fix-thing"}, "work-1",
+                claim_reason="worker self-recorded via `coord test` (#2217)",
+            )
+
+        assert state == TEST_STATE_CONTESTED, (
+            "a refutation contradicting an ALREADY-APPROVED review must not "
+            f"be recorded as a plain 'failed' — got {state!r}"
+        )
+        assert state != "failed"
+        assert state not in ("passed", "skipped"), (
+            "the merge gate must still refuse this row — only "
+            "test_state in ('passed', 'skipped') satisfies it"
+        )
+        assert "#2579" in reason
+        assert "approve" in reason.lower()
+        assert "the independently-run suite command FAILED" in reason, (
+            "the confirmation's own reason must still be quoted, not "
+            f"replaced: {reason!r}"
+        )
+
+    def test_refutation_with_no_review_yet_keeps_todays_failed_behaviour(
+        self, coord_db,
+    ) -> None:
+        """No `record_work_review_verdict` call at all — the common case,
+        completely unaffected by #2579."""
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        self._record_work("work-2")
+
+        with patch(
+            "coord.notify._run_pass_confirmation",
+            return_value=self._refuted_result(),
+        ):
+            state, reason = _confirmed_pass_verdict(
+                self._transition(), {"branch": "issue-42-fix-thing"}, "work-2",
+                claim_reason="worker self-recorded via `coord test` (#2217)",
+            )
+
+        assert state == "failed"
+        assert "REFUTED" in reason
+
+    def test_refutation_with_a_request_changes_review_keeps_todays_failed_behaviour(
+        self, coord_db,
+    ) -> None:
+        """A non-terminal-approved verdict (`request-changes`) must not
+        widen the #2579 reconciliation into a general suppression of
+        refutations — only a terminal APPROVE does."""
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+        from coord.state import record_work_review_verdict  # noqa: PLC0415
+
+        self._record_work("work-3")
+        record_work_review_verdict("work-3", "request-changes")
+
+        with patch(
+            "coord.notify._run_pass_confirmation",
+            return_value=self._refuted_result(),
+        ):
+            state, reason = _confirmed_pass_verdict(
+                self._transition(), {"branch": "issue-42-fix-thing"}, "work-3",
+                claim_reason="worker self-recorded via `coord test` (#2217)",
+            )
+
+        assert state == "failed"
+        assert "REFUTED" in reason
+
+
 class _FakeAssignClient:
     """Minimal agent stand-in for `dispatch_smoke`: /health has no
     `tool_versions` (the #1570 D probe fails open) and /assign returns an id."""

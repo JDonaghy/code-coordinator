@@ -2376,6 +2376,55 @@ def load_assignment_test_state(assignment_id: str) -> str | None:
     return row["test_state"] if hasattr(row, "keys") else row[0]
 
 
+def load_assignment_review_verdict(assignment_id: str) -> tuple[str | None, str | None]:
+    """#2579: the parent WORK row's own ``(review_state, review_verdict)``.
+
+    ``record_work_review_verdict`` stamps a completed review's verdict
+    directly onto the *parent* work row (not just the ``type="review"`` child
+    assignment) the moment the pipeline decides to advance — so this single-
+    row read is enough to tell "this work row's review already reached a
+    terminal, approved verdict" without walking the whole board the way
+    ``coord/review.py``'s #1565 dispatch-side backstop does (that one lacks a
+    single ``assignment_id`` to key off and has to scan for the linked review
+    row instead).
+
+    Used by ``coord notify``'s #2464 confirmation reap
+    (:func:`coord.notify._confirmed_pass_verdict`) to detect the #2528/#2579
+    race: an out-of-band re-run refuting a pass claim *after* that same work
+    row's review already approved it. Same daemon-first, local-fallback
+    routing as :func:`load_assignment_test_state`. Returns ``(None, None)``
+    when the row is absent, both columns are NULL, or a remote read failed —
+    every one of those means "no terminal verdict I can see", and callers
+    must treat that the same as "no review yet", never as an approval.
+    """
+    if not assignment_id:
+        return (None, None)
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return (row.get("review_state"), row.get("review_verdict"))
+            return (None, None)
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return (None, None)
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return (None, None)
+    if row is None:
+        return (None, None)
+    if hasattr(row, "keys"):
+        return (row["review_state"], row["review_verdict"])
+    return (row[0], row[1])
+
+
 def _load_assignment_review_findings_local(
     assignment_id: str,
 ) -> tuple[str, str] | None:

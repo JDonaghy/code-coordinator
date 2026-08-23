@@ -1963,6 +1963,24 @@ def _smoke_worker_verdict(
 NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
 
 
+#: #2579: the ``test_state`` written when a #2464 confirmation REFUTES a pass
+#: claim on a work row whose review has *already* rendered a terminal
+#: ``"approve"`` verdict (the #2528 race — dispatch fast on the self-reported
+#: pass, reconcile once the independent re-run lands). Deliberately distinct
+#: from ``"failed"``: every automatic fix-dispatch door this repo has
+#: (`coord/drive.py`'s ``_decide_test``, `coord/commands/plan_followup.py`'s
+#: `fix` gate) keys off the literal string ``"failed"``, so writing anything
+#: else there means a genuine post-approval refutation is never mistaken for
+#: an ordinary Test-stage failure and silently bounced to a fix worker as if
+#: nothing unusual had happened. It still fails the merge gate exactly like
+#: ``"failed"`` does — `coord/merge_queue.py` only treats
+#: ``test_state in ("passed", "skipped")`` as satisfied — so this can never
+#: read as a clean pass either. `test_reason` carries the full story for
+#: `coord log`/`coord status`/the GitHub comment; this constant is only the
+#: board-column value.
+TEST_STATE_CONTESTED = "contested"
+
+
 def _run_pass_confirmation(transition: Transition, entry: dict):
     """#2464: independently re-run the repo's real build+test for this branch.
 
@@ -2064,6 +2082,21 @@ def _confirmed_pass_verdict(
 
     * **refuted** — a command ran to completion and returned nonzero. The claim
       was wrong; record ``failed``. This is the arm #2464 exists for.
+
+      #2579: UNLESS the parent work row's own review already rendered a
+      terminal ``"approve"`` verdict — `dispatch_pending_reviews` gates
+      automatic review dispatch on `test_state`, not on this confirmation
+      (#2528: serializing every review behind the out-of-band re-run would
+      add its full latency, up to over an hour, to every review, not just
+      the refuted ones), so a review can complete and approve before its own
+      confirmation lands. Recording a plain ``failed`` in that case is
+      indistinguishable from an ordinary Test-stage failure and silently
+      chains a `coord fix` bounce onto a branch a human reviewer already
+      signed off on. Record :data:`TEST_STATE_CONTESTED` instead — still
+      fails the merge gate, but never matches the literal ``"failed"`` every
+      automatic fix-dispatch door keys off. A row with no review verdict
+      yet, or a non-terminal / ``request-changes`` verdict, is unaffected —
+      this must not widen into a general suppression of refutations.
     * **baseline-red** — it failed identically on the merge-base, so the branch
       is not at fault. ``skipped``, matching #2170's existing convention: the
       merge gate treats it as satisfied and no fix round is burned.
@@ -2119,6 +2152,46 @@ def _confirmed_pass_verdict(
             transition.assignment_id, transition.repo_name, result.reason,
             result.output,
         )
+
+        # #2579: check the PARENT's own review verdict before recording a
+        # plain "failed" — a terminal "approve" here means the #2528 race
+        # fired: review dispatch (gated on `test_state`, not on this
+        # confirmation) already ran, completed, and approved while this
+        # out-of-band re-run was still in flight. `record_work_review_verdict`
+        # (coord/state.py) is the single place that stamps `review_verdict`
+        # onto a work row, and only ever with the pipeline's own winning
+        # terminal verdict — so a non-None value here is real, not a race on
+        # this same write. A `None` or `"request-changes"` verdict is exactly
+        # today's behaviour: keep it, don't widen this into a general
+        # suppression of refutations.
+        from coord.state import load_assignment_review_verdict  # noqa: PLC0415
+
+        _review_state, _review_verdict = load_assignment_review_verdict(parent_id)
+        if _review_verdict == "approve":
+            log.warning(
+                "smoke %s: parent %s's review already carries a terminal "
+                "'approve' verdict — recording %r instead of 'failed' so this "
+                "post-approval refutation is never mistaken for an ordinary "
+                "Test-stage failure and silently bounced to a fix worker "
+                "(#2579).",
+                transition.assignment_id, parent_id, TEST_STATE_CONTESTED,
+            )
+            return (
+                TEST_STATE_CONTESTED,
+                f"CONTESTED (#2579): an independent re-run (#2464) REFUTED "
+                f"this claimed pass ({claim_reason}) AFTER its review had "
+                f"already approved it (review_state={_review_state!r}) — "
+                f"{result.reason}. This is the #2528 dispatch-fast/reconcile-"
+                "after-the-fact race, not an ordinary test failure: the "
+                "approved review and the refuting re-run disagree, and that "
+                "conflict needs a human, not an automatic fix dispatch. The "
+                "merge gate stays shut (this is not 'passed'/'skipped'), but "
+                "no fix round is auto-dispatched — after checking `coord log "
+                f"{parent_id}` and the confirmation output, recover with "
+                f"`coord fix --force --guidance <what's broken> {parent_id}` "
+                "or re-dispatch the Test stage by hand.",
+            )
+
         return (
             "failed",
             f"REFUTED by an independent re-run (#2464): {result.reason}. The "
