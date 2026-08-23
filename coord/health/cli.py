@@ -61,6 +61,19 @@ EXIT_CRIT = 2
     default=False,
     help=f"Exit {EXIT_CRIT} on any CRIT, {EXIT_WARN} on any WARN (default: always 0).",
 )
+@click.option(
+    "--fix",
+    is_flag=True,
+    default=False,
+    help=(
+        "Apply the remedy for every failing check on an explicit allow-list "
+        "(#2581) — idempotent, reversible, machine-local repairs only. A "
+        "check not on the allow-list, or a finding covered by "
+        "~/.coord/watchdog-suppress.json, is reported here exactly like "
+        "without --fix and never touched. Run `coord health` again "
+        "afterward to confirm the new state — this does not re-check."
+    ),
+)
 def health(
     config_path: Path,
     local: bool,
@@ -69,12 +82,14 @@ def health(
     only: tuple[str, ...],
     verbose: bool,
     exit_code: bool,
+    fix: bool,
 ) -> None:
     """Report how much headroom is left on this machine and its checkouts.
 
     Read-only and non-destructive by construction: every probe stats, reads,
     or shells out to a read-only command. Nothing here writes, prunes, or
-    remediates — deciding what may self-heal is a separate call.
+    remediates on its own — pass ``--fix`` to additionally apply the
+    allow-listed remedies (#2581).
     """
     config = _load_config_or_none(config_path)
     ctx = build_context(config, allow_network=not no_network)
@@ -91,16 +106,44 @@ def health(
     scopes = ("machine", "checkout") if local else None
     report = run_all(ctx, scopes=scopes, only=list(only) or None)
 
+    fix_outcomes = None
+    if fix:
+        from coord.health.registry import apply_fixes  # noqa: PLC0415
+
+        fix_outcomes = apply_fixes(ctx, report)
+
     if output_json:
-        click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        payload = report.to_dict()
+        if fix_outcomes is not None:
+            payload["fixes"] = [o.to_dict() for o in fix_outcomes]
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
         click.echo(render_report(report, verbose=verbose))
+        if fix_outcomes is not None:
+            click.echo("")
+            click.echo(_render_fix_outcomes(fix_outcomes))
 
     if exit_code:
         if report.severity is Severity.CRIT:
             raise SystemExit(EXIT_CRIT)
         if report.severity is Severity.WARN:
             raise SystemExit(EXIT_WARN)
+
+
+def _render_fix_outcomes(outcomes: list) -> str:
+    """Plain-text summary of a ``--fix`` pass.
+
+    Deliberately local to the CLI rather than added to
+    :mod:`coord.health.render` — the renderer's contract is "lay out
+    already-decided ``CheckResult``s", and a ``FixOutcome`` is a different
+    (much smaller) shape with no severity to sort by.
+    """
+    if not outcomes:
+        return "--fix: nothing to apply (every non-OK finding is either already handled, not allow-listed, or suppressed)."
+    lines = [f"--fix: {len(outcomes)} outcome(s):"]
+    for o in outcomes:
+        lines.append(f"  [{o.status}] {o.key}: {o.message}")
+    return "\n".join(lines)
 
 
 def _load_config_or_none(config_path: Path):

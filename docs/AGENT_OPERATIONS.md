@@ -1052,6 +1052,69 @@ cleanly is left as a follow-up rather than done as a side effect of #2580.
 `tests/test_deploy_manifest.py` only asserts every `ROLE_UNITS` entry ships a
 real file, not the reverse, so this is a safe, intentional gap, not drift.
 
+## `coord health --fix` (#2581)
+
+`coord health` has always printed a remedy command per failing check; `--fix`
+applies it — but only for an **explicit allow-list**, opted in per check via
+`fix=` at registration (`coord/health/registry.py`'s `Check.fix` /
+`check(..., fix=...)`), never inferred from "has a `detail` string". Today
+that's `index_lock`, `worktrees`, `cargo_targets`, and `graph` (each check's
+own module carries its `fix_*` function next to the probe it repairs — see
+`coord/health/checks/{index_lock,worktrees,cargo_targets,graph}.py`).
+Everything else — `agent_version`, `timer_active`/`unit_enablement`,
+`unit_drift`, `coord-web ci pin`, a base checkout's own `git pull` — keeps
+printing its remedy for a human, exactly as before `--fix` existed; see the
+issue for why each of those specifically stays manual.
+
+**Why this isn't just `scripts/fleet_watchdog.py` (#2580).** That script is
+deliberately confined to the handful of bootstrap failures that can't depend
+on `coord` importing (a broken `~/.coord-venv`, `~/.local/bin/coord` unlinked
+from it) — everything else belongs inside `coord`, next to the check that
+detects it, so there is exactly one implementation of each remedy rather than
+two that drift. In practice `scripts/fleet_watchdog.py`'s Tier 1 already also
+auto-repairs a stale `.git/index.lock`, an expired release cordon, and an
+orphaned worktree (conditions that predate this split and haven't been pulled
+out of the watchdog yet) — `index_lock` and `worktrees` here are the
+`coord`-native equivalents, deliberately keyed the same way (see below) so
+the two surfaces never disagree about what's suppressed.
+
+**Same intent sentinel as #2580, same file.** `~/.coord/watchdog-suppress.json`
+— a fixer never applies a suppressed finding, only reports it. Suppression is
+checked at two granularities: the whole `CheckResult` row (`"graph"` or
+`"graph:claude-coordinator"`, either suppresses that finding), and, for a
+check whose one row can bundle several independently-repairable items
+(`index_lock`'s several stale locks, `worktrees`'s several stale worktrees),
+per item — using the exact same keys `scripts/fleet_watchdog.py` uses for the
+identical condition (`stale-git-lock:<path>`, `<assignment_id>` /
+`orphaned-worktree:<assignment_id>`), so one sentinel entry covers both tools.
+
+**Idempotent by construction.** `apply_fixes` skips every `OK` row outright —
+fix a finding once, the next `coord health` reports it `OK`, and a second
+`--fix` never even calls that check's fixer. Each fixer also re-verifies its
+own precondition against live state before acting (mirroring
+`scripts/fleet_watchdog.py`'s Tier-1 re-check), so calling one directly twice
+in a row with the same stale finding is still safe — the second call finds
+nothing left to do rather than erroring on an already-repaired condition.
+
+```bash
+coord health --fix           # apply allow-listed remedies, report the rest
+coord health --fix --json    # same, plus a `"fixes"` array in the JSON contract
+coord health                 # re-run afterward to confirm the new state — `--fix` does not re-check
+```
+
+`worktrees`' fixer is worth calling out: the *probe* is deliberately mtime-only
+(cheap, no board, no network — see the check's own module docstring), but the
+*fixer* is not under that constraint. It re-derives the precise
+board/tmux-confirmed answer `coord diagnose --orphan-worktrees` already
+computes and only ever removes a worktree that sweep positively confirms is
+orphaned; anything the mtime probe flagged that the precise sweep can't
+confirm (no local checkout to check against, an unreachable board, a live
+assignment) is left alone and reported `no_action`, never guessed at.
+`cargo_targets`' fixer is scoped to the *shared* cache
+(`~/.coord/cargo-target/<repo>`) only — the same thing already GC'd
+automatically after every worktree clean — and never touches a per-checkout
+`target/` a human may be building in.
+
 ## Daemon-host unit inventory — what dellserver runs
 
 **If the daemon host is lost, this is the list you rebuild from.** Which units

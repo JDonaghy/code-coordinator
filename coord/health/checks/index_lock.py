@@ -39,8 +39,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import check
+from coord.health.models import CheckResult, FixOutcome, HealthContext, Severity
+from coord.health.registry import check, is_suppressed, load_suppressions
 from coord.health.units import human_hours
 
 # Overridable in tests; there is no config knob for this because /proc is a
@@ -103,12 +103,106 @@ def has_open_holder(lock_path: Path, *, proc_root: Path | None = None) -> bool |
     return False
 
 
+def _fix_one_lock(
+    ctx: HealthContext,
+    *,
+    path_str: str,
+    name: str,
+    stale_seconds: float,
+    suppressions: dict,
+) -> FixOutcome:
+    """Remove one stale lock, re-verifying the precondition fresh (#2581).
+
+    Never trusts the ``CheckResult`` that triggered this: the world may have
+    moved on since the report ran (the lock's holder finished, the operator
+    already cleared it, the age no longer clears the threshold). Re-checking
+    here is also what makes running ``--fix`` twice in a row a no-op — the
+    second pass finds nothing left to do rather than erroring on an already-
+    gone path.
+    """
+    # #2581: per-item suppression using the SAME key `scripts/fleet_watchdog.
+    # py`'s identical Tier-1 repair uses for this exact condition, so one
+    # sentinel entry covers both surfaces.
+    suppressed, entry = is_suppressed(
+        suppressions, (f"stale-git-lock:{path_str}", name), now=ctx.now
+    )
+    if suppressed:
+        reason = (entry or {}).get("reason") or "suppressed"
+        return FixOutcome(
+            check_id="index_lock", subject=name, status="suppressed",
+            message=f"suppressed: {reason}",
+        )
+
+    path = Path(path_str)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return FixOutcome(
+            check_id="index_lock", subject=name, status="no_action",
+            message=f"{path} already gone",
+        )
+
+    age = ctx.now - mtime
+    if age < stale_seconds:
+        return FixOutcome(
+            check_id="index_lock", subject=name, status="no_action",
+            message=f"{path} is no longer stale ({human_hours(age)} old)",
+        )
+
+    holder = has_open_holder(path)
+    if holder in (True, None):
+        return FixOutcome(
+            check_id="index_lock", subject=name, status="error",
+            message=f"cannot confirm no live holder for {path} (holder={holder!r}) — refusing",
+            error="unconfirmed holder",
+        )
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        return FixOutcome(
+            check_id="index_lock", subject=name, status="error",
+            message=f"failed to remove {path}",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return FixOutcome(
+        check_id="index_lock", subject=name, status="applied",
+        message=f"removed stale lock {path} ({human_hours(age)} old)",
+    )
+
+
+def fix_index_lock(ctx: HealthContext, result: CheckResult) -> list[FixOutcome]:
+    """#2581 opt-in remedy: ``rm`` every still-stale, still-unheld lock.
+
+    ``result`` may name several checkouts' locks in one row (see the probe's
+    own ``values["stale"]``); each is independently re-verified and
+    suppression-checked, so one bad lock never blocks the rest.
+    """
+    stale = result.values.get("stale") or []
+    if not stale:
+        return []
+    stale_minutes = float(result.values.get("stale_minutes_threshold", _DEFAULT_STALE_MINUTES))
+    stale_seconds = stale_minutes * 60.0
+    suppressions = load_suppressions(ctx.coord_dir)
+    return [
+        _fix_one_lock(
+            ctx,
+            path_str=entry["path"],
+            name=entry.get("name") or entry["path"],
+            stale_seconds=stale_seconds,
+            suppressions=suppressions,
+        )
+        for entry in stale
+    ]
+
+
 @check(
     id="index_lock",
     scope="machine",
     title="index lock",
     order=31,
     description="Stale .git/index.lock files blocking a checkout's working tree.",
+    fix=fix_index_lock,
 )
 def probe_index_lock(ctx: HealthContext) -> CheckResult | None:
     """One machine-scope result: every known checkout's index.lock, if stale."""

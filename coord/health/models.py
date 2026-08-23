@@ -168,6 +168,56 @@ def unknown_result(
 
 
 @dataclass(frozen=True)
+class FixOutcome:
+    """One answer to "did applying this check's remedy do anything?" (#2581).
+
+    Mirrors :class:`CheckResult`'s posture: a **fixer** (the ``fix`` callable
+    on an allow-listed :class:`~coord.health.registry.Check`) is the only
+    thing allowed to decide ``status`` — a renderer or the CLI may format
+    this, never recompute it.
+
+    ``status`` is one of:
+
+    * ``"applied"`` — the remedy ran and changed something.
+    * ``"no_action"`` — the fixer ran but found nothing to do (the
+      condition already resolved, or a re-verified precondition no longer
+      holds). This is what makes re-running ``--fix`` idempotent: a second
+      pass over an already-fixed finding lands here, not on ``"applied"``
+      again.
+    * ``"suppressed"`` — covered by an unexpired entry in
+      ``~/.coord/watchdog-suppress.json`` (the same intent sentinel #2580
+      defines) — reported, never applied.
+    * ``"not_allowlisted"`` — the check has a remedy string but is not one
+      of the explicit opt-in checks (``Check.fix is None``) — reported,
+      never applied. A check earns this by NOT setting ``fix=`` when it is
+      registered; there is no separate list to keep in sync.
+    * ``"error"`` — the fixer raised, or refused after re-verifying (e.g. a
+      lock's holder became unconfirmable between detection and repair).
+    """
+
+    check_id: str
+    subject: str | None
+    status: str
+    message: str
+    error: str | None = None
+
+    @property
+    def key(self) -> str:
+        """Stable identity, same shape as :attr:`CheckResult.key`."""
+        return f"{self.check_id}:{self.subject}" if self.subject else self.check_id
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "check_id": self.check_id,
+            "subject": self.subject,
+            "status": self.status,
+            "message": self.message,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
 class Checkout:
     """One local git checkout a ``checkout``-scoped probe can run against."""
 
