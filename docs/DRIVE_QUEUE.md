@@ -680,6 +680,32 @@ any repo. `--max-parallel-per-repo 0` turns the per-repo ceiling off entirely
 now that #1715 batches revalidation, which is why it is a flag rather than a
 hardcoded 1.
 
+**Set the fleet-wide value in `coordinator.yml`, not a systemd drop-in
+(#2573).** `--max-parallel-per-repo` resolves in order: the flag on this one
+invocation (if given) → `pipeline.max_parallel_per_repo` in
+`~/.coord/coordinator.yml` → `coord.drive_queue.DEFAULT_MAX_PARALLEL_PER_REPO`
+(1). The packaged `deploy/coord-drive-queue.service` deliberately omits the
+flag so this resolution can apply.
+
+```yaml
+pipeline:
+  max_parallel_per_repo: 2
+```
+
+Before #2573 the only way to raise this on a running fleet was a
+`~/.config/systemd/user/coord-drive-queue.service.d/override.conf` drop-in —
+and a drop-in must restate the packaged unit's **entire** `ExecStart=` line to
+change even one flag on it. That restated copy then silently drifts from the
+packaged unit forever after: dellserver's live drop-in, built solely to carry
+`--max-parallel-per-repo 2`, was found to have reset `ExecStart=` back to
+`%h/.local/bin/coord` — reverting #2314's pinned-venv `ExecStart=` path (§5
+above) right back to a path a worker's stray `pip install --user` can
+overwrite, purely as an unnoticed side effect of the drop-in's own existence.
+`coordinator.yml` has no such coupling — it is read fresh on every tick, so
+there is nothing here to drift. If a host still carries an
+`override.conf` that exists only to set this flag, move the value into
+`coordinator.yml` and delete the drop-in.
+
 Two things to know:
 
 * **A repo-limited queue raises no alert.** Every remaining entry waiting on
