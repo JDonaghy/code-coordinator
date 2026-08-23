@@ -51,6 +51,18 @@
 Description=coord notify — periodic pipeline driver (#1311)
 After=network-online.target
 Wants=network-online.target
+# #2572: when this unit itself enters `failed`, escalate through
+# coord-failure-notify.service — a tiny unit with NO dependency on
+# `coord`/Python/~/.coord-venv. #2569/#2570: this unit and
+# coord-drive-queue.service both exec `~/.coord-venv/bin/coord` directly,
+# and when that venv broke (an editable install pointed at a worktree that
+# was later deleted) BOTH units — and the only "nobody is coming" channel,
+# `coord notifier`, which ALSO runs from that same venv (see
+# docs/NOTIFIER.md's "Where it runs") — went dark together for 11 hours
+# with zero operator-visible signal. This is doubly load-bearing on THIS
+# unit specifically: it is the one that would otherwise have been relied on
+# to notice and page. See deploy/coord-failure-notify.service's header.
+OnFailure=coord-failure-notify.service
 
 [Service]
 Type=oneshot

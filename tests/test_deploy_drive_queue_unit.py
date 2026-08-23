@@ -139,3 +139,22 @@ def test_path_comment_names_the_issue() -> None:
     text = UNIT_PATH.read_text()
     assert "#2532" in text
     assert "Environment=PATH=" in text
+
+
+# ── #2572: OnFailure= escalation ─────────────────────────────────────────
+
+
+def test_on_failure_points_at_the_coord_independent_notifier() -> None:
+    """The actual #2572 fix for this unit: when it enters `failed` (e.g. an
+    unreadable board aborting the tick), systemd itself must start a
+    notifier that has no `coord`/Python/~/.coord-venv dependency — the
+    #2569/#2570 incident is exactly the case where all three were the thing
+    that broke, taking `coord notifier` down with them."""
+    unit = _parse_unit(UNIT_PATH)
+    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service"
+
+
+def test_on_failure_comment_names_the_issue() -> None:
+    text = UNIT_PATH.read_text()
+    assert "#2572" in text
+    assert "OnFailure=coord-failure-notify.service" in text

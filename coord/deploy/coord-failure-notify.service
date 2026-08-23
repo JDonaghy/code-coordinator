@@ -1,0 +1,74 @@
+# coord-failure-notify.service — last-resort, coord-INDEPENDENT escalation
+# on ANY coord daemon systemd unit failure (#2572).
+#
+# NOT timer-fired and NOT `enable`d directly (no [Install] section below) —
+# triggered by `OnFailure=coord-failure-notify.service` on
+# coord-drive-queue.service and coord-notify.service (see those units' own
+# [Unit] sections). systemd starts this the instant either of them enters
+# the `failed` state, which is the single highest-signal fleet alarm
+# available and — before this issue — produced nothing at all.
+#
+# #2569/#2570 (2026-08-22): BOTH the `agent_venv` health check (already CRIT
+# from 03:43 on an editable ~/.coord-venv) and coord-drive-queue.service's
+# own well-written self-cordon refusal correctly detected the fault, and
+# neither reached a human for 11 hours — because the one "nobody is coming"
+# channel, `coord notifier`, runs from the exact same `~/.coord-venv` that
+# broke. See #2572.
+#
+# Runs ~/.local/bin/coord-failure-notify.sh (deploy/coord-failure-notify.sh)
+# — see that script's own header for the channels it tries (journal, wall,
+# ntfy) and why it has ZERO dependency on `coord`, Python, `~/.coord-venv`,
+# or any git checkout.
+#
+# Install ONLY on the box(es) running coord-drive-queue.service /
+# coord-notify.service (dellserver in production) — same scope as those
+# units.
+#
+# Install:
+#   mkdir -p ~/.local/bin ~/.config/systemd/user
+#   cp deploy/coord-failure-notify.sh ~/.local/bin/ && chmod +x ~/.local/bin/coord-failure-notify.sh
+#   cp deploy/coord-failure-notify.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#
+# Then make sure `OnFailure=coord-failure-notify.service` is present in the
+# [Unit] section of any unit that should escalate through it — already done
+# for coord-drive-queue.service and coord-notify.service in this directory.
+# `systemctl --user daemon-reload` again after installing/editing those.
+#
+# Optional, but the whole point of the phone-reachable channel: configure
+# the ntfy push by creating ~/.config/coord/failure-notify.env —
+#
+#   COORD_FAILURE_NTFY_URL=http://dellserver:7440
+#   COORD_FAILURE_NTFY_TOPIC=coord-fleet
+#   COORD_FAILURE_NTFY_TOKEN=                     # optional
+#   COORD_FAILURE_NOTIFY_MIN_INTERVAL_SEC=1800    # optional, default 30min
+#
+# Reusing the SAME server/topic `notifications.ntfy_url`/`ntfy_topic`
+# already push to (docs/NOTIFIER.md) is deliberate — one phone channel to
+# watch, not two — but this file is plain KEY=VALUE, never coordinator.yml:
+# reading it costs nothing more than shell-sourcing it. No YAML parser, no
+# Python, nothing that could itself be broken by the exact class of outage
+# this unit exists to escalate. Without this file the script still logs via
+# `logger`/`wall` (see its header) — degraded, not silent.
+#
+# This unit's own execution must never depend on anything that could be down
+# for the same reason as the units it escalates for: no `After=` on
+# coord-agent.service or anything coord-related, no `Requires=` on
+# ~/.coord-venv, nothing. Its only real dependency is network reachability
+# for the (optional) ntfy push, same as the notifier's own transport.
+
+[Unit]
+Description=coord daemon unit failure escalation (#2572)
+Documentation=https://github.com/JDonaghy/code-coordinator/issues/2572
+After=network-online.target
+
+[Service]
+Type=oneshot
+# `-` prefix: a missing env file is not an error — see the script's own
+# fail-soft posture (logger/wall still fire; only the ntfy push needs this).
+EnvironmentFile=-%h/.config/coord/failure-notify.env
+ExecStart=%h/.local/bin/coord-failure-notify.sh
+# Generous relative to a normal run (a few subprocess calls plus one HTTP
+# POST), short enough that a wedged run here can never itself become the
+# thing silently eating the alert.
+TimeoutStartSec=30

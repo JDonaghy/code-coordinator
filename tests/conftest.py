@@ -482,6 +482,25 @@ def _no_real_roll_pending_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_self_cordon_state(monkeypatch, tmp_path):
+    """#2572: never let a test write the OPERATOR'S real
+    ``~/.coord/self_cordon_escalation.json``.
+
+    Same hazard as ``_no_real_roll_pending_store`` immediately above, one
+    file over: this marker tracks how long a self-cordon has persisted, and
+    a leaked test write could either fabricate a 30-minute-old self-cordon
+    out of nothing (spuriously firing the direct ntfy escalation the first
+    time a test's clock crosses the threshold) or mask a real one (clearing
+    it out from under an operator's actual stuck fleet).
+    ``coord.commands.drive_queue._self_cordon_state_path`` reads
+    ``$COORD_SELF_CORDON_STATE`` first for exactly this redirect.
+    """
+    monkeypatch.setenv(
+        "COORD_SELF_CORDON_STATE", str(tmp_path / "self-cordon-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_dispatch_target_validation(monkeypatch):
     """#2087: default the dispatch-target gate (`record_dispatched` /
     `record_dispatched_assignment` refusing an assignment whose repo/machine
