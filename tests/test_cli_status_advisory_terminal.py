@@ -15,6 +15,8 @@ entry visible) and cached per invocation.
 
 from __future__ import annotations
 
+import time as _time
+
 import coord.network as network_mod
 from click.testing import CliRunner
 
@@ -290,3 +292,102 @@ def test_status_shows_outside_reach_crit_advisories(
     assert "laptop" in result.output
     laptop_section = result.output.split("server", 1)[0]
     assert "outside propagation's reach" not in laptop_section
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #615/#906 thin-client guard for the #2595 cordon check above.
+#
+# `coord doctor` has no `daemon_reroute_target()` early-return, so it runs
+# in-process on a thin client. Deciding "is this cordoned host idle?" off
+# `coord.state.build_board()` would read the thin client's EMPTY local DB,
+# conclude every configured machine is idle, and print a fabricated CRIT for
+# a host that is in fact mid-roll with a running assignment. The read must go
+# through `board_service.read_board()`, which GETs the daemon's canonical
+# board instead.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _thin_client_doctor(monkeypatch, valid_config_path, *, active: list) -> "object":
+    """Invoke `coord doctor` as a thin client whose daemon reports *active*
+    as the board's active assignments and `server` as cordoned past its
+    drain deadline. Every daemon round trip is stubbed; the local DB
+    (`coord_db`) stays empty, which is exactly the thin-client shape."""
+    from coord import client as cc
+    from coord.commands.status import doctor as doctor_cmd
+    from coord.models import Board
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service",
+        lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+    )
+    # A thin client refuses to trust a local coordinator.yml (#1080) — hand
+    # it the fixture config as if the daemon had served it.
+    monkeypatch.setattr(
+        cc, "fetch_remote_config", lambda *a, **k: valid_config_path
+    )
+    # The cordon store also lives on the daemon for a thin client (#1563).
+    monkeypatch.setattr(
+        cc, "fetch_cordons",
+        lambda *a, **k: [
+            {
+                "machine": "server",
+                "target_version": "0.5.232",
+                "created_at": _time.time() - 7200,
+                "expires_at": _time.time() + 3600,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        cc, "fetch_remote_board", lambda *a, **k: Board(active=list(active))
+    )
+
+    def _fake_check_all(machines, timeout=3.0, **kw):
+        return [
+            MachineStatus(
+                machine=m, state="online", latency_ms=1.0,
+                health={"version": "0.5.210"},
+            )
+            for m in machines
+        ]
+
+    monkeypatch.setattr(network_mod, "check_all", _fake_check_all)
+
+    return CliRunner().invoke(
+        doctor_cmd,
+        ["--config", str(valid_config_path), "--no-pypi", "--expected", "0.5.232"],
+        catch_exceptions=False,
+    )
+
+
+def test_doctor_on_a_thin_client_uses_the_daemon_board_for_idleness(
+    valid_config_path, monkeypatch, coord_db,
+) -> None:
+    """The daemon's board says `server` is BUSY, the empty local DB says
+    nothing — no fabricated cordoned-and-IDLE CRIT."""
+    from coord.models import Assignment
+
+    result = _thin_client_doctor(
+        monkeypatch, valid_config_path,
+        active=[
+            Assignment(
+                machine_name="server", repo_name="api", issue_number=42,
+                issue_title="Still working", status="running",
+            )
+        ],
+    )
+
+    assert "cordoned and IDLE" not in result.output, result.output
+    assert "release cordons (coord release cordon):" not in result.output, result.output
+
+
+def test_doctor_on_a_thin_client_still_reports_a_genuinely_idle_cordon(
+    valid_config_path, monkeypatch, coord_db,
+) -> None:
+    """Same thin client, same stubs — but the daemon's board has no running
+    assignment for `server`, so the #2595 CRIT still fires. Without this the
+    test above would pass for the wrong reason (check silently disabled)."""
+    result = _thin_client_doctor(monkeypatch, valid_config_path, active=[])
+
+    assert "release cordons (coord release cordon):" in result.output, result.output
+    assert "CRIT: server is cordoned and IDLE" in result.output, result.output
+    assert result.exit_code == 1, result.output

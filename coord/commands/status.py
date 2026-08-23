@@ -1488,31 +1488,45 @@ def doctor(
     # history rather than by `coordinator.yml`, so a machine `coord doctor`
     # has never dispatched to would read as neither idle nor busy instead of
     # idle.
+    #
+    # #615/#906: the board read below goes through `board_service.read_board()`,
+    # NOT `coord.state.build_board()` — `doctor` has no
+    # `daemon_reroute_target()` early-return, so a direct local read would see
+    # an EMPTY board on a thin client, mark every configured machine idle, and
+    # print a fabricated CRIT for a cordoned host that is in fact mid-roll
+    # with a running assignment. `read_board()` GETs the daemon's canonical
+    # board when `board_service` is configured and falls back to the local DB
+    # otherwise.
     import time as _time  # noqa: PLC0415
 
+    from coord.board_service import read_board  # noqa: PLC0415
     from coord.machine_pause import cordons as fetch_release_cordons  # noqa: PLC0415
     from coord.release_cordon import idle_overdue_cordons  # noqa: PLC0415
-    from coord.state import build_board  # noqa: PLC0415
 
     try:
-        busy_names = {
-            a.machine_name for a in build_board().active if a.status == "running"
+        busy_names: set[str] | None = {
+            a.machine_name for a in read_board().active if a.status == "running"
         }
     except Exception:  # noqa: BLE001 — doctor must still report everything else
-        busy_names = set()
-    idle_names = {mach.name for mach in cfg.machines} - busy_names
+        # Fail CLOSED: without a trustworthy board we cannot tell idle from
+        # busy, and guessing "idle" would invent a CRIT for every cordoned
+        # host. Skip the check rather than report a fabricated one.
+        busy_names = None
     host_versions = {
         name: (health or {}).get("version") for name, health in machine_health.items()
     }
-    try:
-        overdue_idle = idle_overdue_cordons(
-            fetch_release_cordons(),
-            now=_time.time(),
-            idle_hosts=idle_names,
-            host_versions=host_versions,
-        )
-    except Exception:  # noqa: BLE001
-        overdue_idle = ()
+    overdue_idle: tuple = ()
+    if busy_names is not None:
+        idle_names = {mach.name for mach in cfg.machines} - busy_names
+        try:
+            overdue_idle = idle_overdue_cordons(
+                fetch_release_cordons(),
+                now=_time.time(),
+                idle_hosts=idle_names,
+                host_versions=host_versions,
+            )
+        except Exception:  # noqa: BLE001
+            overdue_idle = ()
     if overdue_idle:
         click.echo("")
         click.echo("release cordons (coord release cordon):")
