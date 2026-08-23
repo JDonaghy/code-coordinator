@@ -177,6 +177,80 @@ cross the wall; request-changes reviews, merge conflicts, and CI churn never sur
 Precedence for mixed-state submissions, and the business-time On-hold threshold (~1 business day,
 clock pauses nights/weekends/holidays), are unchanged from `PLATFORM_EVOLUTION.md`.
 
+### Automatic status push (#2588)
+
+The table above is the design; this section is what actually calls `enqueue_status` today. Until
+#2588, nothing did except a human typing `coord portal enqueue-status` — four real submissions shipped
+and closed in production while the portal kept showing `describing`/`planned` (measured 2026-08-22).
+The gap was a real design problem, not an oversight: coord's pipeline state is tracked **per issue**,
+the portal's status is **per submission**, and a submission that decomposed into five issues has no
+single stage. This is the fold that answers it.
+
+**The link is the join key.** `coord portal link <repo> <milestone_number> <submission_id>`
+(`coord/portal_store.py`'s `link_milestone`, #2507/PDR-1) is the only place coord records which issues
+belong to which submission — implicitly, as "every issue under this GitHub milestone in this repo." A
+submission with no link recorded is a **no-op with a visible reason**, not a crash and not a silent
+skip — and that is the common case today, and will stay common for a while: most milestones predate
+`coord portal link`.
+
+**What folds automatically — three statuses, derived with no human judgment call:**
+
+| Fold input (every issue under the linked milestone) | Pushed status |
+|---|---|
+| every issue closed | **Shipped** |
+| ≥1 issue has a `type="work"` assignment ever dispatched, not all closed | **In progress** |
+| no issue has started yet | **Planned** |
+
+`coord.portal_sync.fold_submission_status` is the pure fold; `fold_status_for_milestone` wraps it with
+the GitHub read (`gh issue list --milestone`, open + closed — deliberately *not* the local `issues`
+cache, which only ever holds open issues plus a 7-day grace window on ones that just closed, and would
+silently drop long-shipped members from the fold) and the churn guard (below). Two callers, same fold:
+
+* **`coord.merge_queue._maybe_push_status`** — the immediate half. Right after a merged `type="work"`
+  PR closes its issue (the same trigger point PDR-3/#2508 already uses for design rounds —
+  `coord.merge_queue._maybe_push_design_round`, the pattern #2588 explicitly extends), fold that
+  issue's milestone and push if it changed. Fail-open, same posture as every other bridge call in this
+  file: no portal config, no milestone on the issue, or no link on file all degrade to silence; only a
+  genuine read/enqueue failure surfaces as a `status_push_failed` merge event, and even that never
+  undoes the merge.
+* **`coord.portal_sync.sync_submission_statuses`** — the self-healing half, run every daemon tick
+  (`coord.serve_app._portal_sync_tick`, same `COORD_PORTAL_SYNC_INTERVAL` cadence as the rest of the
+  bridge) across **every** linked milestone. This is what catches "work started" — there is no merge to
+  hook that transition off of — and anything the merge-time push missed (daemon was down, portal was
+  unreachable).
+
+**Churn must not become mail.** A re-fold that lands on the same status as last time must not
+re-enqueue — `fold_status_for_milestone` compares against the most recently queued STATUS row for that
+submission (`coord.portal_sync._last_queued_status`, any outbox state, not just `applied`) before
+calling `enqueue_status` at all. This is on top of, not instead of, the portal's own `applyUpdate`
+dedupe — that guard alone only saves the portal a write, it does not save the outbox from filling with
+(or the customer from a second identical notification past) an unchanged push.
+
+**A portal outage must never block a merge.** Same posture as every other call in this bridge: the fold
+enqueues locally into the same durable outbox `enqueue_status` always has; the drain (`_push`) retries
+independently on its own schedule.
+
+**What does not fold automatically, and why:**
+
+* **Describing · In design · Awaiting your sign-off** — these precede the milestone even existing (an
+  operator hasn't run `coord milestone assign` yet, so there is nothing to fold over) or are already
+  driven by a different, already-wired mechanism: the design-round push (PDR-3/#2508) and its
+  `ANNOUNCING_STATUSES` ordering guard (`awaiting-signoff` requires a confirmed-applied `design_round`
+  row first — dogfood #835).
+* **Quality check** — also an `ANNOUNCING_STATUSES` entry (requires a confirmed `preview` row,
+  #2359/coord-portal#107) with its own trigger (a Cloudflare Pages Preview deploy), a different source
+  of truth from the issue-closed fold above. Automating *that* push is explicitly out of scope for
+  #2588 — see its "Not in scope" section — filed separately if wanted.
+* **Needs your input · On hold** — both require a judgment call this fold deliberately does not make:
+  "needs-input" needs an actual open question queued (`enqueue_question`, its own `ANNOUNCING_STATUSES`
+  entry); "on-hold" needs the business-time threshold `PLATFORM_EVOLUTION.md` defines, which this fold
+  has no clock for.
+
+Tested in `tests/test_portal_sync.py` (`fold_submission_status`'s pure cases; the unlinked/no-issues
+no-ops; the unchanged-status churn guard; a GitHub read failure surfacing without raising) and
+`tests/test_merge_queue.py` (`_maybe_push_status`'s merge-time trigger, mirroring
+`TestDesignRoundPushOnMerge`).
+
 ## Decisions
 
 ### Hosting: Cloudflare
