@@ -2585,6 +2585,226 @@ def _escalate_roll_pending_expired(pending: RollPending, *, now: float) -> None:
         click.echo(f"  (could not record the roll-pending escalation: {exc})", err=True)
 
 
+# ── #2572: escalate a PERSISTENT self-cordon ────────────────────────────────
+#
+# #2569/#2570: from 03:43 to 04:23 this tick correctly refused to launch
+# every single time (`_editable_drift_alert`'s well-written "no launch —
+# this host's coord is an editable checkout ... not its default branch"
+# message) and correctly re-recorded that SAME alert into `drive_escalations`
+# every tick — but `record_drive_escalation`'s own
+# `ON CONFLICT ... DO UPDATE SET ... created_at=excluded.created_at` means
+# every one of those re-records resets the row's own timestamp, so nothing
+# about the alert itself distinguishes "just noticed" from "been true for 40
+# minutes". The only thing that was ever going to turn that alert into a
+# phone push was a SEPARATE process — `coord notifier`'s own tick, reading
+# this same table — and that process was dead from the identical root cause
+# (#2570). This tick, unlike that one, kept running (successfully, on
+# drifted code, but running) the entire window — so it is the one process
+# that could have said something and didn't.
+#
+# This closes that gap: track how long the CURRENT drift reason has held,
+# independent of the routine per-tick re-record above, and once it crosses
+# `SELF_CORDON_ESCALATE_AFTER_SECONDS` push directly from THIS process —
+# never through the notifier — so a dead notifier tick is no longer a single
+# point of failure for this one condition. A plain JSON marker file, same
+# pattern as `roll_pending.json` (`RollPending`) one level up: at most one
+# self-cordon reason is ever active at a time, keyed by a wall-clock
+# `first_seen_at` this module controls directly rather than trusting
+# `drive_escalations.created_at`.
+_SELF_CORDON_STATE_FILENAME = "self_cordon_escalation.json"
+
+#: How long the SAME drift reason must persist, unbroken, before this tick
+#: pushes its own direct escalation. ~30 min per #2572 — long enough that a
+#: transient/one-tick drift (a build, or an interactive `coord test` run
+#: briefly checking out a branch on the shared checkout — see
+#: `_fetch_editable_drift`'s docstring) never pages, short enough that it
+#: still catches the 2026-08-22 incident's 40-minute window well before the
+#: 11-hour outage it was part of.
+SELF_CORDON_ESCALATE_AFTER_SECONDS = 1800
+
+#: #2572's own escalation key — deliberately NOT `QUEUE_ALERT_REPO`/
+#: `QUEUE_ALERT_ISSUE` (the routine per-tick `plan.alert` record, rewritten
+#: every tick — see above) and NOT `ROLL_PENDING_ALERT_REPO`: a distinct slot
+#: so this escalation persists independently of whatever the rest of the
+#: tick's ordinary alert handling does to its own key.
+SELF_CORDON_ALERT_REPO = "(drive-queue-self-cordon)"
+SELF_CORDON_ALERT_ISSUE = 0
+SELF_CORDON_ALERT_STAGE = "self-cordon"
+
+
+def _self_cordon_state_path() -> Path:
+    """Absolute path to the self-cordon persistence marker.
+
+    ``$COORD_SELF_CORDON_STATE`` overrides it — same test-isolation seam as
+    :func:`roll_pending_path`; never let a test touch the operator's real
+    ``~/.coord/self_cordon_escalation.json``.
+    """
+    import os  # noqa: PLC0415
+
+    from coord.platform_paths import default_coord_dir  # noqa: PLC0415
+
+    override = os.environ.get("COORD_SELF_CORDON_STATE")
+    if override:
+        return Path(override).expanduser()
+    return default_coord_dir() / _SELF_CORDON_STATE_FILENAME
+
+
+def _read_self_cordon_state() -> dict | None:
+    """The current marker, or ``None``.
+
+    Fail-soft on anything unreadable — same posture as
+    :func:`read_roll_pending`: a marker this can't parse must read as "no
+    persistence tracked yet", never as a reason to stop the tick or raise.
+    """
+    path = _self_cordon_state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = _json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_self_cordon_state(data: dict) -> None:
+    path = _self_cordon_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_self_cordon_state() -> None:
+    try:
+        _self_cordon_state_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _push_self_cordon_escalation(
+    reason: str, *, age_seconds: float, config_path: Path | None
+) -> None:
+    """The actual out-of-band push (#2572) — direct from THIS process, never
+    routed through `coord notifier`'s own tick.
+
+    Records into ``drive_escalations`` under :data:`SELF_CORDON_ALERT_REPO`
+    (so ``coord drive-queue status`` / ``list_drive_escalations`` / the
+    TUI's escalations panel show it like any other row), AND attempts a live
+    ntfy push using the SAME transport/config `coord notifier` uses
+    (``notifications:`` in coordinator.yml) — best-effort, never raises: an
+    unreachable/unconfigured ntfy server degrades this to "recorded, not
+    pushed", the same posture the notifier's own ``safe_send`` takes
+    (``coord/notifier/transport.py``), never a reason to fail the tick.
+
+    Deliberately bypasses quiet hours (unlike the notifier's own digest
+    path, `coord.notifier.digest`) — this fires at most once per persisted
+    incident, only after 30 minutes of an unbroken self-cordon, which is
+    exactly the class of "time-critical, the system knows and the operator
+    doesn't" event #1632's own quiet-hours doc calls out as the deliberate
+    exception, not a routine notification an operator would want batched
+    until morning.
+    """
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    detail = (
+        f"self-cordon has held for {age_seconds / 60:.0f}+ minutes with the "
+        f"same reason and no operator action recorded: {reason}"
+    )
+    record_drive_escalation(
+        SELF_CORDON_ALERT_REPO,
+        SELF_CORDON_ALERT_ISSUE,
+        stage=SELF_CORDON_ALERT_STAGE,
+        reason=detail,
+        gate_readings=f"age_seconds={age_seconds:.0f} | reason={reason}",
+        proposed_command="git -C <repo_root> checkout main",
+    )
+    click.echo(f"warning: {detail}", err=True)
+
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.notifier.models import Message  # noqa: PLC0415
+        from coord.notifier.transport import build_transport, safe_send  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        notif = getattr(cfg, "notifications", None)
+        if notif is not None and getattr(notif, "enabled", False):
+            transport = build_transport(notif)
+            safe_send(
+                transport,
+                Message(
+                    title="coord drive-queue: stuck self-cordon",
+                    body=detail,
+                    tags=("rotating_light",),
+                    priority=4,
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 — this is an ADDITION on top of
+        # the drive_escalations record above, which has already landed by
+        # this point; a broken import/config here must never take the tick
+        # down with it (same isolation rule docs/NOTIFIER.md states for the
+        # notifier's own tick).
+        click.echo(f"  (could not push the self-cordon escalation: {exc})", err=True)
+
+
+def _escalate_persistent_self_cordon(
+    drift_reason: str, *, now: float, config_path: Path | None
+) -> None:
+    """Track how long *drift_reason* (``plan.drift_reason`` — empty when no
+    self-cordon is active) has held, unbroken, and push once it crosses
+    :data:`SELF_CORDON_ESCALATE_AFTER_SECONDS` (#2572).
+
+    Deliberately separate from the routine `plan.alert` recording a few
+    lines below this function's call site (which re-records the SAME
+    reason, with a refreshed timestamp, every single tick — see this
+    module's header comment above `_SELF_CORDON_STATE_FILENAME` for why
+    that can't answer "how long has this been going on").
+    """
+    if not drift_reason:
+        _clear_self_cordon_state()
+        return
+
+    state = _read_self_cordon_state()
+    if not isinstance(state, dict) or state.get("reason") != drift_reason:
+        # First tick with this exact reason (or the very first self-cordon
+        # ever recorded on this host) — start the clock, nothing to push yet.
+        _write_self_cordon_state(
+            {"reason": drift_reason, "first_seen_at": now, "escalated_at": None}
+        )
+        return
+
+    first_seen_at = state.get("first_seen_at")
+    if not isinstance(first_seen_at, (int, float)):
+        # Corrupt/hand-edited marker — restart the clock rather than guess.
+        _write_self_cordon_state(
+            {"reason": drift_reason, "first_seen_at": now, "escalated_at": None}
+        )
+        return
+
+    age_seconds = max(0.0, now - first_seen_at)
+    if age_seconds < SELF_CORDON_ESCALATE_AFTER_SECONDS:
+        return
+    if state.get("escalated_at") is not None:
+        # Fire once per persisted occurrence — mirrors `coord notifier`'s own
+        # "once per subject per condition, for ever" rule (docs/NOTIFIER.md)
+        # so a stuck self-cordon does not re-page every tick for the rest of
+        # its lifetime.
+        return
+
+    _push_self_cordon_escalation(drift_reason, age_seconds=age_seconds, config_path=config_path)
+    state = dict(state)
+    state["escalated_at"] = now
+    _write_self_cordon_state(state)
+
+
 def _fetch_board_view() -> BoardView:
     """Board + live drive sessions, typed.
 
@@ -4111,6 +4331,16 @@ def drive_queue_tick(
             # no-op when there is nothing to dismiss, so calling it on every
             # alert-free tick is safe and cheap.
             _clear_queue_alert()
+
+        # #2572: independent of the routine alert record just above (which
+        # `record_drive_escalation` overwrites — including its own
+        # timestamp — every tick this stays true), track how long THIS
+        # SPECIFIC self-cordon reason has held and push a direct escalation
+        # once it crosses `SELF_CORDON_ESCALATE_AFTER_SECONDS`. See that
+        # function's own docstring for the incident this closes.
+        _escalate_persistent_self_cordon(
+            plan.drift_reason, now=now, config_path=config_path
+        )
 
         target = plan.launch
         if target is None:

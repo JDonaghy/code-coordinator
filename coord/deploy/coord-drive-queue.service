@@ -97,6 +97,18 @@
 Description=coord drive-queue tick (#1756)
 After=network-online.target
 Wants=network-online.target
+# #2572: when this unit itself enters `failed` (a non-zero ExecStart exit —
+# an unhandled exception, an unreadable board that made the tick abort, ...)
+# escalate through coord-failure-notify.service, which has NO dependency on
+# `coord`/Python/~/.coord-venv at all. #2569/#2570: this unit and
+# coord-notify.service both exec `~/.coord-venv/bin/coord` directly, and
+# when that venv broke (an editable install pointed at a worktree that was
+# later deleted) BOTH units — and the only "nobody is coming" channel,
+# `coord notifier`, which also runs from that same venv — went dark
+# together for 11 hours with zero operator-visible signal. This line is the
+# fix: a systemd-native alarm that cannot share that failure domain. See
+# deploy/coord-failure-notify.service's header for what it actually does.
+OnFailure=coord-failure-notify.service
 
 [Service]
 Type=oneshot

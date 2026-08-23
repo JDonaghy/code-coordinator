@@ -70,15 +70,39 @@ pub(crate) struct WatchSseState {
     pub(crate) pending_tail: String,
 }
 
+/// #2572: this machine's own live `agent_venv` H-1 check result, parsed
+/// straight off `/health`'s `health.results[]` (`coord.agent.AgentServer.
+/// health`'s `"health"` key — `coord/health/checks/agent_install.py`'s
+/// `agent_venv` check, cache-refreshed on `coord-agent.service`'s own TTL,
+/// completely independent of whatever `coord serve`'s own fleet-health
+/// snapshot says). See `merge_live_agent_venv_health`'s doc comment for why
+/// this exists on top of `BoardData::fleet_health`, which already carries
+/// (a possibly stale, possibly empty) `agent_venv` reading of its own.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentVenvHealth {
+    /// `"ok"` | `"warn"` | `"crit"` | `"unknown"` — verbatim from the wire,
+    /// same posture `fleet_health.rs`'s doc comment insists on for every
+    /// other severity string this app renders: never re-derived here.
+    pub(crate) severity: String,
+    /// Human-readable one-liner (`CheckResult.headroom`), e.g. "editable
+    /// 0.5.240 from ~/.coord/worktrees/9c9cc8b694bd".
+    pub(crate) headroom: String,
+}
+
 /// Parsed fields from a successful `/health` HTTP response.
 pub(crate) struct MachineHealthResult {
     pub(crate) version: String,
     pub(crate) worktree_bytes: u64,
+    /// `None` when `/health`'s `health.results[]` carries no `agent_venv`
+    /// entry at all (an old agent that predates #1630, or a `checkout`/
+    /// `fleet`-scope-only build) — never a fabricated "ok".
+    pub(crate) agent_venv: Option<AgentVenvHealth>,
 }
 
 /// Spawn a background thread that fetches `/health` from a remote agent and
-/// parses the version + worktree_bytes fields.  Returns a `Receiver` that
-/// yields `Ok(result)` or `Err(error_string)`.
+/// parses the version + worktree_bytes fields (plus, #2572, the live
+/// `agent_venv` check result — see `AgentVenvHealth`).  Returns a
+/// `Receiver` that yields `Ok(result)` or `Err(error_string)`.
 pub(crate) fn spawn_machine_health(
     host: &str,
     port: u16,
@@ -103,9 +127,11 @@ pub(crate) fn spawn_machine_health(
                             .get("worktree_bytes")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
+                        let agent_venv = parse_agent_venv_health(&v);
                         Ok(MachineHealthResult {
                             version,
                             worktree_bytes,
+                            agent_venv,
                         })
                     }
                     Err(e) => Err(format!("json: {}", e)),
@@ -117,6 +143,134 @@ pub(crate) fn spawn_machine_health(
         let _ = tx.send(result);
     });
     rx
+}
+
+/// Pull the `agent_venv` entry out of `/health`'s `health.results[]` array,
+/// if present (#2572). A free function (not inlined into the closure above)
+/// so it is reachable from `#[cfg(test)]` with a hand-built JSON value,
+/// without needing a live HTTP fetch.
+pub(crate) fn parse_agent_venv_health(health_response: &serde_json::Value) -> Option<AgentVenvHealth> {
+    let results = health_response.get("health")?.get("results")?.as_array()?;
+    let entry = results
+        .iter()
+        .find(|item| item.get("check_id").and_then(|c| c.as_str()) == Some("agent_venv"))?;
+    Some(AgentVenvHealth {
+        severity: entry
+            .get("severity")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        headroom: entry
+            .get("headroom")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// Rank order for the four severity strings this app ever renders — mirrors
+/// `fleet_health.rs`'s `FleetSeverity`'s `#[derive(Ord)]` declaration order
+/// exactly (`Ok < Unknown < Warn < Crit`: an absent/unrecognised signal
+/// outranks a claimed-healthy one, but never a genuine warning or worse —
+/// see that enum's own doc comment for why). Duplicated here rather than
+/// imported: `fleet_health.rs` is the rendering module and this is the
+/// data-assembly one, and the two already stay in sync "by hand, keep in
+/// sync" per that module's own doc comment for the exact same counting
+/// rule — one more small duplication in the same spirit, not a new pattern.
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "crit" => 3,
+        "warn" => 2,
+        "ok" => 0,
+        // "unknown", empty, or anything unrecognised — never silently "ok".
+        _ => 1,
+    }
+}
+
+/// The synthesized `FleetHealthCheckResult` row for a live `agent_venv`
+/// reading — used only by `merge_live_agent_venv_health` below.
+fn live_agent_venv_check_result(machine: &str, av: &AgentVenvHealth) -> FleetHealthCheckResult {
+    FleetHealthCheckResult {
+        key: format!("{machine}:agent_venv:live"),
+        check_id: "agent_venv".to_string(),
+        title: "agent venv".to_string(),
+        label: format!("agent venv ({machine})"),
+        subject: Some(machine.to_string()),
+        severity: av.severity.clone(),
+        headroom: av.headroom.clone(),
+        threshold: String::new(),
+        detail: "live reading via this machine's own /health (#2572) — \
+                  coord serve's fleet-health snapshot did not already \
+                  report this machine at least as severely"
+            .to_string(),
+    }
+}
+
+/// Fold each machine's own LIVE `agent_venv` health-check result (from
+/// `/health`'s `health.results[]` — see [`AgentVenvHealth`]) into
+/// *existing* (`coord serve`'s own fleet-health snapshot — see
+/// `BoardData::fleet_health`'s doc comment).
+///
+/// This exists on top of the daemon-computed snapshot for the same reason
+/// #2572 exists at all: `existing` can be **empty by design** (the
+/// local-SQLite read path has no daemon in-process to poll agent `/health`
+/// or run the fleet-scope registry at all — see `load_data`'s own comment
+/// on this field) or simply **stale**, because it is computed by
+/// `coord serve`, a process that can share the *exact* failure domain the
+/// check itself is reporting on (#2569/#2570: an editable `~/.coord-venv`
+/// broke `coord-drive-queue.service` and `coord-notify.service`, both of
+/// which exec that same venv — a `coord serve` sharing it would have frozen
+/// its own snapshot at whatever it last computed, which reads as "healthy,
+/// last measured a while ago" rather than "CRIT"). The live per-machine
+/// `/health` fetch this function consumes runs on a *different* systemd
+/// unit (`coord-agent.service`) and answers fresh, on this exact poll — so
+/// even if the daemon's own snapshot is wrong or absent, this cannot be.
+///
+/// **Never downgrades.** A machine already reported by `existing` at least
+/// as severely (by [`severity_rank`]) is left completely untouched — this
+/// only ever ADDS a machine `existing` has no entry for, or REPLACES an
+/// entry whose severity is weaker than what was just observed live. A
+/// live `ok`/`unknown` reading is never worth synthesizing a row for at
+/// all (an `agent_venv` check `existing` already has an equal-or-worse
+/// opinion on is not this function's business, and there is nothing useful
+/// to say about a machine this probe found healthy that `existing` didn't
+/// already know).
+fn merge_live_agent_venv_health(
+    mut existing: FleetHealthBlock,
+    live: &[(String, Option<AgentVenvHealth>)],
+    now: f64,
+) -> FleetHealthBlock {
+    for (name, probe) in live {
+        let Some(av) = probe else { continue };
+        let live_rank = severity_rank(&av.severity);
+        if live_rank < severity_rank("warn") {
+            continue;
+        }
+        match existing.machine_health.iter_mut().find(|m| &m.machine == name) {
+            Some(slot) if severity_rank(&slot.severity) >= live_rank => {
+                // `existing` already has an equal-or-worse reading for this
+                // machine (possibly for a DIFFERENT check entirely) — leave
+                // it exactly as `coord serve` reported it.
+            }
+            Some(slot) => {
+                slot.severity = av.severity.clone();
+                slot.stale = false;
+                slot.checked_at = Some(now);
+                slot.results = vec![live_agent_venv_check_result(name, av)];
+            }
+            None => {
+                existing.machine_health.push(FleetMachineHealth {
+                    machine: name.clone(),
+                    state: String::new(),
+                    severity: av.severity.clone(),
+                    stale: false,
+                    checked_at: Some(now),
+                    results: vec![live_agent_venv_check_result(name, av)],
+                });
+            }
+        }
+    }
+    existing
 }
 
 /// How many samples to keep per machine (5 min @ 5 s/sample).
@@ -1775,6 +1929,13 @@ pub(crate) fn assemble_board_data(
         })
         .collect();
 
+    // #2572: paired 1:1 with `machines` below — each machine's own live
+    // `agent_venv` reading, captured alongside the `/health` fetch that's
+    // already happening for `version`/`worktree_bytes`. Folded into
+    // `fleet_health` after the loop (`merge_live_agent_venv_health`) rather
+    // than inline here, so the merge policy stays one pure, testable
+    // function instead of tangled into this probe-collection closure.
+    let mut live_agent_venv: Vec<(String, Option<AgentVenvHealth>)> = Vec::new();
     let machines: Vec<Machine> = probes
         .into_iter()
         .map(|(name, host, repos, tcp_rx, health_rx)| {
@@ -1792,6 +1953,7 @@ pub(crate) fn assemble_board_data(
                 .iter()
                 .filter(|a| a.machine == name && a.status == "running")
                 .count();
+            live_agent_venv.push((name.clone(), health.as_ref().and_then(|h| h.agent_venv.clone())));
             Machine {
                 name,
                 host,
@@ -1803,6 +1965,20 @@ pub(crate) fn assemble_board_data(
             }
         })
         .collect();
+
+    // #2572: an `agent_venv` CRIT must be visible on the always-on status
+    // bar (`fleet_health_status_bar_segment`, #1631) even when it is
+    // learned from THIS live probe rather than `coord serve`'s own snapshot
+    // — see `merge_live_agent_venv_health`'s doc comment for the incident
+    // (#2569/#2570) this closes: a daemon-computed `fleet_health` that is
+    // empty (the local-SQLite read path, by design — see `load_data`'s own
+    // comment on this field) or simply stale must never be the only source
+    // for a signal this load-bearing.
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let fleet_health = merge_live_agent_venv_health(fleet_health, &live_agent_venv, now_epoch);
 
     // ── Determine which machine is local ──────────────────────────────────
     // Match the OS hostname against the `host` column in the machines table.
@@ -3530,4 +3706,254 @@ pub(crate) fn open_purge_conn() -> rusqlite::Result<Connection> {
     let conn = Connection::open(&db_path)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    //! #2572: `parse_agent_venv_health` / `merge_live_agent_venv_health` —
+    //! the TUI-side half of "surface `agent_venv` CRIT somewhere the live
+    //! panel shows without being asked". See those functions' own doc
+    //! comments for the incident (#2569/#2570) this closes: `coord serve`'s
+    //! own `fleet_health` snapshot can be empty (the local-SQLite path, by
+    //! design) or stale (computed by a daemon that can share the exact
+    //! failure domain being checked), so a machine's own live `/health`
+    //! response is folded in as a second, independent source that cannot
+    //! be silently masked.
+    use super::*;
+
+    fn health_response(check_id: &str, severity: &str, headroom: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": "0.5.240",
+            "worktree_bytes": 0,
+            "health": {
+                "schema": 1,
+                "checked_at": 1000.0,
+                "severity": severity,
+                "counts": {},
+                "skipped": [],
+                "results": [
+                    {
+                        "check_id": check_id,
+                        "severity": severity,
+                        "headroom": headroom,
+                    }
+                ],
+            }
+        })
+    }
+
+    fn machine_health(machine: &str, severity: &str) -> FleetMachineHealth {
+        FleetMachineHealth {
+            machine: machine.to_string(),
+            state: String::new(),
+            severity: severity.to_string(),
+            stale: false,
+            checked_at: Some(500.0),
+            results: vec![FleetHealthCheckResult {
+                key: format!("{machine}:disk"),
+                check_id: "disk".to_string(),
+                severity: severity.to_string(),
+                ..FleetHealthCheckResult::default()
+            }],
+        }
+    }
+
+    mod parse_agent_venv_health_tests {
+        use super::*;
+
+        #[test]
+        fn finds_the_agent_venv_entry_among_others() {
+            let v = serde_json::json!({
+                "health": {
+                    "results": [
+                        {"check_id": "disk", "severity": "ok", "headroom": "50% free"},
+                        {"check_id": "agent_venv", "severity": "crit", "headroom": "editable 0.5.240 from ~/x"},
+                    ]
+                }
+            });
+            let av = parse_agent_venv_health(&v).expect("agent_venv present");
+            assert_eq!(av.severity, "crit");
+            assert_eq!(av.headroom, "editable 0.5.240 from ~/x");
+        }
+
+        #[test]
+        fn none_when_health_key_absent() {
+            let v = serde_json::json!({"version": "0.5.240"});
+            assert!(parse_agent_venv_health(&v).is_none());
+        }
+
+        #[test]
+        fn none_when_no_results_array() {
+            let v = serde_json::json!({"health": {}});
+            assert!(parse_agent_venv_health(&v).is_none());
+        }
+
+        #[test]
+        fn none_when_agent_venv_not_among_results() {
+            let v = serde_json::json!({
+                "health": {"results": [{"check_id": "disk", "severity": "ok", "headroom": ""}]}
+            });
+            assert!(parse_agent_venv_health(&v).is_none());
+        }
+
+        #[test]
+        fn defaults_severity_to_unknown_when_missing() {
+            let v = serde_json::json!({
+                "health": {"results": [{"check_id": "agent_venv", "headroom": "?"}]}
+            });
+            let av = parse_agent_venv_health(&v).expect("agent_venv present");
+            assert_eq!(av.severity, "unknown");
+        }
+
+        #[test]
+        fn parses_a_realistic_full_response() {
+            let v = health_response("agent_venv", "crit", "editable 0.5.242 from ~/.coord/worktrees/9c9cc8b694bd");
+            let av = parse_agent_venv_health(&v).expect("agent_venv present");
+            assert_eq!(av.severity, "crit");
+            assert!(av.headroom.contains("editable"));
+        }
+    }
+
+    mod severity_rank_tests {
+        use super::*;
+
+        #[test]
+        fn ranks_in_the_documented_order() {
+            assert!(severity_rank("ok") < severity_rank("unknown"));
+            assert!(severity_rank("unknown") < severity_rank("warn"));
+            assert!(severity_rank("warn") < severity_rank("crit"));
+        }
+
+        #[test]
+        fn unrecognised_string_ranks_as_unknown_not_ok() {
+            assert_eq!(severity_rank("bogus"), severity_rank("unknown"));
+            assert_eq!(severity_rank(""), severity_rank("unknown"));
+        }
+    }
+
+    mod merge_live_agent_venv_health_tests {
+        use super::*;
+
+        #[test]
+        fn adds_a_row_for_a_machine_existing_has_none_for() {
+            let existing = FleetHealthBlock::default();
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "crit".to_string(), headroom: "editable 0.5.240".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert_eq!(merged.machine_health.len(), 1);
+            let row = &merged.machine_health[0];
+            assert_eq!(row.machine, "dellserver");
+            assert_eq!(row.severity, "crit");
+            assert!(!row.stale);
+            assert_eq!(row.checked_at, Some(1000.0));
+            assert_eq!(row.results[0].check_id, "agent_venv");
+        }
+
+        #[test]
+        fn upgrades_an_existing_ok_entry_to_the_live_crit() {
+            let existing = FleetHealthBlock {
+                machine_health: vec![machine_health("dellserver", "ok")],
+                fleet_checks: vec![],
+            };
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "crit".to_string(), headroom: "editable 0.5.240".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert_eq!(merged.machine_health.len(), 1);
+            assert_eq!(merged.machine_health[0].severity, "crit");
+            assert_eq!(merged.machine_health[0].checked_at, Some(1000.0));
+        }
+
+        #[test]
+        fn never_downgrades_an_equal_or_worse_existing_reading() {
+            // `existing` already says CRIT (for some OTHER check, e.g. disk)
+            // — a live WARN on agent_venv must not overwrite it with a
+            // weaker severity or erase the disk-check detail.
+            let existing = FleetHealthBlock {
+                machine_health: vec![machine_health("dellserver", "crit")],
+                fleet_checks: vec![],
+            };
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "warn".to_string(), headroom: "1 release behind".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert_eq!(merged.machine_health.len(), 1);
+            assert_eq!(merged.machine_health[0].severity, "crit");
+            assert_eq!(merged.machine_health[0].results[0].check_id, "disk");
+        }
+
+        #[test]
+        fn a_live_ok_reading_never_synthesizes_a_row() {
+            let existing = FleetHealthBlock::default();
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "ok".to_string(), headroom: "pypi 0.5.242".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert!(merged.machine_health.is_empty());
+        }
+
+        #[test]
+        fn an_unreachable_machine_none_probe_is_a_no_op() {
+            let existing = FleetHealthBlock::default();
+            let live = vec![("dellserver".to_string(), None)];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert!(merged.machine_health.is_empty());
+        }
+
+        #[test]
+        fn only_touches_machines_the_live_probe_actually_names() {
+            let existing = FleetHealthBlock {
+                machine_health: vec![machine_health("elitebook", "ok")],
+                fleet_checks: vec![],
+            };
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "crit".to_string(), headroom: "editable".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert_eq!(merged.machine_health.len(), 2);
+            let elitebook = merged.machine_health.iter().find(|m| m.machine == "elitebook").unwrap();
+            assert_eq!(elitebook.severity, "ok");
+            let dellserver = merged.machine_health.iter().find(|m| m.machine == "dellserver").unwrap();
+            assert_eq!(dellserver.severity, "crit");
+        }
+
+        #[test]
+        fn fleet_scope_checks_pass_through_untouched() {
+            let existing = FleetHealthBlock {
+                machine_health: vec![],
+                fleet_checks: vec![FleetHealthCheckResult {
+                    check_id: "board_latency".to_string(),
+                    severity: "warn".to_string(),
+                    ..FleetHealthCheckResult::default()
+                }],
+            };
+            let live = vec![(
+                "dellserver".to_string(),
+                Some(AgentVenvHealth { severity: "crit".to_string(), headroom: "editable".to_string() }),
+            )];
+
+            let merged = merge_live_agent_venv_health(existing, &live, 1000.0);
+
+            assert_eq!(merged.fleet_checks.len(), 1);
+            assert_eq!(merged.fleet_checks[0].check_id, "board_latency");
+        }
+    }
 }

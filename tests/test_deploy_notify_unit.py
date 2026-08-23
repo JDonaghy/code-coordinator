@@ -117,3 +117,22 @@ def test_path_comment_names_the_issue() -> None:
     text = UNIT_PATH.read_text()
     assert "#2561" in text
     assert "Environment=PATH=" in text
+
+
+# ── #2572: OnFailure= escalation ─────────────────────────────────────────
+
+
+def test_on_failure_points_at_the_coord_independent_notifier() -> None:
+    """#2572: this unit IS `coord notifier`'s own periodic driver in
+    production — the exact channel that was supposed to catch "nobody is
+    coming" and was itself dead from the same #2569/#2570 root cause. When
+    IT fails, systemd must escalate through a unit with no dependency on
+    `coord`/Python/~/.coord-venv."""
+    unit = _parse_unit(UNIT_PATH)
+    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service"
+
+
+def test_on_failure_comment_names_the_issue() -> None:
+    text = UNIT_PATH.read_text()
+    assert "#2572" in text
+    assert "OnFailure=coord-failure-notify.service" in text
