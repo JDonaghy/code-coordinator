@@ -683,6 +683,18 @@ class QueueEntry:
     # column and for any entry enqueued without `--max-fix-rounds` — reads
     # identically to "no override", never as "zero fix rounds".
     max_fix_rounds: int | None = None
+    # #2589: operator opt-out of #1453's oracle-loop JIT slice authoring for
+    # THIS entry's tick-launched drive — a per-entry `coord drive
+    # --no-acceptance` passthrough, same shape as `max_fix_rounds` above.
+    # Exists because a `blocked` row's own recorded reason can recommend
+    # exactly this flag (the #2531 incident: "re-run coord drive with
+    # --no-acceptance to skip JIT authoring") with no way to act on it
+    # through the queue — the operator was left to bypass the queue (and its
+    # `--max-parallel-per-repo` ceiling) entirely to follow the queue's own
+    # advice. `False` for every row predating this column and for any entry
+    # enqueued without `--no-acceptance` — reads identically to "no
+    # override", the tick's pre-#2589 behaviour exactly.
+    no_acceptance: bool = False
 
     @property
     def key(self) -> str:
@@ -767,6 +779,10 @@ class QueueEntry:
                 if row.get("max_fix_rounds") is None
                 else int(row.get("max_fix_rounds"))
             ),
+            # #2589: same 0/1-from-SQLite-or-real-bool-from-JSON acceptance
+            # as `hold_after` above; absent (a row predating this column)
+            # reads `False` — no passthrough, the pre-#2589 behaviour.
+            no_acceptance=bool(row.get("no_acceptance") or 0),
         )
 
 
@@ -2261,6 +2277,65 @@ def is_empty_branch_death_reason(reason: str | None) -> bool:
     non-underscored name rather than a second copy of the text match.
     """
     return _is_empty_branch_death_reason(reason)
+
+
+def _is_dispatch_failure_reason(reason: str | None) -> bool:
+    """#2273: does *reason* carry the "no assignment was ever created for
+    this run" marker `_reconcile_running` stamps onto a `retry`/`exhausted`
+    reason when :func:`_dispatch_produced_nothing` fires?
+
+    Text-matched, same convention as :func:`_is_empty_branch_death_reason`
+    just above — neither call site embeds a dedicated typed column, only
+    prose in `last_reason`.
+    """
+    if not reason:
+        return False
+    return "no assignment was ever created for this run" in reason.lower()
+
+
+def is_pre_dispatch_block_reason(reason: str | None) -> bool:
+    """#2589: does *reason* name a `blocked` cause with NOTHING for #2230's
+    merge-gate sweep to re-check?
+
+    Two shapes, both pre-dispatch by construction:
+
+    * :func:`is_empty_branch_death_reason` — a work row or JIT
+      acceptance-author session that exited DONE/ADVISORY with zero commits
+      on its branch. `coord drive` never dispatched anything further; there
+      is no branch, no PR, no merge-queue row for `_blocked_gate_reading` to
+      have ANY opinion about.
+    * :func:`is_dispatch_failure_reason` — the drive died before `coord
+      assign` ever created a board-visible assignment. Same story: nothing
+      downstream of dispatch ever existed.
+
+    This is the exact gap claude-coordinator#2589 reports: `_BLOCKED_GATE_NOTE`
+    (in `coord.commands.drive_queue`) fires for ANY non-permanent, non-
+    unsatisfiable-`after=` `blocked` cause — including these two, where
+    `_reconcile_blocked`'s own `_blocked_gate_reading` returns `None` ("no
+    evidence either way", per its docstring) EVERY tick, forever. The note
+    then tells the operator #2230 "IS re-checked against the merge gate
+    automatically" for a row that has no merge gate to check — the reverse
+    of the truth. `coord.commands.drive_queue`'s `list` rendering uses this
+    predicate to swap that note for a plain "needs a human" one instead.
+
+    Not itself a check of *whether* the gate sweep has evidence right now
+    (that is `_blocked_gate_reading`'s job, and it needs a live board this
+    module's pure text classifiers deliberately do not require) — this is
+    the cheaper, always-available approximation: a `last_reason` naming
+    either shape could ever ONLY have reached `blocked` via dispatch-time
+    failure, so there is nothing for a later tick to have learned since.
+    """
+    return is_empty_branch_death_reason(reason) or is_dispatch_failure_reason(reason)
+
+
+def is_dispatch_failure_reason(reason: str | None) -> bool:
+    """Public alias for :func:`_is_dispatch_failure_reason` (#2589).
+
+    Same convention as ``is_empty_branch_death_reason``: the classifier is
+    shared with `coord.commands.drive_queue`'s `list` rendering, so it gets a
+    non-underscored name rather than a second copy of the text match.
+    """
+    return _is_dispatch_failure_reason(reason)
 
 
 # ── `add`-time preflight (#2339) ─────────────────────────────────────────────

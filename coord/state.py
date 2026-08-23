@@ -5552,7 +5552,7 @@ _DRIVE_QUEUE_COLUMNS = (
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
     "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
-    "max_fix_rounds"
+    "max_fix_rounds, no_acceptance"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -5634,6 +5634,7 @@ def enqueue_drive_queue(
     resume_when: str = "",
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
+    no_acceptance: bool = False,
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -5666,6 +5667,12 @@ def enqueue_drive_queue(
     entry — omitting the flag on a later ``add`` reverts to the fleet
     default, it does not leave a previous override in place.
 
+    ``no_acceptance`` (#2589) is a per-entry passthrough of `coord drive
+    --no-acceptance` — appended to the tick's launch argv verbatim by
+    ``coord.commands.drive_queue._launch_argv``. Same replace-on-every-`add`
+    posture as ``max_fix_rounds``: a later `add` that omits `--no-acceptance`
+    clears a previously-set one rather than leaving it in place.
+
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
     routed.
@@ -5687,6 +5694,7 @@ def enqueue_drive_queue(
             "resume_when": resume_when,
             "hold_scope": normalized_scope,
             "max_fix_rounds": max_fix_rounds,
+            "no_acceptance": bool(no_acceptance),
         },
     )
     if resp is not None:
@@ -5702,6 +5710,7 @@ def enqueue_drive_queue(
         resume_when=resume_when,
         hold_scope=normalized_scope,
         max_fix_rounds=max_fix_rounds,
+        no_acceptance=no_acceptance,
     )
 
 
@@ -5717,6 +5726,7 @@ def _enqueue_drive_queue_local(
     resume_when: str = "",
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
+    no_acceptance: bool = False,
 ) -> int:
     conn = get_connection()
     now = time.time()
@@ -5740,6 +5750,7 @@ def _enqueue_drive_queue_local(
     # `_normalize_hold_scope` uses for a malformed `hold_scope`.
     if max_fix_rounds is not None and int(max_fix_rounds) < 1:
         max_fix_rounds = None
+    no_acceptance_int = 1 if no_acceptance else 0
     existing = conn.execute(
         "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
@@ -5757,7 +5768,7 @@ def _enqueue_drive_queue_local(
         conn.execute(
             "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
             "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
-            "hold_scope = ?, max_fix_rounds = ? WHERE id = ?",
+            "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
             (
                 machine,
                 after_json,
@@ -5767,6 +5778,7 @@ def _enqueue_drive_queue_local(
                 hold_state,
                 hold_scope,
                 max_fix_rounds,
+                no_acceptance_int,
                 existing["id"],
             ),
         )
@@ -5781,8 +5793,8 @@ def _enqueue_drive_queue_local(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
             " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
-            " max_fix_rounds) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " max_fix_rounds, no_acceptance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -5796,6 +5808,7 @@ def _enqueue_drive_queue_local(
                 hold_state,
                 hold_scope,
                 max_fix_rounds,
+                no_acceptance_int,
             ),
         )
         conn.commit()

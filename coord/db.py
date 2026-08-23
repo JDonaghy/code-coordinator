@@ -622,6 +622,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             -- falls through to the config/tick default exactly as if the
             -- column did not exist.
             max_fix_rounds INTEGER,
+            -- #2589: operator override — this entry's tick-launched drive
+            -- gets `coord drive --no-acceptance` (skip #1453's oracle-loop
+            -- JIT slice authoring), same per-entry-passthrough shape as
+            -- max_fix_rounds above. 0 for every row predating this column
+            -- and for any entry enqueued without --no-acceptance, read
+            -- identically to "no passthrough" by _launch_argv.
+            no_acceptance INTEGER NOT NULL DEFAULT 0,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -1160,6 +1167,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # identically to "no override" by `coord.drive_queue.
         # effective_max_fix_rounds`.
         "ALTER TABLE drive_queue ADD COLUMN max_fix_rounds INTEGER",
+        # #2589: see the CREATE TABLE comment above — a per-entry
+        # `--no-acceptance` passthrough for the tick's `coord drive --tmux`
+        # launch. 0 (no passthrough) for every row predating this migration.
+        "ALTER TABLE drive_queue ADD COLUMN no_acceptance INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:
