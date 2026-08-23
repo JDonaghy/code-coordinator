@@ -149,12 +149,18 @@ def test_on_failure_points_at_the_coord_independent_notifier() -> None:
     unreadable board aborting the tick), systemd itself must start a
     notifier that has no `coord`/Python/~/.coord-venv dependency — the
     #2569/#2570 incident is exactly the case where all three were the thing
-    that broke, taking `coord notifier` down with them."""
+    that broke, taking `coord notifier` down with them.
+
+    #2580 adds a second `OnFailure=` target, coord-fleet-watchdog.service —
+    the repair half of the same story, alongside coord-failure-notify.
+    service's page-a-human half. `OnFailure=` is a list-type directive, so
+    both are named on the one line rather than replacing each other."""
     unit = _parse_unit(UNIT_PATH)
-    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service"
+    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service coord-fleet-watchdog.service"
 
 
 def test_on_failure_comment_names_the_issue() -> None:
     text = UNIT_PATH.read_text()
     assert "#2572" in text
-    assert "OnFailure=coord-failure-notify.service" in text
+    assert "#2580" in text
+    assert "OnFailure=coord-failure-notify.service coord-fleet-watchdog.service" in text

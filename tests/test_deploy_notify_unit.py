@@ -127,12 +127,18 @@ def test_on_failure_points_at_the_coord_independent_notifier() -> None:
     production — the exact channel that was supposed to catch "nobody is
     coming" and was itself dead from the same #2569/#2570 root cause. When
     IT fails, systemd must escalate through a unit with no dependency on
-    `coord`/Python/~/.coord-venv."""
+    `coord`/Python/~/.coord-venv.
+
+    #2580 adds a second `OnFailure=` target, coord-fleet-watchdog.service —
+    the repair half of the same story, alongside coord-failure-notify.
+    service's page-a-human half. `OnFailure=` is a list-type directive, so
+    both are named on the one line rather than replacing each other."""
     unit = _parse_unit(UNIT_PATH)
-    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service"
+    assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service coord-fleet-watchdog.service"
 
 
 def test_on_failure_comment_names_the_issue() -> None:
     text = UNIT_PATH.read_text()
     assert "#2572" in text
-    assert "OnFailure=coord-failure-notify.service" in text
+    assert "#2580" in text
+    assert "OnFailure=coord-failure-notify.service coord-fleet-watchdog.service" in text

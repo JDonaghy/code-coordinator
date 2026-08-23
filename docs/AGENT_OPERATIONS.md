@@ -950,6 +950,100 @@ record can't be read back immediately after, it exits non-zero with a
 `unconfirmed success` is a bug (epic #2096), and this is exactly the tool
 that exists to give operators a durable, trustworthy paper trail.
 
+## Fleet watchdog (`coord-fleet-watchdog`, #2580)
+
+The 2026-08-22 outage (#2569 root cause, #2570 blast radius, #2572
+escalation) took the fleet down for 11h because `~/.coord-venv` became an
+editable install pointing at a deleted worktree — and every existing
+recovery path (the tick, `coord notify`, `coord notifier`) execs from that
+exact venv, so all of them died with it. `coord-fleet-watchdog` is a small,
+**stdlib-only** repair loop that runs under `/usr/bin/python3` — never
+`~/.coord-venv/bin/python` — specifically so it survives the failure class
+that took everything else down. It never `import coord`s (a grep test in
+`tests/test_fleet_watchdog.py` enforces that) and never parses
+`coordinator.yml`.
+
+**Two cadences.** An hourly sweep (`coord-fleet-watchdog.timer`) is the broad
+net; `OnFailure=coord-fleet-watchdog.service` on `coord-drive-queue.service`
+and `coord-notify.service` (alongside the existing `coord-failure-notify.
+service` escalation from #2572) is the tripwire — those units fail every
+~3–5 minutes on a genuinely broken fleet, so the tripwire turns "up to 60
+minutes of dead fleet" into near-immediate repair.
+
+**Tier 1 (auto-repaired, precondition re-checked at repair time):** a broken
+`~/.coord-venv` with a healthy blue/green sibling slot (rolled back via
+`scripts/coord-venv-rollback.sh` — bash, deliberately, so the repair itself
+never depends on `coord` being importable — mirrors
+`deploy/coord-web-rollback.sh`), `~/.local/bin/coord` no longer symlinked
+into the venv (#2314's exact damage), a `coord-*` unit stuck `failed`
+(`reset-failed` + restart), a stale `.git/index.lock` with no live holder
+(#2206), an expired release cordon still present in
+`~/.coord/paused_machines.json`, and an orphaned worktree under
+`~/.coord/worktrees` with no live board assignment (deliberately the most
+conservative of the six — only ever acts on a *positive* "not live"
+confirmation, never on "couldn't check," because a reaped worktree is what
+detonated the editable install in the first place).
+
+**Tier 2 (detect and escalate, never repair):** a `coord-*.timer` that is
+disabled or masked. This is the one that bites: `coord-release-propagate.
+timer` currently reads disabled **on purpose** (manual release rolls until
+the release lane stabilises — see "Release rolls stay manual" in the
+project's memory / `docs/DRIVE_QUEUE.md`), and a watchdog that "fixed" that
+would silently drag the fleet back onto an abandoned lane within the hour.
+Version drift, graph/unit-drift, and phantom `running` board rows are
+intentionally **not implemented** — see the comment in `scripts/
+fleet_watchdog.py` next to `TIER2_CHECKS` for why each is harder than it
+looks (an active-assignment check that headless workers need but `coord
+sessions --remote` can't see; "review, then pull — not automatic"; a naive
+reaper on the wrong host killing a healthy drive it doesn't own).
+
+**The intent sentinel** (`~/.coord/watchdog-suppress.json`, plain JSON —
+same shape as `release_cordons` in `paused_machines.json` and
+`coord-web-rollback.sh`'s `.rollback-blocked-sha`) is how an operator tells
+the watchdog "this is deliberate, not broken":
+
+```json
+{ "coord-release-propagate.timer": { "reason": "manual rolls until release lane stabilises",
+                                     "set": "2026-08-21", "expires": null } }
+```
+
+Anything not covered by a sentinel is reported, never fixed — default to
+reporting. Keys are matched against a condition's specific instance (a bare
+unit name, a specific worktree's assignment id, `venv-rollback`,
+`local-bin-symlink`), not the general category.
+
+**Rate limiting** (`~/.coord/watchdog-state.json`) stops the watchdog from
+repairing the identical condition more than 3 runs in a row (`--rate-limit`,
+default 3) — past that it escalates instead. Patching a recurring fault
+forever is how a root cause survives; this is the exact #2314 → #2569
+pattern the watchdog exists to not repeat.
+
+**Install** (every machine that execs `coord`/`coord-agent` out of
+`~/.coord-venv` — not just the daemon host):
+
+```bash
+mkdir -p ~/.local/bin ~/.config/systemd/user
+cp scripts/fleet_watchdog.py scripts/coord-venv-rollback.sh ~/.local/bin/
+chmod +x ~/.local/bin/fleet_watchdog.py ~/.local/bin/coord-venv-rollback.sh
+cp deploy/coord-fleet-watchdog.service deploy/coord-fleet-watchdog.timer ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now coord-fleet-watchdog.timer
+```
+
+On any machine that isn't the board-daemon host itself, also set
+`~/.config/coord/fleet-watchdog.env` (`COORD_BOARD_URL=http://<daemon-host>:7435`)
+— see `deploy/coord-fleet-watchdog.service`'s header for what degrades
+without it.
+
+**Deliberately not (yet) in the "Daemon-host unit inventory" table below or
+`coord/deploy_manifest.py`'s `ROLE_UNITS`.** Unlike every unit in that table,
+this one belongs on *every* agent host (worker and daemon alike) the same
+way `coord-agent.service` does, not on the daemon host alone — folding it in
+cleanly is left as a follow-up rather than done as a side effect of #2580.
+`tests/test_deploy_manifest.py` only asserts every `ROLE_UNITS` entry ships a
+real file, not the reverse, so this is a safe, intentional gap, not drift.
+
 ## Daemon-host unit inventory — what dellserver runs
 
 **If the daemon host is lost, this is the list you rebuild from.** Which units

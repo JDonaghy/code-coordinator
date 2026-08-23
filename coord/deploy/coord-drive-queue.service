@@ -108,7 +108,15 @@ Wants=network-online.target
 # together for 11 hours with zero operator-visible signal. This line is the
 # fix: a systemd-native alarm that cannot share that failure domain. See
 # deploy/coord-failure-notify.service's header for what it actually does.
-OnFailure=coord-failure-notify.service
+#
+# #2580: ALSO fires coord-fleet-watchdog.service, the repair half of the
+# same story — coord-failure-notify.service only pages a human;
+# coord-fleet-watchdog.service attempts the mechanical fix (e.g. the
+# ~/.coord-venv blue/green rollback this exact incident needed) immediately
+# instead of waiting for its own hourly timer. systemd's OnFailure= is a
+# list-type directive: both lines fire, neither replaces the other. See
+# deploy/coord-fleet-watchdog.service's header.
+OnFailure=coord-failure-notify.service coord-fleet-watchdog.service
 
 [Service]
 Type=oneshot

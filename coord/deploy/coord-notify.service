@@ -62,7 +62,14 @@ Wants=network-online.target
 # with zero operator-visible signal. This is doubly load-bearing on THIS
 # unit specifically: it is the one that would otherwise have been relied on
 # to notice and page. See deploy/coord-failure-notify.service's header.
-OnFailure=coord-failure-notify.service
+#
+# #2580: ALSO fires coord-fleet-watchdog.service, the repair half —
+# coord-failure-notify.service only pages a human; coord-fleet-watchdog.
+# service attempts the mechanical fix (e.g. the ~/.coord-venv blue/green
+# rollback this exact incident needed) immediately instead of waiting for
+# its own hourly timer. `OnFailure=` is a list-type directive: both fire.
+# See deploy/coord-fleet-watchdog.service's header.
+OnFailure=coord-failure-notify.service coord-fleet-watchdog.service
 
 [Service]
 Type=oneshot
