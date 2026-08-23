@@ -452,6 +452,21 @@ class DriveCounters:
     # terminal `_die()` — never an unbounded loop — once the budget is
     # spent.
     advisory_retries: int = 0
+    # #2334: the acceptance-author arm's own copy of `advisory_retries` —
+    # `_decide_acceptance_author`'s ADVISORY and DONE branches both hit the
+    # identical "terminal row, zero commits on its branch" dead end
+    # `_decide_advisory` mirrors above, and until now both were a deliberate
+    # COPY of the pre-#2416 `_die()`-on-first-look behaviour (their own
+    # comments said so: "Mirror `_decide_advisory` exactly"). A bounded
+    # number of FRESH `coord acceptance author` dispatches (`opts.
+    # max_work_retries`) before finally giving up — a new author, not
+    # `coord retry`, because the #1606 zero-commit-advisory reassignment
+    # path `coord retry` uses is a WORK-row concept; `type="test-author"`
+    # has no analogous CLI verb of its own. Separate counter, not a shared
+    # one with `advisory_retries`, because a single drive run can retry the
+    # slice's author AND the issue's own work row in the same session —
+    # sharing a counter would let one budget silently starve the other.
+    acceptance_author_retries: int = 0
 
     def slice_budget(self) -> "DriveCounters":
         """This run's slice-landing budget, created on first use (#2079)."""
@@ -742,6 +757,65 @@ def resolve_oracle_decision(
     )
 
 
+def _dispatch_fresh_acceptance_author(
+    state: IssueState,
+    oracle: OracleDecision,
+    gate_checker: AcceptanceGateChecker,
+    *,
+    label_suffix: str = "",
+) -> Action:
+    """Build the ``coord acceptance author ...`` RUN action for *state*'s
+    issue — the ONE command that can put a new, non-terminal ``test-author``
+    row on the board.
+
+    Shared by two call sites in :func:`_decide_acceptance_author`: the
+    first-ever dispatch (``aid`` empty) and the #2334 bounded retry (a
+    terminal row whose branch carried zero commits — the mirror of
+    ``_decide_advisory``'s own #2416 fix). Both need the identical
+    ``--for-path`` resolution and error handling; before this helper existed
+    only the first dispatch had it; the retry path had no dispatch at all.
+    """
+    command = [
+        "acceptance", "author", state.repo, str(oracle.tracking_issue),
+        "--issue", str(state.issue),
+    ]
+    # #1453 review finding 1: a ROUTED repo's `coord acceptance author`
+    # hard-refuses with no --for-path (coord.test_author.
+    # dispatch_test_author's "no route matched" RuntimeError) — resolve
+    # it from the milestone's Gate-A mock kind (the SHARED
+    # coord.acceptance.resolve_for_path helper) before ever dispatching,
+    # so a routed repo's very first JIT-authoring attempt doesn't die.
+    from coord.acceptance import ForPathResolutionError  # noqa: PLC0415
+
+    try:
+        for_path = gate_checker.resolve_for_path(state.repo, state.milestone_number)
+    except ForPathResolutionError as exc:
+        return _die(
+            f"could not resolve --for-path for {state.repo}'s JIT "
+            f"acceptance slice on #{state.issue}: {exc}"
+        )
+    if for_path:
+        command += ["--for-path", for_path]
+
+    return Action(
+        kind=RUN,
+        label=(
+            "ACCEPTANCE: authoring sealed JIT slice → coord acceptance "
+            f"author {state.repo} {oracle.tracking_issue} --issue "
+            f"{state.issue}"
+            + (f" --for-path {for_path}" if for_path else "")
+            + label_suffix
+        ),
+        command=tuple(command),
+        error_message=(
+            f"coord acceptance author failed to dispatch for #{state.issue}. "
+            "Check coordinator.yml's acceptance.drivers entry for "
+            f"{state.repo!r}, or re-run coord drive with --no-acceptance "
+            "to skip JIT authoring."
+        ),
+    )
+
+
 def _decide_acceptance_author(
     state: IssueState,
     oracle: OracleDecision,
@@ -821,44 +895,7 @@ def _decide_acceptance_author(
         # slice that already landed from an earlier attempt.
         if _slice_already_landed():
             return None
-        command = [
-            "acceptance", "author", state.repo, str(oracle.tracking_issue),
-            "--issue", str(state.issue),
-        ]
-        # #1453 review finding 1: a ROUTED repo's `coord acceptance author`
-        # hard-refuses with no --for-path (coord.test_author.
-        # dispatch_test_author's "no route matched" RuntimeError) — resolve
-        # it from the milestone's Gate-A mock kind (the SHARED
-        # coord.acceptance.resolve_for_path helper) before ever dispatching,
-        # so a routed repo's very first JIT-authoring attempt doesn't die.
-        from coord.acceptance import ForPathResolutionError  # noqa: PLC0415
-
-        try:
-            for_path = gate_checker.resolve_for_path(state.repo, state.milestone_number)
-        except ForPathResolutionError as exc:
-            return _die(
-                f"could not resolve --for-path for {state.repo}'s JIT "
-                f"acceptance slice on #{state.issue}: {exc}"
-            )
-        if for_path:
-            command += ["--for-path", for_path]
-
-        return Action(
-            kind=RUN,
-            label=(
-                "ACCEPTANCE: authoring sealed JIT slice → coord acceptance "
-                f"author {state.repo} {oracle.tracking_issue} --issue "
-                f"{state.issue}"
-                + (f" --for-path {for_path}" if for_path else "")
-            ),
-            command=tuple(command),
-            error_message=(
-                f"coord acceptance author failed to dispatch for #{state.issue}. "
-                "Check coordinator.yml's acceptance.drivers entry for "
-                f"{state.repo!r}, or re-run coord drive with --no-acceptance "
-                "to skip JIT authoring."
-            ),
-        )
+        return _dispatch_fresh_acceptance_author(state, oracle, gate_checker)
 
     if status == "merged":
         return None
@@ -923,11 +960,13 @@ def _decide_acceptance_author(
         # is explicitly excluded from coord's Test/Review/Merge auto-loop
         # (coord.reconcile's "review_state = 'advisory'" skip), so it will
         # NEVER transition to 'merged' on its own — treating it as
-        # "still landing" below would spin forever. Mirror `_decide_advisory`
-        # exactly: a real 0-commit exit is terminal outright; a #1357-style
-        # false positive (commits present) needs the same
-        # `--accept-advisory` opt-in the main work row uses, not a silent
-        # pass-through.
+        # "still landing" below would spin forever. Mirrors
+        # `_decide_advisory`: a real 0-commit exit gets the same #2334
+        # bounded-retry-then-die treatment #2416 gave the work row (a fresh
+        # `coord acceptance author`, not `coord retry` — see
+        # `DriveCounters.acceptance_author_retries`); a #1357-style false
+        # positive (commits present) needs the same `--accept-advisory`
+        # opt-in the main work row uses, not a silent pass-through.
         branch = state.acceptance_author_branch
         probe = replace(state, work_branch=branch) if branch else state
         commits = verifier.branch_has_commits(probe) if branch else False
@@ -949,14 +988,41 @@ def _decide_acceptance_author(
             # manifest before declaring failure.
             if _slice_already_landed():
                 return None
-            return _die(
-                f"acceptance author {aid} exited ADVISORY with no commits on "
-                "its branch — nothing was authored, so there is no slice to "
-                "land.\n"
-                f"   inspect: coord log {aid} --machine "
-                f"{state.acceptance_author_machine or machine}\n"
-                "   Continue by hand, or re-run coord drive with "
-                "--no-acceptance to skip JIT authoring."
+            # #2334: this used to be an immediate, unconditional `_die()` —
+            # the SAME dead end #2416 fixed for `_decide_advisory`'s work
+            # row, left un-mirrored here despite this branch's own comment
+            # saying "Mirror `_decide_advisory` exactly". Nothing could ever
+            # supersede the terminal row automatically: `drive-queue`'s own
+            # retry just relaunches a brand new `coord drive`, which
+            # re-observes the identical row and dies again in seconds
+            # (claude-coordinator#2531: six attempts, same wall, every
+            # time). Dispatch a FRESH `coord acceptance author`, bounded by
+            # `opts.max_work_retries` via `counters.acceptance_author_retries`
+            # — the same budget/shape as the work-row fix — before finally
+            # giving up for a human.
+            budget = opts.max_work_retries
+            if counters.acceptance_author_retries >= budget:
+                return _die(
+                    f"acceptance author {aid} exited ADVISORY with no "
+                    f"commits on its branch {counters.acceptance_author_retries} "
+                    f"time(s) in a row (budget {budget}, #2334) — nothing "
+                    "was authored, so there is no slice to land, and "
+                    "retrying has not produced a different outcome.\n"
+                    f"   inspect: coord log {aid} --machine "
+                    f"{state.acceptance_author_machine or machine}\n"
+                    "   this needs an operator decision: re-author by hand "
+                    f"(coord acceptance author {state.repo} "
+                    f"{oracle.tracking_issue} --issue {state.issue}), or "
+                    "re-run coord drive with --no-acceptance to skip JIT "
+                    "authoring."
+                )
+            counters.acceptance_author_retries += 1
+            return _dispatch_fresh_acceptance_author(
+                state, oracle, gate_checker,
+                label_suffix=(
+                    f" (attempt {counters.acceptance_author_retries}/{budget}"
+                    ", #2334 retry after zero-commit ADVISORY)"
+                ),
             )
         if not opts.accept_advisory:
             return _die(
@@ -1010,19 +1076,37 @@ def _decide_acceptance_author(
             # whole gate exists to detect. Check the manifest before dying.
             if _slice_already_landed():
                 return None
+            # #2334: the third copy of the `_decide_advisory` dead end — see
+            # the ADVISORY branch above's own #2334 comment. Same bounded
+            # retry, same shared `counters.acceptance_author_retries`
+            # budget: a work session that hits BOTH an empty-branch ADVISORY
+            # and an empty-branch DONE for the same slice (a retried author
+            # flapping between the two) still spends from one pool, not two.
             branch_display = repr(branch) if branch else "(none)"
-            return _die(
-                f"acceptance author {aid} exited DONE, but its branch "
-                f"{branch_display} carries no commits — nothing was "
-                "authored, so there is no slice to land, and DONE is "
-                "terminal: it will never change on its own.\n"
-                f"   inspect: coord log {aid} --machine "
-                f"{state.acceptance_author_machine or machine}\n"
-                "   Re-author by hand: coord acceptance author "
-                f"{state.repo} {oracle.tracking_issue} --issue "
-                f"{state.issue}\n"
-                "   or re-run coord drive with --no-acceptance to skip JIT "
-                "authoring."
+            budget = opts.max_work_retries
+            if counters.acceptance_author_retries >= budget:
+                return _die(
+                    f"acceptance author {aid} exited DONE, but its branch "
+                    f"{branch_display} carries no commits, "
+                    f"{counters.acceptance_author_retries} time(s) in a row "
+                    f"(budget {budget}, #2334) — nothing was authored, so "
+                    "there is no slice to land, and retrying has not "
+                    "produced a different outcome.\n"
+                    f"   inspect: coord log {aid} --machine "
+                    f"{state.acceptance_author_machine or machine}\n"
+                    "   this needs an operator decision: re-author by hand "
+                    f"(coord acceptance author {state.repo} "
+                    f"{oracle.tracking_issue} --issue {state.issue}), or "
+                    "re-run coord drive with --no-acceptance to skip JIT "
+                    "authoring."
+                )
+            counters.acceptance_author_retries += 1
+            return _dispatch_fresh_acceptance_author(
+                state, oracle, gate_checker,
+                label_suffix=(
+                    f" (attempt {counters.acceptance_author_retries}/{budget}"
+                    ", #2334 retry after zero-commit DONE)"
+                ),
             )
         # Authoring finished and the branch carries commits: hand over to the
         # landing driver, which observes the daemon-driven Test/Review stages
