@@ -2692,7 +2692,7 @@ def _clear_self_cordon_state() -> None:
 
 def _push_self_cordon_escalation(
     reason: str, *, age_seconds: float, config_path: Path | None
-) -> None:
+) -> bool:
     """The actual out-of-band push (#2572) — direct from THIS process, never
     routed through `coord notifier`'s own tick.
 
@@ -2700,10 +2700,25 @@ def _push_self_cordon_escalation(
     (so ``coord drive-queue status`` / ``list_drive_escalations`` / the
     TUI's escalations panel show it like any other row), AND attempts a live
     ntfy push using the SAME transport/config `coord notifier` uses
-    (``notifications:`` in coordinator.yml) — best-effort, never raises: an
-    unreachable/unconfigured ntfy server degrades this to "recorded, not
-    pushed", the same posture the notifier's own ``safe_send`` takes
-    (``coord/notifier/transport.py``), never a reason to fail the tick.
+    (``notifications:`` in coordinator.yml) — best-effort, never raises: a
+    broken import/config or a failed record never takes the tick down with
+    it, same isolation rule docs/NOTIFIER.md states for the notifier's own
+    tick.
+
+    Returns whether the caller may treat this occurrence as "escalated"
+    (mark ``escalated_at`` so it does not fire again): ``True`` when the
+    ntfy push actually landed, or when there was no push to *attempt*
+    because notifications are disabled/unconfigured — a legitimate reason,
+    not a failure. ``False`` when a push was attempted and failed (a
+    transient ntfy outage, a raised exception building/sending it), so the
+    caller leaves the marker unescalated and the next tick retries — same
+    policy `coord.notifier.service.deliver`'s docstring states: "A failed
+    send is not ledgered... an ntfy server that was down for an hour costs
+    a delayed notification, not a lost one." Recording this push as
+    escalated regardless of outcome would forfeit it permanently the moment
+    a transient failure lined up with the 30-minute threshold — precisely
+    the "the one channel that was supposed to reach a human silently
+    didn't" failure class #2572 exists to close, one layer down.
 
     Deliberately bypasses quiet hours (unlike the notifier's own digest
     path, `coord.notifier.digest`) — this fires at most once per persisted
@@ -2719,14 +2734,21 @@ def _push_self_cordon_escalation(
         f"self-cordon has held for {age_seconds / 60:.0f}+ minutes with the "
         f"same reason and no operator action recorded: {reason}"
     )
-    record_drive_escalation(
-        SELF_CORDON_ALERT_REPO,
-        SELF_CORDON_ALERT_ISSUE,
-        stage=SELF_CORDON_ALERT_STAGE,
-        reason=detail,
-        gate_readings=f"age_seconds={age_seconds:.0f} | reason={reason}",
-        proposed_command="git -C <repo_root> checkout main",
-    )
+    try:
+        record_drive_escalation(
+            SELF_CORDON_ALERT_REPO,
+            SELF_CORDON_ALERT_ISSUE,
+            stage=SELF_CORDON_ALERT_STAGE,
+            reason=detail,
+            gate_readings=f"age_seconds={age_seconds:.0f} | reason={reason}",
+            proposed_command="git -C <repo_root> checkout main",
+        )
+    except Exception as exc:  # noqa: BLE001 — an escalation table that
+        # cannot be written must not take the message down with it (mirrors
+        # `_escalate_roll_pending_expired`'s identical guard just above this
+        # function, and this function's own docstring promise to "never
+        # raise").
+        click.echo(f"  (could not record the self-cordon escalation: {exc})", err=True)
     click.echo(f"warning: {detail}", err=True)
 
     try:
@@ -2736,23 +2758,39 @@ def _push_self_cordon_escalation(
 
         cfg = _load_config(config_path)
         notif = getattr(cfg, "notifications", None)
-        if notif is not None and getattr(notif, "enabled", False):
-            transport = build_transport(notif)
-            safe_send(
-                transport,
-                Message(
-                    title="coord drive-queue: stuck self-cordon",
-                    body=detail,
-                    tags=("rotating_light",),
-                    priority=4,
-                ),
+        if notif is None or not getattr(notif, "enabled", False):
+            # Nothing configured to push through — a legitimate reason not
+            # to escalate-and-retry, same as `build_transport`'s own
+            # "half-configured notifier is a notifier that says nothing"
+            # fallback.
+            return True
+        transport = build_transport(notif)
+        result = safe_send(
+            transport,
+            Message(
+                title="coord drive-queue: stuck self-cordon",
+                body=detail,
+                tags=("rotating_light",),
+                priority=4,
+            ),
+        )
+        if not result.ok:
+            click.echo(
+                "  (self-cordon escalation push failed, will retry next "
+                f"tick: {result.error or 'unknown transport failure'})",
+                err=True,
             )
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001 — this is an ADDITION on top of
-        # the drive_escalations record above, which has already landed by
-        # this point; a broken import/config here must never take the tick
-        # down with it (same isolation rule docs/NOTIFIER.md states for the
-        # notifier's own tick).
+        # the drive_escalations record above, which has already been
+        # attempted by this point; a broken import/config here must never
+        # take the tick down with it (same isolation rule docs/NOTIFIER.md
+        # states for the notifier's own tick) — but it also means the push
+        # itself never happened, so treat it like any other failed send:
+        # retry next tick rather than forfeiting it silently.
         click.echo(f"  (could not push the self-cordon escalation: {exc})", err=True)
+        return False
 
 
 def _escalate_persistent_self_cordon(
@@ -2799,7 +2837,15 @@ def _escalate_persistent_self_cordon(
         # its lifetime.
         return
 
-    _push_self_cordon_escalation(drift_reason, age_seconds=age_seconds, config_path=config_path)
+    pushed = _push_self_cordon_escalation(
+        drift_reason, age_seconds=age_seconds, config_path=config_path
+    )
+    if not pushed:
+        # Push attempted and failed (transient ntfy outage, a raised
+        # exception) — leave the marker as-is (`escalated_at` still `None`)
+        # so the very next tick retries rather than forfeiting this
+        # occurrence for the lifetime of the persisted reason (#2572 review).
+        return
     state = dict(state)
     state["escalated_at"] = now
     _write_self_cordon_state(state)

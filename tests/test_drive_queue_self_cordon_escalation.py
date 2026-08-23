@@ -62,11 +62,12 @@ class TestClockTracking:
 
     def test_same_reason_past_threshold_escalates_exactly_once(self, monkeypatch):
         pushed = []
-        monkeypatch.setattr(
-            dq_cmd,
-            "_push_self_cordon_escalation",
-            lambda reason, *, age_seconds, config_path: pushed.append((reason, age_seconds)),
-        )
+
+        def _fake_push(reason, *, age_seconds, config_path):
+            pushed.append((reason, age_seconds))
+            return True  # simulated successful push
+
+        monkeypatch.setattr(dq_cmd, "_push_self_cordon_escalation", _fake_push)
         reason = "drifted onto 'x'"
         t0 = 1000.0
         dq_cmd._escalate_persistent_self_cordon(reason, now=t0, config_path=None)
@@ -88,11 +89,12 @@ class TestClockTracking:
 
     def test_reason_change_resets_the_clock_instead_of_escalating_immediately(self, monkeypatch):
         pushed = []
-        monkeypatch.setattr(
-            dq_cmd,
-            "_push_self_cordon_escalation",
-            lambda reason, *, age_seconds, config_path: pushed.append(reason),
-        )
+
+        def _fake_push(reason, *, age_seconds, config_path):
+            pushed.append(reason)
+            return True  # simulated successful push
+
+        monkeypatch.setattr(dq_cmd, "_push_self_cordon_escalation", _fake_push)
         t0 = 1000.0
         dq_cmd._escalate_persistent_self_cordon("drifted onto 'a'", now=t0, config_path=None)
         dq_cmd._escalate_persistent_self_cordon(
@@ -117,11 +119,12 @@ class TestClockTracking:
 
     def test_condition_resolving_clears_state_and_a_recurrence_starts_fresh(self, monkeypatch):
         pushed = []
-        monkeypatch.setattr(
-            dq_cmd,
-            "_push_self_cordon_escalation",
-            lambda reason, *, age_seconds, config_path: pushed.append(reason),
-        )
+
+        def _fake_push(reason, *, age_seconds, config_path):
+            pushed.append(reason)
+            return True  # simulated successful push
+
+        monkeypatch.setattr(dq_cmd, "_push_self_cordon_escalation", _fake_push)
         reason = "drifted onto 'x'"
         t0 = 1000.0
         dq_cmd._escalate_persistent_self_cordon(reason, now=t0, config_path=None)
@@ -140,6 +143,34 @@ class TestClockTracking:
         state = dq_cmd._read_self_cordon_state()
         assert state["first_seen_at"] == t0 + 6000.0
 
+    def test_failed_push_leaves_the_marker_unescalated_so_the_next_tick_retries(self, monkeypatch):
+        """A transient failure (bad URL, DNS blip, server briefly down) at
+        the exact moment the threshold is crossed must not permanently
+        forfeit the push — mirrors `coord.notifier.service.deliver`'s "a
+        failed send is not ledgered" policy, one layer down (#2572 review)."""
+        pushed = []
+
+        def _failing_push(reason, *, age_seconds, config_path):
+            pushed.append(reason)
+            return False  # simulated transient ntfy failure
+
+        monkeypatch.setattr(dq_cmd, "_push_self_cordon_escalation", _failing_push)
+        reason = "drifted onto 'x'"
+        t0 = 1000.0
+        dq_cmd._escalate_persistent_self_cordon(reason, now=t0, config_path=None)
+        dq_cmd._escalate_persistent_self_cordon(
+            reason, now=t0 + dq_cmd.SELF_CORDON_ESCALATE_AFTER_SECONDS, config_path=None
+        )
+        state = dq_cmd._read_self_cordon_state()
+        assert state["escalated_at"] is None
+
+        # Next tick, same still-unbroken reason: retries rather than staying
+        # silently forfeited for the rest of this occurrence's lifetime.
+        dq_cmd._escalate_persistent_self_cordon(
+            reason, now=t0 + dq_cmd.SELF_CORDON_ESCALATE_AFTER_SECONDS + 60, config_path=None
+        )
+        assert pushed == [reason, reason]
+
 
 class TestPushSelfCordonEscalation:
     def test_records_a_distinct_escalation_key(self, monkeypatch):
@@ -157,9 +188,10 @@ class TestPushSelfCordonEscalation:
             gates="",
             command="",
         )
-        dq_cmd._push_self_cordon_escalation(
+        result = dq_cmd._push_self_cordon_escalation(
             "drifted onto 'x'", age_seconds=1800.0, config_path=None
         )
+        assert result is True  # nothing to push — disabled is a legitimate reason
 
         routine = get_drive_escalation(dq_cmd.QUEUE_ALERT_REPO, dq_cmd.QUEUE_ALERT_ISSUE)
         persistent = get_drive_escalation(
@@ -174,18 +206,43 @@ class TestPushSelfCordonEscalation:
     def test_never_raises_when_notifier_config_is_unreachable(self, monkeypatch):
         """The DB record is the floor; a broken import/config on the push
         half must not take the tick down with it (#2572, same isolation
-        rule docs/NOTIFIER.md states for the notifier's own tick)."""
+        rule docs/NOTIFIER.md states for the notifier's own tick). But the
+        push itself never happened, so this must read as a retry-able
+        failure, not a silently-forfeited success."""
 
         def _boom(_path):
             raise RuntimeError("simulated config load failure")
 
         monkeypatch.setattr("coord.commands._common._load_config", _boom)
 
-        dq_cmd._push_self_cordon_escalation("drifted onto 'x'", age_seconds=1800.0, config_path=None)
+        result = dq_cmd._push_self_cordon_escalation(
+            "drifted onto 'x'", age_seconds=1800.0, config_path=None
+        )
 
+        assert result is False
         assert get_drive_escalation(
             dq_cmd.SELF_CORDON_ALERT_REPO, dq_cmd.SELF_CORDON_ALERT_ISSUE
         ) is not None
+
+    def test_never_raises_when_recording_the_escalation_fails(self, monkeypatch):
+        """`record_drive_escalation` can route over the network to the board
+        daemon — plausible to fail during exactly the kind of fleet
+        instability that makes this feature necessary. Mirrors
+        `_escalate_roll_pending_expired`'s identical guard, and this
+        function's own docstring promise to "never raise" (#2572 review)."""
+        monkeypatch.setattr("coord.commands._common._load_config", _disabled_config)
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated board daemon failure")
+
+        monkeypatch.setattr("coord.state.record_drive_escalation", _boom)
+
+        # Must not raise, and since nothing is configured to push through
+        # (disabled), this still counts as "nothing left to retry".
+        result = dq_cmd._push_self_cordon_escalation(
+            "drifted onto 'x'", age_seconds=1800.0, config_path=None
+        )
+        assert result is True
 
     def test_attempts_an_ntfy_push_when_notifications_are_enabled(self, monkeypatch):
         sent = []
@@ -208,12 +265,49 @@ class TestPushSelfCordonEscalation:
             lambda _path=None: SimpleNamespace(notifications=notif_cfg),
         )
 
-        dq_cmd._push_self_cordon_escalation("drifted onto 'x'", age_seconds=1800.0, config_path=None)
+        result = dq_cmd._push_self_cordon_escalation(
+            "drifted onto 'x'", age_seconds=1800.0, config_path=None
+        )
 
+        assert result is True
         assert len(sent) == 1
         _, message = sent[0]
         assert "self-cordon" in message.title.lower() or "cordon" in message.title.lower()
         assert "drifted onto 'x'" in message.body
+
+    def test_returns_false_without_raising_when_the_ntfy_push_fails(self, monkeypatch):
+        """The core of the #2572 review finding: a transient send failure
+        (bad URL, DNS blip, server briefly down) must be reported back as
+        "not escalated" so the caller retries next tick, instead of being
+        silently treated the same as a successful push."""
+        monkeypatch.setattr(
+            "coord.notifier.transport.safe_send",
+            lambda transport, message: SendResult(ok=False, error="connection refused"),
+        )
+        notif_cfg = SimpleNamespace(
+            enabled=True,
+            transport="ntfy",
+            ntfy_url="http://dellserver:7440",
+            ntfy_topic="coord-fleet",
+            ntfy_token=None,
+            timeout_secs=5.0,
+        )
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda _path=None: SimpleNamespace(notifications=notif_cfg),
+        )
+
+        result = dq_cmd._push_self_cordon_escalation(
+            "drifted onto 'x'", age_seconds=1800.0, config_path=None
+        )
+
+        assert result is False
+        # The drive_escalations record still lands — only the ntfy push
+        # (and, in turn, whether the marker advances to "escalated") is
+        # gated on the send outcome.
+        assert get_drive_escalation(
+            dq_cmd.SELF_CORDON_ALERT_REPO, dq_cmd.SELF_CORDON_ALERT_ISSUE
+        ) is not None
 
     def test_does_not_push_when_notifications_are_disabled(self, monkeypatch):
         sent = []
@@ -223,8 +317,11 @@ class TestPushSelfCordonEscalation:
         )
         monkeypatch.setattr("coord.commands._common._load_config", _disabled_config)
 
-        dq_cmd._push_self_cordon_escalation("drifted onto 'x'", age_seconds=1800.0, config_path=None)
+        result = dq_cmd._push_self_cordon_escalation(
+            "drifted onto 'x'", age_seconds=1800.0, config_path=None
+        )
 
+        assert result is True
         assert sent == []
         assert get_drive_escalation(
             dq_cmd.SELF_CORDON_ALERT_REPO, dq_cmd.SELF_CORDON_ALERT_ISSUE
