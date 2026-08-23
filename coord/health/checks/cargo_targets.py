@@ -131,6 +131,66 @@ def _gc_verdict(ctx: HealthContext) -> tuple[dict | None, bool]:
     return status, age <= _GC_STATUS_MAX_AGE_SECS
 
 
+def _known_repo_names(ctx: HealthContext) -> set[str]:
+    """Every repo name this machine could plausibly be building.
+
+    Used only as the fail-closed fallback in :func:`_live_repos` below — when
+    we cannot positively determine which repos have a live assignment, this
+    is what "protect everything we know about" means.
+    """
+    from coord.cargo_cache import CACHE_DIRNAME  # noqa: PLC0415
+
+    names: set[str] = {c.name for c in ctx.checkouts}
+    cache_root = ctx.coord_dir / CACHE_DIRNAME
+    try:
+        names |= {
+            entry.name
+            for entry in cache_root.iterdir()
+            if entry.is_dir() and not entry.is_symlink()
+        }
+    except OSError:
+        pass
+    return names
+
+
+def _live_repos(ctx: HealthContext) -> set[str]:
+    """Repo names with a pending/running assignment on THIS machine.
+
+    Mirrors ``AgentServer._gc_cargo_cache``'s own ``protect_repos``
+    computation (``coord/agent.py``) exactly, so ``--fix`` shares the same
+    safety property the automatic post-worktree-clean sweep already has: a
+    repo a worker on this box is actively building is never eligible for
+    tier-3 whole-directory eviction (#2137/#1402). ``_this_machine_name`` is
+    reused from ``release_cordon.py`` rather than re-deriving the hostname
+    match rule a second time.
+
+    Fails closed in both directions a probe can go wrong: unable to tell
+    which machine this is, or unable to read the board — either one means
+    "cannot confirm what's live", which must never be read as "confirmed
+    nothing is live" ahead of a destructive ``rmtree``. Both fall back to
+    :func:`_known_repo_names`, i.e. protect every repo this box even knows
+    about.
+    """
+    from coord.health.checks.release_cordon import _this_machine_name  # noqa: PLC0415
+
+    machine_name = _this_machine_name(ctx.config)
+    if machine_name is None:
+        return _known_repo_names(ctx)
+
+    try:
+        from coord.board_service import read_board  # noqa: PLC0415
+
+        board = read_board()
+    except Exception:  # noqa: BLE001 - fail closed: assume every repo is live
+        return _known_repo_names(ctx)
+
+    return {
+        a.repo_name
+        for a in board.active
+        if a.machine_name == machine_name and a.status in ("pending", "running")
+    }
+
+
 def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     """#2581 opt-in remedy: re-run the shared cargo-cache GC (#2137/#1402).
 
@@ -144,6 +204,13 @@ def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     actively building in is not the same "purely reversible" action a
     shared, worker-only cache's GC is, and #2581 scopes the allow-list to
     the latter.
+
+    Passes :func:`_live_repos` as ``protect_repos`` so this shares the exact
+    safety property ``AgentServer._gc_cargo_cache`` has: a repo with a live
+    pending/running assignment on this machine is never eligible for tier-3
+    whole-directory eviction, even between build steps where ``build_active``
+    (a point-in-time ``.cargo-lock``/``/proc`` probe) would not itself catch
+    it.
 
     Only acts when the check's own escalation fired (`gc_over_cap` AND
     fresh, exactly `probe_cargo_targets`'s own condition for turning this
@@ -161,8 +228,11 @@ def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     from coord.cargo_cache import free_floor_bytes, sweep, write_gc_status  # noqa: PLC0415
 
     before = (values.get("gc") or {}).get("cargo_cache_bytes")
+    protect_repos = _live_repos(ctx)
     try:
-        sweep_result = sweep(ctx.coord_dir, free_floor=free_floor_bytes())
+        sweep_result = sweep(
+            ctx.coord_dir, protect_repos=protect_repos, free_floor=free_floor_bytes()
+        )
     except OSError as exc:
         return FixOutcome(
             check_id="cargo_targets", subject=None, status="error",

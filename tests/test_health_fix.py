@@ -465,6 +465,86 @@ def test_fix_cargo_targets_ignores_a_stale_gc_verdict(tmp_path) -> None:
     assert (coord_dir / "cargo-target" / "repo1" / "blob").exists()
 
 
+def test_fix_cargo_targets_protects_a_repo_with_a_live_assignment(
+    tmp_path, monkeypatch
+) -> None:
+    """#2581 review: a repo with a live pending/running assignment on THIS
+    machine must never be tier-3 evicted, mirroring
+    ``AgentServer._gc_cargo_cache``'s own ``protect_repos`` safety property.
+
+    ``repo1`` here holds only a plain file — not under ``incremental/`` or
+    stale enough for tier 2 — so the only way the sweep could get it under
+    cap is tier-3 whole-directory eviction. With a live `running` assignment
+    for ``repo1`` on this machine, that eviction must be skipped: the sweep
+    stays over cap and the directory survives.
+    """
+    import coord.board_service as board_service
+    from coord.health.checks import release_cordon as check_mod
+
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
+    _gc_status(coord_dir)
+    monkeypatch.setenv("COORD_CARGO_CACHE_CAP_GB", "0.0000000001")
+
+    monkeypatch.setattr(check_mod.socket, "gethostname", lambda: "precision")
+    config = SimpleNamespace(
+        machines=[SimpleNamespace(name="precision", host="precision")]
+    )
+    monkeypatch.setattr(
+        board_service,
+        "read_board",
+        lambda: SimpleNamespace(
+            active=[
+                SimpleNamespace(
+                    machine_name="precision", repo_name="repo1", status="running"
+                )
+            ]
+        ),
+    )
+
+    ctx = make_ctx(tmp_path, coord_dir=coord_dir, config=config)
+    result = cargo_targets.probe_cargo_targets(ctx)
+    assert result.values["gc_over_cap"] is True
+
+    outcome = cargo_targets.fix_cargo_targets(ctx, result)
+    assert outcome.status == "applied"
+    assert "still over cap" in outcome.message
+    # Protected: the whole-directory tier-3 eviction must not have run.
+    assert (coord_dir / "cargo-target" / "repo1" / "blob").exists()
+
+
+def test_fix_cargo_targets_evicts_the_same_repo_once_it_goes_idle(
+    tmp_path, monkeypatch
+) -> None:
+    """Same fixture as the protection test above, minus the live assignment
+    — proves the protection in that test is doing the work, not some other
+    difference between the two setups."""
+    import coord.board_service as board_service
+    from coord.health.checks import release_cordon as check_mod
+
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
+    _gc_status(coord_dir)
+    monkeypatch.setenv("COORD_CARGO_CACHE_CAP_GB", "0.0000000001")
+
+    monkeypatch.setattr(check_mod.socket, "gethostname", lambda: "precision")
+    config = SimpleNamespace(
+        machines=[SimpleNamespace(name="precision", host="precision")]
+    )
+    monkeypatch.setattr(
+        board_service, "read_board", lambda: SimpleNamespace(active=[])
+    )
+
+    ctx = make_ctx(tmp_path, coord_dir=coord_dir, config=config)
+    result = cargo_targets.probe_cargo_targets(ctx)
+    assert result.values["gc_over_cap"] is True
+
+    outcome = cargo_targets.fix_cargo_targets(ctx, result)
+    assert outcome.status == "applied"
+    assert "now under cap" in outcome.message
+    assert not (coord_dir / "cargo-target" / "repo1").exists()
+
+
 def test_fix_cargo_targets_no_action_without_an_over_cap_verdict(tmp_path) -> None:
     coord_dir = tmp_path / ".coord"
     _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
@@ -556,12 +636,18 @@ def test_fix_graph_handles_an_absent_graph(tmp_path, monkeypatch) -> None:
     path = tmp_path / "src" / "claude-coordinator"
     path.mkdir(parents=True)
 
-    monkeypatch.setattr(
-        "coord.graph_health.graph_status",
-        lambda repo_path, default_branch: SimpleNamespace(
-            present=False, stale=False, origin_behind=False,
-        ),
-    )
+    calls = {"n": 0}
+
+    def _fake_status(repo_path, default_branch):
+        calls["n"] += 1
+        # First call (inside the fixer, before running graphify): no graph
+        # built yet. Second call (the fixer's own post-run re-verify): the
+        # subprocess produced one.
+        return SimpleNamespace(
+            present=calls["n"] > 1, stale=False, origin_behind=False,
+        )
+
+    monkeypatch.setattr("coord.graph_health.graph_status", _fake_status)
     run_calls = []
     monkeypatch.setattr(
         subprocess, "run",
@@ -596,6 +682,32 @@ def test_fix_graph_reports_error_on_nonzero_exit(tmp_path, monkeypatch) -> None:
     outcome = graph.fix_graph(ctx, _graph_result(path))
     assert outcome.status == "error"
     assert "boom" in outcome.error
+
+
+def test_fix_graph_reports_error_when_still_stale_after_a_clean_exit(
+    tmp_path, monkeypatch
+) -> None:
+    """#2581 review: a 0 exit code from `graphify update` is evidence the
+    process ran, not evidence the graph it produced is current. When the
+    fixer's own post-run re-check still finds the graph stale/absent, that
+    must surface as `error`, never a silently-unconfirmed `applied`."""
+    path = tmp_path / "src" / "claude-coordinator"
+    path.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "coord.graph_health.graph_status",
+        lambda repo_path, default_branch: SimpleNamespace(
+            present=True, stale=True, origin_behind=False, unknown_reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    ctx = make_ctx(tmp_path)
+    outcome = graph.fix_graph(ctx, _graph_result(path))
+    assert outcome.status == "error"
+    assert "re-check" in outcome.message
 
 
 # ── end-to-end via the CLI ───────────────────────────────────────────────────
