@@ -6944,6 +6944,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             nonlocal last_notify_drain, last_notifier, last_portal_sync
+            from coord.audit import (  # noqa: PLC0415
+                flush_lock_contention_summary as _flush_audit_lock_contention_summary,
+            )
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -6956,6 +6959,22 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # for a daemon-side hand-edit to take effect (faster than
                 # waiting on a `/board` request).
                 _refresh_config()
+                # #2597-review: flush any pending "audit: N writes lost to
+                # lock contention" warning on this tick's cadence rather
+                # than only at process exit. `coord.audit`'s aggregate
+                # counter is atexit-registered, which is the right default
+                # for a short-lived CLI (`coord merge`, `coord notify`) but
+                # means this daemon — arguably the busiest audit writer of
+                # all (this tick loop, the drive-queue tick, up to 4 drives,
+                # 3 agents) — can accumulate losses for its entire uptime
+                # with zero visibility unless it happens to shut down
+                # cleanly. Cheap (in-memory counter + a log call only when
+                # non-zero) and run inline rather than via
+                # `run_in_threadpool` — no I/O, so no reason to hop threads.
+                try:
+                    _flush_audit_lock_contention_summary()
+                except Exception:  # noqa: BLE001 — diagnostics must never crash the daemon
+                    log.warning("audit lock-contention flush failed", exc_info=True)
                 # Step 1: reconcile (independent try/except so a failure here
                 # does not prevent the enqueue step below).
                 try:

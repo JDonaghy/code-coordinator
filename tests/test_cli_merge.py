@@ -1929,6 +1929,66 @@ class TestMergeAutoEnqueue:
         assert "skipped" not in result.output
         assert "auto-enqueued" not in result.output
 
+    def test_lock_contention_on_one_assignment_does_not_abort_scan_of_the_rest(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#2597-review: exhausting `retry_on_locked`'s budget on ONE
+        assignment must not resurrect the #1353 bug for lock contention —
+        every other assignment still queued in this batch must still be
+        scanned and, if eligible, auto-enqueued and reported. The run as a
+        whole still fails loudly (non-zero exit, a real
+        `sqlite3.OperationalError`) once the rest of the batch has had its
+        turn, so the contention is never silently dropped either."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=2599, assignment_id="locked-2599",
+            branch="issue-2599-fix",
+        )
+        from coord.models import Assignment
+        from coord.state import load_board, save_board
+
+        board = load_board()
+        board.completed.append(
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=2600,
+                issue_title="#2600", assignment_id="ok-2600", type="work",
+                status="done", branch="issue-2600-fix", test_state="passed",
+            )
+        )
+        save_board(board)
+        self._seed_issue_state(coord_db, number=2599, state="open")
+        self._seed_issue_state(coord_db, number=2600, state="open")
+
+        from coord import merge_queue as merge_queue_mod
+
+        real_refresh = merge_queue_mod.refresh_entry_assignment
+
+        def _mixed_side_effect(a, **kwargs):
+            if a.issue_number == 2599:
+                # Sustained contention — every attempt fails, exhausting
+                # `retry_on_locked`'s budget.
+                raise sqlite3.OperationalError("database is locked")
+            return real_refresh(a, **kwargs)
+
+        with patch(
+            "coord.merge_queue.refresh_entry_assignment", side_effect=_mixed_side_effect,
+        ), patch(
+            "coord.db.time.sleep",  # keep the test fast — skip the real backoff
+        ):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, sqlite3.OperationalError)
+        # The contended assignment is named and clearly flagged as a hard
+        # failure — not the soft "skipped" line used for other errors.
+        assert "LOCK CONTENTION" in result.output
+        assert "#2599" in result.output
+        assert "skipped" not in result.output
+        # The OTHER assignment in the same batch was still scanned and
+        # auto-enqueued normally — the whole scan was not aborted by the
+        # first assignment's contention.
+        assert "auto-enqueued" in result.output
+        assert "#2600" in result.output
+
 
 class TestStatusMergeQueue:
     def test_status_shows_queue_section(
