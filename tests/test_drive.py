@@ -32,7 +32,13 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config, ProviderDef, ProvidersConfig, UsageGateConfig
+from coord.config import (
+    Config,
+    PipelineConfig,
+    ProviderDef,
+    ProvidersConfig,
+    UsageGateConfig,
+)
 from coord.drive import (
     EXIT_DEAD_END,
     EXIT_DEADLINE,
@@ -75,6 +81,20 @@ def make_config() -> Config:
         repos=[Repo(name=REPO, github="john/claude-coordinator", test_command="pytest -q")],
         machines=[Machine(name="precision", host="precision", repos=[REPO])],
     )
+
+
+def make_config_no_stall_overrides() -> Config:
+    """#2649: ``make_config()`` with ``PipelineConfig.stall_thresholds``
+    cleared. The generic re-nudge/monotonicity/fingerprint-clear tests below
+    exercise the FLAT ``--stall`` mechanism in isolation using tiny
+    fake-clock ``stall_mins`` values and ``board()``'s default
+    ``type="work"`` — without this, the built-in ``work`` override
+    (comfortably larger, by design, than anything those tests configure)
+    would silently take over and the flat value they set would never
+    govern anything."""
+    cfg = make_config()
+    cfg.pipeline.stall_thresholds = {}
+    return cfg
 
 
 def state(**kw) -> IssueState:
@@ -5977,6 +5997,10 @@ def test_stalled_stage_gets_re_nudged_on_every_stall_window(driver_factory, caps
             deadline_mins=8.0 / 60.0,  # 8 units — spans several stall windows
             notify=True,
         ),
+        # #2649: isolate the flat-`--stall` mechanism under test from the
+        # new built-in per-type `work` override — see
+        # `make_config_no_stall_overrides`'s docstring.
+        config=make_config_no_stall_overrides(),
     )
     notify_calls: list[tuple] = []
     driver.run_coord = lambda args, **kw: notify_calls.append(args) or 0  # type: ignore[assignment]
@@ -6005,6 +6029,8 @@ def test_smaller_stall_never_produces_fewer_nudges(driver_factory):
                 deadline_mins=12.0 / 60.0,
                 notify=True,
             ),
+            # #2649: see `test_stalled_stage_gets_re_nudged_on_every_stall_window`.
+            config=make_config_no_stall_overrides(),
         )
         calls: list[tuple] = []
         driver.run_coord = lambda args, **kw: calls.append(args) or 0  # type: ignore[assignment]
@@ -6058,6 +6084,8 @@ def test_fingerprint_change_clears_the_published_stall_nudge(driver_factory, mon
             deadline_mins=6.0 / 60.0,
             notify=False,
         ),
+        # #2649: see `test_stalled_stage_gets_re_nudged_on_every_stall_window`.
+        config=make_config_no_stall_overrides(),
     )
 
     assert driver.run() == EXIT_DEADLINE
@@ -6067,6 +6095,104 @@ def test_fingerprint_change_clears_the_published_stall_nudge(driver_factory, mon
     # publish — the fingerprint-change branch retracting it once the
     # pipeline actually advances past the stalled stage.
     assert ("clear", REPO, ISSUE) in events[first_publish + 1:], events
+
+
+def test_stall_threshold_per_type_override_suppresses_a_false_positive(
+    driver_factory, capsys,
+):
+    """#2649: a `work` stage configured with its own (larger) stall override
+    must not be nudged before THAT threshold elapses, even though the flat
+    ``--stall`` fallback alone would have fired almost immediately. Proven
+    by racing the override against the deadline: the run's whole life
+    (4 fake-clock units) sits entirely under the 5-unit override, so if the
+    flat 1-unit default were still governing, at least one nudge would have
+    fired long before the deadline — none may.
+    """
+    cfg = make_config()
+    cfg.pipeline.stall_thresholds = {"work": 5.0}
+    driver = driver_factory(
+        [board(status="running", type="work")],
+        opts=DriveOptions(
+            machine="precision",
+            poll=1.0,
+            stall_mins=1.0 / 60.0,  # flat fallback: 1 fake-clock unit
+            deadline_mins=4.0 / 60.0,  # 4 units — under the 5-unit override
+            notify=True,
+        ),
+        config=cfg,
+    )
+    notify_calls: list[tuple] = []
+    driver.run_coord = lambda args, **kw: notify_calls.append(args) or 0  # type: ignore[assignment]
+
+    assert driver.run() == EXIT_DEADLINE
+    assert notify_calls.count(("notify",)) == 0, notify_calls
+    err = capsys.readouterr().err
+    assert "no state change" not in err, err
+
+
+def test_stall_threshold_per_type_override_still_fires_once_exceeded(
+    driver_factory,
+):
+    """The other half of the #2649 fix: a per-type override is a LARGER
+    threshold, not a disabled one — once the stage genuinely outlives it,
+    the nudge still fires."""
+    cfg = make_config()
+    cfg.pipeline.stall_thresholds = {"work": 2.0}
+    driver = driver_factory(
+        [board(status="running", type="work")],
+        opts=DriveOptions(
+            machine="precision",
+            poll=1.0,
+            stall_mins=1.0 / 60.0,
+            deadline_mins=6.0 / 60.0,  # comfortably past the 2-unit override
+            notify=True,
+        ),
+        config=cfg,
+    )
+    notify_calls: list[tuple] = []
+    driver.run_coord = lambda args, **kw: notify_calls.append(args) or 0  # type: ignore[assignment]
+
+    assert driver.run() == EXIT_DEADLINE
+    assert notify_calls.count(("notify",)) >= 1, notify_calls
+
+
+def test_stall_threshold_falls_back_to_flat_stall_for_an_unlisted_type(
+    driver_factory,
+):
+    """A type with no ``stall_thresholds`` entry (e.g. ``review``) keeps
+    exactly the pre-#2649 flat-``--stall`` behaviour — the per-type table
+    must never silently apply to a type nobody configured."""
+    cfg = make_config()
+    cfg.pipeline.stall_thresholds = {"work": 999.0}  # would never fire in this run
+    driver = driver_factory(
+        [board(status="running", type="review")],
+        opts=DriveOptions(
+            machine="precision",
+            poll=1.0,
+            stall_mins=1.0 / 60.0,  # flat fallback: 1 fake-clock unit
+            deadline_mins=4.0 / 60.0,
+            notify=True,
+        ),
+        config=cfg,
+    )
+    notify_calls: list[tuple] = []
+    driver.run_coord = lambda args, **kw: notify_calls.append(args) or 0  # type: ignore[assignment]
+
+    assert driver.run() == EXIT_DEADLINE
+    assert notify_calls.count(("notify",)) >= 1, notify_calls
+
+
+def test_default_stall_thresholds_cover_the_2649_evidence():
+    """Pin the #2649 built-in defaults: both measured false positives
+    (a `work` stage at ~26m, the Test-stage `type="smoke"` at ~22m,
+    claude-coordinator#2572) must sit comfortably under the built-in
+    per-type threshold, and an unlisted type (`review`, measured at ~8m in
+    that same run) must fall back to the caller's own default rather than
+    picking up a `work`/`smoke`-sized threshold it never earned."""
+    pipeline = make_config().pipeline
+    assert pipeline.stall_threshold_secs(["work"], default_secs=1200.0) > 26 * 60.0
+    assert pipeline.stall_threshold_secs(["smoke"], default_secs=1200.0) > 22 * 60.0
+    assert pipeline.stall_threshold_secs(["review"], default_secs=1200.0) == 1200.0
 
 
 def test_the_config_path_is_threaded_onto_every_coord_subprocess(driver_factory):

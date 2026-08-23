@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field, fields
 from datetime import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -862,6 +862,30 @@ INTERACTIVE_SESSION_TYPES: frozenset[str] = frozenset({
 })
 
 
+# #2649: per-assignment-type overrides for `coord drive`'s OWN stall
+# detector (`Driver._loop`'s "no state change in Nm" nudge) — a different
+# signal from `_DEFAULT_ATTENTION_THRESHOLDS` above despite the similar
+# shape. That one measures wall clock since a row was *dispatched*
+# (`status="running"`); this one measures minutes since the drive's board
+# *fingerprint* last changed while a stage sits active — the two can and do
+# diverge (a worker can be actively producing output for well over an
+# attention threshold without the board fingerprint moving at all).
+#
+# Seeded from one measured run (claude-coordinator#2572, 2026-08-23,
+# dellserver): under the flat 20m default, a `work` stage completed at
+# ~26m and the Test-stage (board `type="smoke"`) completed at ~22m — both
+# routine, both false positives. `work`/`smoke` get raised, evidenced
+# entries here; every other type (`review` at ~8m, `conflict-fix` at ~9m in
+# that same run, plus `merge`/`plan`/`mock-author`/`test-author`/... with no
+# counter-evidence at all) is intentionally left OFF this table and keeps
+# falling back to the drive's own `--stall` value exactly as before —
+# see `PipelineConfig.stall_threshold_secs`.
+_DEFAULT_STALL_THRESHOLDS: dict[str, float] = {
+    "work": 35 * 60.0,
+    "smoke": 35 * 60.0,
+}
+
+
 @dataclass
 class LivenessAuditorConfig:
     """#2048: cheap, independent per-turn liveness auditor tunables.
@@ -1048,6 +1072,12 @@ class PipelineConfig:
     always wins over this fleet default — see
     ``coord.commands.drive_queue.drive_queue_tick`` for the resolution
     order, which mirrors ``max_fix_rounds`` above.
+
+    ``stall_thresholds`` (#2649) maps assignment ``type`` to a per-type
+    override (seconds) for ``coord drive``'s OWN stall detector — see
+    :data:`_DEFAULT_STALL_THRESHOLDS` for the shape and the evidence behind
+    its two seeded entries, and :meth:`stall_threshold_secs` for how a type
+    absent from the table falls back to the drive's flat ``--stall`` value.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -1076,6 +1106,11 @@ class PipelineConfig:
     # #2573 — None means "use coord.drive_queue.DEFAULT_MAX_PARALLEL_PER_REPO".
     # See the class docstring.
     max_parallel_per_repo: int | None = None
+    # #2649 — per-type overrides for `coord drive`'s own stall detector.
+    # See the class docstring / _DEFAULT_STALL_THRESHOLDS.
+    stall_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_STALL_THRESHOLDS)
+    )
 
     def attention_threshold_for(
         self,
@@ -1146,6 +1181,32 @@ class PipelineConfig:
         return self.attention_thresholds.get(
             "work", _DEFAULT_ATTENTION_THRESHOLDS["work"]
         )
+
+    def stall_threshold_secs(
+        self, active_types: Iterable[str], *, default_secs: float
+    ) -> float:
+        """Seconds of no board-fingerprint-change before ``coord drive``
+        nudges a stall, for a stage whose currently-active assignment types
+        are *active_types* (``IssueState.active_types`` — usually one type,
+        occasionally several when a Test-stage child overlaps its parent).
+
+        A type present in ``stall_thresholds`` (built-in default or
+        user-configured — see :data:`_DEFAULT_STALL_THRESHOLDS`) always
+        wins over *default_secs*. When more than one active type has an
+        entry, the LARGEST wins — a stage is not stalled while ANY of its
+        concurrently-active types would still call it normal, so nudging on
+        the smaller of two thresholds would defeat the point of the larger
+        one. A type with no entry — including ``active_types`` being empty,
+        e.g. no assignment is running and the board simply has not moved —
+        falls back to *default_secs*, the caller's own ``--stall`` value:
+        unlisted types keep exactly today's behaviour.
+        """
+        candidates = [
+            self.stall_thresholds[t] for t in active_types if t in self.stall_thresholds
+        ]
+        if candidates:
+            return max(candidates)
+        return default_secs
 
     def tracked_labels(self) -> list[str]:
         """Return the GitHub issue labels considered part of the pipeline.
@@ -2912,6 +2973,22 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
                 "integer or null (0 disables the per-repo ceiling)"
             )
         cfg.max_parallel_per_repo = value
+
+    if "stall_thresholds" in raw:
+        value = raw["stall_thresholds"]
+        if not isinstance(value, dict):
+            raise ConfigError(
+                "pipeline.stall_thresholds must be a mapping of "
+                "assignment type -> duration (e.g. '35m', '20m', or seconds)"
+            )
+        parsed_stall: dict[str, float] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ConfigError("pipeline.stall_thresholds keys must be strings")
+            parsed_stall[k] = _parse_duration_seconds(
+                v, context=f"pipeline.stall_thresholds[{k!r}]"
+            )
+        cfg.stall_thresholds = parsed_stall
 
     return cfg
 
