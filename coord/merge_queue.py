@@ -5154,6 +5154,70 @@ def _maybe_push_design_round(
     )
 
 
+def _maybe_push_status(
+    entry: QueuedMerge, config, gh_ops: GhOps, board,
+) -> "MergeEvent | None":
+    """#2588: right after a `type="work"` PR closes its issue, fold every
+    issue under that issue's milestone into one customer status and push it
+    if it changed.
+
+    The pattern this issue names explicitly: `_maybe_push_design_round`
+    right above (PDR-3, #2508) is the merge-queue's one existing automatic
+    portal caller, and #2588 asks for the same shape applied to status. Same
+    optional-probe use of `gh_ops.get_issue` (not part of the `GhOps`
+    Protocol proper — most stubs never need it), same fail-open posture: no
+    portal config, no milestone on the merged issue, or no `coord portal
+    link` on file for it are all silently correct no-ops — an operator
+    hasn't linked this milestone yet, which is the common case and stays
+    common for a while (:func:`coord.portal_sync.fold_status_for_milestone`'s
+    own docstring). Only a genuine read/enqueue failure becomes a
+    `status_push_failed` event, and even that never undoes the merge that
+    already happened.
+
+    This is the immediate half of the fold — responsive the moment the last
+    issue in a submission closes. The daemon's periodic portal-sync tick
+    (`coord.portal_sync.sync_submission_statuses`, run from
+    `coord.serve_app._portal_sync_tick`) is the self-healing half: it also
+    catches "work started" (no merge involved to hook here) and anything
+    this hook missed (the daemon was down, the portal was unreachable).
+    """
+    if entry.assignment_type not in CLOSES_ISSUE_TYPES:
+        return None
+    portal_cfg = getattr(config, "portal", None)
+    if portal_cfg is None or not portal_cfg.enabled:
+        return None
+
+    get_issue = getattr(gh_ops, "get_issue", None)
+    if get_issue is None:
+        return None
+    try:
+        issue_data = get_issue(entry.repo_github, entry.issue_number)
+    except Exception as e:  # noqa: BLE001 — best-effort, see docstring
+        return MergeEvent(
+            entry, "status_push_failed",
+            f"could not fetch issue #{entry.issue_number}: {e}",
+        )
+    milestone = (issue_data or {}).get("milestone") or {}
+    milestone_number = milestone.get("number")
+    if milestone_number is None:
+        return None
+
+    from coord.portal_sync import fold_status_for_milestone  # noqa: PLC0415
+
+    result = fold_status_for_milestone(
+        config, entry.repo_name, milestone_number, board=board,
+    )
+    if result.row is not None:
+        return MergeEvent(
+            entry, "status_queued",
+            f"queued status {result.status!r} for portal submission "
+            f"{result.submission_id} (seq={result.row.seq})",
+        )
+    if result.failed:
+        return MergeEvent(entry, "status_push_failed", result.reason)
+    return None
+
+
 def process(
     items: list[QueuedMerge],
     gh_ops: GhOps,
@@ -6392,6 +6456,17 @@ def process(
                     )
                 if design_round_event is not None:
                     events.append(design_round_event)
+                # #2588: the same auto-push pattern as the design round just
+                # above, applied to status — a merged `type="work"` PR that
+                # closed its issue may have just finished (or started) its
+                # submission; fold every linked issue and push if changed.
+                # Best effort, same posture: never undoes a real merge.
+                try:
+                    status_event = _maybe_push_status(entry, config, gh_ops, board)
+                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+                    status_event = MergeEvent(entry, "status_push_failed", str(e))
+                if status_event is not None:
+                    events.append(status_event)
                 continue
             entry.state = CONFLICT
             entry.error = msg

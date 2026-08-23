@@ -1693,6 +1693,183 @@ class TestDesignRoundPushOnMerge:
         assert any(e.kind == "merged" for e in events)
 
 
+class TestStatusPushOnMerge:
+    """#2588: a merged `type="work"` PR that closed its issue folds every
+    issue under that issue's milestone into one customer status and pushes
+    it if it changed — the same PDR-3/#2508 auto-push pattern
+    `TestDesignRoundPushOnMerge` above already covers for design rounds,
+    applied here to status (the pattern #2588 itself names as the model to
+    follow). Same fail-open posture: no link, no portal config, or a GhOps
+    stub that can't resolve the issue's milestone all degrade to a no-op."""
+
+    @staticmethod
+    def _board(completed=None):
+        from coord.models import Board
+        return Board(active=[], completed=list(completed or []))
+
+    @staticmethod
+    def _config(*, portal_enabled: bool = True):
+        from coord.config import PortalConfig
+
+        @dataclass
+        class _RepoCfg:
+            github: str = "acme/api"
+
+        @dataclass
+        class _Cfg:
+            portal: PortalConfig = field(default_factory=PortalConfig)
+
+            def repo(self, name):
+                # `fold_status_for_milestone` resolves `repo_cfg.github` to
+                # call GitHub — unlike the design-round hook above, which
+                # never needs `config.repo()` at all (its `repo_github`
+                # comes straight off the entry).
+                return _RepoCfg() if name == "api" else None
+
+        cfg = _Cfg()
+        cfg.portal = PortalConfig(
+            enabled=portal_enabled,
+            base_url="https://intake.example.com",
+            bridge_client_id="id-123",
+            bridge_client_secret="secret-456",
+        )
+        return cfg
+
+    def _link(self, submission_id: str = "sub_1", milestone_number: int = 9) -> None:
+        from coord import portal_store
+        portal_store.link_milestone(
+            repo_name="api", milestone_number=milestone_number, submission_id=submission_id,
+        )
+
+    def test_no_op_when_portal_not_configured(self) -> None:
+        self._link()
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=None, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("status_")]
+
+    def test_no_op_when_portal_disabled(self) -> None:
+        self._link()
+        cfg = self._config(portal_enabled=False)
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("status_")]
+
+    def test_no_op_when_milestone_has_no_portal_link(self) -> None:
+        # No `_link()` call — milestone 9 is never linked.
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("status_")]
+        # the ordinary close-issue event still fires (alongside whatever the
+        # unrelated expected-red-clear hook reports for a plain work entry)
+        assert any(e.kind == "merged" for e in events)
+
+    def test_no_op_for_a_non_closing_entry_type(self) -> None:
+        """Only a `CLOSES_ISSUE_TYPES` entry (`work`) triggers this hook —
+        e.g. a `mock-author` merge (design round's own trigger) must not
+        also fire the status fold."""
+        self._link()
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("status_")]
+
+    def test_gh_ops_lacking_get_issue_degrades_to_a_noop(self) -> None:
+        """An ordinary `FakeGh` (no `get_issue`) must not crash — same
+        optional-probe convention `branch_has_merge_commit` already uses."""
+        self._link()
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], FakeGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("status_")]
+
+    def test_full_stack_fold_reads_github_and_queues(self, monkeypatch) -> None:
+        """End-to-end through the real `fold_status_for_milestone` — the
+        five-issues-one-shipped scenario #2588 names explicitly, shrunk to
+        two so the fixture stays readable."""
+        self._link(submission_id="sub_1", milestone_number=9)
+        cfg = self._config()
+
+        monkeypatch.setattr(
+            "coord.github_ops.get_milestone",
+            lambda repo, ms: {"number": ms, "title": "Q3 push"},
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_milestone_issues",
+            lambda repo, title, state="all": [
+                {"number": 1, "state": "CLOSED"}, {"number": 2, "state": "CLOSED"},
+            ],
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "status_queued"
+        assert "sub_1" in events[-1].message
+        assert "shipped" in events[-1].message
+
+        from coord import portal_store
+        rows = portal_store.outbox_for_submission("sub_1")
+        assert len(rows) == 1
+        assert rows[0].fields["status"] == "shipped"
+
+    def test_unchanged_status_produces_no_event(self, monkeypatch) -> None:
+        self._link()
+        cfg = self._config()
+
+        from coord import portal_sync
+        result = portal_sync.StatusFoldResult(
+            "sub_1", "planned", "unchanged since last push — not re-notifying (#2588)",
+        )
+        monkeypatch.setattr(
+            portal_sync, "fold_status_for_milestone", lambda *a, **kw: result,
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert not [e for e in events if e.kind.startswith("status_")]
+        assert any(e.kind == "merged" for e in events)
+
+    def test_read_failure_degrades_to_a_failed_event_not_an_exception(
+        self, monkeypatch,
+    ) -> None:
+        self._link()
+        cfg = self._config()
+
+        from coord import portal_sync
+        result = portal_sync.StatusFoldResult(
+            "sub_1", None, "could not read ms-9's issues: gh api rate limited",
+            failed=True,
+        )
+        monkeypatch.setattr(
+            portal_sync, "fold_status_for_milestone", lambda *a, **kw: result,
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "status_push_failed"
+        # The merge itself still went through — this hook never undoes it.
+        assert any(e.kind == "merged" for e in events)
+
+
 class _TestAuthorGateGh(FakeGh):
     """#2191: FakeGh + the API-only manifest/issue-state surface
     `coord.acceptance.missing_expected_red_warning` needs. Defaults to a

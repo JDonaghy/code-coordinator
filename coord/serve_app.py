@@ -827,6 +827,17 @@ def _portal_sync_tick(config: Config):  # noqa: ANN201 — coord.portal_sync.Syn
     ``coord acceptance mock --amend`` an operator would type by hand, now
     triggered by the client's own portal comment instead.
 
+    As of #2588, another phase folds every linked milestone's issues into a
+    customer status and auto-pushes it when it changed
+    (``coord.portal_sync.sync_submission_statuses``) — this is the
+    self-healing half of that fold (the other, immediate half lives at
+    ``coord.merge_queue._maybe_push_status``, right after a merge). It needs
+    the board for the "has work actually started" signal
+    (:func:`coord.portal_sync.fold_submission_status`), so this build is
+    best-effort: a failure degrades to ``board=None`` — the fold still
+    correctly resolves planned/shipped, just never in-progress this tick —
+    rather than skip the whole pass over one bad board read.
+
     Extracted as a module-level function so tests can call it directly without
     wiring up the async ``_tick_loop`` infrastructure (mirrors
     ``_passive_tick`` / ``_sync_issues_tick``).
@@ -834,11 +845,25 @@ def _portal_sync_tick(config: Config):  # noqa: ANN201 — coord.portal_sync.Syn
     Writes straight to the local DB via :mod:`coord.portal_store` for the same
     reason ``_sync_issues_tick`` calls ``_upsert_open_issues_local``: this
     function IS the daemon, so a daemon-routed write would be a
-    self-referential HTTP call.
+    self-referential HTTP call. Same reasoning is why the board is built
+    directly via ``coord.state.build_board`` rather than routed through
+    ``/board``.
     """
-    from coord import portal_sync  # noqa: PLC0415
+    import logging  # noqa: PLC0415
 
-    return portal_sync.sync_tick(config)
+    from coord import portal_sync  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    try:
+        board = build_board()
+    except Exception:  # noqa: BLE001 — see docstring: degrade, don't skip the pass
+        logging.getLogger("coord.serve").warning(
+            "portal sync tick: could not build board for the status fold "
+            "(#2588) — folding without it this tick", exc_info=True,
+        )
+        board = None
+
+    return portal_sync.sync_tick(config, board=board)
 
 
 def _reap_merged_sessions_tick(config: Config) -> list[str]:

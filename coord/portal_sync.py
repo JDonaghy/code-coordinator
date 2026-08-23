@@ -26,9 +26,15 @@ One pass, in this order:
    re-processes that event next tick rather than dropping the client's
    feedback or skipping past it. An ``approved`` verdict is deliberately
    left alone here — see :func:`_consume_verdicts`.
-3. **Push** — coord-authored facts from the outbox (design rounds · status ·
+3. **Fold status** (#2588) — every linked milestone (``coord portal link``,
+   #2507/PDR-1) has its issues folded into one customer status
+   (:func:`fold_submission_status`: planned / in-progress / shipped) and,
+   if it changed since the last push, enqueued — the automatic caller
+   `enqueue_status` never had before this issue. See
+   :func:`sync_submission_statuses`.
+4. **Push** — coord-authored facts from the outbox (design rounds · status ·
    open questions), one row at a time, in per-submission FIFO order.
-4. **Heartbeat** — say the daemon is alive.
+5. **Heartbeat** — say the daemon is alive.
 
 Each phase is independently guarded: a portal outage, a rejected field, or a
 malformed event can never crash the tick or silence the other two phases (the
@@ -182,6 +188,10 @@ class SyncResult:
     applied: int = 0
     rejected: int = 0
     held: int = 0
+    #: Automatic status pushes actually queued this pass (#2588) — a fold
+    #: that ran and found nothing changed does NOT count here; see
+    #: :func:`sync_submission_statuses`.
+    status_queued: int = 0
     heartbeat_ok: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -189,7 +199,8 @@ class SyncResult:
     def moved(self) -> bool:
         """True when this pass actually moved a row in either direction."""
         return bool(
-            self.pulled or self.verdicts_consumed or self.applied or self.rejected
+            self.pulled or self.verdicts_consumed or self.applied
+            or self.rejected or self.status_queued
         )
 
     def summary(self) -> str:
@@ -206,6 +217,7 @@ class SyncResult:
             f"applied={self.applied}",
             f"rejected={self.rejected}",
             f"held={self.held}",
+            f"status_queued={self.status_queued}",
             f"heartbeat={'ok' if self.heartbeat_ok else 'FAILED'}",
         ]
         if self.errors:
@@ -376,6 +388,289 @@ def enqueue_status(
     )
 
 
+# ── automatic status fold (#2588) ───────────────────────────────────────────
+#
+# The gap this closes: `enqueue_status` above has existed since #1982 with
+# exactly one caller — `coord portal enqueue-status` (a human typing it by
+# hand). Four real submissions shipped and closed while the portal kept
+# telling the customer "describing"/"planned" (#2588's own measurement,
+# 2026-08-22) because nothing else ever called it.
+#
+# The reason nothing did is a real design gap, not an oversight: coord's
+# pipeline state is per ISSUE, the portal's status is per SUBMISSION, and a
+# submission that decomposed into five issues has no single stage. This
+# section is the fold that answers that — deliberately narrow, covering only
+# the three statuses coord can derive with no human judgment call:
+#
+#   STATUS_PLANNED      — every linked issue exists, none has started
+#   STATUS_IN_PROGRESS  — at least one linked issue has started, not all done
+#   STATUS_SHIPPED       — every linked issue is closed
+#
+# Every other portal status is either driven by a different, already-wired
+# mechanism (`awaiting-signoff`/`quality-check` via the design-round/preview
+# announcing flow and its ordering guard below) or requires a human call this
+# fold does not attempt to make (`describing`, `in-design`, `needs-input`,
+# `on-hold`) — see `docs/CUSTOMER_PORTAL.md` for the full mapping table.
+#
+# Two callers, same fold, same churn guard:
+#   * `coord.merge_queue._maybe_push_status` — right after a `type="work"`
+#     merge closes an issue (the #2508/PDR-3 pattern this issue asks to
+#     extend from design rounds to status), for immediacy.
+#   * `sync_submission_statuses` below, run once per daemon tick
+#     (`coord.serve_app._portal_sync_tick`) across EVERY linked milestone —
+#     the self-healing sweep that also catches "work started" (no merge
+#     involved to hook) and anything the merge-time push missed (the daemon
+#     was down, the portal was unreachable, ...).
+
+#: The three automatically-derived customer statuses (#2588). Every other
+#: entry in `coord.portal_bridge.SUBMISSION_STATUSES` is out of this fold's
+#: scope — see the module-section docstring above.
+STATUS_PLANNED = "planned"
+STATUS_IN_PROGRESS = "in-progress"
+STATUS_SHIPPED = "shipped"
+
+
+def _is_closed_issue(issue: dict[str, Any]) -> bool:
+    return str(issue.get("state") or "").strip().lower() == "closed"
+
+
+def fold_submission_status(
+    issues: list[dict[str, Any]], started_issue_numbers: Any
+) -> str:
+    """Fold every issue under one linked milestone into a single customer
+    status (#2588). Pure — no I/O, so this is the part unit tests hit hardest.
+
+    ``issues`` is the shape :func:`coord.github_ops.get_milestone_issues`
+    returns: each item at least ``{"number": int, "state": "OPEN"|"CLOSED"}``.
+    Must be non-empty — the caller (:func:`fold_status_for_milestone`) is the
+    one that decides "no issues yet" is a distinct no-op, not a status.
+
+    ``started_issue_numbers`` is the set of issue numbers with a
+    ``type="work"`` assignment ever actually dispatched
+    (``Assignment.dispatched_at is not None``) — the board-local signal for
+    "work has begun." GitHub's open/closed state alone cannot distinguish
+    "not started yet" from "in progress"; an empty set (no board available)
+    still resolves correctly to :data:`STATUS_PLANNED` or
+    :data:`STATUS_SHIPPED`, it just never resolves to
+    :data:`STATUS_IN_PROGRESS`.
+
+    All-closed wins over "started" so a submission's last issue closing always
+    reads ``shipped``, never a stale ``in-progress`` from an assignment that
+    started before it finished.
+    """
+    if all(_is_closed_issue(i) for i in issues):
+        return STATUS_SHIPPED
+    if any(i.get("number") in started_issue_numbers for i in issues):
+        return STATUS_IN_PROGRESS
+    return STATUS_PLANNED
+
+
+def _started_issue_numbers(board: Any, repo_name: str) -> frozenset:
+    """Issue numbers under *repo_name* with a ``type="work"`` assignment that
+    was ever actually dispatched — see :func:`fold_submission_status`.
+
+    Walks both ``board.active`` and ``board.completed``: an issue whose sole
+    assignment already finished (branch merged, issue closed) is caught by
+    the all-closed :data:`STATUS_SHIPPED` check first, so a hit here only
+    ever matters for an issue that started but has not (yet) closed.
+    ``board=None`` (no board available to this caller) degrades to the empty
+    set rather than raising — see :func:`fold_submission_status`'s docstring
+    for what that costs.
+    """
+    if board is None:
+        return frozenset()
+    assignments = list(getattr(board, "active", None) or []) + list(
+        getattr(board, "completed", None) or []
+    )
+    return frozenset(
+        a.issue_number
+        for a in assignments
+        if a.repo_name == repo_name
+        and getattr(a, "type", "work") == "work"
+        and a.dispatched_at is not None
+    )
+
+
+def _milestone_issues(repo_cfg: Any, milestone_number: int) -> list[dict[str, Any]]:
+    """Every issue (open + closed) under *milestone_number* in *repo_cfg*'s
+    repo — the live GitHub read behind the fold, kept separate from
+    :func:`fold_status_for_milestone` so tests can monkeypatch this one seam
+    instead of two ``github_ops`` calls (mirrors ``_resolve_tracking_issue``
+    just above in this module).
+
+    Deliberately reads GitHub directly rather than the local ``issues``
+    cache (:mod:`coord.state`'s ``issues`` table): that cache only ever holds
+    OPEN issues plus a 7-day grace window on ones that just closed
+    (``_upsert_open_issues_local``), so a submission whose issues closed
+    longer ago than that would silently lose members from the fold. Costs a
+    live API call per linked milestone per tick — the same trade the #2509
+    verdict consumer and #2508's design-round push already make elsewhere in
+    this bridge.
+
+    ``gh issue list --milestone`` takes the milestone TITLE, not its number
+    (:func:`coord.github_ops.get_milestone_issues`'s own docstring), so the
+    title is resolved first. Raises on any GitHub read failure — the fail-
+    open posture lives in the caller, not here.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    milestone = github_ops.get_milestone(repo_cfg.github, milestone_number)
+    title = (milestone or {}).get("title")
+    if not title:
+        raise RuntimeError(f"milestone {milestone_number} has no title on GitHub")
+    return github_ops.get_milestone_issues(repo_cfg.github, title, state="all")
+
+
+def _last_queued_status(submission_id: str) -> str | None:
+    """The status of the most recently queued STATUS row for *submission_id*
+    (any outbox state — pending, applied, rejected, held), or ``None`` if
+    none was ever queued.
+
+    #2588's churn guard: re-folding to the SAME status on every tick must
+    not put a fresh row on the outbox each time. The portal's own
+    ``applyUpdate`` dedupes on stored value too, but that only saves the
+    portal a write — it does not save this submission's outbox from filling
+    with (or the customer from a second identical mail past) an unchanged
+    push. See this module's docstring, "Churn must not become mail."
+    """
+    rows = [
+        r for r in portal_store.outbox_for_submission(submission_id)
+        if r.kind == KIND_STATUS
+    ]
+    if not rows:
+        return None
+    return rows[-1].fields.get("status")
+
+
+@dataclass(frozen=True)
+class StatusFoldResult:
+    """What one automatic status-fold attempt did (#2588).
+
+    Never raised — :func:`fold_status_for_milestone` always returns one of
+    these, with ``reason`` populated for every outcome including success, so
+    a caller (the merge-queue hook, the daemon sweep) can log or ignore it
+    without needing to distinguish "nothing to do" from "something broke"
+    itself.
+    """
+
+    submission_id: str | None
+    status: str | None
+    reason: str
+    row: "portal_store.OutboxRow | None" = None
+    #: True only for a genuine failure worth surfacing (a GitHub read
+    #: failure, `enqueue_status` refusing) — never set for the common,
+    #: silent-by-design outcomes (no link on file, no issues yet, unchanged).
+    failed: bool = False
+
+    @property
+    def queued(self) -> bool:
+        return self.row is not None
+
+
+def fold_status_for_milestone(
+    config: Any,
+    repo_name: str,
+    milestone_number: int,
+    *,
+    board: Any = None,
+    now: float | None = None,
+) -> StatusFoldResult:
+    """Resolve, fold, and (if changed) enqueue the customer status for the
+    portal submission linked to ``(repo_name, milestone_number)`` (#2588).
+
+    Never raises. Every failure mode — no link recorded, the repo isn't in
+    ``coordinator.yml``, a GitHub read failure, no issues under the milestone
+    yet, or the folded status matching what was last queued — comes back as
+    a populated :class:`StatusFoldResult` rather than an exception, so a
+    caller inside a merge (:mod:`coord.merge_queue`) is correct to never
+    guard this with anything beyond the belt-and-braces try/except its own
+    docstring already promises the rest of the portal bridge.
+
+    A submission with no recorded link (the common case today, and for a
+    while yet — most milestones predate ``coord portal link``) is a no-op
+    with a visible reason, not a crash and not a silent skip — the reason
+    lands in ``StatusFoldResult.reason`` either way.
+
+    *board* supplies the board-local "has work actually started" signal
+    (:func:`fold_submission_status`); pass ``None`` to fold on GitHub state
+    alone, which still correctly resolves :data:`STATUS_PLANNED` vs
+    :data:`STATUS_SHIPPED`, just never :data:`STATUS_IN_PROGRESS`.
+    """
+    link = portal_store.get_milestone_link(
+        repo_name=repo_name, milestone_number=milestone_number
+    )
+    if link is None:
+        return StatusFoldResult(
+            None, None,
+            f"no portal link recorded for {repo_name} ms-{milestone_number} "
+            "(coord portal link) — nothing to push",
+        )
+
+    repo_cfg = config.repo(repo_name) if config is not None else None
+    if repo_cfg is None:
+        return StatusFoldResult(
+            link.submission_id, None, f"{repo_name!r} is not in coordinator.yml",
+        )
+
+    try:
+        issues = _milestone_issues(repo_cfg, milestone_number)
+    except Exception as exc:  # noqa: BLE001 — a GitHub read failure must not raise into a merge
+        return StatusFoldResult(
+            link.submission_id, None,
+            f"could not read ms-{milestone_number}'s issues: {exc}",
+            failed=True,
+        )
+
+    if not issues:
+        return StatusFoldResult(
+            link.submission_id, None,
+            f"ms-{milestone_number} has no issues yet — nothing to fold",
+        )
+
+    started = _started_issue_numbers(board, repo_name)
+    status = fold_submission_status(issues, started)
+
+    if _last_queued_status(link.submission_id) == status:
+        return StatusFoldResult(
+            link.submission_id, status,
+            "unchanged since last push — not re-notifying (#2588)",
+        )
+
+    try:
+        row = enqueue_status(link.submission_id, status, now=now)
+    except PortalSyncError as exc:
+        return StatusFoldResult(
+            link.submission_id, status, f"refused: {exc}", failed=True,
+        )
+    return StatusFoldResult(link.submission_id, status, "queued", row=row)
+
+
+def sync_submission_statuses(
+    config: Any, *, board: Any = None, now: float | None = None,
+) -> list[StatusFoldResult]:
+    """Fold + auto-push status for every linked milestone (#2588).
+
+    Requires *config* (a real :class:`coord.config.Config`, ``.repo(name)``
+    and all) to resolve each link's repo — same "no config, no-op" contract
+    :func:`_consume_verdicts` already uses, and for the same reason: the
+    ``client``-only bypass :func:`sync_tick` also accepts (tests, ``coord
+    portal sync``) has no repo topology to resolve against.
+
+    Never raises: every link is folded independently through
+    :func:`fold_status_for_milestone`, which itself never raises, so one
+    broken link (an unresolvable repo, a GitHub outage) can never stop the
+    rest from folding.
+    """
+    if config is None:
+        return []
+    return [
+        fold_status_for_milestone(
+            config, link.repo_name, link.milestone_number, board=board, now=now,
+        )
+        for link in portal_store.list_milestone_links()
+    ]
+
+
 # ── the ordering guard ──────────────────────────────────────────────────────
 
 
@@ -420,6 +715,7 @@ def sync_tick(
     config: Any = None,
     *,
     client: Any = None,
+    board: Any = None,
     pull_pages: int = MAX_PULL_PAGES,
     push_limit: int = MAX_PUSH_PER_TICK,
     now: float | None = None,
@@ -431,12 +727,21 @@ def sync_tick(
     ``SyncResult(enabled=False)`` having sent nothing. Pass *client*
     explicitly to bypass config (tests, ``coord portal sync``).
 
-    The four phases are independently isolated, deliberately in this order:
-    pull first (a sign-off verdict pulled now can be acted on this same
-    tick), then verdict consumption (#2509), then push, heartbeat last but
-    unconditionally — a pass that failed everything else still proves the
-    daemon is alive, and that is precisely the pass the portal most needs to
-    hear about.
+    *board* (a :class:`coord.models.Board`, optional) feeds
+    :func:`sync_submission_statuses` (#2588) the local "has work actually
+    started" signal — pass ``None`` (the default) to still fold
+    planned/shipped correctly, just never in-progress. The daemon
+    (``coord.serve_app._portal_sync_tick``) always passes a freshly-built
+    board; the ``coord portal sync`` CLI and most tests don't need to.
+
+    Five phases, independently isolated, deliberately in this order: pull
+    first (a sign-off verdict pulled now can be acted on this same tick),
+    then verdict consumption (#2509), then the automatic status fold (#2588
+    — runs BEFORE push so a status it just enqueued goes out with this same
+    tick's push rather than waiting a full cycle), then push, heartbeat last
+    but unconditionally — a pass that failed everything else still proves
+    the daemon is alive, and that is precisely the pass the portal most
+    needs to hear about.
     """
     if client is None:
         try:
@@ -471,6 +776,27 @@ def sync_tick(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"verdicts: {exc}")
         logger.warning("portal sync: verdict consumption failed", exc_info=True)
+
+    # #2588: fold every linked milestone's issues into a customer status and
+    # enqueue it if it changed — BEFORE push, so a freshly-folded row goes
+    # out with this same tick's push rather than waiting a full cycle.
+    # Isolated exactly like verdict consumption above: one broken link (an
+    # unresolvable repo, a GitHub outage) must not silence push or
+    # heartbeat, and `fold_status_for_milestone` never raises on its own, so
+    # this try/except is belt-and-braces over `sync_submission_statuses`'s
+    # own per-link isolation.
+    status_queued = 0
+    try:
+        status_results = sync_submission_statuses(config, board=board, now=now)
+        status_queued = sum(1 for r in status_results if r.queued)
+        errors.extend(
+            f"status {r.submission_id}: {r.reason}"
+            for r in status_results
+            if r.failed
+        )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"status: {exc}")
+        logger.warning("portal sync: status fold failed", exc_info=True)
 
     applied = rejected = held = 0
     try:
@@ -514,6 +840,7 @@ def sync_tick(
         applied=applied,
         rejected=rejected,
         held=held,
+        status_queued=status_queued,
         heartbeat_ok=heartbeat_ok,
         errors=errors,
     )

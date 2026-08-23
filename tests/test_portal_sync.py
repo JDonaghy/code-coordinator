@@ -1320,3 +1320,319 @@ def test_push_design_round_bundle_round_number_flows_through():
         round_number=2,
     )
     assert row.fields["design_round"]["round"] == 2
+
+
+# ── automatic status fold (#2588) ────────────────────────────────────────────
+#
+# Four real submissions shipped and closed in production while the portal
+# kept showing "describing"/"planned" — `enqueue_status` had exactly one
+# caller (a human) before this. These tests cover the fold that gives it an
+# automatic one: the pure planned/in-progress/shipped derivation, the
+# unlinked/no-issues no-ops, the churn guard, and a GitHub read failure
+# surfacing without raising.
+
+
+def _issue(number: int, state: str) -> dict:
+    return {"number": number, "state": state}
+
+
+class TestFoldSubmissionStatus:
+    """Pure: no I/O, no portal_store, no config."""
+
+    def test_all_closed_is_shipped(self):
+        issues = [_issue(1, "CLOSED"), _issue(2, "closed")]
+        assert portal_sync.fold_submission_status(issues, frozenset()) == "shipped"
+
+    def test_none_started_is_planned(self):
+        issues = [_issue(1, "OPEN"), _issue(2, "OPEN")]
+        assert portal_sync.fold_submission_status(issues, frozenset()) == "planned"
+
+    def test_one_started_not_all_closed_is_in_progress(self):
+        issues = [_issue(1, "OPEN"), _issue(2, "CLOSED")]
+        assert (
+            portal_sync.fold_submission_status(issues, frozenset({1}))
+            == "in-progress"
+        )
+
+    def test_all_closed_wins_over_started(self):
+        """The last issue closing must always read shipped, never a stale
+        in-progress left over from an assignment that started before the
+        submission finished."""
+        issues = [_issue(1, "CLOSED"), _issue(2, "CLOSED")]
+        assert (
+            portal_sync.fold_submission_status(issues, frozenset({1, 2}))
+            == "shipped"
+        )
+
+
+class TestStartedIssueNumbers:
+    def test_none_board_is_the_empty_set(self):
+        assert portal_sync._started_issue_numbers(None, "acme-portal") == frozenset()
+
+    def test_dispatched_work_assignment_counts_as_started(self):
+        from coord.models import Assignment, Board
+
+        a = Assignment(
+            machine_name="m1", repo_name="acme-portal", issue_number=7,
+            issue_title="t", type="work", dispatched_at=123.0,
+        )
+        board = Board(active=[a], completed=[])
+        assert portal_sync._started_issue_numbers(board, "acme-portal") == {7}
+
+    def test_undispatched_assignment_does_not_count(self):
+        from coord.models import Assignment, Board
+
+        a = Assignment(
+            machine_name="m1", repo_name="acme-portal", issue_number=7,
+            issue_title="t", type="work", dispatched_at=None,
+        )
+        board = Board(active=[a], completed=[])
+        assert portal_sync._started_issue_numbers(board, "acme-portal") == frozenset()
+
+    def test_other_repo_does_not_count(self):
+        from coord.models import Assignment, Board
+
+        a = Assignment(
+            machine_name="m1", repo_name="other-repo", issue_number=7,
+            issue_title="t", type="work", dispatched_at=123.0,
+        )
+        board = Board(active=[a], completed=[])
+        assert portal_sync._started_issue_numbers(board, "acme-portal") == frozenset()
+
+    def test_non_work_assignment_does_not_count(self):
+        """A review/smoke/plan assignment against the issue is not "the work
+        has started" — only `type="work"` is."""
+        from coord.models import Assignment, Board
+
+        a = Assignment(
+            machine_name="m1", repo_name="acme-portal", issue_number=7,
+            issue_title="t", type="review", dispatched_at=123.0,
+        )
+        board = Board(active=[a], completed=[])
+        assert portal_sync._started_issue_numbers(board, "acme-portal") == frozenset()
+
+    def test_completed_assignments_also_count(self):
+        from coord.models import Assignment, Board
+
+        a = Assignment(
+            machine_name="m1", repo_name="acme-portal", issue_number=7,
+            issue_title="t", type="work", dispatched_at=123.0, status="done",
+        )
+        board = Board(active=[], completed=[a])
+        assert portal_sync._started_issue_numbers(board, "acme-portal") == {7}
+
+
+class TestFoldStatusForMilestone:
+    """`fold_status_for_milestone` never raises — every outcome, including
+    success, comes back as a `StatusFoldResult` with a populated reason."""
+
+    def test_unlinked_milestone_is_a_visible_no_op(self):
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.submission_id is None
+        assert result.status is None
+        assert result.row is None
+        assert result.failed is False
+        assert "no portal link recorded" in result.reason
+
+    def test_repo_not_in_config_is_a_visible_no_op(self):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({})  # "acme-portal" not registered
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.submission_id == SUB
+        assert result.row is None
+        assert result.failed is False
+        assert "coordinator.yml" in result.reason
+
+    def test_github_read_failure_surfaces_without_raising(self, monkeypatch):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+
+        def boom(repo_cfg, milestone_number):
+            raise RuntimeError("gh api rate limited")
+
+        monkeypatch.setattr(portal_sync, "_milestone_issues", boom)
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.submission_id == SUB
+        assert result.row is None
+        assert result.failed is True
+        assert "gh api rate limited" in result.reason
+
+    def test_no_issues_yet_is_a_visible_no_op(self, monkeypatch):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a: [])
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.row is None
+        assert result.failed is False
+        assert "no issues yet" in result.reason
+
+    def test_five_issues_one_shipped_fold(self, monkeypatch):
+        """The scenario #2588 names explicitly: a submission decomposed into
+        several issues only reads `shipped` once every one of them has
+        closed — not on the first, not on the fourth."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        four_closed_one_open = [
+            _issue(1, "CLOSED"), _issue(2, "CLOSED"), _issue(3, "CLOSED"),
+            _issue(4, "CLOSED"), _issue(5, "OPEN"),
+        ]
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: four_closed_one_open
+        )
+
+        result = portal_sync.fold_status_for_milestone(
+            config, "acme-portal", 5,
+            board=_board_with_started("acme-portal", {5}),
+        )
+        assert result.status == "in-progress"
+        assert result.row is not None
+        assert result.row.fields["status"] == "in-progress"
+
+        # The fifth and final issue closes.
+        all_closed = [_issue(n, "CLOSED") for n in range(1, 6)]
+        monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a: all_closed)
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        assert result.status == "shipped"
+        assert result.row is not None
+        assert result.row.fields["status"] == "shipped"
+
+    def test_unchanged_status_does_not_re_notify(self, monkeypatch):
+        """Churn must not become mail: folding to the SAME status twice in a
+        row must only enqueue once."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues",
+            lambda *a: [_issue(1, "OPEN"), _issue(2, "OPEN")],
+        )
+
+        first = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        assert first.status == "planned"
+        assert first.row is not None
+
+        second = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        assert second.status == "planned"
+        assert second.row is None
+        assert "unchanged" in second.reason
+
+        rows = [
+            r for r in portal_store.outbox_for_submission(SUB)
+            if r.kind == portal_sync.KIND_STATUS
+        ]
+        assert len(rows) == 1
+
+
+def _board_with_started(repo_name: str, issue_numbers: set) -> "object":
+    from coord.models import Assignment, Board
+
+    return Board(
+        active=[
+            Assignment(
+                machine_name="m1", repo_name=repo_name, issue_number=n,
+                issue_title="t", type="work", dispatched_at=1.0,
+            )
+            for n in issue_numbers
+        ],
+        completed=[],
+    )
+
+
+class TestSyncSubmissionStatuses:
+    def test_no_config_is_a_no_op(self):
+        assert portal_sync.sync_submission_statuses(None) == []
+
+    def test_folds_every_linked_milestone_independently(self, monkeypatch):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id="sub-a"
+        )
+        portal_store.link_milestone(
+            repo_name="other-repo", milestone_number=9, submission_id="sub-b"
+        )
+        config = FakeConfig(
+            {"acme-portal": FakeRepoCfg(), "other-repo": FakeRepoCfg("acme/other")}
+        )
+
+        def fake_issues(repo_cfg, milestone_number):
+            if repo_cfg.github == "acme/other":
+                raise RuntimeError("network blip")
+            return [_issue(1, "CLOSED")]
+
+        monkeypatch.setattr(portal_sync, "_milestone_issues", fake_issues)
+
+        results = portal_sync.sync_submission_statuses(config)
+
+        by_submission = {r.submission_id: r for r in results}
+        assert by_submission["sub-a"].status == "shipped"
+        assert by_submission["sub-a"].row is not None
+        # The other link's GitHub failure doesn't stop this one from folding.
+        assert by_submission["sub-b"].failed is True
+
+
+class TestSyncTickStatusFold:
+    """The end-to-end wiring through `sync_tick`: a folded, changed status
+    is queued AND drained within the same tick (#2588's ordering — status
+    fold runs before push)."""
+
+    def test_folded_status_is_pushed_within_the_same_tick(self, monkeypatch):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")],
+        )
+        client = FakeClient()
+
+        result = sync_tick(config=config, client=client)
+
+        assert result.status_queued == 1
+        assert result.applied == 1
+        assert client.pushed_kinds == ["status"]
+
+    def test_a_portal_outage_does_not_prevent_the_status_fold(self, monkeypatch):
+        """The fold enqueues locally regardless of whether the drain that
+        same tick can reach the portal — a portal outage must never block
+        this."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")],
+        )
+        client = FakeClient(push_error=PortalBridgeError("portal unreachable"))
+
+        result = sync_tick(config=config, client=client)
+
+        assert result.status_queued == 1
+        rows = [
+            r for r in portal_store.outbox_for_submission(SUB)
+            if r.kind == portal_sync.KIND_STATUS
+        ]
+        assert len(rows) == 1
+        assert rows[0].state == portal_store.STATE_PENDING
+
+    def test_no_config_skips_the_fold_but_not_the_rest_of_the_tick(self):
+        client = FakeClient()
+        result = sync_tick(client=client)
+        assert result.status_queued == 0
+        assert result.heartbeat_ok is True
