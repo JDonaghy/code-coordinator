@@ -429,6 +429,124 @@ class DrainEscalation:
 
 
 @dataclass(frozen=True)
+class CordonedIdle:
+    """A host that is cordoned, has ZERO active work, and is past the drain
+    deadline (#2595).
+
+    :class:`DrainEscalation` above already fires past the same deadline, but
+    only as a stderr line inside `coord release propagate`'s own oneshot
+    invocation — a `Type=oneshot` timer's stdout goes to the journal and
+    nowhere else. #2595's incident (`precision` stranded 22 releases behind
+    and cordoned, `dellserver` cordoned 27.9 hours past a 90-minute deadline)
+    was found only because an operator happened to read a journal by hand.
+
+    This is the sharper, easier-to-act-on cousin of that condition: a
+    cordon whose host has genuinely nothing left to drain (zero active
+    assignments) has no reason left to still be cordoned at all — it is not
+    "in progress", it is a whole machine quietly pulled from the fleet.
+    Built to be read by three different surfaces (`coord status`, `coord
+    doctor`, and the `release_cordon_idle` health check) off the SAME pure
+    decision (:func:`idle_overdue_cordons`), so the wording and the
+    threshold can never drift apart between them.
+    """
+
+    machine: str
+    waited_seconds: float
+    deadline_seconds: float
+    target_version: str | None = None
+    #: Releases *machine* is behind, when known (``None`` when the caller
+    #: could not resolve a version to compare — never rendered as "0 behind",
+    #: which would read as "basically current").
+    drift: int | None = None
+
+    @property
+    def message(self) -> str:
+        minutes = self.waited_seconds / 60.0
+        limit = self.deadline_seconds / 60.0
+        version = f"v{self.target_version}" if self.target_version else "the release"
+        behind = (
+            f", {self.drift} release{'s' if self.drift != 1 else ''} behind"
+            if self.drift
+            else ""
+        )
+        return (
+            f"{self.machine} is cordoned and IDLE — {minutes:.0f}m past the "
+            f"{limit:.0f}m drain deadline with nothing left to drain "
+            f"(draining for {version}{behind}). It is taking NO WORK and "
+            "nothing will change that on its own. Fix by hand: "
+            f"`coord agent update --machine {self.machine}` then "
+            f"`coord release cordon --clear {self.machine}`."
+        )
+
+    @property
+    def command(self) -> str:
+        return f"coord release cordon --clear {self.machine}"
+
+    def to_dict(self) -> dict:
+        return {
+            "machine": self.machine,
+            "waited_seconds": self.waited_seconds,
+            "deadline_seconds": self.deadline_seconds,
+            "target_version": self.target_version,
+            "drift": self.drift,
+            "message": self.message,
+        }
+
+
+def idle_overdue_cordons(
+    cordons: Mapping[str, Cordon] | Iterable[Cordon],
+    *,
+    now: float,
+    idle_hosts: Iterable[str] = (),
+    deadline: float = DEFAULT_DRAIN_DEADLINE_SECONDS,
+    host_versions: Mapping[str, str | None] | None = None,
+) -> tuple[CordonedIdle, ...]:
+    """Every currently-active cordon on an IDLE host, past *deadline*. Pure.
+
+    *cordons* is the store as read (:func:`coord.machine_pause.cordons`'s
+    ``{machine: Cordon}``, or any iterable of :class:`Cordon`) — expired
+    records are ignored, same as everywhere else in this module. *idle_hosts*
+    is the caller's own idea of "has zero active work right now" (a live
+    `/status` poll's empty ``active`` list for `coord status`, or
+    ``Board.idle_machines()`` for `coord doctor` / the health check) — this
+    function does not read a board or an agent itself, so it stays as pure
+    and network-free as the rest of this module.
+
+    *host_versions*, when given, is used to compute :attr:`CordonedIdle.drift`
+    via :func:`version_drift` against the cordon's own ``target_version`` —
+    optional, because not every caller has a fleet-wide version map handy
+    (the health check, in particular, only knows about its own host), and a
+    missing drift number is far less misleading than a wrong one.
+
+    Sorted by machine name for a stable rendering order.
+    """
+    idle = set(idle_hosts)
+    records = _as_records(cordons)
+    out: list[CordonedIdle] = []
+    for name, cordon in records.items():
+        if not cordon.active(now):
+            continue
+        if name not in idle:
+            continue
+        if not cordon.overdue(now, deadline):
+            continue
+        drift: int | None = None
+        if host_versions is not None:
+            computed = version_drift(host_versions.get(name), cordon.target_version)
+            drift = computed if isinstance(computed, int) else None
+        out.append(
+            CordonedIdle(
+                machine=name,
+                waited_seconds=cordon.age(now),
+                deadline_seconds=deadline,
+                target_version=cordon.target_version,
+                drift=drift,
+            )
+        )
+    return tuple(sorted(out, key=lambda c: c.machine))
+
+
+@dataclass(frozen=True)
 class DeferralPressure:
     """How long the cordon has been failing to produce a window (#2240).
 

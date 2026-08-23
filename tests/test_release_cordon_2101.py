@@ -866,3 +866,208 @@ def test_reconcile_launch_host_forwards_a_remote_timeout_derived_from_its_own(mo
     assert payload["timeout"] == pytest.approx(
         30.0 - release_cmd._RECONCILE_TIMEOUT_MARGIN_SECONDS
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2595: a cordoned host that is ALSO idle is a whole machine silently
+# pulled from the fleet, not a normal in-progress drain (`precision`, 22
+# releases behind and cordoned — found only by hand). `coord status`,
+# `coord doctor` and the `release_cordon_idle` health check all render this
+# off ONE pure decision, tested here directly.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_idle_overdue_cordons_fires_on_a_cordoned_idle_host_past_deadline():
+    now = 10_000.0
+    stuck = rc.Cordon(
+        machine="precision", target_version="0.5.232",
+        created_at=now - 7200, renewed_at=now - 60, expires_at=now + 600,
+    )
+
+    found = rc.idle_overdue_cordons(
+        {"precision": stuck}, now=now, idle_hosts={"precision"},
+        deadline=5400, host_versions={"precision": "0.5.210"},
+    )
+
+    assert len(found) == 1
+    overdue = found[0]
+    assert overdue.machine == "precision"
+    assert overdue.drift == 22
+    assert "precision" in overdue.message
+    assert "cordoned and IDLE" in overdue.message
+    assert "22 releases behind" in overdue.message
+    assert "coord agent update --machine precision" in overdue.message
+    assert "coord release cordon --clear precision" in overdue.message
+
+
+def test_idle_overdue_cordons_ignores_a_host_still_busy():
+    """A cordoned host with active work is draining normally — the whole
+    point of #2595 is distinguishing that from a host with nothing left to
+    drain at all."""
+    now = 10_000.0
+    stuck = rc.Cordon(
+        machine="dellserver", target_version="0.5.232",
+        created_at=now - 7200, renewed_at=now - 60, expires_at=now + 600,
+    )
+
+    assert rc.idle_overdue_cordons(
+        {"dellserver": stuck}, now=now, idle_hosts=set(), deadline=5400,
+    ) == ()
+
+
+def test_idle_overdue_cordons_ignores_an_idle_host_within_deadline():
+    """Idle + cordoned + NOT yet overdue is a normal drain in progress."""
+    now = 10_000.0
+    fresh = rc.Cordon(
+        machine="precision", target_version="0.5.232",
+        created_at=now - 60, renewed_at=now - 60, expires_at=now + 3540,
+    )
+
+    assert rc.idle_overdue_cordons(
+        {"precision": fresh}, now=now, idle_hosts={"precision"}, deadline=5400,
+    ) == ()
+
+
+def test_idle_overdue_cordons_ignores_an_expired_cordon():
+    now = 10_000.0
+    expired = rc.Cordon(
+        machine="precision", target_version="0.5.232",
+        created_at=now - 7200, renewed_at=now - 7200, expires_at=now - 1,
+    )
+
+    assert rc.idle_overdue_cordons(
+        {"precision": expired}, now=now, idle_hosts={"precision"}, deadline=5400,
+    ) == ()
+
+
+def test_idle_overdue_cordons_never_fabricates_a_drift_count():
+    """No `host_versions` given -> `drift` stays `None`, never rendered as a
+    misleading "0 releases behind"."""
+    now = 10_000.0
+    stuck = rc.Cordon(
+        machine="precision", target_version="0.5.232",
+        created_at=now - 7200, renewed_at=now - 60, expires_at=now + 600,
+    )
+
+    [overdue] = rc.idle_overdue_cordons(
+        {"precision": stuck}, now=now, idle_hosts={"precision"}, deadline=5400,
+    )
+
+    assert overdue.drift is None
+    assert "behind" not in overdue.message
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2595: `DRAIN OVERDUE` reaches the notifier, not just `coord release
+# propagate`'s own stderr/journal — same live cordon store `coord status`/
+# `coord doctor` read, same `DrainEscalation` wording `_escalate_drain`
+# already prints.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_the_notifier_collector_receives_an_overdue_drain_escalation(tmp_home):
+    import time as _time
+
+    from coord.notifier import collect
+
+    mp.local_set_cordon(
+        "precision", target_version="0.5.232",
+        created_at=_time.time() - 7200, ttl_seconds=3600,
+    )
+
+    found = collect.drain_overdue(now=_time.time())
+
+    assert len(found) == 1
+    halted = found[0]
+    assert halted.repo == "(release-cordon:precision)"
+    assert halted.urgent is True
+    assert "DRAIN OVERDUE" in halted.reason
+    assert "precision" in halted.reason
+    assert "v0.5.232" in halted.reason
+
+
+def test_the_notifier_collector_is_silent_with_no_cordon_at_all(tmp_home):
+    from coord.notifier import collect
+
+    assert collect.drain_overdue(now=10_000.0) == []
+
+
+def test_the_notifier_collector_is_silent_for_a_cordon_within_its_deadline(tmp_home):
+    import time as _time
+
+    from coord.notifier import collect
+
+    mp.local_set_cordon(
+        "precision", target_version="0.5.232", created_at=_time.time(),
+    )
+
+    assert collect.drain_overdue(now=_time.time()) == []
+
+
+def test_drain_overdue_flows_through_the_full_collector(tmp_home):
+    """Not just the standalone helper — the exact `PipelineSnapshot` field
+    `coord notifier` evaluates every tick."""
+    import time as _time
+    import types
+
+    from coord.notifier import collect
+    from coord.notifier.store import NotifierState
+
+    mp.local_set_cordon(
+        "precision", target_version="0.5.232",
+        created_at=_time.time() - 7200, ttl_seconds=3600,
+    )
+
+    class _Cfg:
+        machines: list = []
+        notifications = types.SimpleNamespace(web_base_url=None)
+
+    snapshot = collect.collect(_Cfg(), now=_time.time(), notifier_state=NotifierState())
+
+    assert any(h.repo == "(release-cordon:precision)" for h in snapshot.halted)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2595: "outside propagation's reach" CRIT advisories (#2403's remedy line)
+# reach nowhere but the timer's own stderr today — `rp.latest_crit_advisories`
+# is the read side that lets `coord status` show the newest run's findings
+# without re-deriving anything.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _record(*, gate=None) -> dict:
+    return {"started_at": 1.0, "target_version": "0.5.232", "gate": gate}
+
+
+def test_latest_crit_advisories_reads_only_the_newest_record():
+    older = _record(gate={"advisory": [
+        {"host": "precision", "lane": "coord-agent spawns (precision)",
+         "severity": "crit", "summary": "stale"},
+    ]})
+    newest = _record(gate={"advisory": [
+        {"host": "dellserver", "lane": "~/.coord-venv (dellserver)",
+         "severity": "crit", "summary": "on 0.5.210, expected 0.5.232"},
+    ]})
+
+    found = rp.latest_crit_advisories([older, newest])
+
+    assert [f["host"] for f in found] == ["dellserver"]
+
+
+def test_latest_crit_advisories_drops_warn_and_ok_findings():
+    record = _record(gate={"advisory": [
+        {"host": "a", "lane": "l", "severity": "warn", "summary": "s"},
+        {"host": "b", "lane": "l", "severity": "crit", "summary": "s"},
+        {"host": "c", "lane": "l", "severity": "ok", "summary": "s"},
+    ]})
+
+    found = rp.latest_crit_advisories([record])
+
+    assert [f["host"] for f in found] == ["b"]
+
+
+def test_latest_crit_advisories_degrades_to_empty_on_missing_or_malformed_data():
+    assert rp.latest_crit_advisories([]) == []
+    assert rp.latest_crit_advisories([_record(gate=None)]) == []
+    assert rp.latest_crit_advisories([_record(gate={"advisory": "nonsense"})]) == []
+    assert rp.latest_crit_advisories([{"started_at": 1.0}]) == []

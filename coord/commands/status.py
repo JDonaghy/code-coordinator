@@ -79,6 +79,50 @@ def _stuck_in_cooldown_hosts() -> dict[str, str | None]:
     return {h: target for h in hosts}
 
 
+def _outside_reach_crit_advisories() -> list[dict]:
+    """CRIT ``gate.advisory`` findings from the newest `coord release
+    propagate` run (#2595) — same journal, same degrade-to-nothing contract
+    as `_cordon_stall_suffix`/`_stuck_in_cooldown_hosts` above.
+
+    These are findings propagation itself could not roll (an out-of-reach
+    lane like ``~/.coord-cli-venv``) and already prints with the exact
+    remedy commands — but only to the timer's own stderr. Degrades to `[]`
+    on any error (no journal, an unreadable one, a thin client): never
+    load-bearing, purely advisory the same way the finding itself is.
+    """
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord.commands.release import _state_dir  # noqa: PLC0415
+
+    try:
+        return rp.latest_crit_advisories(rp.read_records(_state_dir()))
+    except Exception:  # noqa: BLE001 — a status render must never fail on this
+        return []
+
+
+def _cordoned_idle_advisories(
+    cordons: dict, *, idle_hosts: set[str], host_versions: dict | None = None,
+) -> tuple:
+    """Every cordoned host past its drain deadline with zero active work
+    (#2595) — the single pure decision `coord status`, `coord doctor` and
+    the ``release_cordon_idle`` health check all render off of. See
+    :func:`coord.release_cordon.idle_overdue_cordons`.
+
+    Wrapped here only to import ``time`` locally (matches the rest of this
+    module's lazy-import convention) and to fail soft: a status/doctor
+    render must never break because the cordon store had a bad record.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.release_cordon import idle_overdue_cordons  # noqa: PLC0415
+
+    try:
+        return idle_overdue_cordons(
+            cordons, now=_time.time(), idle_hosts=idle_hosts, host_versions=host_versions,
+        )
+    except Exception:  # noqa: BLE001 — a status render must never fail on this
+        return ()
+
+
 def _live_advisory_entries(
     entries: list[dict],
     cfg: "Config",
@@ -214,6 +258,10 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # #2490: hosts the last propagate run flagged as behind + idle + stuck
     # behind an active #2240 cooldown — see `_stuck_in_cooldown_hosts`.
     stuck_in_cooldown = _stuck_in_cooldown_hosts()
+    # #2595: CRIT advisories (lanes propagation could not reach at all) from
+    # the newest `coord release propagate` run — see
+    # `_outside_reach_crit_advisories`.
+    outside_reach = _outside_reach_crit_advisories()
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
@@ -355,6 +403,35 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 "is suppressed by an active #2240 deadlock-release cooldown "
                 "(#2490) — no automatic path back to rolling until it lifts; "
                 f"consider `coord agent update --machine {m.name}`"
+            )
+
+        # #2595: a cordoned host with ZERO active work and past its drain
+        # deadline is not "draining" — it is a whole machine pulled from the
+        # fleet with nothing left to bring it back on its own. Distinct from
+        # the #2240 `cordon_stall` suffix folded into the label above (which
+        # flags a cordon that keeps failing to produce a *window*): this
+        # fires purely off the drain deadline and the live `/status` active
+        # list, whether or not #2240's own deferral bookkeeping ever saw it.
+        if status_result is not None and status_result.ok and not active and m.name in cordons:
+            for overdue in _cordoned_idle_advisories(
+                {m.name: cordons[m.name]},
+                idle_hosts={m.name},
+                host_versions={m.name: agent_version},
+            ):
+                click.echo(f"    ✗ CRIT: {overdue.message}")
+
+        # #2595: CRIT advisories from the newest `coord release propagate`
+        # run naming THIS host — a lane propagation could not reach at all
+        # (e.g. a stale `~/.coord-cli-venv`) and already prints with its
+        # remedy commands, but only to the timer's own stderr.
+        for finding in outside_reach:
+            if finding.get("host") != m.name:
+                continue
+            click.echo(
+                f"    ✗ CRIT: {finding.get('lane')}: {finding.get('summary')} "
+                "— outside propagation's reach, fix by hand — run `coord "
+                f"agent update --machine {m.name}` then `coord release "
+                f"cordon --clear {m.name}`"
             )
 
         if status_result and status_result.ok and status_result.data:
@@ -1397,6 +1474,51 @@ def doctor(
             click.echo(line)
             if is_problem:
                 any_problem = True
+
+    # #2595: a cordoned host with ZERO active assignments and past its drain
+    # deadline is functionally removed from the fleet — reachable, healthy,
+    # and taking nothing. `coord doctor`'s whole question is "is this
+    # machine fit to be routed work?", and a stuck cordon is the starkest
+    # way there is to fail that. Same pure decision `coord status` and the
+    # `release_cordon_idle` health check use
+    # (`coord.release_cordon.idle_overdue_cordons`) — only the "idle" input
+    # differs (here: every `coordinator.yml` machine with no `running` board
+    # row). Deliberately NOT `Board.idle_machines()` — that filters
+    # `Board.machines`, which is populated by machine registration/dispatch
+    # history rather than by `coordinator.yml`, so a machine `coord doctor`
+    # has never dispatched to would read as neither idle nor busy instead of
+    # idle.
+    import time as _time  # noqa: PLC0415
+
+    from coord.machine_pause import cordons as fetch_release_cordons  # noqa: PLC0415
+    from coord.release_cordon import idle_overdue_cordons  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    try:
+        busy_names = {
+            a.machine_name for a in build_board().active if a.status == "running"
+        }
+    except Exception:  # noqa: BLE001 — doctor must still report everything else
+        busy_names = set()
+    idle_names = {mach.name for mach in cfg.machines} - busy_names
+    host_versions = {
+        name: (health or {}).get("version") for name, health in machine_health.items()
+    }
+    try:
+        overdue_idle = idle_overdue_cordons(
+            fetch_release_cordons(),
+            now=_time.time(),
+            idle_hosts=idle_names,
+            host_versions=host_versions,
+        )
+    except Exception:  # noqa: BLE001
+        overdue_idle = ()
+    if overdue_idle:
+        click.echo("")
+        click.echo("release cordons (coord release cordon):")
+        for overdue in overdue_idle:
+            any_problem = True
+            click.echo(f"  ✗ CRIT: {overdue.message}")
 
     # #2607: name the #2587 roll-pending marker here too, not just in `coord
     # drive-queue status` — an operator running `coord doctor` to ask "why

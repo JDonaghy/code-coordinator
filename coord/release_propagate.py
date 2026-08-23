@@ -1227,6 +1227,42 @@ def read_records(state_dir: Path, *, limit: int | None = None) -> list[dict]:
     return out
 
 
+def latest_crit_advisories(records: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """The newest run's CRIT-severity ``gate.advisory`` findings (#2595).
+
+    `coord release propagate` already computes exactly this — a lane
+    :func:`scope_verification` could not roll and is therefore advisory
+    rather than blocking — and already prints it with the two commands that
+    clear it (#2403's remedy line). #2595's finding is that the print goes
+    to stderr on a ``Type=oneshot`` timer and nowhere else: a host can sit
+    on a stale, unreachable venv for the length of a whole release cycle
+    with this line as the only signal an operator ever got.
+
+    This is the read side that lets any OTHER surface (`coord status`,
+    `coord doctor`) show the same findings without re-deriving anything —
+    same journal :func:`read_records` already exposes, same records
+    `render_record` already renders for `coord release history`. Only the
+    NEWEST record's advisories are returned: an advisory the very next run
+    resolved must stop showing as current the moment that run lands, the
+    same "no cleanup step required" contract :class:`Cordon` uses for its
+    own expiry.
+    """
+    if not records:
+        return []
+    newest = records[-1]
+    gate = newest.get("gate") if isinstance(newest, Mapping) else None
+    if not isinstance(gate, Mapping):
+        return []
+    advisory = gate.get("advisory")
+    if not isinstance(advisory, list):
+        return []
+    return [
+        dict(finding)
+        for finding in advisory
+        if isinstance(finding, Mapping) and str(finding.get("severity") or "") == "crit"
+    ]
+
+
 def trim_journal(state_dir: Path, *, keep: int = JOURNAL_MAX_RECORDS) -> int:
     """Truncate the journal to its last *keep* records. Returns records kept."""
     records = read_records(state_dir)

@@ -269,6 +269,71 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
     return out
 
 
+def drain_overdue(*, now: float, deadline: float | None = None) -> list[HaltedDrive]:
+    """Release cordons that have outlived ``--drain-deadline`` (#2101 trap C
+    / #2595).
+
+    `coord release propagate` already computes exactly this condition
+    (:func:`coord.release_cordon.Cordon.overdue`) and already prints a loud
+    ``DRAIN OVERDUE:`` line the moment it fires — #2136's escalation. But
+    that print happens inside a ``Type=oneshot`` timer unit, so it reaches
+    the journal and nothing else: a cordon can sit 18x past its own
+    deadline (#2595's ``dellserver``, cordoned 27.9h against a 90m
+    deadline) with no operator told. This reads the SAME live cordon store
+    `coord status`/`coord doctor` read (:func:`coord.machine_pause.cordons`,
+    daemon-aware, fail-soft — never the propagation journal, which is a
+    file on whichever host happens to run the timer and does not exist at
+    all on a thin client) and reuses :class:`~coord.release_cordon.
+    DrainEscalation` for the exact wording `_escalate_drain` already prints,
+    so this channel and that one never say the condition two different ways.
+
+    Fires per-host, keyed into a unique ``HaltedDrive`` subject
+    (``(release-cordon:<machine>)``) rather than the synthetic
+    ``(release-cordon)``/issue-0 key `coord release propagate` writes into
+    the drive-escalations table — that key collides across hosts (only the
+    LAST overdue host survives a write there); this collector recomputes
+    the condition fresh from live state instead, so every overdue host gets
+    its own notification and its own dedupe identity.
+
+    ``urgent=True`` unconditionally: a blown drain deadline already means
+    "new work is NOT being routed there" — the same class of deadline the
+    notifier's own contract (#1632 rule) treats as opting out of quiet
+    hours, not a severity judgement.
+    """
+    from coord.machine_pause import cordons as fetch_cordons  # noqa: PLC0415
+    from coord.release_cordon import (  # noqa: PLC0415
+        DEFAULT_DRAIN_DEADLINE_SECONDS,
+        DrainEscalation,
+    )
+
+    limit = DEFAULT_DRAIN_DEADLINE_SECONDS if deadline is None else deadline
+    try:
+        live = fetch_cordons(now=now)
+    except Exception as exc:  # noqa: BLE001 — see module docstring
+        log.debug("notifier: cordon store unavailable (%s)", exc)
+        return []
+
+    out: list[HaltedDrive] = []
+    for machine, cordon in sorted(live.items()):
+        if not cordon.overdue(now, limit):
+            continue
+        escalation = DrainEscalation(
+            machine=machine,
+            waited_seconds=cordon.age(now),
+            deadline_seconds=limit,
+            target_version=cordon.target_version,
+        )
+        out.append(
+            HaltedDrive(
+                repo=f"(release-cordon:{machine})",
+                issue=0,
+                reason=escalation.message,
+                urgent=True,
+            )
+        )
+    return out
+
+
 def fleet_crits(
     fleet_health: Mapping[str, Any] | None,
     *,
@@ -335,7 +400,8 @@ def collect(
         now=now,
         probes=probes,
         parked=parked_gates(notifier_state=notifier_state, now=now),
-        halted=halted_drives(notifier_state=notifier_state, now=now),
+        halted=halted_drives(notifier_state=notifier_state, now=now)
+        + drain_overdue(now=now),
         fleet_crits=fleet_crits(fleet_health, busy_machines=busy),
         web_base_url=getattr(getattr(config, "notifications", None), "web_base_url", None),
     )
