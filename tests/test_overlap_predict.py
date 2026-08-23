@@ -146,6 +146,85 @@ def test_excluded_keys_never_become_pre_reqs():
     assert not prediction
 
 
+# ── #2603: an edge's PROVENANCE, not just its conclusion ────────────────────
+
+
+def test_describe_shows_the_compared_branch_and_head_sha():
+    footprint = Footprint(
+        key=f"{REPO}#9",
+        issue_number=9,
+        files=("coord/a.py",),
+        source=SOURCE_BRANCH,
+        branch="issue-9",
+        head_sha="a1b2c3d4e5f6",
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    described = prediction.overlaps[0].describe()
+    # The bare `[branch]` tag stays verbatim (existing callers match it as a
+    # whole word) — the sha is additive detail appended after it.
+    assert "[branch]" in described
+    assert "issue-9" in described
+    assert "a1b2c3d" in described  # first 7 chars of the sha, not the full 12
+    assert "a1b2c3d4e5f6" not in described
+
+
+def test_describe_omits_the_sha_when_it_could_not_be_fetched():
+    footprint = Footprint(
+        key=f"{REPO}#9", issue_number=9, files=("coord/a.py",),
+        source=SOURCE_BRANCH, branch="issue-9",
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    described = prediction.overlaps[0].describe()
+    assert "issue-9" in described
+    assert "@" not in described
+
+
+def test_describe_flags_an_unconfirmed_liveness_check():
+    # #2602's terminal check raised rather than confirming the branch was
+    # still open — the footprint survived (fail-open), but describe() must
+    # say so rather than reading identically to a confirmed-live edge.
+    footprint = Footprint(
+        key=f"{REPO}#9", issue_number=9, files=("coord/a.py",),
+        source=SOURCE_BRANCH, branch="issue-9", liveness_checked=False,
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    assert "liveness check failed" in prediction.overlaps[0].describe()
+
+
+def test_describe_says_nothing_extra_when_liveness_was_confirmed():
+    footprint = Footprint(
+        key=f"{REPO}#9", issue_number=9, files=("coord/a.py",),
+        source=SOURCE_BRANCH, branch="issue-9", liveness_checked=True,
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    assert "liveness" not in prediction.overlaps[0].describe()
+
+
+def test_declared_source_describe_has_no_branch_detail():
+    # No wall clock in this module (see the module docstring) — a `declared`
+    # overlap's cache-age note is the CLI layer's job, not describe()'s.
+    footprint = Footprint(
+        key=f"{REPO}#9", issue_number=9, files=("coord/a.py",),
+        source=SOURCE_DECLARED, synced_at=123.0,
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    described = prediction.overlaps[0].describe()
+    assert described == f"{REPO}#9 [declared]: `coord/a.py`"
+
+
+def test_reason_includes_the_candidates_own_declared_files():
+    footprint = Footprint(
+        key=f"{REPO}#7", issue_number=7, files=("coord/a.py",), source=SOURCE_BRANCH,
+        branch="issue-7",
+    )
+    prediction = predict_overlap(["coord/a.py", "coord/b.py"], [footprint])
+    # `coord/b.py` didn't collide with anything, but it is still part of
+    # what THIS entry declared, and an operator reading the reason should be
+    # able to see the full claim, not just the half that matched.
+    assert "coord/a.py" in prediction.reason
+    assert "coord/b.py" in prediction.reason
+
+
 # ── fanout_warnings (#2601) ──────────────────────────────────────────────────
 
 
@@ -206,6 +285,22 @@ def test_audit_details_carry_both_sides_of_the_claim():
     assert details["after"] == [f"{REPO}#7"]
     assert details["overlaps"][0]["files"] == ["coord/a.py"]
     assert details["overlaps"][0]["source"] == SOURCE_BRANCH
+
+
+def test_audit_details_carry_provenance_for_later_readers(): # #2603
+    prediction = Prediction(
+        predicted_files=("coord/a.py",),
+        overlaps=(
+            Overlap(
+                key=f"{REPO}#7", source=SOURCE_BRANCH, files=("coord/a.py",),
+                branch="issue-7", head_sha="abc123", liveness_checked=False,
+            ),
+        ),
+    )
+    overlap_details = prediction.audit_details()["overlaps"][0]
+    assert overlap_details["head_sha"] == "abc123"
+    assert overlap_details["liveness_checked"] is False
+    assert overlap_details["branch"] == "issue-7"
 
 
 # ── gathering footprints ─────────────────────────────────────────────────────
@@ -270,6 +365,67 @@ def test_inflight_footprints_read_the_real_diff():
     assert [(f.key, f.files, f.source) for f in prints] == [
         (f"{REPO}#9", ("coord/drive_queue.py",), SOURCE_BRANCH)
     ]
+
+
+def test_inflight_footprints_record_the_compared_head_sha():
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/drive_queue.py"],
+        head_sha_fetcher=lambda repo, branch: f"sha-for-{branch}",
+    )
+    assert [f.head_sha for f in prints] == ["sha-for-issue-9"]
+    assert prints[0].liveness_checked is True
+
+
+def test_a_failed_head_sha_fetch_leaves_the_footprint_intact():
+    # The sha is detail on top of a real diff, not a precondition for
+    # trusting it — a failure here must not drop the footprint.
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+
+    def exploding_sha(repo, branch):
+        raise RuntimeError("gh exploded")
+
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/drive_queue.py"],
+        head_sha_fetcher=exploding_sha,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#9"]
+    assert prints[0].head_sha == ""
+
+
+def test_a_terminal_checker_that_raises_marks_liveness_unchecked():
+    # #2602 fails this open (still-in-flight) — #2603 records that the
+    # openness was ASSUMED, not confirmed, so a reader downstream can tell
+    # the two apart.
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+
+    def exploding_checker(repo, issue, branch):
+        raise RuntimeError("gh exploded")
+
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/a.py"],
+        terminal_checker=exploding_checker,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#9"]
+    assert prints[0].liveness_checked is False
+
+
+def test_a_successful_terminal_checker_marks_liveness_checked():
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/a.py"],
+        terminal_checker=lambda repo, issue, branch: False,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#9"]
+    assert prints[0].liveness_checked is True
 
 
 def test_one_undiffable_branch_is_skipped_not_fatal():
@@ -401,6 +557,39 @@ def test_declared_footprints_only_cover_issues_that_declared_something():
     ]
 
 
+def test_declared_footprints_stamp_synced_at_via_the_fetcher(): # #2603
+    bodies = {1: "## Files\n- coord/a.py\n"}
+    prints = declared_footprints(
+        [(REPO, 1)],
+        lambda repo, number: bodies.get(number),
+        synced_at_fetcher=lambda repo, number: 1000.0,
+    )
+    assert prints[0].synced_at == 1000.0
+
+
+def test_declared_footprints_default_to_no_synced_at():
+    # The default (`None`) leaves every footprint's `synced_at` unset —
+    # identical to pre-#2603 behaviour when a caller doesn't wire one up.
+    bodies = {1: "## Files\n- coord/a.py\n"}
+    prints = declared_footprints([(REPO, 1)], lambda repo, number: bodies.get(number))
+    assert prints[0].synced_at is None
+
+
+def test_a_raising_synced_at_fetcher_still_yields_the_footprint():
+    bodies = {1: "## Files\n- coord/a.py\n"}
+
+    def exploding_fetcher(repo, number):
+        raise RuntimeError("db unreachable")
+
+    prints = declared_footprints(
+        [(REPO, 1)],
+        lambda repo, number: bodies.get(number),
+        synced_at_fetcher=exploding_fetcher,
+    )
+    assert prints[0].key == f"{REPO}#1"
+    assert prints[0].synced_at is None
+
+
 def test_collect_candidate_files_prefers_the_declaration_over_extra_sources():
     files = collect_candidate_files(
         REPO, 1,
@@ -480,3 +669,50 @@ def test_audit_rows_flatten_to_one_record_per_predicted_overlap():
         (f"{REPO}#2247", f"{REPO}#1"),
         (f"{REPO}#2247", f"{REPO}#2"),
     ]
+
+
+def test_audit_rows_carry_provenance_through_to_the_flattened_record(): # #2603
+    rows = predictions_from_audit([
+        {
+            "ts": 1.0,
+            "repo": REPO,
+            "issue": 2247,
+            "details": {
+                "overlaps": [
+                    {
+                        "key": f"{REPO}#1",
+                        "source": SOURCE_BRANCH,
+                        "branch": "issue-1",
+                        "head_sha": "abc123",
+                        "liveness_checked": False,
+                        "files": ["coord/a.py"],
+                    },
+                ]
+            },
+        },
+    ])
+    assert rows[0]["branch"] == "issue-1"
+    assert rows[0]["head_sha"] == "abc123"
+    assert rows[0]["liveness_checked"] is False
+
+
+def test_audit_rows_default_provenance_for_a_pre_2603_row():
+    # A row recorded before #2603 shipped has no provenance keys at all —
+    # flattening must not raise, and must default `liveness_checked` to
+    # `True` (the pre-#2603 implicit assumption) rather than `False`.
+    rows = predictions_from_audit([
+        {
+            "ts": 1.0,
+            "repo": REPO,
+            "issue": 2247,
+            "details": {
+                "overlaps": [
+                    {"key": f"{REPO}#1", "source": SOURCE_BRANCH, "files": ["coord/a.py"]},
+                ]
+            },
+        },
+    ])
+    assert rows[0]["branch"] == ""
+    assert rows[0]["head_sha"] == ""
+    assert rows[0]["synced_at"] is None
+    assert rows[0]["liveness_checked"] is True

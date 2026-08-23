@@ -90,6 +90,7 @@ from coord.overlap_predict import (
     EVENT_PREDICTED,
     EVENT_SCORED,
     OUTCOME_UNKNOWN,
+    SOURCE_DECLARED,
     Prediction,
     classify_outcome,
     collect_candidate_files,
@@ -227,6 +228,21 @@ def drive_queue_group() -> None:
     ),
 )
 @click.option(
+    "--reject-after",
+    "reject_after_specs",
+    multiple=True,
+    default=(),
+    help=(
+        "#2603: predicted #2247 edges to NOT auto-apply, even though this "
+        "add's own output says they were found. `N` or `REPO#N`, "
+        "comma-separated, repeatable. Narrower than --no-predict-overlap, "
+        "which drops EVERY prediction for this add — this drops only the "
+        "edge(s) named, e.g. one an operator has independently confirmed is "
+        "stale (a squash-merged branch, a since-edited declaration), while "
+        "still applying anything else #2247 found."
+    ),
+)
+@click.option(
     "--scope",
     "hold_scope",
     type=click.Choice([HOLD_SCOPE_ENTRY, HOLD_SCOPE_FLEET]),
@@ -285,6 +301,7 @@ def drive_queue_add(
     hold_reason: str,
     resume_when: str,
     no_predict_overlap: bool,
+    reject_after_specs: tuple[str, ...],
     hold_scope: str,
     max_fix_rounds: int | None,
     no_acceptance: bool,
@@ -300,6 +317,14 @@ def drive_queue_add(
     collide with work already in flight in the same repo, the entry is chained
     `--after` that work automatically and the reason is recorded. That is an
     ORDER change, never a refusal — see `coord.overlap_predict`.
+
+    #2603: the printed reason names each edge's PROVENANCE, not just its
+    conclusion — the compared branch and head sha, whether #2602's liveness
+    check actually confirmed the branch was still open, and how old a
+    `[declared]` edge's cached body was — because a stale prediction and a
+    correct one render identically without it. `--reject-after` drops one
+    named edge without disabling the whole feature (`--no-predict-overlap`
+    still does that, for everything at once).
     """
     from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
 
@@ -308,6 +333,9 @@ def drive_queue_add(
         raise click.ClickException("--max-fix-rounds must be a positive integer")
     try:
         after = parse_after_spec(after_specs, repo)
+        # #2603: reuses `--after`'s own `N` / `REPO#N` parsing — a rejected
+        # edge is named the same way an operator would name a real one.
+        reject_after = set(parse_after_spec(reject_after_specs, repo))
         validate_config_repo(config_path, repo)
         validate_hold_flags(hold_after, hold_reason, resume_when, hold_scope)
         validate_enqueue(existing_entries, repo, issue, after)
@@ -342,13 +370,19 @@ def drive_queue_add(
     prediction = Prediction()
     staleness_note = ""
     auto_after: list[str] = []
+    rejected_after: list[str] = []
     if not no_predict_overlap:
         prediction, staleness_note = _predict_overlap(
             config_path, repo, issue, existing_entries
         )
-        auto_after = _applicable_auto_after(
+        candidate_after = _applicable_auto_after(
             existing_entries, repo, issue, after, prediction
         )
+        # #2603: --reject-after is the narrower escape hatch — it drops only
+        # the named edge(s) from what actually gets applied, never the whole
+        # prediction (that's what --no-predict-overlap is for).
+        auto_after = [k for k in candidate_after if k not in reject_after]
+        rejected_after = [k for k in candidate_after if k in reject_after]
         after = [*after, *auto_after]
 
     enqueue_drive_queue(
@@ -381,9 +415,19 @@ def drive_queue_add(
     # directory-token warning (independent of whether the edge stuck — a
     # cycle-dropped edge's token is just as worth narrowing), and a staleness
     # note when the candidate's own body could only be read from cache.
+    # #2603: plus, when known, how old each APPLIED `[declared]` edge's OTHER
+    # side is, and confirmation of anything --reject-after dropped — shown
+    # even if that leaves nothing else to report, since a rejection an
+    # operator asked for and got no acknowledgement of looks identical to one
+    # that silently didn't take.
     overlap_notes: list[str] = []
     if auto_after:
         overlap_notes.append(prediction.reason)
+        overlap_notes.extend(_declared_overlap_age_notes(prediction))
+    if rejected_after:
+        overlap_notes.append(
+            "rejected via --reject-after (not applied): " + ", ".join(rejected_after)
+        )
     overlap_notes.extend(fanout_warnings(prediction))
     if staleness_note:
         overlap_notes.append(staleness_note)
@@ -546,12 +590,17 @@ def _mirror_issue_body(repo_name: str, issue_number: int, body: str) -> None:
         pass
 
 
-def _cached_body_age_note(repo_name: str, issue_number: int) -> str:
-    """#2601 point 1's fallback: when a live re-read wasn't possible, say how
-    old the cached body actually is, so a stale prediction is at least
-    visible instead of silently trusted.
+def _issue_body_synced_at(repo_name: str, issue_number: int) -> float | None:
+    """Raw ``issues.synced_at`` for *repo_name*#*issue_number*, or ``None``.
+
+    #2603: shared by `_cached_body_age_note` below (the CANDIDATE's own
+    staleness note, on a live-refresh failure) and by `_predict_overlap`'s
+    ``synced_at_fetcher`` passthrough to
+    :func:`coord.overlap_predict.declared_footprints` (every OTHER `declared`
+    footprint's cache age — those are never live-refreshed, so this is the
+    only freshness signal available for them; see the module docstring for
+    why re-reading them all live is out of scope).
     """
-    row = None
     try:
         from coord.db import get_connection  # noqa: PLC0415
 
@@ -559,19 +608,52 @@ def _cached_body_age_note(repo_name: str, issue_number: int) -> str:
             "SELECT synced_at FROM issues WHERE repo_name = ? AND number = ?",
             (repo_name, int(issue_number)),
         ).fetchone()
-    except Exception:  # noqa: BLE001 — an unreadable age is still worth flagging
-        pass
-    synced_at = row["synced_at"] if row is not None else None
+    except Exception:  # noqa: BLE001 — an unreadable age is just unknown
+        return None
+    if row is None or not row["synced_at"]:
+        return None
+    return float(row["synced_at"])
+
+
+def _cached_body_age_note(repo_name: str, issue_number: int) -> str:
+    """#2601 point 1's fallback: when a live re-read wasn't possible, say how
+    old the cached body actually is, so a stale prediction is at least
+    visible instead of silently trusted.
+    """
+    synced_at = _issue_body_synced_at(repo_name, issue_number)
     if not synced_at:
         return (
             "note: predicted from a cached issue body of unknown age "
             "(live refresh failed) — the declaration may be stale"
         )
-    age = _age_str(max(0.0, time.time() - float(synced_at)))
+    age = _age_str(max(0.0, time.time() - synced_at))
     return (
         f"note: predicted from a cached issue body synced {age} ago "
         "(live refresh failed) — the declaration may be stale"
     )
+
+
+def _declared_overlap_age_notes(prediction: Prediction) -> list[str]:
+    """#2603: how old each APPLIED ``[declared]`` overlap's OTHER side is.
+
+    `Overlap.describe()` cannot render this itself — it is a pure module
+    with no wall clock (see its docstring) — so this is the CLI-layer half:
+    for every ``declared`` overlap whose cache age we know (``synced_at`` was
+    set by `_predict_overlap`'s ``synced_at_fetcher``), say how old that read
+    was. Silent when unknown, same posture as the rest of this feature: a
+    freshness signal we don't have is not manufactured, only shown when real.
+    """
+    notes: list[str] = []
+    now = time.time()
+    for overlap in prediction.overlaps:
+        if overlap.source != SOURCE_DECLARED or not overlap.synced_at:
+            continue
+        age = _age_str(max(0.0, now - overlap.synced_at))
+        notes.append(
+            f"note: {overlap.key}'s declared list was read from a cache "
+            f"synced {age} ago"
+        )
+    return notes
 
 
 def _candidate_body(
@@ -666,7 +748,14 @@ def _predict_overlap(
         and e.key not in covered
         and e.state not in TERMINAL_QUEUE_STATES
     ]
-    footprints.extend(declared_footprints(queued, body_fetcher, exclude_keys=covered))
+    footprints.extend(
+        declared_footprints(
+            queued,
+            body_fetcher,
+            exclude_keys=covered,
+            synced_at_fetcher=_issue_body_synced_at,
+        )
+    )
     return predict_overlap(candidate, footprints, exclude_keys={key}), staleness_note
 
 
