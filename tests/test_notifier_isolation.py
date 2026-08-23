@@ -50,11 +50,16 @@ def history(n=10, secs=600.0):
 
 
 def slow_snapshot(now=NOW):
+    # #2609: over_baseline is gated on output silence, so this fixture needs
+    # a stale `last_output_at` to raise anything at all — these tests are
+    # about transport/state isolation, not the predicate, so just clear the
+    # default warm-baseline silence threshold `history()` builds elsewhere.
     return PipelineSnapshot(
         now=now,
         probes=[
             WorkerProbe(assignment_id="a1", repo="coord", issue=42,
-                        machine="dellserver", dispatched_at=now - 10 * HOUR)
+                        machine="dellserver", dispatched_at=now - 10 * HOUR,
+                        last_output_at=now - 20 * 60.0)
         ],
     )
 

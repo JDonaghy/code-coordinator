@@ -165,13 +165,19 @@ def test_test_send_reports_success(config_path, monkeypatch):
 def test_tick_dry_run_delivers_nothing_and_writes_no_ledger(config_path, monkeypatch):
     from coord.notifier.predicate import PipelineSnapshot, WorkerProbe
 
+    # #2609: a probe past its (cold) duration ceiling with fresh output must
+    # raise nothing — duration alone no longer pages. Give it a stale
+    # `last_output_at` too (past the cold silence threshold) so this test
+    # still exercises a real event, via the silence probe, to prove the
+    # dry-run path delivers-but-does-not-ledger it.
     now = 3_000_000.0
     monkeypatch.setattr(
         "coord.notifier.collect.collect",
         lambda config, **kw: PipelineSnapshot(
             now=kw["now"],
             probes=[WorkerProbe(assignment_id="a1", repo="coord", issue=42,
-                                machine="dellserver", dispatched_at=kw["now"] - 20 * 3600.0)],
+                                machine="dellserver", dispatched_at=kw["now"] - 20 * 3600.0,
+                                last_output_at=kw["now"] - 40 * 60.0)],
         ),
     )
     monkeypatch.setattr("coord.notifier.collect.history_rows", lambda: [])
@@ -180,7 +186,7 @@ def test_tick_dry_run_delivers_nothing_and_writes_no_ledger(config_path, monkeyp
 
     result = run("notifier", "tick", "--config", config_path, "--dry-run")
     assert result.exit_code == 0
-    assert "over_baseline" in result.output
+    assert "output_silence" in result.output
     assert store.load_state().ledger == {}
 
 
