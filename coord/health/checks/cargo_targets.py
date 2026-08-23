@@ -32,7 +32,7 @@ import os
 import time
 from pathlib import Path
 
-from coord.health.models import CheckResult, HealthContext, Severity
+from coord.health.models import CheckResult, FixOutcome, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import expand, gib, human_bytes, shorten_path
 
@@ -131,12 +131,70 @@ def _gc_verdict(ctx: HealthContext) -> tuple[dict | None, bool]:
     return status, age <= _GC_STATUS_MAX_AGE_SECS
 
 
+def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
+    """#2581 opt-in remedy: re-run the shared cargo-cache GC (#2137/#1402).
+
+    Scoped deliberately to the SHARED cache (``~/.coord/cargo-target/<repo>``)
+    only — the same thing ``AgentServer._gc_cargo_cache`` already sweeps
+    automatically after every worktree clean. This fixer exists for the gap
+    between those automatic passes: the 2026-07-30 incident was a status
+    file (``cargo_over_cap``) nothing ever read, not an absence of GC logic.
+    A per-checkout ``target/`` dir (the other thing this check totals) is
+    NOT touched here — ``cargo clean``-ing a checkout a human may be
+    actively building in is not the same "purely reversible" action a
+    shared, worker-only cache's GC is, and #2581 scopes the allow-list to
+    the latter.
+
+    Only acts when the check's own escalation fired (`gc_over_cap` AND
+    fresh, exactly `probe_cargo_targets`'s own condition for turning this
+    into a WARN) — a verdict that's merely stale, or a total that's simply
+    over the size threshold without the GC itself having given up, is left
+    alone; `sweep()` runs on its own cadence for those.
+    """
+    values = result.values
+    if not values.get("gc_over_cap") or values.get("gc_stale"):
+        return FixOutcome(
+            check_id="cargo_targets", subject=None, status="no_action",
+            message="no fresh 'GC could not get under cap' verdict to act on",
+        )
+
+    from coord.cargo_cache import free_floor_bytes, sweep, write_gc_status  # noqa: PLC0415
+
+    before = (values.get("gc") or {}).get("cargo_cache_bytes")
+    try:
+        sweep_result = sweep(ctx.coord_dir, free_floor=free_floor_bytes())
+    except OSError as exc:
+        return FixOutcome(
+            check_id="cargo_targets", subject=None, status="error",
+            message="cargo cache sweep failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    write_gc_status(ctx.coord_dir, sweep_result, now=ctx.now)
+
+    after = sweep_result.get("cargo_cache_bytes")
+    freed = ""
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before > after:
+        freed = f"; freed {human_bytes(int(before - after))}"
+
+    if sweep_result.get("cargo_over_cap"):
+        reason = sweep_result.get("cargo_over_cap_reason") or "unknown reason"
+        return FixOutcome(
+            check_id="cargo_targets", subject=None, status="applied",
+            message=f"ran cargo cache GC{freed}; still over cap: {reason}",
+        )
+    return FixOutcome(
+        check_id="cargo_targets", subject=None, status="applied",
+        message=f"ran cargo cache GC{freed}; now under cap",
+    )
+
+
 @check(
     id="cargo_targets",
     scope="machine",
     title="cargo targets",
     order=20,
     description="Total size of cargo build artifacts across known target dirs.",
+    fix=fix_cargo_targets,
 )
 def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
     """One machine-scope result: the total, with the biggest offenders named."""

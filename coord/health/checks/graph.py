@@ -36,10 +36,15 @@ of and never overriding ``status.stale``'s verdict.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
-from coord.health.models import CheckResult, HealthContext, Severity
+from coord.health.models import CheckResult, FixOutcome, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import human_hours
+
+# graphify's own CLI, resolved via PATH at call time — same posture as any
+# other subprocess this package shells out to (git, tmux, ...).
+_GRAPHIFY_TIMEOUT_SECS = 900.0
 
 
 def _commits_behind(repo_path: str, built_sha: str, head_sha: str) -> int | None:
@@ -73,12 +78,81 @@ def _commits_behind(repo_path: str, built_sha: str, head_sha: str) -> int | None
         return None
 
 
+def fix_graph(ctx: HealthContext, result: CheckResult) -> FixOutcome:
+    """#2581 opt-in remedy: ``graphify update <checkout>`` — but ONLY when the
+    checkout itself is caught up with ``origin/<default_branch>``.
+
+    A stale/absent graph on a checkout that is itself behind origin is
+    exactly the "not automatic" case the probe already refuses to name a
+    bare command for (see the ``origin_behind`` branch above): rebuilding
+    would just produce a confidently-current-looking graph of code that is
+    still stale relative to origin. That half stays human-only — a
+    ``git pull`` under live workers is not this check's decision to make.
+
+    Re-derives the verdict fresh via :func:`coord.graph_health.graph_status`
+    rather than trusting *result*, which may predate the last commit/rebuild
+    on this checkout by the time ``--fix`` actually runs; this is also what
+    makes a second ``--fix`` pass a no-op once the rebuild has landed.
+    """
+    from coord.graph_health import graph_status  # noqa: PLC0415
+
+    name = result.subject
+    path = result.values.get("path")
+    if not path:
+        return FixOutcome(
+            check_id="graph", subject=name, status="error",
+            message="no checkout path on this result", error="missing values['path']",
+        )
+
+    default_branch = result.values.get("default_branch") or "main"
+    fresh = graph_status(Path(path), default_branch)
+
+    if fresh.origin_behind:
+        return FixOutcome(
+            check_id="graph", subject=name, status="no_action",
+            message=f"{path} is itself behind origin/{default_branch} — "
+            "graphify update would only rebuild from stale HEAD; not automatic",
+        )
+    if fresh.present and not fresh.stale:
+        return FixOutcome(
+            check_id="graph", subject=name, status="no_action",
+            message="graph already matches HEAD as of the re-check",
+        )
+
+    try:
+        proc = subprocess.run(
+            ["graphify", "update", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_GRAPHIFY_TIMEOUT_SECS,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return FixOutcome(
+            check_id="graph", subject=name, status="error",
+            message="failed to launch `graphify update`",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        return FixOutcome(
+            check_id="graph", subject=name, status="error",
+            message=f"`graphify update {path}` exited {proc.returncode}",
+            error=tail,
+        )
+    return FixOutcome(
+        check_id="graph", subject=name, status="applied",
+        message=f"ran `graphify update {path}`",
+    )
+
+
 @check(
     id="graph",
     scope="checkout",
     title="graph",
     order=70,
     description="graphify graph freshness vs HEAD, and whether hooks can heal it.",
+    fix=fix_graph,
 )
 def probe_graph(ctx: HealthContext) -> list[CheckResult]:
     from coord.graph_health import (  # noqa: PLC0415
