@@ -423,6 +423,94 @@ def test_events_mirror_customer_facts_but_never_coord_owned_fields():
     assert "design_round" not in record.customer
 
 
+def test_events_wrapped_in_payload_mirror_customer_facts_at_top_level():
+    """#2585: coord-portal's real wire shape (`src/bridge/events.ts`) nests
+    every customer fact under `payload`, not `data`/`fields`. Unhandled, the
+    whole envelope lands in the mirror under one `"payload"` key and every
+    `approved_work._first_str` lookup (which reads `outcome`, `audience`, ...
+    at the top level) comes back empty."""
+    client = FakeClient(
+        pages=[
+            {
+                "events": [
+                    {
+                        "id": "e1",
+                        "submission_id": SUB,
+                        "type": "submission.created",
+                        "revision": 1,
+                        "occurred_at": "2026-08-14T10:00:00Z",
+                        "payload": {
+                            "outcome": "a stick figure website",
+                            "audience": "my kid",
+                            "done_definition": "it loads",
+                        },
+                    }
+                ],
+                "cursor": "c1",
+                "has_more": False,
+            }
+        ]
+    )
+    sync_tick(client=client)
+
+    record = portal_store.get_submission(SUB)
+    assert record is not None
+    assert record.customer["outcome"] == "a stick figure website"
+    assert record.customer["audience"] == "my kid"
+    assert record.customer["done_definition"] == "it loads"
+    assert "payload" not in record.customer
+
+
+def test_signoff_via_payload_envelope_does_not_wipe_the_intake_text():
+    """#2585's live-proof scenario: `submission.created` arrives wrapped in
+    `payload`, then a later `signoff.approved` event — also wrapped in
+    `payload`, carrying only the verdict fields — must merge rather than
+    clobber. Before the fix, both events flattened to a single top-level
+    `"payload"` key, so `mirror_customer_facts`'s dict-merge protection never
+    saw two distinct keys to merge and the sign-off silently replaced the
+    whole record."""
+    intake_page = {
+        "events": [
+            {
+                "id": "e1",
+                "submission_id": SUB,
+                "type": "submission.created",
+                "revision": 1,
+                "payload": {
+                    "outcome": "a stick figure website",
+                    "audience": "my kid",
+                    "done_definition": "it loads",
+                },
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+    signoff_page = {
+        "events": [
+            {
+                "id": "e2",
+                "submission_id": SUB,
+                "type": "signoff.approved",
+                "revision": 2,
+                "payload": {"verdict": "approved", "round": 1, "comment": None},
+            }
+        ],
+        "cursor": "c2",
+        "has_more": False,
+    }
+
+    sync_tick(client=FakeClient(pages=[intake_page]))
+    sync_tick(client=FakeClient(pages=[signoff_page]))
+
+    record = portal_store.get_submission(SUB)
+    assert record is not None
+    assert record.customer["outcome"] == "a stick figure website"
+    assert record.customer["audience"] == "my kid"
+    assert record.customer["done_definition"] == "it loads"
+    assert record.customer["verdict"] == "approved"
+
+
 def test_mirror_merges_rather_than_clobbers_across_events():
     sync_tick(
         client=FakeClient(
