@@ -9,6 +9,12 @@
 > extraction, and a standing Azure footprint. Making it **asynchronous** and **outbound-polled**
 > removes every one of those dependencies. It is buildable now, in parallel with #1825, for
 > roughly the cost of a domain name.
+>
+> **Not all draft any more (2026-08-23).** The bridge, the design-round push, the verdict consumer
+> and the TUI's Approved-work-items panel have shipped. [Running one end to
+> end](#running-one-end-to-end--the-operator-runbook) describes **what the code does today**,
+> including where it diverges from the customer loop this document originally sketched, and lists
+> the known gaps with their issue numbers.
 
 ## Intent
 
@@ -170,10 +176,16 @@ already protected `outcome`/`audience`/`done_definition`/`constraints`.
 3. **Awaiting sign-off.** The customer reads the outcome definition, clicks through the mocks, and
    either **approves** or **requests changes** with comments. Requesting changes returns to *In
    design* as round N+1 — rounds are versioned and all previous rounds stay readable.
-4. **Signed off.** The outcome definition becomes the **Gate-A contract**. The epic + issues are
-   created through the forge seam, labelled `status:ready`, and **the existing pipeline takes over
-   entirely unchanged.**
+4. **Signed off.** The outcome definition becomes the **Gate-A contract**, the milestone's issues
+   are released to run, and **the existing pipeline takes over entirely unchanged.**
 5. **Progress** rolls up in git-free language until *Shipped*.
+
+> **That is the customer's view of the order, not the operator's.** As built, the epic + issues are
+> created *before* the design round rather than at sign-off: the Gate-A mock bundle is rendered from
+> the milestone's own open issues (`coord acceptance mock REPO TRACKING_ISSUE`), so they have to
+> exist before there is anything to show. What sign-off gates is the **work**, not the
+> **decomposition**. The sequence you actually execute is
+> [Running one end to end](#running-one-end-to-end--the-operator-runbook) below.
 
 The engineer gate is preserved: a design round is a **proposal**, and an engineer reviews it before
 it reaches the customer. This is the existing `coord plan → coord approve` pattern with the customer
@@ -280,6 +292,144 @@ Tested in `tests/test_portal_sync.py` (`fold_submission_status`'s pure cases; th
 no-ops; the unchanged-status churn guard; a GitHub read failure surfacing without raising) and
 `tests/test_merge_queue.py` (`_maybe_push_status`'s merge-time trigger, mirroring
 `TestDesignRoundPushOnMerge`).
+
+## Running one end to end — the operator runbook
+
+**This is the section to read when you have forgotten what to do.** The customer loop above is
+what the *customer* experiences; this is the sequence *you* execute, in order, with the commands.
+Every step names what it needs from the one before it.
+
+### The two things that are easy to get wrong
+
+**`signoff.approved` means two different things, and coord cannot tell them apart.** It is emitted
+both when *you* click **Start work** in the portal — `coord-portal`#132 deliberately reused the
+sign-off event shape rather than minting a `work.requested` kind — and when *the customer* approves
+a design round. The TUI's **Approved work items** panel keys on that one event, so it is
+simultaneously your "start here" inbox and a log of past customer approvals.
+
+**Issues are created BEFORE mocks, not after.** See the callout under the customer loop. The
+practical consequence is that a repo, a milestone, a tracking issue and the issues themselves all
+have to exist before the customer can be shown anything.
+
+### The sequence
+
+| # | Step | Where | Needs |
+|---|---|---|---|
+| 1 | Promote lead → request; assign or create the client + project | portal UI | — |
+| 1a | Create the repo, if none exists yet | `coord repo add` | — |
+| 2 | Map the portal project to that repo | `coordinator.yml` | 1a |
+| 3 | Click **Start work** on the submission | portal UI | submission still at `describing` |
+| 4 | Pull it into a decomposition session | TUI, or `coord portal decompose-chat` | 2 + 3 |
+| 5 | Author the Gate-A mocks | `coord acceptance mock` | the milestone + tracking issue from 4 |
+| 6 | Publish the mocks to the customer | PR merge, or `coord portal publish-mocks` | the `coord portal link` from 4 |
+| 7 | Customer approves or requests changes | portal UI | — |
+| 8 | Pipeline runs; status folds itself | automatic | the link from 4 |
+
+**1a — creating a repo.** `coord repo add <name> --github owner/repo --machines dellserver,elitebook`
+writes the `coordinator.yml` entry into the coord-settings checkout, adds the repo to those
+machines, creates the `coord` and tier labels, then prints the residue it deliberately did *not* do
+(the clone itself, mostly). Follow with `coord repo doctor <repo>` — a repo with no graphify graph
+on any machine that runs workers is CRIT and fails that gate.
+
+Do this **before** step 4. `dispatch_decomposition_chat` refuses outright when a submission has no
+mapped repo, and refuses again when no *single* machine claims *every* mapped repo — a session that
+can only reach some of the repos it is meant to decompose into is treated as worse than no session.
+
+**2 — the project↔repo mapping.** `portal.project_repos`, hand-edited. No `coord` subcommand writes
+it:
+
+```yaml
+portal:
+  project_repos:
+    - project_id: "<the portal's opaque project id>"
+      repos: [natal-chart]
+```
+
+The live file is `~/.coord/coordinator.yml` on the daemon host, which is a **symlink into the
+`coord-settings` checkout** (`~/src/coord-settings/coord/coordinator.yml` — see
+`coord.fleet_config_health`). Edit it there and commit; editing through the symlink works but
+leaves the change untracked on one machine.
+
+`project_id` is the portal's own opaque identifier, carried on `submission.created` and never
+re-sent by a later event. There is no human-readable project name on the wire, by design — see
+[Client + project identity](#client--project-identity--confirmed-wire-shape-2586-coord-portal146)
+above. An unmapped project is a normal state, not an error: the panel renders `— no mapping —` and
+keeps the row, precisely so you can see it needs mapping.
+
+**3 — Start work.** The override is gated on the submission still being at `describing`, and the
+card disappears from the portal once coord pushes it past that — so if you have already run a
+design round, this is not the button you want.
+
+**4 — the decomposition session.** In the TUI: open the **Approved work items** panel (`✓` in the
+activity bar), right-click the row, **Pull into decomposition session**. That menu item is a
+one-item context menu, greyed with a `no repo mapping` hint until step 2 is done — a disabled item
+is inert, so nothing happening on click is the mapping telling you it is missing. CLI equivalent:
+`coord portal decompose-chat <submission_id>`.
+
+It dispatches an interactive `type="decomposition-chat"` session — same family as "Chat about
+issue" — whose whole job is to write. It decides oracle-loop-shaped or not
+([`ORACLE_LOOP.md`](ORACLE_LOOP.md)), then runs `coord milestone create` → `coord issue create` ×N
+→ `coord milestone add-child` ×N → `coord drive-queue add` ×N → `coord portal link <repo>
+<milestone_number> <submission_id>`.
+
+**That last command is not optional.** The link is the join key for everything downstream (see
+[Automatic status push](#automatic-status-push-2588) above, "The link is the join key"): with none recorded, no design round
+can be published, no status ever folds, and a `changes_requested` verdict cannot resolve where to
+dispatch its amendment. A decomposition that produced a **single one-off issue with no milestone**
+cannot be linked at all today — `coord portal link` has no non-milestone form (#2665). The session
+is instructed to state that gap explicitly rather than invent a milestone number; if you see it in
+the session's summary, that submission's customer loop cannot complete until #2665 lands.
+
+**5 — Gate-A mocks.** `coord acceptance mock <repo> <tracking_issue>` dispatches an independent
+`mock-author` agent that writes `tests/acceptance/ms-NN/contract.md` plus `mocks/*.html` and opens a
+PR. It is the one dispatch type permitted to write under `tests/acceptance/`. Use `--amend` for a
+targeted correction to an already-merged contract rather than falling back to a plain `coord assign`.
+
+**There is no mocks-without-a-repo path.** The bundle is not a free-floating artifact: it is files
+inside the repo, written by an agent on a machine that has the repo checked out, rendered from the
+milestone's open issues, and published from that checkout.
+
+**6 — getting the mocks in front of the customer.** Two paths, one shared helper
+(`coord.portal_sync.push_design_round_bundle`: upload to R2, reshape, queue the D1 metadata):
+
+* **Automatic**, when the `mock-author` PR merges — `coord.merge_queue._maybe_push_design_round`.
+  Fails **open**: no portal link on file is a silent "nothing to do yet, run `coord portal link`".
+* **On demand** — `coord portal publish-mocks <repo> <tracking_issue>` reads whatever is in *this
+  machine's* local checkout under `tests/acceptance/ms-NN/`, uncommitted changes included, no merge
+  required. Fails **loud**: a missing link, missing portal config or an empty bundle is a clear
+  error naming the fix. This is the one to use while iterating on a mock.
+
+The customer sees **Awaiting your sign-off** only once the `design_round` row is confirmed applied —
+the `ANNOUNCING_STATUSES` ordering guard (#835), so the notification never outruns the thing it
+announces.
+
+**7 — the verdict.** `changes_requested` is fully automatic: `coord.portal_sync._amend_from_verdict`
+dispatches `coord acceptance mock --amend` carrying the customer's comment verbatim, and the event
+stays unconsumed (retried every tick) if anything stops that dispatch, so the client's feedback is
+never silently dropped. `approved` does **nothing** automatically — whether it should auto-record
+`coord gate-a --approved` is the open policy question #2509 deliberately left undecided. It simply
+re-lands on the Approved-work-items panel.
+
+**8 — from here the pipeline is unchanged.** Status folds automatically off the linked milestone
+(Planned → In progress → Shipped — see [Automatic status push](#automatic-status-push-2588)).
+Optionally gate the merge on a real preview build with `coord portal enqueue-preview` and the
+`preview.approved` / `preview.changes_requested` events — the
+[`portal-followup`](../coord/skills/portal-followup/SKILL.md) skill has that procedure, and is also
+where to start when an event "hasn't shown up" (short version: `coord portal
+events`/`outbox`/`sync` must run **on the daemon host**).
+
+### Known gaps in this flow, as of 2026-08-23
+
+| Gap | Effect | Issue |
+|---|---|---|
+| Mirror clobber — `customer_json` keeps only the last event's payload instead of the merged facts | every Approved-panel column renders blank, and `project_id` reads empty so no row can map to a repo | #2585 (cause, fixed on `main`) · #2659 (repair the already-damaged rows) |
+| The panel never drops a row | long-shipped submissions still read as "ready to pull" | #2660 |
+| Un-started requests never reach the panel | a new request is invisible unless someone clicks **Start work** | #2661 |
+| `coord portal link` requires a milestone | a one-off issue decomposition can never be linked | #2665 |
+
+Until #2659 is fixed **and deployed to the daemon host**, step 4 cannot succeed for any real
+submission: `project_id` reads empty, `repos_for_project("")` returns `[]`, and the pull action
+stays disabled no matter what `portal.project_repos` says.
 
 ## Decisions
 
