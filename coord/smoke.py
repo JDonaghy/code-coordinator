@@ -50,7 +50,10 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 import httpx
 
@@ -199,6 +202,25 @@ class SmokeMachineChoice:
     rationale: str
 
 
+def _capability_matched_machines(
+    required_caps: list[str], repo_name: str, config: Config,
+) -> list[Machine]:
+    """Every machine that can build *repo_name* and declares every one of
+    *required_caps* — capability/repo matching only, no pause/quiet-hours or
+    idle/busy filtering.
+
+    Factored out of :func:`rank_smoke_machines` so a caller that sees an
+    empty ranking can tell "nothing is capable" apart from "something is
+    capable but every candidate is paused or in quiet hours" (#2636) without
+    re-deriving the capability filter a second time.
+    """
+    return [
+        m for m in config.machines
+        if m.can_work_on(repo_name)
+        and all(cap in m.capabilities for cap in required_caps)
+    ]
+
+
 def rank_smoke_machines(
     required_caps: list[str],
     repo_name: str,
@@ -207,6 +229,7 @@ def rank_smoke_machines(
     config: Config,
     *,
     prefer_worker: bool = True,
+    now: "datetime | None" = None,
 ) -> list[SmokeMachineChoice]:
     """Every machine that can smoke-test `repo_name` with all `required_caps`,
     best candidate first (#1672).
@@ -252,12 +275,32 @@ def rank_smoke_machines(
     the old behaviour).
 
     Returns an empty list when capabilities can't be matched.
+
+    #2636: candidates are also filtered through ``follow_on_paused_set`` —
+    **not** ``paused_set`` — before ranking. A smoke leg is the tail of work
+    already in flight (the Test stage that certifies a `done` work row), the
+    same shape #2240 established for a review leg, so a release cordon
+    ("route no NEW work here") must not filter its host out — that would
+    reproduce the 2026-08-14 drain deadlock, just in the Test stage instead
+    of Review. An explicit `coord pause` and a `quiet_hours` window both
+    still apply in full: the incident this closes was a smoke leg landing on
+    elitebook 82 minutes into its declared quiet-hours window, ten minutes
+    before the operator suspended it.
+
+    *now* (#2636) is forwarded to ``follow_on_paused_set`` untouched —
+    ``None`` (the default, and every production call site) evaluates quiet
+    hours against the real clock. The seam exists purely so a test can pin a
+    specific wall-clock moment instead of depending on whatever instant the
+    suite happens to run at.
     """
-    candidates = [
-        m for m in config.machines
-        if m.can_work_on(repo_name)
-        and all(cap in m.capabilities for cap in required_caps)
-    ]
+    candidates = _capability_matched_machines(required_caps, repo_name, config)
+    if not candidates:
+        return []
+
+    from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+
+    paused = follow_on_paused_set(config.machines, now=now)
+    candidates = [m for m in candidates if m.name not in paused]
     if not candidates:
         return []
 
@@ -791,6 +834,8 @@ def _report_unroutable_smoke(
     completed: Assignment,
     required_caps: list[str],
     attempts: list[SmokeAttempt],
+    *,
+    paused_capable: list[str] | None = None,
 ) -> None:
     """Report — once — that the Test stage has no machine it can run on.
 
@@ -803,24 +848,43 @@ def _report_unroutable_smoke(
 
     Two outcomes, split on whether the condition can clear by itself:
 
-    * **Durable** (every candidate hard-refused, or there were no candidates
-      at all) — record ``test_state=TEST_STATE_BLOCKED`` with the full reason
-      on the parent work row. That is board state: `coord gates` prints it,
-      the TUI reads it off the row, and `record_test_verdict` writes an
-      ``test_blocked`` audit row. It also ends the spin, because
-      `dispatch_pending_smoke` skips rows that already carry a verdict — the
-      escalation happens once, not every tick.
+    * **Durable** (every candidate hard-refused, there were no candidates at
+      all, or every capability-matched candidate was paused/quiet-covered —
+      see *paused_capable*) — record ``test_state=TEST_STATE_BLOCKED`` with
+      the full reason on the parent work row. That is board state: `coord
+      gates` prints it, the TUI reads it off the row, and
+      `record_test_verdict` writes an ``test_blocked`` audit row. It also
+      ends the spin, because `dispatch_pending_smoke` skips rows that
+      already carry a verdict — the escalation happens once, not every tick.
     * **Transient** (at least one candidate failed only on connectivity) — do
       NOT poison the row. A machine that is rebooting comes back, and marking
       the row blocked would demand a manual `coord diagnose --reset` for what
       the next tick would have fixed for free. Log it once per process
       instead, and leave the row re-dispatchable.
 
+    *paused_capable* (#2636): machine names that matched capability but were
+    filtered out of `rank_smoke_machines`'s ranking by `follow_on_paused_set`
+    — an explicit `coord pause` or a `quiet_hours` window — before
+    `dispatch_smoke` ever got to try them, so `attempts` is empty for a
+    reason that has nothing to do with capability. Naming that here keeps the
+    recorded reason from reading as "no capable machine" while capable
+    machines are sitting right there, merely unavailable right now — #1678's
+    failure mode by a different route. Always durable: cleared the same way
+    (`coord diagnose --stage test --reset`) once the machine is unpaused or
+    its quiet-hours window ends, same as any other exhausted candidate list.
+
     Never raises: a board-write failure must not take the caller down.
     """
     transient = any(a.transient for a in attempts)
     caps = ", ".join(required_caps) if required_caps else "(none — any capable machine)"
-    if attempts:
+    if paused_capable:
+        message = (
+            f"Test stage cannot be routed: every machine that declares "
+            f"capability [{caps}] for repo {completed.repo_name!r} is "
+            f"paused or inside its quiet-hours window right now: "
+            f"{', '.join(paused_capable)}. (#2636)"
+        )
+    elif attempts:
         message = (
             f"Test stage cannot be routed: every machine that declares "
             f"capability [{caps}] for repo {completed.repo_name!r} refused. "
@@ -1062,6 +1126,22 @@ def dispatch_smoke(
     candidates = rank_smoke_machines(
         required_caps, completed.repo_name, completed.machine_name, board, config
     )
+    # #2636: an empty ranking is ambiguous by itself — capability-empty and
+    # every-candidate-paused/quiet both come back as `[]`. Re-derive the
+    # capability-only set (cheap: config-only, no network) so a downstream
+    # unroutable report can name the real cause instead of the generic
+    # "no capable machine" message while capable machines sit idle behind a
+    # pause or a quiet-hours window.
+    paused_capable: list[str] = []
+    if not candidates:
+        capable = _capability_matched_machines(
+            required_caps, completed.repo_name, config
+        )
+        if capable:
+            from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+
+            paused = follow_on_paused_set(config.machines)
+            paused_capable = sorted(m.name for m in capable if m.name in paused)
     attempts: list[SmokeAttempt] = []
     client = http_client or httpx
     dispatched: tuple[SmokeMachineChoice, str, dict] | None = None
@@ -1184,9 +1264,12 @@ def dispatch_smoke(
 
     if dispatched is None:
         # Every capability-matched machine was tried and none could take it
-        # (or there were none at all). Report it where the board can show it,
-        # exactly once — never the silent 30 s spin of #1678.
-        _report_unroutable_smoke(completed, required_caps, attempts)
+        # (or there were none at all, including "none — they're all paused
+        # or in quiet hours right now", #2636). Report it where the board
+        # can show it, exactly once — never the silent 30 s spin of #1678.
+        _report_unroutable_smoke(
+            completed, required_caps, attempts, paused_capable=paused_capable
+        )
         return None
 
     choice, briefing, agent_response = dispatched

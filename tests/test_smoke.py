@@ -1248,6 +1248,176 @@ def test_rank_smoke_machines_empty_when_capability_unmatched(
     assert rank_smoke_machines(["cuda"], "api", "server", Board(), three_gtk_config) == []
 
 
+# ── #2636: rank_smoke_machines consults pause state ─────────────────────────
+#
+# claude-coordinator#2569, 2026-08-22/23: a smoke leg landed on elitebook 82
+# minutes into its declared `quiet_hours` window, and the operator suspended
+# the machine ten minutes later — exactly what "no new dispatch in this
+# window" invites. `rank_smoke_machines` consulted no pause state of any
+# kind. The fix routes candidates through `follow_on_paused_set` — the
+# #2240 spelling, NOT `paused_set`, so a release cordon (which must not
+# block the tail of work already in flight) keeps working.
+
+
+def test_rank_smoke_machines_skips_a_machine_inside_quiet_hours(
+    three_gtk_config: Config,
+) -> None:
+    from datetime import datetime, time, timezone
+
+    from coord.models import QuietHours
+    from coord.smoke import rank_smoke_machines
+
+    quiet_cfg = replace(
+        three_gtk_config,
+        machines=[
+            m if m.name != "desktop-a" else replace(
+                m, quiet_hours=QuietHours(start=time(22, 0), end=time(8, 0), tz="UTC"),
+            )
+            for m in three_gtk_config.machines
+        ],
+    )
+    inside_window = datetime(2026, 8, 23, 5, 22, tzinfo=timezone.utc)  # 22:00-08:00
+    outside_window = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+
+    ranked = rank_smoke_machines(
+        ["gtk"], "api", "server", Board(), quiet_cfg, now=inside_window,
+    )
+    names = [c.machine.name for c in ranked]
+    # desktop-a declares gtk and would otherwise rank first (config order) —
+    # it must be filtered by quiet hours, not merely reordered.
+    assert "desktop-a" not in names
+    assert names == ["desktop-b", "desktop-c"]
+
+    # Outside its window the same machine is a normal, rankable candidate.
+    ranked_awake = rank_smoke_machines(
+        ["gtk"], "api", "server", Board(), quiet_cfg, now=outside_window,
+    )
+    assert "desktop-a" in [c.machine.name for c in ranked_awake]
+
+
+def test_rank_smoke_machines_incident_shape_routes_to_the_idle_non_quiet_worker(
+    repo: Repo,
+) -> None:
+    """The exact #2569 incident: the worker's own machine declares no quiet
+    hours and is idle; the OTHER capability-matched machine is inside its
+    quiet-hours window right now. Smoke must route to the worker — which is
+    both the correct machine (#1402: warm build cache) and the only one not
+    filtered out."""
+    from datetime import datetime, time, timezone
+
+    from coord.models import QuietHours
+    from coord.smoke import rank_smoke_machines
+
+    precision = _machine("precision", "precision.tail", caps=["python"], path="/p/api")
+    elitebook = replace(
+        _machine("elitebook", "elitebook.tail", caps=["python"], path="/e/api"),
+        quiet_hours=QuietHours(start=time(22, 0), end=time(8, 0), tz="America/Chicago"),
+    )
+    cfg = Config(
+        repos=[repo],
+        machines=[elitebook, precision],
+        smoke_tests=SmokeTestsConfig(auto_queue=True, capability_rules=[]),
+    )
+    # 2026-08-22 23:22 CDT == 2026-08-23 04:22 UTC — 82 minutes into the window,
+    # the exact moment smoke leg 4aad0a84b510 was dispatched to elitebook.
+    quiet_moment = datetime(2026, 8, 23, 4, 22, tzinfo=timezone.utc)
+
+    ranked = rank_smoke_machines(
+        [], "api", "precision", Board(), cfg, now=quiet_moment,
+    )
+    assert [c.machine.name for c in ranked] == ["precision"]
+
+
+def test_rank_smoke_machines_skips_an_explicitly_paused_machine(
+    three_gtk_config: Config,
+) -> None:
+    from coord.machine_pause import local_pause
+    from coord.smoke import rank_smoke_machines
+
+    local_pause("desktop-a")
+
+    ranked = rank_smoke_machines(["gtk"], "api", "server", Board(), three_gtk_config)
+    names = [c.machine.name for c in ranked]
+    assert "desktop-a" not in names
+    assert names == ["desktop-b", "desktop-c"]
+
+
+def test_rank_smoke_machines_still_ranks_a_cordoned_machine(
+    three_gtk_config: Config,
+) -> None:
+    """The #2240 regression guard: a release cordon means "no NEW work", but
+    a smoke leg is the tail of work already in flight (the Test stage for a
+    completed work row), so it must NOT be filtered — the same reasoning
+    `pick_reviewer_machine` already applies via `follow_on_paused_set`. If
+    this ever starts filtering cordoned machines, it silently reaches for
+    `paused_set` instead of `follow_on_paused_set` and reproduces the
+    2026-08-14 drain deadlock in the Test stage."""
+    from coord.machine_pause import local_set_cordon
+    from coord.smoke import rank_smoke_machines
+
+    local_set_cordon("desktop-a", target_version="0.5.77")
+
+    ranked = rank_smoke_machines(["gtk"], "api", "server", Board(), three_gtk_config)
+    names = [c.machine.name for c in ranked]
+    assert names == ["desktop-a", "desktop-b", "desktop-c"]
+
+
+def test_rank_smoke_machines_operator_set_quiet_hours_bind_same_as_config(
+    three_gtk_config: Config,
+) -> None:
+    """#2146: a window set via `coord quiet-hours` (no `quiet_hours:` block
+    in `coordinator.yml` at all) must bind exactly like a config-declared
+    one — the fix must go through `follow_on_paused_set`/
+    `_quiet_covered_names`, never re-read `Machine.quiet_hours` directly,
+    which would miss operator-set windows entirely."""
+    from datetime import datetime, timezone
+
+    from coord.machine_pause import local_set_quiet_hours
+    from coord.smoke import rank_smoke_machines
+
+    # None of `three_gtk_config`'s machines declare a `quiet_hours:` block —
+    # this window comes ENTIRELY from the operator-set store.
+    local_set_quiet_hours("desktop-a", start="22:00", end="08:00", tz="UTC")
+    inside_window = datetime(2026, 8, 23, 5, 22, tzinfo=timezone.utc)
+
+    ranked = rank_smoke_machines(
+        ["gtk"], "api", "server", Board(), three_gtk_config, now=inside_window,
+    )
+    names = [c.machine.name for c in ranked]
+    assert "desktop-a" not in names
+    assert names == ["desktop-b", "desktop-c"]
+
+
+def test_dispatch_smoke_blocked_reason_names_pause_not_capability(
+    three_gtk_config: Config,
+) -> None:
+    """#2636 acceptance: when every capability-matched machine is paused or
+    quiet-covered, the recorded reason must say so — NOT the generic
+    capability-shaped message, which would read as "no capable machine"
+    while an operator stares at three capable machines (#1678's failure mode
+    by a different route)."""
+    from coord.machine_pause import local_pause
+
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        local_pause(name)
+
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert completed.test_state == "blocked"
+    reason = completed.test_reason or ""
+    assert "paused or inside its quiet-hours window" in reason
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        assert name in reason
+    # Must NOT read as a capability miss — all three machines DO declare gtk.
+    assert "no configured machine declares capability" not in reason
+
+
 # ── Fallback: try the NEXT capability-matched machine ───────────────────────
 
 
