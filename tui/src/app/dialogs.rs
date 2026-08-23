@@ -833,9 +833,8 @@ impl CoordApp {
 
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
 
-                // #1398: "Drive (automated)" — `coord drive --tmux` drives
-                // the WHOLE Work → Test → Review → Merge sequence unattended
-                // (coord dispatches every stage itself), unlike the
+                // #1398: "Drive (automated)" — hands the WHOLE Work → Test →
+                // Review → Merge sequence to the automated driver, unlike the
                 // single-stage items above. Flat, not nested, for visibility
                 // — this is the marquee one-click entry point the issue asks
                 // for. Only offered when `has_running`/`has_live_drive` are
@@ -843,7 +842,30 @@ impl CoordApp {
                 // (automated)" parent item right above it, `has_zombie` does
                 // NOT gate this: it still appears alongside "Reattach to live
                 // session" when a zombie session exists.
+                //
+                // #2634: this used to launch `coord drive --tmux` in a LOCAL
+                // PTY — a driver that runs correctly but writes nothing to
+                // the daemon's `drive_queue` table, so it could never appear
+                // in the Queue panel and died with the operator's laptop.
+                // The name promised "the automated driver" while the
+                // mechanism was a local, ephemeral one; the durable,
+                // board-backed queue (visible in the Queue panel, survives a
+                // restart, subject to the queue's ordering/overlap/hold
+                // machinery) is what "the automated driver" should mean, so
+                // this item now dispatches through the SAME
+                // `"drive-queue-add"` seam the Board/Pipeline "Add to drive
+                // queue" items use (`dispatch_context_menu_action`).
                 items.push(ContextMenuItem::action("start-drive", "Drive (automated)"));
+                // #2634: the OLD behavior, demoted and distinctly named so
+                // it can never again be mistaken for the durable queue path
+                // above — a local `coord drive --tmux` run that dies with
+                // this machine/tmux and is invisible to the Queue panel by
+                // construction (see `drive.rs`'s module doc). Kept for an
+                // operator deliberately choosing a local, unqueued run.
+                items.push(ContextMenuItem::action(
+                    "start-drive-local",
+                    "Drive locally (tmux, this machine)",
+                ));
 
                 // #685: "Set test mode" — pick smoke vs auto policy for headless Work.
                 if let Some(num) = issue_number {
@@ -7384,9 +7406,27 @@ impl CoordApp {
                 }
                 true
             }
-            // #1398: "Drive (automated)" — `coord drive <repo> <issue>
-            // --tmux`, detached so it survives the TUI restarting.
+            // #2634: "Drive (automated)" — the primary automated action now
+            // queues the issue on the durable, board-backed drive queue
+            // (`coord drive-queue add <repo> <issue>`) instead of launching
+            // a local tmux session. Same seam the Board/Pipeline "Add to
+            // drive queue" items use (`"drive-queue-add"` below) — the queue
+            // is the supported path, and this is the menu's default lead-in
+            // to it. Deliberately does NOT touch `pipeline_detail_tab`:
+            // queueing starts nothing locally, so there is no live run for
+            // the Terminal tab to show yet.
             "start-drive" => {
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.dispatch_drive_queue_add(&repo, issue, None, &[]);
+                }
+                true
+            }
+            // #2634: "Drive locally (tmux, this machine)" — the demoted,
+            // explicitly-local former "Drive (automated)" behavior: `coord
+            // drive <repo> <issue> --tmux`, detached so it survives the TUI
+            // restarting, but LOCAL and never written to `drive_queue` (see
+            // `drive.rs`'s module doc for why that matters).
+            "start-drive-local" => {
                 self.pipeline_detail_tab = PipelineDetailTab::Terminal;
                 self.launch_drive_for_selected_issue();
                 true

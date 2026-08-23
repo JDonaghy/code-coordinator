@@ -1,4 +1,4 @@
-//! Unattended `coord drive --tmux` session integration (#1398).
+//! Unattended `coord drive --tmux` session integration (#1398), LOCAL half.
 //!
 //! `coord drive <repo> <issue> --tmux` runs the whole Work → Test → Review →
 //! Merge sequence unattended, detached inside a `coord-drive-<repo>-<issue>`
@@ -10,14 +10,27 @@
 //! to it, and stop it. "Launch" always ends attached: `spawn_drive_shell`
 //! types `coord drive … --tmux && coord drive-attach …` as a single chained
 //! command line, so opening the Terminal tab right after clicking "Drive
-//! (automated)" shows the live run, not a launch confirmation sitting above
-//! a dead shell prompt.
+//! locally (tmux, this machine)" shows the live run, not a launch
+//! confirmation sitting above a dead shell prompt.
+//!
+//! **#2634: this is the demoted, ephemeral path — NOT the primary automated
+//! action any more.** A drive launched from here runs in a local PTY only:
+//! it dies with this machine/tmux, and it never writes the daemon's
+//! `drive_queue` table, so it is invisible to the Queue panel
+//! (`drive_queue.rs`) by construction — two disjoint drivers under
+//! confusingly similar menu labels ("Drive (automated)" vs "Add to drive
+//! queue") was exactly #2634's report. The Pipeline row menu's prominent
+//! "Drive (automated)" item now calls `dispatch_drive_queue_add`
+//! (`drive_queue.rs`) — the durable, board-backed path — instead of anything
+//! in this module; this module backs only the explicitly-demoted "Drive
+//! locally (tmux, this machine)" item, for an operator who deliberately
+//! wants a local, unqueued run.
 //!
 //! LOCAL ONLY: unlike fleet terminals / interactive `coord-<aid>` sessions, a
-//! drive runs on the operator's own machine (see #1398's "Out of scope" —
-//! running the driver on the daemon is a follow-up gated on #1395 option B),
-//! so there is no `--remote` ssh sweep here, just a local `coord
-//! drive-sessions --json`.
+//! drive launched here runs on the operator's own machine (see #1398's "Out
+//! of scope" — running the driver on the daemon is a follow-up gated on
+//! #1395 option B), so there is no `--remote` ssh sweep here, just a local
+//! `coord drive-sessions --json`.
 //!
 //! Killing the tmux session (`coord drive-stop`) IS Stop: the driver's
 //! per-issue `flock` releases the instant the process exits (the OS does
@@ -235,9 +248,10 @@ impl CoordApp {
     }
 
     /// Launch `coord drive <repo> <issue> --tmux` for the selected Pipeline
-    /// issue (#1398's "Drive (automated)" menu action) — hands the WHOLE
-    /// Work → Test → Review → Merge sequence to `coord drive`, which
-    /// dispatches every stage itself. Unlike
+    /// issue (#2634: backs the demoted "Drive locally (tmux, this machine)"
+    /// menu action, not the primary "Drive (automated)" one any more — see
+    /// module doc) — hands the WHOLE Work → Test → Review → Merge sequence
+    /// to `coord drive`, which dispatches every stage itself. Unlike
     /// `launch_interactive_session_on_machine`, this carries no work_aid and
     /// never runs `coord assign`. The pane doesn't stop at the launch
     /// confirmation: `spawn_drive_shell` chains straight into `coord
@@ -254,7 +268,7 @@ impl CoordApp {
         let issue_num = issue_key.1;
         if self.issue_has_live_drive(issue_num, &repo) {
             self.push_toast(
-                "Drive (automated)",
+                "Drive locally (tmux)",
                 "A drive is already running for this issue — use Attach instead.",
                 ToastSeverity::Warning,
             );
@@ -372,9 +386,38 @@ impl CoordApp {
                         format!("Driving {repo} #{issue_num} — Work → Test → Review → Merge"),
                         Instant::now(),
                     ));
+                    // #2634: the launch was the quietest action in this
+                    // module — only the transient status line above plus an
+                    // optimistic badge, no toast, unlike `confirm_kill_drive`'s
+                    // "Drive stopped" and the already-driving warning toast
+                    // just above in this same function. Symmetric with both.
+                    self.push_toast(
+                        "Drive locally (tmux)",
+                        &format!(
+                            "driving {repo} #{issue_num} on this machine (local, ephemeral — \
+                             not visible in the Queue panel)"
+                        ),
+                        ToastSeverity::Success,
+                    );
                 }
             }
             Err(e) => {
+                // #2634: a failed PTY spawn used to be stashed into
+                // `detail_terminal_spawn_errors` with no toast and no status
+                // line at all — completely silent, indistinguishable from a
+                // successful launch until the operator went looking for the
+                // (missing) live run. Name the failure out loud, same
+                // severity/posture as every other launch-failure toast in
+                // this app.
+                let verb = match mode {
+                    DriveShellMode::Launch => "launch a local drive for",
+                    DriveShellMode::Attach => "attach to the drive for",
+                };
+                self.push_toast(
+                    "Drive locally (tmux)",
+                    &format!("failed to {verb} {repo} #{issue_num}: {e}"),
+                    ToastSeverity::Error,
+                );
                 self.detail_terminal_spawn_errors
                     .insert(issue_key, e.to_string());
             }
@@ -932,20 +975,29 @@ mod tests {
         );
     }
 
-    /// #1398 review: black-box `TuiDriver` coverage for the marquee flow the
-    /// issue opens with — "Right-click a Pipeline row → Drive (automated) →
-    /// … Select the issue, open Terminal, watch it work" — through the REAL
-    /// `event → handle → render` path (`quadraui::tui::testing::
-    /// driver_with_shell`), not a direct call into an internal method. Drives
-    /// a right-click (mirrors `tuidriver_right_click_opens_board_context_
-    /// menu`'s full `UiEvent::MouseDown { button: Right }` chain) on the
-    /// Pipeline row, asserts "Drive (automated)" renders in the menu, clicks
-    /// it, and asserts the Terminal tab becomes the active tab AND the
-    /// "[driving]" row badge appears — both read straight off the rendered
-    /// screen grid, exactly what the coord-tui testing policy in this repo's
-    /// CLAUDE.md requires for a user-visible change.
+    /// #2634: black-box `TuiDriver` coverage for the fixed marquee flow —
+    /// "Right-click a Pipeline row → Drive (automated)" now queues the issue
+    /// on the durable drive queue instead of launching an invisible local
+    /// tmux session — through the REAL `event → handle → render` path
+    /// (`quadraui::tui::testing::driver_with_shell`), not a direct call into
+    /// an internal method. Drives a right-click (mirrors
+    /// `tuidriver_right_click_opens_board_context_menu`'s full
+    /// `UiEvent::MouseDown { button: Right }` chain) on the Pipeline row,
+    /// asserts BOTH the primary "Drive (automated)" item AND the demoted
+    /// "Drive locally (tmux, this machine)" item render — distinguishable
+    /// from each other on screen, addressing the issue's "two adjacent
+    /// actions whose names both promise the automated driver" report —
+    /// clicks the primary one, and asserts the confirmation toast
+    /// `dispatch_drive_queue_add` pushes ("queuing myrepo #42…") lands on
+    /// screen. The TuiDriver shell adapter doesn't expose the wrapped
+    /// `CoordApp` for a typed `spawned_calls` check (same documented
+    /// limitation `tuidriver_add_to_drive_queue_spawns_subprocess_and_toasts`
+    /// works around) — that half of the acceptance criterion (the exact
+    /// `coord drive-queue add myrepo 42` argv) is covered directly by the
+    /// companion test `dispatch_start_drive_queues_via_drive_queue_add`
+    /// below.
     #[test]
-    fn tuidriver_drive_automated_menu_item_switches_to_terminal_and_shows_badge() {
+    fn tuidriver_drive_automated_menu_item_queues_via_drive_queue_add() {
         use quadraui::tui::testing::driver_with_shell;
 
         let mut app = make_test_app(BoardData::default());
@@ -959,17 +1011,11 @@ mod tests {
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
 
-        let screen_before = driver.screen();
-        assert!(
-            screen_before.contains("Gates"),
-            "sanity: must start on the Overview tab (renders the Repo/Local/ \
-             Labels/Gates meta block) before anything is clicked:\n{screen_before}"
-        );
-
         // The lone issue has no milestone, so it lands in the "No milestone"
         // bucket, collapsed by default (mirrors `tuidriver_pipeline_new_
         // milestone_chevron_click_expands_and_persists`'s precedent) — expand
         // it first so "#42" is actually on screen to click.
+        let screen_before = driver.screen();
         let (label_x, label_y) = driver.find("No milestone").unwrap_or_else(|| {
             panic!("'No milestone' bucket header not found:\n{screen_before}")
         });
@@ -977,7 +1023,7 @@ mod tests {
 
         let (x, y) = driver.find("#42").unwrap_or_else(|| {
             panic!(
-                "#1398: could not find Pipeline row '#42' after expanding its \
+                "#2634: could not find Pipeline row '#42' after expanding its \
                  bucket:\n{}",
                 driver.screen()
             )
@@ -994,15 +1040,22 @@ mod tests {
             modifiers: Modifiers::default(),
         });
 
+        let menu_screen = driver.screen();
         assert!(
-            driver.screen_contains("Drive (automated)"),
-            "right-click on an idle Pipeline row must offer 'Drive (automated)':\n{}",
-            driver.screen(),
+            menu_screen.contains("Drive (automated)"),
+            "right-click on an idle Pipeline row must offer the primary \
+             'Drive (automated)' item:\n{menu_screen}",
+        );
+        assert!(
+            menu_screen.contains("Drive locally (tmux, this machine)"),
+            "#2634: the demoted local/ephemeral alternative must render \
+             alongside the primary item, distinguishably named so the two \
+             can never again be mistaken for one another:\n{menu_screen}",
         );
 
         let (dx, dy) = driver.find("Drive (automated)").unwrap_or_else(|| {
             panic!(
-                "#1398: could not find 'Drive (automated)' menu item on screen:\n{}",
+                "#2634: could not find 'Drive (automated)' menu item on screen:\n{}",
                 driver.screen()
             )
         });
@@ -1011,8 +1064,73 @@ mod tests {
         // item-height below where it visibly renders (see the identical
         // nudge + rationale on the "Author acceptance tests (interactive)"
         // click above `tuidriver_author_acceptance_tests_interactive_menu_
-        // item_dispatches`). Without it this click lands on "Set test mode",
-        // the item directly below "Drive (automated)" in the menu.
+        // item_dispatches`).
+        driver.click(dx, dy - 0.1);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("queuing myrepo #42"),
+            "#2634: clicking the primary 'Drive (automated)' item must \
+             toast the drive-queue confirmation ('queuing myrepo #42…'), \
+             not silently launch a local tmux session; got:\n{screen}",
+        );
+    }
+
+    /// #2634: the demoted "Drive locally (tmux, this machine)" item is what
+    /// "Drive (automated)" used to be — a local, ephemeral `coord drive
+    /// --tmux` launch that switches the Terminal tab to the live run and
+    /// flips the row's `[driving]` badge. Same TuiDriver shape as the test
+    /// above, retargeted at the renamed item, so the OLD behavior stays
+    /// covered under its new name rather than disappearing along with the
+    /// rename.
+    #[test]
+    fn tuidriver_drive_locally_menu_item_switches_to_terminal_and_shows_badge() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("Gates"),
+            "sanity: must start on the Overview tab (renders the Repo/Local/ \
+             Labels/Gates meta block) before anything is clicked:\n{screen_before}"
+        );
+
+        let (label_x, label_y) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!("'No milestone' bucket header not found:\n{screen_before}")
+        });
+        driver.click((label_x - 2.0).max(0.0), label_y);
+
+        let (x, y) = driver.find("#42").unwrap_or_else(|| {
+            panic!(
+                "#2634: could not find Pipeline row '#42' after expanding its \
+                 bucket:\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let (dx, dy) = driver
+            .find("Drive locally (tmux, this machine)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "#2634: could not find 'Drive locally (tmux, this machine)' \
+                     menu item on screen:\n{}",
+                    driver.screen()
+                )
+            });
         driver.click(dx, dy - 0.1);
 
         // Tab-switch: the Overview-only Repo/Local/Labels/Gates meta block
@@ -1024,21 +1142,21 @@ mod tests {
         // signal that we left Overview. The exact destination
         // (`PipelineDetailTab::Terminal`, not some other tab) is pinned by
         // the direct-call companion test
-        // `dispatch_start_drive_launches_and_switches_to_terminal_tab` above,
+        // `dispatch_start_drive_local_launches_and_switches_to_terminal_tab`,
         // which the TuiDriver shell adapter doesn't expose a typed field to
         // re-check here (same split as
         // `sessions_panel_stop_running_session_shows_feedback_toast`).
         let screen = driver.screen();
         assert!(
             !screen.contains("Gates"),
-            "clicking 'Drive (automated)' must switch away from the Overview \
-             tab (to Terminal) so the live run is what's shown, not a launch \
-             confirmation left sitting on Overview:\n{screen}",
+            "clicking 'Drive locally (tmux, this machine)' must switch away \
+             from the Overview tab (to Terminal) so the live run is what's \
+             shown, not a launch confirmation left sitting on Overview:\n{screen}",
         );
         assert!(
             screen.contains("[driving]"),
-            "the Pipeline row must carry the '[driving]' badge once a drive \
-             has been launched for it:\n{screen}",
+            "the Pipeline row must carry the '[driving]' badge once a local \
+             drive has been launched for it:\n{screen}",
         );
     }
 
@@ -1232,6 +1350,17 @@ mod tests {
             items.iter().any(|i| i.label == "Drive (automated)"),
             "Drive (automated) must be offered when nothing is live"
         );
+        // #2634: the demoted local/ephemeral alternative must render
+        // alongside the primary queue-backed item, distinctly labelled —
+        // the whole point of the rename is that the two can never again be
+        // mistaken for one another.
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "Drive locally (tmux, this machine)"),
+            "the demoted local-tmux launcher must also be offered when \
+             nothing is live"
+        );
         assert!(!items.iter().any(|i| i.label == "Attach to drive"));
         assert!(!items.iter().any(|i| i.label == "Stop drive"));
     }
@@ -1256,6 +1385,13 @@ mod tests {
         assert!(
             !items.iter().any(|i| i.label == "Drive (automated)"),
             "the one-click Drive launcher must not be offered while already driving"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.label == "Drive locally (tmux, this machine)"),
+            "#2634: the demoted local-tmux launcher must not be offered \
+             while already driving either"
         );
         assert!(
             !items.iter().any(|i| i.label == "Start (interactive)"),
@@ -1295,8 +1431,15 @@ mod tests {
         }
     }
 
+    /// #2634: the primary "Drive (automated)" action now queues the issue
+    /// on the durable drive queue (same seam as `"drive-queue-add"`) instead
+    /// of launching a local tmux session — companion direct-call test to
+    /// `tuidriver_drive_automated_menu_item_queues_via_drive_queue_add`,
+    /// which can't see `command_runner` through the TuiDriver shell
+    /// adapter. Mirrors `dispatch_context_menu_action_drive_queue_add_
+    /// spawns_subprocess_for_board_row`'s assertion shape (`tests.rs`).
     #[test]
-    fn dispatch_start_drive_launches_and_switches_to_terminal_tab() {
+    fn dispatch_start_drive_queues_via_drive_queue_add() {
         let mut app = make_test_app(BoardData::default());
         app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
         app.pipeline_sel = Some(0);
@@ -1305,6 +1448,50 @@ mod tests {
 
         let target = pipeline_target_with_repo(42, "myrepo");
         let handled = app.dispatch_context_menu_action("start-drive", &target);
+
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "drive-queue".to_string(),
+                "add".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+            ]],
+            "must dispatch `coord drive-queue add myrepo 42`; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert!(
+            app.drive_queue_contains("myrepo", 42),
+            "must optimistically reflect the queue entry"
+        );
+        // Queueing starts nothing locally — there is no live run yet for a
+        // Terminal tab to show, so this must NOT switch tabs or spawn a PTY
+        // (unlike the demoted "start-drive-local" action below).
+        assert_eq!(
+            app.pipeline_detail_tab,
+            PipelineDetailTab::Summary,
+            "queueing must not switch the detail tab away from where the \
+             operator was"
+        );
+        assert!(!app
+            .detail_terminal_sessions
+            .contains_key(&("acme/myrepo".to_string(), 42)));
+    }
+
+    /// #2634: the demoted "Drive locally (tmux, this machine)" action is
+    /// what "start-drive" used to do — local `coord drive --tmux` launch,
+    /// switching the Terminal tab to the live run.
+    #[test]
+    fn dispatch_start_drive_local_launches_and_switches_to_terminal_tab() {
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let target = pipeline_target_with_repo(42, "myrepo");
+        let handled = app.dispatch_context_menu_action("start-drive-local", &target);
 
         assert!(handled);
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
