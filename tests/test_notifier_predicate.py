@@ -257,19 +257,55 @@ def test_cold_stratum_does_not_fire_below_the_generous_ceiling():
     assert evaluate(snap, {}) == []
 
 
-def test_over_baseline_never_wins_even_when_its_own_gate_is_satisfied():
-    """Structural check: because over_baseline's gate reuses the exact same
-    quiet-past-threshold test the silence probe applies, whenever the gate
-    is satisfied the silence probe was already satisfied too — and, being
-    ranked stronger, that is what a caller of `evaluate()` sees. This pins
-    the dominance relationship the #2609 fix relies on rather than the
-    (much weaker) "just check the count" assertion above."""
+def test_over_baseline_never_wins_when_last_output_at_is_known_and_quiet():
+    """Structural check for the *confirmed-quiet* branch only: when
+    `last_output_at` is known, over_baseline's gate reuses the exact same
+    quiet-past-threshold test the silence probe applies, so whenever the
+    gate is satisfied the silence probe was already satisfied too — and,
+    being ranked stronger, that is what a caller of `evaluate()` sees. This
+    pins the dominance relationship the #2609 fix relies on rather than the
+    (much weaker) "just check the count" assertion above. It does NOT hold
+    when `last_output_at` is unknown — see the unreachable-agent test
+    below, which is the one case over_baseline is still allowed to win."""
     baselines = warm_baselines(secs=600.0)
     snap = PipelineSnapshot(
         now=NOW,
         probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=NOW - 20 * 60.0)],
     )
     assert CONDITION_OVER_BASELINE not in [e.condition for e in evaluate(snap, baselines)]
+
+
+def test_over_baseline_fires_when_agent_is_unreachable_past_baseline():
+    """#2609 review iteration 1: the collector leaves `last_output_at` as
+    `None` when the owning agent has gone unreachable (collect.py) — that
+    is the single scenario most literally matching "nobody is coming", and
+    it is the one case STUCK and OUTPUT_SILENCE structurally cannot catch,
+    since both also require agent-status data a dead agent can't supply.
+    Requiring *confirmed* quiet (the pre-fix gate) silently dropped this
+    case forever; "unknown" must be treated the same as "silent", not the
+    same as "definitely still talking". This replaces the deleted
+    `test_elapsed_over_baseline_is_the_weakest_probe_and_still_fires`."""
+    snap = PipelineSnapshot(
+        now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=None)]
+    )
+    events = evaluate(snap, warm_baselines(secs=600.0))
+    assert [e.condition for e in events] == [CONDITION_OVER_BASELINE]
+    assert events[0].detail["quiet_for_secs"] is None
+    # Wording must not claim confirmed silence when it is merely unknown —
+    # "Also silent for ?" would misreport an unreachable agent as a
+    # confirmed-quiet one.
+    assert "Also silent for" not in events[0].body
+    assert "unreachable" in events[0].body
+
+
+def test_over_baseline_still_does_not_fire_below_baseline_when_unreachable():
+    """The unreachable-agent branch is still gated on elapsed >= duration
+    threshold — an agent going unreachable moments after dispatch must not
+    page immediately."""
+    snap = PipelineSnapshot(
+        now=NOW, probes=[probe(dispatched_at=NOW - 60.0, last_output_at=None)]
+    )
+    assert evaluate(snap, warm_baselines(secs=600.0)) == []
 
 
 # ── terminal conditions ───────────────────────────────────────────────────

@@ -34,7 +34,7 @@ ping progress either: no "3/7 done" messages.
 | fleet CRIT invalidating in-flight work | disk mainly (#1625) — a verdict recorded under disk pressure is worse than a red one | terminal-ish |
 | stalled past its nudge | `drive` nudged a stalled stage (#1593) and it is *still* stalled | strong |
 | output silence | no new log line / `STATUS:` for longer than the stratum's learned threshold | strong |
-| total elapsed vs baseline | past the stratum's p90 **and** silent past the silence threshold | weakest, fires last |
+| total elapsed vs baseline | past the stratum's p90 **and** (silent past the silence threshold **or** silence unconfirmable — agent unreachable) | weakest, fires last |
 
 **The three worker probes are ranked, not averaged.** A worker that printed
 `STUCK:` is reported as stuck, not as "stuck and also somewhat over its p90".
@@ -48,14 +48,22 @@ p90 threshold trips on 10% of *all* healthy work by construction, and no
 percentile choice removes that — it only moves which 10%. So `over_baseline`
 is now **gated on output silence**, not a substitute for it: it only fires
 when the leg is past its duration baseline *and* has gone quiet past the
-same silence threshold the output-silence probe uses. In practice that gate
-condition is a strict subset of the silence probe's own condition, so
-whenever it is satisfied the silence probe already fired and — being ranked
-stronger — is what actually gets reported; "over baseline" no longer
-produces its own independent page. A worker that is slow but still talking
-is not evidence nobody is coming, and is not this channel's business — a
-pure duration/cost signal belongs in `coord status` or the digest, not the
-push transport.
+same silence threshold the output-silence probe uses — **or** quietness
+could not be confirmed at all, because the owning agent is unreachable and
+the collector has no `last_output_at` to read. That second branch matters:
+"we don't know" is deliberately treated the same as "silent", not the same
+as "confirmed recent output", because an unreachable agent is the single
+scenario this channel's contract names most literally — nobody is coming
+because there is no agent left to come — and it is the one case none of the
+other probes can catch (`STUCK:` and output silence both need the same
+agent-status data a dead agent can't supply). Whenever `last_output_at` IS
+known and quiet, that gate condition is a strict subset of the silence
+probe's own condition, so the silence probe already fired and — being
+ranked stronger — is what actually gets reported; `over_baseline` only
+surfaces on its own for the "duration exceeded, output unknown" case. A
+worker that is slow but still confirmed talking is not evidence nobody is
+coming, and is not this channel's business — a pure duration/cost signal
+belongs in `coord status` or the digest, not the push transport.
 
 ---
 
@@ -244,7 +252,8 @@ to the ntfy server, the tailnet, or the config.
 * A dedicated pure-duration/cost surface in `coord status` or the digest
   (#2609 named this as where an "over baseline, still working" observation
   belongs if it's ever wanted). Not built — `over_baseline` today is simply
-  gated out of the push predicate rather than rerouted anywhere.
+  gated on silence (confirmed or unconfirmed) rather than rerouted anywhere;
+  it still never pages on duration alone while output is confirmed recent.
 * Progress pings / periodic "still going" messages — exceptional events only.
 * Escalation policies, acknowledgement flows, on-call rotation. One operator.
 * Anything that **acts** on a stall (pausing dispatch, killing a worker).

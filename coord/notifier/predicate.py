@@ -266,26 +266,41 @@ def _probe_events(
     #    notifier's own contract ("nobody is coming, and nothing else").
     #    So this no longer fires on elapsed time by itself; it additionally
     #    requires the SAME quiet-past-threshold test probe 3 already
-    #    applies.  Concretely that means whenever this condition holds,
-    #    probe 3 already held too and — being ranked stronger — is what
-    #    `evaluate()` actually reports; over_baseline is a substitute for
-    #    silence no longer, only ever corroborating detail once silence has
-    #    already earned the page.  A pure duration signal with no silence
-    #    gate belongs in the digest / `coord status`, never this push
-    #    predicate (#2609 scope item 2).
+    #    applies — with one deliberate exception.  ``quiet_for is None``
+    #    means the collector could not read `last_output_at` at all, which
+    #    happens when the owning agent is unreachable (collect.py: "an
+    #    unreachable agent leaves both `None`").  That is the single
+    #    scenario the notifier's contract names most literally — nobody is
+    #    coming because there is no agent left to come — and treating
+    #    "we don't know" the same as "definitely still talking" would
+    #    silently swallow it forever, since STUCK and OUTPUT_SILENCE both
+    #    also require agent-status data that a dead agent can't supply.  So
+    #    "unknown" is treated the same as "silent", not the same as
+    #    "confirmed recent output": fire when either the leg has gone quiet
+    #    past the silence threshold, or quietness could not be confirmed at
+    #    all (#2609 review iteration 1).
+    #
+    #    Whenever `last_output_at` IS known and quiet, probe 3 already fired
+    #    on it too and — being ranked stronger — is what `evaluate()`
+    #    actually reports for that case; this condition only surfaces on
+    #    its own for the "duration exceeded, output unknown" case where
+    #    probe 3 declined to guess.
     quiet_for = None if probe.last_output_at is None else max(0.0, now - probe.last_output_at)
     if (
         elapsed is not None
         and elapsed >= base.duration_threshold
-        and quiet_for is not None
-        and quiet_for >= base.silence_threshold
+        and (quiet_for is None or quiet_for >= base.silence_threshold)
     ):
+        if quiet_for is None:
+            silence_clause = "Output could not be confirmed (agent unreachable)."
+        else:
+            silence_clause = f"Also silent for {_fmt_duration(quiet_for)}."
         out.append(
             mk(
                 CONDITION_OVER_BASELINE,
                 f"{probe.type} has been running {_fmt_duration(elapsed)}, past "
                 f"{_fmt_duration(base.duration_threshold)} — {base.basis()}. "
-                f"Also silent for {_fmt_duration(quiet_for)}.",
+                f"{silence_clause}",
                 {
                     "duration_threshold_secs": base.duration_threshold,
                     "baseline_cold": base.cold,
