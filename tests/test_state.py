@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import warnings
 
@@ -2387,3 +2388,136 @@ class TestLoadReviewAssignmentsMissingCost:
 
         rows = load_review_assignments_missing_cost(repo_name="api")
         assert [r["assignment_id"] for r in rows] == ["api1"]
+
+
+# ── #2597: cost/token capture rides out transient lock contention ──────────
+
+
+class _FlakyConnProxy:
+    """Wraps a real sqlite3 connection and makes its first *fail_times*
+    ``execute()`` calls raise ``database is locked`` before delegating to
+    the real connection — simulates a momentary collision with a concurrent
+    writer without needing a genuine second OS-level connection against the
+    in-memory ``coord_db`` fixture (which, being ``:memory:``, has no
+    cross-connection contention to hold in the first place).
+    """
+
+    def __init__(self, real_conn, fail_times: int) -> None:
+        self._real = real_conn
+        self._fail_times = fail_times
+        self.calls = 0
+
+    def execute(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _dispatch_for_cost(coord_db, assignment_id: str = "aid-cost") -> None:
+    proposal = Proposal(
+        id=1, machine_name="laptop", repo_name="api", issue_number=7,
+        issue_title="Fix thing", rationale="", briefing="Fix it",
+    )
+    record_dispatched(
+        assignment_id=assignment_id, proposal=proposal, repo_github="acme/api",
+    )
+
+
+class TestUpdateAssignmentCostRetriesLockContention:
+    """#2597: this write previously had no retry protection at all — a
+    momentary lock collision (a concurrent writer holding the DB for a
+    beat) raised straight out to `coord.notify._capture_cost`, which logs
+    and swallows it, silently understating recorded spend for that
+    assignment. Now rides out a transient collision the same way every
+    other load-bearing write in this codebase does."""
+
+    def test_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _update_assignment_cost_local
+
+        _dispatch_for_cost(coord_db, "aid-cost-1")
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        _update_assignment_cost_local("aid-cost-1", 1.23)
+
+        assert proxy.calls == 3
+        row = coord_db.execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id=?",
+            ("aid-cost-1",),
+        ).fetchone()
+        assert row["cost_usd"] == 1.23
+
+    def test_propagates_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Sustained (not momentary) contention still surfaces as an
+        `OperationalError` to the caller — unchanged from before #2597,
+        which only added the retry, not a new swallow. `_capture_cost`'s
+        own try/except (coord/notify.py) is the existing best-effort net
+        for this case."""
+        from coord.state import _update_assignment_cost_local
+
+        _dispatch_for_cost(coord_db, "aid-cost-2")
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            _update_assignment_cost_local("aid-cost-2", 1.23)
+
+
+class TestUpdateAssignmentTokensRetriesLockContention:
+    """#2597: mirrors TestUpdateAssignmentCostRetriesLockContention — before
+    this, EVERY OperationalError (a missing pre-migration column, or lock
+    contention) was silently swallowed with no retry at all."""
+
+    def test_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _update_assignment_tokens_local
+
+        _dispatch_for_cost(coord_db, "aid-tok-1")
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        _update_assignment_tokens_local(
+            "aid-tok-1", input_tokens=10, output_tokens=20,
+            cache_creation_tokens=0, cache_read_tokens=0,
+        )
+
+        assert proxy.calls == 3
+        row = coord_db.execute(
+            "SELECT input_tokens, output_tokens FROM assignments "
+            "WHERE assignment_id=?",
+            ("aid-tok-1",),
+        ).fetchone()
+        assert row["input_tokens"] == 10
+        assert row["output_tokens"] == 20
+
+    def test_stays_silent_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Preserves this function's pre-#2597 best-effort contract (its
+        docstring: "Silently swallows OperationalError") for the case that
+        contract was written for — now also covering a lock that outlasts
+        the retry budget, not just a genuinely missing column."""
+        from coord.state import _update_assignment_tokens_local
+
+        _dispatch_for_cost(coord_db, "aid-tok-2")
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        # Must not raise.
+        _update_assignment_tokens_local(
+            "aid-tok-2", input_tokens=10, output_tokens=20,
+            cache_creation_tokens=0, cache_read_tokens=0,
+        )

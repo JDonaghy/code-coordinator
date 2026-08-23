@@ -113,6 +113,29 @@ _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_DELAY_S = 0.1
 
 
+def is_lock_contention_error(exc: BaseException) -> bool:
+    """True when *exc* is transient SQLite lock/busy contention rather than
+    a real bug (#2597).
+
+    Centralizes a check that used to be duplicated — and drifting — between
+    this module's own :func:`retry_on_locked` and ``coord.auto_loop``'s
+    ``except`` block: only the ``"database is locked"`` substring was
+    matched anywhere, missing both SQLite's other lock-collision message
+    (``"database table is locked"``, raised for a table-level lock rather
+    than the whole-database one) and the underlying ``SQLITE_BUSY`` result
+    code, which a driver could in principle surface through a differently
+    worded message. Checking the code as well as the text means a future
+    SQLite/driver wording change can't silently turn this back into a
+    "raise instead of retry" bug the way the single-substring version could.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    if "database is locked" in message or "database table is locked" in message:
+        return True
+    return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+
+
 def retry_on_locked(
     write: Callable[[], _T],
     *,
@@ -120,8 +143,8 @@ def retry_on_locked(
     base_delay: float = _LOCK_RETRY_BASE_DELAY_S,
 ) -> _T:
     """Run *write* (a zero-arg callable performing one or more SQLite writes),
-    retrying with exponential backoff when SQLite raises ``database is
-    locked`` (#2538).
+    retrying with exponential backoff when SQLite raises lock/busy
+    contention (:func:`is_lock_contention_error`, #2538/#2597).
 
     That error is transient contention — a concurrent writer holding the DB
     at the exact moment this call tries to write, not a real failure — and a
@@ -135,7 +158,7 @@ def retry_on_locked(
     Any other ``OperationalError`` (schema drift, a malformed statement, …)
     is re-raised immediately without retrying — those are not transient, and
     retrying would only delay surfacing a real bug.  After *attempts*
-    consecutive ``database is locked`` collisions, re-raises the last
+    consecutive lock-contention collisions, re-raises the last
     ``sqlite3.OperationalError`` so the caller can decide how to degrade
     (see ``coord.state._record_dispatched_assignment_local``, whose caller —
     ``coord.auto_loop._dispatch_fix`` — treats it as a declined dispatch
@@ -146,7 +169,7 @@ def retry_on_locked(
         try:
             return write()
         except sqlite3.OperationalError as exc:
-            if "database is locked" not in str(exc).lower() or attempt >= attempts:
+            if not is_lock_contention_error(exc) or attempt >= attempts:
                 raise
             time.sleep(delay)
             delay *= 2

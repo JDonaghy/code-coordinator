@@ -4,6 +4,7 @@ coord/cli.py (#747)."""
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import click
 
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+from coord.db import is_lock_contention_error, retry_on_locked
 from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 
@@ -2273,11 +2275,17 @@ def merge(
                 # longer matches.  Dedup by (repo_github, branch) is
                 # preserved — refresh_entry_assignment is a no-op when the
                 # entry is already correctly keyed.
-                if mq.refresh_entry_assignment(
+                # #2597: wrapped in retry_on_locked — this is a real DB write
+                # (merge_queue.save_queue), and unlike the gh-round-trip
+                # failures this try/except otherwise isolates (#1353), a
+                # `database is locked` collision here is pure transient
+                # contention with a concurrent writer, not a reason to give
+                # up on this assignment.
+                if retry_on_locked(lambda: mq.refresh_entry_assignment(
                     a,
                     repo_github=repo_cfg.github,
                     target_branch=target_branch,
-                ):
+                )):
                     auto_enqueued.append(
                         f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
                         f"({a.branch} → {target_branch}){gate_note}"
@@ -2295,6 +2303,23 @@ def merge(
                         f"{target_branch}) — "
                         f"{mq.describe_merge_gate_failures(gate_failures)}"
                     )
+            except sqlite3.OperationalError as exc:
+                if is_lock_contention_error(exc):
+                    # #2597: `retry_on_locked` above already gave the write
+                    # several backed-off attempts — reaching here means the
+                    # DB is still locked after that budget, i.e. sustained
+                    # contention, not a momentary collision. Dropping a
+                    # mergeable assignment out of the scan on that basis is
+                    # the exact correctness bug #2597 reported (a skipped
+                    # entry here is silent — nothing re-scans it until the
+                    # next `coord merge` invocation). Fail the whole run
+                    # loudly instead of adding a line to the summary below.
+                    raise
+                auto_enqueued.append(
+                    f"  skipped: {a.repo_name} #{a.issue_number} "
+                    f"(assignment {a.assignment_id}) — auto-enqueue scan "
+                    f"failed, skipping this assignment: {exc!r}"
+                )
             except Exception as e:  # noqa: BLE001
                 auto_enqueued.append(
                     f"  skipped: {a.repo_name} #{a.issue_number} "
