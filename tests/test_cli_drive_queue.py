@@ -933,6 +933,48 @@ def test_blocked_row_purely_by_an_unsatisfiable_prereq_gets_the_2362_note(
     assert "re-checked against the merge gate automatically (#2230)" in block_1650
 
 
+def test_a_blocked_entry_resumes_and_launches_once_a_live_recheck_confirms_its_prereq_landed(
+    cli, seed, launches, monkeypatch,
+):
+    """#2602 tick-level regression: coord-portal#145/#149/#150's exact
+    incident shape (2026-08-22) — a pre-req's PR merged and its issue closed,
+    leaving it out of BOTH the `issues` and `assignments` tables faster than
+    anything re-synced the cached board, so `_resolve_prereqs` reads it as
+    "unknown issue" and blocks permanently. Before this fix that verdict
+    never healed; now a live `github_ops.work_is_terminal` re-check taken
+    THIS tick resumes the entry straight into a fresh launch — no operator
+    `remove` + `add`."""
+    # Deliberately no `issues` row and no `assignments` row for 1650 at all —
+    # the cached board has nothing to say about it, exactly the incident.
+    seed(issues={1654: "open"})
+    cli("add", REPO, "1654", "--after", "1650")
+    dep_reason = (
+        f"pre-req {REPO}#1650 is not queued, not merged and not open on the "
+        "board (unknown issue, or the board has not synced it — try "
+        "`coord sync`)"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 1654, state="blocked", last_reason=dep_reason, attempts=2,
+    )
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "work_is_terminal",
+        lambda repo_github, issue_number, branch, **_kw: (
+            repo_github == "john/claude-coordinator" and issue_number == 1650
+        ),
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1654)
+    assert entry["state"] == "running"  # resumed straight into a fresh launch
+    assert entry["attempts"] == 0
+    assert len(launches) == 1, launches
+
+
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
     """A `blocked` entry that never declared any `after=` at all keeps
     rendering exactly as it always has — no board dependency, no remedy
