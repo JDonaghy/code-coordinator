@@ -753,6 +753,22 @@ def test_an_unknown_prereq_is_unsatisfiable_and_does_not_consume_an_attempt():
     assert "ghost#99" in updates["last_reason"]
 
 
+def test_a_live_confirmed_terminal_prereq_satisfies_even_when_the_board_is_unknown():
+    """#2602 recovery half: the cached board has no row at all for the dep
+    (the exact "unknown issue" shape that used to permanently block, e.g. a
+    pre-req that just merged/closed faster than the periodic `/board` build
+    could catch up) — but this tick's live re-check
+    (`coord.commands.drive_queue._fetch_live_prereq_terminal`) confirms it
+    already landed. That must read as satisfied, not blocked."""
+    entries = [entry(1654, after=("ghost#99",))]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_prereq_terminal={"ghost#99": True}
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 1654
+    assert plan.blocked == ()
+
+
 def test_a_prereq_queued_but_blocked_is_unsatisfiable():
     entries = [
         entry(1650, position=0, state=STATE_BLOCKED),
@@ -3002,6 +3018,70 @@ def test_a_permanently_blocked_entry_is_not_resumed_even_once_its_after_lands():
     assert plan.launch is None
 
 
+# ── #2602 recovery half: a live re-check resumes the "unknown pre-req" ────
+# blocked shape too, not just "queued but blocked/failed" (#2362's original
+# scope). Before this, `pre-req is not queued, not merged and not open on
+# the board` was PERMANENT — the module docstring said so outright — and
+# claude-coordinator#2602 (coord-portal#145/#149/#150, 2026-08-22) is the
+# live incident: a pre-req that merged/closed left the queue faster than the
+# periodic `/board` build could catch up, and every entry chained `--after`
+# it sat `blocked` until an operator hand-removed and re-added them.
+
+
+def test_a_blocked_entry_resumes_once_a_live_recheck_confirms_its_unknown_prereq_landed():
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=(
+                f"pre-req {dep_key} is not queued, not merged and not open on "
+                "the board (unknown issue, or the board has not synced it — "
+                "try `coord sync`)"
+            ),
+        ),
+    ]
+    # The cached board still has NOTHING for the dep (exactly the incident
+    # shape) — only the live re-check confirms it landed.
+    plan = plan_tick(
+        entries, board(), capacity=1, live_prereq_terminal={dep_key: True}
+    )
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1654))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    assert plan.launch is not None and plan.launch.issue == 1654
+
+
+def test_a_blocked_entry_with_the_unknown_prereq_reason_stays_blocked_without_live_evidence():
+    """Same shape as above, but no live re-check ran this tick (or it ran and
+    came back inconclusive) — this must stay EXACTLY the pre-#2602 behaviour:
+    still blocked, no false resume from board facts alone."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=(
+                f"pre-req {dep_key} is not queued, not merged and not open on "
+                "the board (unknown issue, or the board has not synced it — "
+                "try `coord sync`)"
+            ),
+        ),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
 # ── #2404 review: a CHAINED (two-hop) after= block, not just single-hop ────
 #
 # The live incident this issue is about (claude-coordinator#2284-#2288) was
@@ -3112,11 +3192,19 @@ def test_a_two_hop_after_chain_leaf_is_not_resumed_until_its_own_pre_req_lands()
     assert all(r.key != entry_key(REPO, 1658) for r in plan.reconciles)
 
 
-def test_is_unsatisfiable_prereq_reason_recognises_only_the_exact_verdict_shape():
+def test_is_unsatisfiable_prereq_reason_recognises_only_the_exact_verdict_shapes():
     from coord.drive_queue import _is_unsatisfiable_prereq_reason
 
     assert _is_unsatisfiable_prereq_reason(
         "pre-req claude-coordinator#1650 is queued but blocked — it will never satisfy"
+    )
+    # #2602: the "unknown to the cached board" verdict is now ALSO recognised
+    # — `_reconcile_blocked_after`'s self-heal covers it too, given a live
+    # re-check.
+    assert _is_unsatisfiable_prereq_reason(
+        "pre-req claude-coordinator#1650 is not queued, not merged and not "
+        "open on the board (unknown issue, or the board has not synced it "
+        "— try `coord sync`)"
     )
     assert not _is_unsatisfiable_prereq_reason("dependency cycle: a -> b -> a")
     assert not _is_unsatisfiable_prereq_reason(

@@ -2865,6 +2865,92 @@ def _fetch_live_blocked_gate(
     return overrides
 
 
+def _fetch_live_prereq_terminal(
+    entries: list, board: Any, config_path: Path | None
+) -> dict[str, bool]:
+    """``{dep_key: True}`` for every ``after=`` pre-req the cached board
+    cannot yet confirm landed, re-checked LIVE against GitHub (#2602) — the
+    recovery-half counterpart of :func:`_fetch_live_ci_gate`/
+    :func:`_fetch_live_blocked_gate`: same bounded per-tick mechanism, a
+    different question.
+
+    THE GAP THIS CLOSES. ``coord.drive_queue._resolve_prereqs`` trusts
+    ``board.facts(dep).landed`` — a periodic ``/board`` build — before
+    anything else. When a pre-req has JUST left the queue (its PR merged, its
+    issue closed) and that cache hasn't caught up, ``_resolve_prereqs`` falls
+    through to its last branch and marks every dependent entry chained
+    ``--after`` it PERMANENTLY blocked — recoverable, before this, only by an
+    operator ``remove`` + ``add`` (claude-coordinator#2602,
+    coord-portal#145/#149/#150, 2026-08-22). This gives that branch one more
+    chance: a live, per-dep ``github_ops.work_is_terminal`` read (issue
+    closed OR PR merged) — the SAME positive-liveness test
+    ``coord.overlap_predict``'s ``terminal_checker`` already uses for the
+    sibling ``[branch]`` half of #2602 — taken THIS tick, before
+    ``_resolve_prereqs`` ever reaches that branch, and again later in the
+    same tick if the entry is instead already sitting ``blocked`` on that
+    exact verdict (``coord.drive_queue._reconcile_blocked_after``'s #2602
+    widening).
+
+    BOUNDED THE SAME WAY ITS SIBLINGS ARE. Only deps named by an entry
+    currently ``waiting`` or ``blocked`` with a non-empty ``after=``, and
+    only those the board does NOT already resolve on its own
+    (``facts.landed``, ``facts.open``, ``facts.active_work``, or a hit in
+    this tick's own pre-reconcile ``states`` — i.e. genuinely still queued)
+    make it into a live call. A queue with no unresolved ``after=`` edge
+    costs nothing here, same as ``_fetch_live_blocked_gate`` costs nothing
+    with no ``blocked`` rows. ``states`` is approximated from *entries*'
+    pre-tick ``state`` field (cheap, no I/O) rather than threaded from
+    ``plan_tick``'s own in-progress reconcile — a false negative here (a dep
+    this approximation still calls a live-check target, when the tick's own
+    authoritative ``states`` would already have resolved it another way)
+    costs one harmless extra ``gh`` read, never a wrong verdict:
+    ``_resolve_prereqs`` only ever consults this mapping in its OWN final
+    branch, after its own ``states``/``facts`` checks have already returned.
+    A false positive (a dep this skips that the tick's real walk would have
+    reached the final branch for) simply leaves that one dep to the
+    pre-#2602 fallback for this tick — caught on the next one.
+    """
+    states = {e.key: e.state for e in entries}
+    targets: set[str] = set()
+    for e in entries:
+        if e.state not in (STATE_WAITING, STATE_BLOCKED) or not e.after:
+            continue
+        for dep in e.after:
+            if dep in targets or states.get(dep) is not None:
+                continue
+            facts = board.facts(dep)
+            if facts.landed or facts.open or facts.active_work:
+                continue
+            targets.add(dep)
+    if not targets:
+        return {}
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        github_by_repo = {r.name: r.github for r in cfg.repos}
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return {}
+
+    out: dict[str, bool] = {}
+    for dep in targets:
+        parsed = parse_key(dep)
+        if parsed is None:
+            continue
+        repo_name, issue_number = parsed
+        repo_github = github_by_repo.get(repo_name)
+        if not repo_github:
+            continue
+        try:
+            if _gh_ops.work_is_terminal(repo_github, issue_number, ""):
+                out[dep] = True
+        except Exception:  # noqa: BLE001 — leave this one dep to the fallback
+            continue
+    return out
+
+
 def _fetch_merge_only_ready(
     entries: list,
     live_ci_gate: Mapping[str, bool],
@@ -3646,6 +3732,13 @@ def drive_queue_tick(
             entries, live_ci_gate, live_blocked_gate
         )
 
+        # #2602: a live re-check for every `after=` pre-req the cached board
+        # cannot yet confirm landed — see `_fetch_live_prereq_terminal`'s
+        # docstring for the gap this closes (a pre-req that merges/closes
+        # between `/board` builds used to permanently block every dependent
+        # chained `--after` it, recoverable only by a manual remove+add).
+        live_prereq_terminal = _fetch_live_prereq_terminal(entries, board, config_path)
+
         # #2101: release cordons. THIS is the hole the issue names — the
         # queue's launcher had zero pause awareness (`coord/drive.py` checks
         # pause only when routing a *worker*), so a cordoned host kept getting
@@ -3690,6 +3783,7 @@ def drive_queue_tick(
             editable_drift=editable_drift,
             merge_only_ready=merge_only_ready,
             roll_pending_reason=roll_pending.describe() if roll_pending is not None else "",
+            live_prereq_terminal=live_prereq_terminal,
         )
 
         if roll_pending is not None:
