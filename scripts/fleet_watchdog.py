@@ -42,6 +42,14 @@ its own precondition immediately before acting, so a condition that resolved
 itself between detection and repair is a no-op, not a mutation. Tier 2
 (:data:`TIER2_CHECKS`) only ever detects and reports — see the module
 docstring of each ``check_*`` function for why.
+
+**Known limitation: the checkout universe is hardcoded, not discovered.**
+Constraint 2 above forbids parsing ``coordinator.yml``, which is where real
+repo checkout paths live — so :func:`_candidate_git_locks` (the stale
+``.git/index.lock`` scan) only ever looks under ``~/src/*`` plus
+``~/.coord/worktrees/*``. A repo cloned somewhere else is invisible to that
+check. Acceptable given the constraint, but worth knowing rather than
+discovering by surprise.
 """
 
 from __future__ import annotations
@@ -153,6 +161,18 @@ def build_context(args: argparse.Namespace) -> WatchdogContext:
     return ctx
 
 
+def _cordon_active(expires_at: float, now: float) -> bool:
+    """Ported (not imported, per constraint 3) from
+    ``coord.release_cordon.Cordon.active`` — same formula, same "an
+    ``expires_at`` of 0 means no expiry, i.e. still active" contract.
+    Pulled out to its own function so a test can cross-check it against the
+    original directly, rather than only exercising it indirectly through
+    :func:`_read_cordon` — the split-brain risk CLAUDE.md's #2096 section
+    flags for every mirrored-not-imported piece of this module.
+    """
+    return not expires_at or now < expires_at
+
+
 def _read_cordon(ctx: WatchdogContext) -> tuple[bool, str]:
     """Is *this* machine under an active (non-expired) release cordon?
 
@@ -169,8 +189,7 @@ def _read_cordon(ctx: WatchdogContext) -> tuple[bool, str]:
     if not isinstance(entry, dict):
         return False, ""
     expires_at = entry.get("expires_at") or 0
-    active = not expires_at or ctx.now < expires_at
-    if not active:
+    if not _cordon_active(expires_at, ctx.now):
         return False, ""
     reason = entry.get("reason") or f"release cordon active ({entry.get('owner', 'release')})"
     return True, reason
@@ -345,6 +364,12 @@ def check_venv_rollback(ctx: WatchdogContext) -> list[Finding]:
     ``coord-venv-rollback.sh`` re-derives "is it actually still broken" and
     "is the sibling actually healthy" itself at repair time and refuses
     rather than guessing (#2580's explicit requirement for that script).
+
+    Accepted gap: a fully MISSING ``~/.coord-venv`` (as opposed to
+    present-but-broken) produces no finding here — the 2026-08-22 incident
+    this watchdog targets was an editable install pointing at a deleted
+    worktree, not an absent venv directory, and ``coord-venv-rollback.sh``
+    itself has nothing to roll back to without a live symlink to inspect.
     """
     venv = ctx.venv_dir
     if not venv.exists():
@@ -384,7 +409,16 @@ def _repair_venv_rollback(ctx: WatchdogContext) -> tuple[bool, str]:
 
 def check_local_bin_symlink(ctx: WatchdogContext) -> list[Finding]:
     """Tier 1 item 2: ``~/.local/bin/coord`` no longer a symlink into the
-    venv — #2314's exact damage."""
+    venv — #2314's exact damage.
+
+    Accepted gap, same root cause as :func:`check_venv_rollback`'s: when
+    ``~/.coord-venv`` itself is fully missing, ``venv_resolved`` is ``None``
+    and the "points outside the venv" branch below is skipped — so a
+    symlink that (correctly, at the time it was made) points into a venv
+    that has since vanished entirely reports nothing. Narrower than it
+    sounds: it only bites when the venv disappears out from under an
+    otherwise-correct symlink, not the editable-install case #2580 targets.
+    """
     target = ctx.local_bin_coord
     venv_resolved = ctx.venv_dir.resolve() if ctx.venv_dir.exists() else None
     broken_reason: str | None = None
@@ -537,6 +571,11 @@ def has_open_holder(lock_path: Path, *, proc_root: Path | None = None) -> bool |
 
 
 def _candidate_git_locks(ctx: WatchdogContext) -> list[Path]:
+    """Known limitation: hardcodes ``~/src/*`` + ``~/.coord/worktrees/*`` as
+    the checkout universe, since constraint 2 (module docstring) forbids
+    parsing ``coordinator.yml``, the actual source of truth for repo
+    checkout paths. A repo cloned somewhere else is invisible to this scan.
+    """
     candidates: list[Path] = []
     src_dir = ctx.home / "src"
     if src_dir.is_dir():
@@ -633,7 +672,7 @@ def check_expired_cordon(ctx: WatchdogContext) -> list[Finding]:
         if not isinstance(entry, dict):
             continue
         expires_at = entry.get("expires_at") or 0
-        if not expires_at or ctx.now < expires_at:
+        if _cordon_active(expires_at, ctx.now):
             continue  # no expiry, or not expired yet
         findings.append(
             Finding(
@@ -732,6 +771,7 @@ def check_orphaned_worktrees(ctx: WatchdogContext) -> list[Finding]:
                 signature=f"orphaned-worktree:{assignment_id}",
                 tier=1,
                 summary=f"{wt} has no live assignment or tmux session ({age:.0f}s old)",
+                suppress_keys=(assignment_id, f"orphaned-worktree:{assignment_id}"),
                 repair_fn=functools.partial(_repair_orphaned_worktree, wt=wt, assignment_id=assignment_id),
             )
         )
