@@ -6016,6 +6016,59 @@ def test_smaller_stall_never_produces_fewer_nudges(driver_factory):
     assert small >= large > 0, (small, large)
 
 
+def test_fingerprint_change_clears_the_published_stall_nudge(driver_factory, monkeypatch):
+    """#2648: once the board fingerprint moves on, a nudge published for the
+    stage that just finished must not go on convicting the NEXT stage's own
+    assignment of the same stall — the notifier's `nudged_at` is per-ISSUE,
+    not per-assignment, so a record left behind would re-fire
+    ``stall_nudged`` for every later leg of this same issue.
+
+    Spies on `_publish_stall_nudge`/`_clear_stall_nudge` directly (rather
+    than reading final store state) because a long enough run can
+    legitimately re-nudge the NEW fingerprint too — that's a fresh, correct
+    stall, not the bug — and because `_clear_stall_nudge` also fires
+    harmlessly on the very first tick (the initial "" fingerprint sentinel
+    "changing" to whatever the board actually says). What must hold is the
+    ORDER: the publish for the stalled stage is followed, later, by a
+    clear — proof the fingerprint-change branch that retracts it actually
+    ran after the nudge, not just once at start-up.
+    """
+    import coord.drive as drive_mod  # noqa: PLC0415
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        drive_mod, "_publish_stall_nudge",
+        lambda repo, issue, **kw: events.append(("publish", repo, issue)),
+    )
+    monkeypatch.setattr(
+        drive_mod, "_clear_stall_nudge",
+        lambda repo, issue: events.append(("clear", repo, issue)),
+    )
+
+    stalled = board(status="running")
+    advanced = board(status="running", test_state="passed")
+    driver = driver_factory(
+        # Long enough stalled to publish at least one nudge, then the
+        # fingerprint moves — held there for the rest of the run.
+        [stalled] * 6 + [advanced] * 20,
+        opts=DriveOptions(
+            machine="precision",
+            poll=1.0,
+            stall_mins=2.0 / 60.0,   # 2 "seconds" in the fake clock's units
+            deadline_mins=6.0 / 60.0,
+            notify=False,
+        ),
+    )
+
+    assert driver.run() == EXIT_DEADLINE
+    assert ("publish", REPO, ISSUE) in events, events
+    first_publish = events.index(("publish", REPO, ISSUE))
+    # A clear for the SAME repo#issue must appear strictly after that
+    # publish — the fingerprint-change branch retracting it once the
+    # pipeline actually advances past the stalled stage.
+    assert ("clear", REPO, ISSUE) in events[first_publish + 1:], events
+
+
 def test_the_config_path_is_threaded_onto_every_coord_subprocess(driver_factory):
     """A `coord drive --config X` run must not dispatch against a different
     config than it reads. The bash driver ran a bare `coord` and had this gap."""

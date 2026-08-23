@@ -52,6 +52,54 @@ def test_record_nudge_swallows_a_broken_store(monkeypatch):
     assert store_mod.record_nudge("coord", 42, at=1.0) is False
 
 
+# ── clearing a stale nudge on pipeline advance (#2648) ────────────────────
+
+
+def test_drive_clears_its_stall_nudge_on_fingerprint_change():
+    """The other half of the seam: `_clear_stall_nudge` is what `_loop`
+    calls the moment the board fingerprint changes, so a nudge published for
+    the stage that just finished cannot go on convicting the NEXT stage's
+    own assignment of the same stall."""
+    from coord.drive import _clear_stall_nudge, _publish_stall_nudge  # noqa: PLC0415
+
+    _publish_stall_nudge("coord", 42, stalled_for=1500.0)
+    assert store.nudge_for(store.load_state(), "coord", 42) is not None
+
+    _clear_stall_nudge("coord", 42)
+    assert store.nudge_for(store.load_state(), "coord", 42) is None
+
+
+def test_clearing_a_nudge_never_raises(monkeypatch):
+    from coord.drive import _clear_stall_nudge  # noqa: PLC0415
+    from coord.notifier import store as store_mod
+
+    monkeypatch.setattr(
+        store_mod, "load_state", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    # Must be a no-op, not an exception into the drive loop.
+    _clear_stall_nudge("coord", 42)
+
+
+def test_clear_nudge_is_a_noop_when_nothing_was_recorded():
+    """No prior nudge for this issue: clearing must still report success,
+    not treat "nothing to clear" as a failure — callers call this
+    unconditionally on every fingerprint change."""
+    assert store.nudge_for(store.load_state(), "coord", 999) is None
+    assert store.clear_nudge("coord", 999) is True
+
+
+def test_clear_nudge_leaves_other_issues_alone():
+    """A nudge keyed per-issue (`repo#issue`) — clearing one must not touch
+    a sibling issue's own in-flight stall record."""
+    store.record_nudge("coord", 42, at=100.0)
+    store.record_nudge("coord", 43, at=100.0)
+
+    assert store.clear_nudge("coord", 42) is True
+
+    assert store.nudge_for(store.load_state(), "coord", 42) is None
+    assert store.nudge_for(store.load_state(), "coord", 43) is not None
+
+
 def test_stale_nudges_are_pruned():
     """A day-old nudge must not make a freshly-dispatched assignment on the
     same issue look pre-stalled."""

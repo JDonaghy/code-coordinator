@@ -3888,11 +3888,39 @@ def _publish_stall_nudge(repo: str, issue: int, *, stalled_for: float) -> None:
     decision, never a second author of it. Import is function-local and the
     whole call is swallowed on failure so a missing/renamed notifier cannot
     perturb the drive loop.
+
+    Published unconditionally, regardless of ``--notify`` — that flag only
+    governs whether THIS process also shells out to `coord notify` itself
+    (see ``run_notify``); the record below is what the 5-min
+    ``coord-notify.timer`` (which runs `coord notify` on its own cadence
+    either way) reads to know a stage was nudged at all. A drive run with
+    ``--notify`` off still needs the notifier to see its stalls.
     """
     try:
         from coord.notifier.store import record_nudge  # noqa: PLC0415
 
         record_nudge(repo, issue, at=time.time(), stalled_for=stalled_for)
+    except Exception:  # noqa: BLE001 — advisory channel, never breaks a drive
+        pass
+
+
+def _clear_stall_nudge(repo: str, issue: int) -> None:
+    """Retract a previously published stall nudge (#2648).
+
+    Called from `_loop` the moment the board fingerprint changes — the
+    pipeline advancing past the stage `_publish_stall_nudge` recorded is
+    proof that record no longer describes reality. Without this,
+    `nudged_at` is per-ISSUE and outlives the assignment that earned it, so
+    every later leg of the same issue re-reads the one stale record and the
+    notifier's stall-survived-its-nudge condition fires again on each new
+    leg's own subject, for as long as the record's TTL allows. Advisory and
+    swallowed exactly like the publish half — a missing/renamed notifier
+    must not perturb the drive loop.
+    """
+    try:
+        from coord.notifier.store import clear_nudge  # noqa: PLC0415
+
+        clear_nudge(repo, issue)
     except Exception:  # noqa: BLE001 — advisory channel, never breaks a drive
         pass
 
@@ -4320,11 +4348,12 @@ class Driver:
             "(pipeline.max_review_iterations — per issue, across every drive)"
         )
         self.log(
-            "  notify nudge   : "
+            "  notify shellout: "
             + (
-                "on"
+                "on (this drive also calls `coord notify` on a stall)"
                 if self.opts.notify
-                else "off (relying on the 5-min coord-notify.timer)"
+                else "off (relying on the 5-min coord-notify.timer; stall "
+                "state is still recorded for it either way)"
             )
         )
         self.log(f"  log            : {self._run_log}")
@@ -4392,6 +4421,13 @@ class Driver:
                 last_fingerprint = fingerprint
                 last_change = now
                 last_nudge = None
+                # #2648: the pipeline just advanced, so any nudge published
+                # for the PREVIOUS state is stale — retract it so a later
+                # leg's own notifier probe (a new assignment, a new ledger
+                # subject) does not inherit an alarm that belongs to a stage
+                # which already finished. A no-op if nothing was ever
+                # nudged; advisory either way.
+                _clear_stall_nudge(self.repo, self.issue)
                 self.log(
                     f"state: work={state.work_status or '-'} "
                     f"test={state.work_test_state or '-'} "
