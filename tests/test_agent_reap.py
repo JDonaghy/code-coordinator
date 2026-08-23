@@ -14,13 +14,19 @@ from pathlib import Path
 from typing import Callable, List, Tuple
 
 from coord.agent import (
+    HOST_SLEEP_EXIT,
     NO_FIRST_OUTPUT_EXIT,
+    RUNTIME_CEILING_EXIT,
     _log_has_output,
     _log_has_result,
     _maybe_bash_wrap,
     _wait_for_proc_or_result,
     _PTY_RESULT_LINE_MARKER,
     _RESULT_LINE_MARKER,
+    format_host_sleep_reason,
+    format_runtime_ceiling_reason,
+    is_host_sleep_reason,
+    is_runtime_ceiling_reason,
 )
 
 
@@ -200,6 +206,26 @@ def _make_killpg_recorder() -> Tuple[Callable[[int, int], None], List[Tuple[int,
 def _fake_clock() -> Callable[[], float]:
     """A controllable clock — call returned ticker to advance time."""
     state = {"t": 0.0}
+
+    def now() -> float:
+        return state["t"]
+
+    def advance(delta: float) -> None:
+        state["t"] += delta
+
+    now.advance = advance  # type: ignore[attr-defined]
+    return now
+
+
+def _fake_wall_clock() -> Callable[[], float]:
+    """A second, independently-advanceable ticker modelling `time.time()`.
+
+    Kept separate from `_fake_clock` (monotonic) so tests can make the two
+    diverge — that divergence is the entire signal the #2638 host-sleep
+    detector looks for. Starts at an arbitrary epoch-ish value purely so
+    assertion output never looks like a bare small int.
+    """
+    state = {"t": 1_700_000_000.0}
 
     def now() -> float:
         return state["t"]
@@ -472,6 +498,255 @@ def test_watchdog_disabled_when_timeout_zero(tmp_path: Path) -> None:
     )
     assert code == 7  # proc's own exit code — watchdog never intervened
     assert calls == []
+
+
+def test_ttft_watchdog_unaffected_by_the_new_wall_clock_params(tmp_path: Path) -> None:
+    """#2638 regression: the wall-clock ceiling and host-sleep checks now run
+    on every poll too, but they must not change the TTFT watchdog's existing
+    behaviour — a rate-limited-but-emitting worker is still never killed by
+    it (#299), even with both new checks fully armed and driven by clocks
+    that never diverge (a normal, awake box)."""
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=5, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        mono.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=2.0,
+        runtime_ceiling_s=10_000.0,
+        sleep_divergence_s=60.0,
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,  # emits output from the very first poll
+        clock=mono,
+        wall_clock=wall,
+    )
+    assert code == 0  # clean exit — nothing killed it
+    assert calls == []
+
+
+# ── wall-clock runtime ceiling + host-sleep detection (#2638) ───────────────
+
+def test_runtime_ceiling_kills_a_leg_that_outlives_it(tmp_path: Path) -> None:
+    """A leg whose wall-clock runtime exceeds the ceiling is killed and
+    returns RUNTIME_CEILING_EXIT, stamped with a distinguishing log line —
+    even though nothing else (TTFT, result, max_wait) ever fires. A leg
+    under the ceiling is left alone (see
+    `test_runtime_ceiling_disabled_behaves_as_pre_2638` for the no-kill
+    shape with the ceiling off; here the proc simply never gets the chance
+    to run long enough for the *disabled* case, so it is asserted directly
+    by the wall-clock elapsed check below instead)."""
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        # A genuinely long-running, AWAKE leg: monotonic and wall-clock
+        # advance together, at the same rate.
+        mono.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=10_000.0,
+        runtime_ceiling_s=3.0,  # → 4th poll (elapsed=4.0) trips the ceiling
+        sleep_divergence_s=60.0,
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,
+        clock=mono,
+        wall_clock=wall,
+    )
+    assert code == RUNTIME_CEILING_EXIT
+    assert calls == [(proc.pid, signal.SIGKILL)]
+    text = Path(log_path).read_text()
+    assert "runtime ceiling" in text
+
+
+def test_runtime_ceiling_measured_on_wall_clock_not_monotonic(tmp_path: Path) -> None:
+    """#2638: the ceiling MUST be measured on wall-clock elapsed, not
+    monotonic elapsed. A leg whose monotonic clock barely advances (the
+    signature of a host that suspended and froze `CLOCK_MONOTONIC`) but
+    whose wall clock keeps ticking normally still gets killed.
+
+    A test that only advanced a fake monotonic clock would pass against a
+    buggy monotonic-only implementation — this is the assertion that
+    matters: monotonic elapsed stays under a second the whole test, while
+    wall-clock elapsed alone crosses the ceiling.
+    """
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        # Monotonic virtually frozen (well under the sleep-divergence
+        # threshold each poll); wall clock advances a full poll_interval,
+        # same as it would on an awake, running box.
+        mono.advance(0.001)  # type: ignore[attr-defined]
+        wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=10_000.0,
+        runtime_ceiling_s=5.0,  # → 6th poll (wall elapsed=6.0) trips it
+        sleep_divergence_s=60.0,  # a ~1s/poll gap must NOT read as a sleep
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,
+        clock=mono,
+        wall_clock=wall,
+    )
+    assert code == RUNTIME_CEILING_EXIT
+    assert calls == [(proc.pid, signal.SIGKILL)]
+    assert mono() < 1.0  # monotonic elapsed stayed tiny the whole time
+
+
+def test_host_sleep_detected_via_wall_monotonic_divergence(tmp_path: Path) -> None:
+    """#2638: a suspend/resume between two polls — monotonic freezes
+    (mirrors `CLOCK_MONOTONIC` not advancing across s2idle) while the wall
+    clock jumps forward by the whole suspend duration. Detected immediately,
+    distinctly from (and well before) the runtime ceiling, which is set
+    generously high here and never reached — this incident's own 10.5h
+    suspend duration is used verbatim.
+    """
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+    state = {"calls": 0}
+
+    def wait_advances(timeout: float | None = None) -> int:
+        state["calls"] += 1
+        mono.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        if state["calls"] == 2:
+            # The host suspends for ten and a half hours between polls.
+            wall.advance(10.5 * 3600.0)  # type: ignore[attr-defined]
+        else:
+            wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=10_000.0,
+        runtime_ceiling_s=6 * 3600.0,  # generous — must NOT be what fires
+        sleep_divergence_s=60.0,
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,
+        clock=mono,
+        wall_clock=wall,
+    )
+    assert code == HOST_SLEEP_EXIT
+    assert calls == [(proc.pid, signal.SIGKILL)]
+    text = Path(log_path).read_text()
+    assert "host sleep detected" in text
+
+
+def test_runtime_ceiling_disabled_behaves_as_pre_2638(tmp_path: Path) -> None:
+    """runtime_ceiling_s=None disables the wall-clock ceiling entirely — a
+    leg with no ceiling configured behaves exactly as it did before #2638:
+    the proc simply runs to its own natural exit, untouched by this
+    watchdog (only the pre-existing TTFT/max_wait/result-based checks would
+    still apply, and none of them fire here either)."""
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=5, exit_after_kill=True, exit_code=3)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        mono.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=10_000.0,
+        runtime_ceiling_s=None,  # disabled
+        sleep_divergence_s=60.0,
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,
+        clock=mono,
+        wall_clock=wall,
+    )
+    assert code == 3  # proc's own exit code — the ceiling never intervened
+    assert calls == []
+
+
+def test_runtime_ceiling_reason_round_trips_and_does_not_match_other_failures() -> None:
+    reason = format_runtime_ceiling_reason(6.5 * 3600.0, 6.0 * 3600.0)
+    assert is_runtime_ceiling_reason(reason)
+    assert "runtime ceiling" in reason
+    assert not is_runtime_ceiling_reason("spend ceiling — $12.41 of $8.00")
+    assert not is_runtime_ceiling_reason("usage limit — resets 8:30pm")
+    assert not is_runtime_ceiling_reason(None)
+    assert not is_runtime_ceiling_reason("")
+
+
+def test_host_sleep_reason_round_trips_and_does_not_match_other_failures() -> None:
+    reason = format_host_sleep_reason(37_800.0, 5.0)
+    assert is_host_sleep_reason(reason)
+    assert "host sleep detected" in reason
+    assert not is_host_sleep_reason(
+        format_runtime_ceiling_reason(6.5 * 3600.0, 6.0 * 3600.0)
+    )
+    assert not is_host_sleep_reason(None)
+    assert not is_host_sleep_reason("")
 
 
 # ── _maybe_bash_wrap ─────────────────────────────────────────────────────────

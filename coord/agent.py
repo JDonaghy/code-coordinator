@@ -354,6 +354,99 @@ NO_FIRST_OUTPUT_EXIT = 124       # exit code reported when the TTFT watchdog fir
 # which diagnostic gets attached.
 SPEND_CEILING_EXIT = 125
 
+# #2638: a suspended worker (`systemctl suspend`, a laptop lid closed, a VM
+# the hypervisor pauses) held its assignment `running` for 10.5h with nothing
+# in the fleet noticing — the only watchdogs above are TTFT (disarms
+# permanently on first output) and the per-leg spend ceiling (opt-in, and
+# only ever armed for headless legs the coordinator gave a `cost_ceiling_usd`
+# to). Neither measures *how long the leg has been alive*. Two independent
+# nets close that gap, both driven off `wall_clock` (`time.time()` by
+# default) rather than `clock` (`time.monotonic()`): Linux's
+# `CLOCK_MONOTONIC` does not advance across a suspend (s2idle), so a
+# monotonic-only ceiling silently fails to fire for exactly the case it
+# exists to catch — this incident's own worker-side `timeout 590` wrapper
+# proved it, firing 28s *after* the wake, having counted only awake seconds.
+#
+# 1. **Wall-clock runtime ceiling** (`RUNTIME_CEILING_EXIT`): a generous
+#    (hours, not minutes) cap on total wall-clock runtime, exactly as
+#    "the worker has been running way too long" reads to an operator —
+#    genuinely long legs are common, so this is a last-resort net, not a
+#    scheduler.
+# 2. **Host-sleep detection** (`HOST_SLEEP_EXIT`): a suspend produces an
+#    unambiguous signature — wall-clock elapsed diverges sharply from
+#    monotonic elapsed over the SAME poll interval, because monotonic time
+#    only advances while the host is actually running. This fires almost
+#    immediately on wake, well before any runtime ceiling would, and is
+#    stamped with its own reason: a leg that slept through a 10-hour
+#    suspend is not a result anyone should trust resumed, whatever it
+#    does next.
+#
+# Distinct exit codes (must not collide with NO_FIRST_OUTPUT_EXIT/
+# SPEND_CEILING_EXIT or any plausible worker exit code) so `_reap` can key
+# its own distinguishing `failure_reason` off each, the same way it already
+# does for `SPEND_CEILING_EXIT` — see `RUNTIME_CEILING_REASON_PREFIX`/
+# `HOST_SLEEP_REASON_PREFIX` below.
+RUNTIME_CEILING_EXIT = 126
+HOST_SLEEP_EXIT = 127
+
+# Generous default: some legs legitimately run for hours. `None`/`<= 0`
+# disables the ceiling entirely — a leg with no ceiling configured (either
+# because the coordinator resolved `AssignmentSpec.runtime_ceiling_s` to a
+# non-positive value, or because a caller of `_wait_for_proc_or_result`
+# passes `runtime_ceiling_s=None` directly) behaves exactly as it did before
+# #2638.
+_DEFAULT_RUNTIME_CEILING_S = 6.0 * 60.0 * 60.0  # 6 hours
+
+# Minimum wall-vs-monotonic divergence measured over a SINGLE poll interval
+# that is unambiguously a host suspend rather than ordinary thread-scheduling
+# jitter, a GC pause, or a loaded box briefly starving this thread. Comfortably
+# larger than `_REAP_POLL_INTERVAL` so an awake-but-slow poll loop can never
+# false-positive; tailscaled's own "time jump detected" log line (this
+# incident's actual wake signal) is the identical wall-vs-monotonic
+# comparison.
+_HOST_SLEEP_DIVERGENCE_S = 60.0
+
+# #2638: stable, greppable `failure_reason` prefixes — mirror
+# `coord.spend_ceiling.SPEND_CEILING_REASON_PREFIX`'s contract exactly. This
+# is the ONLY thing that lets `coord retry`, the auto-reassign skip, and
+# `coord status`/`coord health` tell a runtime-ceiling or host-sleep kill
+# apart from an ordinary crash. NEVER change these strings without updating
+# every `is_runtime_ceiling_reason`/`is_host_sleep_reason` caller.
+RUNTIME_CEILING_REASON_PREFIX = "runtime ceiling — "
+HOST_SLEEP_REASON_PREFIX = "host sleep detected — "
+
+
+def format_runtime_ceiling_reason(wall_elapsed_s: float, ceiling_s: float) -> str:
+    """Render the one-liner stamped onto `failure_reason` for a runtime-
+    ceiling kill. Example: ``"runtime ceiling — ran 6.02h, past the 6.00h
+    ceiling (#2638)"``."""
+    return (
+        f"{RUNTIME_CEILING_REASON_PREFIX}ran {wall_elapsed_s / 3600.0:.2f}h, "
+        f"past the {ceiling_s / 3600.0:.2f}h ceiling (#2638)"
+    )
+
+
+def is_runtime_ceiling_reason(reason: str | None) -> bool:
+    """True iff *reason* is a `failure_reason` stamped by the runtime ceiling."""
+    return bool(reason) and reason.startswith(RUNTIME_CEILING_REASON_PREFIX)
+
+
+def format_host_sleep_reason(wall_delta_s: float, mono_delta_s: float) -> str:
+    """Render the one-liner stamped onto `failure_reason` for a host-sleep
+    kill. Example: ``"host sleep detected — wall clock advanced 37800s while
+    only 5s of monotonic time elapsed; the host likely suspended mid-leg
+    (#2638)"``."""
+    return (
+        f"{HOST_SLEEP_REASON_PREFIX}wall clock advanced {wall_delta_s:.0f}s "
+        f"while only {mono_delta_s:.0f}s of monotonic time elapsed; the host "
+        "likely suspended mid-leg (#2638)"
+    )
+
+
+def is_host_sleep_reason(reason: str | None) -> bool:
+    """True iff *reason* is a `failure_reason` stamped by host-sleep detection."""
+    return bool(reason) and reason.startswith(HOST_SLEEP_REASON_PREFIX)
+
 
 def _append_log_line(log_path: str, line: str) -> None:
     """Best-effort append of a single line to the assignment log. Never raises."""
@@ -465,10 +558,13 @@ def _wait_for_proc_or_result(
     first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
     cost_ceiling_usd: float | None = None,
     read_cost_usd: "Callable[[], float | None] | None" = None,
+    runtime_ceiling_s: float | None = _DEFAULT_RUNTIME_CEILING_S,
+    sleep_divergence_s: float = _HOST_SLEEP_DIVERGENCE_S,
     killpg: Callable[[int, int], None] = _killpg_safe,
     log_has_result: Callable[[str], bool] = _log_has_result,
     log_has_output: Callable[[str], bool] = _log_has_output,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
 ) -> int:
     """Wait for `proc` to exit; force-kill its process group if it hangs after
     the worker emitted its final result event.
@@ -508,10 +604,36 @@ def _wait_for_proc_or_result(
       the worker committed is still on disk, and ``_reap``'s existing
       safety-net push still runs afterwards.
 
+    Wall-clock runtime ceiling + host-sleep detection (#2638): two more
+    watchdogs, both driven off ``wall_clock`` (real time, default
+    ``time.time``) rather than ``clock`` (monotonic, default
+    ``time.monotonic``) — a suspended host freezes ``CLOCK_MONOTONIC`` but
+    not the wall clock, so a monotonic-only ceiling never fires for exactly
+    the case it exists to catch.
+
+    * If ``runtime_ceiling_s`` is a positive number, the process group is
+      killed and :data:`RUNTIME_CEILING_EXIT` returned once wall-clock
+      elapsed since this call started reaches it. Generous default (hours);
+      ``None``/``<= 0`` disables it — a leg with no ceiling configured
+      behaves exactly as it did pre-#2638.
+    * On every poll, this poll interval's wall-clock delta is compared to its
+      monotonic delta. A real, running process advances both at the same
+      rate, so the two track each other tightly; only a suspend/resume
+      produces a gap this large over one interval (the same signal
+      tailscaled's own "time jump detected" line reports). When the
+      divergence reaches ``sleep_divergence_s`` the process group is killed
+      and :data:`HOST_SLEEP_EXIT` returned — independent of, and typically
+      well before, the runtime ceiling above: a leg that slept through a
+      multi-hour suspend should never be trusted to resume cleanly, whatever
+      its eventual wall-clock age would have been.
+
     The keyword-only parameters exist for tests to inject short timeouts and
-    mock kill/clock/cost behavior.
+    mock kill/clock/cost/wall-clock behavior.
     """
     start = clock()
+    wall_start = wall_clock()
+    last_mono = start
+    last_wall = wall_start
     result_seen_at: float | None = None
     output_seen = False
     cost_warned = False
@@ -530,7 +652,34 @@ def _wait_for_proc_or_result(
         except subprocess.TimeoutExpired:
             pass
 
-        elapsed = clock() - start
+        now_mono = clock()
+        now_wall = wall_clock()
+        elapsed = now_mono - start
+
+        # #2638: host-sleep detection — compare THIS poll interval's
+        # monotonic delta to its wall-clock delta, not the cumulative
+        # elapsed-since-start (a long-but-genuinely-running leg has both
+        # deltas large and roughly equal the whole way through; only a
+        # suspend produces a one-interval gap this size). Checked before
+        # every other watchdog: it is the more specific diagnosis, and
+        # explains why a leg might otherwise look TTFT-silent or ceiling-
+        # breached.
+        mono_delta = now_mono - last_mono
+        wall_delta = now_wall - last_wall
+        last_mono, last_wall = now_mono, now_wall
+        if wall_delta - mono_delta >= sleep_divergence_s:
+            _append_log_line(
+                log_path,
+                "# reap: SIGKILL — host sleep detected (wall clock advanced "
+                f"{wall_delta:.0f}s vs {mono_delta:.0f}s monotonic over one "
+                "poll interval) (#2638)\n",
+            )
+            killpg(proc.pid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return HOST_SLEEP_EXIT
 
         # First-output / TTFT watchdog: catch a worker that emits zero bytes.
         # Once any output is seen the watchdog is satisfied forever (never
@@ -558,6 +707,30 @@ def _wait_for_proc_or_result(
                 log_path,
                 "# reap: worker emitted result; awaiting clean exit\n",
             )
+
+        # #2638: wall-clock runtime ceiling — measured from `wall_start`, NOT
+        # from the monotonic `start` above, so a suspend that stalls
+        # monotonic time cannot silently hold this open forever. Gated on
+        # `result_seen_at is None` for the identical reason #2131's spend
+        # ceiling is: once the worker has logically finished, the grace-
+        # period teardown below owns the outcome — killing here instead
+        # would mislabel a completed leg as a ceiling kill merely because
+        # its teardown straddled the ceiling.
+        if runtime_ceiling_s and runtime_ceiling_s > 0 and result_seen_at is None:
+            wall_elapsed = now_wall - wall_start
+            if wall_elapsed >= runtime_ceiling_s:
+                _append_log_line(
+                    log_path,
+                    "# reap: SIGKILL — wall-clock runtime ceiling breached "
+                    f"({wall_elapsed:.0f}s of {runtime_ceiling_s:.0f}s) "
+                    "(#2638)\n",
+                )
+                killpg(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return RUNTIME_CEILING_EXIT
 
         # #2131: per-leg spend ceiling. Only while the leg is still running
         # (see the docstring for why a post-`result` kill is never useful),
@@ -727,6 +900,16 @@ class AssignmentSpec:
     # labels (or dispatched by a caller that never populated
     # `Proposal.issue_labels`) behaves exactly as before this field existed.
     issue_labels: list[str] = field(default_factory=list)
+    # #2638: per-assignment override of the wall-clock runtime ceiling (see
+    # `_DEFAULT_RUNTIME_CEILING_S`). `None` (the default) means "use this
+    # agent's own configured default" — unlike `cost_ceiling_usd`, that
+    # default is generous-but-ON by default (mirrors the TTFT watchdog's
+    # always-on `first_output_timeout`, not the opt-in spend ceiling), so an
+    # agent predating this field is not silently uncapped; only an explicit
+    # non-positive value here disables the ceiling for THIS leg.  Carried on
+    # the wire the same way `cost_ceiling_usd` is, for the same config-free-
+    # agent reason (docs/EPHEMERAL_WORKERS.md).
+    runtime_ceiling_s: float | None = None
 
 
 class _GitError(RuntimeError):
@@ -3201,6 +3384,40 @@ class AgentAssignment:
     # ceiling kill is indistinguishable from a crash and the money is spent
     # again on the next pass.
     spend_ceiling_reason: str | None = None
+    # #2638: set when the reap's watchdog killed this leg because its
+    # WALL-CLOCK runtime crossed the resolved runtime ceiling (either
+    # `spec.runtime_ceiling_s` or, absent that, this agent's own configured
+    # default — see `_DEFAULT_RUNTIME_CEILING_S`). Formatted with
+    # `format_runtime_ceiling_reason` (stable "runtime ceiling — " prefix,
+    # recognised by `is_runtime_ceiling_reason`). Only ever set alongside
+    # `status == FAILED` (the kill returns the non-zero
+    # `RUNTIME_CEILING_EXIT`), and `None` on every other outcome — including
+    # a leg that ran long but finished before the ceiling (nothing here) and
+    # one killed instead by host-sleep detection (`host_sleep_reason` below;
+    # mutually exclusive with this field by construction — see
+    # `_wait_for_proc_or_result`).
+    #
+    # Distinguishable-from-a-crash is the whole point, same as #2131's
+    # `spend_ceiling_reason`: without it a suspended-host kill reads exactly
+    # like a generic FAILED, `coord retry` cheerfully re-spends the same
+    # multi-hour timeout, and nothing tells the operator the leg simply ran
+    # too long rather than crashing on a real defect.
+    runtime_ceiling_reason: str | None = None
+    # #2638: set when the reap's watchdog detected the host suspending mid-
+    # leg — wall-clock elapsed diverged sharply from monotonic elapsed over
+    # one poll interval, a signature only a suspend/resume produces (see
+    # `_wait_for_proc_or_result`'s host-sleep check). Formatted with
+    # `format_host_sleep_reason` (stable "host sleep detected — " prefix,
+    # recognised by `is_host_sleep_reason`). Only ever set alongside `status
+    # == FAILED` (the kill returns the non-zero `HOST_SLEEP_EXIT`), and
+    # `None` on every other outcome.
+    #
+    # This is the #2638 incident's actual root cause made visible: a leg
+    # that slept through a multi-hour suspend is not a result anyone should
+    # trust resumed — `coord status`/`coord health` should say so instead of
+    # rendering it identically to healthy work, which is exactly what let a
+    # suspended worker hold its assignment `running` for 10.5h unnoticed.
+    host_sleep_reason: str | None = None
     # #2188: True when `_reap` classified a clean (exit_code==0), 0-commit
     # exit as a DELIVERABLE — the issue was labelled
     # `coord.models.DELIVERABLE_ANALYSIS_LABEL` (`spec.issue_labels`) — rather
@@ -4681,6 +4898,13 @@ class AgentServer:
         # already bound the socket by the time any reload could run).
         bash_wrap_spawn: bool = True,
         first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
+        # #2638: wall-clock (NOT monotonic) ceiling on how long a single
+        # leg's process may run — see `_DEFAULT_RUNTIME_CEILING_S`. Same
+        # RESTART-ONLY tuning class as the two above: `_spawn`'s reap thread
+        # reads it once per leg via `self.runtime_ceiling_s`.
+        # `None`/`<= 0` disables it fleet-wide (pre-#2638 behaviour); a
+        # per-assignment `AssignmentSpec.runtime_ceiling_s` overrides it.
+        runtime_ceiling_s: float | None = _DEFAULT_RUNTIME_CEILING_S,
         # #305: per-repo artifact glob patterns; repo_name → list of globs.
         # Populated from coordinator.yml Repo.artifact_paths at startup.
         artifact_paths: dict[str, list[str]] | None = None,
@@ -4743,6 +4967,7 @@ class AgentServer:
         # watchdog kills workers that emit zero output within the timeout.
         self.bash_wrap_spawn = bash_wrap_spawn
         self.first_output_timeout = first_output_timeout
+        self.runtime_ceiling_s = runtime_ceiling_s
         # #425: optional provider registry (see constructor docstring).
         # Typed as ``dict[str, object]`` to avoid an import cycle with
         # :mod:`coord.providers` at module load time — concrete instances
@@ -8575,6 +8800,20 @@ class AgentServer:
                     _cost_ceiling = None
                     _cost_meter = None
 
+        # #2638: resolve the wall-clock runtime ceiling for this leg —
+        # `AssignmentSpec.runtime_ceiling_s` (an explicit per-assignment
+        # override; a non-positive value there disables the ceiling for
+        # THIS leg only) wins over this agent's own configured default
+        # (`self.runtime_ceiling_s`, generous-but-on unless the operator set
+        # it to 0/None).
+        _runtime_ceiling: float | None = self.runtime_ceiling_s
+        if _reap_start is not None:
+            _raw_runtime_ceiling = getattr(_reap_start.spec, "runtime_ceiling_s", None)
+            if isinstance(_raw_runtime_ceiling, (int, float)):
+                _runtime_ceiling = (
+                    float(_raw_runtime_ceiling) if _raw_runtime_ceiling > 0 else None
+                )
+
         # Use a polling wait that handles claude-cli's well-known habit of
         # not exiting after emitting its final result event (a child of the
         # process group keeps the session alive). See #228.
@@ -8584,6 +8823,7 @@ class AgentServer:
             log_has_result=_log_has_result_fn,
             cost_ceiling_usd=_cost_ceiling,
             read_cost_usd=_cost_meter.read if _cost_meter is not None else None,
+            runtime_ceiling_s=_runtime_ceiling,
         )
         log_fh.close()
 
@@ -8606,6 +8846,62 @@ class AgentServer:
                 )
             except Exception:  # noqa: BLE001 — best-effort, never break reap
                 _spend_ceiling_reason = None
+
+        # #2638: same stable-diagnostic treatment for a wall-clock runtime-
+        # ceiling kill. `assignment.started_at` (stamped at spawn time with
+        # `time.time()` — real wall clock) lets this report the actual
+        # overshoot rather than just repeating the ceiling value.
+        _runtime_ceiling_reason: str | None = None
+        if exit_code == RUNTIME_CEILING_EXIT:
+            try:
+                _ceiling_for_reason = (
+                    _runtime_ceiling
+                    if _runtime_ceiling is not None
+                    else _DEFAULT_RUNTIME_CEILING_S
+                )
+                _wall_elapsed_for_reason = _ceiling_for_reason
+                if _reap_start is not None and _reap_start.started_at is not None:
+                    _wall_elapsed_for_reason = max(
+                        _ceiling_for_reason, time.time() - _reap_start.started_at
+                    )
+                _runtime_ceiling_reason = format_runtime_ceiling_reason(
+                    _wall_elapsed_for_reason, _ceiling_for_reason
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                _runtime_ceiling_reason = None
+
+        # #2638: host-sleep detection has no single "ceiling" value to
+        # report against — the diagnostic IS the divergence itself. The wait
+        # loop already wrote the exact wall/monotonic deltas it killed on
+        # into the worker's own log; re-read them here rather than re-derive
+        # (nothing else in `_reap`'s scope has them). Best-effort: if the
+        # line can't be found/parsed for any reason, fall back to the
+        # threshold itself — still distinguishable from a generic crash,
+        # only less precise.
+        _host_sleep_reason: str | None = None
+        if exit_code == HOST_SLEEP_EXIT:
+            _wall_delta_for_reason = _HOST_SLEEP_DIVERGENCE_S
+            _mono_delta_for_reason = 0.0
+            try:
+                with open(log_path, "rb") as _f:
+                    _f.seek(max(0, os.path.getsize(log_path) - 4096))
+                    _tail = _f.read()
+                _match = re.search(
+                    rb"host sleep detected \(wall clock advanced (\d+)s vs "
+                    rb"(\d+)s monotonic",
+                    _tail,
+                )
+                if _match:
+                    _wall_delta_for_reason = float(_match.group(1))
+                    _mono_delta_for_reason = float(_match.group(2))
+            except OSError:
+                pass
+            try:
+                _host_sleep_reason = format_host_sleep_reason(
+                    _wall_delta_for_reason, _mono_delta_for_reason
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                _host_sleep_reason = None
 
         # #1461: detect a usage-limit kill from the tail of the transcript.
         # Done HERE — immediately after the worker's own process has exited
@@ -9049,6 +9345,15 @@ class AgentServer:
                 # set CANCELLED before this block ran) is never relabelled.
                 if _spend_ceiling_reason is not None and assignment.status == FAILED:
                     assignment.spend_ceiling_reason = _spend_ceiling_reason
+                # #2638: same belt-and-braces guard — `RUNTIME_CEILING_EXIT`/
+                # `HOST_SLEEP_EXIT` are both non-zero, so the `else` above
+                # has already set FAILED whenever either reason is set;
+                # re-checked here only so a race with `POST /cancel` is
+                # never relabelled.
+                if _runtime_ceiling_reason is not None and assignment.status == FAILED:
+                    assignment.runtime_ceiling_reason = _runtime_ceiling_reason
+                if _host_sleep_reason is not None and assignment.status == FAILED:
+                    assignment.host_sleep_reason = _host_sleep_reason
             self._processes.pop(assignment_id, None)
 
         # #315/#324: parse the log for the worker's claude session_id (from the

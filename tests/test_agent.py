@@ -23,6 +23,7 @@ from coord.agent import (
     REFUSED_POLICY,
     REVIEW_DENY_COMMANDS,
     RUNNING,
+    RUNTIME_CEILING_EXIT,
     MOCK_AUTHOR_SYSTEM_PROMPT,
     WORKER_SYSTEM_PROMPT,
     AgentAssignment,
@@ -34,6 +35,7 @@ from coord.agent import (
     _sealed_write_guard_tools,
     _worker_subprocess_env,
     default_worker_command,
+    is_runtime_ceiling_reason,
 )
 
 
@@ -246,6 +248,64 @@ def test_assign_failure_marks_failed(tmp_path: Path) -> None:
     final = server.wait_for(a.id)
     assert final.status == FAILED
     assert final.exit_code == 7
+    server.shutdown()
+
+
+def test_running_agent_kills_and_marks_a_leg_that_outlives_the_runtime_ceiling(
+    tmp_path: Path,
+) -> None:
+    """#2638 acceptance, end to end through the real `AgentServer`.
+
+    A leg whose wall-clock runtime crosses the configured ceiling would
+    otherwise run forever (this worker never exits and never emits a byte).
+    It must come back FAILED with a reason that says *runtime ceiling* — a
+    generic failure here is the bug, because that is what let a suspended
+    worker hold its assignment `running` for 10.5h with nothing in the
+    fleet noticing.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "sleep 300"],
+        repo_path=repo,
+        runtime_ceiling_s=3.0,  # comfortably under one 5s reap poll interval
+    )
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id, timeout=30)
+
+    assert final.status == FAILED
+    assert final.exit_code == RUNTIME_CEILING_EXIT
+    assert is_runtime_ceiling_reason(final.runtime_ceiling_reason), (
+        "a ceiling kill must be distinguishable from a crash — got "
+        f"{final.runtime_ceiling_reason!r}"
+    )
+    # The other reason fields sharing this "why FAILED" slot must stay clear.
+    assert final.host_sleep_reason is None
+    assert final.spend_ceiling_reason is None
+    assert final.usage_limit_reason is None
+    # And the kill is narrated in the worker's own log.
+    log_text = Path(final.log_path).read_text()
+    assert "runtime ceiling breached" in log_text
+    server.shutdown()
+
+
+def test_running_agent_with_a_generous_ceiling_finishes_untouched(tmp_path: Path) -> None:
+    """The overwhelming majority of legs the ceiling must never touch: a
+    quick worker finishes on its own terms, well under a generous ceiling,
+    and nothing about it appears anywhere."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "echo hi; exit 0"],
+        repo_path=repo,
+        runtime_ceiling_s=6.0 * 3600.0,
+    )
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.exit_code == 0
+    assert final.runtime_ceiling_reason is None
+    assert final.host_sleep_reason is None
     server.shutdown()
 
 
@@ -562,6 +622,9 @@ def test_agent_server_defaults_bash_wrap_and_timeout(tmp_path: Path) -> None:
     server = _server(tmp_path)
     assert server.bash_wrap_spawn is True
     assert server.first_output_timeout == 600.0
+    # #2638: generous-but-on by default, mirroring the TTFT watchdog above —
+    # a leg is never silently uncapped just because nobody configured one.
+    assert server.runtime_ceiling_s == 6.0 * 60.0 * 60.0
     server.shutdown()
 
 
