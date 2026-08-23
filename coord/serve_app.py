@@ -4219,9 +4219,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # key is structurally unreachable from any of them — see
             # tests/test_health_advisory_only.py.
             projection["fleet_health"] = _fleet_health_refresher.snapshot().to_dict()
-            # #2532 (ms-67 contract §5): portal submissions the client has
-            # signed off on and that are waiting to be decomposed into
-            # coordinator work.  Computed HERE, on the daemon host, because
+            # #2532 (ms-67 contract §5), widened by #2661: portal submissions
+            # that are ready to be decomposed into coordinator work — either
+            # the client has signed off (`signoff_status == "approved"`) or
+            # the request just arrived and nobody has acted on it yet
+            # (`signoff_status == "new"`; see coord/approved_work.py's module
+            # docstring). Computed HERE, on the daemon host, because
             # the portal bridge's SQLite tables are canonical only here
             # (coord/portal_store.py's module doc) and the `repos` column is
             # resolved from `coordinator.yml` (#2531's project↔repo map),

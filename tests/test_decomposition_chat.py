@@ -42,6 +42,7 @@ SUBMISSION = {
     "constraints": "Must reuse the existing Stripe customer object.",
     "repos": ["api"],
     "received_at": "2026-08-18T09:14:00Z",
+    "signoff_status": "approved",
 }
 
 
@@ -123,6 +124,18 @@ def test_dispatch_raises_when_submission_not_approved():
     with patch("coord.approved_work.approved_submissions", return_value=[]):
         with pytest.raises(RuntimeError, match="not a currently-approved"):
             decomposition_chat.dispatch_decomposition_chat("sub_missing", cfg)
+
+
+def test_dispatch_raises_when_submission_is_new_not_approved():
+    """#2661: `approved_submissions()` now also returns never-signed-off
+    `signoff_status == "new"` rows (a request nobody has acted on yet). Those
+    must NOT be eligible for decomposition-chat — filing real issues and
+    queuing real dispatch work stays gated on an actual customer sign-off."""
+    cfg = _cfg_with_one_machine()
+    new_row = dict(SUBMISSION, signoff_status="new")
+    with patch("coord.approved_work.approved_submissions", return_value=[new_row]):
+        with pytest.raises(RuntimeError, match="not a currently-approved"):
+            decomposition_chat.dispatch_decomposition_chat("sub_2f6a1c", cfg)
 
 
 def test_dispatch_raises_when_no_mapped_repo():

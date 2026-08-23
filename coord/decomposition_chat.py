@@ -1,9 +1,9 @@
 """#2533 (ms-67 contract §4c): dispatch a `type="decomposition-chat"` session
 for "Pull into decomposition session" — the TUI action that turns an
-Approved-work-items row (a signed-off portal submission) into a briefed
-`claude -p` chat whose job is to decide whether the work is oracle-loop-shaped,
-file the resulting GitHub issue(s) via `coord issue create`, and queue them via
-`coord drive-queue add`.
+Approved-work-items row that the client has actually signed off on into a
+briefed `claude -p` chat whose job is to decide whether the work is
+oracle-loop-shaped, file the resulting GitHub issue(s) via `coord issue
+create`, and queue them via `coord drive-queue add`.
 
 Used by `coord portal decompose-chat <submission_id>` (the CLI command the
 TUI shells out to, mirroring `coord new-issue-chat` / `coord milestone chat`
@@ -16,6 +16,15 @@ audience / done-definition / constraints) plus its server-resolved mapped
 repo(s) come from :func:`coord.approved_work.approved_submissions` — the same
 function that already serves the TUI's `/board` `approved_submissions` block
 (#2532) — rather than re-deriving them from `coord.portal_store` directly.
+
+**#2661:** that shared function now also returns never-signed-off
+`signoff_status == "new"` rows (a request that has arrived but that nobody
+has acted on yet), so :func:`dispatch_decomposition_chat` filters on
+`signoff_status == "approved"` itself before treating a row as eligible —
+see that function's docstring. Filing real issues and queuing real dispatch
+work must stay gated on an actual customer sign-off; the panel's own
+"nothing started yet" widening must not silently become a second way to
+skip that gate.
 
 **Machine selection is generalized to every mapped repo** (contract §4c):
 unlike :func:`coord.new_issue_chat.pick_new_issue_chat_machine` (one repo),
@@ -162,11 +171,28 @@ def dispatch_decomposition_chat(
     Raises ``RuntimeError`` when the submission isn't a currently-approved
     one, has no mapped repo, no machine claims every mapped repo (or the
     forced ``machine_override`` doesn't), or the agent rejects the dispatch.
+
+    **#2661 note:** :func:`coord.approved_work.approved_submissions` now also
+    returns never-signed-off ``signoff_status == "new"`` rows — that widening
+    is correct for the TUI panel (a FIFO backlog of "not started yet" should
+    show requests nobody has touched), but it is wrong for *this* function.
+    Filing real GitHub issues and queuing real dispatch work is exactly the
+    "customer signed off" gate this module exists to enforce, so only
+    ``signoff_status == "approved"`` rows are eligible here — a ``"new"`` row
+    is treated identically to a submission this function has never heard of.
     """
     from coord.approved_work import approved_submissions
 
     rows = approved_submissions(config)
-    submission = next((r for r in rows if r.get("submission_id") == submission_id), None)
+    submission = next(
+        (
+            r
+            for r in rows
+            if r.get("submission_id") == submission_id
+            and r.get("signoff_status") == "approved"
+        ),
+        None,
+    )
     if submission is None:
         raise RuntimeError(
             f"submission {submission_id!r} is not a currently-approved portal "
