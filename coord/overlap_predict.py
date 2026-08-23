@@ -45,6 +45,16 @@ author's own declaration. The seam for it is
 one up yet, because rule 3 says a missing prediction is fine and a *bad* one
 is not. Ship the cheap, exact source first and let the recorded accuracy
 (see :func:`classify_outcome`) justify adding a fuzzier one.
+
+DELIBERATELY NOT IMPLEMENTED (#2601): a hardcoded exclusion list for
+"universal" directory tokens (``tests/``, ``docs/``) that every issue touches.
+It was considered — #2601 found that a single bare ``tests/`` declaration
+chained one issue behind fourteen others that each named a specific,
+disjoint file — but excluding it outright would make rule 1 lie: those
+fourteen ARE what :func:`paths_overlap`'s directory rule says they are, a
+match. The chosen fix is :func:`fanout_warnings`, which leaves the ORDER
+alone and instead tells the author their token was too broad to carry much
+signal, so they can narrow it on the next ``add``.
 """
 
 from __future__ import annotations
@@ -343,6 +353,47 @@ def predict_overlap(
                 Overlap(key=fp.key, source=fp.source, files=hits, branch=fp.branch)
             )
     return Prediction(predicted_files=files, overlaps=tuple(overlaps))
+
+
+# Above this many DISTINCT entries hit by one declared directory token, the
+# match is far more likely a token that happens to be common across the whole
+# repo (``tests/``, ``docs/``) than a deliberate "this covers one feature's
+# tests" declaration. #2601's incident was 14 against a threshold this
+# conservative; two or three files genuinely clustered under one directory is
+# unremarkable and must not warn.
+FANOUT_WARN_THRESHOLD = 3
+
+
+def fanout_warnings(
+    prediction: Prediction, *, threshold: int = FANOUT_WARN_THRESHOLD,
+) -> list[str]:
+    """Declared directory tokens that matched implausibly many entries (#2601).
+
+    :func:`paths_overlap`'s directory rule — a trailing-slash declaration
+    covers everything beneath it — is deliberate: it is the one
+    generalisation an author can write down unambiguously. But a token that
+    is common across the whole repo (``tests/``, ``docs/``) satisfies that
+    rule while carrying almost no signal: #2601 watched one bare ``tests/``
+    declaration chain an issue behind fourteen others it never actually
+    conflicted with.
+
+    This does NOT change the ORDER — rule 1 ("order, never refuse") holds
+    regardless of fanout; every one of those fourteen edges is still applied.
+    It only surfaces the count, so an author can tell a token was too broad
+    and narrow it to a specific file on the next ``add``.
+    """
+    counts: dict[str, int] = {}
+    for overlap in prediction.overlaps:
+        for path in overlap.files:
+            if path.endswith("/"):
+                counts[path] = counts.get(path, 0) + 1
+    return [
+        f"warning: `{path}` matched {count} entries — did you mean a "
+        "specific file? (#2247 orders against all of them regardless — this "
+        "changes nothing, it only flags the token)"
+        for path, count in sorted(counts.items())
+        if count > threshold
+    ]
 
 
 # ── gathering the two sides ──────────────────────────────────────────────────

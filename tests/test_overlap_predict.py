@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from coord.overlap_predict import (
+    FANOUT_WARN_THRESHOLD,
     OUTCOME_CONFIRMED,
     OUTCOME_FALSE_POSITIVE,
     OUTCOME_UNKNOWN,
@@ -22,6 +23,7 @@ from coord.overlap_predict import (
     classify_outcome,
     collect_candidate_files,
     declared_footprints,
+    fanout_warnings,
     inflight_assignments,
     inflight_footprints,
     parse_declared_files,
@@ -142,6 +144,54 @@ def test_excluded_keys_never_become_pre_reqs():
         ["coord/a.py"], [footprint], exclude_keys={f"{REPO}#7"}
     )
     assert not prediction
+
+
+# ── fanout_warnings (#2601) ──────────────────────────────────────────────────
+
+
+def _footprints_declaring_specific_files(count: int) -> list[Footprint]:
+    return [
+        Footprint(
+            key=f"{REPO}#{100 + i}",
+            issue_number=100 + i,
+            files=(f"tests/test_{i}.py",),
+            source=SOURCE_DECLARED,
+        )
+        for i in range(count)
+    ]
+
+
+def test_a_bare_directory_declaration_matching_many_entries_warns():
+    footprints = _footprints_declaring_specific_files(FANOUT_WARN_THRESHOLD + 1)
+    prediction = predict_overlap(["tests/"], footprints)
+    assert len(prediction.overlaps) == FANOUT_WARN_THRESHOLD + 1
+
+    warnings = fanout_warnings(prediction)
+    assert len(warnings) == 1
+    assert "`tests/`" in warnings[0]
+    assert str(FANOUT_WARN_THRESHOLD + 1) in warnings[0]
+    # The order is NOT touched by the warning — every edge is still applied.
+    assert len(prediction.after_keys) == FANOUT_WARN_THRESHOLD + 1
+
+
+def test_a_directory_declaration_at_or_under_the_threshold_does_not_warn():
+    footprints = _footprints_declaring_specific_files(FANOUT_WARN_THRESHOLD)
+    prediction = predict_overlap(["tests/"], footprints)
+    assert fanout_warnings(prediction) == []
+
+
+def test_a_specific_file_match_never_warns_regardless_of_count():
+    footprints = [
+        Footprint(
+            key=f"{REPO}#{200 + i}",
+            issue_number=200 + i,
+            files=("coord/drive_queue.py",),
+            source=SOURCE_DECLARED,
+        )
+        for i in range(FANOUT_WARN_THRESHOLD + 5)
+    ]
+    prediction = predict_overlap(["coord/drive_queue.py"], footprints)
+    assert fanout_warnings(prediction) == []
 
 
 def test_audit_details_carry_both_sides_of_the_claim():

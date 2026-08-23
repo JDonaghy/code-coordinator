@@ -91,7 +91,9 @@ from coord.overlap_predict import (
     classify_outcome,
     collect_candidate_files,
     declared_footprints,
+    fanout_warnings,
     inflight_footprints,
+    parse_declared_files,
     predict_overlap,
     predictions_from_audit,
     tally,
@@ -296,9 +298,12 @@ def drive_queue_add(
     # yields an empty prediction and this add behaves exactly as it did before
     # the feature existed.
     prediction = Prediction()
+    staleness_note = ""
     auto_after: list[str] = []
     if not no_predict_overlap:
-        prediction = _predict_overlap(config_path, repo, issue, existing_entries)
+        prediction, staleness_note = _predict_overlap(
+            config_path, repo, issue, existing_entries
+        )
         auto_after = _applicable_auto_after(
             existing_entries, repo, issue, after, prediction
         )
@@ -326,7 +331,17 @@ def drive_queue_add(
             gate += " (fleet-wide — nothing anywhere launches)"
         if resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
-    overlap_note = f"\n{prediction.reason}" if auto_after else ""
+    # #2601: the reason (if an edge was actually applied), any high-fanout
+    # directory-token warning (independent of whether the edge stuck — a
+    # cycle-dropped edge's token is just as worth narrowing), and a staleness
+    # note when the candidate's own body could only be read from cache.
+    overlap_notes: list[str] = []
+    if auto_after:
+        overlap_notes.append(prediction.reason)
+    overlap_notes.extend(fanout_warnings(prediction))
+    if staleness_note:
+        overlap_notes.append(staleness_note)
+    overlap_note = ("\n" + "\n".join(overlap_notes)) if overlap_notes else ""
     click.echo(
         f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}"
         f"{scope_downgrade_warning}{overlap_note}"
@@ -372,6 +387,121 @@ def _issue_body(repo_name: str, issue_number: int) -> str:
         return ""
 
 
+def _live_issue_body(repo_github: str, issue_number: int) -> str | None:
+    """A live ``gh issue view`` body for the ONE entry actually being enqueued.
+
+    #2601: `_issue_body` above is a cache read by design — cheap, and correct
+    for the overwhelmingly common case (no ``## Files`` block at all) and for
+    every OTHER issue's declaration this module consults for a footprint. But
+    that same design let a `gh issue edit` made directly against the
+    tracker — bypassing `coord.state.edit_issue_content`'s cache mirror — go
+    unnoticed: the predictor kept citing the removed line forever, because
+    nothing had ever told the cache the edit happened.
+
+    Called ONLY for the candidate (see `_candidate_body`), and only when its
+    cached body already parses to a declaration — never on the common
+    empty-declaration path, so this does not reintroduce the per-``add``
+    GitHub round-trip the module was built to avoid.
+
+    Fails open like every other fetch here: ``None`` on any error, and the
+    caller falls back to the cached body.
+    """
+    if not repo_github:
+        return None
+    try:
+        from coord import github_ops  # noqa: PLC0415
+
+        data = github_ops.get_issue(repo_github, int(issue_number))
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    if not data:
+        return None
+    return str(data.get("body") or "")
+
+
+def _mirror_issue_body(repo_name: str, issue_number: int, body: str) -> None:
+    """Write a freshly live-fetched body back into the local cache (#2601).
+
+    Best-effort, mirroring `_edit_issue_content_local`'s own cache write: the
+    live fetch above is authoritative, this only makes the freshness outlive
+    the one predict call it was fetched for — a later `add` for a DIFFERENT
+    issue that compares declaration-to-declaration against this one, or
+    `overlap-report`, should see the same answer without a second round-trip.
+    """
+    try:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        conn = get_connection()
+        conn.execute(
+            "UPDATE issues SET body = ?, synced_at = ? "
+            "WHERE repo_name = ? AND number = ?",
+            (body, time.time(), repo_name, int(issue_number)),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — the cache write is advisory
+        pass
+
+
+def _cached_body_age_note(repo_name: str, issue_number: int) -> str:
+    """#2601 point 1's fallback: when a live re-read wasn't possible, say how
+    old the cached body actually is, so a stale prediction is at least
+    visible instead of silently trusted.
+    """
+    row = None
+    try:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        row = get_connection().execute(
+            "SELECT synced_at FROM issues WHERE repo_name = ? AND number = ?",
+            (repo_name, int(issue_number)),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — an unreadable age is still worth flagging
+        pass
+    synced_at = row["synced_at"] if row is not None else None
+    if not synced_at:
+        return (
+            "note: predicted from a cached issue body of unknown age "
+            "(live refresh failed) — the declaration may be stale"
+        )
+    age = _age_str(max(0.0, time.time() - float(synced_at)))
+    return (
+        f"note: predicted from a cached issue body synced {age} ago "
+        "(live refresh failed) — the declaration may be stale"
+    )
+
+
+def _candidate_body(
+    repo_name: str, issue_number: int, repo_github: str,
+) -> tuple[str, str]:
+    """This entry's OWN body — refreshed live when staleness could matter (#2601).
+
+    The natural correction to a bad prediction is editing the issue's ``##
+    Files`` block and re-adding. That did nothing (#2601) because the
+    predictor always read `_issue_body`'s cache, which a direct
+    ``gh issue edit`` never invalidates.
+
+    So the candidate gets one extra check the rest of the module does not:
+    if its cached body already parses to a declaration, re-read it live and
+    mirror the answer back into the cache. A body with NO cached declaration
+    skips the live round-trip entirely — there is nothing to have gone
+    stale, and a declaration ADDED since the last sync just falls back to
+    today's "no prediction" (rule 3), exactly as an unreadable body would.
+
+    Returns ``(body, staleness_note)``: *body* is what prediction runs
+    against; *staleness_note* is non-empty only when a live re-read was
+    warranted but failed.
+    """
+    cached = _issue_body(repo_name, issue_number)
+    if not parse_declared_files(cached):
+        return cached, ""
+    fresh = _live_issue_body(repo_github, issue_number)
+    if fresh is None:
+        return cached, _cached_body_age_note(repo_name, issue_number)
+    if fresh != cached:
+        _mirror_issue_body(repo_name, issue_number, fresh)
+    return fresh, ""
+
+
 def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
     """``(github slug, default branch)`` for *repo*, or ``None``."""
     try:
@@ -387,27 +517,38 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
 
 def _predict_overlap(
     config_path: Path, repo: str, issue: int, existing_entries: list[QueueEntry],
-) -> Prediction:
+) -> tuple[Prediction, str]:
     """Compare this issue's declared files against work already in flight.
 
     Same-repo only: two repos' paths cannot collide, and comparing them would
     manufacture overlaps out of a shared filename. In-flight branches are
     checked first (ground truth); a queued entry with no branch yet is
     compared declaration-to-declaration, and only when it has one.
+
+    Returns ``(prediction, staleness_note)`` — see `_candidate_body` for when
+    the note is non-empty. Every OTHER body this consults (an in-flight
+    branch's own declaration, an unrelated queued entry's) still comes from
+    the plain cache: re-reading fifteen bodies live on every `add` is exactly
+    the cost the module's docstring rejects, and #2601's own report is about
+    correcting THIS entry's declaration, not anyone else's.
     """
     coordinates = _repo_coordinates(config_path, repo)
     if coordinates is None:
-        return Prediction()
+        return Prediction(), ""
     repo_github, base_branch = coordinates
 
+    candidate_body, staleness_note = _candidate_body(repo, issue, repo_github)
+
     def body_fetcher(repo_name: str, number: int) -> str:
+        if repo_name == repo and number == issue:
+            return candidate_body
         return _issue_body(repo_name, number)
 
     candidate = collect_candidate_files(repo, issue, body_fetcher)
     if not candidate:
         # Rule 3: no prediction is a valid answer. Nothing is fetched, nothing
         # is compared, and the add is byte-identical to the pre-#2247 one.
-        return Prediction()
+        return Prediction(), ""
 
     key = entry_key(repo, issue)
     footprints = inflight_footprints(
@@ -422,7 +563,7 @@ def _predict_overlap(
         and e.state not in TERMINAL_QUEUE_STATES
     ]
     footprints.extend(declared_footprints(queued, body_fetcher, exclude_keys=covered))
-    return predict_overlap(candidate, footprints, exclude_keys={key})
+    return predict_overlap(candidate, footprints, exclude_keys={key}), staleness_note
 
 
 def _applicable_auto_after(
