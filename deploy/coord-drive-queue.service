@@ -128,6 +128,22 @@ KillMode=process
 # Everything the user manager's default PATH carried (tmux, git, gh, and
 # /snap/bin) is preserved below, so this is a strict superset of what the
 # tick could reach before — nothing it currently finds can go missing.
+#
+# #2569: this venv-first PATH is deliberate and is NEVER a worker's PATH —
+# do not "fix" a worker-env leak by changing it. This unit's process (and
+# whatever it launches directly: `coord drive --tmux`'s tmux session, the
+# inline `coord drive` loop, `coord assign` subprocess calls) only ever
+# talks to a WORKER over HTTP, via the target machine's already-running
+# coord-agent.service — that separate daemon builds each worker's env fresh
+# (coord.agent._worker_subprocess_env), independent of whatever PATH this
+# unit itself runs with. See coord.drive.coord_argv()'s docstring for the
+# full chain. The incident this note documents (#2569: a drive-launched
+# worker's bare `pip install -e .` landed in the live `~/.coord-venv`,
+# crash-looping the whole fleet for ~11h) turned out NOT to be this PATH
+# leaking into a worker — it was the worker's own PATH-strip precondition
+# not covering the case; see #402/#2569 in coord/agent.py. This comment
+# stays so nobody re-derives the (wrong) theory that narrowing THIS PATH
+# would have prevented it.
 Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # --max-parallel 4 (#2012, raised from 3 in #2057) — the global ceiling,
 # ONE SLOT PER REPO IN THE FLEET: claude-coordinator, quadraui, vimcode,

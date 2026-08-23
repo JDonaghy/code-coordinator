@@ -123,18 +123,30 @@ Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `
 ## Development
 
 Always work in a virtualenv. Agent workers are spawned with the agent's own
-venv stripped from `PATH` (#402), so a bare `pip install` resolves to system
-Python (PEP 668) — and must **never** target the agent's runtime venv. Create
-your own venv in the checkout (`.venv/` is gitignored):
+pinned venv (`~/.coord-venv` — the live fleet install, not a build artifact)
+stripped from `PATH` and `PIP_REQUIRE_VIRTUALENV=true` set (#402, hardened by
+#2569), so a `pip install` run **without first creating and activating your
+own venv** fails closed instead of silently resolving somewhere unintended
+— and must **never** target the agent's runtime venv. Create your own venv
+in the checkout (`.venv/` is gitignored):
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
 pytest
 coord plan --dry-run
 coord approve --dry-run 1,2
 coord assign --dry-run precision claude-coordinator 42
 ```
+
+**Never run a bare `pip install` in a worktree as a separate command from
+venv creation (#2569).** The line above is ONE chained command
+(`venv && activate && install`) on purpose — an 11h fleet outage started
+when a worker ran only `pip install -e ".[dev]"` on its own, split off from
+the `venv`/`activate` step, and it silently landed in the live
+`~/.coord-venv` instead of failing. If you ever need to re-run `pip install`
+later in the same session, first confirm you're in an activated venv
+(`echo $VIRTUAL_ENV` should print your worktree's `.venv`, not empty) —
+never assume activation from an earlier command carried forward.
 
 **Workers: scope your test run to your diff, never `pytest` bare (#2169).**
 The full suite exceeds Claude Code's 600s Bash ceiling on this repo and

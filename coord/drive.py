@@ -3589,6 +3589,20 @@ def coord_argv() -> list[str]:
     back to ``python -m coord.cli`` when it is not on PATH — which happens under
     a venv whose ``bin`` is not exported, e.g. a worker with the agent venv
     stripped (#402).  Overridable with ``$COORD_DRIVE_COORD_BIN`` for tests.
+
+    #2569: this process's own PATH (this module runs inside ``coord drive`` /
+    ``coord drive-queue tick``, whose systemd unit — deploy/coord-drive-queue.
+    service — puts ``~/.coord-venv/bin`` FIRST, deliberately, so `cargo`/`git`
+    resolve consistently for the driver's own subprocess calls) is NEVER a
+    worker's PATH. Every ``coord assign``/``coord fix``/etc. subprocess this
+    module launches is a CLI invocation that talks to the target machine's
+    agent daemon over HTTP (``coord.dispatch.dispatch`` → ``httpx.post`` to
+    ``/assign``); the actual worker `claude -p` subprocess is spawned by that
+    OTHER, already-running process (``coord-agent.service``), which builds its
+    env fresh via ``coord.agent._worker_subprocess_env`` — this module's own
+    PATH is never inherited into it. The two processes' PATH policies are
+    independent by construction; do not "fix" one by changing the other. See
+    ``_worker_subprocess_env``'s docstring for the worker side of this.
     """
     override = os.environ.get("COORD_DRIVE_COORD_BIN")
     if override:

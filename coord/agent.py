@@ -1376,6 +1376,56 @@ def _safe_realpath(path: str) -> str:
         return path
 
 
+# #2569: the fleet's ONE pinned, non-editable venv (docs/AGENT_OPERATIONS.md).
+# ``~/.coord-venv`` is a symlink an operator atomically repoints at a
+# ``.blue``/``.green`` real directory on release — see `_pinned_venv_bin_dirs`
+# for why realpath (not the literal name) is what actually identifies it.
+_PINNED_VENV_DIRNAME = ".coord-venv"
+
+
+def _pinned_venv_bin_dirs(env: dict[str, str]) -> set[str]:
+    """Realpath(s) of the fleet's pinned venv ``bin`` dir that must never
+    appear on a worker's PATH (#2569: a worker's bare ``pip install -e .``
+    landed in the LIVE ``~/.coord-venv``, crash-looping the whole fleet for
+    ~11h — see the incident writeup on #2569).
+
+    Resolved from *env*'s own ``HOME`` — the environment actually being
+    built for the worker — not this process's, since the two can diverge
+    once a provider's ``env:`` overrides are merged in.  Falls back to this
+    process's home when *env* carries no ``HOME`` (matches
+    ``os.path.expanduser``'s own fallback).
+
+    ``~/.coord-venv`` is a symlink an operator atomically repoints at a
+    ``.blue``/``.green`` real directory on every release (deploy runbook,
+    docs/AGENT_OPERATIONS.md).  Realpath is what makes this match regardless
+    of which side is currently live, and regardless of whether ``PATH``
+    carries the symlink name or an already-resolved path.
+    """
+    home = env.get("HOME") or os.path.expanduser("~")
+    return {_safe_realpath(os.path.join(home, _PINNED_VENV_DIRNAME, "bin"))}
+
+
+def _strip_venv_bins_from_path(env: dict[str, str], venv_bins: set[str]) -> None:
+    """Remove any ``PATH`` entry whose realpath is in *venv_bins*, in place.
+
+    #2569: called both inside :func:`_worker_subprocess_env` and again at
+    each spawn call site AFTER every later ``env.update(...)`` (cargo-cache
+    overlay, ``provider.env()``) — a provider's own ``env:`` override
+    (operator-authored in ``coordinator.yml``) could otherwise reintroduce a
+    pinned venv bin dir onto ``PATH`` and silently undo the strip performed
+    here. No-ops when *venv_bins* is empty or ``PATH`` is unset.
+    """
+    path = env.get("PATH", "")
+    if not path or not venv_bins:
+        return
+    kept = [
+        part
+        for part in path.split(os.pathsep)
+        if part and _safe_realpath(part) not in venv_bins
+    ]
+    env["PATH"] = os.pathsep.join(kept)
+
+
 def _worker_subprocess_env(
     base_env: dict[str, str] | None = None,
     *,
@@ -1397,9 +1447,24 @@ def _worker_subprocess_env(
 
     Dropping the agent's venv ``bin`` from PATH (and clearing ``VIRTUAL_ENV`` /
     ``PYTHONHOME``) forces a worker's ``pip``/``python`` to its own venv instead
-    of the agent's. Only strips when the agent is actually running inside a venv
-    (``prefix != base_prefix``) so a system-Python agent never loses
-    ``/usr/bin`` & co.
+    of the agent's. The ``prefix != base_prefix`` check strips whenever THIS
+    process detects itself as running inside a venv, so a system-Python agent
+    never loses ``/usr/bin`` & co.
+
+    #2569: that detection is a heuristic about *this* process, and it can be
+    wrong, stale, or simply not fire for the process that ends up building a
+    given worker's env — exactly what happened in the incident that gave rise
+    to this note (an 11h fleet outage after a drive-launched worker's bare
+    ``pip install -e .`` landed in the live ``~/.coord-venv``). So on top of
+    the heuristic, this function ALSO strips the fleet's pinned venv by its
+    well-known name (``~/.coord-venv``, resolved via realpath so the
+    blue/green symlink swap doesn't matter — see `_pinned_venv_bin_dirs`).
+    That second strip does not depend on this process's own venv detection at
+    all, so it holds even when the heuristic above doesn't fire. It also sets
+    ``PIP_REQUIRE_VIRTUALENV=true`` as an independent, second-layer guard: a
+    worker that never creates its own venv (skips CLAUDE.md's Development
+    recipe) gets a hard ``pip`` refusal instead of a silent install into
+    whatever unstripped ``python``/``pip`` its PATH happens to resolve to.
 
     #1783: ``base_env`` is a straight copy of the agent daemon's environment,
     and the daemon's own ``PWD`` passes through untouched by default.
@@ -1435,16 +1500,19 @@ def _worker_subprocess_env(
     pfx = sys.prefix if prefix is None else prefix
     base_pfx = sys.base_prefix if base_prefix is None else base_prefix
 
+    # #2569: name-based strip of the fleet's pinned venv — unconditional,
+    # independent of the prefix heuristic below. See _pinned_venv_bin_dirs.
+    venv_bins = _pinned_venv_bin_dirs(env)
     if pfx and base_pfx and _safe_realpath(pfx) != _safe_realpath(base_pfx):
-        venv_bin = _safe_realpath(os.path.join(pfx, "bin"))
-        path = env.get("PATH", "")
-        if path:
-            kept = [
-                part
-                for part in path.split(os.pathsep)
-                if part and _safe_realpath(part) != venv_bin
-            ]
-            env["PATH"] = os.pathsep.join(kept)
+        venv_bins.add(_safe_realpath(os.path.join(pfx, "bin")))
+    _strip_venv_bins_from_path(env, venv_bins)
+
+    # #2569: second, independent layer — a worker that skips CLAUDE.md's
+    # venv-creation step gets a hard `pip` refusal instead of a silent
+    # install into whatever unstripped python/pip its PATH resolves to. A
+    # worker that DOES create+activate its own `.venv` first satisfies this
+    # normally (activation sets VIRTUAL_ENV in that shell).
+    env["PIP_REQUIRE_VIRTUALENV"] = "true"
 
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
@@ -7899,6 +7967,12 @@ class AgentServer:
         if provider_obj is not None:
             _spawn_env.update(provider_obj.env())
 
+        # #2569: re-strip AFTER every env.update() above — a provider's own
+        # `env:` override (operator-authored in coordinator.yml) could
+        # otherwise reintroduce the pinned venv's bin dir onto PATH and
+        # silently undo the strip _worker_subprocess_env already performed.
+        _strip_venv_bins_from_path(_spawn_env, _pinned_venv_bin_dirs(_spawn_env))
+
         try:
             proc = subprocess.Popen(
                 spawn_argv,
@@ -8086,6 +8160,10 @@ class AgentServer:
                 cargo_cache.cargo_env(assignment.spec.repo_name, self.state_dir, env)
             )
             env.update(provider.env())
+            # #2569: see the headless spawn path's identical re-strip for
+            # the rationale — a provider's own env: override could
+            # otherwise reintroduce the pinned venv's bin dir onto PATH.
+            _strip_venv_bins_from_path(env, _pinned_venv_bin_dirs(env))
 
             proc = subprocess.Popen(
                 argv,
