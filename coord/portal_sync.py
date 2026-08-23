@@ -596,11 +596,17 @@ def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
 
     facts: dict[str, Any] = {}
     payload: dict[str, Any] = dict(event)
-    nested = event.get("data") or event.get("fields")
+    # coord-portal's real wire shape nests every customer fact under
+    # `payload` (`src/bridge/events.ts`) — `data` / `fields` are kept as
+    # aliases for whatever shape a caller (or a future portal revision)
+    # actually uses, not narrowed away in favor of the one seen in
+    # production (#2585).
+    nested = event.get("data") or event.get("fields") or event.get("payload")
     if isinstance(nested, dict):
         payload.update(nested)
         payload.pop("data", None)
         payload.pop("fields", None)
+        payload.pop("payload", None)
     for key, value in payload.items():
         if key in _EVENT_ENVELOPE_KEYS or key in COORD_OWNED_FIELDS:
             continue
