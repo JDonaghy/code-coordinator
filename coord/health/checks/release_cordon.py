@@ -18,10 +18,21 @@ not in progress, it is a whole machine quietly pulled from the fleet.
 Deliberately self-contained (the registry's own acceptance bar: adding a
 check should touch exactly one file). It does its own I/O — the cordon
 store and the board, both already daemon-aware and fail-soft
-(:func:`coord.machine_pause.cordons`, :func:`coord.state.build_board`) —
-rather than waiting on a fact the daemon's fleet-health tick would have to
+(:func:`coord.machine_pause.cordons`, :func:`coord.board_service.read_board`)
+— rather than waiting on a fact the daemon's fleet-health tick would have to
 be taught to gather first. ``cost="network"`` so ``--no-network``/timer
 runs can skip it exactly like the other network-costed checks.
+
+This check runs inside ``coord agent``'s ``/health`` route, i.e. on every
+worker machine's own agent process — most of which are thin clients per
+``docs/AGENT_OPERATIONS.md``'s ``board_service = "http://<daemon-host>:7435"``
+per-machine config. ``coord.state.build_board()`` reconstructs the LOCAL,
+non-canonical SQLite board on such a host and only warns (does not raise) on
+the thin-client guard, so a genuinely busy thin client could silently read
+back ``is_busy=False`` and fire a false CRIT. ``coord.board_service.read_board()``
+is the fix: it GETs the daemon's canonical board when ``board_service`` is
+configured and only falls back to the local DB otherwise — the same routing
+``coord doctor`` uses for this identical idleness question (#2595 review).
 
 The actual "cordoned + idle + overdue" decision is
 :func:`coord.release_cordon.idle_overdue_cordons` — the SAME pure function
@@ -110,17 +121,27 @@ def probe_release_cordon_idle(ctx: HealthContext) -> CheckResult | None:
 
     # #2595 review: NOT `Board.idle_machines()` — that filters
     # `Board.machines`, which reflects machine registration/dispatch
-    # history rather than `coordinator.yml`, so a host `build_board()` has
+    # history rather than `coordinator.yml`, so a host `read_board()` has
     # no row for would read as neither idle nor busy instead of idle. The
     # only fact that actually matters here is "does THIS host have a
     # `running` board row right now" — `Board.active` is authoritative for
     # that regardless of what `Board.machines` contains.
+    #
+    # NOT `coord.state.build_board()` — this check runs inside `coord
+    # agent`'s /health route, i.e. on every worker machine's own process,
+    # most of which are thin clients (see module docstring). A direct local
+    # read would reconstruct the non-canonical local SQLite board and could
+    # read a genuinely busy thin client as idle, firing a false CRIT.
+    # `board_service.read_board()` GETs the daemon's canonical board when
+    # `board_service` is configured and only falls back to the local DB
+    # otherwise — the same routing `coord doctor` uses for this identical
+    # question.
     try:
-        from coord.state import build_board  # noqa: PLC0415
+        from coord.board_service import read_board  # noqa: PLC0415
 
         is_busy = any(
             a.machine_name == machine_name and a.status == "running"
-            for a in build_board().active
+            for a in read_board().active
         )
     except Exception as exc:  # noqa: BLE001 — a probe must never raise
         return CheckResult(

@@ -957,6 +957,27 @@ def test_idle_overdue_cordons_never_fabricates_a_drift_count():
     assert "behind" not in overdue.message
 
 
+def test_idle_overdue_cordons_renders_cross_series_drift_as_major_version_behind():
+    """`version_drift()` returns `CROSS_SERIES_DRIFT` (9999) for a cross-major/
+    minor jump (e.g. 0.4.x -> 0.5.x, a transition this fleet's own version
+    history has actually made) — the raw sentinel must never be rendered
+    verbatim as "9999 releases behind" in the CRIT text (#2595 review)."""
+    now = 10_000.0
+    stuck = rc.Cordon(
+        machine="precision", target_version="0.5.0",
+        created_at=now - 7200, renewed_at=now - 60, expires_at=now + 600,
+    )
+
+    [overdue] = rc.idle_overdue_cordons(
+        {"precision": stuck}, now=now, idle_hosts={"precision"}, deadline=5400,
+        host_versions={"precision": "0.4.111"},
+    )
+
+    assert overdue.drift == rc.CROSS_SERIES_DRIFT
+    assert "9999" not in overdue.message
+    assert "major/minor version behind" in overdue.message
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # #2595: `DRAIN OVERDUE` reaches the notifier, not just `coord release
 # propagate`'s own stderr/journal — same live cordon store `coord status`/
