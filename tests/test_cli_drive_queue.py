@@ -477,6 +477,169 @@ def test_an_inferred_edge_never_fails_an_add_it_would_cycle(cli, declare):
     assert queued(306)["after_json"] == []
 
 
+# ── #2603: prediction provenance + --reject-after ────────────────────────────
+#
+# #2247's prediction printed its CONCLUSION but never its INPUTS — a stale
+# prediction and a correct one rendered identically. These drive the real
+# CLI end to end and assert on the actual provenance text an operator reads
+# at enqueue time: the candidate's own declared files, a `[branch]` edge's
+# compared head SHA and liveness-check outcome, a `[declared]` edge's cache
+# age, and the narrower `--reject-after` escape hatch.
+
+
+def test_the_candidates_own_declared_files_are_named_in_the_reason(cli, declare):
+    declare(306, "coord/foo.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    declare(307, "coord/foo.py")
+    result = cli("add", REPO, "307")
+
+    assert result.exit_code == 0, result.output
+    assert "this entry's own declared files" in result.output
+    assert "coord/foo.py" in result.output
+
+
+def test_reject_after_drops_one_named_edge_but_applies_the_other(cli, declare):
+    declare(306, "coord/foo.py")
+    declare(307, "coord/bar.py")
+    assert cli("add", REPO, "306").exit_code == 0
+    assert cli("add", REPO, "307").exit_code == 0
+
+    declare(308, "coord/foo.py", "coord/bar.py")
+    result = cli("add", REPO, "308", "--reject-after", "306")
+
+    assert result.exit_code == 0, result.output
+    # Only the NOT-rejected edge is actually applied...
+    assert queued(308)["after_json"] == [f"{REPO}#307"]
+    # ...and the rejection itself is acknowledged, naming the edge that was
+    # dropped, so an operator's --reject-after never looks like a silent
+    # no-op.
+    assert f"rejected via --reject-after (not applied): {REPO}#306" in result.output
+    assert f"{REPO}#307" in result.output
+
+
+def test_reject_after_that_drops_every_edge_still_says_so(cli, declare):
+    declare(306, "coord/foo.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    declare(307, "coord/foo.py")
+    result = cli("add", REPO, "307", "--reject-after", "306")
+
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+    assert f"rejected via --reject-after (not applied): {REPO}#306" in result.output
+
+
+def test_branch_edge_names_the_compared_branch_and_head_sha(
+    cli, declare, seed, branch_diff, monkeypatch,
+):
+    seed(
+        issues={2230: "open"},
+        assignments=[{"issue_number": 2230, "status": "running"}],
+    )
+    from coord.db import get_connection
+
+    get_connection().execute(
+        "UPDATE assignments SET branch = 'issue-2230' WHERE issue_number = 2230"
+    )
+    get_connection().commit()
+    branch_diff({"issue-2230": ["coord/drive_queue.py"]})
+    monkeypatch.setattr(
+        "coord.github_ops.get_branch_sha",
+        lambda repo, branch: "abcdef1234567890" if branch == "issue-2230" else None,
+    )
+    declare(2234, "coord/drive_queue.py")
+
+    result = cli("add", REPO, "2234")
+
+    assert result.exit_code == 0, result.output
+    # The branch AND the actual compared SHA (short form), not just the fact
+    # that a branch compare happened.
+    assert "issue-2230@abcdef1" in result.output
+
+
+def test_branch_edge_flags_an_unconfirmed_liveness_check(
+    cli, declare, seed, branch_diff, monkeypatch,
+):
+    seed(
+        issues={2230: "open"},
+        assignments=[{"issue_number": 2230, "status": "running"}],
+    )
+    from coord.db import get_connection
+
+    get_connection().execute(
+        "UPDATE assignments SET branch = 'issue-2230' WHERE issue_number = 2230"
+    )
+    get_connection().commit()
+    branch_diff({"issue-2230": ["coord/drive_queue.py"]})
+    # #2602's terminal (closed/merged) check itself blows up — the branch is
+    # still trusted (fail-open), but #2603 says so rather than implying the
+    # liveness check actually ran and confirmed the branch was still open.
+    monkeypatch.setattr(
+        "coord.github_ops.work_is_terminal",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gh unreachable")),
+    )
+    declare(2234, "coord/drive_queue.py")
+
+    result = cli("add", REPO, "2234")
+
+    assert result.exit_code == 0, result.output
+    assert queued(2234)["after_json"] == [f"{REPO}#2230"]
+    assert "liveness check failed" in result.output
+
+
+def test_declared_edge_names_how_old_the_cached_body_was(cli, declare):
+    declare(306, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    from coord.db import get_connection
+
+    conn = get_connection()
+    two_hours_ago = time.time() - 7200
+    conn.execute(
+        "UPDATE issues SET synced_at = ? WHERE repo_name = ? AND number = ?",
+        (two_hours_ago, REPO, 306),
+    )
+    conn.commit()
+
+    declare(307, "coord/drive_queue.py")
+    result = cli("add", REPO, "307")
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f"{REPO}#306's declared list was read from a cache synced" in result.output
+    )
+    assert "2h ago" in result.output
+
+
+def test_a_rejected_declared_edges_cache_age_note_is_not_shown(cli, declare):
+    # Review of the first #2603 iteration: `_declared_overlap_age_notes` used
+    # to walk EVERY predicted overlap, so a `--reject-after`-dropped edge
+    # could still print a cache-age note describing a comparison the operator
+    # never sees applied. It must stay silent about anything not actually in
+    # `after=`.
+    declare(306, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    from coord.db import get_connection
+
+    conn = get_connection()
+    two_hours_ago = time.time() - 7200
+    conn.execute(
+        "UPDATE issues SET synced_at = ? WHERE repo_name = ? AND number = ?",
+        (two_hours_ago, REPO, 306),
+    )
+    conn.commit()
+
+    declare(307, "coord/drive_queue.py")
+    result = cli("add", REPO, "307", "--reject-after", "306")
+
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+    assert "declared list was read from a cache synced" not in result.output
+    assert f"rejected via --reject-after (not applied): {REPO}#306" in result.output
+
+
 # ── #2601: fanout warning + fresh-body re-read ───────────────────────────────
 
 

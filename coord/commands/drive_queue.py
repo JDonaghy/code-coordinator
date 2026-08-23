@@ -423,7 +423,7 @@ def drive_queue_add(
     overlap_notes: list[str] = []
     if auto_after:
         overlap_notes.append(prediction.reason)
-        overlap_notes.extend(_declared_overlap_age_notes(prediction))
+        overlap_notes.extend(_declared_overlap_age_notes(prediction, auto_after))
     if rejected_after:
         overlap_notes.append(
             "rejected via --reject-after (not applied): " + ", ".join(rejected_after)
@@ -633,7 +633,7 @@ def _cached_body_age_note(repo_name: str, issue_number: int) -> str:
     )
 
 
-def _declared_overlap_age_notes(prediction: Prediction) -> list[str]:
+def _declared_overlap_age_notes(prediction: Prediction, applied: list[str]) -> list[str]:
     """#2603: how old each APPLIED ``[declared]`` overlap's OTHER side is.
 
     `Overlap.describe()` cannot render this itself — it is a pure module
@@ -642,10 +642,19 @@ def _declared_overlap_age_notes(prediction: Prediction) -> list[str]:
     set by `_predict_overlap`'s ``synced_at_fetcher``), say how old that read
     was. Silent when unknown, same posture as the rest of this feature: a
     freshness signal we don't have is not manufactured, only shown when real.
+
+    *applied* restricts this to the overlaps that actually landed in the
+    entry's ``after=`` (i.e. ``auto_after``) — review of #2603's first
+    iteration flagged that walking every predicted overlap regardless would
+    surface a cache-age note describing an edge a cycle guard or
+    ``--reject-after`` had just dropped, which the operator never sees
+    applied and has no other cue was excluded.
     """
     notes: list[str] = []
     now = time.time()
     for overlap in prediction.overlaps:
+        if overlap.key not in applied:
+            continue
         if overlap.source != SOURCE_DECLARED or not overlap.synced_at:
             continue
         age = _age_str(max(0.0, now - overlap.synced_at))
