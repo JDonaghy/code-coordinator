@@ -40,6 +40,22 @@ reads as unattributable and blocks every host, the daemon included. This
 module remains the belt-and-braces answer for that residual case, and for
 the daemon host doing real work directly.
 
+#2618: the reason this module treats fleet-wide quiescence as a hard
+prerequisite for restarting `coord-serve` at all — rather than a survivable
+blip for whatever else is running elsewhere — was the WRITE side of an
+in-flight `coord drive`: every daemon-mutating `coord` subcommand it spawns
+made exactly one unretried request, so a restart landing mid-write killed
+that drive outright. `coord.drive.Driver._spawn` now retries a clean
+connection-refusal (never a reset/timeout — see its comment) across a
+bounded window sized for an ordinary restart, so a drive elsewhere in the
+fleet is no longer inherently unable to survive `coord-serve` restarting.
+That does not, on its own, make stopping `coord-drive-queue.timer` here
+unnecessary — the timer is what LAUNCHES new drives onto the daemon host,
+a different concern (see `coord.release_propagate`'s own #2618 note for the
+full split) — but it does mean a future revisit of "must the daemon host's
+OWN restart wait for drives running on OTHER hosts" starts from "the drives
+can take it" rather than "unconfirmed, so assume they cannot."
+
 #2101 (release cordons) answers this for every OTHER host: cordon it,
 drain it, roll it the moment it's free. It cannot answer it for the daemon
 host itself — cordoning stops NEW work from routing there, but the daemon

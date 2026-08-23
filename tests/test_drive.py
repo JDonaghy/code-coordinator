@@ -5665,6 +5665,100 @@ def test_a_die_on_error_action_raises_a_drive_error(driver_factory, monkeypatch)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2618: surviving a `coord-serve` restart mid-drive. `_spawn` is the ONE
+# place every daemon-mutating `coord` subcommand this driver runs actually
+# executes — see its own #2618 comment in coord/drive.py for the full
+# investigation. These exercise `_spawn` directly (not through the whole
+# `decide()`/`_loop()` machinery) so the retry/give-up boundary is pinned
+# precisely, independent of which Action happened to trigger it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_spawn_retries_a_clean_connection_refusal_and_recovers(
+    driver_factory, monkeypatch,
+):
+    driver = driver_factory([board(status="merged")])
+    calls: list[list[str]] = []
+
+    def flaky_run(argv, **kw):
+        calls.append(list(argv))
+        if len(calls) <= 2:
+            # httpx's own wording for an ECONNREFUSED, as seen in a `coord`
+            # subcommand's captured stderr when the daemon isn't listening
+            # yet (a `coord-serve` restart in progress).
+            return subprocess.CompletedProcess(
+                argv, 1, "",
+                "httpx.ConnectError: [Errno 111] Connection refused",
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    monkeypatch.setattr("coord.drive.subprocess.run", flaky_run)
+    rc = driver._spawn(["coord", "test", "--passed", "w1"])
+    assert rc == 0
+    assert len(calls) == 3  # two refusals ridden out, then the real attempt
+    assert driver._last_run_output == "ok"
+
+
+def test_spawn_gives_up_after_the_retry_budget_on_a_connection_refusal(
+    driver_factory, monkeypatch,
+):
+    from coord.drive import _DAEMON_CONN_REFUSED_RETRIES
+
+    driver = driver_factory([board(status="merged")])
+    calls: list[list[str]] = []
+
+    def always_refused(argv, **kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv, 1, "",
+            "requests.exceptions.ConnectionError: Failed to establish a new "
+            "connection: [Errno 111] Connection refused",
+        )
+
+    monkeypatch.setattr("coord.drive.subprocess.run", always_refused)
+    rc = driver._spawn(["coord", "test", "--passed", "w1"])
+    assert rc == 1  # a genuinely-down daemon still surfaces as a failure
+    assert len(calls) == _DAEMON_CONN_REFUSED_RETRIES + 1  # bounded, not infinite
+
+
+def test_spawn_does_not_retry_an_ordinary_command_failure(driver_factory, monkeypatch):
+    """A ValueError from bad input, a guard refusal, a stack trace — none of
+    these carry the connection-refused signature, so retrying would just
+    delay a real failure's diagnosis for no reason (and, for a
+    non-idempotent RUN action, risk a double-dispatch on top)."""
+    driver = driver_factory([board(status="merged")])
+    calls: list[list[str]] = []
+
+    def failing_run(argv, **kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv, 1, "", "ValueError: no such machine 'elitebook'",
+        )
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_run)
+    rc = driver._spawn(["coord", "assign", "precision", REPO, str(ISSUE)])
+    assert rc == 1
+    assert len(calls) == 1  # not retried
+
+
+def test_looks_like_daemon_connection_refused_matches_known_signatures():
+    from coord.drive import _looks_like_daemon_connection_refused as looks
+
+    assert looks("httpx.ConnectError: [Errno 111] Connection refused")
+    assert looks(
+        "requests.exceptions.ConnectionError: Failed to establish a new "
+        "connection: [Errno 111] Connection refused"
+    )
+    assert looks("Connection refused")  # bare OS-level wording
+    assert not looks("ValueError: no such machine 'elitebook'")
+    assert not looks("")
+    # A reset or timeout mid-request is ambiguous (the daemon may already
+    # have processed it) — deliberately NOT matched, see the #2618 comment.
+    assert not looks("httpx.ReadTimeout: timed out")
+    assert not looks("ConnectionResetError: [Errno 104] Connection reset by peer")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #1844: a permanent pre-dispatch refusal is NOT a generic RUN-action
 # failure. `coord assign`/`coord approve-plan`/`coord fix` exit
 # EXIT_DISPATCH_REFUSED (not the generic 1) when `enforce_oracle_readiness`/
