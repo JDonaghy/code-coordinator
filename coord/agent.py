@@ -9327,6 +9327,7 @@ class AgentServer:
             return
 
         from coord import github_ops  # noqa: PLC0415
+        from coord.models import trust_issue_closed_for  # noqa: PLC0415
 
         terminal_cache: dict = {}
         slug_cache: dict[str, str | None] = {}
@@ -9339,9 +9340,16 @@ class AgentServer:
             if not repo_github:
                 continue
             try:
+                # #2639: trust_issue_closed_for(a.spec.type) — an
+                # ADVISORY/REFUSED_POLICY row for a test-author/mock-author
+                # spec carries the milestone tracking issue in
+                # issue_number, not its own deliverable, so a closed
+                # tracking epic must not read as "this row is terminal"
+                # here either.
                 terminal = github_ops.work_is_terminal(
                     repo_github, a.spec.issue_number, a.branch,
                     cache=terminal_cache,
+                    trust_issue_closed=trust_issue_closed_for(a.spec.type),
                 )
             except Exception:  # noqa: BLE001 — fail-open, never crash /status
                 terminal = False

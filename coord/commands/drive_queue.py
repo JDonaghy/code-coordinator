@@ -3352,6 +3352,18 @@ def _fetch_live_prereq_terminal(
         if not repo_github:
             continue
         try:
+            # #2639 audit: intentionally left at the default
+            # trust_issue_closed=True. `dep` is a drive-queue `repo#issue`
+            # key, not a board assignment row, and the branch argument here
+            # is always "" (no branch to check against a `--after` pre-req
+            # key) — `work_is_terminal`'s `elif branch and pr_is_merged(...)`
+            # never fires, so issue-closed IS the only signal this call can
+            # ever use. Setting trust_issue_closed=False would make this
+            # function permanently return nothing rather than fix a real
+            # test-author aliasing bug: a `--after` pre-req is queued by its
+            # own issue number (`coord drive-queue add REPO ISSUE`), not a
+            # milestone tracking issue, so `issue_number` here is already
+            # the dependency's own deliverable.
             if _gh_ops.work_is_terminal(repo_github, issue_number, ""):
                 out[dep] = True
         except Exception:  # noqa: BLE001 — leave this one dep to the fallback

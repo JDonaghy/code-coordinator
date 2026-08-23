@@ -693,6 +693,7 @@ def detect_stalled_pipeline(
         load_queue,
         passes_merge_gates,
     )
+    from coord.models import trust_issue_closed_for  # noqa: PLC0415
 
     if board is None:
         from coord.board_service import read_board  # noqa: PLC0415
@@ -714,8 +715,18 @@ def detect_stalled_pipeline(
 
         repo = config.repo(work.repo_name)
         repo_github = repo.github if repo is not None else None
+        # #2639: trust_issue_closed_for(work.type) — _pipeline_heads(board)
+        # can surface test-author/mock-author heads, whose issue_number is
+        # the milestone's tracking issue (closed for most of its life while
+        # slices are still authored against it), not this row's own
+        # deliverable. Trusting a closed tracking epic here would suppress
+        # a legitimate stall notification for a genuinely stuck slice.
         if repo_github and github_ops.work_is_terminal(
-            repo_github, work.issue_number, work.branch, cache=terminal_cache
+            repo_github,
+            work.issue_number,
+            work.branch,
+            cache=terminal_cache,
+            trust_issue_closed=trust_issue_closed_for(getattr(work, "type", None)),
         ):
             continue
 

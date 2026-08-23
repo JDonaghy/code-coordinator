@@ -149,6 +149,8 @@ def _live_advisory_entries(
     round-trip, not one per entry — this list renders on every ``coord
     status``.
     """
+    from coord.models import trust_issue_closed_for  # noqa: PLC0415
+
     if cache is None:
         cache = {}
     live = []
@@ -159,11 +161,17 @@ def _live_advisory_entries(
         if repo_cfg is None or not repo_cfg.github:
             live.append(e)
             continue
+        # #2639: trust_issue_closed_for(spec type) — a test-author/mock-author
+        # advisory's issue_number is the milestone's tracking issue, not its
+        # own deliverable, so a closed tracking epic must not read as "this
+        # advisory's work is terminal" (it would silently drop a genuinely
+        # unresolved advisory from view).
         if github_ops.work_is_terminal(
             repo_cfg.github,
             spec.get("issue_number"),
             e.get("branch"),
             cache=cache,
+            trust_issue_closed=trust_issue_closed_for(spec.get("type", "work")),
         ):
             continue
         live.append(e)

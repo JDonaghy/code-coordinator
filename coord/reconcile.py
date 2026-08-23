@@ -13,15 +13,23 @@ from typing import TYPE_CHECKING
 from coord.config import INTERACTIVE_SESSION_TYPES, Config
 from coord.dispatch import AGENT_PORT
 from coord.models import (
-    SEALED_PATH_AUTHOR_TYPES,
     WORK_LIKE_TYPES,
     Assignment,
     Board,
     Machine,
+    trust_issue_closed_for,
 )
 
 if TYPE_CHECKING:
     from coord.merge_queue import QueuedMerge
+
+# #2639: bounds the per-row file-content fetch count in sweep (h)'s
+# falsely-merged audit (reconcile_board_merges) — a branch with a huge diff
+# (e.g. a generated-file sweep) must not turn one row's audit into hundreds
+# of `gh api contents` round-trips. The first differing file is enough to
+# flag the row; this only limits how many files are checked before giving up
+# and treating a huge, all-matching-so-far diff as inconclusive (fail open).
+_FALSE_MERGE_AUDIT_MAX_FILES = 20
 
 
 def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -2838,6 +2846,17 @@ def reconcile_board_merges(
     actions list still describes what *would* change.  The board objects are
     mutated in place on a real run so a subsequent ``save_board`` agrees with
     the targeted DB writes.
+
+    (This docstring predates sweeps (c)-(g), which grew this function well
+    past "two" — see their own inline comments below for what each does.
+    Sweep (h), #2639, is DETECTION-ONLY and never mutates the board: it flags
+    a ``status='merged'`` row whose branch is still ahead of its base with no
+    merged PR at its tip and content that genuinely differs from the base —
+    the "already-corrupted rows are undetectable" gap the #2639 review named,
+    catching a historical false ``status='merged'`` flip that predates this
+    fix (or any future bug shaped like it) rather than leaving it invisible
+    to every other diagnostic forever. See its own inline comment for the
+    full methodology and false-positive guards.)
     """
     from coord import github_ops, state  # noqa: PLC0415
 
@@ -2940,7 +2959,10 @@ def reconcile_board_merges(
         # for these rows; every other work-like type (chiefly `type='work'`,
         # where `issue_number` genuinely is the row's own deliverable) keeps
         # the #522 issue-closed fast path so a manually-closed issue still
-        # retires it here.
+        # retires it here. `trust_issue_closed_for` (coord/models.py) is the
+        # single shared derivation of this — every other `work_is_terminal`
+        # call site that can see a WORK_LIKE_TYPES row should use it too,
+        # rather than re-deriving `type not in SEALED_PATH_AUTHOR_TYPES`.
         if (
             a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a)
         ) and github_ops.work_is_terminal(
@@ -2948,7 +2970,7 @@ def reconcile_board_merges(
             a.issue_number,
             a.branch,
             cache=terminal_cache,
-            trust_issue_closed=a.type not in SEALED_PATH_AUTHOR_TYPES,
+            trust_issue_closed=trust_issue_closed_for(a.type),
         ):
             actions.append(
                 f"mark merged {a.assignment_id} "
@@ -3045,6 +3067,24 @@ def reconcile_board_merges(
             if key not in work_branch_for or work_branch_for[key] is None:
                 work_branch_for[key] = _a.branch
 
+    # #2639: a parallel (repo_name, issue_number) → work-like `type` lookup,
+    # scoped to WORK_LIKE_TYPES (unlike work_branch_for above, which is
+    # deliberately "work"-only for its branch-fallback purpose). A
+    # review/smoke/conflict-fix ghost sibling below inherits its
+    # `issue_number` from the work row it was dispatched for — if THAT row
+    # is test-author/mock-author, `issue_number` is the milestone's tracking
+    # issue, not the sibling's own deliverable, even though the sibling's
+    # own `a.type` is "review"/"smoke"/"conflict-fix" (not itself in
+    # SEALED_PATH_AUTHOR_TYPES). Trusting a closed tracking epic for such a
+    # sibling would settle it before the underlying slice ever really
+    # landed.
+    work_type_for: dict[tuple[str, int], str] = {}
+    for _a in board.active + board.completed:
+        if _a.type in WORK_LIKE_TYPES and _a.issue_number is not None:
+            key = (_a.repo_name, _a.issue_number)
+            if key not in work_type_for:
+                work_type_for[key] = _a.type
+
     # Identify ghost sibling rows subject to this sweep.
     ghost_candidates = [
         a
@@ -3085,8 +3125,16 @@ def reconcile_board_merges(
         # branch so the pr_is_merged check fires even when the sibling has none.
         branch = a.branch or work_branch_for.get((a.repo_name, a.issue_number))
 
+        # #2639: trust_issue_closed_for the underlying work-like row's type
+        # (falling back to this sibling's own type when no work-like row is
+        # on the board for the same issue) — see work_type_for above.
+        _terminal_type = work_type_for.get((a.repo_name, a.issue_number), a.type)
         if not github_ops.work_is_terminal(
-            repo_cfg.github, a.issue_number, branch, cache=terminal_cache
+            repo_cfg.github,
+            a.issue_number,
+            branch,
+            cache=terminal_cache,
+            trust_issue_closed=trust_issue_closed_for(_terminal_type),
         ):
             continue  # Issue still live — leave this row alone.
 
@@ -3223,8 +3271,17 @@ def reconcile_board_merges(
             # (repo_name="(drive-queue)"), which isn't a real GitHub issue.
             continue
         _branch = work_branch_for.get((_esc_repo, _esc_issue))
+        # #2639: an escalation can be raised against a test-author/
+        # mock-author dispatch too (drive-queue milestone automation) —
+        # reuse work_type_for so a closed tracking epic doesn't dismiss a
+        # still-unresolved escalation.
+        _esc_type = work_type_for.get((_esc_repo, _esc_issue), "work")
         if not github_ops.work_is_terminal(
-            _repo_cfg.github, _esc_issue, _branch, cache=terminal_cache
+            _repo_cfg.github,
+            _esc_issue,
+            _branch,
+            cache=terminal_cache,
+            trust_issue_closed=trust_issue_closed_for(_esc_type),
         ):
             continue
         actions.append(
@@ -3234,5 +3291,134 @@ def reconcile_board_merges(
         )
         if not dry_run:
             state.dismiss_drive_escalation(_esc_repo, _esc_issue)
+
+    # (h) #2639 second half — flag a `status='merged'` row that may never
+    # actually have landed.
+    #
+    # THE GAP: before this fix, `work_is_terminal`'s issue-closed check could
+    # flip a `status='merged'` row whose branch was NEVER actually merged
+    # anywhere (a test-author/mock-author row booked against a closed
+    # tracking epic — see sweep (b) above and #2639). Once flipped, the row
+    # is invisible to every other diagnostic: `coord diagnose --stage review`
+    # reads "review stage looks healthy", `coord diagnose --stage work` reads
+    # "no work assignment", and `coord merge --dry-run` proposes nothing —
+    # because all three trust `status='merged'` at face value. This sweep is
+    # the one place that DOESN'T: it re-derives "did this actually land" from
+    # git/GitHub reality for every already-`merged` row, the same way sweep
+    # (b) does for `done` rows, so a historical mis-flip (from before this
+    # fix existed, or from any other future bug shaped like it) doesn't stay
+    # permanently invisible.
+    #
+    # DETECTION ONLY — this sweep NEVER mutates board state. Recovering a
+    # falsely-merged row needs a human call (re-dispatch? was it actually
+    # superseded? is the branch salvageable?) that this sweep cannot safely
+    # make on its own; it only surfaces the row so an operator can decide.
+    #
+    # METHODOLOGY (from the live #2639 blast-radius sweep, 2026-08-23 — 67
+    # branches checked, 3 flagged, 1 genuine casualty):
+    #   1. Skip if the branch was deleted from origin — the dominant, benign
+    #      case (merged + cleaned up the normal way).
+    #   2. Skip if `pr_is_merged` confirms a merged PR at the branch's
+    #      CURRENT tip (#1150, SHA-exact) — correctly tracked, nothing to see.
+    #   3. Skip if the branch is 0 commits ahead of its resolved base branch
+    #      — its content is already an ancestor of the base, just never had
+    #      (or needed) its own PR. This is the sweep's own first false
+    #      positive: `issue-2531-config-portal-project-repo-mapping`.
+    #   4. Otherwise the branch carries commits neither `pr_is_merged` nor
+    #      "already an ancestor" accounts for — but SHA identity alone is
+    #      NOT proof of loss: a rebase, squash, different PR, or direct push
+    #      can all land the exact same CONTENT under a different SHA (the
+    #      sweep's second false positive: coord-portal's
+    #      `issue-16-gate-a-...` — rebased to a new SHA, content identical).
+    #      So compare CONTENT: fetch every file the branch's diff touches
+    #      (bounded — `_FALSE_MERGE_AUDIT_MAX_FILES`) at both the branch's
+    #      tip and the base branch's tip; if every one is byte-identical, the
+    #      content already landed — not lost, skip. Only when at least one
+    #      changed file's content actually differs is this flagged.
+    #
+    # Still imperfect (a legitimate LATER edit to the same file on the base
+    # branch, unrelated to this branch's change, would also show up as
+    # "differs" and get flagged) — deliberately conservative on outcome:
+    # this is a FLAG for a human to check, exactly like the manual sweep this
+    # automates, not a verdict. Fail-open at every layer: any fetch failure
+    # skips that row/file rather than either flagging or clearing it.
+    _false_merge_candidates = [
+        a
+        for a in board.active + board.completed
+        if a.status == "merged"
+        and a.branch
+        and (a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a))
+        and (repo is None or a.repo_name == repo)
+        and (issue is None or a.issue_number == issue)
+    ]
+    if _false_merge_candidates:
+        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+        _false_merge_milestone_cache: dict = {}
+        for a in _false_merge_candidates:
+            repo_cfg = config.repo(a.repo_name)
+            if repo_cfg is None or not repo_cfg.github:
+                continue
+            try:
+                if not github_ops.branch_exists_on_remote(repo_cfg.github, a.branch):
+                    continue  # branch gone — presumed genuinely merged + cleaned up
+                if github_ops.pr_is_merged(repo_cfg.github, a.branch):
+                    continue  # correctly tracked: a merged PR sits at this exact tip
+                base_branch = resolve_base_branch_for_issue_number(
+                    repo_cfg,
+                    repo_cfg.github,
+                    a.issue_number,
+                    cache=_false_merge_milestone_cache,
+                )
+                ahead = github_ops.branch_commits_ahead(
+                    repo_cfg.github, base_branch, a.branch
+                )
+                if not ahead:  # None (fail-open) or 0 (already an ancestor)
+                    continue
+                changed_files = github_ops.get_compare_files(
+                    repo_cfg.github, base_branch, a.branch
+                )
+                if not changed_files:
+                    continue  # can't confirm anything — fail open
+                content_differs = False
+                differing_path = None
+                for _path in changed_files[:_FALSE_MERGE_AUDIT_MAX_FILES]:
+                    try:
+                        branch_content = github_ops.get_repo_file(
+                            repo_cfg.github, _path, a.branch
+                        )
+                    except RuntimeError:
+                        continue  # file gone from the branch tip too — no signal
+                    try:
+                        base_content = github_ops.get_repo_file(
+                            repo_cfg.github, _path, base_branch
+                        )
+                    except RuntimeError:
+                        base_content = None  # never landed on base at all
+                    if branch_content != base_content:
+                        content_differs = True
+                        differing_path = _path
+                        break
+                if not content_differs:
+                    continue  # verbatim on base already — rebase/squash, not lost
+                actions.append(
+                    f"POSSIBLY LOST (#2639): {a.assignment_id} "
+                    f"({a.repo_name} #{a.issue_number}, branch={a.branch}) is "
+                    f"status='merged' but is {ahead} commit(s) ahead of "
+                    f"{base_branch} with no merged PR at its current tip, and "
+                    f"{differing_path!r} differs from {base_branch}'s copy — "
+                    "this sweep never auto-fixes; an operator should confirm "
+                    "the branch's content genuinely never landed (check "
+                    f"{differing_path!r}'s history on {base_branch}) before "
+                    "deciding how to recover it (re-dispatch, manual PR, or "
+                    "confirm it's a false positive and leave the row alone)"
+                )
+            except Exception as exc:  # noqa: BLE001 — detection-only, never
+                # let one bad row's `gh` failure sink the whole sweep or
+                # (worse) get treated as evidence either way.
+                actions.append(
+                    f"skip false-merge audit for {a.assignment_id} "
+                    f"({a.repo_name} #{a.issue_number}): {exc}"
+                )
 
     return actions

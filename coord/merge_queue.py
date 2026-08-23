@@ -33,7 +33,12 @@ from coord.ci_store import (
 )
 from coord.db import get_connection
 from coord.forge_availability import MERGE_GATE_REFUSAL_KINDS, record_merge_gate_refusal
-from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
+from coord.models import (
+    CLOSES_ISSUE_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    trust_issue_closed_for,
+)
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
 from coord.state import COORD_DIR, dismiss_drive_escalation
 
@@ -3168,11 +3173,17 @@ def enqueue_approved_work(config, board=None) -> list[str]:
 
         # Gate 3: not already terminal on GitHub (merged / closed).  Fail OPEN
         # on transient gh errors so a network blip never blocks a real enqueue.
+        #
+        # #2639: this function processes WORK_LIKE_TYPES rows (not just
+        # type='work' — see module docstring), so a test-author/mock-author
+        # `a` must not trust its (tracking-issue) `issue_number`'s closed
+        # state, or a closed epic silently blocks its enqueue forever.
         if _gho.work_is_terminal(
             repo_cfg.github,
             getattr(a, "issue_number", 0),
             branch,
             cache=terminal_cache,
+            trust_issue_closed=trust_issue_closed_for(getattr(a, "type", None)),
         ):
             continue
 
