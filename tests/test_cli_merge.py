@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1850,6 +1851,83 @@ class TestMergeAutoEnqueue:
         assert "auto-enqueued" in result.output
         assert "#1501" in result.output
         create.assert_called_once()
+
+    # ── #2597: DB lock contention on the enqueue write ──────────────────
+
+    def test_lock_contention_on_enqueue_write_retries_then_succeeds(
+        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch
+    ) -> None:
+        """A momentary `database is locked` collision on the enqueue write
+        (a concurrent writer holding the DB for a beat) must not drop the
+        assignment out of the scan — `retry_on_locked` rides it out and the
+        assignment is auto-enqueued normally, same as if there had been no
+        contention at all."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=2597, assignment_id="w-2597",
+            branch="issue-2597-fix",
+        )
+        self._seed_issue_state(coord_db, number=2597, state="open")
+
+        from coord import merge_queue as merge_queue_mod
+
+        real_refresh = merge_queue_mod.refresh_entry_assignment
+        calls = {"n": 0}
+
+        def _flaky_refresh(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return real_refresh(*args, **kwargs)
+
+        with patch(
+            "coord.merge_queue.refresh_entry_assignment", side_effect=_flaky_refresh,
+        ), patch(
+            "coord.db.time.sleep",  # keep the test fast — skip the real backoff
+        ), patch(
+            "coord.github_ops.create_pr",
+        ) as create, patch(
+            "coord.github_ops.merge_pr", return_value=(True, "ok"),
+        ), patch(
+            "coord.github_ops.get_pr_size", return_value=10,
+        ):
+            create.return_value = {"number": 99, "url": "u/99", "existed": False}
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert calls["n"] == 3
+        assert "auto-enqueued" in result.output
+        assert "#2597" in result.output
+        assert "skipped" not in result.output
+        create.assert_called_once()
+
+    def test_lock_contention_on_enqueue_write_fails_loudly_when_retries_exhausted(
+        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch
+    ) -> None:
+        """#2597: once `retry_on_locked`'s bounded budget is exhausted, the
+        contention is sustained, not momentary — the scan must NOT report
+        this as an ordinary `skipped: ...` line (the exact behavior that let
+        a mergeable assignment silently fall out of a real `coord merge`
+        run) and must instead surface loudly (a failing invocation), the
+        same way any other genuinely unrecoverable write failure would."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=2598, assignment_id="w-2598",
+            branch="issue-2598-fix",
+        )
+        self._seed_issue_state(coord_db, number=2598, state="open")
+
+        with patch(
+            "coord.merge_queue.refresh_entry_assignment",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch(
+            "coord.db.time.sleep",  # keep the test fast — skip the real backoff
+        ):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, sqlite3.OperationalError)
+        # Never silently swallowed into the scan's ordinary summary output.
+        assert "skipped" not in result.output
+        assert "auto-enqueued" not in result.output
 
 
 class TestStatusMergeQueue:

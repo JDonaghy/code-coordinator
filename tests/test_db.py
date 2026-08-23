@@ -14,6 +14,7 @@ from coord.db import (
     override_connection,
     close,
     _migrate_gate_order,
+    is_lock_contention_error,
     retry_on_locked,
 )
 
@@ -728,6 +729,72 @@ class TestMergeQueueCiFixDispatchesColumn:
         _ensure_schema(conn)
         assert "ci_fix_dispatches" in _merge_queue_columns(conn)
         conn.close()
+
+
+# ── is_lock_contention_error (#2597) ────────────────────────────────────────
+
+
+class TestIsLockContentionError:
+    """#2597: the substring check used to be duplicated (and drifting)
+    between `retry_on_locked` here and `coord.auto_loop`'s except block —
+    this predicate is the single shared source of truth both now call."""
+
+    def test_true_for_database_is_locked(self) -> None:
+        assert is_lock_contention_error(
+            sqlite3.OperationalError("database is locked")
+        )
+
+    def test_true_for_uppercase_or_mixed_case_message(self) -> None:
+        assert is_lock_contention_error(
+            sqlite3.OperationalError("Database Is Locked")
+        )
+
+    def test_true_for_table_level_lock_message(self) -> None:
+        """SQLite's other lock-collision wording — a table-level lock,
+        distinct from (and not a substring of) "database is locked"."""
+        assert is_lock_contention_error(
+            sqlite3.OperationalError("database table is locked")
+        )
+
+    def test_true_when_sqlite_errorcode_is_busy_even_with_other_wording(self) -> None:
+        """Belt-and-suspenders: a differently-worded message still counts
+        as contention when the underlying SQLITE_BUSY result code says so."""
+        exc = sqlite3.OperationalError("some other phrasing entirely")
+        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        assert is_lock_contention_error(exc)
+
+    def test_false_for_unrelated_operational_error(self) -> None:
+        assert not is_lock_contention_error(
+            sqlite3.OperationalError("no such table: bogus")
+        )
+
+    def test_false_for_non_operational_exception(self) -> None:
+        assert not is_lock_contention_error(RuntimeError("database is locked"))
+
+    def test_real_contention_between_two_connections_is_detected(
+        self, tmp_path
+    ) -> None:
+        """Not just message-matching in the abstract — the real exception
+        SQLite raises for genuine cross-connection contention on a file-
+        backed DB is recognized."""
+        path = tmp_path / "contend.db"
+        writer = sqlite3.connect(str(path), timeout=0)
+        writer.execute("CREATE TABLE t (x)")
+        writer.commit()
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO t VALUES (1)")
+
+        reader = sqlite3.connect(str(path), timeout=0)
+        reader.execute("PRAGMA busy_timeout=50")
+        try:
+            reader.execute("INSERT INTO t VALUES (2)")
+            raise AssertionError("expected the second writer to collide")
+        except sqlite3.OperationalError as exc:
+            assert is_lock_contention_error(exc)
+        finally:
+            writer.rollback()
+            writer.close()
+            reader.close()
 
 
 # ── retry_on_locked (#2538) ─────────────────────────────────────────────────

@@ -2551,12 +2551,22 @@ def _update_assignment_cost_local(assignment_id: str, cost_usd: float) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
-        "UPDATE assignments SET cost_usd=? WHERE assignment_id=? "
-        "AND (cost_usd IS NULL OR cost_usd < ?)",
-        (cost_usd, assignment_id, cost_usd),
-    )
-    conn.commit()
+
+    # #2597: this write previously had no lock-contention protection at
+    # all, so a momentary collision with a concurrent writer (the daemon's
+    # own tick, another `coord merge`/`coord notify`) raised straight out to
+    # `coord.notify._capture_cost`, which logs and swallows it — silently
+    # understating per-assignment spend rather than losing the write to a
+    # collision that a short retry would have ridden out.
+    def _write() -> None:
+        conn.execute(
+            "UPDATE assignments SET cost_usd=? WHERE assignment_id=? "
+            "AND (cost_usd IS NULL OR cost_usd < ?)",
+            (cost_usd, assignment_id, cost_usd),
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
 
 
 def update_assignment_branch(assignment_id: str, branch: str) -> None:
@@ -2872,7 +2882,8 @@ def _update_assignment_tokens_local(
     if total <= 0:
         return
     conn = get_connection()
-    try:
+
+    def _write() -> None:
         conn.execute(
             "UPDATE assignments SET "
             "input_tokens=?, output_tokens=?, "
@@ -2886,8 +2897,16 @@ def _update_assignment_tokens_local(
             ),
         )
         conn.commit()
+
+    try:
+        # #2597: retry momentary lock contention (same rationale as
+        # `_update_assignment_cost_local` above) before falling through to
+        # this function's existing best-effort swallow, which stays in
+        # place for the case that guard was originally written for — a
+        # genuinely missing column on a pre-migration DB or test fixture —
+        # and now also covers a lock that outlasts the retry budget.
+        retry_on_locked(_write)
     except sqlite3.OperationalError:
-        # Column may not exist yet (pre-migration DB or test fixtures).
         pass
 
 

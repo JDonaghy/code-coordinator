@@ -13,6 +13,8 @@ Scope per the issue's acceptance bar:
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 
 import pytest
 
@@ -147,6 +149,137 @@ class TestRecordAudit:
             r for r in _audit_rows(coord_db, assignment_id="aid-1")
             if r["category"] == "test"
         ] == []
+
+
+class _FlakyConn:
+    """Wraps a real sqlite3 connection and makes its first *fail_times*
+    ``execute()`` calls raise ``database is locked`` before delegating to
+    the real connection — simulates a momentary collision with a
+    concurrent writer.  ``fail_times=None`` never delegates (sustained
+    contention that outlasts the whole retry budget)."""
+
+    def __init__(self, real_conn, fail_times: int | None) -> None:
+        self._real = real_conn
+        self._fail_times = fail_times
+        self.calls = 0
+
+    def execute(self, *args, **kwargs):
+        self.calls += 1
+        if self._fail_times is None or self.calls <= self._fail_times:
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestRecordAuditRetriesLockContention:
+    """#2597: record_audit's write previously had zero retry protection at
+    all — 1,804 audit rows/24h were measured lost to ordinary, momentary
+    lock contention (a concurrent writer holding the DB for a beat) on
+    dellserver. It now rides out a transient collision via
+    `coord.db.retry_on_locked` before falling back to the documented
+    best-effort swallow (unaffected by this fix — see
+    `TestRecordAudit.test_swallows_bad_write_without_raising` above)."""
+
+    def test_retries_transient_contention_then_writes_the_row(
+        self, coord_db, monkeypatch
+    ) -> None:
+        proxy = _FlakyConn(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="retried through contention",
+            assignment_id="aid-retry",
+        )
+
+        assert proxy.calls == 3
+        rows = _audit_rows(coord_db, assignment_id="aid-retry")
+        assert len(rows) == 1
+        assert rows[0]["summary"] == "retried through contention"
+
+    def test_sustained_contention_is_still_swallowed_not_raised(
+        self, coord_db, monkeypatch
+    ) -> None:
+        proxy = _FlakyConn(coord_db, fail_times=None)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        # Must not raise — record_audit's documented contract, unchanged.
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="lost to sustained contention",
+        )
+
+        assert _audit_rows(coord_db) == []
+
+
+class TestLockContentionLossCounter:
+    """#2597: 1,804 identical WARNING lines/day is not a usable signal — a
+    write lost to sustained contention is now counted instead of logged
+    individually, so a per-run aggregate can report the total in one
+    line."""
+
+    def test_stays_at_zero_when_nothing_is_lost(self, coord_db) -> None:
+        from coord.audit import audit_lock_contention_losses
+
+        baseline = audit_lock_contention_losses()
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="ordinary write",
+        )
+        assert audit_lock_contention_losses() == baseline
+
+    def test_increments_when_a_write_is_genuinely_dropped(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.audit import audit_lock_contention_losses
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        baseline = audit_lock_contention_losses()
+        proxy = _FlakyConn(coord_db, fail_times=None)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary="should be counted, not logged per-row",
+        )
+
+        assert audit_lock_contention_losses() == baseline + 1
+
+    def test_flush_emits_one_aggregated_warning_and_resets(
+        self, coord_db, monkeypatch, caplog
+    ) -> None:
+        from coord.audit import (
+            _flush_lock_contention_summary,
+            audit_lock_contention_losses,
+        )
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        proxy = _FlakyConn(coord_db, fail_times=None)
+        monkeypatch.setattr("coord.audit.get_connection", lambda: proxy)
+
+        for _ in range(3):
+            record_audit(
+                tier="business", category="test", event_type="test_passed",
+                actor="user", summary="lost",
+            )
+        losses_before_flush = audit_lock_contention_losses()
+        assert losses_before_flush >= 3
+
+        with caplog.at_level(logging.WARNING, logger="coord.audit"):
+            _flush_lock_contention_summary()
+
+        assert audit_lock_contention_losses() == 0
+        matches = [
+            r for r in caplog.records
+            if "writes lost to lock contention" in r.message
+        ]
+        # ONE aggregated line, not one per lost write.
+        assert len(matches) == 1
+        assert str(losses_before_flush) in matches[0].getMessage()
 
 
 class TestAuditLevel:

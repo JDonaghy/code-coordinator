@@ -22,16 +22,21 @@ row is best-effort observability on top of it.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import time
 from typing import Any
 
-from coord.db import get_connection
+from coord.db import get_connection, is_lock_contention_error, retry_on_locked
 
 _log = logging.getLogger(__name__)
 
-__all__ = ["record_audit", "query_audit_log"]
+__all__ = [
+    "record_audit",
+    "query_audit_log",
+    "audit_lock_contention_losses",
+]
 
 # Valid values are documented in the issue but not enforced here — callers
 # are all internal (coord.state / coord.issue_store), and rejecting an
@@ -94,7 +99,19 @@ def record_audit(
             details=details,
         )
     except Exception as exc:  # noqa: BLE001 — audit logging must never break the caller
-        _log.warning("record_audit: best-effort write failed: %s", exc)
+        if is_lock_contention_error(exc):
+            # #2597: `_record_audit_unsafe` already retried this write
+            # several times (`retry_on_locked`) before this was reached —
+            # sustained contention, not a momentary collision. Still
+            # best-effort (never raises into the caller), but a WARNING per
+            # occurrence is exactly the flood #2597 measured (1,804/day on
+            # dellserver, one indistinguishable line each) — count it
+            # instead and let `_flush_lock_contention_summary` report the
+            # aggregate once per run.
+            _record_lock_contention_loss()
+            _log.debug("record_audit: write lost to lock contention: %s", exc)
+        else:
+            _log.warning("record_audit: best-effort write failed: %s", exc)
 
 
 def _record_audit_unsafe(
@@ -115,27 +132,95 @@ def _record_audit_unsafe(
     try/except wrapper is the ONLY thing between this and the caller —
     keeps the swallow-and-log behavior in one obvious place."""
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO audit_log (
-            ts, tier, category, event_type, actor,
-            repo, issue, assignment_id, machine, summary, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            ts if ts is not None else time.time(),
-            tier,
-            category,
-            event_type,
-            actor,
-            repo,
-            issue,
-            assignment_id,
-            machine,
-            summary,
-            json.dumps(details) if details is not None else None,
-        ),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            """INSERT INTO audit_log (
+                ts, tier, category, event_type, actor,
+                repo, issue, assignment_id, machine, summary, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ts if ts is not None else time.time(),
+                tier,
+                category,
+                event_type,
+                actor,
+                repo,
+                issue,
+                assignment_id,
+                machine,
+                summary,
+                json.dumps(details) if details is not None else None,
+            ),
+        )
+        conn.commit()
+
+    # #2597: this table is the coordinator's primary diagnostic surface —
+    # "coord audit" — and 1,804 rows/24h were measured lost to ordinary,
+    # momentary lock contention (a concurrent writer holding the DB for a
+    # beat) on dellserver, indistinguishable from a real gap in the trail.
+    # Give this write the same short, backed-off retry every other
+    # load-bearing write in this codebase already gets before falling
+    # through to record_audit's best-effort swallow.
+    retry_on_locked(_write)
     _maybe_trim(conn)
+
+
+# ── Lock-contention loss counter (#2597) ────────────────────────────────────
+#
+# `retry_on_locked` above turns most lock collisions into a successful write
+# a few hundred milliseconds later, so a write reaching `record_audit`'s
+# `except` clause with `is_lock_contention_error(exc)` true means sustained
+# contention outlasted that whole retry budget — rare, but not impossible
+# under a genuinely busy DB. Logging each occurrence at WARNING is exactly
+# the flood #2597 measured (1,804 identical lines/day) — count them instead
+# and report ONE aggregated warning per process (`atexit`, so it fires for a
+# short-lived CLI invocation like `coord merge` and, if it ever shuts down
+# cleanly, the long-running daemon too) rather than leaving the loss
+# invisible or drowning the log in duplicates.
+
+_lock_contention_losses = 0
+_summary_flush_registered = False
+
+
+def _record_lock_contention_loss() -> None:
+    """Bump the run-scoped lost-write counter and arrange for the aggregate
+    to be reported once this process exits (see
+    :func:`_flush_lock_contention_summary`)."""
+    global _lock_contention_losses, _summary_flush_registered
+    _lock_contention_losses += 1
+    if not _summary_flush_registered:
+        _summary_flush_registered = True
+        atexit.register(_flush_lock_contention_summary)
+
+
+def _flush_lock_contention_summary() -> None:
+    """Emit ONE aggregated warning for this run's audit writes lost to
+    sustained lock contention, if any, and reset the counter.
+
+    Registered via :func:`atexit.register` the first time a write is lost
+    (see :func:`_record_lock_contention_loss`) rather than called from a
+    fixed call site, so it fires for every entry point — `coord merge`,
+    `coord notify`, the daemon — without each one needing its own hook.
+    Also callable directly (tests; a caller that wants to flush mid-run
+    without waiting for process exit).
+    """
+    global _lock_contention_losses
+    if _lock_contention_losses:
+        _log.warning(
+            "audit: %d writes lost to lock contention", _lock_contention_losses
+        )
+        _lock_contention_losses = 0
+
+
+def audit_lock_contention_losses() -> int:
+    """Current count of audit writes lost to sustained lock contention this
+    run, not yet flushed by :func:`_flush_lock_contention_summary`.
+
+    Exposed for tests and diagnostics — advisory only, like the rest of the
+    audit log; nothing gates dispatch/review/merge decisions on this value.
+    """
+    return _lock_contention_losses
 
 
 def _maybe_trim(conn) -> None:

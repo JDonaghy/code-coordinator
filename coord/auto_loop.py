@@ -42,6 +42,7 @@ from dataclasses import dataclass
 import httpx
 
 from coord.config import Config
+from coord.db import is_lock_contention_error
 from coord.dispatch import AGENT_PORT
 from coord import github_ops
 from coord.models import SEALED_PATH_AUTHOR_TYPES, Assignment, Board
@@ -1228,7 +1229,7 @@ def _dispatch_fix(
             repo_github=repo.github,
         )
     except sqlite3.OperationalError as exc:
-        if "database is locked" not in str(exc).lower():
+        if not is_lock_contention_error(exc):
             # Not the transient contention this guard exists for (#2538) —
             # a schema mismatch or malformed statement is a real bug and
             # must not be swallowed as an ordinary declined dispatch.
