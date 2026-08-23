@@ -20,17 +20,33 @@ A later ``changes_requested`` on the same submission takes it back off the
 list — last verdict wins, not "was ever approved".
 
 **Field-name honesty (contract §6.9).** coord-portal's submission schema
-lives in a separate repo that is not visible from here, so the intake fields
-(outcome / audience / done-definition / constraints, plus client and project
-identity) are read out of the read-only customer mirror
-(``portal_submissions.customer_json``, which
+lives in a separate repo, so the intake fields (outcome / audience /
+done-definition / constraints, plus client and project identity) are read out
+of the read-only customer mirror (``portal_submissions.customer_json``, which
 :func:`coord.portal_sync._mirror_event` fills with whatever the portal sent
 minus coord-owned keys) under the contract's own key spelling, with the
 camelCase variant accepted as an alias because the portal is a TypeScript
 worker. A field the portal never sent renders as an empty string — the panel
-shows a blank cell, it does not omit the row or crash. If coord-portal's
-real spelling turns out to be something else entirely, this alias table is
-the one place to correct it.
+shows a blank cell, it does not omit the row or crash.
+
+**Client + project identity, confirmed (#2586, coord-portal#146).**
+``submission.created``'s payload (coord-portal's ``src/submissions.ts``)
+carries ``client_id`` and ``project_id`` — both opaque ids, both ``null``
+until the portal has matched/assigned one. There is deliberately **no**
+human-readable name on the wire for either: an earlier round of #146 shipped
+a ``client_email``/name field and reverted it, because ms-2's "coord never
+sees leads" invariant (issue #33) forbids a customer's contact address
+reaching the daemon, and a display label is "the portal's to render, from its
+own screens" — not this bridge's to carry. So ``project_id`` was already the
+right guess from #2532 (unchanged below), but ``client`` was not: the portal
+never sends a bare ``client``/``client_name``/``clientName`` key, only
+``client_id``, so that alias tuple now reads the real spelling first and
+keeps the old guesses only as a fallback for hand-seeded fixtures.
+``project_label`` remains a guess with nothing behind it today — kept in the
+table so a future portal addition is picked up automatically, but it will
+render ``""`` until coord-portal actually ships one. If coord-portal's real
+spelling for anything else here turns out to be something different, this
+alias table is the one place to correct it.
 """
 
 from __future__ import annotations
@@ -45,8 +61,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: deserializes without ``#[serde(default)]``, i.e. the ones this module must
 #: always emit even when the mirror has nothing for them.
 _TEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
-    "client": ("client", "client_name", "clientName"),
+    # coord-portal#146 (confirmed): `submission.created` carries client
+    # identity as `client_id` only — an opaque id, `null` until the portal
+    # has matched a `clients` row, never a name or email. The pre-#146 guess
+    # (`client` / `client_name` / `clientName`) never matched anything real;
+    # it stays as a fallback for hand-seeded fixtures, but `client_id` is the
+    # confirmed spelling and is tried first.
+    "client": ("client_id", "client", "client_name", "clientName"),
+    # coord-portal#146 confirmed this guess was already correct — no change.
+    # Left in place (rather than collapsed to one key) as a record that it
+    # was actually checked, not skipped.
     "project_id": ("project_id", "projectId"),
+    # coord-portal#146 does NOT send a human-readable project label — a
+    # display name is deliberately kept off the wire (see the module
+    # docstring). This renders "" until/unless a future portal change adds
+    # one; kept here so that day needs no code change.
     "project_label": ("project_label", "projectLabel"),
     "outcome": ("outcome",),
     "audience": ("audience",),

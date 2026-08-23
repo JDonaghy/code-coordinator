@@ -319,6 +319,35 @@ class TestBoardWiring:
         # ISO-8601 Z, the shape tui/src/app/data.rs parses.
         assert row["received_at"] == "2025-08-18T06:54:00Z"
 
+    def test_the_real_coord_portal_146_identity_shape_resolves_end_to_end(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """coord-portal#146's confirmed `submission.created` payload sends
+        `client_id`/`project_id` only — opaque ids, no display name/label of
+        any kind (see docs/CUSTOMER_PORTAL.md). This seeds exactly that
+        shape (not the pre-#146 `client=`/`project_label=` guess the other
+        test above still checks as a fallback) and proves
+        `portal.project_repos` resolves the real id to a coord repo, wired
+        all the way through `GET /board`."""
+        _seed_submission(
+            "sub_real_shape",
+            project_id="proj_9f2a",
+            first_seen_at=1755500040.0,
+            client_id="cli_9f2a",
+            outcome="Customers can self-serve a billing address change.",
+        )
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+
+        assert row["submission_id"] == "sub_real_shape"
+        # The confirmed wire key `client_id` is read, not just the old guess.
+        assert row["client"] == "cli_9f2a"
+        assert row["project_id"] == "proj_9f2a"
+        # coord-portal never sends a label — this stays the empty-string
+        # supported state, not an error.
+        assert row["project_label"] == ""
+        assert row["repos"] == ["api", "shared"]
+
     def test_every_non_defaulted_wire_field_is_always_present(
         self, detail_db, portal_config_path, rw_db
     ) -> None:

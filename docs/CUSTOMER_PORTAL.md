@@ -122,6 +122,36 @@ the two retries the announcement; it can never overtake its content.
 operator surface; it is a daemon-host command group because the bridge's cursor lives in the daemon's
 `coord.db`.
 
+### Client + project identity — confirmed wire shape (#2586, coord-portal#146)
+
+`coord/approved_work.py`'s `_TEXT_FIELD_ALIASES` table used to guess at coord-portal's real field
+spelling (its schema lives in a separate repo). coord-portal#146 pinned it, so this records the
+confirmed shape rather than making the next reader re-measure it against a live DB:
+
+- **`client_id`** — an opaque id into coord-portal's `clients` table, `null` until the portal has
+  matched this customer to one. **Not** `client` / `client_name` / `clientName` — an earlier round of
+  #146 shipped a `client_email` field on `submission.created` and reverted it: ms-2's "coord never sees
+  leads" invariant (coord-portal issue #33) forbids a customer's contact address reaching the daemon at
+  all, on any field, and the reasoning that a *client account's* address is a different fact from "who
+  filed this submission" did not survive that contract. **No email address of any kind crosses this
+  bridge**, and no human-readable client name does either — a display label is the portal's to render,
+  from its own screens.
+- **`project_id`** — an opaque id into coord-portal's `projects` table. This is what
+  `portal.project_repos` (`coordinator.yml`) actually keys on, and is the field #2532's original guess
+  already had right.
+- **No project label/name is sent.** Same posture as the client name above — coord-portal keeps
+  human-readable labels off the wire deliberately. `project_label` stays in the alias table as a
+  reserved key (renders `""` today) so a future portal addition needs no coord-side code change, not
+  because one exists yet.
+- `outcome` / `audience` / `done_definition` / `constraints` on `submission.created`'s payload are
+  exactly the snake_case guesses `_TEXT_FIELD_ALIASES` already had — also confirmed, not changed.
+
+Both `client_id` and `project_id` are set once, at `submission.created`, and never re-sent by a later
+`signoff.*` event — `coord.portal_store.mirror_customer_facts`'s merge-not-replace behavior (the same
+mechanism #2585 fixed the envelope-nesting bug for) is what keeps a bare `signoff.approved` payload
+(typically just `{"verdict": ..., "round": ..., "comment": ...}`) from wiping them, the same way it
+already protected `outcome`/`audience`/`done_definition`/`constraints`.
+
 ## The customer loop
 
 ```
