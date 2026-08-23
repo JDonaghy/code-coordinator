@@ -110,27 +110,49 @@ def _resolve_log_machine_via_daemon(assignment_id: str, config_path: Path):
     too. Returns ``None`` (silently — the caller's existing "no log found"
     error is the right message in that case) when no board_service is
     configured, the daemon is unreachable, or the id doesn't resolve there
-    either."""
-    from coord.client import fetch_board_payload, resolve_board_service
+    either.
+
+    #2547: the ``/board`` collection scan below is a *lossy* projection —
+    ``coord.board_wire.cap_terminal_assignments`` drops terminal rows past
+    ``MAX_TERMINAL_ASSIGNMENTS`` once the payload exceeds its byte budget, so
+    a perfectly real, terminal assignment (e.g. a rescued ``advisory`` row on
+    a closed issue) can legitimately be absent from ``payload["assignments"]``
+    while the log file — and the DB row itself — are fully intact on the
+    machine that ran it. Before giving up, fall back to the point lookup
+    (``GET /assignment/{id}`` via :func:`~coord.client.fetch_assignment`),
+    which reads the row straight from the daemon's DB and is never subject to
+    the collection wire's truncation.
+    """
+    from coord.client import fetch_assignment, fetch_board_payload, resolve_board_service
 
     svc = resolve_board_service()
     if svc is None:
         return None
+    machine_name = None
     try:
         payload = fetch_board_payload(svc)
-    except Exception:  # noqa: BLE001 — best-effort; fall through to local error
-        return None
-    row = next(
-        (
-            a
-            for a in payload.get("assignments", [])
-            if a.get("assignment_id") == assignment_id
-        ),
-        None,
-    )
-    if row is None:
-        return None
-    machine_name = row.get("machine_name")
+    except Exception:  # noqa: BLE001 — best-effort; fall through to the point lookup
+        payload = None
+    if payload is not None:
+        row = next(
+            (
+                a
+                for a in payload.get("assignments", [])
+                if a.get("assignment_id") == assignment_id
+            ),
+            None,
+        )
+        if row is not None:
+            machine_name = row.get("machine_name")
+    if not machine_name:
+        # #2547: not in the (possibly truncated) board collection — try the
+        # untruncated single-row lookup before concluding "no log".
+        try:
+            row = fetch_assignment(svc, assignment_id)
+        except Exception:  # noqa: BLE001 — best-effort; fall through to local error
+            row = None
+        if row is not None:
+            machine_name = row.get("machine_name")
     if not machine_name:
         return None
     cfg = _load_config(config_path)

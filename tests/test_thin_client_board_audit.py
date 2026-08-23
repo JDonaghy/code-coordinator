@@ -389,6 +389,11 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     "reconcile.py": {
         # build_board in reconcile_completed_assignments: daemon tick only.
         ("reconcile_completed_assignments", "build_board"),
+        # build_board in reconcile_late_agent_reports (#2547): same daemon-
+        # tick-only posture as reconcile_completed_assignments above — called
+        # from serve_app._passive_tick / _tick_loop right after it, never
+        # from a thin-client CLI command.
+        ("reconcile_late_agent_reports", "build_board"),
         # save_plan in _capture_plan_best_effort: daemon tick only.
         ("_capture_plan_best_effort", "save_plan"),
         # NOTE: reconcile() calls get_issue_test_mode(), but that function is
