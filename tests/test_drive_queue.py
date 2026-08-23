@@ -37,10 +37,12 @@ from coord.drive_queue import (
     IssueFacts,
     QueueEntry,
     QueueError,
+    add_preflight_notice,
     build_board_view,
     entries_from_rows,
     entry_key,
     find_cycle,
+    is_empty_branch_death_reason,
     parse_after_spec,
     parse_key,
     plan_tick,
@@ -4241,3 +4243,87 @@ def test_drift_is_checked_even_when_no_cordon_is_present():
     )
     assert plan.launch is None
     assert "detached HEAD" in plan.drift_reason
+
+
+# ── #2339: `add`-time preflight for a terminal zero-commit ADVISORY ──────────
+
+
+_EMPTY_BRANCH_REASON = (
+    "drive exited for claude-coordinator#3 (exit_code=1): work adv-1 exited "
+    "ADVISORY with no commits on its branch 1 time(s) in a row (budget 1, "
+    "#2416) — nothing was pushed, so there is nothing to test, review, or "
+    "merge."
+)
+
+
+def test_preflight_is_silent_for_an_unqueued_issue_with_no_advisory_row():
+    assert add_preflight_notice(REPO, 3, None) == ""
+    assert (
+        add_preflight_notice(REPO, 3, entry(3), work_aid="a1", work_status="running")
+        == ""
+    )
+
+
+def test_preflight_names_coord_retry_with_the_real_assignment_id():
+    notice = add_preflight_notice(
+        REPO, 3, None, work_aid="adv-1", work_status="advisory", work_machine="precision"
+    )
+    assert "coord retry adv-1" in notice
+    assert "TERMINAL" in notice
+    assert "#1606" in notice
+    # The escape hatch for the OTHER advisory shape is named too, so an
+    # operator whose branch does carry commits is not sent down a path
+    # `coord retry` will refuse.
+    assert "--accept-advisory" in notice
+    assert "coord log adv-1 --machine precision" in notice
+
+
+def test_preflight_reports_a_stuck_entry_that_this_add_did_not_requeue():
+    notice = add_preflight_notice(
+        REPO, 3, entry(3, state=STATE_BLOCKED, attempts=2), work_aid="", work_status=""
+    )
+    assert "did NOT requeue it" in notice
+    assert "2 attempt(s) spent" in notice
+    assert f"coord drive-queue remove {REPO} 3" in notice
+    # No board row was resolvable, so nothing claims to know the cause.
+    assert "coord retry" not in notice
+
+
+def test_preflight_reports_both_halves_cause_before_mechanical_reset():
+    notice = add_preflight_notice(
+        REPO,
+        3,
+        entry(3, state=STATE_BLOCKED, attempts=2, last_reason=_EMPTY_BRANCH_REASON),
+        work_aid="adv-1",
+        work_status="advisory",
+    )
+    lines = notice.splitlines()
+    assert "coord retry adv-1" in notice
+    assert "did NOT requeue it" in notice
+    # Cause first, mechanical reset second — an operator who runs the
+    # remove+add without clearing the row just burns the attempts again.
+    retry_at = next(i for i, line in enumerate(lines) if "coord retry adv-1" in line)
+    requeue_at = next(i for i, line in enumerate(lines) if "did NOT requeue it" in line)
+    assert retry_at < requeue_at
+
+
+def test_preflight_falls_back_to_the_queues_own_recorded_death():
+    """The board leg failed (or the row was already cleared), but the entry's
+    own `last_reason` is the zero-commit shape `coord drive` writes."""
+    notice = add_preflight_notice(
+        REPO, 3, entry(3, last_reason=_EMPTY_BRANCH_REASON)
+    )
+    assert "zero-commit" in notice
+    assert "coord retry <assignment_id>" in notice
+    # No id was resolvable, so none is invented.
+    assert "coord retry adv-1" not in notice
+
+
+def test_a_running_entrys_ordinary_death_gets_no_zero_commit_note():
+    assert is_empty_branch_death_reason("drive exited: CI red on issue-3") is False
+    assert add_preflight_notice(REPO, 3, entry(3, last_reason="CI red")) == ""
+
+
+def test_is_empty_branch_death_reason_matches_the_drive_advisory_text():
+    assert is_empty_branch_death_reason(_EMPTY_BRANCH_REASON) is True
+    assert is_empty_branch_death_reason(None) is False

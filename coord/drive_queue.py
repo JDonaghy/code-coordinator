@@ -2199,6 +2199,135 @@ def _is_empty_branch_death_reason(reason: str | None) -> bool:
     return "exited advisory" in lowered and "nothing was pushed" in lowered
 
 
+def is_empty_branch_death_reason(reason: str | None) -> bool:
+    """Public alias for :func:`_is_empty_branch_death_reason` (#2339).
+
+    Same convention as ``is_permanent_block_reason`` /
+    ``is_unsatisfiable_prereq_reason``: the classifier is shared with the
+    ``add``-side preflight in ``coord.commands.drive_queue``, so it gets a
+    non-underscored name rather than a second copy of the text match.
+    """
+    return _is_empty_branch_death_reason(reason)
+
+
+# ── `add`-time preflight (#2339) ─────────────────────────────────────────────
+
+#: Board statuses a queue attempt can never move on its own — every launch
+#: re-reads the identical terminal row.  Only ``advisory`` today (#1606); a
+#: ``failed`` work row IS re-dispatched automatically by ``coord drive``'s own
+#: ``work_retries`` budget, so it is deliberately not in here.
+TERMINAL_WORK_STATUSES: frozenset[str] = frozenset({"advisory"})
+
+#: Queue states in which an ``add`` upsert changes NOTHING about whether the
+#: entry will ever launch — ``enqueue`` writes the operator-declared columns
+#: (machine / after / gate) and deliberately leaves run state (``state`` /
+#: ``attempts`` / ``last_reason``) to the tick.
+STUCK_QUEUE_STATES: frozenset[str] = frozenset({STATE_BLOCKED, STATE_FAILED})
+
+
+def add_preflight_notice(
+    repo: str,
+    issue: int,
+    previous: "QueueEntry | None",
+    *,
+    work_aid: str = "",
+    work_status: str = "",
+    work_machine: str = "",
+) -> str:
+    """#2339: what ``coord drive-queue add`` must SAY, or ``''`` for nothing.
+
+    The incident this closes (space-invaders#3): an issue whose latest work
+    assignment is a genuine zero-commit ADVISORY (#1606 — the worker exited
+    0, its branch carries no commits) is sitting on a **terminal** board row.
+    ``coord retry <aid>`` is the one command that clears it — it re-verifies
+    the commit count against GitHub, refuses the #1357 false-positive shape
+    where the branch does carry commits, and dispatches a fresh worker.
+    ``coord drive-queue add`` knew none of that: it echoed ``queued repo#N``
+    and stopped, so the entry drained its attempts against the identical
+    unchanged row (five launches over ~8 hours, only the first of which ever
+    created an assignment), and nothing anywhere named ``coord retry``. An
+    operator found the cause only by reading the drive's run log by hand.
+
+    Two independent notes, either of which can fire alone:
+
+    * **the terminal work row** — *work_status* is one of
+      :data:`TERMINAL_WORK_STATUSES`, or the entry's own recorded death is
+      the zero-commit shape (:func:`is_empty_branch_death_reason`, the text
+      ``coord drive``'s ``_decide_advisory`` writes). Names the assignment
+      id and ``coord retry``.
+    * **the no-op upsert** — *previous* is in a :data:`STUCK_QUEUE_STATES`
+      state, where ``add`` updates order/flags only and therefore did NOT
+      requeue anything. Names ``remove && add``, the documented reset.
+
+    Deliberately advisory-only and never a refusal, the same posture #2247's
+    overlap prediction takes: a false positive here costs an operator one
+    paragraph of reading, a refusal costs them the queue. Every input is
+    optional and unknown values simply produce fewer lines — the caller
+    resolves the board fail-open, so an unreachable board degrades to exactly
+    the pre-#2339 output rather than an error.
+    """
+    key = entry_key(repo, issue)
+    lines: list[str] = []
+
+    status = str(work_status or "").strip().lower()
+    terminal_row = bool(work_aid) and status in TERMINAL_WORK_STATUSES
+    empty_branch = previous is not None and _is_empty_branch_death_reason(
+        previous.last_reason
+    )
+
+    if terminal_row:
+        lines.append(
+            f"warning: {key}'s latest work assignment ({work_aid}) is "
+            f"{status.upper()} — a TERMINAL board row (#1606). Queuing does not "
+            "clear it: every launch re-reads the same row, so the attempts drain "
+            "with no new board state."
+        )
+        if empty_branch:
+            lines.append(
+                "  this entry's last drive died on exactly that shape "
+                "(zero commits on the branch — nothing was pushed)."
+            )
+        lines.append(f"  clear it first:  coord retry {work_aid}")
+        lines.append(
+            "  `coord retry` re-verifies the branch's commit count against "
+            "GitHub before dispatching a fresh worker, and refuses the #1357 "
+            "false-positive shape where the branch DOES carry commits — use "
+            "`coord drive --accept-advisory` for that one."
+        )
+        if work_machine:
+            lines.append(
+                f"  inspect first:   coord log {work_aid} --machine {work_machine}"
+            )
+    elif empty_branch:
+        # No live terminal row to name — it was already cleared, or the board
+        # could not be read — but the queue's OWN recorded death is the
+        # zero-commit shape, which is still worth surfacing before the entry
+        # spends another attempt reproducing it.
+        lines.append(
+            f"warning: {key}'s last drive died on the zero-commit "
+            "DONE/ADVISORY shape (#1606) — the worker claimed success but "
+            "pushed nothing."
+        )
+        lines.append(
+            "  if its work row is still ADVISORY, `coord retry <assignment_id>` "
+            "is what clears it; `coord drive-queue list` shows the recorded "
+            "reason in full."
+        )
+
+    if previous is not None and previous.state in STUCK_QUEUE_STATES:
+        lines.append(
+            f"warning: {key} was already queued in state {previous.state!r} "
+            f"({previous.attempts} attempt(s) spent). `add` updates order and "
+            "flags only — never run state — so this add did NOT requeue it."
+        )
+        lines.append(
+            f"  requeue it:      coord drive-queue remove {repo} {issue} && "
+            f"coord drive-queue add {repo} {issue}"
+        )
+
+    return "\n".join(lines)
+
+
 def _retry_backoff_reason(
     entry: QueueEntry,
     facts: IssueFacts,

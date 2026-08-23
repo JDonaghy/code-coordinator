@@ -359,6 +359,85 @@ def test_overlap_ordering_can_be_opted_out_of(cli, declare):
     assert queued(307)["after_json"] == []
 
 
+# ── #2339: the zero-commit-ADVISORY preflight on `add` ───────────────────────
+#
+# space-invaders#3: five `drive-queue add`/relaunch cycles over ~8 hours
+# against a work row that had been terminally ADVISORY since the first one.
+# Only `coord retry <aid>` clears that row, and nothing in `add`'s output had
+# ever named it — the operator found the cause by reading a run log by hand.
+
+
+def _advisory_row(issue: int, aid: str = "adv-1") -> dict:
+    return {"issue_number": issue, "status": "advisory", "assignment_id": aid}
+
+
+def test_add_names_coord_retry_for_a_terminal_advisory_work_row(cli, seed):
+    seed(issues={3: "open"}, assignments=[_advisory_row(3, "adv-space-3")])
+
+    result = cli("add", REPO, "3")
+
+    assert result.exit_code == 0, result.output
+    # The write still happened — this is an advisory, never a refusal.
+    assert queued(3) is not None
+    assert "queued claude-coordinator#3" in result.output
+    # ... and the one command that actually clears the row is named, with the
+    # real assignment id, not a placeholder the operator has to go look up.
+    assert "coord retry adv-space-3" in result.output
+    assert "ADVISORY" in result.output
+    assert "#1606" in result.output
+
+
+def test_add_says_nothing_extra_for_an_ordinary_issue(cli, seed):
+    seed(issues={3: "open"}, assignments=[{"issue_number": 3, "status": "running"}])
+
+    result = cli("add", REPO, "3")
+
+    assert result.exit_code == 0, result.output
+    assert "coord retry" not in result.output
+    assert result.output.strip() == "queued claude-coordinator#3"
+
+
+def test_add_onto_a_blocked_entry_says_it_did_not_requeue_it(cli, seed):
+    seed(issues={3: "open"}, assignments=[_advisory_row(3, "adv-space-3")])
+    assert cli("add", REPO, "3").exit_code == 0
+    state._update_drive_queue_entry_local(
+        REPO,
+        3,
+        state=STATE_BLOCKED,
+        attempts=2,
+        last_reason=(
+            "work adv-space-3 exited ADVISORY with no commits on its branch "
+            "(2/2 attempts) — nothing was pushed, so there is nothing to test"
+        ),
+    )
+
+    result = cli("add", REPO, "3")
+
+    assert result.exit_code == 0, result.output
+    # The upsert leaves run state alone, so the entry is still blocked and
+    # will NOT launch — say so instead of echoing a bare "queued".
+    assert queued(3)["state"] == STATE_BLOCKED
+    assert queued(3)["attempts"] == 2
+    assert "did NOT requeue it" in result.output
+    assert f"coord drive-queue remove {REPO} 3" in result.output
+    # And the root cause is still named ahead of the mechanical reset.
+    assert "coord retry adv-space-3" in result.output
+    assert "zero commits" in result.output
+
+
+def test_add_preflight_survives_an_unreadable_board(cli, seed, monkeypatch):
+    seed(issues={3: "open"}, assignments=[_advisory_row(3)])
+    monkeypatch.setattr(
+        "coord.drive_state.BoardFetcher.fetch",
+        lambda self: (_ for _ in ()).throw(RuntimeError("daemon down")),
+    )
+
+    result = cli("add", REPO, "3")
+
+    assert result.exit_code == 0, result.output
+    assert "queued claude-coordinator#3" in result.output
+
+
 def test_a_declared_file_is_checked_against_a_live_branchs_real_diff(
     cli, declare, seed, branch_diff,
 ):
