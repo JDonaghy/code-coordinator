@@ -189,6 +189,102 @@ class TestGetLinkBySubmission:
         assert get_link_by_submission("sub_b").repo_name == "repo-b"
 
 
+class TestEventsForSubmission:
+    """#2659: the read half of the `coord portal remirror` backfill — the
+    full, undamaged event history a clobbered mirror is reconstructed from.
+    """
+
+    def test_empty_when_no_events_pulled(self, coord_db) -> None:
+        from coord.portal_store import events_for_submission
+
+        assert events_for_submission("sub_1") == []
+
+    def test_empty_submission_id_is_a_clean_empty_list(self, coord_db) -> None:
+        from coord.portal_store import events_for_submission
+
+        assert events_for_submission("") == []
+
+    def test_returns_oldest_first(self, coord_db) -> None:
+        from coord.portal_store import events_for_submission, record_events
+
+        record_events(
+            [
+                {"id": "e2", "submission_id": "sub_1", "type": "b", "at": "t2"},
+                {"id": "e1", "submission_id": "sub_1", "type": "a", "at": "t1"},
+            ]
+        )
+        events = events_for_submission("sub_1")
+        assert [e.event_id for e in events] == ["e2", "e1"]  # insertion order,
+        # since both share the same `received_at` stamp — real pulls arrive
+        # on separate ticks and so get distinct, ordering `received_at`s.
+
+    def test_only_returns_the_named_submission(self, coord_db) -> None:
+        from coord.portal_store import events_for_submission, record_events
+
+        record_events(
+            [
+                {"id": "e1", "submission_id": "sub_1", "type": "a"},
+                {"id": "e2", "submission_id": "sub_2", "type": "a"},
+            ]
+        )
+        events = events_for_submission("sub_1")
+        assert len(events) == 1
+        assert events[0].event_id == "e1"
+
+
+class TestAllEventSubmissionIds:
+    def test_empty_by_default(self, coord_db) -> None:
+        from coord.portal_store import all_event_submission_ids
+
+        assert all_event_submission_ids() == []
+
+    def test_deduplicates_and_sorts(self, coord_db) -> None:
+        from coord.portal_store import all_event_submission_ids, record_events
+
+        record_events(
+            [
+                {"id": "e1", "submission_id": "sub_b", "type": "a"},
+                {"id": "e2", "submission_id": "sub_a", "type": "a"},
+                {"id": "e3", "submission_id": "sub_b", "type": "a"},
+            ]
+        )
+        assert all_event_submission_ids() == ["sub_a", "sub_b"]
+
+
+class TestReplaceCustomerJson:
+    """#2659: the write half — rebuild from empty, not merge, which is the
+    whole point of the backfill (a merge would leave a stale `"payload"` key
+    sitting next to the freshly-derived facts)."""
+
+    def test_creates_the_submission_row_if_missing(self, coord_db) -> None:
+        from coord.portal_store import get_submission, replace_customer_json
+
+        replace_customer_json("sub_1", {"outcome": "x"})
+        record = get_submission("sub_1")
+        assert record is not None
+        assert record.customer == {"outcome": "x"}
+
+    def test_overwrites_rather_than_merges(self, coord_db) -> None:
+        from coord.portal_store import (
+            get_submission,
+            mirror_customer_facts,
+            replace_customer_json,
+        )
+
+        mirror_customer_facts("sub_1", {"payload": {"verdict": "approved"}})
+        replace_customer_json("sub_1", {"outcome": "x", "verdict": "approved"})
+        record = get_submission("sub_1")
+        assert record is not None
+        assert record.customer == {"outcome": "x", "verdict": "approved"}
+        assert "payload" not in record.customer
+
+    def test_empty_submission_id_is_a_no_op(self, coord_db) -> None:
+        from coord.portal_store import list_submissions, replace_customer_json
+
+        replace_customer_json("", {"outcome": "x"})
+        assert list_submissions() == []
+
+
 class TestStatePersistenceDirect:
     """The board_meta seam itself — `coord.state`'s half, exercised the same
     way `TestPersistence` in `tests/test_gate_a.py` exercises the sibling

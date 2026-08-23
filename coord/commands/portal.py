@@ -794,6 +794,85 @@ def portal_enqueue_question(submission_id: str, question: str) -> None:
     )
 
 
+@portal_group.command("remirror")
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Print before/after per submission; write nothing.",
+)
+@click.argument("submission_ids", nargs=-1)
+def portal_remirror(dry_run: bool, submission_ids: tuple[str, ...]) -> None:
+    """Rebuild portal_submissions.customer_json from portal_events (#2659).
+
+    Backfill for the rows a since-fixed `_mirror_event` (#2585, `b09a3e2f`)
+    already wrote wrong: the envelope-unwrap bug left every customer fact
+    nested under a top-level `"payload"` key, and the pre-fix merge-by-
+    top-level-key fold let a later event's payload (e.g. a sign-off verdict)
+    CLOBBER an earlier one's (e.g. the original intake) instead of merging
+    into it. `portal_events` still holds every pulled event, undamaged —
+    nothing ever rewrites a stored event — so the mirror is fully
+    reconstructible: this replays a submission's events oldest-first through
+    the FIXED fold (`coord.portal_sync.customer_facts_from_event`, the exact
+    function the live pull path uses) and REBUILDS `customer_json` from
+    empty.
+
+    From empty, not merged into the current value — a merge would leave the
+    stale, un-unwrapped `"payload"` key sitting next to the newly-derived
+    facts, a third bad state rather than a repair.
+
+    With SUBMISSION_IDS: remirror just those. Without: every submission_id
+    `portal_events` has ever seen.
+
+    Run this only after the daemon fleet has rolled the #2585 release —
+    replaying events through the OLD broken fold would just rewrite the same
+    damage (see the issue's operator note).
+    """
+    _refuse_if_thin_client("remirror")
+
+    from coord import portal_store  # noqa: PLC0415
+    from coord.portal_sync import customer_facts_from_event  # noqa: PLC0415
+
+    ids = list(submission_ids) or portal_store.all_event_submission_ids()
+    if not ids:
+        click.echo("no portal events on file — nothing to remirror")
+        return
+
+    changed = 0
+    for submission_id in ids:
+        events = portal_store.events_for_submission(submission_id)
+        if not events:
+            click.secho(f"{submission_id}: no events on file — skipping", fg="yellow")
+            continue
+        before = portal_store.get_submission(submission_id)
+        before_json = json.dumps(before.customer, sort_keys=True) if before else "{}"
+
+        facts: dict = {}
+        for event in events:
+            facts.update(customer_facts_from_event(event.payload))
+        after_json = json.dumps(facts, sort_keys=True)
+        is_changed = after_json != before_json
+
+        if dry_run:
+            click.echo(
+                f"{submission_id}: {'CHANGED' if is_changed else 'unchanged'} "
+                f"({len(events)} event(s))"
+            )
+            click.echo(f"  before: {before_json}")
+            click.echo(f"  after:  {after_json}")
+            continue
+
+        portal_store.replace_customer_json(submission_id, facts)
+        if is_changed:
+            changed += 1
+        click.echo(f"{submission_id}: remirrored ({len(events)} event(s))")
+
+    if dry_run:
+        click.echo(f"# dry-run: {len(ids)} submission(s) inspected, nothing written")
+    else:
+        click.secho(
+            f"remirrored {len(ids)} submission(s), {changed} changed", fg="green"
+        )
+
+
 @portal_group.command("requeue")
 @click.argument("submission_id")
 @click.argument("seq", type=int)

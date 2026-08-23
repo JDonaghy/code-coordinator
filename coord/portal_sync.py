@@ -908,8 +908,42 @@ def _pull(client: Any, *, pages: int, now: float | None) -> int:
     return total_new
 
 
-def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
-    """Fold one pulled event into the read-only customer mirror.
+def _merged_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """Flatten *event* into one dict, unwrapping the portal's wire envelope.
+
+    coord-portal's real wire shape nests every customer fact under
+    `payload` (`src/bridge/events.ts`) — `data` / `fields` are kept as
+    aliases for whatever shape a caller (or a future portal revision)
+    actually uses, not narrowed away in favor of the one seen in
+    production (#2585).
+    """
+    payload: dict[str, Any] = dict(event)
+    nested = event.get("data") or event.get("fields") or event.get("payload")
+    if isinstance(nested, dict):
+        payload.update(nested)
+        payload.pop("data", None)
+        payload.pop("fields", None)
+        payload.pop("payload", None)
+    return payload
+
+
+def _facts_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _EVENT_ENVELOPE_KEYS and key not in COORD_OWNED_FIELDS
+    }
+
+
+def customer_facts_from_event(event: dict[str, Any]) -> dict[str, Any]:
+    """The customer-owned facts one raw event contributes to the mirror.
+
+    Shared by the live pull-time fold (:func:`_mirror_event`) and the
+    `coord portal remirror` backfill (#2659) — both need exactly this:
+    unwrap the portal's wire envelope, drop bookkeeping + coord-owned keys,
+    and return whatever customer-authored content is left. Keeping it in one
+    place is what makes the backfill a genuine replay of the live fold
+    rather than a second, driftable copy of it.
 
     Mirrors everything the event carries **except** the envelope keys and
     anything coord itself owns. An allowlist would go stale the first time
@@ -917,27 +951,20 @@ def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
     same rule the portal enforces on its own side
     (:data:`coord.portal_bridge.COORD_OWNED_FIELDS`).
     """
+    return _facts_from_payload(_merged_event_payload(event))
+
+
+def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
+    """Fold one pulled event into the read-only customer mirror.
+
+    See :func:`customer_facts_from_event` for what is and is not mirrored.
+    """
     submission_id = str(event.get("submission_id") or "").strip()
     if not submission_id:
         return
 
-    facts: dict[str, Any] = {}
-    payload: dict[str, Any] = dict(event)
-    # coord-portal's real wire shape nests every customer fact under
-    # `payload` (`src/bridge/events.ts`) — `data` / `fields` are kept as
-    # aliases for whatever shape a caller (or a future portal revision)
-    # actually uses, not narrowed away in favor of the one seen in
-    # production (#2585).
-    nested = event.get("data") or event.get("fields") or event.get("payload")
-    if isinstance(nested, dict):
-        payload.update(nested)
-        payload.pop("data", None)
-        payload.pop("fields", None)
-        payload.pop("payload", None)
-    for key, value in payload.items():
-        if key in _EVENT_ENVELOPE_KEYS or key in COORD_OWNED_FIELDS:
-            continue
-        facts[key] = value
+    payload = _merged_event_payload(event)
+    facts = _facts_from_payload(payload)
     if facts:
         portal_store.mirror_customer_facts(submission_id, facts, now=now)
 
