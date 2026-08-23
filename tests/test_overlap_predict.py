@@ -298,6 +298,99 @@ def test_an_unreadable_board_yields_no_footprints_rather_than_raising():
     assert inflight_footprints(REPO, GITHUB, "main", board=Exploding()) == []
 
 
+# ── #2602: a landed branch is not a footprint candidate ─────────────────────
+#
+# `status == "done"` is deliberately still IN `inflight_assignments`'s output
+# (that's the finished-but-unmerged case #2247 exists to catch) — but by the
+# time `inflight_footprints` is about to trust that branch's diff, it must
+# check whether the branch has ACTUALLY landed on GitHub already (a squash
+# merge closes the issue/merges the PR well before the assignment's own
+# `status` field catches up). A landed branch's diff is real but permanently
+# stale, so it must never become a footprint.
+
+
+def test_a_landed_done_status_branch_is_excluded_from_footprints():
+    board = SimpleNamespace(
+        active=[
+            _assignment(issue_number=1, status="running", branch="issue-1"),
+            # #144 in the incident: status still "done", but already merged
+            # on GitHub — the reconcile flip to "merged" hasn't landed yet.
+            _assignment(issue_number=2, status="done", branch="issue-2"),
+        ],
+    )
+    fetched: list[str] = []
+
+    def fetcher(repo, base, head):
+        fetched.append(head)
+        return ["coord/whatever.py"]
+
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=fetcher,
+        terminal_checker=lambda repo, issue, branch: issue == 2,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#1"]
+    # The landed branch's diff is never even fetched — no wasted compare call
+    # and no chance its stale file list leaks into a footprint some other way.
+    assert fetched == ["issue-1"]
+
+
+def test_a_finished_but_unmerged_branch_still_becomes_a_footprint():
+    board = SimpleNamespace(
+        active=[_assignment(issue_number=2, status="done", branch="issue-2")],
+    )
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/a.py"],
+        terminal_checker=lambda repo, issue, branch: False,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#2"]
+
+
+def test_the_default_terminal_checker_is_github_ops_work_is_terminal(monkeypatch):
+    calls: list[tuple] = []
+
+    def fake_work_is_terminal(repo_github, issue_number, branch, **kwargs):
+        calls.append((repo_github, issue_number, branch))
+        return issue_number == 2
+
+    monkeypatch.setattr(
+        "coord.github_ops.work_is_terminal", fake_work_is_terminal
+    )
+    board = SimpleNamespace(
+        active=[
+            _assignment(issue_number=1, status="running", branch="issue-1"),
+            _assignment(issue_number=2, status="done", branch="issue-2"),
+        ],
+    )
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/a.py"],
+    )
+    assert [f.key for f in prints] == [f"{REPO}#1"]
+    assert (GITHUB, 2, "issue-2") in calls
+
+
+def test_an_erroring_terminal_checker_fails_open_to_still_in_flight():
+    board = SimpleNamespace(
+        active=[_assignment(issue_number=2, status="done", branch="issue-2")],
+    )
+
+    def exploding_checker(repo, issue, branch):
+        raise RuntimeError("gh exploded")
+
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/a.py"],
+        terminal_checker=exploding_checker,
+    )
+    assert [f.key for f in prints] == [f"{REPO}#2"]
+
+
 def test_declared_footprints_only_cover_issues_that_declared_something():
     bodies = {1: "## Files\n- coord/a.py\n", 2: "no declaration here"}
     prints = declared_footprints(

@@ -55,6 +55,27 @@ fourteen ARE what :func:`paths_overlap`'s directory rule says they are, a
 match. The chosen fix is :func:`fanout_warnings`, which leaves the ORDER
 alone and instead tells the author their token was too broad to carry much
 signal, so they can narrow it on the next ``add``.
+
+#2602: a squash-merged branch is a permanent false candidate, not a stale
+one. :func:`inflight_assignments` deliberately widens past ``status ==
+"running"`` to include ``status == "done"`` — a worker that finished but
+whose PR has not merged yet is exactly the collision this feature exists to
+catch, and the ``status`` field genuinely lags: the flip to ``"merged"``
+happens later, in ``coord/reconcile.py``, gated on a live GitHub read. In the
+gap, a ``"done"`` assignment whose branch has ALREADY landed (issue closed,
+PR merged) reads exactly like one that is still in flight — and unlike the
+gap itself, that reading never heals: this fleet's mandated squash-merge
+policy means the branch head is never an ancestor of the base branch, so
+``main...branch`` keeps returning the full original file list forever, not
+just until the next sync. #2247's rule 2 ("check a guess against ground
+truth") is intact — the diff IS real — but it answers the wrong question,
+because the candidate SET it was asked about is stale. :func:`inflight_footprints`
+is therefore the one place that runs a POSITIVE liveness check —
+``github_ops.work_is_terminal`` (issue closed OR PR merged) — against every
+candidate before trusting its diff. Not ancestry (broken by squash-merge,
+above); not widening :data:`LANDED_STATUSES` to include ``"done"`` (that
+would also exclude the finished-but-unmerged case this module exists to
+catch — see that constant's own docstring).
 """
 
 from __future__ import annotations
@@ -403,12 +424,22 @@ def fanout_warnings(
 DiffFilesFetcher = Callable[[str, str, str], "list[str] | None"]
 # ``(repo_name, issue_number) -> issue body or None``.
 BodyFetcher = Callable[[str, int], "str | None"]
+# ``(repo_github, issue_number, branch) -> True if the work already landed``
+# (issue closed OR PR merged) — #2602's positive liveness test, injectable
+# for tests the same way ``DiffFilesFetcher`` is.
+TerminalChecker = Callable[[str, int, str], bool]
 
 
 def _default_diff_fetcher(repo_github: str, base: str, head: str) -> list[str] | None:
     from coord import github_ops  # noqa: PLC0415
 
     return github_ops.get_compare_files(repo_github, base, head)
+
+
+def _default_terminal_checker(repo_github: str, issue_number: int, branch: str) -> bool:
+    from coord import github_ops  # noqa: PLC0415
+
+    return github_ops.work_is_terminal(repo_github, issue_number, branch)
 
 
 def inflight_assignments(
@@ -430,6 +461,15 @@ def inflight_assignments(
       sit on the board indefinitely, and ordering live work behind a corpse
       would be a permanent latency cost with no collision to prevent. A retry
       of that issue creates a fresh non-failed assignment, which this does see.
+
+    Deliberately does NOT also exclude a ``"done"`` assignment whose branch
+    has actually landed on GitHub already (#2602) — that status flip is
+    asynchronous (``coord/reconcile.py``, gated on a live read) and folding
+    ``"done"`` into the excluded set here would silently drop the
+    finished-but-unmerged case this function exists to catch. The positive
+    liveness check that DOES catch a landed ``"done"`` branch lives one layer
+    up, in :func:`inflight_footprints`, right before its diff would otherwise
+    be trusted — see that function and the module docstring.
     """
     out: list[Any] = []
     seen_ids: set[int] = set()
@@ -460,6 +500,7 @@ def inflight_footprints(
     board: Any = None,
     exclude_issue_number: int | None = None,
     diff_files_fetcher: DiffFilesFetcher | None = None,
+    terminal_checker: TerminalChecker | None = None,
 ) -> list[Footprint]:
     """GROUND TRUTH: the real diff of every in-flight branch in *repo_name*.
 
@@ -467,6 +508,15 @@ def inflight_footprints(
     compute_overlap_fence` does: an unreadable board yields ``[]``, and one
     branch whose compare fails is skipped rather than sinking the rest. The
     worst case is a missed prediction, i.e. today's behaviour.
+
+    #2602: before trusting a candidate's diff, each one is checked against
+    ``terminal_checker`` (default :func:`_default_terminal_checker`, i.e.
+    ``github_ops.work_is_terminal`` — issue closed OR PR merged). This is
+    what keeps a squash-merged ``"done"`` assignment from citing its real,
+    but permanently stale, diff forever — see the module docstring. A
+    checker that raises, like every other fetch here, fails OPEN: the
+    candidate is treated as still in flight, which is at worst today's
+    latency cost, never a missed real collision (design rule 1).
     """
     try:
         if board is None:
@@ -479,10 +529,16 @@ def inflight_footprints(
     except Exception:  # noqa: BLE001 — never block an enqueue on a board read
         return []
 
+    check_terminal = terminal_checker or _default_terminal_checker
     fetch = diff_files_fetcher or _default_diff_fetcher
     out: list[Footprint] = []
     seen: set[str] = set()
     for a in assignments:
+        try:
+            if check_terminal(repo_github, int(a.issue_number), str(a.branch or "")):
+                continue  # #2602: already landed on GitHub — not a candidate
+        except Exception:  # noqa: BLE001 — an unreadable liveness check must
+            pass  # not sink a real candidate; fall through, still in flight
         try:
             files = fetch(repo_github, base_branch, a.branch)
         except Exception:  # noqa: BLE001 — one bad branch, not all of them
