@@ -266,6 +266,19 @@ def test_stage_status_for(
         return DONE
     if verdict == "failed":
         return FAILED
+    # #2579: ``"contested"`` (``coord.notify.TEST_STATE_CONTESTED``) is an
+    # independent #2464 re-run REFUTING a pass claim whose review had already
+    # rendered a terminal "approve" verdict — deliberately distinct from the
+    # literal string "failed" so it is never mistaken by an automatic
+    # fix-dispatch door for an ordinary Test-stage failure (see that
+    # constant's docstring). But per this module's own #1672 rule right
+    # below — PENDING is reserved for values that say NOTHING about the
+    # branch — "contested" is very much a statement about the branch (a
+    # re-run disagreed with the claimed pass), so it must render exactly
+    # like an ordinary failure here: a red Failed badge, not a neutral
+    # Pending one indistinguishable from "nothing has happened yet".
+    if verdict == "contested":
+        return FAILED
     # #1672: ``"blocked"`` (``coord.smoke.TEST_STATE_BLOCKED`` — no
     # capability-matched machine could run the Test stage) deliberately falls
     # through to PENDING here rather than mapping to FAILED. FAILED is a

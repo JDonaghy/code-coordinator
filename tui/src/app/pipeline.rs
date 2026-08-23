@@ -6891,7 +6891,14 @@ impl CoordApp {
         // explicitly, so this never reads as a verdict anywhere else.
         match verdict {
             Some("passed") | Some("skipped") => StageStatus::Done,
-            Some("failed") => StageStatus::Failed,
+            // #2579: "contested" (coord.notify.TEST_STATE_CONTESTED) is an
+            // independent #2464 re-run REFUTING a pass claim whose review
+            // had already approved it — deliberately distinct from the
+            // literal "failed" so no automatic fix-dispatch door mistakes it
+            // for an ordinary Test-stage failure, but it IS a statement
+            // about the branch, so it renders identically to "failed" here
+            // (mirrors coord.stage_projection.test_stage_status_for).
+            Some("failed") | Some("contested") => StageStatus::Failed,
             Some("running") => StageStatus::Active,
             _ => StageStatus::Pending,
         }

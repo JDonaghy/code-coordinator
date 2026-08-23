@@ -754,7 +754,16 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             # test_state="failed" takes priority: the review gate is correctly
             # held but "[awaiting review]" would mislead the operator into
             # thinking the item is queued to move forward (real incident: #1116).
-            if getattr(a, "test_state", None) == "failed":
+            #
+            # #2579: test_state="contested" (coord.notify.TEST_STATE_CONTESTED)
+            # gets the same priority-override treatment, but its own distinct
+            # tag — this is the #1116 failure mode reintroduced for a row whose
+            # review already reached "done": without this branch a contested
+            # row would show "[review done]", which reads as fine when a
+            # confirmation just refuted the pass claim it was approved on.
+            if getattr(a, "test_state", None) == "contested":
+                rs_tag = "[⚠ CONTESTED — review approved, but a re-run refuted the pass; needs a human]"
+            elif getattr(a, "test_state", None) == "failed":
                 rs_tag = "[✗ test FAILED — needs fix]"
             else:
                 rs_tag = _REVIEW_STATE_TAGS.get(a.review_state or "", "")
