@@ -25,7 +25,10 @@ supplies it:
   from a thin client at all).  → This is a resumable state machine over the
   daemon's board: it dispatches the WORK assignment, then OBSERVES
   Test/Review/Merge — coord dispatches all three itself — nudging ``coord
-  notify`` (``--notify``) when nothing has changed for ``--stall`` minutes.
+  notify`` (``--notify``) when nothing has changed for ``--stall`` minutes
+  (per-assignment-type overrides — #2649,
+  ``pipeline.stall_thresholds``/``PipelineConfig.stall_threshold_secs`` —
+  win over the flat ``--stall`` value for a type they cover).
 
 A FAILING TEST IS A LOOP ITERATION, NOT A DEAD END.  On a genuine test failure
 this runs ``coord fix``, which dispatches a headless follow-up worker on the
@@ -4417,6 +4420,16 @@ class Driver:
                 continue
 
             fingerprint = state.fingerprint
+            # #2649: the flat `--stall` value is a false-positive magnet for
+            # stages (`work`, the `type="smoke"` Test-stage) whose normal
+            # duration on this fleet routinely exceeds it — see
+            # `PipelineConfig.stall_threshold_secs`/`_DEFAULT_STALL_THRESHOLDS`
+            # for the measured evidence. Recomputed every tick (not cached)
+            # because `state.active_types` changes as the pipeline advances
+            # through stages, each with its own threshold.
+            stall_secs = self.config.pipeline.stall_threshold_secs(
+                state.active_types, default_secs=self.opts.stall_secs
+            )
             if fingerprint != last_fingerprint:
                 last_fingerprint = fingerprint
                 last_change = now
@@ -4462,8 +4475,8 @@ class Driver:
                         else ""
                     )
                 )
-            elif now - last_change > self.opts.stall_secs and (
-                last_nudge is None or now - last_nudge > self.opts.stall_secs
+            elif now - last_change > stall_secs and (
+                last_nudge is None or now - last_nudge > stall_secs
             ):
                 # #1593: re-nudge on a `stall_secs` cadence for as long as the
                 # fingerprint stays put, instead of firing once and going
