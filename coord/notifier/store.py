@@ -310,3 +310,35 @@ def record_nudge(repo: str, issue: int, *, at: float, stalled_for: float | None 
 
 def nudge_for(state: NotifierState, repo: str, issue: int) -> dict[str, Any] | None:
     return state.nudges.get(urgent_key(repo, issue))
+
+
+def clear_nudge(repo: str, issue: int) -> bool:
+    """Retract a previously published stall nudge (#2648).
+
+    Called from ``Driver._loop`` the instant the board fingerprint changes —
+    the pipeline advancing past the stage that was nudged is proof the
+    record no longer describes reality. Without this, ``nudged_at`` is
+    per-ISSUE (see :func:`urgent_key`) but never refreshed on progress, so
+    every later leg of the same issue (a new assignment, new subject in the
+    ledger's dedupe key) reads the one stale record and re-fires
+    ``stall_nudged`` for ever, until :data:`NUDGE_TTL_SECS` eventually
+    drops it. Clearing it here means a probe built for a later leg simply
+    finds no nudge at all — the same "never nudged" path
+    :func:`nudge_for`'s caller already handles.
+
+    A no-op (not an error) when there is nothing to clear, so callers can
+    call this unconditionally on every fingerprint change without first
+    checking whether a nudge exists. Never raises, mirroring
+    :func:`record_nudge` — a notifier whose state file is unwritable must
+    not be able to take a drive down with it.
+    """
+    try:
+        state = load_state()
+        key = urgent_key(repo, issue)
+        if key not in state.nudges:
+            return True
+        del state.nudges[key]
+        return save_state(state)
+    except Exception:  # noqa: BLE001 — advisory, see module docstring
+        log.debug("notifier: could not clear stall nudge for %s#%s", repo, issue)
+        return False
