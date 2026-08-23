@@ -13,7 +13,11 @@ import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.db import is_lock_contention_error, retry_on_locked
-from coord.models import WORK_LIKE_TYPES, effective_issue_number
+from coord.models import (
+    WORK_LIKE_TYPES,
+    effective_issue_number,
+    trust_issue_closed_for,
+)
 
 
 def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
@@ -2195,9 +2199,22 @@ def merge(
                 # after the last sync), treat as unknown and allow — denying
                 # on cache miss silently skipped post-sync issues
                 # (#278/#280 hit this).
+                #
+                # #2639: gated on trust_issue_closed_for(a.type) — a
+                # test-author/mock-author row's `issue_number` is the
+                # milestone's tracking issue, not its own deliverable, so a
+                # closed tracking epic (closed for most of a milestone's
+                # life) must not silently drop it out of auto-enqueue here.
+                # The branch-existence and work_is_terminal (#525) checks
+                # right below already answer "is THIS row's own work landed"
+                # correctly for these types.
                 known_issues = known_by_repo.get(a.repo_name, set())
                 open_issues = open_by_repo.get(a.repo_name, set())
-                if a.issue_number in known_issues and a.issue_number not in open_issues:
+                if (
+                    trust_issue_closed_for(getattr(a, "type", None))
+                    and a.issue_number in known_issues
+                    and a.issue_number not in open_issues
+                ):
                     continue
                 # Skip work whose branch no longer exists on origin (already
                 # merged + deleted).  Fail OPEN: only skip when we got a real
@@ -2212,9 +2229,13 @@ def merge(
                 # issue closed OR PR merged.  Mirrors the #522 guard in
                 # review.dispatch_review.  Fail OPEN: a transient gh error
                 # must never block a real enqueue.
+                #
+                # #2639: trust_issue_closed_for(a.type) — see the
+                # issue-state filter above for the same rationale.
                 if _gho.work_is_terminal(
                     repo_cfg.github, a.issue_number, a.branch,
                     cache=terminal_cache,
+                    trust_issue_closed=trust_issue_closed_for(getattr(a, "type", None)),
                 ):
                     continue
                 # #946: review + smoke gates, via the shared predicate — this

@@ -153,15 +153,28 @@ def _work_is_terminal(
     Thin Assignment/Config-shaped wrapper over
     :func:`coord.github_ops.work_is_terminal` (the shared chokepoint guard,
     #522) — resolves the repo's GitHub slug and delegates.  Fail-open.
+
+    #2639: derives ``trust_issue_closed`` from *work*'s own ``type`` via
+    :func:`coord.models.trust_issue_closed_for` rather than trusting
+    ``work_is_terminal``'s ``True`` default — this wrapper is reached by the
+    #522 fix-dispatch and re-review-dispatch guards for reviews of ANY
+    :data:`coord.models.WORK_LIKE_TYPES` row (#1574), including
+    test-author/mock-author, whose ``issue_number`` is a milestone tracking
+    issue rather than their own deliverable.
     """
     repo = config.repo(work.repo_name)
     if repo is None or not repo.github:
         return False
 
     from coord import github_ops  # noqa: PLC0415
+    from coord.models import trust_issue_closed_for  # noqa: PLC0415
 
     return github_ops.work_is_terminal(
-        repo.github, work.issue_number, work.branch, cache=cache
+        repo.github,
+        work.issue_number,
+        work.branch,
+        cache=cache,
+        trust_issue_closed=trust_issue_closed_for(work.type),
     )
 
 

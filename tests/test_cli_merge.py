@@ -1818,7 +1818,9 @@ class TestMergeAutoEnqueue:
         self._seed_issue_state(coord_db, number=1500, state="open")
         self._seed_issue_state(coord_db, number=1501, state="open")
 
-        def _terminal_side_effect(repo_github, issue_number, branch, *, cache=None):
+        def _terminal_side_effect(
+            repo_github, issue_number, branch, *, cache=None, trust_issue_closed=True
+        ):
             if issue_number == 1500:
                 # Simulates the #1353 incident: an unexpected exception deep
                 # in the per-assignment `gh` round-trip (a bad decode, a

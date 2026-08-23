@@ -347,6 +347,35 @@ CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 # which must also list it since it mutates GitHub via `gh pr create`.
 PR_HELPER_TYPE = "pr-helper"
 
+
+def trust_issue_closed_for(assignment_type: str | None) -> bool:
+    """Whether :func:`coord.github_ops.work_is_terminal` may trust
+    ``issue_is_closed`` for a row of *assignment_type* (#2639).
+
+    ``False`` only for :data:`SEALED_PATH_AUTHOR_TYPES` (``test-author``/
+    ``mock-author``), whose ``issue_number`` is always the milestone's
+    *tracking* issue — never this row's own deliverable (the per-slice issue
+    lives in ``for_issue_number``) — so a tracking epic that's closed for
+    most of a milestone's life must not read as "this row is done".
+
+    ``True`` for everything else, including :data:`CLOSES_ISSUE_TYPES`
+    (``work``, whose ``issue_number`` genuinely is its own deliverable — the
+    #522 flood guard requires this) and interactive ``--merge-of`` sessions
+    (``type="conflict-fix"`` with no sealed-path semantics). Within
+    :data:`WORK_LIKE_TYPES` ∪ interactive-merge-session, ``WORK_LIKE_TYPES -
+    SEALED_PATH_AUTHOR_TYPES == CLOSES_ISSUE_TYPES``, so this reduces to a
+    single "trust it unless sealed-path-authoring" rule — kept as one shared
+    helper (rather than re-deriving ``type not in SEALED_PATH_AUTHOR_TYPES``
+    at each ``work_is_terminal`` call site) so the two families can't drift.
+
+    Every call site that can process a :data:`WORK_LIKE_TYPES` row (or an
+    interactive merge session) should pass
+    ``trust_issue_closed=trust_issue_closed_for(row.type)`` to
+    :func:`coord.github_ops.work_is_terminal` rather than relying on that
+    kwarg's ``True`` default.
+    """
+    return assignment_type not in SEALED_PATH_AUTHOR_TYPES
+
 # #685: the per-issue Test-stage POLICY labels, and the one pure function that
 # reads them. ``test-mode:auto`` → the headless Test stage auto-dispatches
 # (`coord.smoke.dispatch_pending_smoke`); ``test-mode:smoke`` → it deliberately

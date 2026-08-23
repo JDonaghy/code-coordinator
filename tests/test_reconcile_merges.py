@@ -1564,3 +1564,218 @@ def test_merging_via_coord_merge_leaves_no_dangling_escalation_after_reconcile(
     reconcile_board_merges(board, config)
 
     assert state._get_drive_escalation_local("api", 7) is None
+
+
+# ── #2639 second half — sweep (h): flag a falsely-`merged` row ─────────────
+#
+# `github_ops.work_is_terminal`'s issue-closed check (before the fix in this
+# same PR) could flip a `status='merged'` row whose branch never actually
+# landed anywhere — this sweep re-derives "did this really land" from
+# git/GitHub reality for every already-`merged` row, so a historical mis-flip
+# doesn't stay permanently invisible to `coord diagnose`/`coord merge
+# --dry-run`. DETECTION ONLY: it must never mutate board state.
+
+
+def _merged_row(
+    *,
+    assignment_id: str = "ta-1",
+    issue_number: int = 16,
+    branch: str = "test-author-ms-1-slice-10",
+    row_type: str = "test-author",
+) -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=issue_number,
+        issue_title="t",
+        status="merged",
+        assignment_id=assignment_id,
+        branch=branch,
+        type=row_type,
+    )
+
+
+def _patch_false_merge_probes(
+    monkeypatch,
+    *,
+    branch_exists: bool = True,
+    pr_merged: bool = False,
+    ahead: int | None = 2,
+    changed_files: list[str] | None = None,
+    file_contents: dict[str, tuple[str | None, str | None]] | None = None,
+):
+    """Stub the sweep (h) probes directly (bypassing `_patch_probes`'s
+    `work_is_terminal` stub, which sweep (h) never calls).
+
+    *file_contents* maps ``path -> (branch_content, base_content)``;
+    ``get_repo_file`` raises ``RuntimeError`` (mirroring a real 404) when the
+    requested ref's content is ``None``.
+    """
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        github_ops, "branch_exists_on_remote", lambda repo, branch: branch_exists
+    )
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: pr_merged)
+    monkeypatch.setattr(
+        github_ops,
+        "branch_commits_ahead",
+        lambda repo, base, branch: ahead,
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "get_compare_files",
+        lambda repo, base, branch: changed_files,
+    )
+
+    _contents = file_contents or {}
+
+    def _fake_get_repo_file(repo, path, ref):
+        branch_content, base_content = _contents.get(path, (None, None))
+        content = branch_content if ref != "main" else base_content
+        if content is None:
+            raise RuntimeError("404")
+        return content
+
+    monkeypatch.setattr(github_ops, "get_repo_file", _fake_get_repo_file)
+
+
+def test_falsely_merged_row_with_differing_content_is_flagged(
+    monkeypatch, config
+) -> None:
+    """The #2639 headline case: a `test-author` row flipped to `status=
+    'merged'` whose branch is still ahead of main, has no merged PR at its
+    tip, and whose changed file's content genuinely differs from main's
+    current copy — this is exactly the live `test-author-ms-1-slice-10-v2`
+    casualty (#2639's blast-radius sweep)."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["tests/acceptance/ms-1/10-up-mapping.spec.ts"],
+        file_contents={
+            "tests/acceptance/ms-1/10-up-mapping.spec.ts": ("new content", "old content"),
+        },
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert any("POSSIBLY LOST" in s and "ta-1" in s for s in actions)
+    # DETECTION ONLY — the row itself must be untouched.
+    assert a.status == "merged"
+
+
+def test_falsely_merged_sweep_skips_when_branch_already_deleted(
+    monkeypatch, config
+) -> None:
+    """The dominant, benign case: the branch was deleted after a real merge
+    + cleanup — nothing to flag."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_skips_when_pr_is_merged_confirms_tip(
+    monkeypatch, config
+) -> None:
+    """`pr_is_merged` (#1150, SHA-exact) already confirms this exact tip
+    merged — correctly tracked, no flag."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(monkeypatch, pr_merged=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_skips_when_zero_commits_ahead(monkeypatch, config) -> None:
+    """False positive #1 from the live #2639 blast-radius sweep:
+    `issue-2531-config-portal-project-repo-mapping` — the branch's tip is an
+    ancestor of main, so it's 0 commits ahead despite no merged PR. Content
+    is fully present; never flag."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(monkeypatch, ahead=0)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_skips_when_ahead_is_unconfirmable(
+    monkeypatch, config
+) -> None:
+    """`branch_commits_ahead` fails open to ``None`` on a `gh` error — never
+    treated as "0 commits ahead" (that would wrongly clear a real loss) NOR
+    as evidence of loss; skip, fail open."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(monkeypatch, ahead=None)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_skips_when_content_matches_base_verbatim(
+    monkeypatch, config
+) -> None:
+    """False positive #2 from the live #2639 blast-radius sweep: the
+    coord-portal `issue-16-gate-a-...` row — a rebase moved the SHA but the
+    content is byte-identical on main. SHA mismatch alone must never be
+    treated as proof of loss."""
+    a = _merged_row()
+    board = Board(completed=[a])
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["contract.md"],
+        file_contents={"contract.md": ("same content", "same content")},
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_scoped_to_work_like_types(monkeypatch, config) -> None:
+    """A `type='review'` row (never itself a WORK_LIKE_TYPES/interactive-
+    merge-session candidate) must never reach this sweep even if somehow
+    `status='merged'` — matches every other sweep's WORK_LIKE_TYPES scope."""
+    a = _merged_row(row_type="review")
+    board = Board(completed=[a])
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["x.py"],
+        file_contents={"x.py": ("new", "old")},
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert not any("POSSIBLY LOST" in s for s in actions)
+
+
+def test_falsely_merged_sweep_respects_repo_and_issue_filters(
+    monkeypatch, config
+) -> None:
+    a = _merged_row(assignment_id="ta-1", issue_number=16)
+    b = _merged_row(assignment_id="ta-2", issue_number=99)
+    board = Board(completed=[a, b])
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["x.py"],
+        file_contents={"x.py": ("new", "old")},
+    )
+
+    actions = reconcile_board_merges(board, config, issue=16)
+
+    assert any("ta-1" in s and "POSSIBLY LOST" in s for s in actions)
+    assert not any("ta-2" in s for s in actions)

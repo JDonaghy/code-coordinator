@@ -44,6 +44,7 @@ from coord.models import (
     Assignment,
     Board,
     Machine,
+    trust_issue_closed_for,
 )
 
 log = logging.getLogger(__name__)
@@ -2026,8 +2027,19 @@ def dispatch_review(
     # fix-dispatch guard alone didn't cover. Mark the row done so the pending-
     # review loop stops treating it as eligible. Fail-open inside
     # work_is_terminal, so a transient gh error never blocks a real review.
+    #
+    # #2639: `trust_issue_closed_for(completed.type)` — a test-author/
+    # mock-author row's `issue_number` is the milestone's tracking issue,
+    # not this row's own deliverable, so a closed tracking epic must not
+    # read as "this row is already reviewed" (it would deny dispatch and
+    # stamp review_state='done' with no real review ever run). Only
+    # `pr_is_merged` (branch/commit-scoped, #1150) may decide for those.
     if github_ops.work_is_terminal(
-        repo.github, completed.issue_number, completed.branch, cache=terminal_cache
+        repo.github,
+        completed.issue_number,
+        completed.branch,
+        cache=terminal_cache,
+        trust_issue_closed=trust_issue_closed_for(completed.type),
     ):
         completed.review_state = "done"
         return _deny(
@@ -3020,8 +3032,17 @@ def dispatch_scoped_review(
     # work that's already done on GitHub — issue closed OR PR merged. Best
     # effort — a small race window remains before the merge-queue entry is
     # cleaned up, same as the full-review path.
+    #
+    # #2639: mirror dispatch_review's trust_issue_closed derivation — *entry*
+    # is a QueuedMerge, whose `assignment_type` carries the originating
+    # assignment's `type` (#1077). A test-author/mock-author entry's
+    # `issue_number` is the tracking issue, not its own deliverable.
     if github_ops.work_is_terminal(
-        repo.github, entry.issue_number, entry.branch, cache=terminal_cache
+        repo.github,
+        entry.issue_number,
+        entry.branch,
+        cache=terminal_cache,
+        trust_issue_closed=trust_issue_closed_for(entry.assignment_type),
     ):
         return None
 

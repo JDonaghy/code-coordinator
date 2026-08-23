@@ -525,6 +525,35 @@ def _default_terminal_checker(repo_github: str, issue_number: int, branch: str) 
     return github_ops.work_is_terminal(repo_github, issue_number, branch)
 
 
+def _default_terminal_checker_for_type(assignment_type: str | None) -> TerminalChecker:
+    """A :data:`TerminalChecker` closure over *assignment_type* (#2639).
+
+    ``inflight_footprints`` filters candidates to :data:`coord.models.
+    WORK_LIKE_TYPES`, which includes test-author/mock-author — whose
+    ``issue_number`` is the milestone's tracking issue, not the row's own
+    deliverable. Trusting a closed tracking epic here would wrongly report
+    a still-in-flight branch "already landed" and drop it from the
+    candidate set, defeating #2602's whole purpose: never miss a real
+    collision. Kept as a closure (rather than widening the public
+    :data:`TerminalChecker` signature every injected test double would then
+    need to match) so the production default path gets the right answer
+    without disturbing the 3-arg ``(repo_github, issue_number, branch)``
+    contract callers already inject stubs against.
+    """
+    from coord.models import trust_issue_closed_for  # noqa: PLC0415
+
+    trust = trust_issue_closed_for(assignment_type)
+
+    def _check(repo_github: str, issue_number: int, branch: str) -> bool:
+        from coord import github_ops  # noqa: PLC0415
+
+        return github_ops.work_is_terminal(
+            repo_github, issue_number, branch, trust_issue_closed=trust
+        )
+
+    return _check
+
+
 def _default_head_sha_fetcher(repo_github: str, branch: str) -> str | None:
     from coord import github_ops  # noqa: PLC0415
 
@@ -628,12 +657,18 @@ def inflight_footprints(
     except Exception:  # noqa: BLE001 — never block an enqueue on a board read
         return []
 
-    check_terminal = terminal_checker or _default_terminal_checker
     fetch = diff_files_fetcher or _default_diff_fetcher
     fetch_head_sha = head_sha_fetcher or _default_head_sha_fetcher
     out: list[Footprint] = []
     seen: set[str] = set()
     for a in assignments:
+        # #2639: an explicitly injected terminal_checker (tests) is used
+        # verbatim; the production default is rebuilt per-assignment so it
+        # can trust_issue_closed correctly for this row's own `type` (see
+        # _default_terminal_checker_for_type).
+        check_terminal = terminal_checker or _default_terminal_checker_for_type(
+            getattr(a, "type", None)
+        )
         liveness_checked = True
         try:
             if check_terminal(repo_github, int(a.issue_number), str(a.branch or "")):
