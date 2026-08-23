@@ -70,6 +70,7 @@ from coord.drive_queue import (
     add_preflight_notice,
     build_board_view,
     diagnose_blocked_after,
+    effective_max_fix_rounds,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -237,6 +238,23 @@ def drive_queue_group() -> None:
         "migration) where that is really what's needed. Requires --hold-after."
     ),
 )
+@click.option(
+    "--max-fix-rounds",
+    "max_fix_rounds",
+    type=int,
+    default=None,
+    help=(
+        "#2604: override the `coord drive --tmux --max-fix-rounds` THIS "
+        "entry's tick-launched drive gets. Omit to use "
+        "pipeline.max_fix_rounds (or, absent that, "
+        "coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS — deliberately lower "
+        "than interactive `coord drive`'s own default of 3, since an "
+        "unattended fix round that goes nowhere costs a queue slot for "
+        "hours, not a human a few minutes of noticing). Re-adding an "
+        "already-queued entry WITHOUT this flag reverts it to the fleet "
+        "default — it does not leave a previous override in place."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -249,6 +267,7 @@ def drive_queue_add(
     resume_when: str,
     no_predict_overlap: bool,
     hold_scope: str,
+    max_fix_rounds: int | None,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -265,6 +284,8 @@ def drive_queue_add(
     from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
 
     existing_entries = entries_from_rows(list_drive_queue())
+    if max_fix_rounds is not None and max_fix_rounds < 1:
+        raise click.ClickException("--max-fix-rounds must be a positive integer")
     try:
         after = parse_after_spec(after_specs, repo)
         validate_config_repo(config_path, repo)
@@ -320,11 +341,13 @@ def drive_queue_add(
         hold_reason=hold_reason,
         resume_when=resume_when,
         hold_scope=hold_scope,
+        max_fix_rounds=max_fix_rounds,
     )
     if auto_after:
         _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
     pinned = f" on {machine}" if machine else ""
+    fix_rounds_note = f" · max-fix-rounds={max_fix_rounds}" if max_fix_rounds else ""
     gate = ""
     if hold_after:
         gate = " · holds the queue when done"
@@ -344,7 +367,7 @@ def drive_queue_add(
         overlap_notes.append(staleness_note)
     overlap_note = ("\n" + "\n".join(overlap_notes)) if overlap_notes else ""
     click.echo(
-        f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}"
+        f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}{fix_rounds_note}"
         f"{scope_downgrade_warning}{overlap_note}"
     )
 
@@ -2865,12 +2888,35 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     ``test_session_dies_immediately_raises_instead_of_reporting_success``).
     Fixing the ``__main__`` guard closes this path too, since it is the same
     fallback the driver's own ``coord assign`` calls go through.
+
+    #2604: always emits ``--max-fix-rounds`` (never left to `coord drive`'s
+    own interactive default of 3) — see
+    ``coord.drive_queue.effective_max_fix_rounds`` for the resolution order
+    (entry override → ``pipeline.max_fix_rounds`` → the tick's own lower
+    default). Reads the config here rather than threading it through the
+    caller because every OTHER caller of this function already only has
+    ``config_path``, the same shape ``_merge_only_argv`` takes — a config
+    LOAD failure (unreadable file, bad YAML) falls back to the tick's default
+    rather than aborting the launch, the same fail-soft posture the rest of
+    this module takes for advisory reads.
     """
     from coord.drive import coord_argv  # noqa: PLC0415
+
+    config_default: int | None = None
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        config_default = _load_config(config_path).pipeline.max_fix_rounds
+    except Exception:  # noqa: BLE001 — advisory read, see docstring
+        config_default = None
 
     argv = coord_argv() + ["drive", entry.repo, str(entry.issue), "--tmux"]
     if entry.machine:
         argv += ["--machine", entry.machine]
+    argv += [
+        "--max-fix-rounds",
+        str(effective_max_fix_rounds(entry, config_default)),
+    ]
     if config_path:
         argv += ["--config", str(config_path)]
     return argv

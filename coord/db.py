@@ -612,6 +612,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             -- and for any entry that has never died — `_retry_backoff_reason`
             -- treats that identically to `attempts <= 0` (no backoff yet).
             retry_backoff_at REAL,
+            -- #2604: operator override of `coord drive`'s `--max-fix-rounds`
+            -- for THIS entry's tick-launched drive — see
+            -- coord.drive_queue.effective_max_fix_rounds for the resolution
+            -- order (this column, then pipeline.max_fix_rounds, then
+            -- coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS). NULL means "no
+            -- per-entry override" — every row predating this column, and any
+            -- entry enqueued without `--max-fix-rounds`, reads that way and
+            -- falls through to the config/tick default exactly as if the
+            -- column did not exist.
+            max_fix_rounds INTEGER,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -1144,6 +1154,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # past, not re-sent — see `coord.portal_sync._consume_verdicts`.
         "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_at REAL",
         "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid INTEGER",
+        # #2604: see the CREATE TABLE comment above — a per-entry
+        # `--max-fix-rounds` override for the tick's `coord drive --tmux`
+        # launch. NULL for every row predating this migration, read
+        # identically to "no override" by `coord.drive_queue.
+        # effective_max_fix_rounds`.
+        "ALTER TABLE drive_queue ADD COLUMN max_fix_rounds INTEGER",
     ]
     for sql in migrations:
         try:

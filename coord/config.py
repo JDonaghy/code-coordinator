@@ -1008,6 +1008,18 @@ class PipelineConfig:
     performs by hand (branch/commits preserved, stage re-dispatchable). Set
     ``false`` to require a human to run ``coord diagnose --reset``
     themselves, as before #2536.
+
+    ``max_fix_rounds`` (#2604) is the fleet-wide default for a
+    **tick-launched** ``coord drive --tmux --max-fix-rounds`` — set once here
+    instead of on every ``coord drive-queue add``. ``None`` (the default)
+    leaves each tick-launched drive at
+    ``coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS`` (2), deliberately lower
+    than interactive ``coord drive``'s own default of 3: see that constant's
+    docstring for why an unattended round costs more than an attended one.
+    An entry's own ``coord drive-queue add --max-fix-rounds`` always wins
+    over this — see ``coord.drive_queue.effective_max_fix_rounds`` for the
+    full resolution order. This does **not** change interactive ``coord
+    drive``'s own default; it is read only by the drive-queue tick.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -1030,6 +1042,9 @@ class PipelineConfig:
     confirm_test_verdict: bool = True
     # #2536 — DEFAULT ON. See the class docstring.
     auto_heal_phantom_rows: bool = True
+    # #2604 — None means "use coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS".
+    # See the class docstring.
+    max_fix_rounds: int | None = None
 
     def attention_threshold_for(
         self,
@@ -2844,6 +2859,16 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
 
     if "liveness_auditor" in raw:
         cfg.liveness_auditor = _parse_liveness_auditor(raw["liveness_auditor"])
+
+    if "max_fix_rounds" in raw:
+        value = raw["max_fix_rounds"]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ConfigError(
+                "pipeline.max_fix_rounds must be a positive integer or null"
+            )
+        cfg.max_fix_rounds = value
 
     return cfg
 
