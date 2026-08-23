@@ -52,9 +52,54 @@
 
 set -uo pipefail
 
+# Absolute paths for every binary this script shells out to (fleet_watchdog.py
+# constraint 4, #2580) — a cron/systemd PATH is barer than a login shell's,
+# and a rollback script that silently resolves the wrong `mv` is worse than
+# one that refuses. Mirrors fleet_watchdog.py's `_first_existing`.
+resolve_bin() {
+  local candidate
+  for candidate in "$@"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+DATE_BIN="$(resolve_bin /usr/bin/date /bin/date)" || {
+  echo "ERROR: no 'date' binary at any known absolute path — refusing to guess via PATH." >&2
+  exit 1
+}
+READLINK_BIN="$(resolve_bin /usr/bin/readlink /bin/readlink)" || {
+  echo "ERROR: no 'readlink' binary at any known absolute path — refusing to guess via PATH." >&2
+  exit 1
+}
+GREP_BIN="$(resolve_bin /usr/bin/grep /bin/grep)" || {
+  echo "ERROR: no 'grep' binary at any known absolute path — refusing to guess via PATH." >&2
+  exit 1
+}
+LN_BIN="$(resolve_bin /usr/bin/ln /bin/ln)" || {
+  echo "ERROR: no 'ln' binary at any known absolute path — refusing to guess via PATH." >&2
+  exit 1
+}
+MV_BIN="$(resolve_bin /usr/bin/mv /bin/mv)" || {
+  echo "ERROR: no 'mv' binary at any known absolute path — refusing to guess via PATH." >&2
+  exit 1
+}
+
+# `readlink -f` is a GNU coreutils extension — the BSD `readlink` shipped on
+# macOS (the Mac mini agent host, docs/MAC_MINI.md) has no `-f` at all. Check
+# up front and fail with a clear message rather than let a silent option
+# error downstream masquerade as "not a recognized .blue/.green suffix".
+if ! "$READLINK_BIN" -f / >/dev/null 2>&1; then
+  echo "ERROR: $READLINK_BIN does not support '-f' (looks like a non-GNU readlink, e.g. BSD/macOS) — this script needs GNU coreutils." >&2
+  exit 1
+fi
+
 VENV_DIR="${VENV_DIR:-$HOME/.coord-venv}"
 
-say() { echo "[$(date -Is)] $*" >&2; }
+say() { echo "[$("$DATE_BIN" -Is)] $*" >&2; }
 
 # Empty stdout => healthy. Non-empty stdout => the reason it's broken.
 # Never trips `set -e` (there isn't one) on a missing/failing subprocess —
@@ -73,7 +118,7 @@ slot_broken_reason() {
     echo "coord is not importable from $slot"
     return
   fi
-  if [[ -x "$pip" ]] && "$pip" show code-coordinator 2>/dev/null | grep -qi '^Editable project location:'; then
+  if [[ -x "$pip" ]] && "$pip" show code-coordinator 2>/dev/null | "$GREP_BIN" -qi '^Editable project location:'; then
     echo "editable install at $slot"
     return
   fi
@@ -90,7 +135,7 @@ if [[ ! -L "$VENV_DIR" ]]; then
   exit 1
 fi
 
-CURRENT="$(readlink -f "$VENV_DIR")"
+CURRENT="$("$READLINK_BIN" -f "$VENV_DIR")"
 CURRENT="${CURRENT%/}"
 
 case "$CURRENT" in
@@ -125,8 +170,8 @@ say "sibling slot is healthy: $SIBLING — rolling back: $CURRENT -> $SIBLING"
 # Atomic publish — identical pattern to coord-web-rollback.sh / coord.
 # agent_update._atomic_swap: symlink under a temp name, then rename(2) over
 # the live name. No window where $VENV_DIR is missing or half-updated.
-ln -sfn "$SIBLING" "$VENV_DIR.new"
-mv -Tf "$VENV_DIR.new" "$VENV_DIR"
+"$LN_BIN" -sfn "$SIBLING" "$VENV_DIR.new"
+"$MV_BIN" -Tf "$VENV_DIR.new" "$VENV_DIR"
 
 say "done: $VENV_DIR -> $SIBLING"
 say "Any process already running out of $CURRENT (coord-agent, coord-serve, coord-web, coord-drive-queue.service, coord-notify.service, ...) keeps executing its already-open interpreter from the OLD slot until it restarts — the symlink flip alone does not evict it. Restart the affected unit(s):"

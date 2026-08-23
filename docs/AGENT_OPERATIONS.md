@@ -970,6 +970,14 @@ service` escalation from #2572) is the tripwire — those units fail every
 ~3–5 minutes on a genuinely broken fleet, so the tripwire turns "up to 60
 minutes of dead fleet" into near-immediate repair.
 
+**The watchdog's own failures page too.** `coord-fleet-watchdog.service`
+itself carries `OnFailure=coord-failure-notify.service` — `main()` returns
+exit 1 on any unsuppressed Tier-2 finding or rate-limit escalation, which is
+a `failed` unit like any other, and #2580's entire premise is that nothing
+should depend on an operator thinking to run `systemctl --user status`
+unprompted. No cycle: `coord-failure-notify.service` carries no `OnFailure=`
+of its own.
+
 **Tier 1 (auto-repaired, precondition re-checked at repair time):** a broken
 `~/.coord-venv` with a healthy blue/green sibling slot (rolled back via
 `scripts/coord-venv-rollback.sh` — bash, deliberately, so the repair itself

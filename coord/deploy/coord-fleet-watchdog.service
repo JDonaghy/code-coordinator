@@ -2,7 +2,11 @@
 # coord-fleet-watchdog.timer (hourly) and, since #2580, chained via
 # `OnFailure=` off coord-drive-queue.service / coord-notify.service (see
 # those units' [Unit] sections) as an immediate tripwire rather than waiting
-# up to an hour for the next scheduled sweep.
+# up to an hour for the next scheduled sweep. This unit's OWN [Unit] section
+# also carries `OnFailure=coord-failure-notify.service` — a Tier-2/escalated
+# finding makes `main()` exit 1, which is a failure of THIS unit too, and it
+# deserves the same active page as everything else in this chain rather than
+# depending on someone thinking to check `systemctl --user status`.
 #
 # Runs scripts/fleet_watchdog.py under **/usr/bin/python3** — the
 # root-owned system interpreter, NEVER ~/.coord-venv/bin/python. That is the
@@ -61,6 +65,16 @@
 [Unit]
 Description=Fleet watchdog — stdlib-only, coord-independent repair sweep (#2580)
 Documentation=https://github.com/JDonaghy/code-coordinator/issues/2580
+# `main()` returns exit 1 on any unsuppressed Tier-2 finding (e.g. a
+# disabled timer nobody has sentineled) or rate-limit escalation, which
+# systemd reports as this UNIT'S OWN failure — the same "operator has to
+# think to run `systemctl --user status`" gap #2580 exists to close for
+# every OTHER condition class. coord-failure-notify.service has no
+# dependency on `coord`/Python/~/.coord-venv (see its own header), so
+# chaining it here pages a human even when the watchdog itself is the thing
+# that noticed something it can't safely fix. No cycle: that unit carries
+# no OnFailure= of its own.
+OnFailure=coord-failure-notify.service
 
 [Service]
 Type=oneshot

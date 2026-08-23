@@ -11,6 +11,7 @@ every context is built with an explicit ``--home`` under ``tmp_path``.
 
 from __future__ import annotations
 
+import configparser
 import http.server
 import json
 import os
@@ -39,6 +40,15 @@ from scripts.fleet_watchdog import (  # noqa: E402
     run_check,
     run_sweep,
 )
+
+# Cross-check-only imports (#2580 review): the WATCHDOG's own runtime must
+# never `import coord` (see TestNeverImportsCoord, a grep test against
+# scripts/fleet_watchdog.py specifically) but this TEST FILE is not that
+# runtime — importing coord here, purely to compare its originals against
+# fleet_watchdog.py's necessarily-reimplemented mirrors, does not weaken
+# that guarantee at all.
+from coord.health.checks import index_lock as coord_index_lock  # noqa: E402
+from coord.release_cordon import Cordon as CoordCordon  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +294,48 @@ class TestSuppressionSentinel:
         assert finding.suppressed is True
         assert finding.repaired is False
         assert not (tmp_path / ".local" / "bin" / "coord").exists()
+
+    def test_suppressed_orphaned_worktree_by_bare_assignment_id_is_not_repaired(
+        self, tmp_path, fake_board_server, monkeypatch
+    ):
+        # docs/AGENT_OPERATIONS.md documents suppressing "a specific
+        # worktree's assignment id" the same way failed-unit accepts a bare
+        # unit name -- i.e. writing the sentinel keyed by just "abc123",
+        # with no "orphaned-worktree:" prefix, must actually suppress it.
+        _BoardHandler.board_json = json.dumps({"assignments": []}).encode()
+        monkeypatch.setattr(fleet_watchdog, "TMUX", None)
+
+        wt = tmp_path / ".coord" / "worktrees" / "abc123"
+        wt.mkdir(parents=True)
+        old = 1_700_000_000.0
+        os.utime(wt, (old, old))
+
+        coord_dir = tmp_path / ".coord"
+        (coord_dir / "watchdog-suppress.json").write_text(
+            json.dumps(
+                {
+                    "abc123": {
+                        "reason": "test: deliberately keeping this worktree around",
+                        "set": "2026-08-21",
+                        "expires": None,
+                    }
+                }
+            )
+        )
+
+        port = fake_board_server.server_address[1]
+        ctx = _ctx(
+            tmp_path,
+            now=old + 7200,
+            board_url=f"http://127.0.0.1:{port}",
+            hostname="thishost",
+        )
+        findings = run_sweep(ctx)
+        [finding] = [f for f in findings if f.condition == "orphaned-worktree"]
+
+        assert finding.suppressed is True
+        assert finding.repaired is False
+        assert wt.exists()
 
     def test_release_propagate_timer_disabled_on_purpose_is_reported_not_flagged_actionable(
         self, tmp_path, monkeypatch
@@ -533,6 +585,90 @@ class TestExpiredCordonCleanup:
         assert not any(f.condition == "expired-cordon" for f in findings)
 
 
+class TestMirroredLogicCrossCheck:
+    """#2580 review: constraint 3 forces several pieces of coord's own logic
+    to be reimplemented rather than imported (``_slot_health`` /
+    ``has_open_holder`` / ``_cordon_active``) — exactly the "two independent
+    implementations answering the same question" split-brain risk CLAUDE.md's
+    #2096 section flags. These tests feed the SAME synthetic fixtures to both
+    the watchdog's mirror and coord's original and assert identical verdicts,
+    so a future drift in one implementation's formula shows up here instead
+    of silently diverging in production.
+    """
+
+    def test_has_open_holder_matches_coord_original_when_holder_present(self, tmp_path):
+        target = tmp_path / "repo" / ".git" / "index.lock"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"")
+        proc_root = tmp_path / "proc"
+        fd_dir = proc_root / "4242" / "fd"
+        fd_dir.mkdir(parents=True)
+        os.symlink(str(target), fd_dir / "5")
+
+        assert has_open_holder(target, proc_root=proc_root) is True
+        assert (
+            has_open_holder(target, proc_root=proc_root)
+            == coord_index_lock.has_open_holder(target, proc_root=proc_root)
+        )
+
+    def test_has_open_holder_matches_coord_original_when_deleted_suffix(self, tmp_path):
+        # A holder whose fd target has been unlinked while still open reads
+        # as "/path (deleted)" — both implementations must strip that
+        # suffix identically to still recognize the match.
+        target = tmp_path / "repo" / ".git" / "index.lock"
+        target.parent.mkdir(parents=True)
+        proc_root = tmp_path / "proc"
+        fd_dir = proc_root / "77" / "fd"
+        fd_dir.mkdir(parents=True)
+        # Symlink to a target that doesn't exist -> os.readlink still
+        # returns the literal text; append the kernel's own "(deleted)"
+        # marker by pointing at a target and then removing it isn't
+        # reproducible cross-platform, so fabricate the fd entry directly
+        # via a symlink whose target string already carries the suffix.
+        (fd_dir / "3").symlink_to(str(target) + " (deleted)")
+
+        assert has_open_holder(target, proc_root=proc_root) is True
+        assert (
+            has_open_holder(target, proc_root=proc_root)
+            == coord_index_lock.has_open_holder(target, proc_root=proc_root)
+        )
+
+    def test_has_open_holder_matches_coord_original_when_clean(self, tmp_path):
+        target = tmp_path / "repo" / ".git" / "index.lock"
+        proc_root = tmp_path / "proc"
+        (proc_root / "1" / "fd").mkdir(parents=True)
+
+        assert has_open_holder(target, proc_root=proc_root) is False
+        assert (
+            has_open_holder(target, proc_root=proc_root)
+            == coord_index_lock.has_open_holder(target, proc_root=proc_root)
+        )
+
+    def test_has_open_holder_matches_coord_original_when_proc_unreadable(self, tmp_path):
+        target = tmp_path / "repo" / ".git" / "index.lock"
+        proc_root = tmp_path / "does-not-exist"
+
+        assert has_open_holder(target, proc_root=proc_root) is None
+        assert (
+            has_open_holder(target, proc_root=proc_root)
+            == coord_index_lock.has_open_holder(target, proc_root=proc_root)
+        )
+
+    @pytest.mark.parametrize(
+        ("expires_at", "now"),
+        [
+            (0, 1_700_000_000.0),  # no expiry -> always active
+            (2_000_000_000.0, 1_700_000_000.0),  # far future -> active
+            (1_000.0, 2_000.0),  # long past -> expired
+            (1_700_000_000.0, 1_700_000_000.0),  # exactly at expiry -> expired
+        ],
+    )
+    def test_cordon_active_formula_matches_coord_original(self, expires_at, now):
+        mirrored = fleet_watchdog._cordon_active(expires_at, now)
+        original = CoordCordon(machine="thishost", expires_at=expires_at).active(now)
+        assert mirrored == original
+
+
 class TestStaleGitLock:
     def test_stale_lock_with_no_holder_is_removed(self, tmp_path):
         repo = tmp_path / "src" / "code-coordinator" / ".git"
@@ -691,3 +827,54 @@ class TestFailedUnitsScopedToCoord:
         ctx = _ctx(tmp_path)
         findings = fleet_watchdog.check_failed_units(ctx)
         assert [f.signature for f in findings] == ["failed-unit:coord-agent.service"]
+
+
+# ---------------------------------------------------------------------------
+# deploy/coord-fleet-watchdog.service's own OnFailure= escalation (#2580
+# review, non-blocking concern). Mirrors the guard style of
+# test_deploy_notify_unit.py / test_deploy_drive_queue_unit.py for the
+# equivalent line on those units.
+# ---------------------------------------------------------------------------
+
+WATCHDOG_UNIT_PATH = REPO_ROOT / "deploy" / "coord-fleet-watchdog.service"
+WATCHDOG_UNIT_PACKAGED_PATH = REPO_ROOT / "coord" / "deploy" / "coord-fleet-watchdog.service"
+
+
+def _parse_unit(path: Path) -> configparser.RawConfigParser:
+    # RawConfigParser (not ConfigParser): systemd's `%h`/`%%` specifiers
+    # collide with configparser's default `%`-interpolation syntax and would
+    # otherwise raise (e.g. this unit's `ExecStart=` line).
+    cp = configparser.RawConfigParser(strict=False)
+    cp.read(path)
+    return cp
+
+
+class TestFleetWatchdogUnitOwnOnFailure:
+    """`main()` returns exit 1 on any unsuppressed Tier-2 finding or
+    rate-limit escalation, which systemd reports as THIS unit's own
+    `failed` state — unlike coord-drive-queue.service/coord-notify.service
+    (which this same PR wires to `OnFailure=coord-failure-notify.service
+    coord-fleet-watchdog.service`), nothing paged a human when the watchdog
+    ITSELF failed or escalated. Given #2580's entire premise is "zero
+    operator-visible signal was the problem," that gap reproduces a milder
+    version of the same failure for a different condition class. Fixed by
+    chaining coord-failure-notify.service off this unit too."""
+
+    def test_unit_exists(self) -> None:
+        assert WATCHDOG_UNIT_PATH.exists(), "deploy/coord-fleet-watchdog.service is missing"
+
+    def test_on_failure_points_at_the_coord_independent_notifier(self) -> None:
+        unit = _parse_unit(WATCHDOG_UNIT_PATH)
+        assert unit.get("Unit", "OnFailure") == "coord-failure-notify.service"
+
+    def test_on_failure_comment_explains_why(self) -> None:
+        text = WATCHDOG_UNIT_PATH.read_text()
+        assert "OnFailure=coord-failure-notify.service" in text
+        assert "systemctl --user status" in text
+
+    def test_packaged_copy_matches(self) -> None:
+        """Also covered generally by test_packaged_deploy_units.py — pinned
+        again here so a failure of just this fact points straight at the
+        OnFailure= line rather than a generic byte-diff assertion."""
+        assert WATCHDOG_UNIT_PACKAGED_PATH.exists(), "coord/deploy/coord-fleet-watchdog.service is missing"
+        assert WATCHDOG_UNIT_PACKAGED_PATH.read_text() == WATCHDOG_UNIT_PATH.read_text()
