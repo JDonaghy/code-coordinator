@@ -688,6 +688,67 @@ def test_host_sleep_detected_via_wall_monotonic_divergence(tmp_path: Path) -> No
     assert "host sleep detected" in text
 
 
+def test_host_sleep_check_gated_on_result_seen_at_is_none(tmp_path: Path) -> None:
+    """Review finding (non-blocking, #2638 iteration 1): the host-sleep check
+    must be gated on `result_seen_at is None`, exactly like the runtime
+    ceiling and #2131's spend ceiling right below it — otherwise a
+    suspend/resume that straddles the short post-result grace-period
+    teardown would kill and mislabel an already-finished leg as a host-sleep
+    kill instead of letting it land DONE via the ordinary grace-period path.
+
+    Sequence: the worker's result is seen on the FIRST poll (so
+    `result_seen_at` is set before any divergence is measured); the SECOND
+    poll then sees a huge wall-vs-monotonic divergence — well past
+    `sleep_divergence_s` — but must be ignored because the leg is already
+    logically finished. The pre-existing grace-period teardown must be what
+    actually returns 0, not the host-sleep watchdog.
+    """
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    mono = _fake_clock()
+    wall = _fake_wall_clock()
+    real_wait = proc.wait
+    state = {"calls": 0}
+
+    def wait_advances(timeout: float | None = None) -> int:
+        state["calls"] += 1
+        mono.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        if state["calls"] == 2:
+            # The host suspends for ten hours AFTER the worker's result was
+            # already observed — e.g. straddling the post-result teardown.
+            wall.advance(10.0 * 3600.0)  # type: ignore[attr-defined]
+        else:
+            wall.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,  # short grace so poll 2 escalates via SIGTERM
+        max_wait=10_000.0,
+        first_output_timeout=10_000.0,
+        runtime_ceiling_s=6 * 3600.0,
+        sleep_divergence_s=60.0,
+        killpg=record,
+        log_has_result=lambda _: True,  # result already seen on the 1st poll
+        log_has_output=lambda _: True,
+        clock=mono,
+        wall_clock=wall,
+    )
+    # Grace-period teardown owns the outcome (SIGTERM, exit 0) — the
+    # host-sleep watchdog must NOT have fired despite the huge divergence.
+    assert code == 0
+    assert calls
+    assert calls[0][1] == signal.SIGTERM
+    text = Path(log_path).read_text()
+    assert "host sleep detected" not in text
+
+
 def test_runtime_ceiling_disabled_behaves_as_pre_2638(tmp_path: Path) -> None:
     """runtime_ceiling_s=None disables the wall-clock ceiling entirely — a
     leg with no ceiling configured behaves exactly as it did before #2638:

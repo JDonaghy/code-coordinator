@@ -226,6 +226,18 @@ class ConcurrencyConfig:
     # never interrupted, but tight enough to catch orphaned rows from crashed
     # sessions overnight.  Set to 0 to disable the sweep entirely.
     interactive_session_timeout_hours: float = 12.0
+    # #2638: wall-clock (NOT monotonic — see coord.agent's module comment on
+    # `_wait_for_proc_or_result`) ceiling on how long a single leg's process
+    # may run before it is killed and failed with a `runtime_ceiling_reason`.
+    # A suspended/asleep host (a laptop lid closed mid-leg) held a gate for
+    # 10.5h with nothing noticing before this existed. Generous default (6h,
+    # matching `coord.agent._DEFAULT_RUNTIME_CEILING_S` — kept as a literal
+    # here rather than imported, to avoid a config<->agent import cycle; keep
+    # the two in sync by hand) — some legs legitimately run for hours. 0/None
+    # disables the ceiling fleet-wide (pre-#2638 behaviour). RESTART-ONLY,
+    # same class as `first_output_timeout`/`bash_wrap_spawn` above — read
+    # once at `coord agent` startup, not refreshed by the config reload.
+    runtime_ceiling_s: float = 6.0 * 60.0 * 60.0
 
 
 @dataclass
@@ -2453,6 +2465,7 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
     for key in (
         "max_workers", "stagger_seconds", "backoff_base", "max_retries",
         "stale_threshold", "first_output_timeout", "interactive_session_timeout_hours",
+        "runtime_ceiling_s",
     ):
         val = raw.get(key)
         if val is None:

@@ -3244,12 +3244,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # commits" the #448 ADVISORY default would otherwise have produced.
         # Mutually exclusive with the other four (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2638: `runtime_ceiling_reason`/`host_sleep_reason` are the same
+        # column again — a suspended/asleep host killed the leg. Must reach
+        # `error=` below too, so the GitHub failure comment says "runtime
+        # ceiling" / "host sleep detected" instead of leaving the operator to
+        # `journalctl | grep suspend`. Mutually exclusive with the other five
+        # (see `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
             or entry.get("truncation_reason")
+            or entry.get("runtime_ceiling_reason")
+            or entry.get("host_sleep_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
@@ -3353,12 +3361,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # commits" the #448 ADVISORY default would otherwise have produced.
         # Mutually exclusive with the other four (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2638: `runtime_ceiling_reason`/`host_sleep_reason` are the same
+        # column again — a suspended/asleep host killed the leg. Must reach
+        # `error=` below too, so the GitHub failure comment says "runtime
+        # ceiling" / "host sleep detected" instead of leaving the operator to
+        # `journalctl | grep suspend`. Mutually exclusive with the other five
+        # (see `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
             or entry.get("truncation_reason")
+            or entry.get("runtime_ceiling_reason")
+            or entry.get("host_sleep_reason")
         )
         post_failure(
             exit_code=transition.exit_code,

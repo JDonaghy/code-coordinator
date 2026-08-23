@@ -502,12 +502,26 @@ def reconcile_completed_assignments(
         # truncated run lands FAILED with no `failure_reason` recorded —
         # exactly the "advisory looks the same as this" gap #2316 exists to
         # close.
+        # #2638: `runtime_ceiling_reason`/`host_sleep_reason` are the SAME
+        # column again — stamped by `AgentServer._reap` when the wall-clock
+        # runtime ceiling or host-sleep detector killed the leg (see
+        # `coord.agent.RUNTIME_CEILING_EXIT`/`HOST_SLEEP_EXIT`). Never
+        # coexist with each other (mutually exclusive exit codes) or with the
+        # other five: both are non-zero exits that preempt the push-failure
+        # and truncation branches, and neither is a terminal `result` event
+        # so `api_error_reason`/`usage_limit_reason` never fire alongside
+        # them either. Without this, a suspended-host kill lands FAILED with
+        # no `failure_reason` — invisible to `coord status`/`coord health`,
+        # `coord retry`, and the GitHub failure comment, which is the exact
+        # "nothing said the word asleep" gap #2638 exists to close.
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
             or entry.get("truncation_reason")
+            or entry.get("runtime_ceiling_reason")
+            or entry.get("host_sleep_reason")
         )
         _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
@@ -1945,6 +1959,11 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
         # column, same mutual exclusivity — see the identical chain in
         # `reconcile_completed_assignments`.
         or entry.get("truncation_reason")
+        # #2638: a wall-clock runtime-ceiling or host-sleep kill. Same
+        # column, same mutual exclusivity — see the identical chain in
+        # `reconcile_completed_assignments`.
+        or entry.get("runtime_ceiling_reason")
+        or entry.get("host_sleep_reason")
     )
     if not reason or not assignment_id:
         return

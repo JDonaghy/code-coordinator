@@ -206,6 +206,79 @@ class TestRun:
         assert row is not None, "assignment row must exist"
         assert row["failure_reason"] == "remote: Invalid username or token."
 
+    def test_runtime_ceiling_reason_surfaces_in_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#2638: a `type="work"` assignment killed by the wall-clock runtime
+        ceiling hits the same generic FAILED branch as the push-failure case
+        above. Before this fix that branch's `or` chain didn't know about
+        `runtime_ceiling_reason`, so the kill reached GitHub as a blank,
+        unexplained failure instead of naming the ceiling — exactly the
+        "nothing said the word asleep" gap #2638 exists to close."""
+        _record("ceiling-1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ceiling-1",
+                    "failed",
+                    error=None,
+                    runtime_ceiling_reason=(
+                        "runtime ceiling — ran 6.02h, past the 6.00h ceiling (#2638)"
+                    ),
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Coordinator: Assignment Failed" in body
+        assert "runtime ceiling" in body
+        row = state_mod.get_connection().execute(
+            "SELECT failure_reason FROM assignments WHERE assignment_id=?",
+            ("ceiling-1",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert row["failure_reason"] == (
+            "runtime ceiling — ran 6.02h, past the 6.00h ceiling (#2638)"
+        )
+
+    def test_host_sleep_reason_surfaces_in_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#2638: same generic FAILED branch, for a host-sleep-detection kill
+        instead of a runtime-ceiling one — see
+        `test_runtime_ceiling_reason_surfaces_in_failure_comment` above."""
+        _record("sleep-1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "sleep-1",
+                    "failed",
+                    error=None,
+                    host_sleep_reason=(
+                        "host sleep detected — wall clock advanced 37800s "
+                        "while only 5s of monotonic time elapsed; the host "
+                        "likely suspended mid-leg (#2638)"
+                    ),
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Coordinator: Assignment Failed" in body
+        assert "host sleep detected" in body
+        row = state_mod.get_connection().execute(
+            "SELECT failure_reason FROM assignments WHERE assignment_id=?",
+            ("sleep-1",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert "host sleep detected" in row["failure_reason"]
+
     def test_analysis_deliverable_completion_posts_final_message(
         self, coord_dir: Path, config: Config
     ) -> None:
