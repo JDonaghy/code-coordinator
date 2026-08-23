@@ -178,6 +178,24 @@ Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:
 # ceiling (>= the release carrying #1972). A higher global ceiling on an
 # older coord launches two same-repo drives, which stale each other's
 # Test verdicts (#1479) — the exact collision #1972 exists to prevent.
+#
+# #2573: the per-repo ceiling deliberately does NOT appear as a
+# --max-parallel-per-repo flag below. It has a THIRD source now — set it as
+# `pipeline.max_parallel_per_repo` in ~/.coord/coordinator.yml instead of a
+# `systemctl --user edit` drop-in. A drop-in has to restate this entire
+# ExecStart= line to change one flag on it, and that restated copy silently
+# drifts from THIS file forever after — dellserver's live drop-in, built
+# solely to carry --max-parallel-per-repo 2, was found resetting ExecStart=
+# back to %h/.local/bin/coord, silently reverting #2314's pinned-venv path
+# above as an unnoticed side effect (see docs/DRIVE_QUEUE.md §9 and #2573).
+# coordinator.yml has no such coupling — it is read fresh by the flag's own
+# resolution (an explicit --max-parallel-per-repo on this ExecStart= would
+# still win, but none is set here on purpose) — see
+# `coord.commands.drive_queue.drive_queue_tick` for the exact order and
+# `coord.config.PipelineConfig.max_parallel_per_repo` for the field. If a
+# `coord-drive-queue.service.d/override.conf` still exists on a host purely
+# to carry --max-parallel-per-repo, move that value into coordinator.yml and
+# delete the drop-in — an empty override directory cannot drift.
 ExecStart=%h/.coord-venv/bin/coord drive-queue tick --max-parallel 4 --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below

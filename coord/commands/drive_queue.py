@@ -3866,14 +3866,20 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
 @click.option(
     "--max-parallel-per-repo",
     type=int,
-    default=DEFAULT_MAX_PARALLEL_PER_REPO,
-    show_default=True,
+    default=None,
     help=(
         "Per-repo concurrency ceiling, applied after --max-parallel (#1972). "
         "An entry whose repo is already at it DEFERS — position unchanged, no "
         "attempt spent — so the walk lands on the first entry from a repo with "
         "headroom: per-repo serialisation, cross-repo parallelism. 0 disables "
-        "it, restoring one global counter."
+        "it, restoring one global counter. Omit this flag to use "
+        "pipeline.max_parallel_per_repo from coordinator.yml (or, absent "
+        f"that, {DEFAULT_MAX_PARALLEL_PER_REPO}, #2573) — passing it "
+        "explicitly always wins over both. Prefer the config setting over a "
+        "systemd drop-in for anything that needs to persist: a drop-in has "
+        "to restate the packaged unit's whole ExecStart= to change just this "
+        "flag, and that copy silently drifts from the packaged unit's other "
+        "flags over time (#2573)."
     ),
 )
 @click.option(
@@ -3903,7 +3909,7 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
 @_CONFIG_OPTION
 def drive_queue_tick(
     max_parallel: int,
-    max_parallel_per_repo: int,
+    max_parallel_per_repo: int | None,
     dry_run: bool,
     reconcile_only: bool,
     config_path: Path,
@@ -3922,12 +3928,22 @@ def drive_queue_tick(
     host actually running it (#1870).
 
     Capacity has two ceilings (#1972): the global `--max-parallel`, then
-    `--max-parallel-per-repo` (default 1). Entries whose repo is already at the
-    per-repo ceiling defer, so a tick with a claude-coordinator drive running
-    skips the 38 queued claude-coordinator entries behind it and launches the
-    quadraui one — per-repo serialisation, cross-repo parallelism. `--dry-run`
-    prints the per-repo breakdown so "why didn't item 2 go?" is answerable from
-    the output alone.
+    `--max-parallel-per-repo`. Entries whose repo is already at the per-repo
+    ceiling defer, so a tick with a claude-coordinator drive running skips the
+    38 queued claude-coordinator entries behind it and launches the quadraui
+    one — per-repo serialisation, cross-repo parallelism. `--dry-run` prints
+    the per-repo breakdown so "why didn't item 2 go?" is answerable from the
+    output alone.
+
+    #2573: `--max-parallel-per-repo` resolves in this order — the flag on
+    THIS invocation, when given; else `pipeline.max_parallel_per_repo` from
+    `coordinator.yml`; else `coord.drive_queue.DEFAULT_MAX_PARALLEL_PER_REPO`
+    (1). Set the fleet-wide value in `coordinator.yml`, not a systemd
+    drop-in — a drop-in has to restate the packaged unit's entire
+    `ExecStart=` to override one flag, and that copy silently drifts from
+    the packaged unit (a dellserver drop-in built to carry this flag
+    reverted #2314's pinned-venv `ExecStart=` right back to a
+    worker-overwritable path as an unnoticed side effect).
 
     `--max-parallel 0` (or `--reconcile-only`, the readable spelling of the
     same thing — #2110) reconciles every `running` entry against the board and
@@ -3965,6 +3981,23 @@ def drive_queue_tick(
             "--max-parallel must be at least 0 (0 = reconcile-only, launch "
             "nothing this run — see --reconcile-only)"
         )
+
+    # #2573: an explicit `--max-parallel-per-repo` always wins; otherwise
+    # fall back to the fleet-wide `pipeline.max_parallel_per_repo` in
+    # coordinator.yml, and only then to the hardcoded default. Resolved
+    # BEFORE validation below so a bad value from either source is caught
+    # the same way regardless of which one supplied it.
+    if max_parallel_per_repo is None:
+        try:
+            from coord.commands._common import _load_config  # noqa: PLC0415
+
+            config_default = _load_config(config_path).pipeline.max_parallel_per_repo
+        except Exception:  # noqa: BLE001 — an unreadable config must not abort the tick
+            config_default = None
+        max_parallel_per_repo = (
+            DEFAULT_MAX_PARALLEL_PER_REPO if config_default is None else config_default
+        )
+
     if max_parallel_per_repo < 0:
         raise click.ClickException(
             "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"

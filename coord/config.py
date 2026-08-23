@@ -1020,6 +1020,22 @@ class PipelineConfig:
     over this — see ``coord.drive_queue.effective_max_fix_rounds`` for the
     full resolution order. This does **not** change interactive ``coord
     drive``'s own default; it is read only by the drive-queue tick.
+
+    ``max_parallel_per_repo`` (#2573) is the fleet-wide default for
+    ``coord drive-queue tick``'s per-repo concurrency ceiling (#1972,
+    ``--max-parallel-per-repo`` — see ``docs/DRIVE_QUEUE.md`` §9). It exists
+    so that value can live in ``coordinator.yml`` instead of a systemd
+    drop-in: a drop-in has to restate the packaged unit's ENTIRE
+    ``ExecStart=`` to change one flag, and that copy silently drifts —
+    #2573 found dellserver's live drop-in reverting #2314's pinned-venv
+    ``ExecStart`` path back to a worker-overwritable one, purely as a side
+    effect of the drop-in also carrying this setting. ``None`` (the
+    default) leaves the ceiling at
+    ``coord.drive_queue.DEFAULT_MAX_PARALLEL_PER_REPO`` (1). An explicit
+    ``coord drive-queue tick --max-parallel-per-repo N`` on the command line
+    always wins over this fleet default — see
+    ``coord.commands.drive_queue.drive_queue_tick`` for the resolution
+    order, which mirrors ``max_fix_rounds`` above.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -1045,6 +1061,9 @@ class PipelineConfig:
     # #2604 — None means "use coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS".
     # See the class docstring.
     max_fix_rounds: int | None = None
+    # #2573 — None means "use coord.drive_queue.DEFAULT_MAX_PARALLEL_PER_REPO".
+    # See the class docstring.
+    max_parallel_per_repo: int | None = None
 
     def attention_threshold_for(
         self,
@@ -2869,6 +2888,17 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
                 "pipeline.max_fix_rounds must be a positive integer or null"
             )
         cfg.max_fix_rounds = value
+
+    if "max_parallel_per_repo" in raw:
+        value = raw["max_parallel_per_repo"]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ConfigError(
+                "pipeline.max_parallel_per_repo must be a non-negative "
+                "integer or null (0 disables the per-repo ceiling)"
+            )
+        cfg.max_parallel_per_repo = value
 
     return cfg
 
