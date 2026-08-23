@@ -3327,6 +3327,14 @@ def _openapi_spec() -> dict:
                                             "pipeline.max_fix_rounds"
                                         ),
                                     },
+                                    "no_acceptance": {
+                                        "type": "boolean",
+                                        "description": (
+                                            "#2589: per-entry `--no-acceptance` "
+                                            "passthrough for the tick's launch; "
+                                            "omitted means no passthrough"
+                                        ),
+                                    },
                                     "to_position": {
                                         "type": "integer",
                                         "description": "move: destination slot (clamped)",
@@ -6015,6 +6023,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     # (a client predating this feature) means "no override",
                     # same as an explicit `null`.
                     max_fix_rounds=body.get("max_fix_rounds"),
+                    # #2589: per-entry `--no-acceptance` passthrough. Absent
+                    # key (a client predating this feature) means "no
+                    # passthrough", same as `bool(None)`.
+                    no_acceptance=bool(body.get("no_acceptance")),
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":

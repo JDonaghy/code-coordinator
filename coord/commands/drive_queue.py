@@ -76,6 +76,7 @@ from coord.drive_queue import (
     find_cycle,
     fired_holds,
     is_permanent_block_reason,
+    is_pre_dispatch_block_reason,
     is_unsatisfiable_prereq_reason,
     parse_after_spec,
     parse_key,
@@ -255,6 +256,24 @@ def drive_queue_group() -> None:
         "default — it does not leave a previous override in place."
     ),
 )
+@click.option(
+    "--no-acceptance",
+    "no_acceptance",
+    is_flag=True,
+    default=False,
+    help=(
+        "#2589: per-entry passthrough of `coord drive --no-acceptance` — "
+        "skip #1453's oracle-loop JIT slice authoring for THIS entry's "
+        "tick-launched drive (use when the issue's own deliverable has no "
+        "user-visible behaviour for a slice to exercise, e.g. a config "
+        "schema change — see the #2531 incident). Following that advice by "
+        "running `coord drive` directly instead bypasses the queue's own "
+        "--max-parallel-per-repo ceiling; this flag is how to follow it "
+        "THROUGH the queue instead. Re-adding an already-queued entry "
+        "WITHOUT this flag reverts it to the ordinary oracle-loop path — it "
+        "does not leave a previous passthrough in place."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -268,6 +287,7 @@ def drive_queue_add(
     no_predict_overlap: bool,
     hold_scope: str,
     max_fix_rounds: int | None,
+    no_acceptance: bool,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -342,12 +362,14 @@ def drive_queue_add(
         resume_when=resume_when,
         hold_scope=hold_scope,
         max_fix_rounds=max_fix_rounds,
+        no_acceptance=no_acceptance,
     )
     if auto_after:
         _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
     pinned = f" on {machine}" if machine else ""
     fix_rounds_note = f" · max-fix-rounds={max_fix_rounds}" if max_fix_rounds else ""
+    no_acceptance_note = " · --no-acceptance" if no_acceptance else ""
     gate = ""
     if hold_after:
         gate = " · holds the queue when done"
@@ -368,7 +390,7 @@ def drive_queue_add(
     overlap_note = ("\n" + "\n".join(overlap_notes)) if overlap_notes else ""
     click.echo(
         f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}{fix_rounds_note}"
-        f"{scope_downgrade_warning}{overlap_note}"
+        f"{no_acceptance_note}{scope_downgrade_warning}{overlap_note}"
     )
 
     # #2339: say out loud when this add cannot possibly accomplish anything —
@@ -821,6 +843,35 @@ _BLOCKED_GATE_NOTE = (
     "re-blocked"
 )
 
+# #2589: `_BLOCKED_GATE_NOTE` above is flatly wrong for a row whose cause is
+# `coord.drive_queue.is_pre_dispatch_block_reason` — an empty-branch
+# DONE/ADVISORY death (#2363) or a "no assignment was ever created" dispatch
+# failure (#2273). Neither ever produced a branch or a PR, so there is no
+# merge-queue row for #2230's `_blocked_gate_reading` to have ANY opinion
+# about — it returns `None` ("no evidence either way") EVERY tick, forever,
+# which is exactly the "will never satisfy" shape `_BLOCKED_AFTER_NOTE`
+# already names for the `after=`-graph case. The claude-coordinator#2531
+# incident this closes: the row's OWN reason recommended `coord retry` or
+# `coord drive --no-acceptance` while this note, right below it, told the
+# operator #2230 would clear it on its own — the opposite of true. Two
+# distinct sentences (never "a live gate, confirmed clear" — this predicate
+# fires when there never WAS a gate) so `attempts=N/N` reads as the headline
+# it is, not a suffix the operator has to go hunting for.
+_BLOCKED_TERMINAL_NOTE = (
+    "NEEDS OPERATOR — attempts {attempts}/{attempts} exhausted, and this "
+    "cause has no merge gate to re-check (#2589): no branch/PR was ever "
+    "created for this run, so #2230's automatic re-check has no evidence to "
+    "act on and never will. `coord drive-queue remove` + `add` only helps "
+    "once the underlying cause is actually fixed."
+)
+_BLOCKED_TERMINAL_NOTE_NO_ATTEMPTS = (
+    "NEEDS OPERATOR — this cause has no merge gate to re-check (#2589): no "
+    "branch/PR was ever created for this run, so #2230's automatic "
+    "re-check has no evidence to act on and never will. `coord drive-queue "
+    "remove` + `add` only helps once the underlying cause is actually "
+    "fixed."
+)
+
 
 def _row_cause(reason: str) -> str:
     """The first line of *reason*, clipped to fit the summary row (#2183)."""
@@ -898,13 +949,27 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
 
+        # #2589: a `blocked` row whose cause never produced a branch/PR has
+        # NOTHING for #2230's merge-gate sweep to re-check — see
+        # `_BLOCKED_TERMINAL_NOTE`'s comment. Computed once per row and
+        # consulted below both for the row's own headline (this must read as
+        # terminal, not as "just blocked", the moment an operator sees it —
+        # `attempts=N/N` is the fact that matters, not a suffix buried after
+        # `deferrals=`) and for which remedy note prints.
+        pre_dispatch_terminal = entry.state == STATE_BLOCKED and (
+            not is_permanent_block_reason(entry.last_reason)
+            and is_pre_dispatch_block_reason(entry.last_reason)
+        )
+
         # A diagnosed row whose block is NOT (or no longer) caused by its
         # `after=` graph gets its own cause on the state token itself — #2183
         # point 2: the terminal reason leads, not a dependency list that may
         # have nothing to do with it. A row that IS dependency-caused (or
         # wasn't diagnosed at all) keeps the plain state token unchanged.
         state_label = entry.state
-        if diagnosed and not dependency_reason and entry.last_reason:
+        if pre_dispatch_terminal:
+            state_label = f"{entry.state} [NEEDS OPERATOR]"
+        elif diagnosed and not dependency_reason and entry.last_reason:
             state_label = f"{entry.state}: {_row_cause(entry.last_reason)}"
 
         bits = [f"{entry.position:>2}  {entry.key:<28} {state_label}"]
@@ -970,7 +1035,15 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             and not is_permanent_block_reason(entry.last_reason)
             and not is_unsatisfiable_prereq_reason(entry.last_reason)
         ):
-            click.echo(f"      {_BLOCKED_GATE_NOTE}")
+            if pre_dispatch_terminal:
+                note = (
+                    _BLOCKED_TERMINAL_NOTE.format(attempts=entry.attempts)
+                    if entry.attempts
+                    else _BLOCKED_TERMINAL_NOTE_NO_ATTEMPTS
+                )
+                click.echo(f"      {note}")
+            else:
+                click.echo(f"      {_BLOCKED_GATE_NOTE}")
         for line in _hold_lines(entry):
             click.echo(line)
 
@@ -2899,6 +2972,12 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     LOAD failure (unreadable file, bad YAML) falls back to the tick's default
     rather than aborting the launch, the same fail-soft posture the rest of
     this module takes for advisory reads.
+
+    #2589: also emits ``--no-acceptance`` when ``entry.no_acceptance`` is
+    set — the per-entry passthrough `coord drive-queue add --no-acceptance`
+    stores. Unlike ``--max-fix-rounds`` this has no fleet-config fallback:
+    it is opt-in-only, so an entry that never set it launches exactly as
+    before this column existed.
     """
     from coord.drive import coord_argv  # noqa: PLC0415
 
@@ -2917,6 +2996,8 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
         "--max-fix-rounds",
         str(effective_max_fix_rounds(entry, config_default)),
     ]
+    if entry.no_acceptance:
+        argv += ["--no-acceptance"]
     if config_path:
         argv += ["--config", str(config_path)]
     return argv

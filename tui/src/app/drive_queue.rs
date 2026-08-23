@@ -174,6 +174,56 @@ fn hold_headline(e: &BoardDriveQueueEntry) -> String {
     }
 }
 
+/// #2589: does *reason* name the "claimed success, wrote nothing" signature
+/// — an acceptance-author or plain work session that exited DONE/ADVISORY
+/// while its branch carried zero commits?
+///
+/// Mirrors `coord.drive_queue._is_empty_branch_death_reason` exactly (same
+/// two text shapes, same "no commits" required in both) — a pure text
+/// classifier, not a typed column, because neither Python `_die` call site
+/// this recognizes embeds a dedicated marker; today nothing reads their
+/// reason text for anything but display, on either side of the wire.
+fn is_empty_branch_death_reason(reason: &str) -> bool {
+    let lowered = reason.to_lowercase();
+    if !lowered.contains("no commits") {
+        return false;
+    }
+    if lowered.contains("acceptance author")
+        && (lowered.contains("exited advisory") || lowered.contains("exited done"))
+    {
+        return true;
+    }
+    lowered.contains("exited advisory") && lowered.contains("nothing was pushed")
+}
+
+/// #2589: does *reason* carry the "no assignment was ever created for this
+/// run" marker `coord.drive_queue._reconcile_running` stamps onto a
+/// `retry`/`exhausted` reason when `_dispatch_produced_nothing` fires?
+///
+/// Mirrors `coord.drive_queue._is_dispatch_failure_reason` exactly.
+fn is_dispatch_failure_reason(reason: &str) -> bool {
+    reason
+        .to_lowercase()
+        .contains("no assignment was ever created for this run")
+}
+
+/// #2589: does *reason* name a `blocked` cause with NOTHING for the
+/// coordinator's #2230 merge-gate sweep to re-check?
+///
+/// Mirrors `coord.drive_queue.is_pre_dispatch_block_reason` exactly — see
+/// its docstring for the full rationale. The short version: both shapes
+/// below are pre-dispatch by construction (no branch, no PR, no merge-queue
+/// row ever existed for this run), so `coord`'s own `_blocked_gate_reading`
+/// has "no evidence either way" for them, forever — a `blocked` row this
+/// classifier matches needs a human, not a tick. Used by [`CoordApp::
+/// queue_row`] to render such a row visibly distinct from an ordinary
+/// `blocked` row that genuinely might self-heal, closing the exact gap
+/// claude-coordinator#2589 reports: two `blocked` rows that looked
+/// identical, one of which needed an operator and the other did not.
+pub(crate) fn is_pre_dispatch_block_reason(reason: &str) -> bool {
+    is_empty_branch_death_reason(reason) || is_dispatch_failure_reason(reason)
+}
+
 /// Is this row's `after` list satisfied by the queue it sits in?
 ///
 /// Deliberately a *local, conservative* read: the authoritative eligibility
@@ -971,7 +1021,7 @@ impl CoordApp {
                 e.position.to_string(),
                 alias_queue_key(&e.key()),
                 or_dash(self.queue_issue_title(&e.repo_name, e.issue_number)),
-                or_dash(e.state.clone()),
+                or_dash(queue_state_cell(e)),
                 or_dash(self.queue_live_machine(e).unwrap_or_default()),
                 work_count.to_string(),
                 smoke_count.to_string(),
@@ -2038,6 +2088,31 @@ pub(crate) fn alias_queue_key(key: &str) -> String {
     match key.split_once('#') {
         Some((repo, rest)) => format!("{}#{}", repo_alias(repo), rest),
         None => key.to_string(),
+    }
+}
+
+/// #2589: appended to the `State` cell of a `blocked` row whose cause
+/// [`is_pre_dispatch_block_reason`] matches — the row is `blocked` the same
+/// as any other by [`QueueRow::state`] (sorting, colouring, and the `u`
+/// unblock action all key off the WIRE state, unchanged), but the rendered
+/// text says out loud what an operator otherwise has to read the `Reason`
+/// column and do the classification themselves to learn: this row will
+/// never self-heal, unlike an ordinary `blocked` row #2230's merge-gate
+/// sweep (or #2362's `after=`-graph sweep) might still clear on its own.
+pub(crate) const QUEUE_NEEDS_OPERATOR_SUFFIX: &str = " [NEEDS OPERATOR]";
+
+/// The `State` cell for one entry — the wire `state` verbatim, plus
+/// [`QUEUE_NEEDS_OPERATOR_SUFFIX`] when this `blocked` row's own cause has
+/// no merge gate #2230's tick sweep could ever clear (#2589). Deliberately
+/// only touches the CELL TEXT, never [`QueueRow::state`] itself — sorting,
+/// row colour ([`dq_state_colors`]) and the row menu's `u`/unblock action
+/// all still key off the plain wire state, exactly as before this column
+/// existed.
+fn queue_state_cell(e: &BoardDriveQueueEntry) -> String {
+    if e.state == QUEUE_STATE_BLOCKED && is_pre_dispatch_block_reason(&e.last_reason) {
+        format!("{}{}", e.state, QUEUE_NEEDS_OPERATOR_SUFFIX)
+    } else {
+        e.state.clone()
     }
 }
 
@@ -3459,6 +3534,85 @@ mod tests {
         assert_eq!(row.cells[CoordApp::QUEUE_COL_SMOKE], "0");
         assert_eq!(row.cells[CoordApp::QUEUE_COL_REVIEW], "0");
         assert_eq!(row.cells[4], QUEUE_EMPTY_CELL);
+    }
+
+    /// #2589: the pure classifier matches both pre-dispatch shapes (mirrors
+    /// `coord.drive_queue.is_pre_dispatch_block_reason`'s own two cases) and
+    /// nothing else — an ordinary drive-session death has real board state
+    /// behind it (dispatched fine, died at a later stage), which is exactly
+    /// what still might self-heal.
+    #[test]
+    fn is_pre_dispatch_block_reason_matches_only_the_two_pre_dispatch_shapes() {
+        assert!(is_pre_dispatch_block_reason(
+            "drive exited (exit_code=1): acceptance author 8e5acd6b589f exited \
+             ADVISORY with no commits on its branch — nothing was authored, so \
+             there is no slice to land."
+        ));
+        assert!(is_pre_dispatch_block_reason(
+            "drive session died without landing the work (2/2 attempts) — \
+             giving up — no assignment was ever created for this run (#2273): \
+             likely an infrastructure/dispatch-layer failure, not a code defect"
+        ));
+        assert!(!is_pre_dispatch_block_reason(
+            "drive exited: merge attempted 3 times without landing"
+        ));
+        assert!(!is_pre_dispatch_block_reason(
+            "pre-req myrepo#7 is queued but blocked — it will never satisfy"
+        ));
+        assert!(!is_pre_dispatch_block_reason(""));
+    }
+
+    /// The exact claude-coordinator#2589 shape: two `blocked` rows that look
+    /// identical by state alone — one exhausted its attempts against a
+    /// pre-dispatch cause with no merge gate to ever re-check (needs a
+    /// human), the other died for an ordinary reason a later tick's #2230
+    /// sweep might still clear on its own. The `State` cell must tell them
+    /// apart; sorting/colouring/the row menu must not (`QueueRow::state`
+    /// stays the plain wire value for both).
+    #[test]
+    fn queue_row_marks_a_pre_dispatch_blocked_row_needs_operator_but_leaves_an_ordinary_one_plain()
+    {
+        let needs_operator = BoardDriveQueueEntry {
+            attempts: 6,
+            last_reason: "acceptance author 8e5acd6b589f exited ADVISORY with no \
+                           commits on its branch — nothing was authored"
+                .to_string(),
+            ..entry(2531, 0, QUEUE_STATE_BLOCKED, &[])
+        };
+        let self_healing = BoardDriveQueueEntry {
+            attempts: 1,
+            last_reason: "pre-req myrepo#2531 is queued but blocked — it will \
+                           never satisfy"
+                .to_string(),
+            ..entry(2533, 1, QUEUE_STATE_BLOCKED, &["myrepo#2531"])
+        };
+        let app = make_test_app(BoardData {
+            drive_queue: vec![needs_operator, self_healing],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        assert_eq!(rows.len(), 2);
+        let row_2531 = rows.iter().find(|r| r.issue_number == 2531).unwrap();
+        let row_2533 = rows.iter().find(|r| r.issue_number == 2533).unwrap();
+
+        assert!(
+            row_2531.cells[3].ends_with(QUEUE_NEEDS_OPERATOR_SUFFIX),
+            "cells: {:?}",
+            row_2531.cells
+        );
+        assert!(
+            !row_2533.cells[3].ends_with(QUEUE_NEEDS_OPERATOR_SUFFIX),
+            "cells: {:?}",
+            row_2533.cells
+        );
+        assert_ne!(row_2531.cells[3], row_2533.cells[3]);
+
+        // Both rows are still, unambiguously, `blocked` on the wire — this
+        // is presentation only. Sorting, `dq_state_colors`, and the row
+        // menu's `u`/unblock action all key off `QueueRow::state`, which
+        // must never carry the suffix.
+        assert_eq!(row_2531.state, QUEUE_STATE_BLOCKED);
+        assert_eq!(row_2533.state, QUEUE_STATE_BLOCKED);
     }
 
     /// A `waiting` entry that's pinned but has nothing currently running
