@@ -9,7 +9,12 @@ from pathlib import Path
 
 import click
 
-from coord.commands._common import _apply_label_change, _CONFIG_OPTION, _load_config
+from coord.commands._common import (
+    _apply_label_change,
+    _CONFIG_OPTION,
+    _load_config,
+    _resolve_repo_slug,
+)
 
 
 @click.command(help="Sync open issues from GitHub into the local SQLite cache.")
@@ -104,8 +109,7 @@ def issue_view_cmd(
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     from coord import github_ops  # noqa: PLC0415
 
     try:
@@ -184,8 +188,7 @@ def issue_list_cmd(
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     from coord import github_ops  # noqa: PLC0415
 
     try:
@@ -247,8 +250,7 @@ def issue_edit_cmd(
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     if body_file is not None:
         body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
     if title is None and body is None:
@@ -300,8 +302,7 @@ def issue_close_cmd(
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     from coord.state import close_issue  # noqa: PLC0415
 
     try:
@@ -334,8 +335,7 @@ def issue_reopen_cmd(
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     from coord.state import reopen_issue  # noqa: PLC0415
 
     try:
@@ -437,8 +437,7 @@ def issue_create_cmd(
         )
 
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     if body_file is not None:
         body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
     from coord.state import create_issue as _create_issue  # noqa: PLC0415
@@ -497,8 +496,7 @@ def issue_label_cmd(
     from coord.state import apply_issue_labels, get_cached_issue_labels  # noqa: PLC0415
 
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
 
     # Snapshot the pre-change cache so the echoed message reflects the actual
     # delta, not just the requested --add/--remove sets (a requested label
@@ -728,8 +726,7 @@ def track(repo: str, issue: int, config_path: Path) -> None:
     """#261/#486: TUI right-click 'Send to Pipeline' fires this command to
     make the issue a dispatchable Pipeline:New card (`coord` + `status:ready`)."""
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
         add={"coord", "status:ready"},
@@ -766,8 +763,7 @@ def untrack(repo: str, issue: int, config_path: Path) -> None:
     """#266: TUI right-click 'Drop to backlog' on a Pipeline row fires this to
     evict the issue from the coord Pipeline (removes `coord` + any `status:*`)."""
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
         add=set(),
@@ -803,8 +799,7 @@ def backlog(repo: str, issue: int, config_path: Path) -> None:
     """#266: TUI right-click 'Drop to Backlog' fires this command to
     walk a Refining/Refined row back to the unscoped Backlog state."""
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
         add=set(),
@@ -843,8 +838,7 @@ def queue(repo: str, issue: int, config_path: Path) -> None:
     Pipeline:New issue (or an epic + its non-Done children, one call per
     issue) into In-progress:`ready`."""
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
         add={"status:queued"},
@@ -869,8 +863,7 @@ def unqueue(repo: str, issue: int, config_path: Path) -> None:
     """#1500: TUI right-click 'Unmark ready' fires this command to strip
     `status:queued`, returning the issue to Pipeline:New."""
     cfg = _load_config(config_path)
-    repo_entry = cfg.repo(repo)
-    slug = repo_entry.github if repo_entry else repo
+    slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
         add=set(),
