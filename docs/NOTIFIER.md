@@ -34,7 +34,7 @@ ping progress either: no "3/7 done" messages.
 | fleet CRIT invalidating in-flight work | disk mainly (#1625) — a verdict recorded under disk pressure is worse than a red one | terminal-ish |
 | stalled past its nudge | `drive` nudged a stalled stage (#1593) and it is *still* stalled | strong |
 | output silence | no new log line / `STATUS:` for longer than the stratum's learned threshold | strong |
-| total elapsed vs baseline | past the stratum's p90 **and** (silent past the silence threshold **or** silence unconfirmable — agent unreachable) | weakest, fires last |
+| total elapsed vs baseline | past the stratum's p90 **and** (silent past the silence threshold **or** silence unconfirmable because the agent is *confirmed* unreachable) | weakest, fires last |
 
 **The three worker probes are ranked, not averaged.** A worker that printed
 `STUCK:` is reported as stuck, not as "stuck and also somewhat over its p90".
@@ -49,21 +49,43 @@ percentile choice removes that — it only moves which 10%. So `over_baseline`
 is now **gated on output silence**, not a substitute for it: it only fires
 when the leg is past its duration baseline *and* has gone quiet past the
 same silence threshold the output-silence probe uses — **or** quietness
-could not be confirmed at all, because the owning agent is unreachable and
-the collector has no `last_output_at` to read. That second branch matters:
-"we don't know" is deliberately treated the same as "silent", not the same
-as "confirmed recent output", because an unreachable agent is the single
-scenario this channel's contract names most literally — nobody is coming
-because there is no agent left to come — and it is the one case none of the
-other probes can catch (`STUCK:` and output silence both need the same
-agent-status data a dead agent can't supply). Whenever `last_output_at` IS
-known and quiet, that gate condition is a strict subset of the silence
-probe's own condition, so the silence probe already fired and — being
-ranked stronger — is what actually gets reported; `over_baseline` only
-surfaces on its own for the "duration exceeded, output unknown" case. A
-worker that is slow but still confirmed talking is not evidence nobody is
-coming, and is not this channel's business — a pure duration/cost signal
-belongs in `coord status` or the digest, not the push transport.
+could not be confirmed because the owning agent is *confirmed* unreachable
+(it did not answer `/status` at all). That second branch matters: "we don't
+know" is deliberately treated the same as "silent" **only** in that one
+case, because an unreachable agent is the single scenario this channel's
+contract names most literally — nobody is coming because there is no agent
+left to come — and it is the one case none of the other probes can catch
+(`STUCK:` and output silence both need the same agent-status data a dead
+agent can't supply).
+
+**"We don't know" is not the same as "it's gone" (#2657).** An earlier
+version of this gate conflated two different reasons `last_output_at` can
+come back `None`: the agent never answered at all, versus the agent
+answered fine but the assignment had simply finished and no longer appears
+in its `active` list — the board's own `in_progress` row lags the agent by
+up to two notifier ticks (`coord-notify.timer`'s reconcile cadence is 5
+minutes; this channel ticks every 120s). The second case is not silence at
+all, it is the *strongest possible evidence the leg is done* — and the old
+code paged it as `over_baseline` with the wording "Output could not be
+confirmed (agent unreachable)" even though the agent was up and had
+answered. Two structural fixes close this: the collector now checks the
+agent's `completed` list too, and drops the probe **entirely** for any id
+the agent reports finished, regardless of what the board still says; and
+`WorkerProbe.agent_reachable` (`True`/`False`/`None` for "never asked")
+lets the predicate's escape hatch require a *confirmed* unreachable agent
+(`agent_reachable is False`) rather than merely an absent `last_output_at`.
+A reachable agent that does not list an id now produces no event at all,
+and the "agent unreachable" wording is reserved for when the collector
+actually failed to reach that machine.
+
+Whenever `last_output_at` IS known and quiet, that gate condition is a
+strict subset of the silence probe's own condition, so the silence probe
+already fired and — being ranked stronger — is what actually gets reported;
+`over_baseline` only surfaces on its own for the "duration exceeded, agent
+confirmed unreachable" case. A worker that is slow but still confirmed
+talking (or simply finished) is not evidence nobody is coming, and is not
+this channel's business — a pure duration/cost signal belongs in `coord
+status` or the digest, not the push transport.
 
 ---
 

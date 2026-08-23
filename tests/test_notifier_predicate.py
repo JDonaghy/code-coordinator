@@ -284,9 +284,14 @@ def test_over_baseline_fires_when_agent_is_unreachable_past_baseline():
     Requiring *confirmed* quiet (the pre-fix gate) silently dropped this
     case forever; "unknown" must be treated the same as "silent", not the
     same as "definitely still talking". This replaces the deleted
-    `test_elapsed_over_baseline_is_the_weakest_probe_and_still_fires`."""
+    `test_elapsed_over_baseline_is_the_weakest_probe_and_still_fires`.
+    ``agent_reachable=False`` is what the collector now sets in exactly
+    this scenario (#2657) — the confirmed-unreachable case is pinned."""
     snap = PipelineSnapshot(
-        now=NOW, probes=[probe(dispatched_at=NOW - 10 * HOUR, last_output_at=None)]
+        now=NOW,
+        probes=[
+            probe(dispatched_at=NOW - 10 * HOUR, last_output_at=None, agent_reachable=False)
+        ],
     )
     events = evaluate(snap, warm_baselines(secs=600.0))
     assert [e.condition for e in events] == [CONDITION_OVER_BASELINE]
@@ -303,7 +308,39 @@ def test_over_baseline_still_does_not_fire_below_baseline_when_unreachable():
     threshold — an agent going unreachable moments after dispatch must not
     page immediately."""
     snap = PipelineSnapshot(
-        now=NOW, probes=[probe(dispatched_at=NOW - 60.0, last_output_at=None)]
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 60.0, last_output_at=None, agent_reachable=False)],
+    )
+    assert evaluate(snap, warm_baselines(secs=600.0)) == []
+
+
+def test_reachable_agent_that_does_not_list_the_id_never_pages_over_baseline():
+    """#2657: the actual bug. `last_output_at is None` no longer implies
+    "agent unreachable" — a REACHABLE agent that simply does not list this
+    assignment as running (because it finished, or some other benign gap)
+    must produce no over_baseline event at all, at any elapsed time, and
+    must never be reported as "agent unreachable" — the collector never
+    established that claim. This replays the shape of the two observed
+    false pages (coord-web#25, claude-coordinator#2639): a leg well past
+    its duration baseline whose agent answered but the assignment is
+    simply absent from `active`."""
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[
+            probe(dispatched_at=NOW - 24 * HOUR, last_output_at=None, agent_reachable=True)
+        ],
+    )
+    assert evaluate(snap, warm_baselines(secs=600.0)) == []
+
+
+def test_never_asked_agent_does_not_page_over_baseline_either():
+    """`agent_reachable=None` means the collector never even asked (no
+    configured host) — that is a config gap, not confirmed evidence nobody
+    is coming, so it must not be treated the same as a confirmed-
+    unreachable agent."""
+    snap = PipelineSnapshot(
+        now=NOW,
+        probes=[probe(dispatched_at=NOW - 24 * HOUR, last_output_at=None, agent_reachable=None)],
     )
     assert evaluate(snap, warm_baselines(secs=600.0)) == []
 
