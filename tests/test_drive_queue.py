@@ -1743,6 +1743,84 @@ def test_exhausted_immediate_escalation_merge_status_does_not_get_the_dispatch_n
     assert "infrastructure/dispatch-layer failure" not in reason
 
 
+def test_exhausted_empty_branch_advisory_does_not_get_the_dispatch_note():
+    """#2334: the queue's own misdiagnosis half of the issue. `own_reason`
+    here is `_decide_advisory`'s #2416 exhaustion message — `coord drive`
+    read a terminal, zero-commit ADVISORY row, spent its own bounded
+    `coord retry` budget on it, and gave up. That is `coord drive`
+    DECLINING to dispatch anything further, not a dispatch-layer failure —
+    the #2273 note ("likely an infrastructure/dispatch-layer failure, not a
+    code defect") directly contradicts `own_reason`'s own "this needs an
+    operator decision: coord retry ..." wording, exactly the space-invaders#3
+    incident the issue documents. `_is_empty_branch_death_reason` is the
+    same additive-note guard `_is_merge_gate_block_reason` already provides
+    for a merge-gate death — see the sibling tests above."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=EMPTY_BRANCH_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): work w1 "
+        "exited ADVISORY with no commits on its branch 1 time(s) in a row "
+        "(budget 1, #2416) — nothing was pushed, so there is nothing to "
+        "test, review, or merge, and retrying has not produced a different "
+        "outcome.\n"
+        "   inspect: coord log w1 --machine precision\n"
+        "   this needs an operator decision: coord retry w1 by hand once "
+        "the underlying blocker is understood, or dispatch an independent "
+        "follow-up issue if another attempt at this one is not the right "
+        "fix."
+    )
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
+def test_exhausted_empty_branch_acceptance_author_does_not_get_the_dispatch_note():
+    """#2334's own mirrored acceptance-author shape — the exact wording
+    `_decide_acceptance_author`'s bounded retry now produces once its
+    budget is spent (claude-coordinator#2531: six attempts burned on this
+    exact reason, each also carrying the misleading dispatch-layer note)."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=EMPTY_BRANCH_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): "
+        "acceptance author ta1 exited ADVISORY with no commits on its "
+        "branch 1 time(s) in a row (budget 1, #2334) — nothing was "
+        "authored, so there is no slice to land, and retrying has not "
+        "produced a different outcome."
+    )
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
 def test_a_genuine_dispatch_failure_still_gets_the_note_alongside_own_reason():
     """Regression guard for #2424's fix: an own_reason that does NOT name a
     merge-gate block (a genuine pre-`coord assign` crash) must still get the

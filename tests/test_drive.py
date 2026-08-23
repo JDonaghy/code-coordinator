@@ -980,21 +980,65 @@ def test_oracle_active_dies_when_for_path_cannot_be_resolved():
 # ── #1453 review finding 2: an ADVISORY JIT slice must not spin forever ─────
 
 
-def test_oracle_active_advisory_with_no_commits_is_terminal():
+def test_oracle_active_advisory_with_no_commits_retries_a_fresh_author_then_stops_at_the_cap():
+    """#2334: this used to be an immediate, unconditional `_die()` — a
+    deliberate copy of the pre-#2416 `_decide_advisory` dead end (its own
+    comment said "Mirror `_decide_advisory` exactly", including the bug).
+    Now it mirrors the FIXED `_decide_advisory`: a bounded number of fresh
+    `coord acceptance author` dispatches (`opts.max_work_retries`) before
+    finally giving up — same shape as
+    `test_advisory_with_no_commits_retries_via_coord_retry_then_stops_at_the_cap`."""
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        oracle_state(
-            acceptance_author_aid="ta1",
-            acceptance_author_status="advisory",
-            acceptance_author_branch="",
-        ),
-        oracle=oracle,
-        verifier=verifier,
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = oracle_state(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="advisory",
+        acceptance_author_branch="",
     )
-    assert action.is_exit
-    assert action.exit_code == EXIT_TERMINAL_FAILURE
-    assert "no commits" in action.message
+
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+    assert first.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+    )
+    assert counters.acceptance_author_retries == 1
+
+    second = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no commits" in second.message
+    assert "ta1" in second.message
+
+
+def test_oracle_active_advisory_with_no_commits_retry_resolves_for_path():
+    """#2334: the retry dispatch must reuse the SAME `--for-path` resolution
+    as the first-ever dispatch (#1453 review finding 1) — a ROUTED repo's
+    `coord acceptance author` hard-refuses without it, so a retry that
+    skipped this would just dispatch a doomed command."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    checker = FakeGateChecker(for_path="tui/**")
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = oracle_state(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="advisory",
+        acceptance_author_branch="",
+    )
+
+    retry = step(
+        s, opts, oracle=oracle, verifier=verifier, counters=counters,
+        gate_checker=checker,
+    )
+    assert retry.kind == RUN
+    assert retry.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+        "--for-path", "tui/**",
+    )
+    assert "#2334" in retry.label
+    assert "attempt 1/1" in retry.label
 
 
 def test_oracle_active_advisory_with_no_commits_is_not_terminal_when_the_slice_already_landed():
@@ -1107,26 +1151,38 @@ def test_oracle_active_advisory_never_falls_through_to_a_bare_wait_label():
 # ── #1535: a DONE JIT slice must not spin to --deadline on zero commits ─────
 
 
-def test_oracle_active_done_with_no_commits_is_terminal():
+def test_oracle_active_done_with_no_commits_retries_a_fresh_author_then_stops_at_the_cap():
     """The advisory-path guard, applied to `done`: a terminal status whose
     branch has zero commits can never reach `merged` on its own — waiting
-    burns the deadline with no diagnosis (#1526's defect, reborn here)."""
+    burns the deadline with no diagnosis (#1526's defect, reborn here).
+
+    #2334: this used to `_die()` on the very first observation — the third
+    copy of the `_decide_advisory` dead end (the ADVISORY branch above is
+    the second). Now bounded-retries a fresh author first, same as the
+    ADVISORY branch, sharing the same `acceptance_author_retries` budget."""
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        oracle_state(
-            acceptance_author_aid="ta1",
-            acceptance_author_status="done",
-            acceptance_author_branch="test-author-ms-38-slice-1124",
-        ),
-        oracle=oracle,
-        verifier=verifier,
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = oracle_state(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="done",
+        acceptance_author_branch="test-author-ms-38-slice-1124",
     )
-    assert action.is_exit
-    assert action.exit_code == EXIT_TERMINAL_FAILURE
-    assert "test-author-ms-38-slice-1124" in action.message
-    assert "no commits" in action.message
-    assert "ta1" in action.message
+
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+    assert first.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+    )
+    assert counters.acceptance_author_retries == 1
+
+    second = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "test-author-ms-38-slice-1124" in second.message
+    assert "no commits" in second.message
+    assert "ta1" in second.message
 
 
 def test_oracle_active_done_with_no_commits_is_not_terminal_when_the_slice_already_landed():
@@ -1156,21 +1212,27 @@ def test_oracle_active_done_with_no_commits_is_not_terminal_when_the_slice_alrea
     assert checker.landed_calls == [(REPO, 38, 1392)]
 
 
-def test_oracle_active_done_with_no_branch_is_terminal():
+def test_oracle_active_done_with_no_branch_eventually_terminal():
+    """#2334: no branch at all is the same zero-commit dead-end signature as
+    a branch verified empty — bounded retry, then terminal, same as
+    `test_oracle_active_done_with_no_commits_retries_a_fresh_author_then_stops_at_the_cap`."""
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        oracle_state(
-            acceptance_author_aid="ta1",
-            acceptance_author_status="done",
-            acceptance_author_branch="",
-        ),
-        oracle=oracle,
-        verifier=verifier,
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = oracle_state(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="done",
+        acceptance_author_branch="",
     )
-    assert action.is_exit
-    assert action.exit_code == EXIT_TERMINAL_FAILURE
-    assert "no commits" in action.message
+
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+
+    second = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no commits" in second.message
 
 
 def test_oracle_active_done_with_unverifiable_branch_waits():
@@ -1229,21 +1291,25 @@ def test_oracle_active_done_with_commits_lands_the_slice():
 
 def test_oracle_active_advisory_behaviour_is_unchanged_by_the_done_fix():
     """Regression guard: the `done` probe must not leak into the `advisory`
-    branch's own handling."""
+    branch's own handling. #2334: both now bounded-retry before dying, so
+    exhaust the (shared, budget-1) retry first."""
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        oracle_state(
-            acceptance_author_aid="ta1",
-            acceptance_author_status="advisory",
-            acceptance_author_branch="",
-        ),
-        oracle=oracle,
-        verifier=verifier,
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = oracle_state(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="advisory",
+        acceptance_author_branch="",
     )
-    assert action.is_exit
-    assert action.exit_code == EXIT_TERMINAL_FAILURE
-    assert "ADVISORY" in action.message
+
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+
+    second = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "ADVISORY" in second.message
 
 
 # ═══════════════════════════════════════════════════════════════════════════

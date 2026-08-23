@@ -2163,9 +2163,10 @@ def _is_empty_branch_death_reason(reason: str | None) -> bool:
     death that merely MENTIONS one of the other words in passing does not
     false-positive:
 
-    * the acceptance-author JIT-slice death (`coord/drive.py:850-865`
-      ADVISORY, `:887-918` DONE) — "acceptance author ... exited
-      (ADVISORY|DONE) ... no commits".
+    * the acceptance-author JIT-slice death (`coord/drive.py`'s
+      `_decide_acceptance_author`, the ADVISORY and DONE zero-commit
+      branches — both bounded-retry via #2334 before reaching this) —
+      "acceptance author ... exited (ADVISORY|DONE) ... no commits".
     * the plain work-row death (`coord/drive.py`'s `_decide_advisory`) —
       "work ... exited ADVISORY ... no commits ... nothing was pushed".
 
@@ -2176,6 +2177,15 @@ def _is_empty_branch_death_reason(reason: str | None) -> bool:
     acceptance criteria name, and has no recorded evidence of its own in
     `queue-block-log.jsonl` — folding it in unasked would be exactly the
     un-scoped widening #2230's own docstring warns a naive rule invites.
+
+    #2334: also read by `_reconcile_running` to SUPPRESS the "no assignment
+    was ever created for this run (#2273): likely an infrastructure/
+    dispatch-layer failure" note — the same additive-note contradiction
+    `_is_merge_gate_block_reason` already guards against for a merge-gate
+    death. A `coord drive` that dies on exactly this reason DECLINED to
+    dispatch anything further for a terminal, already-observed board row
+    (#2334's own bounded in-session retry already spent its dispatch
+    attempts before reaching it); it did not fail to dispatch.
     """
     if not reason:
         return False
@@ -2716,9 +2726,26 @@ def _reconcile_running(
     # contradicts it — see `_is_merge_gate_block_reason` for the two live
     # escalations (claude-coordinator#2405, coord-web#2) this false-positive
     # actually produced.
-    dispatch_only = _dispatch_produced_nothing(
-        entry, facts
-    ) and not _is_merge_gate_block_reason(own_reason)
+    #
+    # #2334: the SAME false-positive, a third shape — `own_reason` names an
+    # empty-branch DONE/ADVISORY death (`_is_empty_branch_death_reason`: a
+    # work row or a JIT acceptance-author row that exited with zero commits
+    # on its branch). That is `coord drive` DECLINING to dispatch anything
+    # further for a terminal board row it already read — a deliberate
+    # choice, not an infrastructure/dispatch-layer failure — and #2334's own
+    # bounded in-session retry (`DriveCounters.advisory_retries` /
+    # `.acceptance_author_retries`) already spends its own dispatch attempts
+    # before this reason is ever reached, so treating THIS exit as more
+    # evidence of a broken dispatch layer is exactly backwards. The observed
+    # incident (space-invaders#3, claude-coordinator#2531) is `own_reason`
+    # itself pointing an operator at `coord retry`/`coord acceptance
+    # author`, immediately followed by this note contradicting it with
+    # "likely an infrastructure/dispatch-layer failure, not a code defect".
+    dispatch_only = (
+        _dispatch_produced_nothing(entry, facts)
+        and not _is_merge_gate_block_reason(own_reason)
+        and not _is_empty_branch_death_reason(own_reason)
+    )
     if not dispatch_only:
         dispatch_note = ""
     elif own_reason:
