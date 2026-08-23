@@ -277,7 +277,14 @@ def test_a_marker_pending_for_a_different_target_is_replaced(
     valid_config_path, state_dir, no_network, escalations, monkeypatch
 ):
     """A stale marker (an older release still waiting for its window) must
-    not silently block or shadow the newly resolved target."""
+    not silently block or shadow the newly resolved target.
+
+    #2607: the target/reason move to the newly resolved version, but
+    `set_at`/`deferrals` are PRESERVED rather than reset — see
+    `test_a_marker_pending_for_a_different_target_preserves_the_escape_hatch`
+    below for the regression this guards (PyPI's "latest" climbing on every
+    merge meant this replacement fired almost every re-arm, and resetting
+    the clock here made the TTL/deferral bound unreachable in practice)."""
     _stub_verify(monkeypatch, daemon_version="0.5.30")
     prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
     dq_cmd.write_roll_pending(_pending(target_version="0.5.29", set_at=1000.0))
@@ -293,11 +300,38 @@ def test_a_marker_pending_for_a_different_target_is_replaced(
     pending = dq_cmd.read_roll_pending()
     assert pending is not None
     assert pending.target_version == "0.5.31"
-    assert pending.set_at > 1000.0
+    assert pending.set_at == 1000.0  # #2607: preserved, not reset
 
     record = _records(state_dir)[0]
     assert record["status"] == rw.STATUS_ROLL_PENDING
     assert not escalations
+
+
+def test_a_marker_pending_for_a_different_target_preserves_the_escape_hatch(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2607: re-arming for a climbing target must not reset the TTL/
+    deferral escape hatch — a marker one tick away from its own bound must
+    still expire on schedule even though the target it names moved
+    underneath it moments before."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    dq_cmd.write_roll_pending(
+        _pending(target_version="0.5.235", set_at=1000.0, deferrals=6, ttl_seconds=3600)
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.236", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.236"
+    assert pending.set_at == 1000.0  # original clock survives the re-arm
+    assert pending.deferrals == 6  # accumulated count survives too
+    assert pending.expired(now=1000.0 + 3600.0)  # still bounded by the ORIGINAL set_at
 
 
 # ── a marker already pending for the SAME target: one best-effort fire ───
