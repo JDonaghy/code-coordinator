@@ -13,6 +13,11 @@ same `GET /board` endpoint a thin client uses:
    every non-defaulted wire field `ApprovedSubmission` (tui/src/app/types.rs)
    requires, `repos` resolved server-side, and an unmapped project rendered
    as `[]` rather than dropped.
+4. A submission whose `last_status` has moved to `planned` / `in-progress` /
+   `quality-check` / `shipped` drops off the panel even though its sign-off
+   verdict is still `approved` (#2660) — it has already been pulled.
+   Everything else (pre-decomposition statuses, operator-set interrupts, an
+   empty/unset status, anything unrecognised) stays on the list.
 """
 
 from __future__ import annotations
@@ -274,6 +279,19 @@ def _seed_submission(
     )
 
 
+def _set_last_status(submission_id: str, status: str, *, now: float) -> None:
+    """Confirm *status* as the submission's `last_status`, bypassing the
+    real push round-trip (`coord.portal_sync`'s `SUBMISSION_STATUSES`/
+    `ANNOUNCING_STATUSES` machinery, which needs a fake bridge client and,
+    for `quality-check`, a prior confirmed `preview` row). This module only
+    reads the confirmed column — `portal_store.enqueue` + `mark_applied` is
+    the direct way to land a value in it for a test."""
+    from coord import portal_store
+
+    row = portal_store.enqueue(submission_id, "status", {"status": status}, now=now)
+    portal_store.mark_applied(row, now=now)
+
+
 def _board(detail_db: Path, config_path: Path) -> dict:
     app = build_app(SqliteStore(detail_db), load_config(config_path))
     with TestClient(app) as cli:
@@ -422,3 +440,74 @@ class TestBoardWiring:
         board = _board(detail_db, portal_config_path)
         assert board["approved_submissions"] == []
         assert "issues" in board  # the rest of the board is intact
+
+
+# ── 4. a pulled submission drops off even though it is still "approved" ─────
+# (#2660: the panel used to be an append-only "was approved" log)
+
+
+class TestPulledSubmissionsDropOff:
+    @pytest.mark.parametrize(
+        "status", ["planned", "in-progress", "quality-check", "shipped"]
+    )
+    def test_a_submission_pulled_past_decomposition_drops_off(
+        self, detail_db, portal_config_path, rw_db, status
+    ) -> None:
+        """The whole point of the panel is a FIFO backlog of work NOT yet
+        pulled — an approved sign-off whose confirmed status has moved past
+        `awaiting-signoff` has already been decomposed and dispatched."""
+        _seed_submission("sub_pulled", project_id="proj_9f2a", first_seen_at=1.0)
+        _set_last_status("sub_pulled", status, now=2.0)
+
+        assert _board(detail_db, portal_config_path)["approved_submissions"] == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "describing",
+            "in-design",
+            "awaiting-signoff",
+            "needs-input",
+            "on-hold",
+            "some-future-status-this-module-has-never-seen",
+        ],
+    )
+    def test_a_submission_not_yet_pulled_stays_on_the_list(
+        self, detail_db, portal_config_path, rw_db, status
+    ) -> None:
+        """Pre-decomposition statuses, operator-set interrupts (needs-input /
+        on-hold can land before decomposition just as easily as after), and
+        any status this module does not recognise all stay — "never suppress
+        a row you cannot explain" applies to `last_status` exactly as it
+        already does to an unmapped project."""
+        _seed_submission("sub_waiting", project_id="proj_9f2a", first_seen_at=1.0)
+        _set_last_status("sub_waiting", status, now=2.0)
+
+        rows = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert [r["submission_id"] for r in rows] == ["sub_waiting"]
+
+    def test_an_unset_last_status_stays_on_the_list(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """The common case: a freshly-approved submission whose status has
+        never been pushed at all (`last_status == ""`, the schema default)
+        must not be mistaken for "pulled"."""
+        _seed_submission("sub_fresh", project_id="proj_9f2a", first_seen_at=1.0)
+
+        rows = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert [r["submission_id"] for r in rows] == ["sub_fresh"]
+
+    def test_only_the_pulled_submissions_drop_leaving_the_rest(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """Mirrors the issue's own evidence table: two shipped submissions
+        that should read "0 ready to pull" alongside one still-unpulled
+        submission that should stay — the fix must be surgical, not blanket."""
+        _seed_submission("sub_shipped_a", project_id="proj_9f2a", first_seen_at=1.0)
+        _set_last_status("sub_shipped_a", "shipped", now=1.5)
+        _seed_submission("sub_shipped_b", project_id="proj_9f2a", first_seen_at=2.0)
+        _set_last_status("sub_shipped_b", "shipped", now=2.5)
+        _seed_submission("sub_still_waiting", project_id="proj_9f2a", first_seen_at=3.0)
+
+        rows = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert [r["submission_id"] for r in rows] == ["sub_still_waiting"]

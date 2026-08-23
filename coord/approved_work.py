@@ -19,6 +19,28 @@ accumulate as exactly the FIFO backlog the panel exists to work through.
 A later ``changes_requested`` on the same submission takes it back off the
 list — last verdict wins, not "was ever approved".
 
+**What takes a row back off the list once it *is* approved (#2660).** An
+approved verdict never expires on its own, so something else has to say
+"this one has already been pulled" — that is :data:`_PULLED_STATUSES`,
+applied in :func:`approved_submissions` against the coord-owned
+``portal_submissions.last_status`` (:mod:`coord.portal_store`'s
+``SubmissionRecord`` — "confirmed applied", not merely enqueued; see that
+module's docstring). The rule: a submission drops off once its status has
+moved to ``planned`` / ``in-progress`` / ``quality-check`` / ``shipped`` —
+the four values that are only ever written *after* an operator has actually
+pulled the design round into a linked milestone (``coord portal link``) and
+dispatch has begun against it
+(:func:`coord.portal_sync.fold_submission_status` for the first three; the
+``quality-check`` preview push in the same sync loop for the fourth).
+Everything else stays on the list: ``""`` (status never pushed at all),
+``describing`` / ``in-design`` / ``awaiting-signoff`` (pre-decomposition —
+an approval nobody has acted on yet is exactly what this panel is for),
+``needs-input`` / ``on-hold`` (operator-set interrupts that can land before
+decomposition just as easily as after, so treating them as "pulled" would
+be a guess this module has no basis for), or any status this module has
+never heard of. That is the same "never suppress a row you cannot explain"
+posture the unmapped-``repos`` case below already has.
+
 **Field-name honesty (contract §6.9).** coord-portal's submission schema
 lives in a separate repo, so the intake fields (outcome / audience /
 done-definition / constraints, plus client and project identity) are read out
@@ -82,6 +104,18 @@ _TEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "done_definition": ("done_definition", "doneDefinition"),
     "constraints": ("constraints",),
 }
+
+#: ``portal_submissions.last_status`` values that mean a submission has
+#: already been pulled off this list by hand — see the module docstring's
+#: "What takes a row back off the list" section (#2660) for the full
+#: reasoning. Kept as plain string literals rather than importing
+#: :mod:`coord.portal_sync`'s ``STATUS_*`` constants: that module only names
+#: three of these (``STATUS_PLANNED`` / ``STATUS_IN_PROGRESS`` /
+#: ``STATUS_SHIPPED``), ``quality-check`` has no constant of its own there,
+#: and pulling in half a set by name while spelling the other half out
+#: would be a worse reader experience than one literal tuple here, next to
+#: the rule it encodes.
+_PULLED_STATUSES = frozenset({"planned", "in-progress", "quality-check", "shipped"})
 
 
 def _first_str(mirror: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -162,6 +196,12 @@ def approved_submissions(config: "Config") -> list[dict[str, Any]]:
     yields ``[]``, which the panel renders as "— no mapping —". That is a
     normal state, not an error, so it never suppresses the row: an operator
     who cannot see the unmapped submission cannot know to map it.
+
+    A submission is additionally dropped once its ``last_status`` is in
+    :data:`_PULLED_STATUSES` — an approved sign-off that has already been
+    pulled into decomposition and delivery is no longer "ready to pull"
+    (#2660). See the module docstring for the exact rule and why the other
+    statuses stay on the list.
     """
     from coord import portal_store  # noqa: PLC0415 — avoid import cycle
 
@@ -173,6 +213,8 @@ def approved_submissions(config: "Config") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for record in portal_store.list_submissions():
         if record.submission_id not in approved:
+            continue
+        if record.last_status in _PULLED_STATUSES:
             continue
         mirror = record.customer if isinstance(record.customer, dict) else {}
         row: dict[str, Any] = {"submission_id": record.submission_id}
