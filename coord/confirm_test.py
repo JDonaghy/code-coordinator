@@ -87,7 +87,14 @@ saying so:
   #2527) — a negative ``returncode`` from `subprocess.run` (e.g. ``-15`` for
   SIGTERM), most often a `coord-agent`/`coord-serve` restart landing mid-run.
   The command never ran to completion, exactly like a timeout, so it gets the
-  identical inconclusive treatment rather than being read as "ran and failed".
+  identical inconclusive treatment rather than being read as "ran and failed";
+* exit 126 (:data:`PERMISSION_DENIED_EXIT`, #2596) — POSIX's "found but not
+  executable", the same "toolchain problem, not a branch problem" shape as
+  exit 127's "not found";
+* a nonzero exit with literally no captured output (:data:`KIND_NO_OUTPUT`,
+  #2596) — a crash with no message, an OOM-kill, a runner that swallowed its
+  own output. A refutation is only as good as the evidence behind it, and
+  there is nothing here to put in a fix briefing.
 
 That asymmetry is the safety property: the worst case of a broken confirmation
 environment is that the Test stage behaves exactly as it did before this module
@@ -197,6 +204,28 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: existing ``TimeoutExpired`` carve-out and get misread as "ran and failed".
 KIND_SIGNAL = "signal"
 
+#: #2596: POSIX's "found but not executable" — a permission bit dropped on a
+#: build script, an environment inconsistency, the identical "toolchain
+#: problem, not a branch problem" shape :data:`~coord.revalidate.
+#: SHELL_NOT_FOUND_EXIT` (127, "not found") already covers. Handled locally
+#: here rather than folded into :func:`~coord.revalidate.
+#: is_infrastructure_failure`: that helper is shared with ``coord merge
+#: --revalidate``, which #2596 does not touch, and this module already keeps
+#: its own signal-kill classification local for the same reason.
+PERMISSION_DENIED_EXIT = 126
+
+#: #2596: a build/test command that ran to completion, returned nonzero, and
+#: captured NOTHING — no stdout, no stderr. A genuine failure almost always
+#: leaves a trace (an assertion, a traceback, a compiler error); zero bytes
+#: of output before dying nonzero is more often a crash with no message, an
+#: OOM-kill, or a runner that silently swallowed its own output than a real,
+#: diagnosable test failure. There is nothing here to extract into a fix
+#: briefing (see ``coord/drive.py``'s matching #2596 guard against
+#: dispatching a fix worker with no extracted failure), so this stays
+#: inconclusive rather than refuting a claim we cannot back up with a
+#: single line of evidence.
+KIND_NO_OUTPUT = "no_output"
+
 #: The only kinds that may overturn a PASS claim: a build or test command that
 #: ran to completion and returned nonzero. Nothing weaker. See the module
 #: docstring's fail-direction section — this frozenset IS that safety property.
@@ -204,7 +233,9 @@ REFUTING_KINDS = frozenset({KIND_BUILD, KIND_SUITE})
 
 #: Kinds meaning "the check could not reach a verdict". The caller falls back to
 #: the worker's own claim on any of these, which is pre-#2464 behaviour.
-INCONCLUSIVE_KINDS = frozenset({KIND_SETUP, KIND_INFRA, KIND_TIMEOUT, KIND_SIGNAL})
+INCONCLUSIVE_KINDS = frozenset({
+    KIND_SETUP, KIND_INFRA, KIND_TIMEOUT, KIND_SIGNAL, KIND_NO_OUTPUT,
+})
 
 
 # ── Per-pass budget (#2464-review) ──────────────────────────────────────────
@@ -584,7 +615,9 @@ def _classify_failure(
             returncode=returncode,
             worktree=worktree,
         )
-    infra = is_infrastructure_failure(returncode, output)
+    infra = returncode == PERMISSION_DENIED_EXIT or is_infrastructure_failure(
+        returncode, output,
+    )
     baseline = not infra and is_baseline_red_failure(returncode, output)
     if infra:
         return ConfirmationResult(
@@ -610,6 +643,25 @@ def _classify_failure(
                 "(#2170)"
             ),
             output=_tail(output),
+            command=command,
+            returncode=returncode,
+            worktree=worktree,
+        )
+    if not (output or "").strip():
+        # #2596: ran to completion, returned nonzero, and captured literally
+        # nothing — no stdout, no stderr. Same fail-direction reasoning as
+        # every other arm above: a refutation is only as good as the
+        # evidence behind it, and there is not one line of it here (a crash
+        # with no message, an OOM-kill, a runner that swallowed its own
+        # output). Never REFUTING_KINDS on evidence this thin.
+        return ConfirmationResult(
+            kind=KIND_NO_OUTPUT,
+            reason=(
+                f"the independently-run {stage} command exited nonzero (exit "
+                f"{returncode}) but produced NO captured output — there is "
+                "nothing here to diagnose as a branch failure, so this is "
+                "not treated as a refutation (#2596)"
+            ),
             command=command,
             returncode=returncode,
             worktree=worktree,
@@ -885,8 +937,10 @@ __all__ = [
     "CONFIRM_PASS_BUDGET_SECONDS",
     "DISABLE_ENV_VAR",
     "INCONCLUSIVE_KINDS",
+    "KIND_NO_OUTPUT",
     "KIND_SIGNAL",
     "NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS",
+    "PERMISSION_DENIED_EXIT",
     "REFUTING_KINDS",
     "ConfirmationResult",
     "begin_confirmation_pass",

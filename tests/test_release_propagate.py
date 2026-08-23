@@ -138,6 +138,73 @@ def test_extra_busy_signals_are_honoured():
     assert "board unreadable" in q.reason
 
 
+# ── #2596: a #2464 confirmation running must defer a restart ───────────────
+#
+# 2026-08-22: `coord release propagate` restarted `coord-agent` while a
+# confirmation subprocess (`coord.confirm_test.confirm_branch`) was running
+# as a child of that unit's cgroup. systemd reaped it (SIGTERM, exit -15);
+# #2527 already stops that misread from becoming a REFUTED verdict, but
+# nothing stopped the restart itself. `confirmation_lock_busy` is the other
+# half: a local, non-blocking probe of the SAME lock
+# (`coord.filelock.notify_lock_path`) `coord.notify.run_drain` holds for a
+# confirmation's whole duration.
+
+
+def test_confirmation_lock_busy_is_quiet_when_the_lock_is_free(tmp_path):
+    lock_path = tmp_path / "notify.lock"
+    assert rp.confirmation_lock_busy(lock_path) == []
+
+
+def test_confirmation_lock_busy_probing_does_not_hold_the_lock(tmp_path):
+    """A probe that finds the lock free must release it again — otherwise
+    the very act of checking would itself become the busy signal."""
+    lock_path = tmp_path / "notify.lock"
+    rp.confirmation_lock_busy(lock_path)
+
+    from coord.filelock import FileLock
+
+    lock = FileLock(lock_path)
+    lock.acquire(timeout=0.0)  # would raise LockBusy if the probe leaked it
+    lock.release()
+
+
+def test_confirmation_lock_busy_defers_when_something_holds_the_lock(tmp_path):
+    from coord.filelock import FileLock
+
+    lock_path = tmp_path / "notify.lock"
+    holder = FileLock(lock_path)
+    holder.acquire(timeout=0.0)
+    try:
+        busy = rp.confirmation_lock_busy(lock_path)
+    finally:
+        holder.release()
+
+    assert len(busy) == 1
+    assert busy[0].host is None, (
+        "unattributable on purpose — the daemon-leads invariant already "
+        "turns 'daemon busy' into 'defer the whole roll' (#2596)"
+    )
+    assert "confirmation" in busy[0].kind or "notify" in busy[0].kind
+
+    q = rp.assess_quiescence(extra_busy=busy)
+    assert not q.quiescent
+    assert q.fleet_wide_busy, (
+        "an unattributable signal must block every host, never none of them "
+        "(#2067)"
+    )
+
+
+def test_confirmation_lock_busy_is_clear_again_once_the_holder_releases(tmp_path):
+    from coord.filelock import FileLock
+
+    lock_path = tmp_path / "notify.lock"
+    holder = FileLock(lock_path)
+    holder.acquire(timeout=0.0)
+    holder.release()
+
+    assert rp.confirmation_lock_busy(lock_path) == []
+
+
 def test_queue_key_falls_back_across_row_spellings():
     """`/board` publishes sqlite columns; a rendered row carries `key`. Both
     must resolve — `coord drive-queue resume` needs the real key."""

@@ -2358,7 +2358,10 @@ def test_a_failed_test_loops_through_coord_fix_on_the_same_branch():
     """`coord fix` gates on the legacy smoke_test field and dispatches with
     inherit_branch=True — the same branch, model escalated (#1445)."""
     counters = DriveCounters()
-    action = step(done_work(work_test_state="failed"), counters=counters)
+    action = step(
+        done_work(work_test_state="failed", work_test_reason="3 failed"),
+        counters=counters,
+    )
     assert action.command == ("fix", "w1")
     assert counters.fix_rounds == 1
     assert "smoke_test" in action.error_message  # the diagnosis if it won't dispatch
@@ -2381,10 +2384,43 @@ def test_the_test_fix_loop_is_bounded_by_max_fix_rounds():
 
 def test_max_fix_rounds_zero_never_dispatches_a_fix():
     action = step(
-        done_work(work_test_state="failed"),
+        done_work(work_test_state="failed", work_test_reason="3 failed"),
         DriveOptions(machine="precision", max_fix_rounds=0),
     )
     assert action.is_exit
+
+
+def test_a_failed_test_with_no_reason_refuses_to_dispatch_a_fix():
+    """#2596: `test_state == 'failed'` with an EMPTY reason is not a graded
+    failure — every real failure path (a worker's own `SMOKE: fail` text,
+    `coord.confirm_test`'s "REFUTED by an independent re-run" wording)
+    populates `test_reason`. An empty reason means the gate flipped red
+    without ever extracting what failed — the 2026-08-22 incident's shape,
+    which dispatched a worker (escalated to opus on retry) that ran 20
+    minutes finding nothing because there was nothing to find. This must
+    refuse to dispatch `coord fix` and surface the suspicious verdict
+    instead of burning a round."""
+    counters = DriveCounters()
+    action = step(
+        done_work(work_test_state="failed", work_test_reason=""), counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert counters.fix_rounds == 0, "must not consume a fix round on nothing"
+    assert "NO reason" in action.message
+    assert "#2596" in action.message
+    assert "coord diagnose" in action.message
+
+
+def test_a_failed_test_with_whitespace_only_reason_also_refuses():
+    """Whitespace is not a reason either — a stray newline must not slip
+    past the #2596 guard the way it would past a bare truthiness check."""
+    action = step(
+        done_work(work_test_state="failed", work_test_reason="   \n  "),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert action.command == ()
 
 
 def test_an_unexpected_test_state_warns_and_waits_rather_than_guessing():
@@ -2671,7 +2707,10 @@ def test_the_review_fix_arm_shares_one_fix_budget_with_the_test_arm():
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_fix_rounds=2)
 
-    first = step(done_work(work_test_state="failed"), opts, counters=counters)
+    first = step(
+        done_work(work_test_state="failed", work_test_reason="3 failed"),
+        opts, counters=counters,
+    )
     assert first.command == ("fix", "w1")  # test arm, round 1
 
     second = step(requested_changes(), opts, counters=counters)
@@ -2686,7 +2725,8 @@ def test_the_review_fix_arm_shares_one_fix_budget_with_the_test_arm():
     assert "NOT exhausted" in exhausted.message  # says WHICH cap was hit
 
     still_exhausted = step(
-        done_work(work_test_state="failed"), opts, counters=counters
+        done_work(work_test_state="failed", work_test_reason="3 failed"),
+        opts, counters=counters,
     )
     assert still_exhausted.is_exit
 

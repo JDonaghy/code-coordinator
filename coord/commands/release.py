@@ -431,6 +431,24 @@ def _paused_machine_busy(config) -> list:
     return busy
 
 
+def _confirmation_running_busy() -> list:
+    """A #2464 out-of-band test confirmation in flight, as a `Busy` signal
+    (#2596).
+
+    Thin wiring around :func:`coord.release_propagate.confirmation_lock_busy`
+    — see that function's docstring for the incident and why a LOCAL,
+    non-networked lock probe is the right (and sufficient) check here. Feeds
+    the same `extra_busy` seam `_interactive_session_busy`/
+    `_paused_machine_busy` do, at both call sites that build one (the top of
+    `propagate` and `_drain`'s default `extra_busy_fetch`), so a confirmation
+    in flight defers a restart exactly like a live headless assignment does.
+    """
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord.filelock import notify_lock_path  # noqa: PLC0415
+
+    return rp.confirmation_lock_busy(notify_lock_path())
+
+
 def _daemon_machine_name(
     config, override: str | None, machine_health: dict | None = None
 ) -> str | None:
@@ -808,6 +826,13 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # seam from the daemon-aware pause store, so an operator-paused machine
     # defers exactly like a live assignment does instead of reading idle.
     extra_busy.extend(_paused_machine_busy(config))
+    # #2596: nor can it see a #2464 confirmation running in the notify
+    # drain — a restart landing mid-confirmation is exactly what let a
+    # SIGTERM get read as a test failure on 2026-08-22 (the confirmation
+    # itself now refuses that read, #2527, but the restart still shouldn't
+    # have happened at all). Feed the same seam so it defers like a live
+    # assignment instead of getting reaped.
+    extra_busy.extend(_confirmation_running_busy())
     quiescence = rp.assess_quiescence(
         queue_entries=board.get("drive_queue") or [],
         assignments=board.get("assignments") or [],
@@ -2510,8 +2535,15 @@ def _drain(
             # #2174: paused/quiet-hours state, same as the top-level
             # `propagate` call site — a paused daemon host must keep the
             # drain from ever reading "clear" just because tmux is quiet.
+            # #2596: same for a confirmation running under `notify.lock` —
+            # gated on `config is not None` too, even though the check
+            # itself needs no config, purely to keep this function's
+            # documented "no *config* means no real filesystem I/O"
+            # contract intact for the `config=None` unit-test path above.
             extra_busy_fetch = lambda: (  # noqa: E731
-                _interactive_session_busy(config) + _paused_machine_busy(config)
+                _interactive_session_busy(config)
+                + _paused_machine_busy(config)
+                + _confirmation_running_busy()
             )
         else:
             extra_busy_fetch = lambda: []  # noqa: E731

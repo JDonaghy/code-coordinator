@@ -510,6 +510,70 @@ class Busy:
         return f"{base} ({self.detail})" if self.detail else base
 
 
+def confirmation_lock_busy(lock_path: Path) -> list[Busy]:
+    """A #2464 out-of-band test confirmation in flight, as a `Busy` signal
+    (#2596).
+
+    2026-08-22: `coord release propagate` restarted `coord-agent` while a
+    confirmation's build/test subprocess (`coord.confirm_test.confirm_branch`)
+    was running as a child of that unit — systemd reaped its cgroup, the
+    subprocess died by SIGTERM (`exit -15`), and while #2527 already stops
+    that from being misread as a REFUTATION (see `coord.confirm_test`'s
+    `KIND_SIGNAL`), nothing stopped the restart from happening in the first
+    place. Two workers got dispatched against a branch with nothing wrong
+    with it, one of them on opus. This closes the other half: check for one
+    of these BEFORE restarting anything, exactly like a live headless
+    assignment already gates a restart (module docstring, "Why the cut is
+    not optional").
+
+    A LOCAL, non-blocking probe of *lock_path* — in production
+    :func:`coord.filelock.notify_lock_path`, the same lock
+    `coord.notify.run_drain` holds for a confirmation's whole duration (see
+    `coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS`) — not a fleet-wide
+    fan-out. `deploy/coord-release-propagate.service`'s "WHICH HOST" section
+    installs this unit ONLY on the daemon host, the same host `coord
+    notify`'s drain (and so any confirmation) actually runs on, so a network
+    probe would answer the identical local question at ten times the cost.
+
+    Unattributable on purpose (``host=None``, so it blocks the WHOLE fleet,
+    not just one host — see :attr:`Busy.host`'s #2067 note): the restart this
+    protects against is specifically the DAEMON's own `coord-agent`, and the
+    daemon-leads invariant (:func:`assess_quiescence`'s docstring, "LANE
+    ORDER") already turns "the daemon host is busy" into "defer the whole
+    roll" — so resolving a host name for this signal (not yet known this
+    early in `propagate`, #2176) would add complexity for no behavioural
+    difference.
+
+    Fails OPEN: a lock probe that raises for a reason OTHER than contention
+    (a permissions problem, a read-only home) is a local host problem this
+    call must not turn into "block the entire fleet until someone notices" —
+    it returns ``[]`` and the existing per-host/board signals still apply.
+    """
+    from coord.filelock import FileLock, LockBusy  # noqa: PLC0415
+
+    lock = FileLock(lock_path)
+    try:
+        lock.acquire(timeout=0.0)
+    except LockBusy:
+        return [
+            Busy(
+                kind="confirmation/notify drain running",
+                subject=str(lock_path),
+                detail=(
+                    "a #2464 out-of-band test confirmation (or another "
+                    "notify-drain side effect) may be running under this "
+                    "lock right now — restarting agents could SIGTERM it "
+                    "mid-run and misclassify a good branch (#2596)"
+                ),
+            )
+        ]
+    except OSError:
+        return []
+    else:
+        lock.release()
+        return []
+
+
 @dataclass(frozen=True)
 class Quiescence:
     """Is there a window right now, and if not, where.

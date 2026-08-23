@@ -2410,6 +2410,33 @@ def _decide_test(
         return _wait(label="TEST: in progress on a capability-matched machine")
 
     if test_state == "failed":
+        # #2596: `test_state == "failed"` with an EMPTY reason is not a
+        # graded failure — every genuine failure path populates
+        # `test_reason` (a worker's own `SMOKE: fail` explanation, or
+        # `coord.confirm_test`'s "REFUTED by an independent re-run" wording,
+        # both non-empty by construction). An empty reason here means
+        # something upstream flipped the gate to red without ever
+        # extracting WHAT failed — an infrastructure signal wearing a test
+        # verdict, the same shape #2532's acceptance driver hit (a bare
+        # non-zero exit folded into a false-red trust gate with an empty
+        # reason string). The 2026-08-22 incident this issue is named for
+        # cost two dispatched workers — one escalated to opus — burning 20+
+        # minutes finding nothing to fix, because nothing was there to find.
+        # Refuse to dispatch and surface it instead of repeating that.
+        if not (state.work_test_reason or "").strip():
+            return _die(
+                "test stage reports test_state='failed' with NO reason "
+                "recorded — there is no extracted failure to hand a fix "
+                "worker, which means the verdict itself is suspect (an "
+                "infrastructure signal misread as a test failure, #2596) "
+                "rather than a real one. Dispatching `coord fix` here would "
+                "spend a round (and, on retry, a model escalation) finding "
+                "nothing.\n"
+                f"   Inspect: coord log {state.work_aid} --machine "
+                f"{state.work_machine or machine}\n"
+                f"   Recover: coord diagnose {state.repo} {state.issue} "
+                "--stage test --reset"
+            )
         if counters.fix_rounds >= opts.max_fix_rounds:
             return _die(
                 f"test still failing after {counters.fix_rounds} fix round(s) — "
