@@ -281,6 +281,11 @@ reviewer can stop reading here.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it all fits together, plus the settled design rationale. Two diagnostic entry points: [why a merge/review isn't happening](docs/ARCHITECTURE.md#when-a-merge-isnt-happening) (**check here first when "Go does nothing"**) and [why an issue is in the Pipeline you never dispatched](docs/ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched).
 - [`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md) — dispatch economics; what to send to a worker versus keep in the coordinator session.
 - [`docs/NOTIFIER.md`](docs/NOTIFIER.md) — the "nobody is coming" push channel (`coord notifier`).
+- [`docs/CUSTOMER_PORTAL.md`](docs/CUSTOMER_PORTAL.md) — the coord-portal bridge. **Its
+  [operator runbook](docs/CUSTOMER_PORTAL.md#running-one-end-to-end--the-operator-runbook) is
+  the one to read when a customer request needs turning into coordinator work** — repo
+  creation, the project↔repo mapping, the decomposition session, Gate-A mocks, and how a mock
+  gets back to the client for sign-off, in the order you actually do them.
 - [`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md) — sealed acceptance suites, Gate-A contracts, the test-author agent.
 - [`docs/PHONE_WEBAPP.md`](docs/PHONE_WEBAPP.md) — Phone Control Center v1 runbook and the `/api/pipeline` surface.
 - [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
