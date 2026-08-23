@@ -282,6 +282,78 @@ def mark_event_handled(event_id: str, *, now: float | None = None) -> None:
     conn.commit()
 
 
+def events_for_submission(submission_id: str) -> list[PortalEvent]:
+    """Every pulled event for *submission_id*, oldest first.
+
+    Unlike :func:`unhandled_events` / :func:`signoff_events`, this is not
+    filtered by kind or ``handled_at`` — it is the full, undamaged history
+    `coord portal remirror` (#2659) replays through the mirror fold to
+    reconstruct a submission's ``customer_json`` from scratch. `portal_events`
+    is the source of truth the mirror is derived from (see this module's
+    docstring), so a damaged mirror is always reconstructible from it as long
+    as the events themselves are intact — which they are, since nothing ever
+    rewrites a stored event.
+    """
+    if not submission_id:
+        return []
+    rows = _conn().execute(
+        """
+        SELECT * FROM portal_events
+         WHERE submission_id = ?
+         ORDER BY received_at ASC, rowid ASC
+        """,
+        (submission_id,),
+    ).fetchall()
+    return [_event_from_row(r) for r in rows]
+
+
+def all_event_submission_ids() -> list[str]:
+    """Every distinct ``submission_id`` `portal_events` has ever seen.
+
+    Read from the events table rather than `portal_submissions` because a
+    `coord portal remirror` with no arguments (#2659) must be able to
+    reconstruct a submission whose mirror row is missing or wrong — reading
+    from the derived table would only ever find what the (possibly broken)
+    mirror fold already wrote there.
+    """
+    rows = _conn().execute(
+        """
+        SELECT DISTINCT submission_id FROM portal_events
+         WHERE submission_id != ''
+         ORDER BY submission_id ASC
+        """
+    ).fetchall()
+    return [r["submission_id"] for r in rows]
+
+
+def replace_customer_json(
+    submission_id: str, facts: dict[str, Any], *, now: float | None = None
+) -> None:
+    """Overwrite (not merge) a submission's customer mirror with *facts*.
+
+    The backfill counterpart to :func:`mirror_customer_facts`'s merge.
+    `coord portal remirror` (#2659) rebuilds a submission's mirror from
+    empty by replaying every event through the fold — a merge into whatever
+    is already there would leave a stale, un-unwrapped ``"payload"`` key
+    sitting next to the freshly-derived facts, a third bad state rather than
+    a repair.
+    """
+    if not submission_id:
+        return
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    _ensure_submission_row(conn, submission_id, stamp)
+    conn.execute(
+        """
+        UPDATE portal_submissions
+           SET customer_json = ?, updated_at = ?
+         WHERE submission_id = ?
+        """,
+        (json.dumps(facts, sort_keys=True), stamp, submission_id),
+    )
+    conn.commit()
+
+
 def mirror_customer_facts(
     submission_id: str, facts: dict[str, Any], *, now: float | None = None
 ) -> None:

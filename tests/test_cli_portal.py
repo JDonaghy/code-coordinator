@@ -100,6 +100,7 @@ def test_sync_loop_commands_are_registered():
         "enqueue-status",
         "enqueue-design-round",
         "enqueue-preview",
+        "remirror",
     ):
         assert sub in result.output
 
@@ -447,6 +448,110 @@ def test_requeue_reports_an_unknown_row_cleanly():
     assert "no outbox row" in result.output
 
 
+# ── #2659: backfill a mirror clobbered by the (since-fixed) #2585 bug ──────
+
+
+def _seed_damaged_mirror(sub_id: str) -> None:
+    """Reproduce the issue's exact evidence: `portal_events` intact, but
+    `customer_json` folded through the pre-#2585 broken `_mirror_event` —
+    every fact nested under `"payload"`, and the second event's envelope
+    CLOBBERING the first's wholesale rather than merging into it."""
+    from coord import portal_store
+
+    portal_store.record_events(
+        [
+            {
+                "id": f"{sub_id}-e1",
+                "submission_id": sub_id,
+                "type": "submission.created",
+                "revision": 1,
+                "payload": {
+                    "outcome": "a stick figure website",
+                    "audience": "my kid",
+                    "done_definition": "it loads",
+                },
+            },
+            {
+                "id": f"{sub_id}-e2",
+                "submission_id": sub_id,
+                "type": "signoff.approved",
+                "revision": 2,
+                "payload": {"verdict": "approved", "round": 1, "comment": None},
+            },
+        ]
+    )
+    portal_store.replace_customer_json(
+        sub_id, {"payload": {"verdict": "approved", "round": 1, "comment": None}}
+    )
+
+
+def test_remirror_rebuilds_a_clobbered_mirror():
+    _seed_damaged_mirror("SUB-1")
+
+    result = run("portal", "remirror", "SUB-1")
+    assert result.exit_code == 0, result.output
+    assert "remirrored 1 submission(s), 1 changed" in result.output
+
+    from coord import portal_store
+
+    record = portal_store.get_submission("SUB-1")
+    assert record is not None
+    assert record.customer["outcome"] == "a stick figure website"
+    assert record.customer["audience"] == "my kid"
+    assert record.customer["verdict"] == "approved"
+    assert "payload" not in record.customer
+
+
+def test_remirror_dry_run_writes_nothing():
+    _seed_damaged_mirror("SUB-2")
+
+    result = run("portal", "remirror", "--dry-run", "SUB-2")
+    assert result.exit_code == 0, result.output
+    assert "SUB-2: CHANGED" in result.output
+    assert "dry-run" in result.output
+
+    from coord import portal_store
+
+    record = portal_store.get_submission("SUB-2")
+    assert record is not None
+    assert record.customer == {
+        "payload": {"verdict": "approved", "round": 1, "comment": None}
+    }
+
+
+def test_remirror_with_no_arguments_covers_every_submission():
+    _seed_damaged_mirror("SUB-A")
+    _seed_damaged_mirror("SUB-B")
+
+    result = run("portal", "remirror")
+    assert result.exit_code == 0, result.output
+    assert "remirrored 2 submission(s), 2 changed" in result.output
+
+    from coord import portal_store
+
+    for sub_id in ("SUB-A", "SUB-B"):
+        record = portal_store.get_submission(sub_id)
+        assert record is not None
+        assert record.customer["outcome"] == "a stick figure website"
+
+
+def test_remirror_reports_an_unknown_submission_cleanly():
+    result = run("portal", "remirror", "SUB-NOPE")
+    assert result.exit_code == 0
+    assert "no events on file" in result.output
+
+
+def test_remirror_is_idempotent_once_clean():
+    """A second pass over an already-correct mirror reports 0 changed —
+    remirror is a repair, not a perpetual toggle."""
+    _seed_damaged_mirror("SUB-3")
+    run("portal", "remirror", "SUB-3")
+
+    result = run("portal", "remirror", "SUB-3")
+    assert result.exit_code == 0, result.output
+    assert "remirrored 1 submission(s), 0 changed" in result.output
+
+
 # ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────
 
 
@@ -714,6 +819,8 @@ def thin_client(monkeypatch):
         ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
         ("portal", "enqueue-question", "sub_1", "why?"),
         ("portal", "requeue", "sub_1", "1"),
+        ("portal", "remirror"),
+        ("portal", "remirror", "sub_1"),
         ("portal", "publish-mocks", "coord", "3"),
         ("portal", "decompose-chat", "sub_1"),
     ],
