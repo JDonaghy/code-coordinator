@@ -1584,6 +1584,65 @@ class TestBranchCommitsAheadForAssignment:
         assert result == 0
 
 
+class TestGetBranchSha:
+    """#2704: `raise_on_transient` is opt-in and off by default — every
+    existing caller's fold-everything-to-``None`` contract is unchanged;
+    only a caller that passes the flag sees `GhTransientError` for a
+    confirmed transient failure."""
+
+    def test_returns_sha_on_success(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"commit": {"sha": "abc123"}}),
+        ):
+            assert github_ops.get_branch_sha("acme/api", "main") == "abc123"
+
+    def test_returns_none_on_gh_error_by_default(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=RuntimeError("gh api ... failed: HTTP 404: Not Found"),
+        ):
+            assert github_ops.get_branch_sha("acme/api", "deleted-branch") is None
+
+    def test_returns_none_on_rate_limit_by_default(self) -> None:
+        """Without opting in, a rate limit folds to `None` exactly like any
+        other failure — the pre-#2704 behaviour every existing caller
+        still gets."""
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=RuntimeError(
+                "gh api ... failed: HTTP 403: API rate limit exceeded"
+            ),
+        ):
+            assert github_ops.get_branch_sha("acme/api", "main") is None
+
+    def test_raise_on_transient_raises_for_rate_limit(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=RuntimeError(
+                "gh api ... failed: HTTP 403: API rate limit exceeded"
+            ),
+        ):
+            with pytest.raises(github_ops.GhTransientError):
+                github_ops.get_branch_sha(
+                    "acme/api", "main", raise_on_transient=True
+                )
+
+    def test_raise_on_transient_still_returns_none_for_confirmed_absent(self) -> None:
+        """A 404 (branch genuinely gone) is not transient — it must keep
+        folding to `None` even with the flag set, never raise."""
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=RuntimeError("gh api ... failed: HTTP 404: Not Found"),
+        ):
+            assert (
+                github_ops.get_branch_sha(
+                    "acme/api", "deleted-branch", raise_on_transient=True
+                )
+                is None
+            )
+
+
 class TestGetBranchPatchId:
     """#1475: fetches the three-dot compare diff (no PR required, mirroring
     get_branch_diff_size) and hashes it."""

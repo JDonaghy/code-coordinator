@@ -9,6 +9,7 @@ Two-layer design so the logic is testable without hitting `gh`:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
@@ -17,6 +18,13 @@ from pathlib import Path
 from typing import Iterable, NamedTuple, Protocol
 
 from coord.audit import record_audit
+# #2704: recognized (not required) — only `coord.github_ops.get_branch_sha`'s
+# opt-in `raise_on_transient=True` path raises this. A `gh_ops` stand-in that
+# doesn't support the kwarg (e.g. `coord.gate_snapshot.GateSnapshot`, whose
+# cache-miss `None` is a deliberate, unrelated fail-open convention — see
+# `evaluate_smoke_verdict`) raises a plain `TypeError` instead, caught by the
+# generic `except Exception` alongside it and never mistaken for this.
+from coord.github_ops import GhTransientError
 from coord.ci_store import (
     CheckRun,
     CiCheckSummary,
@@ -395,6 +403,29 @@ def _backfill_branch_patch_id(entry: "QueuedMerge", gh_ops: "GhOps | None") -> s
         except Exception:  # noqa: BLE001 — best effort; a read-only entry just recomputes next time
             pass
     return computed
+
+
+# #2704: the honest reason for a review/smoke gate refusal when the
+# underlying cause is that this caller could not read the branch's live head
+# SHA at all — GitHub unreachable, `gh` unauthenticated, or (the incident
+# that filed this) a secondary rate limit. Before #2704 the two gates
+# inverted in OPPOSITE directions on exactly this condition: the review gate
+# folded it into the generic "review required but not approved" (a
+# fabricated refusal — see `ApprovalScan.unknown_head`, which already
+# distinguished this case but never reached the reason string), while
+# `evaluate_smoke_verdict` silently skipped every staleness compare it
+# couldn't make and returned SMOKE_OK (a fabricated pass — see
+# `SMOKE_UNKNOWN`). Both gates now report THIS string instead, so:
+#   - the operator sees the real cause, not a fictitious "not approved"/
+#     "passing" verdict;
+#   - `coord.drive._merge_gate_kind` recognizes it as its own kind (neither
+#     "review" nor "smoke"), so the auto-loop WAITS for the probe to recover
+#     instead of escalating a re-review or a Test re-run for a gate that was
+#     never actually evaluated.
+UNKNOWN_BRANCH_HEAD_REASON = (
+    "branch head unknown — cannot evaluate freshness gates (GitHub "
+    "unreachable, unauthenticated, or rate-limited; retry once it recovers)"
+)
 
 
 class ApprovalScan(NamedTuple):
@@ -1069,14 +1100,23 @@ def merge_gate_failures(
     never makes a second round trip) just to answer yes/no.
     """
     failures: list[MergeGateFailure] = []
-    if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
-        failures.append(MergeGateFailure(
-            gate="review",
-            reason="review required but not approved",
-            waiver_flag="--skip-review",
-        ))
-        if stop_early:
-            return failures
+    if requires_review(a, config):
+        review_scan = scan_approved_reviews(a, board, gh_ops)
+        if not review_scan.approved:
+            # #2704: `unknown_head` means the branch head could not be
+            # confirmed at all — never collapse that into "not approved",
+            # which asserts a refusal this scan never actually confirmed.
+            failures.append(MergeGateFailure(
+                gate="review",
+                reason=(
+                    UNKNOWN_BRANCH_HEAD_REASON
+                    if review_scan.unknown_head
+                    else "review required but not approved"
+                ),
+                waiver_flag="--skip-review",
+            ))
+            if stop_early:
+                return failures
     if requires_smoke(a, config):
         smoke = evaluate_smoke_verdict(a, board, gh_ops)
         if not smoke.ok:
@@ -1158,9 +1198,19 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
 # Before #1640 both collapsed to "smoke test required but no verdict
 # recorded", which is a false statement in the stale case and is exactly what
 # made #1640 get filed as a lost DB write.
+#
+# #2704 adds a third: SMOKE_UNKNOWN — a recorded verdict exists, but the LIVE
+# branch/base SHA needed to check it for staleness could not be read at all
+# (GitHub unreachable, `gh` unauthenticated, or a rate limit), as opposed to
+# being read and confirmed unchanged. Before #2704 this case fell through
+# every staleness compare below (each one requires the current SHA to be
+# non-``None`` to run) straight to SMOKE_OK — a verdict this code never
+# actually confirmed still covers the current head. See
+# `UNKNOWN_BRANCH_HEAD_REASON`.
 SMOKE_OK = "ok"
 SMOKE_MISSING = "missing"
 SMOKE_STALE = "stale"
+SMOKE_UNKNOWN = "unknown"
 
 
 def _short_sha(sha: str | None) -> str:
@@ -1190,6 +1240,11 @@ class SmokeVerdictStatus:
     with no Test worker left alive to resolve it. That is an *abandoned*
     verdict, not an absent one — see :data:`RUNNING_MARKER_STALE_AFTER`.
 
+    #2704: ``anchor`` is also set (to ``"base"`` or ``"branch"``) on a
+    :data:`SMOKE_UNKNOWN` result — it names which side's live SHA could not
+    be read, mirroring the STALE case, even though (unlike STALE) there is
+    no ``current_sha`` to report since that is exactly what is unknown.
+
     ``spared_reason`` is the mirror image, set only on a passing (``ok``)
     verdict when the merge base *did* move but one of the #1479 escape
     hatches proved the move couldn't have invalidated the verdict — #1738
@@ -1200,9 +1255,9 @@ class SmokeVerdictStatus:
     """
 
     ok: bool
-    kind: str  # SMOKE_OK | SMOKE_MISSING | SMOKE_STALE
+    kind: str  # SMOKE_OK | SMOKE_MISSING | SMOKE_STALE | SMOKE_UNKNOWN
     assignment_id: str | None = None
-    anchor: str | None = None  # "base" | "branch" | "run" (SMOKE_STALE only)
+    anchor: str | None = None  # "base" | "branch" | "run" (SMOKE_STALE/SMOKE_UNKNOWN only)
     recorded_sha: str | None = None
     current_sha: str | None = None
     spared_reason: str | None = None  # set only on `ok=True` after a base move (#1847)
@@ -1215,6 +1270,8 @@ class SmokeVerdictStatus:
         """
         if self.ok:
             return None
+        if self.kind == SMOKE_UNKNOWN:
+            return UNKNOWN_BRANCH_HEAD_REASON
         if self.kind == SMOKE_STALE:
             if self.anchor == "run":
                 return (
@@ -1235,6 +1292,10 @@ class SmokeVerdictStatus:
         ``smoke_required`` event message). ``None`` when the gate passes."""
         if self.ok:
             return None
+        if self.kind == SMOKE_UNKNOWN:
+            # #2704: never fabricate SMOKE_OK on evidence this call never
+            # actually obtained — see `UNKNOWN_BRANCH_HEAD_REASON`.
+            return UNKNOWN_BRANCH_HEAD_REASON
         if self.kind == SMOKE_STALE:
             aid = self.assignment_id or "<assignment>"
             if self.anchor == "run":
@@ -2096,6 +2157,51 @@ def _abandoned_running_marker(
     return running[0]
 
 
+# #2704: True only for a `gh_ops.get_branch_sha` that actually declares the
+# `raise_on_transient` kwarg (today: only `coord.github_ops.get_branch_sha`
+# itself). Checked once per call via `inspect.signature` rather than just
+# always passing the kwarg, because `GhOps` is a duck-typed `Protocol` with
+# many concrete stand-ins — `coord.gate_snapshot.GateSnapshot` (whose
+# cache-miss `None` is an unrelated, deliberate fail-open convention, #1640)
+# and every test's ad hoc stub among them — and blindly passing an unknown
+# keyword to a two-positional-argument stub raises `TypeError` before the
+# stub's own body ever runs, silently discarding whatever SHA it would have
+# returned. This keeps every such stand-in's exact existing behaviour byte
+# for byte; only a `get_branch_sha` that opted in ever sees the kwarg.
+_RAISE_ON_TRANSIENT_KW = "raise_on_transient"
+
+
+def _gh_get_branch_sha(
+    gh_ops: "GhOps", repo: str, branch: str
+) -> tuple[str | None, bool]:
+    """``(sha, probe_failed_transiently)`` for one ``gh_ops.get_branch_sha``
+    call (#2704).
+
+    ``probe_failed_transiently`` is ``True`` only when *gh_ops* both
+    declares support for ``raise_on_transient`` and raised
+    :class:`~coord.github_ops.GhTransientError` for this call — a CONFIRMED
+    transient failure (GitHub unreachable, ``gh`` unauthenticated, a rate
+    limit), never a merely-empty result. See the module-level comment above
+    for why support is detected rather than assumed.
+    """
+    fn = gh_ops.get_branch_sha
+    try:
+        supports = _RAISE_ON_TRANSIENT_KW in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        supports = False
+    if not supports:
+        try:
+            return fn(repo, branch), False
+        except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+            return None, False
+    try:
+        return fn(repo, branch, raise_on_transient=True), False
+    except GhTransientError:
+        return None, True
+    except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+        return None, False
+
+
 def evaluate_smoke_verdict(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
 ) -> SmokeVerdictStatus:
@@ -2164,10 +2270,24 @@ def evaluate_smoke_verdict(
     from its tick-refreshed data; keep that in lockstep if a new gh_ops
     stand-in is ever introduced.
 
+    #2704: a *gh_ops* that answers a live SHA lookup with ``None`` — GitHub
+    unreachable, ``gh`` unauthenticated, or a rate limit — is not the same
+    as never having asked. Before #2704 that ``None`` looked identical to
+    "no live lookup was needed/possible", so every staleness check below
+    (each requires the live SHA to be non-``None`` to run) silently no-opped
+    and this function reached :data:`SMOKE_OK` on a verdict it never
+    actually confirmed. Now a genuinely *attempted-and-failed* lookup
+    produces :data:`SMOKE_UNKNOWN` instead — fail closed, distinctly from
+    both other failure kinds, so the caller (and, since #2704, ``coord
+    drive``) can wait for GitHub to answer rather than treat an unreadable
+    probe as either a pass or a plain missing/stale verdict.
+
     Returns a :class:`SmokeVerdictStatus`: ``ok`` plus, when it fails,
-    whether the verdict is :data:`SMOKE_MISSING` (never recorded) or
+    whether the verdict is :data:`SMOKE_MISSING` (never recorded),
     :data:`SMOKE_STALE` (recorded, but against a branch/base combination
-    that no longer exists) and the SHAs that disagree.
+    that no longer exists — and the SHAs that disagree), or
+    :data:`SMOKE_UNKNOWN` (recorded, but the live SHA needed to check it
+    could not be read at all).
     """
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
@@ -2194,12 +2314,28 @@ def evaluate_smoke_verdict(
     base_sha_attempted = current_base_sha is not None
     branch_sha_attempted = current_branch_sha is not None
     patch_id_attempted = current_patch_id is not None
+    # #2704: True only when a live lookup *positively confirmed* a transient
+    # failure (`GhTransientError`, opt-in via `raise_on_transient=True`) —
+    # never merely because the lookup returned/left `None`. That keeps
+    # `coord.gate_snapshot.GateSnapshot`'s deliberate cache-miss-is-`None`
+    # fail-open convention (#1640) intact: it doesn't accept the kwarg, so
+    # the call raises a plain `TypeError` there, caught by the generic
+    # `except Exception` below and never mistaken for this.
+    base_sha_probe_failed = False
+    branch_sha_probe_failed = False
 
     # #1640: the first row rejected purely for staleness, so a refusal can
     # name the case ("recorded at X, base now Y") instead of claiming no
     # verdict exists. Only set when a terminal verdict was actually found —
     # a board with no terminal verdict at all stays SMOKE_MISSING.
     stale: SmokeVerdictStatus | None = None
+    # #2704: the first row rejected because a live SHA lookup this call
+    # actually attempted came back empty — distinct from `stale` (which
+    # means the lookup SUCCEEDED and the SHAs disagree) and reported ahead
+    # of it below: "cannot confirm" must never lose to a `stale` verdict
+    # found on some other row in the same chain, since neither tells this
+    # caller the verdict is actually fresh.
+    unknown: SmokeVerdictStatus | None = None
 
     # Work found — check whether any carries a fresh terminal smoke verdict.
     for a in branch_work:
@@ -2231,11 +2367,30 @@ def evaluate_smoke_verdict(
             and repo_github
             and target_branch
         ):
-            try:
-                current_base_sha = gh_ops.get_branch_sha(repo_github, target_branch)
-            except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
-                current_base_sha = None
+            current_base_sha, base_sha_probe_failed = _gh_get_branch_sha(
+                gh_ops, repo_github, target_branch
+            )
             base_sha_attempted = True
+
+        # #2704: the live probe just above positively confirmed it could not
+        # read GitHub, while a recorded verdict names a specific base SHA to
+        # compare against. Before #2704 a failed (or merely un-attempted)
+        # lookup was indistinguishable from a clean `None`, so this fell
+        # straight through to the "base moved" check below, which is a
+        # silent no-op on `current_base_sha is None` and lets execution
+        # reach SMOKE_OK further down: a verdict this call never actually
+        # confirmed still covers the current base. Fail closed instead — we
+        # do not KNOW whether the base moved, so we cannot vouch for it.
+        if test_base_sha is not None and base_sha_probe_failed:
+            if unknown is None:
+                unknown = SmokeVerdictStatus(
+                    ok=False,
+                    kind=SMOKE_UNKNOWN,
+                    assignment_id=getattr(a, "assignment_id", None),
+                    anchor="base",
+                    recorded_sha=test_base_sha,
+                )
+            continue
 
         # #1738/#1778/#1847: the base moved, but a moved SHA doesn't
         # necessarily mean a content change that could affect a test result.
@@ -2288,11 +2443,27 @@ def evaluate_smoke_verdict(
             and repo_github
             and entry_branch
         ):
-            try:
-                current_branch_sha = gh_ops.get_branch_sha(repo_github, entry_branch)
-            except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
-                current_branch_sha = None
+            current_branch_sha, branch_sha_probe_failed = _gh_get_branch_sha(
+                gh_ops, repo_github, entry_branch
+            )
             branch_sha_attempted = True
+
+        # #2704: same fail-closed treatment as the base-SHA probe above — the
+        # live probe just above positively confirmed it could not read
+        # GitHub, with a recorded verdict that names a specific branch head
+        # to compare against. Left unchecked this would silently skip the
+        # branch-content check below and reach SMOKE_OK.
+        if test_head_sha is not None and branch_sha_probe_failed:
+            if unknown is None:
+                unknown = SmokeVerdictStatus(
+                    ok=False,
+                    kind=SMOKE_UNKNOWN,
+                    assignment_id=getattr(a, "assignment_id", None),
+                    anchor="branch",
+                    recorded_sha=test_head_sha,
+                )
+            continue
+
         if (
             test_head_sha is not None
             and current_branch_sha is not None
@@ -2331,6 +2502,12 @@ def evaluate_smoke_verdict(
             spared_reason=base_move_spare_reason,
         )
 
+    # #2704: "cannot confirm" outranks "confirmed stale" — both mean the
+    # verdict cannot be trusted as-is, but only `stale` names an actual
+    # discrepancy this call observed; `unknown` means no comparison was
+    # possible at all, which is the more honest thing to report first.
+    if unknown is not None:
+        return unknown
     if stale is not None:
         return stale
 
@@ -4057,8 +4234,16 @@ def _entry_gate_status(
         # #1506: pass gh_ops through so a null branch_patch_id (e.g. an entry
         # whose approved review predates #1475) is computed on demand rather
         # than displaying a stale "review not approved" the plan can't fix.
-        if requires_review(entry, config) and not has_approved_review(entry, board, gh_ops):
-            return PLAN_BLOCKED, "review not approved"
+        if requires_review(entry, config):
+            review_scan = scan_approved_reviews(entry, board, gh_ops)
+            if not review_scan.approved:
+                # #2704: don't render "not approved" for a branch head this
+                # scan couldn't even read — see `ApprovalScan.unknown_head`.
+                return PLAN_BLOCKED, (
+                    UNKNOWN_BRANCH_HEAD_REASON
+                    if review_scan.unknown_head
+                    else "review not approved"
+                )
         if requires_smoke(entry, config):
             # #1640: render the specific failure. A stale verdict used to be
             # reported with the same "test verdict missing" wording as one
@@ -5636,10 +5821,17 @@ def process(
                     and requires_review(entry, config)
                     and (board is None or not has_approved_review(entry, board, gh_ops))
                 ):
+                    # #2704: don't report a confirmed refusal ("not
+                    # approved") for a branch head this scan couldn't even
+                    # read — see `ApprovalScan.unknown_head`.
                     _why = (
                         "board unavailable to confirm review approval"
                         if board is None
-                        else "review required but not approved"
+                        else (
+                            UNKNOWN_BRANCH_HEAD_REASON
+                            if scan_approved_reviews(entry, board, gh_ops).unknown_head
+                            else "review required but not approved"
+                        )
                     )
                     events.append(MergeEvent(
                         entry, "review_required",
@@ -6022,10 +6214,17 @@ def process(
                 and requires_review(entry, config)
                 and (board is None or not has_approved_review(entry, board, gh_ops))
             ):
+                # #2704: don't report a confirmed refusal ("not approved")
+                # for a branch head this scan couldn't even read — see
+                # `ApprovalScan.unknown_head`.
                 msg = (
                     "review required but board unavailable to confirm approval"
                     if board is None
-                    else "review required but not approved"
+                    else (
+                        UNKNOWN_BRANCH_HEAD_REASON
+                        if scan_approved_reviews(entry, board, gh_ops).unknown_head
+                        else "review required but not approved"
+                    )
                 )
                 entry.error = msg
                 events.append(MergeEvent(entry, "review_required", msg))

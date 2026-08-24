@@ -138,6 +138,7 @@ from coord.worker_events import is_usage_limit_reason
 # See `_STALE_SMOKE_MARKERS` / `_is_stale_smoke_reason` below.
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
+    UNKNOWN_BRANCH_HEAD_REASON as _mq_unknown_branch_head_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
@@ -2997,24 +2998,52 @@ _SMOKE_GATE_MARKERS = (
 )
 _REVIEW_GATE_MARKERS = ("review required", "review not approved")
 
+# #2704: the branch-head-unknown condition
+# (`coord.merge_queue.UNKNOWN_BRANCH_HEAD_REASON`) is its OWN gate kind —
+# neither "smoke" nor "review" — even though `merge_gate_failures` reports it
+# under `gate="review"`. Matching it as "review" here would let
+# `_merge_gate_divergence` fire whenever this driver's own cached
+# `review_verdict == "approve"` (routinely true: the #2704 incident's
+# approval WAS for the current head, coord merge just couldn't confirm it),
+# which would escalate proposing `coord review-reaffirm` — asking a human to
+# re-bless a review that was never actually refused. The correct response is
+# the same as the CI-unreadable wait just below: this driver's cached
+# review/test verdicts say nothing usable about a gate that was never
+# actually evaluated, so WAIT for the next live GitHub read to succeed
+# rather than spend a merge attempt (or a human) on a fabricated refusal.
+_UNKNOWN_BRANCH_HEAD_MARKER = _mq_unknown_branch_head_reason.lower()
+
 
 def _merge_gate_kind(reason: str) -> str | None:
     """Classify a merge-queue block *reason* as the gate it names, or
-    ``None`` when it isn't one of the two this module knows a corrective
-    action for.
+    ``None`` when it isn't one this module knows a corrective action for.
 
     Matches both `merge_queue.process()`'s live-attempt wording ("smoke test
     required but no verdict recorded" / "review required but not approved")
     and `merge_queue.plan()`'s board-render wording ("test verdict missing" /
     "review not approved") — the two functions describe the identical gates
     in different words.
+
+    #2704: checked BEFORE the review marker below — `UNKNOWN_BRANCH_HEAD_
+    REASON` names its own condition (`"unknown_head"`), never "review" or
+    "smoke", regardless of which gate's refusal carried it.
     """
     r = (reason or "").lower()
+    if _UNKNOWN_BRANCH_HEAD_MARKER in r:
+        return "unknown_head"
     if any(marker in r for marker in _SMOKE_GATE_MARKERS):
         return "smoke"
     if any(marker in r for marker in _REVIEW_GATE_MARKERS):
         return "review"
     return None
+
+
+def _is_unknown_branch_head_reason(reason: str | None) -> bool:
+    """True when *reason* names the #2704 branch-head-unknown condition —
+    ``coord.merge_queue.UNKNOWN_BRANCH_HEAD_REASON``, regardless of which
+    gate (``review``/``smoke``) it was reported under.
+    """
+    return _UNKNOWN_BRANCH_HEAD_MARKER in (reason or "").lower()
 
 
 # #1738: the two wordings that name a verdict recorded-but-STALE specifically
@@ -3345,6 +3374,23 @@ def _decide_merge(
     gate_reason, gate_reason_from_diagnostic = _effective_merge_gate_reason(
         state, counters
     )
+    # #2704: the branch head itself could not be read (GitHub unreachable,
+    # `gh` unauthenticated, or a rate limit) — checked before the divergence
+    # classification below, which would otherwise fire on this driver's own
+    # cached review_verdict/work_test_state (routinely still "approve"/
+    # "passed" — the gate was never actually re-evaluated, not contradicted)
+    # and escalate a re-review or Test re-run for a refusal nothing here
+    # confirmed. No retry or fix this driver can take changes GitHub's
+    # answer; wait, exactly like the CI-unreadable case below, and never
+    # spend a merge attempt re-observing the identical unreadable probe.
+    if _is_unknown_branch_head_reason(gate_reason):
+        return _wait(
+            label=(
+                "MERGE: branch head unknown — GitHub read failed (rate "
+                "limit, auth, or network); waiting, not retrying (#2704): "
+                f"{gate_reason}"
+            )
+        )
     divergence = _merge_gate_divergence(state, reason=gate_reason)
     if (
         gate_reason_from_diagnostic
