@@ -3508,6 +3508,13 @@ pub struct CoordApp {
     /// #1040: current category filter (contract §9), cycled by `Tab`.
     /// Persists across panel navigation; resets to `All` on restart.
     audit_category: AuditCategory,
+    /// #2653: current tier filter, cycled by `T`. Defaults to `Business` —
+    /// unlike `audit_time_range`/`audit_category` above, whose defaults are
+    /// "no filter" — because the un-filtered `/audit` stream is ~96%
+    /// `forge_availability` operational telemetry (#1896 Phase 0) that
+    /// drowns real board transitions; see `AuditTier`'s doc comment.
+    /// Persists across panel navigation; resets to `Business` on restart.
+    audit_tier: AuditTier,
     /// #1040: free-text filter on the `/audit` `type` (`event_type`) param
     /// — reuses the same `SidebarFilter` widget Board/Pipeline embed for
     /// their issue filters (deliverable 1). Toggled into edit mode with
@@ -4214,6 +4221,9 @@ impl CoordApp {
             // defaults ("All" time-range, "all" category, empty type text).
             audit_time_range: AuditTimeRange::All,
             audit_category: AuditCategory::All,
+            // #2653: tier defaults to `Business` (not "no filter") — see
+            // `AuditTier`'s doc comment.
+            audit_tier: AuditTier::default(),
             audit_type_filter: SidebarFilter::default(),
             // #1094: no column-width overrides / active resize drag / cached
             // layout on startup — all populated by the first render + user
@@ -9594,9 +9604,21 @@ impl CoordApp {
                 // advertising it as a quit key would be wrong.
                 " type to filter (event_type)  Enter=apply  Esc=clear ".to_string()
             } else {
+                // #2653: `T=tier` is deliberately shown WITHOUT an inline
+                // `(value)` — unlike `t=time-range`/`Tab=category` above,
+                // which the ms-33 contract requires to show their current
+                // selection inline. Adding a third `(value)` here (worst
+                // case `" (operational)"`, 13 chars) pushes this line past
+                // the sealed contract's 120-column fixture width alongside
+                // the other two at their own longest labels ("Last hour" /
+                // "override"), clipping the trailing `q=quit` the
+                // `status_bar_hints_list_mode` acceptance test requires.
+                // The sidebar's `"Tier: {label}"` row (`audit_sidebar`
+                // above) is the value's real home; this hint only needs to
+                // advertise that the `T` key exists.
                 format!(
                     " j/k=nav  Enter=detail  r=refresh  t=time-range ({})  \
-                     Tab=category ({})  f=filter  Esc=clear  q=quit ",
+                     Tab=category ({})  T=tier  f=filter  Esc=clear  q=quit ",
                     self.audit_time_range.label(),
                     self.audit_category.label(),
                 )

@@ -2233,6 +2233,62 @@ impl AuditCategory {
     }
 }
 
+/// #2653: tier filter for the Audit panel, cycled forward by the `T` key.
+/// Maps to the `/audit` endpoint's `tier` query param (`coord/audit.py`'s
+/// `query_audit_log(tier=...)`).
+///
+/// Defaults to `Business` — not `All` like `AuditTimeRange`/`AuditCategory`
+/// above. Measured on dellserver 2026-08-23, `forge_availability` rows
+/// (`coord/forge_availability.py`, #1896 Phase 0, written `tier=
+/// "operational"`) are ~96% of the live `/audit` stream (2,937 of 3,045 rows
+/// in the last hour) and drown every real dispatch/test/review/merge
+/// transition off the panel. Those rows are worth keeping in the DB — this
+/// is purely a default-view decision — so `Operational` and `All` stay one
+/// keystroke away rather than being dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AuditTier {
+    /// Only `tier="business"` rows — dispatch/test/review/merge/override/
+    /// plan/error, the human-facing board transitions. The default.
+    #[default]
+    Business,
+    /// Only `tier="operational"` rows — daemon-tick/housekeeping/
+    /// forge-availability telemetry.
+    Operational,
+    /// No tier filter applied — both tiers.
+    All,
+}
+
+impl AuditTier {
+    /// Cycle forward: `Business -> Operational -> All -> Business`.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            AuditTier::Business => AuditTier::Operational,
+            AuditTier::Operational => AuditTier::All,
+            AuditTier::All => AuditTier::Business,
+        }
+    }
+
+    /// Display string — shown in the sidebar and the `T=tier (…)` status-bar
+    /// hint, and doubles as the `/audit` `tier=` query value (lowercase,
+    /// matching the DB column's `"business"`/`"operational"` values).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AuditTier::Business => "business",
+            AuditTier::Operational => "operational",
+            AuditTier::All => "all",
+        }
+    }
+
+    /// The `/audit` `tier=` query value, or `None` for `All` (no filter —
+    /// `query_audit_log` treats an absent/empty `tier` as "every tier").
+    pub(crate) fn query_value(self) -> Option<&'static str> {
+        match self {
+            AuditTier::All => None,
+            other => Some(other.label()),
+        }
+    }
+}
+
 /// CI check status for one PR.
 ///
 /// #1344: previously fetched client-side via a perpetual `gh pr checks`

@@ -637,16 +637,18 @@ pub(crate) const AUDIT_FETCH_TTL: Duration = Duration::from_secs(15);
 /// loop in `settings_ui.rs`), same gating discipline as the Machines-panel
 /// metrics poll above.
 ///
-/// `since`/`category`/`event_type` are the Audit panel's current filter
-/// selection (contract §8/§9/§11, `tests/acceptance/ms-33/contract.md`) —
-/// `None`/empty means "no filter", matching `/audit`'s own optional-param
-/// semantics (#1037). Values ride as `ureq` query params (not manually
-/// interpolated into the URL) so free-text `event_type` input never needs
-/// its own percent-encoding.
+/// `since`/`category`/`event_type`/`tier` are the Audit panel's current
+/// filter selection (contract §8/§9/§11, `tests/acceptance/ms-33/
+/// contract.md`, plus the #2653 tier filter which predates any contract
+/// pin) — `None`/empty means "no filter", matching `/audit`'s own
+/// optional-param semantics (#1037). Values ride as `ureq` query params
+/// (not manually interpolated into the URL) so free-text `event_type` input
+/// never needs its own percent-encoding.
 pub(crate) fn spawn_audit_fetch(
     since: Option<f64>,
     category: Option<&str>,
     event_type: Option<&str>,
+    tier: Option<&str>,
 ) -> std::sync::mpsc::Receiver<AuditFetchOutcome> {
     let (tx, rx) = std::sync::mpsc::channel();
     let Some((url, token)) = resolve_board_service() else {
@@ -655,6 +657,7 @@ pub(crate) fn spawn_audit_fetch(
     };
     let category = category.map(|s| s.to_string());
     let event_type = event_type.map(|s| s.to_string());
+    let tier = tier.map(|s| s.to_string());
     std::thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(5))
@@ -669,6 +672,9 @@ pub(crate) fn spawn_audit_fetch(
         }
         if let Some(event_type) = &event_type {
             req = req.query("type", event_type);
+        }
+        if let Some(tier) = &tier {
+            req = req.query("tier", tier);
         }
         if let Some(t) = &token {
             req = req.set("Authorization", &format!("Bearer {t}"));

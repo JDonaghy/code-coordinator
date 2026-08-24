@@ -100,6 +100,13 @@ impl CoordApp {
             &format!("  Category: {}", self.audit_category.label()),
             Color::rgb(150, 180, 220),
         ));
+        // #2653: tier selection, cycled by `T` — shown unconditionally, same
+        // discoverability reasoning as Time/Category just above (visible
+        // before the operator has touched it, not only while non-default).
+        items.push(activity_item(
+            &format!("  Tier: {}", self.audit_tier.label()),
+            Color::rgb(150, 180, 220),
+        ));
         // #1040 deliverable 1 / contract §10 ("f=filter"): free-text filter
         // on `/audit`'s `type` param, reusing `SidebarFilter`'s state (same
         // struct Board/Pipeline embed) but rendered as a plain row here —
@@ -138,12 +145,26 @@ impl CoordApp {
         self.data.audit_recent_count
     }
 
-    /// #1040: `true` when any Audit filter differs from its default ("All"
-    /// time-range, "all" category, empty type text) — drives the sidebar's
-    /// `" (filtered)"` count-line suffix (mock `audit-panel-filters.screen`).
+    /// #1040/#2653: `true` when any Audit filter differs from its default
+    /// ("All" time-range, "all" category, "business" tier, empty type text)
+    /// — drives the sidebar's `" (filtered)"` count-line suffix (mock
+    /// `audit-panel-filters.screen`).
+    ///
+    /// `audit_tier`'s own default is `Business`, not "no filter" like the
+    /// other three — deliberately: #2653 makes `Business` the default
+    /// *view*, not a filter the operator applied, so it must NOT pin
+    /// `" (filtered)"` on permanently (that would make the suffix
+    /// meaningless — it'd show on literally every fresh session). Comparing
+    /// against `AuditTier::Business` (the default) rather than
+    /// `AuditTier::All` (the "everything" value the other two compare
+    /// against) is what keeps that distinction: the suffix now means "you
+    /// changed something from its default", exactly as it does for
+    /// time-range/category/type, with tier's default just being a
+    /// non-`All` value instead of `All`.
     pub(crate) fn audit_filters_active(&self) -> bool {
         self.audit_time_range != AuditTimeRange::All
             || self.audit_category != AuditCategory::All
+            || self.audit_tier != AuditTier::default()
             || !self.audit_type_filter.is_empty()
     }
 

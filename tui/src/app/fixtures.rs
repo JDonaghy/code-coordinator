@@ -361,10 +361,15 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_detail_open: false,
         audit_fetch_error: None,
         audit_no_service: false,
-        // #1040: no filter applied by default in test helpers; individual
-        // tests override these fields directly to exercise the filters.
+        // #1040: no time/category filter applied by default in test
+        // helpers; individual tests override these fields directly to
+        // exercise the filters.
         audit_time_range: AuditTimeRange::All,
         audit_category: AuditCategory::All,
+        // #2653: tier defaults to `Business` here too, matching
+        // `CoordApp::new` — tests that want the unfiltered/operational view
+        // override this field directly, same pattern as the two above.
+        audit_tier: AuditTier::default(),
         audit_type_filter: SidebarFilter::default(),
         // #1094: no column-width overrides / active resize drag / cached
         // layout in test helpers by default.
