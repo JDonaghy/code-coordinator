@@ -14,10 +14,14 @@ the daemon or falls through to a ``_*_local()`` SQL function.  That
 ``commands/acceptance`` analogues) is the single write choke point — #1036
 hooked the audit log there for exactly that reason — and is the portability
 seam a future Postgres backend (#282/#828) would actually swap.  DB-API 2.0
-already abstracts ``sqlite3`` vs ``psycopg`` at the connection layer, so the
-port keeps the raw-SQL shape and swaps the connection rather than rewriting the
-call sites into store methods; a ``CoordStore``-style write interface would buy
-a cleaner API, not portability that is otherwise missing.
+abstracts the *connection and cursor protocol*, not the SQL dialect or the
+parameter style: ``sqlite3.paramstyle`` is ``qmark`` (``?``) and ``psycopg``'s
+is ``pyformat`` (``%s``), and this tree has on the order of 220 ``?``
+placeholders plus SQLite-only idioms (``INSERT OR REPLACE``,
+``AUTOINCREMENT``, ``PRAGMA``/WAL, ``lastrowid``) that a connection swap alone
+would not touch — the portability work is a dialect seam, not a drop-in
+(#1948).  A ``CoordStore``-style write interface would still buy a cleaner
+API, just not portability that is otherwise missing (#1948).
 
 ``SqliteStore`` is the concrete SQLite implementation of this read contract.
 It owns its *own* read-only connection (NOT ``coord.db``'s read/write
