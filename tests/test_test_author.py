@@ -37,7 +37,11 @@ def _machine(name: str, repos: list[str], caps: list[str] | None = None) -> Mach
         name=name,
         host=f"{name}.tailnet",
         repos=repos,
-        repo_paths={r: f"/tmp/{name}/{r}" for r in repos},
+        # #2684: Path composition (OS-native separators), not an f-string
+        # POSIX literal — these directories are never touched on disk here
+        # (dispatch is fully mocked), only threaded through as strings, but
+        # a hardcoded `/tmp/...` is still a portability smell on Windows.
+        repo_paths={r: str(Path("tmp") / name / r) for r in repos},
         capabilities=caps or [],
     )
 
