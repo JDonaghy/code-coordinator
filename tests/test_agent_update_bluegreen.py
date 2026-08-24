@@ -17,20 +17,33 @@ from unittest.mock import patch
 import pytest
 
 from coord.agent_update import (
+    _same_path,
     _slot_backing_interpreter,
     current_slot,
     ensure_symlink_layout,
     perform_update,
     rollback,
 )
+from coord.platform_paths import venv_bin, venv_exe, venv_pip, venv_python
+
+#: #2684 (W4): `current_slot()`/`ensure_symlink_layout()` call `Path.resolve()`
+#: internally (see their docstrings), which on Windows can return the
+#: `\\?\`-prefixed extended-length form even when the other side of the
+#: comparison was built by plain string-suffixing a `tmp_path` that was
+#: never resolved that way. A bare `==` between the two then fails despite
+#: both sides naming the same directory. `_same_path` (the module's own
+#: symlink-aware equality helper, #2121) already handles exactly this --
+#: falling back to `.resolve() == .resolve()` only once a literal string
+#: comparison misses -- so assertions below use it wherever one side may
+#: have gone through `current_slot`/`ensure_symlink_layout`.
 
 
 def _make_fake_slot(slot: Path) -> None:
-    """Populate *slot* with just enough of a venv's bin/ layout for the
-    module's own existence checks to pass, without a real interpreter."""
-    (slot / "bin").mkdir(parents=True, exist_ok=True)
-    for name in ("python", "pip", "coord"):
-        target = slot / "bin" / name
+    """Populate *slot* with just enough of a venv's bin/ (Scripts/ on
+    win32) layout for the module's own existence checks to pass, without a
+    real interpreter."""
+    venv_bin(slot).mkdir(parents=True, exist_ok=True)
+    for target in (venv_python(slot), venv_pip(slot), venv_exe(slot, "coord")):
         target.write_text("#!/bin/sh\n")
         target.chmod(0o755)
 
@@ -56,15 +69,16 @@ def _make_symlinked_fake_slot(slot: Path, base_interpreter: Path) -> None:
     ``_slot_backing_interpreter``'s/``perform_update``'s handling of a
     *real* running interpreter must use this fixture, not the plain one.
     """
-    (slot / "bin").mkdir(parents=True, exist_ok=True)
-    for name in ("pip", "coord"):
-        target = slot / "bin" / name
+    bin_dir = venv_bin(slot)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for target in (venv_pip(slot), venv_exe(slot, "coord")):
         target.write_text("#!/bin/sh\n")
         target.chmod(0o755)
-    python3 = slot / "bin" / "python3"
-    python = slot / "bin" / "python"
+    python3_name = "python3.exe" if sys.platform == "win32" else "python3"
+    python3 = bin_dir / python3_name
+    python = venv_python(slot)
     python3.symlink_to(base_interpreter)
-    python.symlink_to("python3")
+    python.symlink_to(python3_name)
 
 
 def _make_base_interpreter(tmp_path: Path) -> Path:
@@ -103,15 +117,20 @@ def _run_stub(
                 return subprocess.CompletedProcess(cmd, 1, "", "venv creation failed\n")
             _make_fake_slot(slot)
             return subprocess.CompletedProcess(cmd, 0, "created\n", "")
-        if cmd[0].endswith("/bin/pip") and "install" in cmd:
+        # #2684 (W4): match on the executable's stem rather than a
+        # hardcoded "/bin/<name>" suffix -- on win32 the real call sites
+        # (routed through coord.platform_paths) build "...\Scripts\pip.exe"
+        # etc, which a POSIX-only suffix check would never match.
+        exe = Path(cmd[0]).stem
+        if exe == "pip" and "install" in cmd:
             if not install_ok:
                 return subprocess.CompletedProcess(cmd, 1, "", "pip failed\n")
             return subprocess.CompletedProcess(cmd, 0, "Successfully installed\n", "")
-        if cmd[0].endswith("/bin/python") and "-c" in cmd:
+        if exe == "python" and "-c" in cmd:
             if not smoke_import_ok:
                 return subprocess.CompletedProcess(cmd, 1, "", "ModuleNotFoundError\n")
             return subprocess.CompletedProcess(cmd, 0, f"{version}\n", "")
-        if cmd[0].endswith("/bin/coord") and "--version" in cmd:
+        if exe == "coord" and "--version" in cmd:
             if not smoke_coord_ok:
                 return subprocess.CompletedProcess(cmd, 1, "", "coord is broken\n")
             return subprocess.CompletedProcess(cmd, 0, f"coord, version {version}\n", "")
@@ -141,7 +160,7 @@ class TestSymlinkLayout:
 
         assert active == tmp_path / ".coord-venv.blue"
         assert venv_dir.is_symlink()
-        assert current_slot(venv_dir) == active
+        assert _same_path(current_slot(venv_dir), active)
         assert (venv_dir / "marker").read_text() == "original install\n"
 
     def test_migration_is_idempotent(self, tmp_path: Path) -> None:
@@ -149,7 +168,7 @@ class TestSymlinkLayout:
         venv_dir.mkdir()
         first = ensure_symlink_layout(venv_dir)
         second = ensure_symlink_layout(venv_dir)
-        assert first == second
+        assert _same_path(first, second)
 
     def test_migrate_missing_venv_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
@@ -171,7 +190,7 @@ class TestPerformUpdateHappyPath:
         assert result.ok is True
         assert result.swapped is True
         assert result.new_version == "1.2.3"
-        assert current_slot(venv_dir) == tmp_path / ".coord-venv.green"
+        assert _same_path(current_slot(venv_dir), tmp_path / ".coord-venv.green")
         # The pre-migration install survives as the (now-inactive) blue slot.
         assert (tmp_path / ".coord-venv.blue" / "marker").read_text() == "gen0\n"
 
@@ -181,13 +200,13 @@ class TestPerformUpdateHappyPath:
 
         with patch("coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.0.0")):
             perform_update(venv_dir, "pkg", target_version="1.0.0")
-        assert current_slot(venv_dir) == tmp_path / ".coord-venv.green"
+        assert _same_path(current_slot(venv_dir), tmp_path / ".coord-venv.green")
 
         with patch("coord.agent_update.subprocess.run", side_effect=_run_stub(version="2.0.0")):
             result = perform_update(venv_dir, "pkg", target_version="2.0.0")
 
         assert result.ok is True
-        assert current_slot(venv_dir) == tmp_path / ".coord-venv.blue"
+        assert _same_path(current_slot(venv_dir), tmp_path / ".coord-venv.blue")
         # Exactly one prior generation is ever kept: green (now inactive)
         # still exists...
         assert (tmp_path / ".coord-venv.green").exists()
@@ -205,7 +224,7 @@ class TestPerformUpdateHappyPath:
         ):
             perform_update(venv_dir, "code-coordinator[server]", target_version="3.4.5")
 
-        pip_calls = [c for c in calls if c[0].endswith("/bin/pip")]
+        pip_calls = [c for c in calls if Path(c[0]).stem == "pip"]
         assert len(pip_calls) == 1
         assert "code-coordinator[server]==3.4.5" in pip_calls[0]
 
@@ -220,7 +239,7 @@ class TestPerformUpdateHappyPath:
         ):
             perform_update(venv_dir, "code-coordinator[server]")
 
-        pip_calls = [c for c in calls if c[0].endswith("/bin/pip")]
+        pip_calls = [c for c in calls if Path(c[0]).stem == "pip"]
         assert "code-coordinator[server]" in pip_calls[0]
         assert not any("==" in arg for arg in pip_calls[0])
 
@@ -245,7 +264,7 @@ class TestPerformUpdateNeverTorn:
 
         assert result.ok is False
         assert result.swapped is False
-        assert current_slot(venv_dir) == before
+        assert _same_path(current_slot(venv_dir), before)
         assert (venv_dir / "marker").read_text() == "still-live\n"
 
     def test_pip_failure_removes_half_built_slot_and_leaves_live_untouched(
@@ -261,7 +280,7 @@ class TestPerformUpdateNeverTorn:
             result = perform_update(venv_dir, "pkg", target_version="1.0.0")
 
         assert result.ok is False
-        assert current_slot(venv_dir) == before
+        assert _same_path(current_slot(venv_dir), before)
         # The half-built next slot (venv created, pip install torn/failed)
         # must not survive to be mistaken for a real install later.
         assert not (tmp_path / ".coord-venv.green").exists()
@@ -283,7 +302,7 @@ class TestPerformUpdateNeverTorn:
             result = perform_update(venv_dir, "pkg", target_version="1.0.0")
 
         assert result.ok is False
-        assert current_slot(venv_dir) == before
+        assert _same_path(current_slot(venv_dir), before)
         assert not (tmp_path / ".coord-venv.green").exists()
 
     def test_smoke_coord_version_failure_never_swaps(self, tmp_path: Path) -> None:
@@ -298,7 +317,7 @@ class TestPerformUpdateNeverTorn:
             result = perform_update(venv_dir, "pkg", target_version="1.0.0")
 
         assert result.ok is False
-        assert current_slot(venv_dir) == before
+        assert _same_path(current_slot(venv_dir), before)
 
     def test_version_mismatch_against_target_fails_the_smoke_check(
         self, tmp_path: Path
@@ -345,8 +364,8 @@ class TestSlotBackingInterpreter:
         _make_fake_slot(blue)
         _make_fake_slot(green)
 
-        assert _slot_backing_interpreter(venv_dir, blue / "bin" / "python") == blue
-        assert _slot_backing_interpreter(venv_dir, green / "bin" / "python") == green
+        assert _slot_backing_interpreter(venv_dir, venv_python(blue)) == blue
+        assert _slot_backing_interpreter(venv_dir, venv_python(green)) == green
 
     def test_none_when_interpreter_is_outside_both_slots(self, tmp_path: Path) -> None:
         venv_dir = tmp_path / ".coord-venv"
@@ -368,8 +387,9 @@ class TestSlotBackingInterpreter:
         _make_symlinked_fake_slot(blue, base_interpreter)
         _make_symlinked_fake_slot(green, base_interpreter)
 
-        assert _slot_backing_interpreter(venv_dir, blue / "bin" / "python3") == blue
-        assert _slot_backing_interpreter(venv_dir, green / "bin" / "python3") == green
+        python3_name = "python3.exe" if sys.platform == "win32" else "python3"
+        assert _slot_backing_interpreter(venv_dir, venv_bin(blue) / python3_name) == blue
+        assert _slot_backing_interpreter(venv_dir, venv_bin(green) / python3_name) == green
         # The shared base interpreter itself is outside both slots.
         assert _slot_backing_interpreter(venv_dir, base_interpreter) is None
 
@@ -398,14 +418,15 @@ class TestPerformUpdateRefusesOwnRunningSlot:
             perform_update(venv_dir, "pkg", target_version="1.0.0")
         blue = tmp_path / ".coord-venv.blue"
         green = tmp_path / ".coord-venv.green"
-        assert current_slot(venv_dir) == green
+        assert _same_path(current_slot(venv_dir), green)
         assert blue.exists()
 
         # This process is (hypothetically) still running from blue — the
         # slot the symlink swapped away from, and the one the *next*
         # update would try to rebuild.
+        python3_name = "python3.exe" if sys.platform == "win32" else "python3"
         monkeypatch.setattr(
-            "coord.agent_update.sys.executable", str(blue / "bin" / "python3")
+            "coord.agent_update.sys.executable", str(venv_bin(blue) / python3_name)
         )
 
         calls: list = []
@@ -421,8 +442,8 @@ class TestPerformUpdateRefusesOwnRunningSlot:
         # Nothing was even attempted: no subprocess calls, blue is intact,
         # venv_dir is still on green (the rollback generation survives).
         assert calls == []
-        assert (blue / "bin" / "python3").exists()
-        assert current_slot(venv_dir) == green
+        assert (venv_bin(blue) / python3_name).exists()
+        assert _same_path(current_slot(venv_dir), green)
 
     def test_proceeds_when_running_interpreter_is_outside_the_layout(
         self, tmp_path: Path, monkeypatch
@@ -466,7 +487,7 @@ class TestPerformUpdateBuildsWithSymlinkedSlotPython:
         assert result.ok is True
         venv_calls = [c for c in calls if "-m" in c and "venv" in c]
         assert len(venv_calls) == 1
-        assert venv_calls[0][0] == str(active / "bin" / "python")
+        assert venv_calls[0][0] == str(venv_python(active))
         assert venv_calls[0][0] != "/some/unrelated/python3"
 
     def test_falls_back_to_sys_executable_when_active_slot_has_no_python(
@@ -511,14 +532,14 @@ class TestRollback:
             perform_update(venv_dir, "pkg", target_version="1.0.0")
         blue = tmp_path / ".coord-venv.blue"
         green = tmp_path / ".coord-venv.green"
-        assert current_slot(venv_dir) == green
+        assert _same_path(current_slot(venv_dir), green)
 
         with patch("coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.0.0")):
             result = rollback(venv_dir)
 
         assert result.ok is True
         assert result.swapped is True
-        assert current_slot(venv_dir) == blue
+        assert _same_path(current_slot(venv_dir), blue)
 
     def test_rollback_refuses_when_previous_slot_fails_smoke_check(
         self, tmp_path: Path
