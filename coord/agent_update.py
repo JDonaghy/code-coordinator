@@ -85,6 +85,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from coord.platform_paths import venv_exe, venv_pip, venv_python
+
 _log = logging.getLogger(__name__)
 
 #: Suffixes for the two blue/green slots, relative to the live venv dir
@@ -548,8 +550,8 @@ def _smoke_check(slot: Path, *, target_version: str | None) -> tuple[bool, str |
     caught) — that means the fresh install is genuinely broken, which is
     exactly what a failed smoke check should report.
     """
-    python = slot / "bin" / "python"
-    coord_bin = slot / "bin" / "coord"
+    python = venv_python(slot)
+    coord_bin = venv_exe(slot, "coord")
     lines: list[str] = []
 
     try:
@@ -730,7 +732,7 @@ def perform_update(
     # distinct blue/green slots), so the interpreter doing the building can
     # never be the thing this update is about to rmtree, regardless of
     # which slot the calling process itself happens to be running from.
-    builder_python = active / "bin" / "python"
+    builder_python = venv_python(active)
     if not builder_python.exists():
         builder_python = Path(sys.executable)
     try:
@@ -746,7 +748,7 @@ def perform_update(
     if result.returncode != 0:
         return _fail(f"venv creation failed (exit {result.returncode})")
 
-    pip = str(next_slot / "bin" / "pip")
+    pip = str(venv_pip(next_slot))
     install_spec = f"{pkg_spec}=={target_version}" if target_version else pkg_spec
     try:
         result = subprocess.run(

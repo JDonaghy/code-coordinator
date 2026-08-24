@@ -41,3 +41,40 @@ def default_coord_dir() -> Path:
 
         return Path(platformdirs.user_data_dir("coord", appauthor=False))
     return Path.home() / ".coord"
+
+
+# ── #2683 (W3): venv layout — `bin/` vs `Scripts/` ──────────────────────────
+#
+# A `python -m venv`/`virtualenv` environment puts its executables in
+# `<root>/bin/` on POSIX and `<root>/Scripts/` on Windows, and the
+# interpreter/pip shims themselves carry a `.exe` suffix there. The
+# blue/green agent-update machinery (`coord.agent_update`, `coord.agent_app`)
+# used to hardcode the POSIX spelling directly (`slot / "bin" / "python"`),
+# which is silently wrong on Windows -- not an exception, just a path that
+# never exists, so every subprocess call built from it fails.  These three
+# helpers are the one seam every such call site should route through.
+
+
+def venv_bin(root: Path) -> Path:
+    """The executables directory inside venv *root* for this platform."""
+    return root / ("Scripts" if sys.platform == "win32" else "bin")
+
+
+def venv_python(root: Path) -> Path:
+    """The venv-local Python interpreter inside venv *root*."""
+    return venv_bin(root) / ("python.exe" if sys.platform == "win32" else "python")
+
+
+def venv_pip(root: Path) -> Path:
+    """The venv-local ``pip`` entry point inside venv *root*."""
+    return venv_bin(root) / ("pip.exe" if sys.platform == "win32" else "pip")
+
+
+def venv_exe(root: Path, name: str) -> Path:
+    """A named console-script entry point (e.g. ``"coord"``) inside venv
+    *root* for this platform.
+
+    Windows console-script shims are ``<name>.exe``; POSIX entry points
+    carry no suffix.
+    """
+    return venv_bin(root) / (f"{name}.exe" if sys.platform == "win32" else name)

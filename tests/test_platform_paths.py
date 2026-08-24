@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from coord.platform_paths import default_coord_dir
+from coord.platform_paths import default_coord_dir, venv_bin, venv_exe, venv_pip, venv_python
 
 
 def test_linux_resolves_to_dot_coord_back_compat(monkeypatch) -> None:
@@ -77,6 +77,30 @@ def test_windows_delegates_to_platformdirs_user_data_dir(monkeypatch) -> None:
     result = default_coord_dir()
     assert calls == [("coord", False)]
     assert result == Path(r"C:\Users\bob\AppData\Local\coord")
+
+
+def test_venv_layout_posix(monkeypatch) -> None:
+    """#2683 (W3): on POSIX a venv's executables live under ``bin/`` with no
+    suffix -- the layout every fleet machine's real `~/.coord-venv` uses
+    today, so this must stay byte-identical to the pre-#2683 hardcoded
+    ``slot / "bin" / "python"`` spelling."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    root = Path("/home/john/.coord-venv.blue")
+    assert venv_bin(root) == root / "bin"
+    assert venv_python(root) == root / "bin" / "python"
+    assert venv_pip(root) == root / "bin" / "pip"
+    assert venv_exe(root, "coord") == root / "bin" / "coord"
+
+
+def test_venv_layout_windows(monkeypatch) -> None:
+    """On win32 a venv's executables live under ``Scripts\\`` and the
+    interpreter/entry-point shims carry a ``.exe`` suffix."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    root = Path(r"C:\Users\bob\.coord-venv.blue")
+    assert venv_bin(root) == root / "Scripts"
+    assert venv_python(root) == root / "Scripts" / "python.exe"
+    assert venv_pip(root) == root / "Scripts" / "pip.exe"
+    assert venv_exe(root, "coord") == root / "Scripts" / "coord.exe"
 
 
 def test_state_root_modules_derive_from_default_coord_dir() -> None:

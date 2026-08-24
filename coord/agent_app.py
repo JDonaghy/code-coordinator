@@ -26,6 +26,7 @@ from coord.dist_name import DistributionNotFoundError, resolve_installed, resolv
 from coord.dist_name import pkg_spec as _dist_pkg_spec
 from coord.events import stream_assignment_log
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
+from coord.platform_paths import venv_python as platform_venv_python
 
 _log = logging.getLogger(__name__)
 
@@ -414,8 +415,8 @@ def _default_exec_restart(argv: list[str]) -> None:
     """
     if _running_under_systemd() and _restart_via_systemctl():
         os._exit(0)
-    venv_python = _venv_dir() / "bin" / "python"
-    executable = str(venv_python) if venv_python.exists() else sys.executable
+    venv_python_path = platform_venv_python(_venv_dir())
+    executable = str(venv_python_path) if venv_python_path.exists() else sys.executable
     os.execv(executable, [executable] + argv)
 
 
