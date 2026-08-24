@@ -451,7 +451,7 @@ def is_host_sleep_reason(reason: str | None) -> bool:
 def _append_log_line(log_path: str, line: str) -> None:
     """Best-effort append of a single line to the assignment log. Never raises."""
     try:
-        with open(log_path, "a") as fh:
+        with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
         pass
@@ -972,6 +972,7 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=timeout,
     )
     if result.returncode != 0:
@@ -1229,6 +1230,7 @@ def _worktree_dirt(wt_path: Path) -> tuple[int, int] | None:
             cwd=str(wt_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30.0,
         )
     except (subprocess.SubprocessError, OSError):
@@ -2163,7 +2165,7 @@ def stash_artifacts_for_branch(
     # not be recorded as a valid build artifact set.
     if assignment_id is not None and copied > 0:
         try:
-            (stash_dir / ".assignment_id").write_text(assignment_id)
+            (stash_dir / ".assignment_id").write_text(assignment_id, encoding="utf-8")
         except OSError:
             pass
 
@@ -2301,6 +2303,8 @@ def _run_pre_stash_build(
             cwd=str(worktree),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
         )
         ok = result.returncode == 0
@@ -4487,7 +4491,7 @@ def find_blocking_deny_rule(
     worktree_path = worktree_path.expanduser()
     for settings_path in settings_files:
         try:
-            raw = settings_path.read_text()
+            raw = settings_path.read_text(encoding="utf-8")
         except OSError:
             continue
         try:
@@ -4530,7 +4534,7 @@ def check_worktree_writable(
     try:
         worktree_path.mkdir(parents=True, exist_ok=True)
         probe = worktree_path / f".coord-write-probe-{os.getpid()}"
-        probe.write_text("probe")
+        probe.write_text("probe", encoding="utf-8")
         probe.unlink()
     except OSError as e:
         return f"cannot write to {worktree_path}: {e}"
@@ -6430,7 +6434,7 @@ class AgentServer:
         aid_path = stash_dir / ".assignment_id"
         built_by: str | None = None
         try:
-            built_by = aid_path.read_text().strip()
+            built_by = aid_path.read_text(encoding="utf-8").strip()
         except OSError:
             pass
 
@@ -7326,7 +7330,7 @@ class AgentServer:
         # Trace the injection in the log so users can correlate later.
         if assignment.log_path:
             try:
-                with open(assignment.log_path, "a") as fh:
+                with open(assignment.log_path, "a", encoding="utf-8") as fh:
                     fh.write(f"# inject: {text}\n")
             except OSError:
                 pass
@@ -7470,7 +7474,7 @@ class AgentServer:
                         f"Push them when convenient so they aren't lost.\n"
                     )
                     try:
-                        with open(assignment.log_path, "a") as fh:
+                        with open(assignment.log_path, "a", encoding="utf-8") as fh:
                             fh.write(msg)
                     except OSError:
                         pass
@@ -7573,7 +7577,7 @@ class AgentServer:
             # won't fail and so the worker starts from origin/<default>.
             if local_has_branch and assignment.log_path:
                 try:
-                    with open(assignment.log_path, "a") as fh:
+                    with open(assignment.log_path, "a", encoding="utf-8") as fh:
                         fh.write(
                             f"# warning: discarding leftover local branch "
                             f"{branch_name!r} (not on origin) and branching "
@@ -7602,7 +7606,7 @@ class AgentServer:
     def _log_line(self, assignment: AgentAssignment, text: str) -> None:
         """Append one line to the assignment log. Never raises (#1394)."""
         try:
-            with open(assignment.log_path, "a") as fh:
+            with open(assignment.log_path, "a", encoding="utf-8") as fh:
                 fh.write(text if text.endswith("\n") else text + "\n")
         except (OSError, AttributeError, TypeError):
             pass
@@ -8061,7 +8065,7 @@ class AgentServer:
         On any failure: mark the assignment FAILED and skip spawn. The HTTP
         client polls status to discover this.
         """
-        with open(assignment.log_path, "w") as log_fh:
+        with open(assignment.log_path, "w", encoding="utf-8") as log_fh:
             log_fh.write(
                 f"# pulling dependencies: {assignment.spec.pull_repos}\n"
             )
@@ -8161,7 +8165,7 @@ class AgentServer:
             argv = self.worker_command(assignment.spec)
             initial_input = _user_message_line(assignment.spec.briefing)
 
-        log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
+        log_fh = open(assignment.log_path, "a", encoding="utf-8")  # noqa: SIM115 — handle closed in _reap
 
         argv_oneline = shlex.join(argv).replace("\n", "\\n")
         header = (
@@ -8333,7 +8337,7 @@ class AgentServer:
             spec, resolved_model=spec.model
         )
 
-        log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — closed in _reap
+        log_fh = open(assignment.log_path, "a", encoding="utf-8")  # noqa: SIM115 — closed in _reap
         argv_oneline = shlex.join(argv).replace("\n", "\\n")
         header = (
             f"# agent={self.machine_name} repo={spec.repo_name} "
@@ -8942,7 +8946,7 @@ class AgentServer:
                 if _kill is not None:
                     _usage_limit_reason = format_usage_limit_reason(_kill)
                     try:
-                        with open(log_path, "a") as reopen:
+                        with open(log_path, "a", encoding="utf-8") as reopen:
                             reopen.write(
                                 "# reap: usage-limit kill detected — "
                                 f"{_usage_limit_reason} (#1461)\n"
@@ -8997,7 +9001,7 @@ class AgentServer:
                     result_text=_worker_summary.result_text,
                 )
                 try:
-                    with open(log_path, "a") as reopen:
+                    with open(log_path, "a", encoding="utf-8") as reopen:
                         reopen.write(
                             "# reap: terminal API error detected — "
                             f"{_api_error_reason} (#1584)\n"
@@ -9046,11 +9050,11 @@ class AgentServer:
                 wt_path = Path(assignment.worktree_path)
                 if wt_path.exists() and exit_code == 0:
                     try:
-                        with open(assignment.log_path, "a") as reopen:
+                        with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                             reopen.write("\n# reap: push starting\n")
                         _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write("# reap: push completed\n")
                         except OSError:
                             pass
@@ -9097,7 +9101,7 @@ class AgentServer:
                             else:
                                 _push_failure_reason = _reason
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 if _suppressed_as_already_pushed:
                                     # Deliberately NOT the generic "push
                                     # failed" line below: that line reads as
@@ -9172,7 +9176,7 @@ class AgentServer:
                             _worker_summary.stop_reason, assignment.spec.provider
                         )
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write(
                                     "# reap: truncated — 0 commits ahead of "
                                     f"{_base}; stop_reason="
@@ -9184,7 +9188,7 @@ class AgentServer:
                     elif DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
                         _analysis_deliverable = True
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write(
                                     "# reap: analysis deliverable — 0 commits "
                                     f"ahead of {_base}; issue labelled "
@@ -9208,7 +9212,7 @@ class AgentServer:
                             "worker cited a standing repo-rule prohibition"
                         )
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write(
                                     "# reap: refused_policy — 0 commits ahead "
                                     f"of {_base}; worker's final message cites "
@@ -9222,7 +9226,7 @@ class AgentServer:
                             "worker exited cleanly but pushed 0 commits"
                         )
                         try:
-                            with open(assignment.log_path, "a") as reopen:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write(
                                     "# reap: advisory — 0 commits ahead of "
                                     f"{_base}; status set to advisory\n"
@@ -9233,7 +9237,7 @@ class AgentServer:
         # This block MUST always run regardless of push outcome so that
         # the assignment transitions out of 'running'.
         try:
-            with open(assignment.log_path, "a") as reopen:
+            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                 reopen.write("# reap: updating status\n")
         except (OSError, AttributeError):
             pass
@@ -9412,7 +9416,7 @@ class AgentServer:
 
         self._persist()
         try:
-            with open(assignment.log_path, "a") as reopen:
+            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                 final_status = assignment.status if assignment else "unknown"
                 # #2212: log a plain `graphify_invocations=N` counter alongside
                 # the existing reap line — this is the measurable half of the
@@ -9494,7 +9498,7 @@ class AgentServer:
                     _sa.stash_unmatched_globs = list(_stash_unmatched)
             self._persist()
             try:
-                with open(assignment.log_path, "a") as _lf:
+                with open(assignment.log_path, "a", encoding="utf-8") as _lf:
                     _lf.write(
                         f"# reap: stash diagnostic — {_stash_diag_reason}; "
                         "status left unchanged (see #1357)\n"
@@ -9781,7 +9785,7 @@ class AgentServer:
                 dir=str(self.state_dir), prefix="agent_state.", suffix=".tmp"
             )
             tmp_path = Path(tmp_name)
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(json.dumps(data, indent=2))
             os.replace(tmp_path, self.state_path)
         except (FileNotFoundError, OSError) as e:
@@ -9796,7 +9800,7 @@ class AgentServer:
         if not self.state_path.exists():
             return
         try:
-            data = json.loads(self.state_path.read_text())
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             # #1421: a corrupt/truncated state file used to be discarded
             # silently here, so an agent restart after the _persist() race

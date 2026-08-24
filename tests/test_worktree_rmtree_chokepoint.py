@@ -47,7 +47,7 @@ def _init_local_repo(path: Path) -> Path:
     subprocess.run(
         ["git", "config", "user.name", "T"], cwd=str(path), check=True, capture_output=True
     )
-    (path / "README.md").write_text("base\n")
+    (path / "README.md").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(path), check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "init"], cwd=str(path), check=True, capture_output=True
@@ -78,10 +78,10 @@ def test_worktree_add_collision_on_base_checkout_raises_and_keeps_it(
         cwd=str(repo), check=True, capture_output=True,
     )
     sentinel = repo / "sentinel.txt"
-    sentinel.write_text("must survive")
+    sentinel.write_text("must survive", encoding="utf-8")
 
     log = tmp_path / "worker.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
 
     with pytest.raises(_GitError) as excinfo:
         _git_worktree_add(
@@ -97,17 +97,17 @@ def test_worktree_add_collision_on_base_checkout_raises_and_keeps_it(
 
     assert repo.exists(), "base checkout directory was deleted (#1693)"
     assert (repo / ".git").exists(), "base checkout .git was deleted (#1693)"
-    assert sentinel.read_text() == "must survive", (
+    assert sentinel.read_text(encoding="utf-8") == "must survive", (
         "base checkout contents were destroyed (#1693)"
     )
     # Still a usable checkout, still on its branch.
     branch = subprocess.run(
         ["git", "branch", "--show-current"],
-        cwd=str(repo), capture_output=True, text=True, check=True,
+        cwd=str(repo), capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout.strip()
     assert branch == "issue-1693-parked"
     # And the log says why, rather than claiming it force-removed something.
-    assert "BASE CHECKOUT" in log.read_text()
+    assert "BASE CHECKOUT" in log.read_text(encoding="utf-8")
 
 
 def test_worktree_add_collision_on_base_checkout_never_calls_rmtree(
@@ -186,7 +186,7 @@ def test_safe_remove_worktree_refuses_unregistered_path_outside_sandbox(
     repo = _init_local_repo(tmp_path / "repo")
     stranger = tmp_path / "not-a-worktree"
     stranger.mkdir()
-    (stranger / "keep.txt").write_text("keep")
+    (stranger / "keep.txt").write_text("keep", encoding="utf-8")
 
     calls: list[str] = []
     monkeypatch.setattr(
@@ -198,7 +198,7 @@ def test_safe_remove_worktree_refuses_unregistered_path_outside_sandbox(
         repo, stranger, sandbox_root=tmp_path / "worktrees"
     ) is False
     assert calls == []
-    assert (stranger / "keep.txt").read_text() == "keep"
+    assert (stranger / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_safe_remove_worktree_removes_sandboxed_orphan(tmp_path: Path) -> None:
@@ -207,7 +207,7 @@ def test_safe_remove_worktree_removes_sandboxed_orphan(tmp_path: Path) -> None:
     sandbox = tmp_path / "worktrees"
     orphan = sandbox / "abc123"
     orphan.mkdir(parents=True)
-    (orphan / "junk.txt").write_text("junk")
+    (orphan / "junk.txt").write_text("junk", encoding="utf-8")
 
     assert _safe_remove_worktree(repo, orphan, sandbox_root=sandbox) is True
     assert not orphan.exists()
@@ -249,7 +249,7 @@ def test_worktree_add_collision_on_linked_worktree_still_retries_once(
 
     new_wt = tmp_path / "new-wt"
     log = tmp_path / "test.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
 
     adds: list[tuple[str, ...]] = []
     real_git = agent_mod._git
@@ -270,7 +270,7 @@ def test_worktree_add_collision_on_linked_worktree_still_retries_once(
     assert new_wt.exists(), "retry did not create the new worktree"
     assert not conflict_wt.exists(), "conflicting linked worktree was not removed"
     assert len(adds) == 2, f"expected exactly one retry, got {len(adds)} adds"
-    assert "collision" in log.read_text()
+    assert "collision" in log.read_text(encoding="utf-8")
 
 
 def test_classify_worktree_labels_main_linked_and_unregistered(
@@ -367,7 +367,7 @@ def test_no_new_rmtree_site_outside_the_chokepoint(module_rel: str) -> None:
     """
     repo_root = Path(__file__).resolve().parent.parent
     module_path = repo_root / module_rel
-    found = _rmtree_sites(module_path.read_text())
+    found = _rmtree_sites(module_path.read_text(encoding="utf-8"))
     expected = _ALLOWED_RMTREE[module_rel]
     unexpected = found - expected
     assert not unexpected, (
