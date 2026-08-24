@@ -51769,6 +51769,51 @@ Milestone tracking issue.
         );
     }
 
+    /// #2642 review fix: the picker is open-only, matching the `/` command
+    /// palette's own convention (no toggle-close). Once open,
+    /// `doc_tab_picker.is_some()` folds into `any_blocking_modal_active()`
+    /// (sidebar.rs), so a second Ctrl+E while it's open can never reach the
+    /// "open" arm — it's swallowed by the "picker owns ALL input" block
+    /// instead, exactly as any other key not recognised by the palette
+    /// would be. The picker stays open and the active tab is unchanged;
+    /// only Esc closes it (covered by the sibling test below).
+    #[test]
+    fn ctrl_e_while_the_picker_is_already_open_does_not_close_it() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+        assert_eq!(active_tab_number(&driver), Some(103));
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#101 Fix login race timeout"),
+            "precondition: the picker is open:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#101 Fix login race timeout"),
+            "#2642: a second Ctrl+E while the picker is open does NOT close \
+             it — it's open-only, same as the `/` command palette:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(103),
+            "…and the active tab hasn't changed:\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Open tabs"),
+            "#2642: Esc still closes it:\n{}",
+            driver.screen()
+        );
+    }
+
     /// Typing narrows the list; Esc cancels with the active tab (and
     /// everything else) exactly as it was before the picker opened.
     #[test]
@@ -51842,6 +51887,39 @@ Milestone tracking issue.
         assert!(
             !driver.screen_contains("#101 Fix login race timeout"),
             "#2642: …never the Board panel's tab set, even though #101 is \
+             open there at the same time:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Symmetric case of the test above: the picker reads the FOCUSED
+    /// panel's own tab set — Board's, while Board is active — never
+    /// Pipeline's, even though a Pipeline tab is open at the same time on a
+    /// shared issue number range. Only the Pipeline→excludes-Board
+    /// direction was covered before; this closes the other direction.
+    #[test]
+    fn ctrl_e_picker_on_board_reads_boards_own_tabs_not_pipelines() {
+        let mut app = pipeline_doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_pipeline_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 103), true);
+        app.active_view = SidebarView::Board;
+
+        let mut driver =
+            quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#102 Auth token refresh bug"),
+            "#2642: the Board picker lists Board's OWN open tabs:\n{}",
+            driver.screen()
+        );
+        assert!(driver.screen_contains("#103 Race condition in poller"));
+        assert!(
+            !driver.screen_contains("#101 Fix login race timeout"),
+            "#2642: …never the Pipeline panel's tab set, even though #101 is \
              open there at the same time:\n{}",
             driver.screen()
         );
