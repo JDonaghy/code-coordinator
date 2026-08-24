@@ -3114,6 +3114,82 @@ def test_a_blocked_entry_with_the_unknown_prereq_reason_stays_blocked_without_li
     assert plan.launch is None
 
 
+# ── #2715: the queue's OWN `done` record satisfies a pre-req immediately ───
+#
+# `_resolve_prereqs` had exactly one proof a pre-req was satisfied —
+# `board.facts(dep).landed`, i.e. the CACHED `issues` row — with no case for
+# the dep's own `states` entry already reading `STATE_DONE`. That cache is a
+# periodic `/board` build, not a live read, so a pre-req the queue itself
+# just merged (e.g. #2350's `coord merge --only` fast path, which writes
+# `STATE_DONE` straight from the merge queue's own confirmed `MERGED` row —
+# see `_run_merge_only_candidates` in coord/commands/drive_queue.py) reads as
+# still-outstanding here for however long that cache takes to catch up —
+# observed at over 10 minutes / three ticks on claude-coordinator#2706
+# (2026-08-24). Every `STATE_DONE` write in the queue is gated on a landed
+# fact (either `board.facts(...).landed` itself, or the merge queue's own
+# live-verified `MERGED` row), never written speculatively — so the dep's own
+# `states` entry reading `done` is exactly as trustworthy as `facts.landed`,
+# and does not need to wait for the cache to independently confirm it.
+
+
+def test_a_waiting_entrys_prereq_is_satisfied_by_the_queues_own_done_state_before_the_board_cache_catches_up():
+    """The dep's queue row already reads `STATE_DONE` (the queue's own
+    record of having landed it), but the cached board has NOT caught up yet
+    — `board()` here carries nothing for the dep at all, exactly like a
+    stale `issues` cache. A `waiting` entry naming it as a pre-req must
+    launch THIS tick rather than defer on 'waiting on ... (queued, done)'."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(1654, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=2)
+    assert plan.deferrals == ()
+    assert plan.blocked == ()
+    assert plan.launch is not None and plan.launch.issue == 1654
+
+
+def test_a_blocked_entry_resumes_once_its_prereqs_queue_row_reads_done_even_before_the_board_cache_catches_up():
+    """The exact claude-coordinator#2706 shape: #1654(-analog) was already
+    `blocked` on #1650(-analog) reading `blocked` at the time — an
+    unsatisfiable verdict, correctly recorded. #1650 then landed via the
+    queue's own #2350 merge-only fast path, flipping its OWN row straight to
+    `STATE_DONE` — but the cached board (`board()` here, carrying nothing for
+    #1650) has not caught up. Before #2715 this sat blocked for however long
+    that cache took (observed 10m14s / three ticks live); the fix must
+    resume it on the very next tick, no cache round trip required."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(
+            1650,
+            position=0,
+            state=STATE_DONE,
+            last_reason=(
+                "merged directly from the tick — Test/Review were already "
+                "satisfied, Merge was the only gate left (#2350)"
+            ),
+        ),
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(), capacity=2)
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1654))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    # …and falls straight into this SAME tick's launch selection — no cache
+    # round trip, no extra tick spent doing nothing (#2715).
+    assert plan.launch is not None and plan.launch.issue == 1654
+
+
 # ── #2404 review: a CHAINED (two-hop) after= block, not just single-hop ────
 #
 # The live incident this issue is about (claude-coordinator#2284-#2288) was
