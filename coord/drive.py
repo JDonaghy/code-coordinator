@@ -1543,6 +1543,7 @@ class GitMergeVerifier:
             ["git", "-C", str(base), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
 
@@ -3777,6 +3778,7 @@ def list_drive_sessions(*, host: TmuxHost = TmuxHost(None)) -> list[dict[str, An
             ]),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=5.0,
         )
     except (subprocess.SubprocessError, OSError):
@@ -3877,6 +3879,7 @@ def launch_drive_in_tmux(
             host.cmd(["new-session", "-d", "-s", session, *cmd]),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=15.0,
         )
     except (subprocess.SubprocessError, OSError) as exc:
@@ -4042,7 +4045,7 @@ class Driver:
         if self._run_log is None or not text:
             return
         try:
-            with self._run_log.open("a") as fh:
+            with self._run_log.open("a", encoding="utf-8") as fh:
                 fh.write(text)
         except OSError:
             pass
@@ -4103,7 +4106,9 @@ class Driver:
     def _spawn(self, argv: list[str]) -> int:
         attempt = 1
         while True:
-            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8", check=False
+            )
             combined = (proc.stdout or "") + (proc.stderr or "")
             # #2618: a clean connection refusal (nothing was listening —
             # never a partially-processed request) is the one failure shape
@@ -4279,7 +4284,7 @@ class Driver:
             lock.acquire(timeout=0.0)
         except LockBusy:
             try:
-                who = holder.read_text().strip()
+                who = holder.read_text(encoding="utf-8").strip()
             except OSError:
                 who = "another run"
             # No `drive_started`/`drive_exited` pair here — this run never
@@ -4293,7 +4298,9 @@ class Driver:
                 EXIT_USAGE,
             ) from None
         try:
-            holder.write_text(f"{self.repo} #{self.issue} (pid {os.getpid()})\n")
+            holder.write_text(
+                f"{self.repo} #{self.issue} (pid {os.getpid()})\n", encoding="utf-8"
+            )
         except OSError:
             pass
         self._record_drive_audit(

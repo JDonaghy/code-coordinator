@@ -23,7 +23,7 @@ def _init_repo(path: Path) -> Path:
     subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
-    (path / "README").write_text("init\n")
+    (path / "README").write_text("init\n", encoding="utf-8")
     subprocess.run(["git", "add", "README"], cwd=str(path), check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "initial"], cwd=str(path), check=True, capture_output=True)
     return path
@@ -40,7 +40,8 @@ class TestParseProgress:
             "some output\n"
             "STATUS: read codebase → planning approach → confidence: high\n"
             "more output\n"
-            "STATUS: first build passed → running tests → confidence: medium\n"
+            "STATUS: first build passed → running tests → confidence: medium\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert len(p.updates) == 2
@@ -54,7 +55,8 @@ class TestParseProgress:
         log.write_text(
             "STATUS: trying approach 1 → confidence: medium\n"
             "STATUS: approach 1 failed → trying approach 2 → confidence: low\n"
-            "STUCK: tried PATH fix and rustup, both failed. Blocker: missing system dep\n"
+            "STUCK: tried PATH fix and rustup, both failed. Blocker: missing system dep\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert p.stuck is not None
@@ -80,7 +82,8 @@ class TestParseProgress:
             "it's empty\n"
             "\n"
             "# pty: briefing injection unverified after 3 attempt(s) — the "
-            "briefing may not have landed in the input box\n"
+            "briefing may not have landed in the input box\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert p.stuck is not None
@@ -92,7 +95,8 @@ class TestParseProgress:
         log.write_text(
             "STATUS: first try → confidence: medium\n"
             "STATUS: second try → confidence: low\n"
-            "STATUS: third try → confidence: low\n"
+            "STATUS: third try → confidence: low\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert any("low" in w for w in p.warnings)
@@ -101,7 +105,8 @@ class TestParseProgress:
         log = tmp_path / "test.log"
         log.write_text(
             "STATUS: setup → building → confidence: high\n"
-            "STATUS: tests passing → cleanup → confidence: high\n"
+            "STATUS: tests passing → cleanup → confidence: high\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert p.warnings == []
@@ -114,20 +119,20 @@ class TestParseProgress:
 
     def test_empty_log(self, tmp_path: Path) -> None:
         log = tmp_path / "test.log"
-        log.write_text("")
+        log.write_text("", encoding="utf-8")
         p = parse_progress(str(log))
         assert p.updates == []
 
     def test_limits_updates_to_10(self, tmp_path: Path) -> None:
         log = tmp_path / "test.log"
         lines = [f"STATUS: step {i} → confidence: high\n" for i in range(20)]
-        log.write_text("".join(lines))
+        log.write_text("".join(lines), encoding="utf-8")
         p = parse_progress(str(log))
         assert len(p.updates) == 10
 
     def test_to_dict(self, tmp_path: Path) -> None:
         log = tmp_path / "test.log"
-        log.write_text("STATUS: doing stuff → confidence: medium\n")
+        log.write_text("STATUS: doing stuff → confidence: medium\n", encoding="utf-8")
         p = parse_progress(str(log))
         d = p.to_dict()
         assert "updates" in d
@@ -141,7 +146,7 @@ class TestParseProgress:
 
 
 def _ndjson_log(log: Path, events: list[dict]) -> None:
-    log.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    log.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
 
 
 class TestParseProgressStreamJson:
@@ -210,7 +215,7 @@ class TestParseProgressStreamJson:
         )
         # Append a truncated/incomplete JSON line, simulating the worker being
         # mid-write when we read the log file.
-        with open(log, "a") as f:
+        with open(log, "a", encoding="utf-8") as f:
             f.write('{"type": "assistant", "message": {')  # truncated — no closing braces
         # Must not raise; incomplete line is silently discarded.
         p = parse_progress(str(log))
@@ -221,7 +226,8 @@ class TestParseProgressStreamJson:
         log = tmp_path / "test.log"
         log.write_text(
             "STATUS: doing stuff → confidence: high\n"
-            "STUCK: missing system dep\n"
+            "STUCK: missing system dep\n",
+            encoding="utf-8",
         )
         p = parse_progress(str(log))
         assert p.stuck is not None
@@ -316,7 +322,8 @@ class TestCoordStop:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
-            "machines:\n  - name: laptop\n    host: laptop.tailnet\n    repos: [api]\n"
+            "machines:\n  - name: laptop\n    host: laptop.tailnet\n    repos: [api]\n",
+            encoding="utf-8",
         )
 
         runner = CliRunner()
@@ -336,7 +343,8 @@ class TestCoordStop:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
-            "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
+            "machines:\n  - name: m\n    host: h\n    repos: [api]\n",
+            encoding="utf-8",
         )
 
         runner = CliRunner()
