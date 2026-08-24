@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -36,6 +37,43 @@ _REAL_GH = github_ops._gh
 _AMBIENT_HOME_AT_COLLECTION = Path(
     os.environ.get("HOME") or os.path.expanduser("~")
 ).resolve()
+
+
+def _resolve_posix_bash() -> str:
+    """#2727: resolve a real POSIX ``bash`` deliberately rather than trusting
+    bare ``"bash"`` + ``PATH`` order.
+
+    On the ``windows-latest`` GitHub runner, bare ``bash`` resolves via
+    ``PATH`` to ``C:\\Windows\\System32\\bash.exe`` -- the WSL launcher, not
+    a POSIX shell. No distro is installed there, so it prints its banner (in
+    UTF-16LE) to stderr and exits non-zero; any test that shells out to a
+    REAL ``.sh`` script under test would then be reading that banner instead
+    of ever running the script.
+
+    Git Bash ships on the same runners at
+    ``C:\\Program Files\\Git\\bin\\bash.exe``. Prefer whatever ``bash``
+    ``PATH`` resolution finds UNLESS it is the WSL launcher (identified by
+    living under a ``System32`` directory), then fall back to that known
+    Git-Bash install path.
+
+    On POSIX this is a no-op: ``shutil.which("bash")`` never resolves to a
+    path containing ``System32``, so every call site keeps using exactly the
+    ``bash`` it always did.
+    """
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    if git_bash.exists():
+        return str(git_bash)
+    return found or "bash"
+
+
+#: A real POSIX ``bash`` executable, resolved once at collection time (#2727).
+#: Every test that shells out to a REAL ``.sh`` script under test should
+#: launch it via this constant instead of the bare string ``"bash"``, so the
+#: subprocess is never the WSL launcher on a Windows runner.
+POSIX_BASH = _resolve_posix_bash()
 
 
 @pytest.fixture(autouse=True)

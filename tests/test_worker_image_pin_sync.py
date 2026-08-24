@@ -36,6 +36,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from .conftest import POSIX_BASH
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "azure-workers" / "build-worker-image.sh"
 EPIC_UP_SCRIPT = REPO_ROOT / "scripts" / "azure-workers" / "epic-up.sh"
@@ -62,7 +64,7 @@ def test_bake_then_up_adopts_the_new_image_with_no_manual_edit(tmp_path: Path) -
     #    exactly that, for real, against the scratch epic.env.
     bake = subprocess.run(
         [
-            "bash",
+            POSIX_BASH,
             "-c",
             f"""
 set -euo pipefail
@@ -84,7 +86,7 @@ update_epic_env "2026.0804.0" {shlex.quote(NEW_ID)}
     #    no edit in between.
     deploy = subprocess.run(
         [
-            "bash",
+            POSIX_BASH,
             "-c",
             f"""
 set -euo pipefail
@@ -111,7 +113,7 @@ def test_no_update_env_bake_leaves_the_stale_pin_for_the_next_up(tmp_path: Path)
 
     bake = subprocess.run(
         [
-            "bash",
+            POSIX_BASH,
             "-c",
             f"""
 set -euo pipefail
@@ -130,7 +132,7 @@ update_epic_env "2026.0804.0" {shlex.quote(NEW_ID)}
 
     deploy = subprocess.run(
         [
-            "bash",
+            POSIX_BASH,
             "-c",
             f"""
 set -euo pipefail
