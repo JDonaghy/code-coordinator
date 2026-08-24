@@ -1660,3 +1660,218 @@ class TestSchemaVersionGate:
             assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
         finally:
             conn.close()
+
+
+# ── assignments.uat_state / uat_reason columns (#2687 / #2709) ─────────────
+
+_UAT_STATE_AND_REASON_COLUMNS = {"uat_state", "uat_reason"}
+
+# The `assignments` CREATE TABLE literal exactly as it stood immediately
+# before #2687 (i.e. every column #2687 itself did NOT add), at
+# schema_version 3 -- exactly what every real ``~/.coord/coord.db`` looked
+# like the moment #2687 merged: #2675's fix had already bumped
+# _DB_SCHEMA_VERSION to 3 for the #2604/#2589 columns, and #2687 landed its
+# own two ALTER TABLE lines into `_migrate_add_columns` without a further
+# bump (#2709).
+_PRE_2687_ASSIGNMENTS_TABLE = """
+    CREATE TABLE assignments (
+        assignment_id TEXT PRIMARY KEY,
+        machine_name TEXT NOT NULL,
+        repo_name TEXT NOT NULL,
+        repo_github TEXT,
+        issue_number INTEGER NOT NULL,
+        issue_title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        type TEXT NOT NULL DEFAULT 'work',
+        branch TEXT,
+        pr_url TEXT,
+        briefing TEXT DEFAULT '',
+        files_allowed TEXT DEFAULT '[]',
+        files_forbidden TEXT DEFAULT '[]',
+        model TEXT,
+        dispatched_at REAL,
+        finished_at REAL,
+        smoke_test TEXT,
+        smoke_test_reason TEXT,
+        review_state TEXT,
+        review_of_assignment_id TEXT,
+        review_target TEXT,
+        required_gates TEXT DEFAULT '[]',
+        plan TEXT,
+        unreachable_count INTEGER DEFAULT 0,
+        exit_code INTEGER,
+        review_iteration INTEGER DEFAULT 0,
+        review_posted_at REAL,
+        test_state TEXT,
+        test_reason TEXT,
+        cost_usd REAL,
+        smoke_tests TEXT,
+        review_findings TEXT,
+        test_plan TEXT
+    )
+"""
+
+
+def _seed_pre_2687_database(db_path: Path) -> None:
+    """Write a real on-disk database at schema_version 3 whose ``assignments``
+    table predates #2687 -- the exact #2709 repro.  ``_open()``'s
+    ``_read_schema_version(conn) < _DB_SCHEMA_VERSION`` compare read
+    ``3 < 3`` as False (before this fix) and skipped ``_ensure_schema`` --
+    and therefore ``_migrate_add_columns`` -- forever, on every database
+    already at version 3, leaving ``uat_state``/``uat_reason`` permanently
+    missing.
+    """
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    raw.execute("INSERT INTO schema_version VALUES (3)")
+    raw.execute(_PRE_2687_ASSIGNMENTS_TABLE)
+    raw.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, issue_number, issue_title) "
+        "VALUES ('a1', 'host1', 'api', 42, 'demo')"
+    )
+    raw.commit()
+    raw.close()
+
+
+class TestUatStateAndReasonColumns:
+    def test_existing_version_3_database_gains_them_on_open(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact #2709 repro.  ``save_board``'s ``_UPSERT_SQL`` writes
+        ``uat_state``/``uat_reason`` unconditionally for every assignments
+        row (``coord/state.py``) -- a database that never gains these
+        columns makes every dispatch write raise ``OperationalError:
+        table assignments has no column named uat_state``, forever, on
+        every existing installation.
+        """
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2687_database(db_path)
+
+        before = sqlite3.connect(str(db_path))
+        cols_before = {
+            r[1] for r in before.execute("PRAGMA table_info(assignments)")
+        }
+        before.close()
+        assert not (_UAT_STATE_AND_REASON_COLUMNS & cols_before)
+
+        conn = db_mod._open(db_path)
+        try:
+            cols_after = {
+                r[1] for r in conn.execute("PRAGMA table_info(assignments)")
+            }
+            assert _UAT_STATE_AND_REASON_COLUMNS <= cols_after
+
+            row = conn.execute(
+                "SELECT uat_state, uat_reason FROM assignments "
+                "WHERE assignment_id = 'a1'"
+            ).fetchone()
+            # A row predating these columns reads as "no UAT verdict yet" --
+            # never a silent behavior change for an entry that never had one.
+            assert row["uat_state"] is None
+            assert row["uat_reason"] is None
+
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            assert version == db_mod._DB_SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_migration_is_idempotent(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2687_database(db_path)
+
+        for _ in range(3):
+            conn = db_mod._open(db_path)
+            conn.close()
+
+        conn = db_mod._open(db_path)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(assignments)")}
+            assert _UAT_STATE_AND_REASON_COLUMNS <= cols
+        finally:
+            conn.close()
+
+    def test_save_board_records_a_dispatch_without_raising(
+        self, tmp_path: Path
+    ) -> None:
+        """``save_board`` is the exact function+line from #2709's
+        traceback (``conn.execute(_UPSERT_SQL, _assignment_upsert_params(a))``)
+        -- the write path that records every dispatch onto the board,
+        whole-board snapshot included (`coord.state.save_board`'s own
+        docstring: the daemon's generic ``/board`` thin-client endpoint
+        backing ``assign``/``approve``/... and ``auto_loop``). Confirms it
+        no longer raises against a database that was stuck at version 3.
+        """
+        from coord import state
+        from coord.models import Assignment, Board
+
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2687_database(db_path)
+
+        conn = db_mod._open(db_path)
+        override_connection(conn)
+        try:
+            board = Board(
+                active=[
+                    Assignment(
+                        machine_name="host1",
+                        repo_name="api",
+                        issue_number=99,
+                        issue_title="new dispatch",
+                        assignment_id="a2",
+                        status="running",
+                    )
+                ]
+            )
+            state.save_board(board)  # must not raise OperationalError
+
+            row = conn.execute(
+                "SELECT uat_state, uat_reason FROM assignments "
+                "WHERE assignment_id = 'a2'"
+            ).fetchone()
+            assert row["uat_state"] is None
+            assert row["uat_reason"] is None
+        finally:
+            close()
+
+
+# ── _migrate_add_columns / _DB_SCHEMA_VERSION structural guard (#2709) ─────
+
+# Pinned together: (_DB_SCHEMA_VERSION, len(_MIGRATE_ADD_COLUMNS)) as of this
+# commit.  #2604, #2589, and #2687 each appended an entry to
+# `_migrate_add_columns` without bumping `_DB_SCHEMA_VERSION` -- the
+# hand-written warning comment directly above `_DB_SCHEMA_VERSION` in
+# coord/db.py did not stop the third occurrence (#2687).  This test is the
+# structural version: change either number in coord/db.py without updating
+# this pinned tuple to match, and it fails red -- see the test body for the
+# exact assertion.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (4, 71)
+
+
+class TestMigrateAddColumnsVersionGuard:
+    def test_migration_count_is_pinned_to_the_schema_version(self) -> None:
+        """Appending a new ``ALTER TABLE ...`` line to
+        ``coord.db._MIGRATE_ADD_COLUMNS`` changes ``len(...)`` without
+        touching ``_DB_SCHEMA_VERSION`` -- exactly the #2604/#2589/#2687
+        mistake.  This assertion goes red the moment that happens, because
+        the actual ``(version, count)`` pair no longer matches the value
+        pinned above.
+
+        The fix when this fires: bump ``_DB_SCHEMA_VERSION`` in
+        ``coord/db.py``, then update
+        ``_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT`` above to match the
+        new pair -- in the SAME commit as the new migration entry, which is
+        the whole point (#2709).
+        """
+        actual = (db_mod._DB_SCHEMA_VERSION, len(db_mod._MIGRATE_ADD_COLUMNS))
+        assert actual == _PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT, (
+            f"coord.db._DB_SCHEMA_VERSION={actual[0]}, "
+            f"len(_MIGRATE_ADD_COLUMNS)={actual[1]} no longer matches the "
+            f"pinned {_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT}. If you "
+            "just appended a migration, bump _DB_SCHEMA_VERSION in "
+            "coord/db.py (#2709 -- this is the third time an appended "
+            "migration shipped without one) and update the pinned tuple "
+            "above to match, in the same commit."
+        )

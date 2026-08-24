@@ -194,7 +194,17 @@ def retry_on_locked(
 # caught-up database (version == _DB_SCHEMA_VERSION) never will, because the
 # whole write path is gated on this compare. There is no exemption: if you
 # touched `_migrate_add_columns`, bump this.
-_DB_SCHEMA_VERSION = 3
+#
+# #2709: that comment alone did not stop a THIRD occurrence — #2687
+# appended `uat_state`/`uat_reason` without bumping this, one day after
+# #2675 added the comment above. A comment is not a gate. There is now a
+# structural one: `_MIGRATE_ADD_COLUMNS` (below `_migrate_add_columns`) is
+# a module-level list precisely so
+# `tests/test_db.py::TestMigrateAddColumnsVersionGuard` can pin its length
+# next to this version number — append an entry without updating both and
+# that test fails red. If you touched `_migrate_add_columns`, bump this
+# AND update the pinned count in that test, in the same commit.
+_DB_SCHEMA_VERSION = 4
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -840,360 +850,371 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, _DB_SCHEMA_VERSION)
 
 
+# #2709: module-level (not a local inside _migrate_add_columns below) so
+# tests/test_db.py's TestMigrateAddColumnsVersionGuard can inspect its
+# length without executing any SQL. `len(_MIGRATE_ADD_COLUMNS)` is pinned
+# there alongside `_DB_SCHEMA_VERSION` — appending an entry here changes
+# the pinned count and fails that test red, forcing this list and the
+# version bump above to be edited in the same commit. See that test's
+# docstring, and the _DB_SCHEMA_VERSION comment above, for why a plain
+# code comment already failed to stop this three times (#2604, #2589,
+# #2687).
+_MIGRATE_ADD_COLUMNS: list[str] = [
+    "ALTER TABLE assignments ADD COLUMN review_iteration INTEGER DEFAULT 0",
+    "ALTER TABLE assignments ADD COLUMN review_posted_at REAL",
+    # #200: human-driven Test gate between Work and Review.
+    "ALTER TABLE assignments ADD COLUMN test_state TEXT",
+    "ALTER TABLE assignments ADD COLUMN test_reason TEXT",
+    # #253: persisted adversarial-review verdict so the merge gate can
+    # check approval without re-parsing logs after restart.
+    "ALTER TABLE assignments ADD COLUMN review_verdict TEXT",
+    # #208: worker cost captured from the final stream-json result event.
+    "ALTER TABLE assignments ADD COLUMN cost_usd REAL",
+    # #252: worker-emitted smoke-test list (JSON array of strings;
+    # NULL = not emitted, '[]' = explicit "(none — internal)").
+    "ALTER TABLE assignments ADD COLUMN smoke_tests TEXT",
+    # #bounce: cached review-findings body (markdown text) so coord
+    # bounce + the upcoming per-stage display don't have to re-fetch
+    # the review log from the agent.  Populated by notify.py when
+    # the review is first parsed.  NULL = not yet parsed; populated
+    # = full findings.body text.
+    "ALTER TABLE assignments ADD COLUMN review_findings TEXT",
+    # #315: claude session ID captured from the worker's `system.init`
+    # event.  Set by notify.py after the agent reports completion.  Used
+    # by `coord chat-continue` to pass `--resume <id>` to the next
+    # worker so it loads the prior conversation and continues it.
+    "ALTER TABLE assignments ADD COLUMN claude_session_id TEXT",
+    # #342 Phase A: AI-generated smoke test plan (JSON-encoded).
+    # NULL = not yet generated.  Set by `coord test-plan` and read back
+    # by the CLI (cache hit) and eventually by the TUI (Phase B).
+    "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
+    # #349 Phase B: branch HEAD SHA at the time `coord test-plan` last ran.
+    # Used by the TUI to detect staleness: if the branch has advanced
+    # since the plan was generated, it re-runs `coord test-plan --refresh`
+    # automatically.  NULL = plan not yet generated, or generated without
+    # branch tracking (legacy).  Always reset to NULL when set_test_plan
+    # is called with branch_head=None so no stale SHA persists.
+    "ALTER TABLE assignments ADD COLUMN test_plan_branch_head TEXT",
+    # #406 Phase A: milestone columns on the issues table.
+    # milestone_number is the GitHub milestone number (integer id); NULL for
+    # unassigned.  milestone_title is the human-readable name (e.g. "v0.5");
+    # NULL when no milestone is assigned.  Idempotent — SQLite raises
+    # OperationalError when the column already exists, which is swallowed
+    # below.
+    "ALTER TABLE issues ADD COLUMN milestone_number INTEGER",
+    "ALTER TABLE issues ADD COLUMN milestone_title TEXT",
+    # #324: resolved provider name recorded at dispatch time so the TUI
+    # can surface it in the assignment detail panel (#327).  NULL for rows
+    # dispatched before #324 landed; the TUI shows "claude" as the
+    # implicit default when the column is NULL.
+    "ALTER TABLE assignments ADD COLUMN provider_name TEXT",
+    # #546: token counts for automated (claude -p) assignments, parsed from
+    # the final stream-json result event alongside cost_usd.  All default
+    # 0 so the TUI can sum them without NULLs.  Interactive (Max/OAuth)
+    # sessions do not bill per-token; those rows stay at 0 and the TUI
+    # labels them "Max (subscription)" rather than showing a dollar figure.
+    "ALTER TABLE assignments ADD COLUMN input_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE assignments ADD COLUMN output_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE assignments ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE assignments ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+    # #546: track whether an assignment ran as a human-attended interactive
+    # session (Max/Pro subscription).  Used by the TUI to show
+    # "Max (subscription)" accurately without misidentifying old automated
+    # rows that also lack cost_usd + token data.
+    "ALTER TABLE assignments ADD COLUMN is_interactive INTEGER DEFAULT 0",
+    # #618: short human-readable reason for a launch failure (e.g.
+    # "branch already checked out at ~/.coord/worktrees/<old-aid>").
+    # Written by the CLI immediately when an interactive session can't
+    # start so the TUI can explain the red box without any log file.
+    # NULL for assignments that launched successfully.
+    "ALTER TABLE assignments ADD COLUMN failure_reason TEXT",
+    # #776 (Merge Queue v2-A): track when an entry was added to the queue
+    # so the merge plan can display age and sort stably.  NULL for entries
+    # created before this migration ran.
+    "ALTER TABLE merge_queue ADD COLUMN enqueued_at REAL",
+    # #821: commit-bound review gate — SHA of the branch HEAD at the time
+    # the review assignment ran.  When both this column and the merge-queue
+    # entry's branch_head_sha are populated and differ, `has_approved_review`
+    # treats the approval as stale (new commits since the review → re-review
+    # required).  NULL for rows predating this feature.
+    "ALTER TABLE assignments ADD COLUMN review_head_sha TEXT",
+    # #944: the Acceptance-gate verdict (oracle loop, docs/ORACLE_LOOP.md)
+    # — set by `coord acceptance record --issue N --sha <sha>`, the
+    # coordinator's external re-run of the sealed suite against the
+    # pushed SHA. NULL until a record has run. acceptance_reason carries
+    # a short failing-test summary (mirrors test_reason); acceptance_sha
+    # is the exact commit the verdict was recorded against, so staleness
+    # (new commits since the last record) is detectable the same way
+    # review_head_sha detects a stale review approval.
+    "ALTER TABLE assignments ADD COLUMN acceptance_state TEXT",
+    "ALTER TABLE assignments ADD COLUMN acceptance_reason TEXT",
+    "ALTER TABLE assignments ADD COLUMN acceptance_sha TEXT",
+    # #932: per-test counts alongside acceptance_state, so the Acceptance
+    # box can render "3/7 acceptance green" instead of a bare verdict.
+    "ALTER TABLE assignments ADD COLUMN acceptance_total INTEGER",
+    "ALTER TABLE assignments ADD COLUMN acceptance_passed INTEGER",
+    # #874: persist the worker's ### Summary prose block so the TUI's
+    # Summary tab has a durable, board-sourced field.  NULL when the
+    # worker emitted no summary (best-effort; never blocks completion).
+    "ALTER TABLE assignments ADD COLUMN completion_summary TEXT",
+    # #886 Phase 2: structured Milestone Outcome Audit verdict. Written by
+    # issue_store._persist_audit_result for type="audit" assignments only
+    # (the epic's issue_number doubles as the audit's issue_number — see
+    # #885's _dispatch_audit_of). audit_goals_json is a JSON array of
+    # {goal, metric_before, metric_after, verdict (met|partial|gap),
+    # evidence} — kept as a raw JSON string on the wire, same convention
+    # as review_findings above. audit_run_number increments once per
+    # `--audit-of <epic>` run against the same (repo_name, issue_number)
+    # so later runs can diff against earlier ones. NULL for every row
+    # predating this feature and for non-audit assignment types.
+    "ALTER TABLE assignments ADD COLUMN audit_goals_json TEXT",
+    "ALTER TABLE assignments ADD COLUMN audit_bottom_line TEXT",
+    "ALTER TABLE assignments ADD COLUMN audit_run_number INTEGER",
+    # #1077: the originating assignment's `type` (e.g. "work",
+    # "mock-author"), so the merge processor can tell whether merging
+    # this entry's PR should deterministically close `issue_number` —
+    # see coord.models.CLOSES_ISSUE_TYPES. Existing rows default to
+    # 'work', preserving the prior always-close behavior for entries
+    # enqueued before this column existed.
+    "ALTER TABLE merge_queue ADD COLUMN assignment_type TEXT DEFAULT 'work'",
+    # #1084: for type="test-author" JIT-mode assignments, the work-order
+    # member issue this dispatch is extending the acceptance suite for —
+    # see coord.models.Assignment.for_issue_number. NULL for milestone-
+    # mode (Gate A) authoring, every other assignment type, and rows
+    # predating this column.
+    "ALTER TABLE assignments ADD COLUMN for_issue_number INTEGER",
+    # #1213: snapshot of the originating assignment's resolved
+    # required_gates (JSON array; NULL/'[]' = no per-issue override —
+    # callers fall back to config.pipeline.default_gates), captured at
+    # enqueue time so the review/smoke merge gates are commit-bound
+    # rather than re-resolved from the live board at merge time. NULL
+    # for rows predating this column, which fall back the same way.
+    "ALTER TABLE merge_queue ADD COLUMN required_gates TEXT",
+    # #1456: audit trail for a coordinator override of a reviewer's verdict
+    # (the #476 approve-with-nits gate).  `review_verdict_original` holds
+    # the reviewer's own verdict and `review_verdict_override_reason` the
+    # parsed counts that justified the override; `review_verdict` keeps the
+    # effective value the merge gate reads.  NULL for every row where the
+    # coordinator never overrode anything, and for rows predating this
+    # column — see coord.models.Assignment.review_verdict_original.
+    "ALTER TABLE assignments ADD COLUMN review_verdict_original TEXT",
+    "ALTER TABLE assignments ADD COLUMN review_verdict_override_reason TEXT",
+    # #1475: content-addressed fingerprint of the diff a review approved
+    # (`git patch-id --stable`), captured alongside `review_head_sha`. A
+    # rebase that changes no content produces the same patch-id even
+    # though the branch's HEAD SHA moved, so `has_approved_review` can
+    # carry the approval forward instead of re-blocking on the #821 SHA
+    # check. NULL for rows predating this column or where the patch-id
+    # could not be computed — those fall back to today's SHA-only
+    # staleness behaviour (fail closed).
+    "ALTER TABLE assignments ADD COLUMN review_patch_id TEXT",
+    # #1479: Test-gate staleness anchor, captured (best-effort) alongside
+    # a terminal test_state write in
+    # `coord.state._record_test_verdict_local`. `test_head_sha` /
+    # `test_patch_id` mirror `review_head_sha` / `review_patch_id`
+    # (#821/#1475) for the branch's own content; `test_base_sha` is the
+    # NEW piece — the target/merge branch's HEAD SHA at test time, so
+    # `coord.merge_queue.has_smoke_verdict` can detect a base that moved
+    # out from under an otherwise content-identical branch (a rebase can
+    # break tests without changing the branch's own diff). NULL for rows
+    # predating this column or where the anchor couldn't be computed —
+    # those fall back to today's no-staleness-check behavior (fail open).
+    "ALTER TABLE assignments ADD COLUMN test_head_sha TEXT",
+    "ALTER TABLE assignments ADD COLUMN test_patch_id TEXT",
+    "ALTER TABLE assignments ADD COLUMN test_base_sha TEXT",
+    # #1476: audit trail for a SCOPED re-review — dispatched when a
+    # conflict-fix rebase changed content under an already-approved
+    # review (patch-id mismatch) but no other work/fix commit
+    # intervened. `review_scoped` marks the review row as scoped (vs. a
+    # full re-review of the whole PR); `review_scope_base_sha` records
+    # the prior review's `review_head_sha` — the commit the resolution
+    # delta was computed from — so a later audit can distinguish
+    # "reviewed the 15-line resolution" from "reviewed the whole PR".
+    # 0/NULL for every row predating this column and for ordinary
+    # (non-scoped) reviews.
+    "ALTER TABLE assignments ADD COLUMN review_scoped INTEGER DEFAULT 0",
+    "ALTER TABLE assignments ADD COLUMN review_scope_base_sha TEXT",
+    # #1499: durable provenance — `f"drive:{repo}#{issue}"` when this
+    # assignment was dispatched by `coord drive` (via `coord assign
+    # --driven-by`), NULL for a hand `coord assign` and for every row
+    # predating this column. This is the piece that survives the
+    # driver process exiting — see coord.models.Assignment.driven_by.
+    "ALTER TABLE assignments ADD COLUMN driven_by TEXT",
+    # #1629 (H-2): the toolchain string that produced a Test-gate
+    # verdict — e.g. "rustc 1.95.0" or "python 3.12.4, node 20.11.0" —
+    # captured (best-effort) alongside `test_state` in
+    # `coord.state._record_test_verdict_local`. Annotation only: nothing
+    # reads this to gate dispatch/review/merge (see
+    # coord.health.checks.toolchain's fleet_toolchain_skew, which is the
+    # thing that actually judges skew). NULL for every row predating
+    # this column and for any verdict recorded without a resolvable
+    # toolchain — a historical/unknown value, never treated as a mismatch.
+    "ALTER TABLE assignments ADD COLUMN test_toolchain TEXT",
+    # #1757 (deploy gates): mark a queue entry so that when it completes,
+    # the tick STOPS launching and waits for a human deploy step —
+    # `merged != live` is this repo's most-repeated operational lesson and
+    # a queue that models merge but not deploy sequences work straight into
+    # it, unattended.  DQ-1 shipped before this, so an existing
+    # ~/.coord/coord.db is upgraded in place here (the same columns are in
+    # `_ensure_schema`'s CREATE for fresh databases; the duplicate-column
+    # OperationalError is swallowed below).
+    #
+    #   hold_after   0/1 — this entry ends with a deploy gate
+    #   hold_reason  shown to the operator when the gate fires
+    #   resume_when  optional probe command; '' = manual resume only
+    #   hold_state   ''|armed|fired|released (coord/drive_queue.py)
+    #   hold_probes  consecutive failed `resume_when` runs since the gate
+    #                fired — a TYPED count, so the alert's rising attempt
+    #                number never has to be parsed back out of prose
+    #                (#1523 §2: typed state, never CLI prose).
+    "ALTER TABLE drive_queue ADD COLUMN hold_after INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE drive_queue ADD COLUMN hold_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN resume_when TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN hold_state TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN hold_probes INTEGER NOT NULL DEFAULT 0",
+    # #1870: the short hostname of the machine that actually launched this
+    # entry's `coord drive --tmux` — see the CREATE TABLE comment above.
+    # '' for every row written before this migration; `_reconcile_running`
+    # treats that exactly like "launched here" (today's behaviour).
+    "ALTER TABLE drive_queue ADD COLUMN launch_host TEXT NOT NULL DEFAULT ''",
+    # #1892: count of automatic `CiStore.rerun_for_pr` calls `merge_queue
+    # .process()` has issued for this entry's current verdictless-CI-
+    # failure streak — see `coord.merge_queue.MAX_CI_INFRA_RERUNS` and
+    # `QueuedMerge.ci_infra_reruns`'s docstring. 0 for every row
+    # predating this column (no auto-reruns spent yet), same as the
+    # column's own default for freshly-enqueued entries.
+    "ALTER TABLE merge_queue ADD COLUMN ci_infra_reruns INTEGER NOT NULL DEFAULT 0",
+    # #2197: the CI-staleness auto-rerun's OWN counter — see
+    # `coord.merge_queue.MAX_CI_STALE_RERUNS` and
+    # `QueuedMerge.ci_stale_reruns`'s docstring for why it is kept
+    # separate from `ci_infra_reruns` rather than sharing it. 0 for
+    # every row predating this column, same as a freshly-enqueued entry.
+    "ALTER TABLE merge_queue ADD COLUMN ci_stale_reruns INTEGER NOT NULL DEFAULT 0",
+    # #1956: verdict provenance — WHO recorded `review_verdict` and HOW
+    # (see coord.models.Assignment.verdict_source for the three values
+    # and why conflating them was the second half of #1956). NULL for
+    # every row predating this column and for the common case (the
+    # reviewer's own log was parsed) — callers treat NULL identically to
+    # "agent".
+    "ALTER TABLE assignments ADD COLUMN verdict_source TEXT",
+    "ALTER TABLE assignments ADD COLUMN verdict_source_reason TEXT",
+    # #2133: see the CREATE TABLE comment above — capture time of
+    # `drive_queue.last_reason`, so a `blocked` entry's displayed reason
+    # carries its age instead of rendering a stale snapshot as current
+    # state. NULL for every row predating this migration.
+    "ALTER TABLE drive_queue ADD COLUMN reason_at REAL",
+    # #2186: deploy-gate SCOPE — see the CREATE TABLE comment above and
+    # coord/drive_queue.py's HOLD_SCOPE_ENTRY/HOLD_SCOPE_FLEET. Every row
+    # predating this migration (and every armed-but-not-yet-fired gate)
+    # defaults to 'entry', the narrower reading — a fired gate on such a
+    # row holds only its own dependents rather than the whole queue, which
+    # is the #2186 fix itself, not just a schema detail.
+    "ALTER TABLE drive_queue ADD COLUMN hold_scope TEXT NOT NULL DEFAULT 'entry'",
+    # #2230: see the CREATE TABLE comment above — count of times the
+    # blocked-reconciliation sweep has auto-resumed a row from 'blocked'.
+    # 0 for every row predating this migration, same as the column's own
+    # default for a freshly-enqueued entry.
+    "ALTER TABLE drive_queue ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0",
+    # #2252: the flake-recheck auto-rerun's OWN counter/pending-state —
+    # see `coord.merge_queue.MAX_CI_FLAKY_RERUNS` and
+    # `QueuedMerge.ci_flaky_reruns`/`ci_flaky_pending`'s docstrings for
+    # why they're kept separate from `ci_infra_reruns`/`ci_stale_reruns`
+    # above rather than sharing either. 0/'' for every row predating
+    # this migration — no flake re-run ever spent/pending — same as the
+    # columns' own defaults for a freshly-enqueued entry.
+    "ALTER TABLE merge_queue ADD COLUMN ci_flaky_reruns INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE merge_queue ADD COLUMN ci_flaky_pending TEXT NOT NULL DEFAULT ''",
+    # #2273 (post-review): see the CREATE TABLE comment above — a
+    # backoff-window anchor the deferral's own per-tick status write
+    # never touches, fixing the "moving target" bug where re-stamping
+    # `reason_at` every backing-off tick reset the very clock it fed.
+    # NULL for every row predating this migration, same as the column's
+    # own default and identical in effect to `attempts <= 0` (no backoff
+    # window active).
+    "ALTER TABLE drive_queue ADD COLUMN retry_backoff_at REAL",
+    # #2316: the worker's own terminal `stop_reason` (e.g. `"end_turn"`,
+    # opencode's `"length"`, claude's `"max_tokens"`) — see
+    # `coord.agent.AgentServer._reap`'s `/status` `completed` entry
+    # (already sent by every agent build) and `coord.reconcile._capture_
+    # stop_reason_best_effort`, which persists it here for EVERY terminal
+    # assignment, not just failed ones. Previously this value reached the
+    # agent's own `/status` response and nothing else — `coord gates`,
+    # `coord status` and the dashboard had no column to read it from and
+    # a truncated (`stop_reason == "length"`/`"max_tokens"`), 0-commit
+    # run was recorded `advisory` with no trace of WHY. NULL for every
+    # row predating this migration and for a non-stream-json / PTY
+    # worker whose log carries no such field.
+    "ALTER TABLE assignments ADD COLUMN stop_reason TEXT",
+    # #2347: count of automatic checks `merge_queue.process()` has made
+    # against this entry's CURRENT streak of bare check-list FETCH
+    # failures (GitHub unreachable, not a real CI verdict) — see
+    # `coord.merge_queue.MAX_CI_UNREADABLE_RERUNS` and
+    # `QueuedMerge.ci_unreadable_reruns`'s docstring. 0 for every row
+    # predating this column, same as the column's own default for a
+    # freshly-enqueued entry.
+    "ALTER TABLE merge_queue ADD COLUMN ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0",
+    # #2359: the preview-approval gate's coord-owned preview URL, mirroring
+    # `design_round` — the highest-confirmed preview build's URL, written
+    # only by `coord.portal_store.mark_applied`'s `kind == "preview"`
+    # branch. '' for every row predating this migration and for a
+    # submission with no preview queued yet, same as `open_question`'s
+    # own default.
+    "ALTER TABLE portal_submissions ADD COLUMN preview_url TEXT NOT NULL DEFAULT ''",
+    # #2417: the CALLING assignment's id when this row was dispatched by
+    # a `coord` subcommand run from INSIDE another worker's own turn
+    # (e.g. `coord acceptance author`/`coord fix` shelled out to from a
+    # `type="work"` session's own bash tool) rather than typed by a
+    # human — see `coord.models.Assignment.dispatched_by_assignment_id`.
+    # NULL for a hand dispatch, a coordinator/brain-proposed dispatch,
+    # and every row predating this column.
+    "ALTER TABLE assignments ADD COLUMN dispatched_by_assignment_id TEXT",
+    # #2510: count of `coord.ci_fix.dispatch_ci_fix` fix-worker dispatches
+    # issued for this entry's CURRENT confirmed (non-infra, non-first-
+    # flake) `checks_failed` streak — see `QueuedMerge.ci_fix_dispatches`'s
+    # docstring and `coord.ci_fix.MAX_CI_FIX_DISPATCHES`. 0 for every row
+    # predating this migration, same as the column's own default for a
+    # freshly-enqueued entry.
+    "ALTER TABLE merge_queue ADD COLUMN ci_fix_dispatches INTEGER NOT NULL DEFAULT 0",
+    # #2509 review fix: the verdict consumer's own read position into
+    # `portal_events` — see the CREATE TABLE comment above for why it
+    # cannot reuse the shared `handled_at` column. NULL (read as
+    # `(0.0, 0)`, before every real event) for every database predating
+    # this migration, which replays the full existing inbox exactly once
+    # on upgrade — safe: re-scanning a non-actionable event is a no-op,
+    # and `_consume_verdicts` skips (never re-dispatches) any event
+    # whose `handled_at` is already set, so an already-consumed
+    # `changes_requested` event from before this migration is walked
+    # past, not re-sent — see `coord.portal_sync._consume_verdicts`.
+    "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_at REAL",
+    "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid INTEGER",
+    # #2604: see the CREATE TABLE comment above — a per-entry
+    # `--max-fix-rounds` override for the tick's `coord drive --tmux`
+    # launch. NULL for every row predating this migration, read
+    # identically to "no override" by `coord.drive_queue.
+    # effective_max_fix_rounds`.
+    "ALTER TABLE drive_queue ADD COLUMN max_fix_rounds INTEGER",
+    # #2589: see the CREATE TABLE comment above — a per-entry
+    # `--no-acceptance` passthrough for the tick's `coord drive --tmux`
+    # launch. 0 (no passthrough) for every row predating this migration.
+    "ALTER TABLE drive_queue ADD COLUMN no_acceptance INTEGER NOT NULL DEFAULT 0",
+    # #2687: the pre-merge UAT (User Acceptance Test) gate's human
+    # verdict — see coord.models.Assignment.uat_state/uat_reason and
+    # `coord uat <id> --passed|--failed`. NULL for every row predating
+    # this column and for every repo that hasn't opted in via
+    # `Repo.uat_preview` (`coord.merge_queue.requires_uat` no-ops on a
+    # NULL `uat_preview` regardless of this column).
+    "ALTER TABLE assignments ADD COLUMN uat_state TEXT",
+    "ALTER TABLE assignments ADD COLUMN uat_reason TEXT",
+]
+
+
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:
     """Add new columns to existing databases via ALTER TABLE.
 
     Safe to call on databases that already have the columns — the
     OperationalError raised by SQLite is silently swallowed.
     """
-    migrations = [
-        "ALTER TABLE assignments ADD COLUMN review_iteration INTEGER DEFAULT 0",
-        "ALTER TABLE assignments ADD COLUMN review_posted_at REAL",
-        # #200: human-driven Test gate between Work and Review.
-        "ALTER TABLE assignments ADD COLUMN test_state TEXT",
-        "ALTER TABLE assignments ADD COLUMN test_reason TEXT",
-        # #253: persisted adversarial-review verdict so the merge gate can
-        # check approval without re-parsing logs after restart.
-        "ALTER TABLE assignments ADD COLUMN review_verdict TEXT",
-        # #208: worker cost captured from the final stream-json result event.
-        "ALTER TABLE assignments ADD COLUMN cost_usd REAL",
-        # #252: worker-emitted smoke-test list (JSON array of strings;
-        # NULL = not emitted, '[]' = explicit "(none — internal)").
-        "ALTER TABLE assignments ADD COLUMN smoke_tests TEXT",
-        # #bounce: cached review-findings body (markdown text) so coord
-        # bounce + the upcoming per-stage display don't have to re-fetch
-        # the review log from the agent.  Populated by notify.py when
-        # the review is first parsed.  NULL = not yet parsed; populated
-        # = full findings.body text.
-        "ALTER TABLE assignments ADD COLUMN review_findings TEXT",
-        # #315: claude session ID captured from the worker's `system.init`
-        # event.  Set by notify.py after the agent reports completion.  Used
-        # by `coord chat-continue` to pass `--resume <id>` to the next
-        # worker so it loads the prior conversation and continues it.
-        "ALTER TABLE assignments ADD COLUMN claude_session_id TEXT",
-        # #342 Phase A: AI-generated smoke test plan (JSON-encoded).
-        # NULL = not yet generated.  Set by `coord test-plan` and read back
-        # by the CLI (cache hit) and eventually by the TUI (Phase B).
-        "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
-        # #349 Phase B: branch HEAD SHA at the time `coord test-plan` last ran.
-        # Used by the TUI to detect staleness: if the branch has advanced
-        # since the plan was generated, it re-runs `coord test-plan --refresh`
-        # automatically.  NULL = plan not yet generated, or generated without
-        # branch tracking (legacy).  Always reset to NULL when set_test_plan
-        # is called with branch_head=None so no stale SHA persists.
-        "ALTER TABLE assignments ADD COLUMN test_plan_branch_head TEXT",
-        # #406 Phase A: milestone columns on the issues table.
-        # milestone_number is the GitHub milestone number (integer id); NULL for
-        # unassigned.  milestone_title is the human-readable name (e.g. "v0.5");
-        # NULL when no milestone is assigned.  Idempotent — SQLite raises
-        # OperationalError when the column already exists, which is swallowed
-        # below.
-        "ALTER TABLE issues ADD COLUMN milestone_number INTEGER",
-        "ALTER TABLE issues ADD COLUMN milestone_title TEXT",
-        # #324: resolved provider name recorded at dispatch time so the TUI
-        # can surface it in the assignment detail panel (#327).  NULL for rows
-        # dispatched before #324 landed; the TUI shows "claude" as the
-        # implicit default when the column is NULL.
-        "ALTER TABLE assignments ADD COLUMN provider_name TEXT",
-        # #546: token counts for automated (claude -p) assignments, parsed from
-        # the final stream-json result event alongside cost_usd.  All default
-        # 0 so the TUI can sum them without NULLs.  Interactive (Max/OAuth)
-        # sessions do not bill per-token; those rows stay at 0 and the TUI
-        # labels them "Max (subscription)" rather than showing a dollar figure.
-        "ALTER TABLE assignments ADD COLUMN input_tokens INTEGER DEFAULT 0",
-        "ALTER TABLE assignments ADD COLUMN output_tokens INTEGER DEFAULT 0",
-        "ALTER TABLE assignments ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
-        "ALTER TABLE assignments ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
-        # #546: track whether an assignment ran as a human-attended interactive
-        # session (Max/Pro subscription).  Used by the TUI to show
-        # "Max (subscription)" accurately without misidentifying old automated
-        # rows that also lack cost_usd + token data.
-        "ALTER TABLE assignments ADD COLUMN is_interactive INTEGER DEFAULT 0",
-        # #618: short human-readable reason for a launch failure (e.g.
-        # "branch already checked out at ~/.coord/worktrees/<old-aid>").
-        # Written by the CLI immediately when an interactive session can't
-        # start so the TUI can explain the red box without any log file.
-        # NULL for assignments that launched successfully.
-        "ALTER TABLE assignments ADD COLUMN failure_reason TEXT",
-        # #776 (Merge Queue v2-A): track when an entry was added to the queue
-        # so the merge plan can display age and sort stably.  NULL for entries
-        # created before this migration ran.
-        "ALTER TABLE merge_queue ADD COLUMN enqueued_at REAL",
-        # #821: commit-bound review gate — SHA of the branch HEAD at the time
-        # the review assignment ran.  When both this column and the merge-queue
-        # entry's branch_head_sha are populated and differ, `has_approved_review`
-        # treats the approval as stale (new commits since the review → re-review
-        # required).  NULL for rows predating this feature.
-        "ALTER TABLE assignments ADD COLUMN review_head_sha TEXT",
-        # #944: the Acceptance-gate verdict (oracle loop, docs/ORACLE_LOOP.md)
-        # — set by `coord acceptance record --issue N --sha <sha>`, the
-        # coordinator's external re-run of the sealed suite against the
-        # pushed SHA. NULL until a record has run. acceptance_reason carries
-        # a short failing-test summary (mirrors test_reason); acceptance_sha
-        # is the exact commit the verdict was recorded against, so staleness
-        # (new commits since the last record) is detectable the same way
-        # review_head_sha detects a stale review approval.
-        "ALTER TABLE assignments ADD COLUMN acceptance_state TEXT",
-        "ALTER TABLE assignments ADD COLUMN acceptance_reason TEXT",
-        "ALTER TABLE assignments ADD COLUMN acceptance_sha TEXT",
-        # #932: per-test counts alongside acceptance_state, so the Acceptance
-        # box can render "3/7 acceptance green" instead of a bare verdict.
-        "ALTER TABLE assignments ADD COLUMN acceptance_total INTEGER",
-        "ALTER TABLE assignments ADD COLUMN acceptance_passed INTEGER",
-        # #874: persist the worker's ### Summary prose block so the TUI's
-        # Summary tab has a durable, board-sourced field.  NULL when the
-        # worker emitted no summary (best-effort; never blocks completion).
-        "ALTER TABLE assignments ADD COLUMN completion_summary TEXT",
-        # #886 Phase 2: structured Milestone Outcome Audit verdict. Written by
-        # issue_store._persist_audit_result for type="audit" assignments only
-        # (the epic's issue_number doubles as the audit's issue_number — see
-        # #885's _dispatch_audit_of). audit_goals_json is a JSON array of
-        # {goal, metric_before, metric_after, verdict (met|partial|gap),
-        # evidence} — kept as a raw JSON string on the wire, same convention
-        # as review_findings above. audit_run_number increments once per
-        # `--audit-of <epic>` run against the same (repo_name, issue_number)
-        # so later runs can diff against earlier ones. NULL for every row
-        # predating this feature and for non-audit assignment types.
-        "ALTER TABLE assignments ADD COLUMN audit_goals_json TEXT",
-        "ALTER TABLE assignments ADD COLUMN audit_bottom_line TEXT",
-        "ALTER TABLE assignments ADD COLUMN audit_run_number INTEGER",
-        # #1077: the originating assignment's `type` (e.g. "work",
-        # "mock-author"), so the merge processor can tell whether merging
-        # this entry's PR should deterministically close `issue_number` —
-        # see coord.models.CLOSES_ISSUE_TYPES. Existing rows default to
-        # 'work', preserving the prior always-close behavior for entries
-        # enqueued before this column existed.
-        "ALTER TABLE merge_queue ADD COLUMN assignment_type TEXT DEFAULT 'work'",
-        # #1084: for type="test-author" JIT-mode assignments, the work-order
-        # member issue this dispatch is extending the acceptance suite for —
-        # see coord.models.Assignment.for_issue_number. NULL for milestone-
-        # mode (Gate A) authoring, every other assignment type, and rows
-        # predating this column.
-        "ALTER TABLE assignments ADD COLUMN for_issue_number INTEGER",
-        # #1213: snapshot of the originating assignment's resolved
-        # required_gates (JSON array; NULL/'[]' = no per-issue override —
-        # callers fall back to config.pipeline.default_gates), captured at
-        # enqueue time so the review/smoke merge gates are commit-bound
-        # rather than re-resolved from the live board at merge time. NULL
-        # for rows predating this column, which fall back the same way.
-        "ALTER TABLE merge_queue ADD COLUMN required_gates TEXT",
-        # #1456: audit trail for a coordinator override of a reviewer's verdict
-        # (the #476 approve-with-nits gate).  `review_verdict_original` holds
-        # the reviewer's own verdict and `review_verdict_override_reason` the
-        # parsed counts that justified the override; `review_verdict` keeps the
-        # effective value the merge gate reads.  NULL for every row where the
-        # coordinator never overrode anything, and for rows predating this
-        # column — see coord.models.Assignment.review_verdict_original.
-        "ALTER TABLE assignments ADD COLUMN review_verdict_original TEXT",
-        "ALTER TABLE assignments ADD COLUMN review_verdict_override_reason TEXT",
-        # #1475: content-addressed fingerprint of the diff a review approved
-        # (`git patch-id --stable`), captured alongside `review_head_sha`. A
-        # rebase that changes no content produces the same patch-id even
-        # though the branch's HEAD SHA moved, so `has_approved_review` can
-        # carry the approval forward instead of re-blocking on the #821 SHA
-        # check. NULL for rows predating this column or where the patch-id
-        # could not be computed — those fall back to today's SHA-only
-        # staleness behaviour (fail closed).
-        "ALTER TABLE assignments ADD COLUMN review_patch_id TEXT",
-        # #1479: Test-gate staleness anchor, captured (best-effort) alongside
-        # a terminal test_state write in
-        # `coord.state._record_test_verdict_local`. `test_head_sha` /
-        # `test_patch_id` mirror `review_head_sha` / `review_patch_id`
-        # (#821/#1475) for the branch's own content; `test_base_sha` is the
-        # NEW piece — the target/merge branch's HEAD SHA at test time, so
-        # `coord.merge_queue.has_smoke_verdict` can detect a base that moved
-        # out from under an otherwise content-identical branch (a rebase can
-        # break tests without changing the branch's own diff). NULL for rows
-        # predating this column or where the anchor couldn't be computed —
-        # those fall back to today's no-staleness-check behavior (fail open).
-        "ALTER TABLE assignments ADD COLUMN test_head_sha TEXT",
-        "ALTER TABLE assignments ADD COLUMN test_patch_id TEXT",
-        "ALTER TABLE assignments ADD COLUMN test_base_sha TEXT",
-        # #1476: audit trail for a SCOPED re-review — dispatched when a
-        # conflict-fix rebase changed content under an already-approved
-        # review (patch-id mismatch) but no other work/fix commit
-        # intervened. `review_scoped` marks the review row as scoped (vs. a
-        # full re-review of the whole PR); `review_scope_base_sha` records
-        # the prior review's `review_head_sha` — the commit the resolution
-        # delta was computed from — so a later audit can distinguish
-        # "reviewed the 15-line resolution" from "reviewed the whole PR".
-        # 0/NULL for every row predating this column and for ordinary
-        # (non-scoped) reviews.
-        "ALTER TABLE assignments ADD COLUMN review_scoped INTEGER DEFAULT 0",
-        "ALTER TABLE assignments ADD COLUMN review_scope_base_sha TEXT",
-        # #1499: durable provenance — `f"drive:{repo}#{issue}"` when this
-        # assignment was dispatched by `coord drive` (via `coord assign
-        # --driven-by`), NULL for a hand `coord assign` and for every row
-        # predating this column. This is the piece that survives the
-        # driver process exiting — see coord.models.Assignment.driven_by.
-        "ALTER TABLE assignments ADD COLUMN driven_by TEXT",
-        # #1629 (H-2): the toolchain string that produced a Test-gate
-        # verdict — e.g. "rustc 1.95.0" or "python 3.12.4, node 20.11.0" —
-        # captured (best-effort) alongside `test_state` in
-        # `coord.state._record_test_verdict_local`. Annotation only: nothing
-        # reads this to gate dispatch/review/merge (see
-        # coord.health.checks.toolchain's fleet_toolchain_skew, which is the
-        # thing that actually judges skew). NULL for every row predating
-        # this column and for any verdict recorded without a resolvable
-        # toolchain — a historical/unknown value, never treated as a mismatch.
-        "ALTER TABLE assignments ADD COLUMN test_toolchain TEXT",
-        # #1757 (deploy gates): mark a queue entry so that when it completes,
-        # the tick STOPS launching and waits for a human deploy step —
-        # `merged != live` is this repo's most-repeated operational lesson and
-        # a queue that models merge but not deploy sequences work straight into
-        # it, unattended.  DQ-1 shipped before this, so an existing
-        # ~/.coord/coord.db is upgraded in place here (the same columns are in
-        # `_ensure_schema`'s CREATE for fresh databases; the duplicate-column
-        # OperationalError is swallowed below).
-        #
-        #   hold_after   0/1 — this entry ends with a deploy gate
-        #   hold_reason  shown to the operator when the gate fires
-        #   resume_when  optional probe command; '' = manual resume only
-        #   hold_state   ''|armed|fired|released (coord/drive_queue.py)
-        #   hold_probes  consecutive failed `resume_when` runs since the gate
-        #                fired — a TYPED count, so the alert's rising attempt
-        #                number never has to be parsed back out of prose
-        #                (#1523 §2: typed state, never CLI prose).
-        "ALTER TABLE drive_queue ADD COLUMN hold_after INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE drive_queue ADD COLUMN hold_reason TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE drive_queue ADD COLUMN resume_when TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE drive_queue ADD COLUMN hold_state TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE drive_queue ADD COLUMN hold_probes INTEGER NOT NULL DEFAULT 0",
-        # #1870: the short hostname of the machine that actually launched this
-        # entry's `coord drive --tmux` — see the CREATE TABLE comment above.
-        # '' for every row written before this migration; `_reconcile_running`
-        # treats that exactly like "launched here" (today's behaviour).
-        "ALTER TABLE drive_queue ADD COLUMN launch_host TEXT NOT NULL DEFAULT ''",
-        # #1892: count of automatic `CiStore.rerun_for_pr` calls `merge_queue
-        # .process()` has issued for this entry's current verdictless-CI-
-        # failure streak — see `coord.merge_queue.MAX_CI_INFRA_RERUNS` and
-        # `QueuedMerge.ci_infra_reruns`'s docstring. 0 for every row
-        # predating this column (no auto-reruns spent yet), same as the
-        # column's own default for freshly-enqueued entries.
-        "ALTER TABLE merge_queue ADD COLUMN ci_infra_reruns INTEGER NOT NULL DEFAULT 0",
-        # #2197: the CI-staleness auto-rerun's OWN counter — see
-        # `coord.merge_queue.MAX_CI_STALE_RERUNS` and
-        # `QueuedMerge.ci_stale_reruns`'s docstring for why it is kept
-        # separate from `ci_infra_reruns` rather than sharing it. 0 for
-        # every row predating this column, same as a freshly-enqueued entry.
-        "ALTER TABLE merge_queue ADD COLUMN ci_stale_reruns INTEGER NOT NULL DEFAULT 0",
-        # #1956: verdict provenance — WHO recorded `review_verdict` and HOW
-        # (see coord.models.Assignment.verdict_source for the three values
-        # and why conflating them was the second half of #1956). NULL for
-        # every row predating this column and for the common case (the
-        # reviewer's own log was parsed) — callers treat NULL identically to
-        # "agent".
-        "ALTER TABLE assignments ADD COLUMN verdict_source TEXT",
-        "ALTER TABLE assignments ADD COLUMN verdict_source_reason TEXT",
-        # #2133: see the CREATE TABLE comment above — capture time of
-        # `drive_queue.last_reason`, so a `blocked` entry's displayed reason
-        # carries its age instead of rendering a stale snapshot as current
-        # state. NULL for every row predating this migration.
-        "ALTER TABLE drive_queue ADD COLUMN reason_at REAL",
-        # #2186: deploy-gate SCOPE — see the CREATE TABLE comment above and
-        # coord/drive_queue.py's HOLD_SCOPE_ENTRY/HOLD_SCOPE_FLEET. Every row
-        # predating this migration (and every armed-but-not-yet-fired gate)
-        # defaults to 'entry', the narrower reading — a fired gate on such a
-        # row holds only its own dependents rather than the whole queue, which
-        # is the #2186 fix itself, not just a schema detail.
-        "ALTER TABLE drive_queue ADD COLUMN hold_scope TEXT NOT NULL DEFAULT 'entry'",
-        # #2230: see the CREATE TABLE comment above — count of times the
-        # blocked-reconciliation sweep has auto-resumed a row from 'blocked'.
-        # 0 for every row predating this migration, same as the column's own
-        # default for a freshly-enqueued entry.
-        "ALTER TABLE drive_queue ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0",
-        # #2252: the flake-recheck auto-rerun's OWN counter/pending-state —
-        # see `coord.merge_queue.MAX_CI_FLAKY_RERUNS` and
-        # `QueuedMerge.ci_flaky_reruns`/`ci_flaky_pending`'s docstrings for
-        # why they're kept separate from `ci_infra_reruns`/`ci_stale_reruns`
-        # above rather than sharing either. 0/'' for every row predating
-        # this migration — no flake re-run ever spent/pending — same as the
-        # columns' own defaults for a freshly-enqueued entry.
-        "ALTER TABLE merge_queue ADD COLUMN ci_flaky_reruns INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE merge_queue ADD COLUMN ci_flaky_pending TEXT NOT NULL DEFAULT ''",
-        # #2273 (post-review): see the CREATE TABLE comment above — a
-        # backoff-window anchor the deferral's own per-tick status write
-        # never touches, fixing the "moving target" bug where re-stamping
-        # `reason_at` every backing-off tick reset the very clock it fed.
-        # NULL for every row predating this migration, same as the column's
-        # own default and identical in effect to `attempts <= 0` (no backoff
-        # window active).
-        "ALTER TABLE drive_queue ADD COLUMN retry_backoff_at REAL",
-        # #2316: the worker's own terminal `stop_reason` (e.g. `"end_turn"`,
-        # opencode's `"length"`, claude's `"max_tokens"`) — see
-        # `coord.agent.AgentServer._reap`'s `/status` `completed` entry
-        # (already sent by every agent build) and `coord.reconcile._capture_
-        # stop_reason_best_effort`, which persists it here for EVERY terminal
-        # assignment, not just failed ones. Previously this value reached the
-        # agent's own `/status` response and nothing else — `coord gates`,
-        # `coord status` and the dashboard had no column to read it from and
-        # a truncated (`stop_reason == "length"`/`"max_tokens"`), 0-commit
-        # run was recorded `advisory` with no trace of WHY. NULL for every
-        # row predating this migration and for a non-stream-json / PTY
-        # worker whose log carries no such field.
-        "ALTER TABLE assignments ADD COLUMN stop_reason TEXT",
-        # #2347: count of automatic checks `merge_queue.process()` has made
-        # against this entry's CURRENT streak of bare check-list FETCH
-        # failures (GitHub unreachable, not a real CI verdict) — see
-        # `coord.merge_queue.MAX_CI_UNREADABLE_RERUNS` and
-        # `QueuedMerge.ci_unreadable_reruns`'s docstring. 0 for every row
-        # predating this column, same as the column's own default for a
-        # freshly-enqueued entry.
-        "ALTER TABLE merge_queue ADD COLUMN ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0",
-        # #2359: the preview-approval gate's coord-owned preview URL, mirroring
-        # `design_round` — the highest-confirmed preview build's URL, written
-        # only by `coord.portal_store.mark_applied`'s `kind == "preview"`
-        # branch. '' for every row predating this migration and for a
-        # submission with no preview queued yet, same as `open_question`'s
-        # own default.
-        "ALTER TABLE portal_submissions ADD COLUMN preview_url TEXT NOT NULL DEFAULT ''",
-        # #2417: the CALLING assignment's id when this row was dispatched by
-        # a `coord` subcommand run from INSIDE another worker's own turn
-        # (e.g. `coord acceptance author`/`coord fix` shelled out to from a
-        # `type="work"` session's own bash tool) rather than typed by a
-        # human — see `coord.models.Assignment.dispatched_by_assignment_id`.
-        # NULL for a hand dispatch, a coordinator/brain-proposed dispatch,
-        # and every row predating this column.
-        "ALTER TABLE assignments ADD COLUMN dispatched_by_assignment_id TEXT",
-        # #2510: count of `coord.ci_fix.dispatch_ci_fix` fix-worker dispatches
-        # issued for this entry's CURRENT confirmed (non-infra, non-first-
-        # flake) `checks_failed` streak — see `QueuedMerge.ci_fix_dispatches`'s
-        # docstring and `coord.ci_fix.MAX_CI_FIX_DISPATCHES`. 0 for every row
-        # predating this migration, same as the column's own default for a
-        # freshly-enqueued entry.
-        "ALTER TABLE merge_queue ADD COLUMN ci_fix_dispatches INTEGER NOT NULL DEFAULT 0",
-        # #2509 review fix: the verdict consumer's own read position into
-        # `portal_events` — see the CREATE TABLE comment above for why it
-        # cannot reuse the shared `handled_at` column. NULL (read as
-        # `(0.0, 0)`, before every real event) for every database predating
-        # this migration, which replays the full existing inbox exactly once
-        # on upgrade — safe: re-scanning a non-actionable event is a no-op,
-        # and `_consume_verdicts` skips (never re-dispatches) any event
-        # whose `handled_at` is already set, so an already-consumed
-        # `changes_requested` event from before this migration is walked
-        # past, not re-sent — see `coord.portal_sync._consume_verdicts`.
-        "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_at REAL",
-        "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid INTEGER",
-        # #2604: see the CREATE TABLE comment above — a per-entry
-        # `--max-fix-rounds` override for the tick's `coord drive --tmux`
-        # launch. NULL for every row predating this migration, read
-        # identically to "no override" by `coord.drive_queue.
-        # effective_max_fix_rounds`.
-        "ALTER TABLE drive_queue ADD COLUMN max_fix_rounds INTEGER",
-        # #2589: see the CREATE TABLE comment above — a per-entry
-        # `--no-acceptance` passthrough for the tick's `coord drive --tmux`
-        # launch. 0 (no passthrough) for every row predating this migration.
-        "ALTER TABLE drive_queue ADD COLUMN no_acceptance INTEGER NOT NULL DEFAULT 0",
-        # #2687: the pre-merge UAT (User Acceptance Test) gate's human
-        # verdict — see coord.models.Assignment.uat_state/uat_reason and
-        # `coord uat <id> --passed|--failed`. NULL for every row predating
-        # this column and for every repo that hasn't opted in via
-        # `Repo.uat_preview` (`coord.merge_queue.requires_uat` no-ops on a
-        # NULL `uat_preview` regardless of this column).
-        "ALTER TABLE assignments ADD COLUMN uat_state TEXT",
-        "ALTER TABLE assignments ADD COLUMN uat_reason TEXT",
-    ]
-    for sql in migrations:
+    for sql in _MIGRATE_ADD_COLUMNS:
         try:
             conn.execute(sql)
             conn.commit()
