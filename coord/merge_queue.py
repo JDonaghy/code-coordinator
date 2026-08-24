@@ -5868,25 +5868,34 @@ def process(
                     not skip_review
                     and config is not None
                     and requires_review(entry, config)
-                    and (board is None or not has_approved_review(entry, board, gh_ops))
                 ):
-                    # #2704: don't report a confirmed refusal ("not
-                    # approved") for a branch head this scan couldn't even
-                    # read — see `ApprovalScan.unknown_head`.
-                    _why = (
-                        "board unavailable to confirm review approval"
-                        if board is None
-                        else (
-                            UNKNOWN_BRANCH_HEAD_REASON
-                            if scan_approved_reviews(entry, board, gh_ops).unknown_head
-                            else "review required but not approved"
-                        )
+                    # #2704: a single scan, reused for both the boolean check
+                    # and the `unknown_head` reason below — two separate
+                    # calls each walk the full board a second time per
+                    # blocked entry per tick, adding gh load precisely during
+                    # the rate-limited/unreachable condition this reason
+                    # exists to report.
+                    _review_scan = (
+                        None if board is None else scan_approved_reviews(entry, board, gh_ops)
                     )
-                    events.append(MergeEvent(
-                        entry, "review_required",
-                        f"(dry run) would be blocked: {_why} for {entry.branch}",
-                    ))
-                    continue
+                    if board is None or not _review_scan.approved:
+                        # #2704: don't report a confirmed refusal ("not
+                        # approved") for a branch head this scan couldn't even
+                        # read — see `ApprovalScan.unknown_head`.
+                        _why = (
+                            "board unavailable to confirm review approval"
+                            if board is None
+                            else (
+                                UNKNOWN_BRANCH_HEAD_REASON
+                                if _review_scan.unknown_head
+                                else "review required but not approved"
+                            )
+                        )
+                        events.append(MergeEvent(
+                            entry, "review_required",
+                            f"(dry run) would be blocked: {_why} for {entry.branch}",
+                        ))
+                        continue
                 # #465/#821: smoke gate in dry-run — same fail-closed logic.
                 # #1640: when a verdict exists but failed the #1479 freshness
                 # binding, say so (and against which SHA) rather than
@@ -6261,23 +6270,29 @@ def process(
                 not skip_review
                 and config is not None
                 and requires_review(entry, config)
-                and (board is None or not has_approved_review(entry, board, gh_ops))
             ):
-                # #2704: don't report a confirmed refusal ("not approved")
-                # for a branch head this scan couldn't even read — see
-                # `ApprovalScan.unknown_head`.
-                msg = (
-                    "review required but board unavailable to confirm approval"
-                    if board is None
-                    else (
-                        UNKNOWN_BRANCH_HEAD_REASON
-                        if scan_approved_reviews(entry, board, gh_ops).unknown_head
-                        else "review required but not approved"
-                    )
+                # #2704: a single scan, reused for both the boolean check and
+                # the `unknown_head` reason below — see the matching dry-run
+                # site above for why a second call here is worth avoiding.
+                _review_scan = (
+                    None if board is None else scan_approved_reviews(entry, board, gh_ops)
                 )
-                entry.error = msg
-                events.append(MergeEvent(entry, "review_required", msg))
-                continue  # #292: skip this entry; try the next in the group
+                if board is None or not _review_scan.approved:
+                    # #2704: don't report a confirmed refusal ("not
+                    # approved") for a branch head this scan couldn't even
+                    # read — see `ApprovalScan.unknown_head`.
+                    msg = (
+                        "review required but board unavailable to confirm approval"
+                        if board is None
+                        else (
+                            UNKNOWN_BRANCH_HEAD_REASON
+                            if _review_scan.unknown_head
+                            else "review required but not approved"
+                        )
+                    )
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "review_required", msg))
+                    continue  # #292: skip this entry; try the next in the group
             # Smoke gate (#465/#821): refuse to merge when the interactive smoke
             # is required by the pipeline policy but no passing/skipped verdict
             # is recorded on the work assignment.  Same skip-not-halt semantics

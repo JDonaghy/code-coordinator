@@ -20,7 +20,7 @@ Two things were missing before this module existed:
 :func:`build_gate_report` is the read-only core (board + config + an
 optional ``gh_ops`` duck-typed seam in, a :class:`GateReport` out); it
 reuses ``coord.merge_queue``'s own review/smoke gate functions
-(:func:`~coord.merge_queue.has_approved_review`,
+(:func:`~coord.merge_queue.scan_approved_reviews`,
 :func:`~coord.merge_queue.evaluate_smoke_verdict`) rather than
 re-implementing the #1479 freshness math a second time, so this can never
 drift from what ``coord merge``/``coord merge --plan`` actually decide.
@@ -370,28 +370,39 @@ def build_gate_report(
     review_reason: str | None = None
     review_verdict_unparseable = False
     if review_required:
-        review_ok = mq.has_approved_review(entry, board, gh_ops)
+        review_scan = mq.scan_approved_reviews(entry, board, gh_ops)
+        review_ok = review_scan.approved
         if not review_ok:
-            # #1956: don't lump "verdict capture failed" in with the
-            # generic "not approved" — a review row that finished with no
-            # parseable verdict needs OPERATOR RECOVERY, not another
-            # dispatched review (see _find_verdict_unparseable_review's
-            # docstring). Checked only on the refusal path — a review that
-            # actually approved never reaches here.
-            unparseable = _find_verdict_unparseable_review(entry, board)
-            if unparseable is not None:
-                review_verdict_unparseable = True
-                review_reason = (
-                    f"review {unparseable.assignment_id!r} finished with NO "
-                    "parseable verdict (#1956) — needs operator recovery, "
-                    "not a pending/failed review: `coord report-result "
-                    f"--assignment {unparseable.assignment_id} --verdict "
-                    "<approve|request-changes> --verdict-source recovered "
-                    '--verdict-reason "<why>" --body-file '
-                    "<extracted-review.md>`"
-                )
+            # #2704: `unknown_head` means the branch head could not be
+            # confirmed at all — never collapse that into "not approved",
+            # which asserts a refusal this scan never actually confirmed.
+            # Mirrors `merge_queue.merge_gate_failures`/`_entry_gate_status`
+            # exactly, so this report can never drift from what a live
+            # `coord merge`/`coord drive-queue diagnose` decides (#2096).
+            if review_scan.unknown_head:
+                review_reason = mq.UNKNOWN_BRANCH_HEAD_REASON
             else:
-                review_reason = "review required but not approved"
+                # #1956: don't lump "verdict capture failed" in with the
+                # generic "not approved" — a review row that finished with no
+                # parseable verdict needs OPERATOR RECOVERY, not another
+                # dispatched review (see _find_verdict_unparseable_review's
+                # docstring). Checked only on the refusal path — a review
+                # that actually approved never reaches here.
+                unparseable = _find_verdict_unparseable_review(entry, board)
+                if unparseable is not None:
+                    review_verdict_unparseable = True
+                    review_reason = (
+                        f"review {unparseable.assignment_id!r} finished with "
+                        "NO parseable verdict (#1956) — needs operator "
+                        "recovery, not a pending/failed review: `coord "
+                        f"report-result --assignment "
+                        f"{unparseable.assignment_id} --verdict "
+                        "<approve|request-changes> --verdict-source "
+                        'recovered --verdict-reason "<why>" --body-file '
+                        "<extracted-review.md>`"
+                    )
+                else:
+                    review_reason = "review required but not approved"
     report.decisions.append(
         GateDecision(
             gate="review", required=review_required, ok=review_ok, reason=review_reason,

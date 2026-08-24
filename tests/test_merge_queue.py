@@ -2122,6 +2122,26 @@ class TestReviewGate:
         assert items[0].state == PENDING
         assert items[0].error == "review required but not approved"
 
+    def test_process_reports_unknown_head_not_a_fabricated_refusal(self) -> None:
+        """#2704: `process()`'s live review-required message must not claim
+        "not approved" when the branch head could not even be read — the
+        same `ApprovalScan.unknown_head` distinction `merge_gate_failures`
+        already makes, now asserted end-to-end through `process()` itself
+        (the two call sites at the dry-run and live merge-gate checks)."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"  # review DID capture a SHA to compare
+        board = self._board(completed=[work, review])
+        items = [_q("w1", size=10)]  # branch_head_sha left None — unconfirmable
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds
+        assert "merged" not in kinds
+        assert items[0].error == mq.UNKNOWN_BRANCH_HEAD_REASON
+
     def test_process_proceeds_when_review_is_approved(self) -> None:
         cfg = self._config()
         board = self._board(completed=[
@@ -2814,6 +2834,27 @@ class TestReviewGate:
         assert "merged" not in kinds
         # dry-run never touches state
         assert items[0].state == PENDING
+
+    def test_dry_run_reports_unknown_head_not_a_fabricated_refusal(self) -> None:
+        """#2704: the dry-run "would be blocked" message must name the
+        unreadable branch head, not fabricate "not approved" — the same
+        distinction the live path makes, asserted through the dry-run
+        message-construction site specifically."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"  # review DID capture a SHA to compare
+        board = self._board(completed=[work, review])
+        items = [_q("w1", size=10)]  # branch_head_sha left None — unconfirmable
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds
+        assert "merged" not in kinds
+        review_event = next(e for e in events if e.kind == "review_required")
+        assert mq.UNKNOWN_BRANCH_HEAD_REASON in review_event.message
+        assert "not approved" not in review_event.message
 
     def test_dry_run_shows_merged_for_approved(self) -> None:
         """#292: dry-run with a real approval → would-merge event."""
