@@ -3302,6 +3302,85 @@ class TestPassesMergeGates:
         review_failure = next(f for f in failures if f.gate == "review")
         assert review_failure.reason == "review required but not approved"
 
+    # ── #2704 follow-up: an unreadable branch head only explains the refusal
+    # while the approval is still the chain's LAST word. The #2085/#1966
+    # chain ends in an explicit `request-changes`, which needs no head SHA
+    # to be true — reporting "branch head unknown" there hides a real
+    # refusal behind a transient-looking probe failure (and tells
+    # `coord.drive` to wait for a probe that can never unblock it).
+
+    @staticmethod
+    def _superseded_chain_board(board_factory):
+        """The #1966 chain on one branch: approve (sha-a) → fix round →
+        request-changes (sha-b), newest last by ``dispatched_at``."""
+        def _work(aid: str, at: float) -> Assignment:
+            return Assignment(
+                machine_name="m1", repo_name="api", issue_number=1966,
+                issue_title="t", assignment_id=aid, type="work", status="done",
+                branch="issue-1966-fix", test_state="passed", dispatched_at=at,
+            )
+
+        def _review(aid: str, of: str, verdict: str, sha: str, at: float) -> Assignment:
+            return Assignment(
+                machine_name="m2", repo_name="api", issue_number=1966,
+                issue_title="t", assignment_id=aid, type="review", status="done",
+                review_of_assignment_id=of, review_verdict=verdict,
+                review_head_sha=sha, dispatched_at=at,
+            )
+
+        return board_factory(completed=[
+            _work("c908129d", 1.0),
+            _review("rev-orig", "c908129d", "approve", "sha-a", 2.0),
+            _work("8e3eb76e", 3.0),
+            _review("rev-fix", "8e3eb76e", "request-changes", "sha-b", 4.0),
+        ])
+
+    def test_approval_superseded_by_later_request_changes_is_not_unknown_head(
+        self,
+    ) -> None:
+        """The scan's own verdict: not approved, and NOT ``unknown_head`` —
+        the refusal is on the record regardless of the head SHA."""
+        board = self._superseded_chain_board(self._board)
+        entry = _q("8e3eb76e", branch="issue-1966-fix")  # branch_head_sha None
+
+        scan = mq.scan_approved_reviews(entry, board)
+
+        assert scan.approved is False
+        assert scan.unknown_head is False
+
+    def test_merge_gate_failures_reports_the_refusal_not_the_unknown_head(
+        self,
+    ) -> None:
+        """#2704 regression: the gate reason an operator (and the `/board`
+        merge plan) reads must name the review, not the unreadable head."""
+        cfg = self._config()
+        board = self._superseded_chain_board(self._board)
+        entry = _q("8e3eb76e", branch="issue-1966-fix")
+
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert review_failure.reason == "review required but not approved"
+        assert review_failure.reason != mq.UNKNOWN_BRANCH_HEAD_REASON
+
+    def test_unfinished_later_review_does_not_settle_the_question(self) -> None:
+        """A review still in flight (no verdict) settles nothing — the
+        unreadable head remains the honest reason."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        approve = self._review("w1", verdict="approve")
+        approve.review_head_sha = "sha-any"
+        approve.dispatched_at = 2.0
+        pending = self._review("w1", verdict=None)
+        pending.dispatched_at = 3.0
+        board = self._board(completed=[work, approve], active=[pending])
+        entry = _q("w1")
+
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert review_failure.reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+
 
 class TestHasPassedTest:
     """#2350: :func:`has_passed_test` — the Merge-only fast path's bare

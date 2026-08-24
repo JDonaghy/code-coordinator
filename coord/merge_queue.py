@@ -444,10 +444,49 @@ class ApprovalScan(NamedTuple):
       "confirmed superseded" vs "not yet checked". :func:`display_error`
       needs that distinction (see its docstring); the gate deliberately
       does not — both fail closed there.
+
+      #2704 follow-up: "not yet checked" is only honest while nothing else
+      settled the question. When the chain's LATEST verdict-bearing review
+      is a ``request-changes`` (the #2085/#1966 chain: approve, then a fix
+      round, then an explicit refusal), the reviewer refused on the record
+      — that verdict needs no head SHA to be true, so ``unknown_head`` is
+      False and every surface reads the genuine refusal. See
+      :func:`_latest_review_verdict`.
     """
 
     approved: bool
     unknown_head: bool
+
+
+def _latest_review_verdict(pool, branch_work_ids: set | frozenset) -> str | None:
+    """The verdict of the most-recently-dispatched *verdict-bearing* review
+    in *pool* covering any of *branch_work_ids*, or ``None`` when the chain
+    has no completed verdict at all.
+
+    Reviews still in flight (``review_verdict is None``) are skipped — an
+    unfinished review settles nothing. Ties on ``dispatched_at`` (including
+    everything being ``None``, e.g. rows from tests or pre-#821 data)
+    resolve to the last matching row in *pool* order, the same tie-break
+    convention as :func:`_select_winning_work_assignment`.
+
+    This is the same "latest review wins" reading the board's per-issue
+    stage projection uses for its ``review`` badge, which is why the two
+    surfaces can no longer disagree about a superseded approval (#2085).
+    """
+    winner: str | None = None
+    winner_at = float("-inf")
+    for a in pool:
+        if getattr(a, "type", None) != "review":
+            continue
+        if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:
+            continue
+        verdict = getattr(a, "review_verdict", None)
+        if verdict is None:
+            continue
+        at = getattr(a, "dispatched_at", None) or 0.0
+        if at >= winner_at:
+            winner, winner_at = verdict, at
+    return winner
 
 
 def has_approved_review(
@@ -570,6 +609,16 @@ def scan_approved_reviews(
                 unknown_head = True
             continue  # stale/unconfirmed: cannot prove this approval covers the current head
         return ApprovalScan(approved=True, unknown_head=False)
+    if unknown_head and _latest_review_verdict(pool, branch_work_ids) != "approve":
+        # #2704 follow-up: an unreadable branch head only explains the
+        # refusal while the approval is the chain's last word. The #1966
+        # chain (approve → fix round → request-changes) ends in an explicit
+        # refusal, which is true regardless of what the head SHA is — so
+        # reporting "branch head unknown" here would hide a real
+        # request-changes behind a transient-looking probe failure, and
+        # would tell `coord.drive` to WAIT for a probe that can never
+        # unblock it. Fall back to the confirmed refusal.
+        unknown_head = False
     return ApprovalScan(approved=False, unknown_head=unknown_head)
 
 
