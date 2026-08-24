@@ -1867,6 +1867,27 @@ def _resolve_prereqs(
             continue
         dep_state = states.get(dep)
         if dep_state is not None:
+            if dep_state == STATE_DONE:
+                # #2715: the queue's OWN row for *dep* already knows it
+                # landed — every `STATE_DONE` write in this module
+                # (`_reconcile_running`'s `facts.landed` branch, the
+                # `parked`/`blocked`/`failed` #2055 re-check, and step 4's
+                # own `facts.landed` short-circuit just below) is gated on a
+                # landed fact from `board.facts`, and the one write outside
+                # this module — `_run_merge_only_candidates` in
+                # `coord.commands.drive_queue` — only fires after its own
+                # `coord merge --only` attempt lands, confirmed by reading
+                # the merge queue's row back as `MERGED`
+                # (`_merge_only_landed`). `done` is therefore never written
+                # speculatively, so it is as trustworthy as `facts.landed`
+                # itself — and unlike `facts.landed`, it does not depend on
+                # the `issues` cache's own refresh cadence (observed ~10m
+                # behind) to reflect a merge the queue performed itself this
+                # same tick. Treating it as satisfied here is what lets a
+                # dependent resume on the tick right after its pre-req's row
+                # flips to `done`, instead of the tick after the cache
+                # independently rediscovers the same fact.
+                continue
             if dep_state in (STATE_BLOCKED, STATE_FAILED):
                 return _Verdict(
                     False,
@@ -1943,7 +1964,11 @@ def diagnose_blocked_after(
 
     * which of ``entry.after`` are still NOT landed — the merged ones drop
       out entirely; a satisfied ``after=`` entry displayed on a terminal row
-      is not a dependency, it is a caption for a fact that no longer holds;
+      is not a dependency, it is a caption for a fact that no longer holds.
+      #2715: a dep whose OWN queue row already reads :data:`STATE_DONE`
+      counts as landed here too, same as ``board.facts(dep).landed`` — see
+      :func:`_resolve_prereqs`'s matching case for why that row is trustworthy
+      without waiting on the ``issues`` cache to independently confirm it;
     * whether the CURRENT pre-req graph is even a plausible cause —
       delegated to :func:`_resolve_prereqs`, the exact function a live tick
       uses to decide this, so a render can never disagree with what the tick
@@ -1962,7 +1987,9 @@ def diagnose_blocked_after(
     live_terminal = live_prereq_terminal or {}
     unsatisfied = tuple(
         dep for dep in entry.after
-        if not board.facts(dep).landed and not live_terminal.get(dep)
+        if not board.facts(dep).landed
+        and not live_terminal.get(dep)
+        and states.get(dep) != STATE_DONE
     )
     if not entry.after:
         return BlockedAfterDiagnosis(unsatisfied)
@@ -2063,7 +2090,8 @@ def _reconcile_blocked_after(
       drive-queue list`/`status` rendering already uses, so this can never
       disagree with what an operator is shown — comes back satisfied (every
       named pre-req now reads `facts.landed`, OR *live_prereq_terminal*
-      confirms it live). Anything else (still unsatisfied, or unsatisfiable
+      confirms it live, OR the dep's own queue row already reads
+      `STATE_DONE`, #2715). Anything else (still unsatisfied, or unsatisfiable
       for a fresh reason, including a DIFFERENT pre-req going bad in the
       meantime) leaves the entry blocked.
 
