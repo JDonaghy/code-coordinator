@@ -761,11 +761,27 @@ impl CoordApp {
                 return false;
             }
         };
+        self.spawn_milestone_dispatch_command(&repo, tracking_issue, &title)
+    }
+
+    /// #2645: the reusable core of [`Self::dispatch_milestone_action`] —
+    /// spawns `coord milestone dispatch <repo> <tracking_issue>` and toasts
+    /// the outcome. Split out so a Pipeline-row epic right-click (which
+    /// carries a `ContextMenuTarget::PipelineRow`, not `MilestoneHeader`)
+    /// can drive the exact same seam `dialogs.rs`'s "Drive (automated)" item
+    /// re-points at for epic rows, instead of the mis-wired
+    /// `drive-queue add <repo> <epic_number>` it used to fall through to.
+    pub(crate) fn spawn_milestone_dispatch_command(
+        &mut self,
+        repo: &str,
+        tracking_issue: u64,
+        title: &str,
+    ) -> bool {
         let issue_str = tracking_issue.to_string();
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self
-            .command_runner
-            .spawn_queued(&["milestone", "dispatch", &repo, &issue_str]);
+        let outcome =
+            self.command_runner
+                .spawn_queued(&["milestone", "dispatch", repo, &issue_str]);
         match outcome {
             SpawnQueuedOutcome::Deduped => {}
             SpawnQueuedOutcome::Queued => {

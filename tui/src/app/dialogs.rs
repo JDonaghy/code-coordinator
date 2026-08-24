@@ -7415,9 +7415,37 @@ impl CoordApp {
             // to it. Deliberately does NOT touch `pipeline_detail_tab`:
             // queueing starts nothing locally, so there is no live run for
             // the Terminal tab to show yet.
+            //
+            // #2645: an epic (tracking-issue) row is NOT "the issue" in the
+            // sense `drive-queue add` expects — it carries the `epic`
+            // label, so `coord.dispatch.enforce_epic_dispatch_guard`
+            // refuses any `type="work"` dispatch against it (#1314), and
+            // `coord/drive_queue.py` sends a pre-dispatch refusal straight
+            // to `blocked` without incrementing `attempts` — one of the two
+            // cases #2230's self-heal deliberately never re-evaluates, so
+            // the row stays permanently blocked. What an epic row's "Drive
+            // (automated)" click should mean is exactly what the Plans
+            // panel's "Dispatch milestone" already does — expand the
+            // epic's `## Work order` DAG and queue every still-open child
+            // in dependency order — so this re-points at the same `coord
+            // milestone dispatch <repo> <tracking_issue>` seam
+            // `dispatch_milestone_action` uses, instead of queuing the
+            // tracking issue itself.
             "start-drive" => {
                 if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
-                    self.dispatch_drive_queue_add(&repo, issue, None, &[]);
+                    let epic_target = self
+                        .pipeline_issues
+                        .iter()
+                        .find(|iss| {
+                            iss.number == issue && iss.coord_repo.as_deref() == Some(repo.as_str())
+                        })
+                        .filter(|iss| labels_carry_epic_label(&iss.all_labels))
+                        .map(|iss| iss.title.clone());
+                    if let Some(title) = epic_target {
+                        self.spawn_milestone_dispatch_command(&repo, issue, &title);
+                    } else {
+                        self.dispatch_drive_queue_add(&repo, issue, None, &[]);
+                    }
                 }
                 true
             }
