@@ -2619,3 +2619,296 @@ class TestUpdateAssignmentTokensRetriesLockContention:
             "aid-tok-2", input_tokens=10, output_tokens=20,
             cache_creation_tokens=0, cache_read_tokens=0,
         )
+
+
+# ── #2689: issue-tracker seam writes ride out transient lock contention,
+# and never fail the call once the (irreversible) upstream GitHub write has
+# already landed ─────────────────────────────────────────────────────────
+
+
+class _BrokenConn:
+    """A connection whose every ``execute()`` raises a non-contention
+    `OperationalError` — simulates a real bug (schema drift, a typo in
+    hand-written SQL) rather than transient lock contention, so it must
+    surface immediately instead of being retried or swallowed."""
+
+    def execute(self, *args, **kwargs):
+        raise sqlite3.OperationalError("no such column: bogus")
+
+
+class TestCreateIssueLocalLockContention:
+    """`_create_issue_local` does an irreversible GitHub write (the issue
+    now exists) followed by a local cache-mirror write. Before #2689, any
+    `OperationalError` on that second write — including transient lock
+    contention from a concurrent writer elsewhere in the daemon — propagated
+    out as a 503. The natural response (retry) filed a duplicate GitHub
+    issue, because nothing told the caller the first call had actually
+    succeeded."""
+
+    @staticmethod
+    def _mock_create_issue(monkeypatch, calls: list, number: int = 99) -> None:
+        def _fake(repo, title, body, *, labels=None):
+            calls.append((repo, title, body, labels))
+            return {"number": number, "url": f"https://github.com/{repo}/issues/{number}"}
+
+        monkeypatch.setattr("coord.github_ops.create_issue", _fake)
+
+    def test_retries_transient_contention_then_returns_result(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _create_issue_local
+
+        calls: list = []
+        self._mock_create_issue(monkeypatch, calls)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        result = _create_issue_local(
+            "api", "new issue", "body", repo_github="acme/api"
+        )
+
+        assert result == {"number": 99, "url": "https://github.com/acme/api/issues/99"}
+        assert len(calls) == 1, "GitHub create_issue must be called exactly once"
+        assert proxy.calls == 3
+
+    def test_returns_result_without_raising_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The duplicate-filing regression, asserted directly: even when the
+        cache mirror never lands, the caller must see the created issue back
+        — not a 503 that reads as "nothing happened" and invites a retry
+        that creates a second issue on GitHub."""
+        from coord.state import _create_issue_local
+
+        calls: list = []
+        self._mock_create_issue(monkeypatch, calls)
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            result = _create_issue_local(
+                "api", "new issue", "body", repo_github="acme/api"
+            )
+
+        assert result == {"number": 99, "url": "https://github.com/acme/api/issues/99"}
+        assert len(calls) == 1, "GitHub create_issue must be called exactly once"
+        assert any("2689" in rec.message for rec in caplog.records)
+
+    def test_raises_on_non_contention_operational_error(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A genuine bug in the hand-written cache-mirror SQL (schema drift,
+        a typo) must still surface — only lock contention is absorbed."""
+        from coord.state import _create_issue_local
+
+        calls: list = []
+        self._mock_create_issue(monkeypatch, calls)
+        monkeypatch.setattr("coord.state.get_connection", lambda: _BrokenConn())
+
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            _create_issue_local("api", "new issue", "body", repo_github="acme/api")
+        assert len(calls) == 1, "the GitHub write already happened before the raise"
+
+
+class TestEditIssueContentLocalLockContention:
+    """Mirrors TestCreateIssueLocalLockContention for `_edit_issue_content_local`
+    — the sibling the #2689 issue names as already sharing this exact shape."""
+
+    @staticmethod
+    def _mock_edit_issue(monkeypatch, calls: list) -> None:
+        def _fake(repo, issue_number, *, title=None, body=None):
+            calls.append((repo, issue_number, title, body))
+
+        monkeypatch.setattr("coord.github_ops.edit_issue", _fake)
+
+    def test_retries_transient_contention_then_returns_true(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _edit_issue_content_local
+
+        calls: list = []
+        self._mock_edit_issue(monkeypatch, calls)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        result = _edit_issue_content_local(
+            "api", 9, title="new title", repo_github="acme/api"
+        )
+
+        assert result is True
+        assert calls == [("acme/api", 9, "new title", None)]
+        assert proxy.calls == 3
+
+    def test_returns_true_without_raising_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _edit_issue_content_local
+
+        calls: list = []
+        self._mock_edit_issue(monkeypatch, calls)
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            result = _edit_issue_content_local(
+                "api", 9, title="new title", repo_github="acme/api"
+            )
+
+        assert result is True
+        assert len(calls) == 1, "the GitHub edit must not be retried"
+        assert any("2689" in rec.message for rec in caplog.records)
+
+    def test_raises_on_non_contention_operational_error(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _edit_issue_content_local
+
+        calls: list = []
+        self._mock_edit_issue(monkeypatch, calls)
+        monkeypatch.setattr("coord.state.get_connection", lambda: _BrokenConn())
+
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            _edit_issue_content_local(
+                "api", 9, title="new title", repo_github="acme/api"
+            )
+        assert len(calls) == 1, "the GitHub write already happened before the raise"
+
+
+class TestApplyIssueLabelsLocalLockContention:
+    """Same shape as `_create_issue_local`: `github_ops.change_issue_labels`
+    is the irreversible upstream write; the cache mirror (via
+    `_update_issue_labels_local`) must not fail the call once it has
+    landed."""
+
+    def test_retries_transient_contention_then_returns_labels(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _apply_issue_labels_local
+
+        monkeypatch.setattr(
+            "coord.github_ops.change_issue_labels",
+            lambda repo, num, *, add, remove: (["bug", "coord"], True),
+        )
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        new_labels, changed = _apply_issue_labels_local(
+            "api", 9, add={"coord"}, remove=set(), repo_github="acme/api"
+        )
+
+        assert (new_labels, changed) == (["bug", "coord"], True)
+        assert proxy.calls == 3
+
+    def test_returns_labels_without_raising_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _apply_issue_labels_local
+
+        monkeypatch.setattr(
+            "coord.github_ops.change_issue_labels",
+            lambda repo, num, *, add, remove: (["bug", "coord"], True),
+        )
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            new_labels, changed = _apply_issue_labels_local(
+                "api", 9, add={"coord"}, remove=set(), repo_github="acme/api"
+            )
+
+        assert (new_labels, changed) == (["bug", "coord"], True)
+        assert any("2689" in rec.message for rec in caplog.records)
+
+
+class TestMilestoneLocalLockContention:
+    """Same shape, for `_assign_issue_milestone_local` /
+    `_unassign_issue_milestone_local`."""
+
+    def test_assign_retries_transient_contention_without_raising(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _assign_issue_milestone_local
+
+        monkeypatch.setattr("coord.github_ops.assign_issue_milestone", lambda *a, **k: None)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        _assign_issue_milestone_local(
+            "api", 9, 3, milestone_title="v1", repo_github="acme/api"
+        )  # must not raise
+
+        assert proxy.calls == 3
+
+    def test_assign_does_not_raise_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _assign_issue_milestone_local
+
+        monkeypatch.setattr("coord.github_ops.assign_issue_milestone", lambda *a, **k: None)
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            _assign_issue_milestone_local(
+                "api", 9, 3, milestone_title="v1", repo_github="acme/api"
+            )  # must not raise
+        assert any("2689" in rec.message for rec in caplog.records)
+
+    def test_unassign_does_not_raise_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _unassign_issue_milestone_local
+
+        monkeypatch.setattr("coord.github_ops.unassign_issue_milestone", lambda *a, **k: None)
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            _unassign_issue_milestone_local(
+                "api", 9, repo_github="acme/api"
+            )  # must not raise
+        assert any("2689" in rec.message for rec in caplog.records)
+
+
+class TestMarkReviewPostedLocalLockContention:
+    """`_mark_review_posted_local` is pure local bookkeeping — no GitHub
+    call inside it — but the review findings it records as "posted" were
+    already posted to GitHub by its caller before this runs. This was the
+    one confirmed *live* instance of the #2689 bug class (observed firing
+    every few minutes on dellserver from `post_orphaned_review_findings`)."""
+
+    def test_retries_transient_contention_without_raising(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _mark_review_posted_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        _mark_review_posted_local("aid-does-not-exist")  # must not raise
+        # 2 failed UPDATE attempts + 1 successful UPDATE + the follow-up
+        # SELECT this function does afterward (for the audit-log lookup).
+        assert proxy.calls == 4
+
+    def test_does_not_raise_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _mark_review_posted_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            _mark_review_posted_local("aid-does-not-exist")  # must not raise
+        assert any("2689" in rec.message for rec in caplog.records)
