@@ -10,6 +10,7 @@ Covers the three acceptance criteria from the issue:
 
 from __future__ import annotations
 
+import errno
 import os
 import time
 from pathlib import Path
@@ -20,6 +21,34 @@ from coord import cargo_cache
 from coord.agent import stash_artifacts_for_branch
 
 from tests.test_agent import _init_repo, _server, _spec
+
+
+class _FakeFcntlHeld:
+    """Stand-in for the pieces of ``fcntl`` that ``cargo_cache._build_lock_held``
+    uses, always reporting the probed lock as already held by someone else.
+
+    #2729: the two tests below used to ``import fcntl`` directly and take a
+    *real* OS-level advisory lock to simulate an external ``cargo`` process
+    mid-build -- ``fcntl`` doesn't exist on Windows at all, so a bare
+    ``import fcntl`` raised ``ModuleNotFoundError`` there before the test body
+    even ran.  ``cargo_cache.py`` itself already degrades cleanly when
+    ``fcntl`` is unavailable (``_build_lock_held`` returns ``False``), so the
+    real gap was the test reaching past that guard for a module the platform
+    may not have.  Patching ``cargo_cache.fcntl`` to this fake — same pattern
+    ``tests/test_filelock.py`` uses for its ``_FakeMsvcrt`` -- exercises the
+    *decision logic* (an ``OSError`` from ``flock`` means "a build is in
+    flight", which must block pruning) without depending on a real OS lock
+    primitive being available on the host running the test.
+    """
+
+    LOCK_EX = 1
+    LOCK_NB = 2
+    LOCK_UN = 4
+
+    def flock(self, fd: int, op: int) -> None:
+        if op & self.LOCK_UN:
+            return
+        raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
 
 
 def _fill(path: Path, nbytes: int, name: str = "blob.bin") -> Path:
@@ -398,25 +427,27 @@ def test_protected_repo_is_pruned_when_nothing_is_compiling(tmp_path: Path) -> N
 
 
 def test_protected_repo_with_a_live_build_is_left_alone_and_escalates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """The build lock is real: cargo holds an exclusive flock on
-    ``<target>/<profile>/.cargo-lock`` for the duration of a build, so a held
-    lock means "do not touch this tree" — and the sweep must then *report* the
-    overage rather than returning quietly the way it did while 38G piled up."""
-    import fcntl
+    """cargo holds an exclusive flock on ``<target>/<profile>/.cargo-lock``
+    for the duration of a build, so a held lock means "do not touch this
+    tree" — and the sweep must then *report* the overage rather than
+    returning quietly the way it did while 38G piled up.
+
+    #2729: the held lock is simulated via a fake ``fcntl`` (see
+    ``_FakeFcntlHeld`` above) rather than a real OS-level flock — ``fcntl``
+    doesn't exist on Windows, and this test cares about the decision logic
+    ("a build is in flight" blocks pruning), not the OS lock primitive
+    itself.
+    """
+    monkeypatch.setattr(cargo_cache, "fcntl", _FakeFcntlHeld())
 
     root = tmp_path / "cargo-target"
     repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
     lock = repo / "debug" / cargo_cache.BUILD_LOCK_NAME
     lock.write_text("")
-    fd = os.open(str(lock), os.O_RDONLY)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        r = cargo_cache.sweep(tmp_path, cap=2000, protect_repos={"quadraui"})
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+
+    r = cargo_cache.sweep(tmp_path, cap=2000, protect_repos={"quadraui"})
 
     assert r["cargo_pruned"] == []
     assert r["cargo_prune_blocked"] == ["quadraui"]
@@ -426,24 +457,22 @@ def test_protected_repo_with_a_live_build_is_left_alone_and_escalates(
 
 
 def test_an_unprotected_repo_with_a_live_build_is_left_alone_too(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """An operator's own ``cargo build`` against the shared cache holds no
     coord assignment.  Refusing to reclaim costs disk (and says so); rmtree-ing
-    39G out from under their rustc costs them the build."""
-    import fcntl
+    39G out from under their rustc costs them the build.
+
+    #2729: same fake-``fcntl`` seam as the test above.
+    """
+    monkeypatch.setattr(cargo_cache, "fcntl", _FakeFcntlHeld())
 
     root = tmp_path / "cargo-target"
     repo = _repo_cache(root, "quadraui", warm=4000, incremental=1000)
     lock = repo / "debug" / cargo_cache.BUILD_LOCK_NAME
     lock.write_text("")
-    fd = os.open(str(lock), os.O_RDONLY)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        r = cargo_cache.sweep(tmp_path, cap=100)
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+
+    r = cargo_cache.sweep(tmp_path, cap=100)
 
     assert r["cargo_evicted_repos"] == []
     assert r["cargo_pruned"] == []

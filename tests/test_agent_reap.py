@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, List, Tuple
+
+import pytest
 
 from coord.agent import (
     HOST_SLEEP_EXIT,
@@ -151,6 +154,26 @@ def test_pty_marker_bytes_sync_with_provider_string() -> None:
 
 # ── _wait_for_proc_or_result ─────────────────────────────────────────────────
 
+# #2729: every test below whose ``killpg`` recorder actually fires exercises
+# `_wait_for_proc_or_result`'s real, uninjected `signal.SIGKILL`/`SIGTERM`
+# constants -- `killpg` itself is injected per-test, but the signal VALUES
+# handed to it are built inside `coord/agent.py`'s own module body from its
+# own module-level `signal` import, which has no `SIGKILL` attribute on
+# win32 at all ("Availability: Unix", per the stdlib docs) -- so the real
+# (non-test) function raises `AttributeError` there regardless of the
+# injected callable. This is the process-group reaper CP-7 (#1163) owns the
+# Job Objects port for, per #2729/#2680's explicit bucket-b boundary: skip
+# rather than shim. Tests where the watchdog/ceiling never actually fires
+# (``calls == []``) never reach those lines and need no skip.
+_WIN32_REAPER_SKIP = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="_wait_for_proc_or_result's kill escalation reaches the real "
+    "signal.SIGKILL/SIGTERM (coord/agent.py) even with killpg() injected -- "
+    "process-group reaping is POSIX-only until Job Objects (Windows-native "
+    "attended sessions) land, owned by #1163, not this issue",
+)
+
+
 class _FakeProc:
     """Minimal Popen stand-in: exits after N wait() calls or never exits.
 
@@ -253,6 +276,7 @@ def test_clean_exit_returns_proc_exit_code(tmp_path: Path) -> None:
     assert code == 42
 
 
+@_WIN32_REAPER_SKIP
 def test_force_kills_when_result_seen_then_proc_hangs(tmp_path: Path) -> None:
     """The fix for #228: worker emits result, proc.wait keeps timing out,
     so we SIGTERM the group and return 0."""
@@ -278,6 +302,7 @@ def test_force_kills_when_result_seen_then_proc_hangs(tmp_path: Path) -> None:
     assert "SIGTERM" in text
 
 
+@_WIN32_REAPER_SKIP
 def test_escalates_to_sigkill_when_sigterm_ignored(tmp_path: Path) -> None:
     """If SIGTERM doesn't bring the proc down, SIGKILL follows."""
     log_path = str(tmp_path / "log")
@@ -299,6 +324,7 @@ def test_escalates_to_sigkill_when_sigterm_ignored(tmp_path: Path) -> None:
     assert signal.SIGKILL in sigs
 
 
+@_WIN32_REAPER_SKIP
 def test_max_wait_safety_net_sigkills_and_marks_failed(tmp_path: Path) -> None:
     """If the worker never emits a result, max_wait elapses and we SIGKILL."""
     log_path = str(tmp_path / "log")
@@ -331,6 +357,7 @@ def test_max_wait_safety_net_sigkills_and_marks_failed(tmp_path: Path) -> None:
     assert "max-wait" in Path(log_path).read_text()
 
 
+@_WIN32_REAPER_SKIP
 def test_result_detected_mid_wait_only_kills_after_grace(tmp_path: Path) -> None:
     """If the worker emits the result mid-wait but might still exit cleanly,
     we wait the grace period before escalating."""
@@ -416,6 +443,7 @@ def _clock_advancing_proc(proc: _FakeProc, clock) -> None:
     proc.wait = wait_advances  # type: ignore[assignment]
 
 
+@_WIN32_REAPER_SKIP
 def test_watchdog_fires_when_no_first_output(tmp_path: Path) -> None:
     """No output within first_output_timeout → killpg once + NO_FIRST_OUTPUT_EXIT."""
     log_path = str(tmp_path / "log")
@@ -542,6 +570,7 @@ def test_ttft_watchdog_unaffected_by_the_new_wall_clock_params(tmp_path: Path) -
 
 # ── wall-clock runtime ceiling + host-sleep detection (#2638) ───────────────
 
+@_WIN32_REAPER_SKIP
 def test_runtime_ceiling_kills_a_leg_that_outlives_it(tmp_path: Path) -> None:
     """A leg whose wall-clock runtime exceeds the ceiling is killed and
     returns RUNTIME_CEILING_EXIT, stamped with a distinguishing log line —
@@ -589,6 +618,7 @@ def test_runtime_ceiling_kills_a_leg_that_outlives_it(tmp_path: Path) -> None:
     assert "runtime ceiling" in text
 
 
+@_WIN32_REAPER_SKIP
 def test_runtime_ceiling_measured_on_wall_clock_not_monotonic(tmp_path: Path) -> None:
     """#2638: the ceiling MUST be measured on wall-clock elapsed, not
     monotonic elapsed. A leg whose monotonic clock barely advances (the
@@ -638,6 +668,7 @@ def test_runtime_ceiling_measured_on_wall_clock_not_monotonic(tmp_path: Path) ->
     assert mono() < 1.0  # monotonic elapsed stayed tiny the whole time
 
 
+@_WIN32_REAPER_SKIP
 def test_host_sleep_detected_via_wall_monotonic_divergence(tmp_path: Path) -> None:
     """#2638: a suspend/resume between two polls — monotonic freezes
     (mirrors `CLOCK_MONOTONIC` not advancing across s2idle) while the wall
@@ -688,6 +719,7 @@ def test_host_sleep_detected_via_wall_monotonic_divergence(tmp_path: Path) -> No
     assert "host sleep detected" in text
 
 
+@_WIN32_REAPER_SKIP
 def test_host_sleep_check_gated_on_result_seen_at_is_none(tmp_path: Path) -> None:
     """Review finding (non-blocking, #2638 iteration 1): the host-sleep check
     must be gated on `result_seen_at is None`, exactly like the runtime

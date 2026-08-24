@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -391,6 +392,26 @@ class TestResolveWebToken:
         assert resolve_web_token("   ") is None
 
 
+# #2729: both classes below drive the REAL ``TmuxSessionAttacher.attach()``
+# (not the ``_FakeSessionAttacher`` seam the WebSocket-bridge tests above
+# use), which opens a real PTY via ``pty.openpty()`` and primes it with
+# ``fcntl.ioctl``/``termios.TIOCSWINSZ`` -- all three stdlib modules are
+# Unix-only ("Availability: Unix" per the stdlib docs) and `coord/dashboard/
+# terminal.py` defers importing them into the function body specifically so
+# the module itself still loads on Windows (#1156); calling the function for
+# real is what reaches them. This is the PTY layer CP-7 (#1163) owns the
+# ConPTY/pywinpty port for, per #2729/#2680's explicit bucket-b boundary:
+# skip rather than shim.
+_WIN32_PTY_SKIP = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="TmuxSessionAttacher.attach() opens a real PTY via pty.openpty() "
+    "and primes it via fcntl.ioctl/termios.TIOCSWINSZ (coord/dashboard/"
+    "terminal.py) -- all Unix-only; the Windows PTY layer is ConPTY/"
+    "pywinpty, owned by #1163, not this issue",
+)
+
+
+@_WIN32_PTY_SKIP
 class TestTmuxSessionAttacherTermEnv:
     """Regression tests for #1229: ``TERM`` must always reach the subprocess.
 
@@ -467,6 +488,7 @@ class TestTmuxSessionAttacherTermEnv:
         assert captured_env["TERM"] == "rxvt-unicode-256color"
 
 
+@_WIN32_PTY_SKIP
 class TestTmuxSessionAttacherResizeHardening:
     """Tests for the tmux resize-to-client hardening.
 

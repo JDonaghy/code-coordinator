@@ -829,6 +829,47 @@ class TestFailedUnitsScopedToCoord:
         assert [f.signature for f in findings] == ["failed-unit:coord-agent.service"]
 
 
+class TestSystemctlEnvWindowsSafe:
+    """#2729: ``_systemctl_env``'s ``XDG_RUNTIME_DIR`` default must not reach
+    ``os.getuid()`` on win32 — same shape as coord/agent_app.py's #2681 fix.
+    ``SYSTEMCTL`` already resolves to ``None`` on a real Windows machine (no
+    absolute path exists), but tests above patch ``SYSTEMCTL`` directly to
+    exercise the subprocess-calling paths on every platform, so the default
+    itself must degrade instead of raising.
+    """
+
+    def test_sets_xdg_runtime_dir_on_posix(self, monkeypatch):
+        """Faking ``sys.platform`` exercises the POSIX branch on any host,
+        including a real Windows CI runner -- but faking the platform
+        doesn't fake away a genuinely missing stdlib attribute, so
+        ``os.getuid`` must be stubbed too rather than called for real."""
+        monkeypatch.setattr(fleet_watchdog.sys, "platform", "linux")
+        monkeypatch.setattr(fleet_watchdog.os, "getuid", lambda: 1000, raising=False)
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+        env = fleet_watchdog._systemctl_env()
+        assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+    def test_preserves_an_existing_xdg_runtime_dir(self, monkeypatch):
+        """``dict.setdefault``'s default argument is evaluated eagerly
+        regardless of whether the key is already present, so ``os.getuid``
+        must be stubbed here too or this crashes on a host without it."""
+        monkeypatch.setattr(fleet_watchdog.sys, "platform", "linux")
+        monkeypatch.setattr(fleet_watchdog.os, "getuid", lambda: 1000, raising=False)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/custom")
+
+        env = fleet_watchdog._systemctl_env()
+        assert env["XDG_RUNTIME_DIR"] == "/run/user/custom"
+
+    def test_skips_xdg_runtime_dir_on_win32(self, monkeypatch):
+        monkeypatch.setattr(fleet_watchdog.sys, "platform", "win32")
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delattr(fleet_watchdog.os, "getuid", raising=False)
+
+        env = fleet_watchdog._systemctl_env()
+        assert "XDG_RUNTIME_DIR" not in env
+
+
 # ---------------------------------------------------------------------------
 # deploy/coord-fleet-watchdog.service's own OnFailure= escalation (#2580
 # review, non-blocking concern). Mirrors the guard style of
