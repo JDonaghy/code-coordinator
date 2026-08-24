@@ -111,6 +111,7 @@ from coord.commands.test_gate import (
     set_test_mode,
     test,
     test_plan_cmd,
+    uat,
 )
 from coord.commands.chat import (
     new_issue_chat,
@@ -448,6 +449,7 @@ main.add_command(merge)
 main.add_command(resume)
 main.add_command(test)
 main.add_command(test_plan_cmd)
+main.add_command(uat)
 main.add_command(split)
 main.add_command(done)
 main.add_command(session)

@@ -98,6 +98,10 @@ def row_to_assignment(row: object) -> Assignment:
         review_posted_at=d.get("review_posted_at"),
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
+        # #2687: pre-merge UAT gate verdict; None for rows predating this
+        # column or a repo that hasn't opted in via Repo.uat_preview.
+        uat_state=d.get("uat_state"),
+        uat_reason=d.get("uat_reason"),
         # #1479: Test-gate staleness anchor; None for pre-1479 rows or where
         # it couldn't be captured — the merge-queue gate treats that as "SHA
         # tracking unavailable" and skips the staleness check (fail open).

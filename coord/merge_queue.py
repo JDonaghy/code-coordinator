@@ -712,6 +712,138 @@ def requires_smoke(entry: "QueuedMerge", config) -> bool:
     return "test" in gates
 
 
+# ── UAT gate (#2687) ─────────────────────────────────────────────────────────
+#
+# A human-attended gate for customer-facing repos: the operator must click
+# through the PR's deployed preview and record a verdict before merge — the
+# thing that would have caught natal-chart#42 (a shipped visual defect no
+# automated gate could see). Two-part opt-in, deliberately AND-ed together
+# rather than either one alone being sufficient:
+#
+#   1. "uat" appears in the entry's effective gate list (required_gates, or
+#      config.pipeline.default_gates) — the fleet-wide half, same mechanism
+#      requires_review/requires_smoke use.
+#   2. The entry's OWN repo has Repo.uat_preview configured — the per-repo
+#      half. This is what keeps "ship the mechanism with the default off
+#      everywhere" true even if an operator adds "uat" to default_gates
+#      (fleet-wide) without meaning to turn it on for every repo: a repo
+#      with no uat_preview never blocks, no matter what default_gates says.
+#
+# Unlike requires_review/requires_smoke, there is no SHA/patch-id staleness
+# tracking here (see evaluate_uat_verdict's docstring) — a UAT verdict is a
+# human's judgment on a rendered preview, not a re-runnable measurement.
+
+def _uat_repo_for(entry, config):
+    """Best-effort ``config.repo(entry.repo_name)`` lookup for the UAT gate.
+
+    Mirrors the existing ``try/except`` duck-typing convention this module
+    already uses for the identical lookup in ``_staging_smoke_entry`` — a
+    *config* that is a real ``coord.config.Config`` (every production
+    caller) always has ``.repo()``, but a minimal test double or a future
+    duck-typed stand-in might not, and an unknown/malformed repo name is
+    "can't confirm this repo opted in", not a crash.
+    """
+    if config is None:
+        return None
+    try:
+        return config.repo(getattr(entry, "repo_name", None))
+    except Exception:  # noqa: BLE001 — unknown repo: no live lookup possible
+        return None
+
+
+def requires_uat(entry: "QueuedMerge", config) -> bool:
+    """True when *entry* must have a recorded UAT verdict before merging.
+
+    See the module-comment above this function for the two-part opt-in.
+    Duck-typed on ``entry.repo_name``/``entry.required_gates``, matching
+    :func:`requires_review`/:func:`requires_smoke`.
+    """
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None or config is None:
+        return False
+    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
+    if "uat" not in gates:
+        return False
+    repo = _uat_repo_for(entry, config)
+    return bool(repo is not None and repo.uat_preview)
+
+
+def _uat_branch_work(entry: "QueuedMerge", board) -> list:
+    """Work-like assignments in *entry*'s branch chain, most-recently-
+    dispatched first — the population :func:`evaluate_uat_verdict` reads
+    ``uat_state``/``uat_reason`` from. Mirrors the board walk
+    :func:`evaluate_smoke_verdict` opens with."""
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = _chain_work_ids(entry, pool)
+    branch_work = [
+        a for a in pool
+        if getattr(a, "assignment_id", None) in branch_work_ids
+        and getattr(a, "type", None) in WORK_LIKE_TYPES
+    ]
+    branch_work.sort(key=lambda a: getattr(a, "dispatched_at", None) or 0, reverse=True)
+    return branch_work
+
+
+def evaluate_uat_verdict(
+    entry: "QueuedMerge", board, config
+) -> tuple[bool, str]:
+    """Return ``(ok, message)`` for *entry*'s UAT-gate state.
+
+    ``ok`` is True only when the most recent verdict on the branch's work
+    chain is ``"passed"``. ``message`` (populated only when not ``ok``) is
+    the whole point of #2687's "surface the URL where the operator already
+    looks": it names the missing/failed verdict, the repo's rendered
+    preview URL (:meth:`coord.models.Repo.resolve_uat_preview_url`), and
+    the exact ``coord uat`` command to clear it — so a caller can print it
+    verbatim instead of sending the operator hunting for the link.
+
+    Fails CLOSED when no work assignment can be identified for the branch
+    (unlike :func:`evaluate_smoke_verdict`, which fails open there) — same
+    posture as the review gate's :func:`has_approved_review`: a verdict
+    this gate exists specifically to force a human to record is never
+    assumed to exist merely because the board can't prove otherwise.
+    """
+    branch_work = _uat_branch_work(entry, board)
+    aid = getattr(entry, "assignment_id", None)
+    uat_state: str | None = None
+    uat_reason: str | None = None
+    if branch_work:
+        # Most-recently-dispatched row carrying ANY verdict wins — mirrors
+        # find_scoped_review_candidate's "latest wins" rationale: a bounce/
+        # fix round's fresh work assignment is a new thing for the operator
+        # to look at, so an older sibling's stale verdict must not paper
+        # over it.
+        for a in branch_work:
+            state = getattr(a, "uat_state", None)
+            if state:
+                uat_state = state
+                uat_reason = getattr(a, "uat_reason", None)
+                aid = getattr(a, "assignment_id", None) or aid
+                break
+    if uat_state == "passed":
+        return True, ""
+
+    repo = _uat_repo_for(entry, config)
+    preview_url = (
+        repo.resolve_uat_preview_url(
+            branch=getattr(entry, "branch", None),
+            issue_number=getattr(entry, "issue_number", None),
+            pr_number=getattr(entry, "pr_number", None),
+        )
+        if repo is not None
+        else None
+    )
+    if uat_state == "failed":
+        reason_part = f": {uat_reason}" if (uat_reason or "").strip() else ""
+        message = f"uat verdict FAILED{reason_part}"
+    else:
+        message = "uat verdict missing"
+    if preview_url:
+        message += f" — preview: {preview_url}"
+    message += f" — run: coord uat {aid or '<assignment-id>'} --passed|--failed"
+    return False, message
+
+
 # ── Gate-bypass auditing (#1213) ────────────────────────────────────────────
 
 def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
@@ -721,15 +853,18 @@ def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     Returns ``[]`` when ``entry`` carries no override (``required_gates``
     empty/absent — falls back to ``config.pipeline.default_gates``, nothing
     to bypass) or when its resolved gates already match the default list.
-    Only ``"review"`` and ``"test"`` are reported — ``"merge"`` is the
-    terminal action being gated, not a checkpoint that can be "bypassed".
+    Only ``"review"``, ``"test"``, and ``"uat"`` are reported — ``"merge"``
+    is the terminal action being gated, not a checkpoint that can be
+    "bypassed".
 
     ``"review"`` is reported only when ``config.reviews.enabled`` is truthy
     — mirroring the guard :func:`requires_review` applies first. When review
     is globally disabled, dropping ``"review"`` from a label's resolved gate
     list changes nothing (the gate was already off), so it isn't a real
     bypass and reporting it would produce a misleading audit row / CLI note
-    (#1213 review finding 1).
+    (#1213 review finding 1). ``"uat"`` (#2687) gets the same treatment,
+    mirroring :func:`requires_uat`'s guard instead: reported only when the
+    entry's own repo has ``uat_preview`` configured.
     """
     gates = getattr(entry, "required_gates", None)
     if not gates:
@@ -739,9 +874,21 @@ def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     reviews_enabled = bool(getattr(config, "reviews", None)) and bool(
         getattr(config.reviews, "enabled", True)
     )
-    candidates = [g for g in ("review", "test") if g in default_gates and g not in gates]
+    # #2687: only look up the repo when "uat" is actually a candidate — same
+    # short-circuit requires_uat applies, and it means a config stand-in
+    # with no `.repo()` (an older test double, a future duck-typed caller)
+    # never has to grow one just because this function now knows about a
+    # gate it will filter out on the very next line anyway.
+    uat_configured = "uat" in default_gates and "uat" not in gates and bool(
+        (repo := _uat_repo_for(entry, config)) is not None and repo.uat_preview
+    )
+    candidates = [
+        g for g in ("review", "test", "uat") if g in default_gates and g not in gates
+    ]
     if not reviews_enabled:
         candidates = [g for g in candidates if g != "review"]
+    if not uat_configured:
+        candidates = [g for g in candidates if g != "uat"]
     return candidates
 
 
@@ -881,11 +1028,19 @@ class MergeGateFailure:
     merge time** — the whole point of #1695 being that the gate and its
     override must live at the same stage. It is a display string; nothing
     here waives anything.
+
+    #2687: ``"uat"`` has no waiver flag at all — recording an actual verdict
+    (``coord uat <id> --passed``) is the only way through, by design (an
+    unattended bypass would defeat the entire point of the gate). Its
+    ``waiver_flag`` carries that command instead of a ``coord merge`` flag —
+    the field is repurposed as "the thing that clears this", not narrowed to
+    literally "a waiver", so :func:`describe_merge_gate_failures` still
+    prints one actionable line per failure without a third field.
     """
 
-    gate: str          # "review" | "smoke"
+    gate: str          # "review" | "smoke" | "uat"
     reason: str        # short human-readable cause
-    waiver_flag: str   # "--skip-review" | "--skip-smoke"
+    waiver_flag: str   # "--skip-review" | "--skip-smoke" | "coord uat <id> --passed"
 
     def __str__(self) -> str:
         return f"{self.gate} gate — {self.reason} (waive with {self.waiver_flag})"
@@ -929,6 +1084,17 @@ def merge_gate_failures(
                 gate="smoke",
                 reason=smoke.short_reason or "test verdict missing",
                 waiver_flag="--skip-smoke",
+            ))
+            if stop_early:
+                return failures
+    if requires_uat(a, config):
+        uat_ok, uat_message = evaluate_uat_verdict(a, board, config)
+        if not uat_ok:
+            aid = getattr(a, "assignment_id", None) or "<id>"
+            failures.append(MergeGateFailure(
+                gate="uat",
+                reason=uat_message,
+                waiver_flag=f"coord uat {aid} --passed",
             ))
             if stop_early:
                 return failures
@@ -2377,6 +2543,13 @@ _STALE_GATE_ERRORS = frozenset({
 # without any merge attempt running), so it gets the same recomputation.
 _STALE_GATE_ERROR_PREFIXES = ("smoke test verdict is stale:",)
 
+# #2687: the UAT gate's messages embed a preview URL/assignment id (see
+# evaluate_uat_verdict), so — like the smoke-stale wording above — they
+# can't be matched by equality; both variants (missing/failed) share this
+# prefix and go stale the same #420 way: `coord uat --passed` outside a
+# merge attempt doesn't touch the stored `entry.error` string.
+_UAT_GATE_ERROR_PREFIX = "uat verdict"
+
 # #2085: the honest third answer for the review gate on a read-only surface —
 # neither "not approved" (unconfirmed failure) nor cleared (unconfirmed
 # success). See `display_error`.
@@ -2389,7 +2562,11 @@ def _is_recomputable_gate_error(err: str | None) -> bool:
     """True when *err* is a gate refusal :func:`display_error` may recompute."""
     if not err:
         return False
-    return err in _STALE_GATE_ERRORS or err.startswith(_STALE_GATE_ERROR_PREFIXES)
+    return (
+        err in _STALE_GATE_ERRORS
+        or err.startswith(_STALE_GATE_ERROR_PREFIXES)
+        or err.startswith(_UAT_GATE_ERROR_PREFIX)
+    )
 
 
 def display_error(entry: "QueuedMerge", board, config) -> str | None:
@@ -2405,8 +2582,9 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
     approved" indefinitely. Left unchecked this invites operators to bounce
     already-approved work back for another round (the #410 real-world case).
 
-    Only the two gate messages known to go stale this way are recomputed
-    here, and recomputation is pure board/config lookups — no I/O. Every
+    Only the gate messages known to go stale this way (review, smoke, and
+    — #2687 — uat) are recomputed here, and recomputation is pure
+    board/config lookups — no I/O. Every
     other stored error (merge conflicts, CI check results) reflects the
     outcome of the *last actual attempt* and is left untouched; re-checking
     CI on every ``coord status`` would mean a live ``gh`` call per queue
@@ -2456,6 +2634,16 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
         if entry.error.startswith(_STALE_GATE_ERROR_PREFIXES):
             return entry.error
         return None
+    if entry.error.startswith(_UAT_GATE_ERROR_PREFIX):
+        # #2687: no staleness nuance to preserve here (unlike the smoke
+        # branch above) — a UAT verdict carries no SHA anchor that can go
+        # stale, so a fresh recompute is always the right answer: cleared
+        # when a "passed" verdict landed since the stored error was set,
+        # otherwise the freshly-worded (still-accurate) message.
+        if not requires_uat(entry, config):
+            return None
+        uat_ok, uat_message = evaluate_uat_verdict(entry, board, config)
+        return None if uat_ok else uat_message
     return entry.error  # pragma: no cover — unreachable, kept for safety
 
 
@@ -3892,6 +4080,16 @@ def _entry_gate_status(
                 if conflict_reason is not None:
                     return PLAN_BLOCKED, conflict_reason
                 return PLAN_BLOCKED, smoke.short_reason
+        # #2687: UAT gate, ordered between review/smoke and CI/merge —
+        # matching the issue's "ordered between review and merge". No
+        # staleness recompute needed (unlike the smoke branch above): a UAT
+        # verdict carries no SHA anchor to go stale against, so the message
+        # `evaluate_uat_verdict` returns here is already exactly what a
+        # live merge attempt would report.
+        if requires_uat(entry, config):
+            uat_ok, uat_message = evaluate_uat_verdict(entry, board, config)
+            if not uat_ok:
+                return PLAN_BLOCKED, uat_message
     if ci_store is not None and ci_store.is_available and entry.pr_number:
         checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
         # #1904: an empty check list satisfies every gate below vacuously —
@@ -5242,6 +5440,7 @@ def process(
     board=None,
     skip_review: bool = False,
     skip_smoke: bool = False,
+    skip_uat: bool = False,
 ) -> list[MergeEvent]:
     """Open PRs, size them, then merge each pending item.
 
@@ -5488,6 +5687,24 @@ def process(
                         events.append(MergeEvent(
                             entry, "smoke_required",
                             f"(dry run) would be blocked: {_why} for {entry.branch}",
+                        ))
+                        continue
+                # #2687: UAT gate preview — same check the live path below
+                # runs, ordered between review/smoke and CI/merge.
+                if (
+                    not skip_uat
+                    and config is not None
+                    and requires_uat(entry, config)
+                ):
+                    _uat_ok, _uat_message = (
+                        (False, "board unavailable to confirm UAT verdict")
+                        if board is None
+                        else evaluate_uat_verdict(entry, board, config)
+                    )
+                    if not _uat_ok:
+                        events.append(MergeEvent(
+                            entry, "uat_required",
+                            f"(dry run) would be blocked: {_uat_message} for {entry.branch}",
                         ))
                         continue
                 # CI gate (#240) preview, added by #1624: same check the real
@@ -5857,6 +6074,26 @@ def process(
                     )
                     entry.error = msg
                     events.append(MergeEvent(entry, "smoke_required", msg))
+                    continue  # skip this entry; try the next in the group
+            # UAT gate (#2687): refuse to merge a customer-facing change until
+            # an operator has clicked through the PR's deployed preview and
+            # recorded a verdict. Ordered between review/smoke and CI/merge,
+            # same skip-not-halt semantics as the gates above. Two-part
+            # opt-in (see requires_uat) means this is a no-op for every repo
+            # that hasn't set `uat_preview` — the default posture everywhere.
+            if (
+                not skip_uat
+                and config is not None
+                and requires_uat(entry, config)
+            ):
+                uat_ok, uat_msg = (
+                    (False, "uat verdict required but board unavailable to confirm")
+                    if board is None
+                    else evaluate_uat_verdict(entry, board, config)
+                )
+                if not uat_ok:
+                    entry.error = uat_msg
+                    events.append(MergeEvent(entry, "uat_required", uat_msg))
                     continue  # skip this entry; try the next in the group
             # CI gate (#240): refuse to merge when checks are failed or
             # still running.  --force-merge overrides for the case where the

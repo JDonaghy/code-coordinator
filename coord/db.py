@@ -307,6 +307,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             review_posted_at REAL,
             test_state TEXT,
             test_reason TEXT,
+            uat_state TEXT,
+            uat_reason TEXT,
             cost_usd REAL,
             smoke_tests TEXT,
             review_findings TEXT,
@@ -1182,6 +1184,14 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # `--no-acceptance` passthrough for the tick's `coord drive --tmux`
         # launch. 0 (no passthrough) for every row predating this migration.
         "ALTER TABLE drive_queue ADD COLUMN no_acceptance INTEGER NOT NULL DEFAULT 0",
+        # #2687: the pre-merge UAT (User Acceptance Test) gate's human
+        # verdict — see coord.models.Assignment.uat_state/uat_reason and
+        # `coord uat <id> --passed|--failed`. NULL for every row predating
+        # this column and for every repo that hasn't opted in via
+        # `Repo.uat_preview` (`coord.merge_queue.requires_uat` no-ops on a
+        # NULL `uat_preview` regardless of this column).
+        "ALTER TABLE assignments ADD COLUMN uat_state TEXT",
+        "ALTER TABLE assignments ADD COLUMN uat_reason TEXT",
     ]
     for sql in migrations:
         try:
