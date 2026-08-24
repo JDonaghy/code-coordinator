@@ -1479,6 +1479,53 @@ mod tests {
             .contains_key(&("acme/myrepo".to_string(), 42)));
     }
 
+    /// #2645: on an epic (tracking-issue) row, "Drive (automated)" must NOT
+    /// queue the tracking issue itself via `drive-queue add` — that queues
+    /// an entry `coord.dispatch.enforce_epic_dispatch_guard` (#1314)
+    /// unconditionally refuses (the row carries the `epic` label, and
+    /// `type="work"` is in `CLOSES_ISSUE_TYPES`), which `coord/drive_queue.py`
+    /// then sends straight to `blocked` without incrementing `attempts` —
+    /// one of the two pre-dispatch-refusal cases #2230's self-heal
+    /// deliberately never re-evaluates, leaving the row permanently stuck
+    /// and none of the epic's children ever queued. It must instead
+    /// re-point at the same `coord milestone dispatch <repo>
+    /// <tracking_issue>` seam the Plans-panel "Dispatch milestone" action
+    /// (`dispatch_milestone_action` in `milestone_dag.rs`) already uses to
+    /// expand the `## Work order` DAG and queue every still-open child in
+    /// dependency order.
+    #[test]
+    fn dispatch_start_drive_on_epic_row_dispatches_milestone_not_drive_queue() {
+        let mut app = make_test_app(BoardData::default());
+        let mut epic = pipeline_issue(26, Some("coord-web"));
+        epic.all_labels = vec!["coord".to_string(), "epic".to_string()];
+        app.pipeline_issues = vec![epic];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let target = pipeline_target_with_repo(26, "coord-web");
+        let handled = app.dispatch_context_menu_action("start-drive", &target);
+
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "dispatch".to_string(),
+                "coord-web".to_string(),
+                "26".to_string(),
+            ]],
+            "an epic row must dispatch `coord milestone dispatch coord-web \
+             26`, not `drive-queue add`; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert!(
+            !app.drive_queue_contains("coord-web", 26),
+            "the tracking issue itself must never land on the drive queue \
+             — enforce_epic_dispatch_guard would only strand it there"
+        );
+    }
+
     /// #2634: the demoted "Drive locally (tmux, this machine)" action is
     /// what "start-drive" used to do — local `coord drive --tmux` launch,
     /// switching the Terminal tab to the live run.
