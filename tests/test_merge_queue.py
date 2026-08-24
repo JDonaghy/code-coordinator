@@ -9902,6 +9902,219 @@ class TestStaleSmokeVerdictReporting:
         assert verdict.kind == mq.SMOKE_OK
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# #2705 Case 1: the refusal must name the WINNING (newest) row in a
+# bounce/fix chain, never whichever stale row pool order surfaces first.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSmokeStaleReportsWinningRow:
+    """quadraui#595, 2026-08-24: four work rows piled up on one branch across
+    a bounce/fix chain. `branch_work` is built from `board.completed +
+    board.active` in POOL order — never chronological — and the
+    ``if stale is None:`` latch inside `evaluate_smoke_verdict`'s loop kept
+    only the FIRST stale row it happened to iterate over. That was
+    frequently the oldest, long-superseded round, so both the reported
+    anchor and the `coord test <aid> --passed` remedy named an assignment
+    nobody was merging.
+
+    `_uat_branch_work` already sorts its branch-work population newest-first
+    for exactly this reason ("a bounce/fix round's fresh work assignment is
+    a new thing for the operator to look at, so an older sibling's stale
+    verdict must not paper over it") — the smoke gate wants the same rule.
+    """
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(
+        aid: str,
+        *,
+        dispatched_at: float,
+        base_sha: str = "base-old",
+        head_sha: str = "branch-old",
+        test_state: str | None = "passed",
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch="worker/issue-1", dispatched_at=dispatched_at,
+            test_state=test_state,
+            test_head_sha=head_sha,
+            test_base_sha=base_sha,
+            test_patch_id="patch-1",
+        )
+
+    def test_reports_the_newest_stale_row_not_the_first_in_pool_order(self) -> None:
+        # Oldest round first, newest round last — i.e. `board.completed`'s
+        # natural accumulation order, and exactly the ordering the fix must
+        # NOT trust.
+        oldest = self._work("round-1", dispatched_at=100.0, base_sha="base-ancient")
+        mid = self._work("round-2", dispatched_at=200.0, base_sha="base-old")
+        newest = self._work("round-3", dispatched_at=300.0, base_sha="base-old")
+        board = self._board(completed=[oldest, mid, newest])
+
+        entry = _q("round-3", branch="worker/issue-1", target="main")
+        entry.target_branch_head_sha = "base-new"  # moved since every round
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.assignment_id == "round-3", (
+            "must name the newest (winning) row, not whichever stale row "
+            "pool order happens to surface first"
+        )
+
+    def test_remedy_names_the_winning_assignment_not_the_superseded_one(self) -> None:
+        oldest = self._work("round-1", dispatched_at=100.0)
+        newest = self._work("round-2", dispatched_at=200.0)
+        board = self._board(completed=[oldest, newest])
+        entry = _q("round-2", branch="worker/issue-1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert "coord test round-2 --passed" in (verdict.message or "")
+        assert "round-1" not in (verdict.message or "")
+
+    def test_missing_verdict_fallback_also_names_the_newest_row(self) -> None:
+        """No terminal verdict anywhere in the chain: SMOKE_MISSING must
+        still report the most-recently-dispatched row, not whichever row
+        happens to be first in pool order."""
+        oldest = self._work("round-1", dispatched_at=100.0, test_state=None)
+        newest = self._work("round-2", dispatched_at=200.0, test_state=None)
+        board = self._board(completed=[oldest, newest])
+        entry = _q("round-2", branch="worker/issue-1", target="main")
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.kind == mq.SMOKE_MISSING
+        assert verdict.assignment_id == "round-2"
+
+    def test_revalidation_candidate_names_the_winning_row(self) -> None:
+        """`RevalidationCandidate.work_assignment_id` is populated straight
+        from `evaluate_smoke_verdict`'s `assignment_id` — fixing the
+        selection there fixes `--revalidate`'s eligibility for free, with no
+        separate change needed."""
+        from dataclasses import dataclass as _dc, field as _f
+
+        @_dc
+        class _Pipeline:
+            default_gates: list = _f(default_factory=lambda: ["test", "merge"])
+
+        @_dc
+        class _Reviews:
+            enabled: bool = False
+
+        @_dc
+        class _Cfg:
+            reviews: _Reviews = _f(default_factory=_Reviews)
+            pipeline: _Pipeline = _f(default_factory=_Pipeline)
+
+        oldest = self._work("round-1", dispatched_at=100.0)
+        newest = self._work("round-2", dispatched_at=200.0)
+        board = self._board(completed=[oldest, newest])
+        entry = _q("round-2", branch="worker/issue-1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        candidates = mq.revalidation_candidates([entry], board, _Cfg())
+
+        assert [c.work_assignment_id for c in candidates] == ["round-2"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# #2705 Case 2: a post-merge refusal must never report a staleness the
+# entry's own merge created.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSmokeGateSparesAnAlreadyMergedEntry:
+    """quadraui#595, 2026-08-24: `coord merge --revalidate` recorded a fresh
+    `passed` verdict and merged clean — moving `target_branch`'s head to the
+    tip of the commits it had just landed. A LATER reader that hands this
+    same, now-``MERGED`` queue row back to `evaluate_smoke_verdict` reads
+    that base move as "the base moved out from under the verdict" and
+    refuses a merge that already happened, naming a
+    `coord test ... --passed` remedy for work with nothing left to verify.
+
+    A `MERGED` entry's code is already in the base — no SHA comparison can
+    produce a meaningful refusal for it, so the gate must short-circuit
+    before ever looking at one.
+    """
+
+    @staticmethod
+    def _board(completed=None):
+        from coord.models import Board
+        return Board(active=[], completed=list(completed or []))
+
+    @staticmethod
+    def _tested_work(aid: str = "w1") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=f"worker/{aid}", test_state="passed",
+            test_head_sha="branch-sha", test_base_sha="base-old",
+            test_patch_id="patch-1",
+        )
+
+    def test_merged_entry_is_never_reported_stale(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main", state=MERGED)
+        # The quadraui#595 shape: `target_branch_head_sha` reads the LIVE
+        # post-merge base — one commit past the base this entry's own fresh
+        # verdict was recorded against, because the merge itself moved it.
+        entry.target_branch_head_sha = "base-that-includes-this-merge"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+        assert verdict.message is None
+
+    def test_pending_entry_with_the_same_stale_shas_still_blocks(self) -> None:
+        """Guard against over-broadening: only `state == MERGED` spares the
+        entry — an otherwise-identical PENDING entry blocks exactly as
+        before."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")  # state defaults to PENDING
+        entry.target_branch_head_sha = "base-that-includes-this-merge"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_merge_gate_failures_also_spares_a_merged_entry(self) -> None:
+        """`merge_gate_failures` — the shared reason-carrying reader
+        `--revalidate` eligibility, the plan view, and `coord drive` all use
+        — delegates straight to `evaluate_smoke_verdict`; confirm the
+        short-circuit reaches it too."""
+        from dataclasses import dataclass as _dc, field as _f
+
+        @_dc
+        class _Pipeline:
+            default_gates: list = _f(default_factory=lambda: ["test", "merge"])
+
+        @_dc
+        class _Reviews:
+            enabled: bool = False
+
+        @_dc
+        class _Cfg:
+            reviews: _Reviews = _f(default_factory=_Reviews)
+            pipeline: _Pipeline = _f(default_factory=_Pipeline)
+
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main", state=MERGED)
+        entry.target_branch_head_sha = "base-new"
+
+        failures = mq.merge_gate_failures(entry, _Cfg(), board)
+
+        assert failures == []
+
+
 def _patched_time(now: float):
     """Freeze `coord.merge_queue`'s clock — the #1819 abandoned-marker check is
     the module's only wall-clock-dependent gate decision."""
