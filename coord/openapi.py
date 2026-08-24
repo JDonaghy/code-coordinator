@@ -14,11 +14,13 @@ hand-writing a parallel schema):
   ``components/schemas`` and returning a ``$ref``. This is what fully
   specifies ``POST /assign`` (``AssignmentSpec`` request / ``AgentAssignment``
   response) on the agent app.
-- :func:`sqlite_table_schema` builds a JSON Schema straight from
-  ``PRAGMA table_info`` for a live (migrated) SQLite connection — because, per
-  ``scripts/gen_board_fixture.py``, the daemon's ``/board`` wire schema *is*
-  the SQLite DDL (``coord/db.py``), not a dataclass. This fully specifies
-  ``GET /board`` on the daemon app.
+  ``GET /board`` on the daemon app is specified the same way, from the
+  explicit wire DTOs in ``coord/board_schema.py`` (#1849). It used to be
+  built by ``PRAGMA table_info``-introspecting a live migrated SQLite
+  connection — the daemon's wire schema literally *was* the DDL
+  (``coord/db.py``) — which made every migration a silent wire change and
+  made the storage engine's type system load-bearing on a three-language
+  contract. That helper is gone; nothing in this module knows about SQLite.
 - :func:`build_spec` assembles the OpenAPI 3.0.3 document.
 - :func:`openapi_and_docs_routes` returns the two ``Route`` objects
   (``/openapi.json`` serving the spec, ``/docs`` serving a Swagger UI page)
@@ -37,7 +39,6 @@ Python dataclasses directly.
 from __future__ import annotations
 
 import dataclasses
-import sqlite3
 import types as _types
 import typing
 from typing import Any
@@ -144,80 +145,6 @@ def dataclass_schema(cls: type, components: dict[str, Any]) -> dict[str, Any]:
         schema["required"] = required
     components[name] = schema
     return ref
-
-
-# ── SQLite table → JSON Schema (the /board wire schema IS the DDL) ──────────
-
-# Per-column overrides for JSON-encoded TEXT columns (decoded to a native
-# object/array before hitting the wire — see coord/dao.py:_JSON_COLUMNS).
-# Anything JSON-decoded but not listed here still gets a properties entry,
-# just typed as "any" ({}) rather than a precise array/object shape.
-_JSON_COLUMN_SHAPES: dict[tuple[str, str], dict[str, Any]] = {
-    ("assignments", "files_allowed"): {"type": "array", "items": {"type": "string"}},
-    ("assignments", "files_forbidden"): {"type": "array", "items": {"type": "string"}},
-    ("assignments", "required_gates"): {"type": "array", "items": {"type": "string"}},
-    ("assignments", "smoke_tests"): {"type": "array", "items": {"type": "string"}},
-    ("assignments", "plan"): {"type": "object"},
-    ("assignments", "test_plan"): {"type": "object"},
-    ("proposals", "files_likely"): {"type": "array", "items": {"type": "string"}},
-    ("proposals", "required_gates"): {"type": "array", "items": {"type": "string"}},
-    ("merge_queue", "required_gates"): {"type": "array", "items": {"type": "string"}},
-    ("issues", "labels"): {"type": "array", "items": {"type": "string"}},
-    ("machines", "capabilities"): {"type": "array", "items": {"type": "string"}},
-    ("machines", "repos"): {"type": "array", "items": {"type": "string"}},
-    # #2428: the drive queue's pre-req list — ["repo#N", ...] on the wire.
-    ("drive_queue", "after_json"): {"type": "array", "items": {"type": "string"}},
-}
-
-_SQLITE_AFFINITY_TO_SCHEMA: dict[str, dict[str, Any]] = {
-    "INTEGER": {"type": "integer"},
-    "REAL": {"type": "number"},
-    "TEXT": {"type": "string"},
-    "BLOB": {"type": "string"},
-}
-
-
-def sqlite_table_schema(
-    conn: sqlite3.Connection,
-    table: str,
-    *,
-    drop: frozenset[str] = frozenset(),
-    json_columns: frozenset[str] = frozenset(),
-) -> dict[str, Any]:
-    """Build an ``object`` JSON Schema straight from ``PRAGMA table_info``.
-
-    *drop* — columns the projection omits (e.g. ``assignments.briefing``,
-    see ``coord/dao.py:_DROP_COLUMNS``).
-    *json_columns* — columns decoded from a JSON-TEXT column to a native
-    value (see ``coord/dao.py:_JSON_COLUMNS``); typed via
-    :data:`_JSON_COLUMN_SHAPES` when known, else left as "any".
-
-    Every column is nullable unless SQLite's ``PRAGMA table_info`` reports
-    ``notnull=1`` — SQLite's own affinity typing is loose, and several
-    columns (e.g. ``finished_at`` while an assignment is running) are
-    legitimately absent until a later write.
-    """
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    for _cid, name, decl_type, notnull, _dflt, _pk in conn.execute(
-        f"PRAGMA table_info({table})"  # noqa: S608 — table name is a literal, not user input
-    ):
-        if name in drop:
-            continue
-        if name in json_columns:
-            schema = dict(_JSON_COLUMN_SHAPES.get((table, name), {}))
-        else:
-            affinity = (decl_type or "TEXT").split("(")[0].upper()
-            schema = dict(_SQLITE_AFFINITY_TO_SCHEMA.get(affinity, {"type": "string"}))
-        if notnull:
-            required.append(name)
-        elif schema:
-            schema["nullable"] = True
-        properties[name] = schema
-    out: dict[str, Any] = {"type": "object", "properties": properties}
-    if required:
-        out["required"] = required
-    return out
 
 
 # ── spec assembly ─────────────────────────────────────────────────────────

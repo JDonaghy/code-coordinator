@@ -532,7 +532,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- `machine` NULL means "let `coord drive` route it".  `after_json` is
         -- a JSON list of FULLY QUALIFIED pre-req keys (`["repo#N", ...]`) so a
         -- cross-repo queue needs no second column; it is decoded to a real
-        -- list on the wire via coord/dao.py's `_JSON_COLUMNS`.  This table
+        -- list on the wire via its `list[str]` field on
+        -- coord/board_schema.py's BoardDriveQueueEntry.  This table
         -- only STORES `after_json` — interpreting it (pre-req satisfaction) is
         -- the tick processor's job, not the schema's.
         --

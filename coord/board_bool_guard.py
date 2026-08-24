@@ -15,6 +15,15 @@ custom deserializer, and cross-references them against the live SQLite
 schema. ``tests/test_board_fixture.py`` wires this up against the real
 ``tui/src/app/types.rs`` + a freshly-migrated DB so CI goes red the moment
 someone adds an unguarded INTEGER-backed bool field.
+
+#1849 added the *other* half of this guard, one level up: the ``/board`` wire
+contract is now the explicit DTOs in ``coord/board_schema.py``, and
+``tests/test_board_schema.py`` asserts every column in
+``board_schema.INTEGER_BACKED_BOOLEANS`` is declared ``int`` — so the JSON
+type is pinned by the contract rather than by SQLite's (missing) boolean type,
+and a Postgres backend cannot silently start sending ``true``/``false``.  This
+text-scraping check stays because it is the only one that reads the *actual
+Rust consumer*; the DTO assertion cannot see ``types.rs``.
 """
 
 from __future__ import annotations

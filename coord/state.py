@@ -5917,8 +5917,9 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
 def _decode_drive_queue_row(row) -> dict:
     """One ``drive_queue`` row as a dict with ``after_json`` decoded to a list.
 
-    Mirrors ``coord.dao._JSON_COLUMNS`` handling so the ``/drive-queue`` and
-    ``/board`` payloads agree: ``after_json`` is a real JSON array on the wire,
+    Mirrors ``coord.board_schema.BoardDriveQueueEntry``'s ``after_json:
+    list[str]`` field so the ``/drive-queue`` and ``/board`` payloads agree:
+    ``after_json`` is a real JSON array on the wire,
     never a string. A row written by hand with unparseable JSON degrades to
     ``[]`` rather than blowing up the whole list read.
     """

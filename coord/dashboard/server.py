@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,9 +41,8 @@ from coord.events import (
     EventSource,
     build_events_route,
 )
+from coord.board_schema import BoardDriveQueueEntry
 from coord.board_service import read_board, write_board
-from coord.dao import _JSON_COLUMNS
-from coord.db import _ensure_schema
 from coord.drive_queue import (
     HOLD_FIRED,
     STATE_BLOCKED,
@@ -54,12 +52,7 @@ from coord.drive_queue import (
 )
 from coord.models import Assignment
 from coord.network import check_all, fetch_status
-from coord.openapi import (
-    build_spec,
-    dataclass_schema,
-    openapi_and_docs_routes,
-    sqlite_table_schema,
-)
+from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 from coord.pipeline import PipelineView
 from coord.state import list_drive_queue, load_proposals
 
@@ -426,27 +419,16 @@ def openapi_spec() -> dict:
     components: dict = {}
     assignment_ref = dataclass_schema(Assignment, components)
     pipeline_view_ref = dataclass_schema(PipelineView, components)
-    # #2428 DQW-1: the drive-queue entry schema comes straight from the
-    # SQLite DDL, the same way coord/serve_app.py's `_board_response_schema`
-    # builds `BoardDriveQueueEntry` for `/board` — the wire schema *is* the
-    # DDL (coord/db.py), not a hand-maintained field list that can drift from
-    # it. `after_json` is JSON-encoded TEXT in SQLite, decoded to an array on
-    # the wire — the JSON columns come from `coord.dao._JSON_COLUMNS` itself
-    # (the same source `coord/serve_app.py`'s `_board_response_schema` derives
-    # its own `frozenset(_JSON_COLUMNS.get(table, ()))` from) rather than a
-    # second hand-maintained literal, so a future JSON column on `drive_queue`
-    # only needs updating in one place (#2096).
-    _schema_conn = sqlite3.connect(":memory:")
-    try:
-        _ensure_schema(_schema_conn)
-        components["BoardDriveQueueEntry"] = sqlite_table_schema(
-            _schema_conn,
-            "drive_queue",
-            json_columns=frozenset(_JSON_COLUMNS.get("drive_queue", ())),
-        )
-    finally:
-        _schema_conn.close()
-    drive_queue_entry_ref = {"$ref": "#/components/schemas/BoardDriveQueueEntry"}
+    # #2428 DQW-1 / #1849: the drive-queue entry schema comes from the same
+    # explicit DTO the daemon publishes as `BoardDriveQueueEntry` on `/board`
+    # (`coord/board_schema.py`) — not from a hand-maintained field list, and
+    # no longer from `PRAGMA table_info` on a freshly-migrated DB either, so
+    # a `coord/db.py` migration can't silently change what this surface
+    # advertises. `after_json` is JSON-encoded TEXT in SQLite and a real array
+    # on the wire; that is expressed by its `list[str]` annotation on the DTO,
+    # so a future JSON column on `drive_queue` only needs declaring in one
+    # place (#2096).
+    drive_queue_entry_ref = dataclass_schema(BoardDriveQueueEntry, components)
     drive_queue_summary_ref = dataclass_schema(DriveQueueSummary, components)
     drive_queue_response = {
         "type": "object",
