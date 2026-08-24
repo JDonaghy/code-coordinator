@@ -1625,6 +1625,21 @@ def _base_move_spared(
     total per invocation, regardless of which disjunct fires or whether none
     do — same worst case as the pre-#1847 `_base_move_is_inert(...) or
     _branch_is_inert(...)` this replaces at the call site.
+
+    #2705 considered a fourth escape hatch here — "the base move is this
+    entry's own already-tested content landing" — but nothing this module
+    can ask (only file-*name* compares via `get_compare_files`, no commit
+    ancestry, no local git checkout) can tell "the base absorbed exactly
+    this branch's diff" apart from "the base absorbed a DIFFERENT change to
+    the same file(s)"; the file-set-subset heuristic that was tried here
+    collapsed onto exactly the case
+    `_base_move_disjoint_from_branch`'s own existing test suite deliberately
+    keeps STALE (overlapping-but-not-identical file sets), so it would have
+    been an unsound, test-regressing entry in this chain, not a real one.
+    See :func:`evaluate_smoke_verdict`'s ``state == MERGED`` short-circuit
+    for how #2705's actual reported case (quadraui#595) is handled instead —
+    at the "is this entry already merged" layer, not by inferring it from a
+    compare diff.
     """
     base_files = _fetch_compare_files(
         gh_ops, repo_github, test_base_sha, current_base_sha
@@ -2337,7 +2352,32 @@ def evaluate_smoke_verdict(
     that no longer exists — and the SHAs that disagree), or
     :data:`SMOKE_UNKNOWN` (recorded, but the live SHA needed to check it
     could not be read at all).
+
+    #2705: an *entry* already carrying ``state == MERGED`` short-circuits to
+    :data:`SMOKE_OK` before any SHA is looked at. A merge is exactly the
+    event that moves ``target_branch``'s head — so re-running this same
+    check on the entry that JUST performed that move reads its own merge
+    back as "the base moved out from under the verdict" and reports a
+    staleness the merge itself created (quadraui#595, 2026-08-24: a
+    ``--revalidate`` run recorded a fresh ``passed`` verdict, merged clean,
+    then this function — handed the same, now-``MERGED`` row by a later
+    reader — refused it as stale against the base its own merge had just
+    produced, naming a ``coord test ... --passed`` remedy for work that had
+    already landed). There is nothing left to gate: a ``MERGED`` entry's
+    code is already in the base, so no SHA comparison below can produce a
+    meaningful refusal — the same posture ``coord.drive``'s
+    ``_extract_already_merged`` (#2157) takes once a diagnostic confirms the
+    merge already happened. ``process()`` itself never reaches this
+    function for a non-``PENDING`` entry (it filters before grouping), so
+    this guard is for every OTHER reader that hands this function a
+    persisted queue row without first checking state — a live re-derivation
+    of ``merge_reason``, a direct ``evaluate_smoke_verdict``/
+    ``merge_gate_failures`` call, or a future caller that doesn't know to
+    filter terminal rows out first.
     """
+    if getattr(entry, "state", None) == MERGED:
+        return SmokeVerdictStatus(ok=True, kind=SMOKE_OK)
+
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
     )
@@ -2350,6 +2390,18 @@ def evaluate_smoke_verdict(
         if getattr(a, "assignment_id", None) in branch_work_ids
         and getattr(a, "type", None) in WORK_LIKE_TYPES
     ]
+    # #2705: most-recently-dispatched first, mirroring `_uat_branch_work`.
+    # `pool` order is `board.completed + board.active`, which is NOT
+    # chronological — a bounce/fix chain leaves several terminal-verdict rows
+    # in this list, and the `if stale is None:` latch below keeps only the
+    # first one the loop sees. Without this sort that's whichever stale row
+    # happens to sit earliest in pool order — frequently the oldest,
+    # long-superseded round — so both the reported anchor and the
+    # `coord test <aid> --passed` remedy name a row nobody is merging. Sorting
+    # here makes "first stale row seen" and "winning (newest) row" the same
+    # row, for every reader below: this loop, the SMOKE_MISSING fallback, and
+    # `_abandoned_running_marker`.
+    branch_work.sort(key=lambda a: getattr(a, "dispatched_at", None) or 0, reverse=True)
     # Fail open: no work assignment found → can't block without evidence.
     if not branch_work:
         return SmokeVerdictStatus(ok=True, kind=SMOKE_OK)
