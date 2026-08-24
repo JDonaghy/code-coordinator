@@ -952,7 +952,7 @@ impl CoordApp {
             return Reaction::Redraw;
         }
 
-        // ── #2642: Ctrl+E doc-tab picker — open/close toggle ────────────────
+        // ── #2642: Ctrl+E opens the doc-tab picker ──────────────────────────
         // Supersedes the dead `‹`/`›` overflow markers baked into the
         // Board/Pipeline doc-tab strip (`bake_doc_tab_overflow_markers`,
         // render.rs) as the way to reach a tab scrolled out of view — two
@@ -960,6 +960,14 @@ impl CoordApp {
         // Pipeline, the only panels with a doc-tab strip at all; a no-op
         // (no picker opens) when that panel currently has zero tabs, mirroring
         // `open_command_palette`'s own "nothing registered" no-op.
+        //
+        // Open-only, matching the `/` command palette's own convention just
+        // below (no toggle-close): `doc_tab_picker.is_some()` is folded into
+        // `any_blocking_modal_active()` (sidebar.rs) so it owns ALL input
+        // while open, which makes this same key a toggle-close impossible to
+        // reach here — the guard below already excludes it once open. Esc,
+        // handled in the "picker owns ALL input" block right after this one,
+        // is the only way to close it.
         if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
             let pty_active = (self.active_view == SidebarView::Board
                 && self.board_detail_tab == BoardDetailTab::Terminal
@@ -974,14 +982,10 @@ impl CoordApp {
                 && !self.any_blocking_modal_active()
                 && self.issue_finder.is_none()
             {
-                if self.doc_tab_picker.is_some() {
-                    self.doc_tab_picker = None;
-                } else {
-                    match self.active_view {
-                        SidebarView::Board => self.open_doc_tab_picker(PanelScope::Board),
-                        SidebarView::Pipeline => self.open_doc_tab_picker(PanelScope::Pipeline),
-                        _ => {}
-                    }
+                match self.active_view {
+                    SidebarView::Board => self.open_doc_tab_picker(PanelScope::Board),
+                    SidebarView::Pipeline => self.open_doc_tab_picker(PanelScope::Pipeline),
+                    _ => {}
                 }
                 return Reaction::Redraw;
             }
