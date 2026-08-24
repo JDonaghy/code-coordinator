@@ -3266,6 +3266,42 @@ class TestPassesMergeGates:
             config=cfg, board=board,
         ) is None
 
+    # ── #2704: the review gate's reason must not fabricate a refusal when
+    # the branch head is genuinely unconfirmable (`ApprovalScan.unknown_head`,
+    # #2085) — this is `entry.branch_head_sha` simply never having been
+    # populated on this caller's entry, the same condition a live GitHub
+    # read failing (rate limit, auth, network) produces after `process()`.
+
+    def test_merge_gate_failures_reports_unknown_head_not_a_fabricated_refusal(
+        self,
+    ) -> None:
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"  # review DID capture a SHA to compare
+        board = self._board(completed=[work, review])
+        entry = _q("w1")  # branch_head_sha left None — unconfirmable here
+
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert review_failure.reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+        assert "not approved" not in review_failure.reason
+
+    def test_merge_gate_failures_still_reports_genuine_refusal(self) -> None:
+        """The generic wording is preserved for an actual refusal — a
+        #2704 regression guard: the new branch must not swallow every
+        review failure into "unknown"."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])  # no review at all
+        entry = _q("w1")
+
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert review_failure.reason == "review required but not approved"
+
 
 class TestHasPassedTest:
     """#2350: :func:`has_passed_test` — the Merge-only fast path's bare
@@ -5997,6 +6033,26 @@ class TestPlan:
         plan = mq.plan(board, cfg)
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "review" in (plan[0].reason or "").lower()
+
+    def test_blocked_unknown_branch_head_is_not_reported_as_not_approved(
+        self, coord_db,
+    ) -> None:
+        """#2704: an approving review DOES exist, but this entry's branch
+        head is unconfirmable (never populated, no live gh_ops) — the plan
+        view must say so, not render the generic "review not approved" a
+        genuine refusal gets (`test_blocked_review_not_approved` above)."""
+        items = [_q("w1", size=50)]
+        save_queue(items)
+        work = self._work("w1", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"  # a SHA to compare, just unconfirmable here
+        board = self._board(completed=[work, review])
+        cfg = self._config()
+
+        plan = mq.plan(board, cfg)
+
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert plan[0].reason == mq.UNKNOWN_BRANCH_HEAD_REASON
 
     def test_blocked_test_verdict_missing(self, coord_db) -> None:
         """Entry with no test verdict appears as BLOCKED with reason."""
@@ -9665,6 +9721,65 @@ class TestStaleSmokeVerdictReporting:
         assert len(merged) == 1
         assert "#1738" in merged[0].message
         assert "#1847" not in merged[0].message
+
+    # ── #2704: a live probe that CONFIRMS it could not read GitHub (a rate
+    # limit, auth failure, or network blip) must fail closed, distinctly from
+    # both a genuine "no verdict recorded" and a genuine "confirmed stale" —
+    # never fall through to SMOKE_OK on evidence this call never obtained.
+
+    @dataclass
+    class _TransientFailGh(FakeGh):
+        """A gh_ops whose `get_branch_sha` supports the #2704 opt-in
+        `raise_on_transient` flag (mirroring the real
+        `coord.github_ops.get_branch_sha`) and raises `GhTransientError`
+        for it — simulating a live client hitting a rate limit/auth/network
+        failure, as opposed to `FakeGh`'s plain "no SHA tracking exercised"
+        default."""
+
+        def get_branch_sha(
+            self, repo: str, branch: str, *, raise_on_transient: bool = False
+        ) -> str | None:
+            if raise_on_transient:
+                from coord.github_ops import GhTransientError
+                raise GhTransientError("HTTP 403: API rate limit exceeded")
+            return None
+
+    def test_confirmed_transient_failure_is_unknown_not_ok(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")  # no live SHAs populated yet
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, self._TransientFailGh())
+
+        assert verdict.ok is False, (
+            "a verdict this call could never confirm fresh must not pass"
+        )
+        assert verdict.kind == mq.SMOKE_UNKNOWN
+        assert verdict.message == mq.UNKNOWN_BRANCH_HEAD_REASON
+
+    def test_confirmed_transient_failure_outranks_a_stale_verdict(self) -> None:
+        """When BOTH conditions are present in the same chain, "cannot
+        confirm" must win — it is the more honest statement (#2704)."""
+        work = self._tested_work()
+        board = self._board(completed=[work])
+        entry = _q("w1", target="main")
+        entry.branch_head_sha = "branch-sha"  # confirmed unchanged already
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, self._TransientFailGh())
+
+        assert verdict.kind == mq.SMOKE_UNKNOWN
+
+    def test_a_cache_miss_still_fails_open_not_unknown(self) -> None:
+        """The #1640 `GateSnapshot` convention — a `get_branch_sha` that
+        simply doesn't support `raise_on_transient` and returns `None` —
+        must keep its EXACT pre-#2704 fail-open behaviour. Only a CONFIRMED
+        transient failure (the test above) is SMOKE_UNKNOWN."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, FakeGh())
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
 
 
 def _patched_time(now: float):

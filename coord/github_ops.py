@@ -35,6 +35,24 @@ class GhNotFound(GhError):
     """
 
 
+class GhTransientError(GhError):
+    """Raised by :func:`get_branch_sha` (opt-in via ``raise_on_transient``)
+    when a branch-head lookup failed for a transient infra reason — auth,
+    network, or (#2704's incident) a secondary rate limit — as opposed to
+    the branch genuinely not existing.
+
+    #2704: ``get_branch_sha``'s unconditional ``except Exception: return
+    None`` made a 403 rate limit indistinguishable from a 404 "branch
+    deleted" — both callers ever saw was ``None``. The two call for opposite
+    handling: a 404 is permanent (stop asking), a rate limit is transient
+    and retryable (ask again once it clears). ``raise_on_transient=False``
+    (the default) keeps every existing caller's exact fold-both-to-``None``
+    contract; a caller that needs to react differently opts in and catches
+    this specifically, mirroring how :class:`GhNotFound` lets a caller
+    distinguish "gone" from "unreachable" for other resources.
+    """
+
+
 class GhTooOldForJsonChecks(GhError):
     """Raised when the installed ``gh`` doesn't support ``gh pr checks --json``
     *at all* (#1564 Addendum 2), as opposed to supporting ``--json`` but
@@ -1460,19 +1478,34 @@ def get_default_branch_head(repo: str, branch: str) -> str:
     return data["commit"]["sha"]
 
 
-def get_branch_sha(repo: str, branch: str) -> str | None:
+def get_branch_sha(repo: str, branch: str, *, raise_on_transient: bool = False) -> str | None:
     """Return the current HEAD SHA for *branch* on *repo*, or ``None`` on failure.
 
     Best-effort wrapper around the GitHub branches API.  Returns ``None`` when
     GitHub is unavailable, ``gh`` is not authenticated, or the branch does not
     exist — callers treat ``None`` as "SHA tracking unavailable" and skip the
     commit-bound staleness check introduced in #821.
+
+    #2704: *raise_on_transient* (default ``False``, so every caller that
+    doesn't ask for it keeps the exact behaviour above) raises
+    :class:`GhTransientError` instead of returning ``None`` when the failure
+    looks like transient infra — auth, network, or a rate limit, per
+    :func:`_is_transient_error` — rather than a confirmed-absent branch. Opt
+    in only where the caller can act differently on "GitHub couldn't answer"
+    versus "the branch is gone" — today that's
+    :func:`coord.merge_queue.evaluate_smoke_verdict`, via
+    :func:`coord.merge_queue._gh_get_branch_sha`, which detects support for
+    this kwarg before passing it (``GhOps`` is duck-typed; most stand-ins,
+    e.g. :class:`coord.gate_snapshot.GateSnapshot`, don't implement it and
+    are unaffected).
     """
     try:
         raw = _gh("api", f"repos/{repo}/branches/{branch}")
         data = _json_loads_or(raw, default={})
         return data["commit"]["sha"]
-    except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+    except Exception as exc:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+        if raise_on_transient and _is_transient_error(exc):
+            raise GhTransientError(str(exc)) from exc
         return None
 
 

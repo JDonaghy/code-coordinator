@@ -3672,6 +3672,72 @@ def test_a_genuinely_failed_check_is_not_read_as_ci_unreadable():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2704: the branch head itself could not be read (GitHub unreachable, `gh`
+# unauthenticated, or a rate limit) — `coord.merge_queue.
+# UNKNOWN_BRANCH_HEAD_REASON`. Before #2704 this fabricated a "review
+# required but not approved" refusal (fails CLOSED with the WRONG reason) or
+# a silently-passing smoke gate (fails OPEN). Now it is its own gate kind:
+# the drive waits for GitHub to answer again rather than retry `coord merge`
+# (a no-op — nothing about GitHub's reachability changes by re-running it) or
+# escalate a re-review/Test re-run for a gate nothing here actually refused.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_unknown_branch_head_waits_regardless_of_which_status_the_board_shows(status):
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    action = step(
+        approved_work(merge_status=status, merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+    )
+    assert action.kind == WAIT
+    assert "branch head unknown" in action.label
+    assert "not retrying" in action.label
+
+
+def test_unknown_branch_head_never_spends_an_attempt():
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_unknown_branch_head_does_not_escalate_a_fabricated_review_refusal():
+    """#2704's core repro: the driver's OWN cached view already shows
+    `review_verdict='approve'` (`approved_work`'s default) — exactly the
+    incident's shape, where the approval WAS for the current head and
+    `coord merge` simply couldn't confirm it. Before the fix this reason
+    would have been classified as the "review" gate kind, and — because the
+    driver's view contradicts a plain "review" refusal — escalated via
+    `_merge_gate_divergence` proposing `coord review-reaffirm` for a review
+    nothing actually refused. It must instead be its own kind and just
+    wait."""
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    action = step(
+        approved_work(merge_status="BLOCKED", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+
+
+def test_merge_gate_kind_recognises_unknown_branch_head_as_its_own_kind():
+    from coord.drive import _merge_gate_kind
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    assert _merge_gate_kind(UNKNOWN_BRANCH_HEAD_REASON) == "unknown_head"
+    # Regression guard: must never be swallowed into "review" just because
+    # `merge_gate_failures` reports it under `gate="review"`.
+    assert _merge_gate_kind(UNKNOWN_BRANCH_HEAD_REASON) != "review"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
 # real about the code, but `coord merge`'s own live attempt has only
 # observed it fail ONCE so far and is already re-running the failed job(s)
