@@ -9,6 +9,7 @@ import json
 
 import pytest
 
+from coord import merge_queue as mq
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.gates import (
     REVIEW_REQUIRED,
@@ -480,7 +481,33 @@ class TestDecision:
         # #2085 traces to this same fail-open shape at other call sites.
         assert by_gate["merge"].ok is False
         assert by_gate["merge"].reason == "review_required"
+        # #2704: the review gate's OWN reason must not fabricate "not
+        # approved" for a branch head this report could never confirm —
+        # exactly the `coord gates`/`coord drive-queue diagnose` surface the
+        # issue's incident report quotes verbatim.
+        assert by_gate["review"].reason == mq.UNKNOWN_BRANCH_HEAD_REASON
         assert report.target_branch == "main"  # falls back, no milestone lookup
+
+    def test_unknown_head_reason_not_fabricated_as_not_approved(self, config: Config) -> None:
+        """#2704 regression, dedicated: `build_gate_report` must consult
+        `ApprovalScan.unknown_head` (via `scan_approved_reviews`) instead of
+        collapsing every `has_approved_review() is False` into the generic
+        "review required but not approved" — the literal repro from the
+        issue body (`coord drive-queue diagnose` printing that reason for
+        every board row whose branch head could not be read)."""
+        work = _work(test_state="passed")
+        # Review DID capture a head SHA to compare, but this report has no
+        # gh_ops — entry.branch_head_sha is never populated, so the scan
+        # cannot confirm OR refute freshness: unknown, not refused.
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=None)
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is False
+        assert by_gate["review"].reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+        assert by_gate["review"].reason != "review required but not approved"
+        assert by_gate["review"].verdict_unparseable is False
 
 
 # ── is_interactive enrichment (#748/#632: not an Assignment dataclass field) ─

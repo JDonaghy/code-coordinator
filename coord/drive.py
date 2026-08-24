@@ -3038,14 +3038,6 @@ def _merge_gate_kind(reason: str) -> str | None:
     return None
 
 
-def _is_unknown_branch_head_reason(reason: str | None) -> bool:
-    """True when *reason* names the #2704 branch-head-unknown condition —
-    ``coord.merge_queue.UNKNOWN_BRANCH_HEAD_REASON``, regardless of which
-    gate (``review``/``smoke``) it was reported under.
-    """
-    return _UNKNOWN_BRANCH_HEAD_MARKER in (reason or "").lower()
-
-
 # #1738: the two wordings that name a verdict recorded-but-STALE specifically
 # (`merge_queue.process`'s live-attempt text and `merge_queue.plan`'s
 # board-render text — see the module comment above `_SMOKE_GATE_MARKERS`) —
@@ -3383,7 +3375,7 @@ def _decide_merge(
     # confirmed. No retry or fix this driver can take changes GitHub's
     # answer; wait, exactly like the CI-unreadable case below, and never
     # spend a merge attempt re-observing the identical unreadable probe.
-    if _is_unknown_branch_head_reason(gate_reason):
+    if _merge_gate_kind(gate_reason) == "unknown_head":
         return _wait(
             label=(
                 "MERGE: branch head unknown — GitHub read failed (rate "
