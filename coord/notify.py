@@ -599,6 +599,7 @@ def detect_stalled_pipeline(
     board: "Board | None" = None,
     merge_queue_items: list | None = None,
     terminal_cache: dict | None = None,
+    ignore_notified: bool = False,
 ) -> list[tuple[StalledDetection, "Assignment"]]:
     """Scan the board for *done* work chains stuck on an unmet precondition
     that a fresh review/fix transition would already have resolved (#1441).
@@ -668,8 +669,19 @@ def detect_stalled_pipeline(
     (:func:`coord.github_ops.work_is_terminal`, via *terminal_cache* — the
     same cache :func:`coord.notify.run` threads through the review/fix
     auto-loop calls) so a closed issue or merged PR never surfaces, and
-    against the ``notified`` ledger (composite key, :func:`_stalled_notified_key`)
-    so a flagged row is not re-flagged every pass.
+    (unless *ignore_notified* is set) against the ``notified`` ledger
+    (composite key, :func:`_stalled_notified_key`) so a flagged row is not
+    re-flagged every pass.
+
+    *ignore_notified* (#2679): the ``notified`` ledger is right for the
+    one-shot GitHub comment this function's other callers post — chatty by
+    design, so it must stop repeating itself. It is wrong for a *terminal*
+    stall, which cannot resolve itself: miss the single comment and the row
+    becomes permanently invisible even though the underlying condition is
+    still true. ``coord health``'s ``stalled_pipeline`` check passes
+    ``ignore_notified=True`` so it re-derives the same rows from live state
+    on every run, independent of whatever the GitHub-comment ledger already
+    recorded — see ``coord/health/checks/stalled_pipeline.py``.
 
     Detection only, mirroring :func:`detect_needs_attention`'s contract — no
     dispatch, no kill, no handoff (that lives in
@@ -710,7 +722,7 @@ def detect_stalled_pipeline(
     for work in _pipeline_heads(board):
         if work.status != "done" or not work.assignment_id:
             continue
-        if _stalled_notified_key(work.assignment_id) in notified:
+        if not ignore_notified and _stalled_notified_key(work.assignment_id) in notified:
             continue
 
         repo = config.repo(work.repo_name)
