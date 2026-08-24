@@ -197,6 +197,64 @@ class TestEditableSourceRoot:
         with patch("importlib.metadata.Distribution.from_name", return_value=fake_dist):
             assert _editable_source_root("claude-coordinator") is None
 
+    def test_recovers_drive_letter_from_a_windows_style_direct_url(self) -> None:
+        """#2728: on Windows, pip writes `direct_url.json`'s `url` as
+        `file:///C:/Users/.../checkout` (see `path_to_url`/`pathname2url`
+        in cpython/pip) — three slashes, then the drive letter, no
+        leading backslash. `urlparse` turns that into a path component of
+        `/C:/Users/.../checkout`. The pre-fix code fed that straight to
+        `unquote()` and then `pathlib.Path`; Windows path parsing only
+        recognizes a drive letter at the very start of the string, so the
+        leading slash makes the whole thing parse as a *driveless*,
+        rooted path — a literal top-level folder named `C:` that can
+        never exist — and `.is_dir()` silently reads False. That made
+        every Windows editable install look non-editable, falling
+        straight through to the frozen `.dist-info` snapshot: the exact
+        pre-#2010 symptom, reintroduced Windows-only.
+
+        This can only be observed for real on an actual Windows job —
+        `pathlib.Path` is bound to the host OS's flavour, so a Linux
+        runner's `Path("C:/...")` is a `PosixPath` no matter what string
+        it's handed. This test isolates the OS-independent piece that
+        the fix actually changes (`urllib.request.url2pathname` instead
+        of a bare `unquote`) by forcing that call through the real
+        Windows implementation (`nturl2path`, always importable
+        regardless of host OS) and substituting a `pathlib.Path` stand-in
+        that mimics `WindowsPath`'s drive-letter parsing without hitting
+        a real filesystem — so it fails before the fix (no drive
+        recovered, `is_dir()` false) and passes after it.
+        """
+        import nturl2path
+
+        class _FakeWindowsPath:
+            """Stands in for `pathlib.WindowsPath`: parses a drive letter
+            only when it appears at the very start of the string, exactly
+            like the real Windows path flavour — a leading `/` before
+            `C:` does NOT count, which is the crux of the bug."""
+
+            def __init__(self, raw: str) -> None:
+                self.raw = str(raw)
+                head = self.raw[:2]
+                self.drive = head if len(head) == 2 and head[1] == ":" else ""
+
+            def is_dir(self) -> bool:
+                return self.drive != "" and self.raw == r"C:\Users\dev\tagged_clone"
+
+        direct_url = json.dumps(
+            {"url": "file:///C:/Users/dev/tagged_clone", "dir_info": {"editable": True}}
+        )
+        fake_dist = SimpleNamespace(read_text=lambda name: direct_url)
+
+        with (
+            patch("importlib.metadata.Distribution.from_name", return_value=fake_dist),
+            patch("urllib.request.url2pathname", side_effect=nturl2path.url2pathname),
+            patch("pathlib.Path", _FakeWindowsPath),
+        ):
+            result = _editable_source_root("claude-coordinator")
+
+        assert isinstance(result, _FakeWindowsPath)
+        assert result.raw == r"C:\Users\dev\tagged_clone"
+
 
 class TestLiveScmVersion:
     """#2010: `_live_scm_version` prefers `setuptools_scm.get_version()`
