@@ -286,6 +286,11 @@ reviewer can stop reading here.
   the one to read when a customer request needs turning into coordinator work** — repo
   creation, the project↔repo mapping, the decomposition session, Gate-A mocks, and how a mock
   gets back to the client for sign-off, in the order you actually do them.
+- [`docs/CUSTOMER_FACING_APPS.md`](docs/CUSTOMER_FACING_APPS.md) — shipping a repo whose
+  **external** customer judges it by looking at it (natal-chart today). Why `Work → Test →
+  Review → Merge → auto-deploy` makes that customer the first human to see the change, the
+  per-PR preview / `uat` gate / visual-baseline pattern that fixes it, and the manual runbook
+  to use until the gate exists.
 - [`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md) — sealed acceptance suites, Gate-A contracts, the test-author agent.
 - [`docs/PHONE_WEBAPP.md`](docs/PHONE_WEBAPP.md) — Phone Control Center v1 runbook and the `/api/pipeline` surface.
 - [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
