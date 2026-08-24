@@ -17,6 +17,7 @@ dispatch/kill/handoff, idempotent via the shared `notified` ledger.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,8 +26,13 @@ from coord import notify as notify_mod
 from coord import state as state_mod
 from coord.auto_loop import LoopAction
 from coord.comments import EVENT_STALLED, format_stalled_pipeline
-from coord.config import Config, PipelineConfig
+from coord.config import Config, HealthConfig, PipelineConfig
 from coord.github_ops import work_is_terminal as _real_work_is_terminal
+from coord.health.checks.stalled_pipeline import (
+    TERMINAL_STALL_REASONS,
+    probe_stalled_pipeline,
+)
+from coord.health.models import HealthContext, Severity
 from coord.merge_queue import CONFLICT, PENDING, QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
 from coord.worker_events import (
@@ -2193,3 +2199,219 @@ class TestSweepStalledPipeline:
 
         notified = state_mod.load_notified()
         assert "work-1:stalled" in notified
+
+
+# ── #2679: `ignore_notified` — the notified ledger must be bypassable ──────
+#
+# The `notified` ledger is right for the one-shot GitHub comment
+# (`post_stalled_pipeline`'s caller marks it right after posting) but wrong
+# for a caller that wants to re-derive live state on every call, e.g.
+# `coord health`'s `stalled_pipeline` check. Without `ignore_notified`, a row
+# that was announced once becomes permanently invisible to EVERY caller of
+# `detect_stalled_pipeline`, not just the one-shot GitHub comment — exactly
+# the #2679 incident (three rows sat stalled for 8 days after their single
+# comment landed).
+
+
+class TestIgnoreNotifiedLedgerBypass:
+    def test_default_still_suppresses_an_already_notified_row(
+        self, config: Config, coord_db
+    ) -> None:
+        """Unchanged default behaviour: every existing caller (the one-shot
+        GitHub-comment sweep) must keep seeing nothing for a row already on
+        the ledger."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        first = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(first) == 1
+        with patch.object(notify_mod, "github_ops") as mock_gh:
+            notify_mod.post_stalled_pipeline(first[0][0], config)
+            assert mock_gh.post_issue_comment.called
+
+        second = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert second == []
+
+    def test_ignore_notified_still_returns_an_already_notified_row(
+        self, config: Config, coord_db
+    ) -> None:
+        """The #2679 regression guard: a row already on the `notified`
+        ledger (announced once, then invisible forever under the default)
+        must still be returned when the caller passes
+        `ignore_notified=True` — this is exactly what lets `coord health`
+        re-derive live state independent of whatever the GitHub-comment
+        sweep already recorded."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        first = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(first) == 1
+        with patch.object(notify_mod, "github_ops") as mock_gh:
+            notify_mod.post_stalled_pipeline(first[0][0], config)
+            assert mock_gh.post_issue_comment.called
+
+        # Default call still suppresses it...
+        assert notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        ) == []
+
+        # ...but `ignore_notified=True` re-derives it from live state anyway.
+        again = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[], ignore_notified=True,
+        )
+        assert len(again) == 1
+        detection, work = again[0]
+        assert detection.assignment_id == "work-1"
+        assert detection.reason == "review_request_changes_no_fix"
+        assert work.assignment_id == "work-1"
+
+    def test_ignore_notified_still_respects_the_terminal_guard(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """`ignore_notified` bypasses only the ledger — a terminal (closed
+        issue / merged PR) row must still never surface."""
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[], ignore_notified=True,
+        )
+        assert results == []
+
+
+# ── #2679: `coord health`'s `stalled_pipeline` check ────────────────────────
+
+
+def _health_ctx(config: Config | None, now: float = 10_000.0) -> HealthContext:
+    return HealthContext(
+        thresholds=HealthConfig(),
+        home=Path("/tmp/unused-home"),
+        coord_dir=Path("/tmp/unused-home/.coord"),
+        now=now,
+        config=config,
+    )
+
+
+class TestStalledPipelineHealthCheck:
+    def test_unknown_when_no_config(self) -> None:
+        result = probe_stalled_pipeline(_health_ctx(None))
+        assert result.severity == Severity.UNKNOWN
+        assert "no coordinator.yml" in result.headroom
+
+    def test_ok_when_nothing_stalled(self, config: Config, monkeypatch) -> None:
+        monkeypatch.setattr(
+            notify_mod, "detect_stalled_pipeline", lambda cfg, **kw: []
+        )
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.OK
+        assert result.headroom == "0 stalled pipeline rows"
+
+    def test_crit_for_a_terminal_reason(self, config: Config, monkeypatch) -> None:
+        work = _work("work-1", test_state="passed")
+        detection = notify_mod.StalledDetection(
+            assignment_id="work-1", machine_name="mac-mini", repo_name="vimcode",
+            issue_number=602, reason="review_request_changes_no_fix",
+            detail="Review review-1 completed with request-changes...",
+        )
+        monkeypatch.setattr(
+            notify_mod, "detect_stalled_pipeline",
+            lambda cfg, **kw: [(detection, work)],
+        )
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.CRIT
+        assert "1 terminal" in result.headroom
+        assert "vimcode#602" in result.detail
+        assert result.values["terminal"] == 1
+        assert result.values["rows"][0]["reason"] == "review_request_changes_no_fix"
+        assert result.values["rows"][0]["terminal"] is True
+
+    def test_warn_for_a_transient_reason_only(self, config: Config, monkeypatch) -> None:
+        work = _work("work-1", test_state="passed")
+        detection = notify_mod.StalledDetection(
+            assignment_id="work-1", machine_name="mac-mini", repo_name="vimcode",
+            issue_number=602, reason="done_no_review",
+            detail="no review dispatched",
+        )
+        monkeypatch.setattr(
+            notify_mod, "detect_stalled_pipeline",
+            lambda cfg, **kw: [(detection, work)],
+        )
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.WARN
+        assert "1 transient" in result.headroom
+        assert result.values["terminal"] == 0
+
+    def test_unknown_when_detection_raises(self, config: Config, monkeypatch) -> None:
+        def _boom(cfg, **kw):
+            raise RuntimeError("board unreachable")
+
+        monkeypatch.setattr(notify_mod, "detect_stalled_pipeline", _boom)
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.UNKNOWN
+        assert "board unreachable" in result.headroom
+
+    def test_all_terminal_reasons_are_covered(self) -> None:
+        """Regression guard: every reason `detect_stalled_pipeline` can
+        actually emit for the three "cannot self-resolve" shapes the issue
+        names must be in the CRIT set — a typo here would silently downgrade
+        a real #2679 incident row to WARN."""
+        assert TERMINAL_STALL_REASONS == {
+            "review_request_changes_no_fix",
+            "merge_conflict_unresolved",
+            "review_done_no_verdict",
+        }
+
+    def test_already_notified_row_still_reports_end_to_end(
+        self, config: Config, coord_db
+    ) -> None:
+        """The #2679 acceptance case, end to end through the real (not
+        mocked) `detect_stalled_pipeline`: a row already sitting in the
+        `notified` ledger — today's ledger guard means it reports nothing to
+        `coord notify` — must still surface here, because the health check
+        has no ledger of its own to go stale."""
+        board = _vimcode_602_board()
+        state_mod.save_board(board)
+
+        with patch.object(
+            notify_mod, "_agent_status", return_value={"completed": [], "active": []}
+        ), patch("coord.notify.github_ops.post_issue_comment"):
+            notify_mod.run(config)  # posts the one-shot comment, marks notified
+
+        # Confirm the ledger guard really did suppress it for the ordinary path.
+        assert notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        ) == []
+
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.CRIT
+        assert "vimcode#602" in result.detail
+        assert result.values["rows"][0]["assignment_id"] == "work-602"
+
+    def test_disappears_once_the_review_is_no_longer_stalled(
+        self, config: Config, coord_db
+    ) -> None:
+        """The other half of the acceptance bar: once the underlying
+        precondition clears (here, a fix worker gets dispatched), the row
+        must stop reporting — this check has no memory of its own, so a
+        resolved row simply falls out of `detect_stalled_pipeline`'s live
+        scan."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+            _fix("work-1", aid="fix-1", status="running", dispatched_at=1200.0),
+        )
+        state_mod.save_board(board)
+
+        result = probe_stalled_pipeline(_health_ctx(config))
+        assert result.severity == Severity.OK
+        assert result.headroom == "0 stalled pipeline rows"
