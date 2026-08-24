@@ -60,6 +60,7 @@ from coord.drive import (
     GitMergeVerifier,
     LockBusy,
     OracleDecision,
+    _die,
     _remote_matches_repo,
     coord_argv,
     decide,
@@ -5709,6 +5710,33 @@ def test_driver_writes_the_per_issue_run_log(driver_factory, tmp_path):
     driver.run()
     log = tmp_path / f"{REPO}-{ISSUE}.log"
     assert log.exists() and "ok" in log.read_text()
+
+
+def test_die_exit_message_is_written_to_the_run_log_not_just_the_pane(
+    driver_factory, tmp_path, monkeypatch
+):
+    """#2712 second defect: `_die()`'s message reached `self.warn` only —
+    stderr, which for a `--tmux` drive is the tmux pane, destroyed the
+    instant the session exits (the exact moment this fires). Without also
+    appending it to `_run_log` (the file `launch_drive_in_tmux`'s own
+    docstring calls out as the thing that survives the pane), a drive that
+    dies mid-merge leaves `/tmp/coord-drive-issue-<uid>/<repo>-<issue>.log`
+    simply stopping after its last narrated action with no explanation
+    recorded anywhere — reading as "stalled" instead of "failed"."""
+    driver = driver_factory([board(status="done", test_state="")])
+
+    def fake_decide(*a, **kw):
+        return _die(
+            "merge attempted 3 times without landing.\n"
+            "   Last board state: status='CONFLICT' reason='rebase failed'"
+        )
+
+    monkeypatch.setattr("coord.drive.decide", fake_decide)
+    exit_code = driver.run()
+    assert exit_code == EXIT_TERMINAL_FAILURE
+    log_text = (tmp_path / f"{REPO}-{ISSUE}.log").read_text()
+    assert "merge attempted 3 times without landing." in log_text
+    assert "Last board state: status='CONFLICT' reason='rebase failed'" in log_text
 
 
 def test_driver_writes_a_start_marker_even_when_the_loop_never_spawns_anything(

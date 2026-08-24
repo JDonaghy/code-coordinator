@@ -36,7 +36,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from coord.merge_queue import is_ci_flaky_reason, is_ci_infra_reason
+from coord.merge_queue import (
+    is_ci_flaky_reason,
+    is_ci_infra_reason,
+    is_ci_pending_reason,
+)
 from coord.models import WORK_LIKE_TYPES, test_mode_from_labels
 
 # Assignment types that can carry the Test/Review gates for an issue.  Sourced
@@ -568,41 +572,36 @@ def _merge_entry(
         )
 
     reason = plan_entry.get("reason") or (raw_entry or {}).get("error")
-    # #1892: `plan_entry["reason"]` is `_entry_gate_status`'s FRESH
-    # re-derivation at board-build time — and that function never computes
-    # the CI_INFRA_PREFIX classification, because doing so needs an extra
-    # `gh api .../jobs` call the board *read* path must never make (see
-    # `coord.gate_snapshot`'s Invariant 1). Only a LIVE `coord merge`
-    # attempt (`merge_queue.process()`, which already pays for fresh truth)
-    # computes it and persists it onto the raw row's `error`. So a
-    # verdictless CI failure always re-derives as the plain "checks failed:
-    # ..." wording in `plan_entry`, shadowing the more specific reading the
-    # raw row already has — recover it here, mirroring the NEEDS_ATTENTION
-    # recovery above: prefer the raw row's reason whenever IT carries the
-    # #1892 classification and the plan's own fresher reason doesn't.
+    # #1892/#2252/#2712: `plan_entry["reason"]` is `_entry_gate_status`'s
+    # FRESH re-derivation at board-build time, and it can shadow a more
+    # specific classification the raw row's persisted `error` already
+    # carries — either because the classification needs extra live-merge
+    # I/O the read-only board build must never pay for (CI_INFRA_PREFIX
+    # needs a `gh api .../jobs` call, see `coord.gate_snapshot`'s
+    # Invariant 1; CI_FLAKY_PREFIX needs `QueuedMerge.ci_flaky_reruns`
+    # state that only `merge_queue.process()` tracks), or because the two
+    # readings simply land on different classifications in the same tick
+    # (CI_PENDING_PREFIX: the raw row's last live `coord merge` attempt saw
+    # checks still running, but the fresh re-derivation reads the same
+    # in-flight run as something else, e.g. "checks failed"). Whenever the
+    # raw row carries one of these classifications and the plan's own
+    # fresher reason doesn't, prefer the raw reading — mirroring the
+    # NEEDS_ATTENTION recovery above. This is the THIRD time the same
+    # shadowing bug has been fixed one predicate at a time (#1892, #2252,
+    # now #2712 for CI_PENDING_PREFIX), so it is a shared loop instead of
+    # another hand-copied `elif`: the classifications are mutually
+    # exclusive per entry (a given raw_reason can match at most one), but a
+    # loop means the NEXT one of these needs no new branch, just a new
+    # predicate in the tuple.
     if raw_entry is not None:
         raw_reason = raw_entry.get("error")
-        if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(reason):
-            reason = raw_reason
-        # #2252: same recovery, for the SAME reason, for the sibling
-        # CI_FLAKY_PREFIX classification — `_entry_gate_status`'s fresh
-        # re-derivation has no notion of "this entry already spent its one
-        # #2252 re-run and is waiting on the answer" (that state lives only
-        # in `QueuedMerge.ci_flaky_reruns`/`ci_flaky_pending`, updated by
-        # the live `merge_queue.process()` path and persisted onto the raw
-        # row's `error`), so it would otherwise re-derive the SAME failing
-        # checks as the plain "checks failed: ..." wording every tick,
-        # shadowing the more specific CI-re-checking reading the raw row
-        # already has. `elif` — the two classifications are mutually
-        # exclusive per entry (one failure streak is either infra or
-        # flaky-pending, never both at once), so only one raw-preference
-        # branch can ever legitimately fire for a given raw_reason.
-        elif is_ci_flaky_reason(raw_reason) and not is_ci_flaky_reason(reason):
-            reason = raw_reason
-        # #2347: deliberately NO third `elif` here for
-        # `is_ci_unreadable_reason` — unlike CI_INFRA_PREFIX/CI_FLAKY_PREFIX
-        # above, that classification needs no extra `CiStore` I/O (see
-        # `coord.merge_queue._ci_unreadable_reason`'s docstring), so
+        for is_reason in (is_ci_infra_reason, is_ci_flaky_reason, is_ci_pending_reason):
+            if is_reason(raw_reason) and not is_reason(reason):
+                reason = raw_reason
+                break
+        # #2347: deliberately no loop entry for `is_ci_unreadable_reason` —
+        # unlike the three above, that classification needs no extra I/O
+        # (see `coord.merge_queue._ci_unreadable_reason`'s docstring), so
         # `_entry_gate_status` already computes it directly at board-build
         # time. `plan_entry["reason"]` (i.e. `reason` here) already carries
         # it whenever it applies — there is nothing for the raw row to
