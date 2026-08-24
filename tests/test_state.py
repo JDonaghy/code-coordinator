@@ -15,6 +15,7 @@ from coord.state import (
     clear_proposals,
     record_dispatched,
     record_test_verdict,
+    record_uat_verdict,
     update_assignment_claude_session_id,
 )
 
@@ -2211,6 +2212,103 @@ class TestRecordTestVerdictToolchain:
         board = build_board()
         row = next(a for a in board.active if a.assignment_id == "aid-old")
         assert row.test_toolchain is None
+
+
+class TestRecordUatVerdict:
+    """#2687: `record_uat_verdict` — the single-row seam writer behind
+    `coord uat <id> --passed|--failed`. Deliberately simpler than
+    `record_test_verdict`: no legacy mirror column, no staleness anchor —
+    see `coord.models.Assignment.uat_state`'s docstring for why."""
+
+    @staticmethod
+    def _seed_assignment(coord_db, *, assignment_id="aid-1", branch="worker/aid-1"):
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch) VALUES (?, 'm1', 'api', 1, 't', ?)",
+            (assignment_id, branch),
+        )
+        coord_db.commit()
+
+    def test_records_passed_verdict(self, coord_db) -> None:
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed")
+
+        row = coord_db.execute(
+            "SELECT uat_state, uat_reason FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "passed"
+        assert row["uat_reason"] is None
+
+    def test_records_failed_verdict_with_reason(self, coord_db) -> None:
+        self._seed_assignment(coord_db)
+        record_uat_verdict(
+            assignment_id="aid-1", uat_state="failed", uat_reason="logo is cropped",
+        )
+
+        row = coord_db.execute(
+            "SELECT uat_state, uat_reason FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "failed"
+        assert row["uat_reason"] == "logo is cropped"
+
+    def test_clearing_verdict_sets_null(self, coord_db) -> None:
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed")
+        record_uat_verdict(assignment_id="aid-1", uat_state=None)
+
+        row = coord_db.execute(
+            "SELECT uat_state FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] is None
+
+    def test_failed_verdict_adds_issue_context_entry(self, coord_db) -> None:
+        # #2687: "a --failed verdict should read as actionable feedback on
+        # the PR the same way a failed test verdict does" — carried into
+        # the per-issue digest exactly like a failed Test-gate verdict is.
+        self._seed_assignment(coord_db)
+        record_uat_verdict(
+            assignment_id="aid-1", uat_state="failed", uat_reason="logo is cropped",
+        )
+
+        rows = coord_db.execute(
+            "SELECT body, source FROM issue_context WHERE repo_name='api' AND issue_number=1"
+        ).fetchall()
+        assert any(
+            r["source"] == "uat" and "logo is cropped" in r["body"] for r in rows
+        )
+
+    def test_passed_verdict_round_trips_through_build_board(self, coord_db) -> None:
+        from coord.state import build_board
+
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed")
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == "aid-1")
+        assert row.uat_state == "passed"
+
+    def test_uat_state_excluded_from_whole_board_upsert(self, coord_db) -> None:
+        """Mirrors test_state's #1482 exclusion: a stale in-memory
+        `save_board()` snapshot (no `uat_state` known to it — every
+        `Assignment` defaults to `None`) must never clobber a verdict
+        already recorded through the dedicated seam writer."""
+        from coord.models import Assignment, Board
+        from coord.state import build_board, save_board
+
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed")
+
+        stale_snapshot = Board(active=[
+            Assignment(
+                machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+                assignment_id="aid-1", branch="worker/aid-1", uat_state=None,
+            ),
+        ])
+        save_board(stale_snapshot)
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == "aid-1")
+        assert row.uat_state == "passed"
 
 
 class TestVerdictSourceRoundTrip:

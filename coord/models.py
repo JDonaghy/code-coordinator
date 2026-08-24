@@ -37,6 +37,35 @@ class WorkerPermissionsConfig:
     deny: list[str] = field(default_factory=list)
 
 
+def _cloudflare_branch_slug(branch: str) -> str:
+    """Best-effort Cloudflare Pages branch-alias slug for *branch*.
+
+    Cloudflare Pages derives a preview subdomain from a branch name by
+    lowercasing it, collapsing every run of characters outside
+    ``[a-z0-9-]`` into a single ``-``, trimming leading/trailing ``-``, and
+    truncating to 28 characters (Cloudflare's documented branch-alias
+    length ceiling). This is the ``{pr_branch_slug}`` substitution
+    available in a repo's ``uat_preview`` template.
+
+    #2687: this was ported from Cloudflare's documented branch-alias
+    algorithm, NOT verified against a live deployment — this worker has no
+    network/`gh` access to check a real natal-chart PR preview URL. Confirm
+    against one before switching the gate on for that repo; adjust here if
+    it disagrees.
+    """
+    slug = re.sub(r"[^a-z0-9-]+", "-", branch.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return slug[:28].rstrip("-")
+
+
+class _UatPreviewVars(dict):
+    """``dict`` for ``str.format_map`` that leaves an unknown ``{placeholder}``
+    unrendered instead of raising ``KeyError`` (see ``Repo.uat_preview``)."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
 @dataclass
 class Repo:
     name: str
@@ -104,6 +133,53 @@ class Repo:
     # must match a key in providers.definitions (or be "claude" which is
     # always implicit).  None means "use the global default".
     provider: str | None = None
+    # #2687: per-PR preview URL template for the pre-merge UAT gate — e.g.
+    # "https://{pr_branch_slug}.natal-chart-3ew.pages.dev/". `None` (the
+    # default) is the "not configured" state: `coord.merge_queue.
+    # requires_uat` treats an unset `uat_preview` as "this repo has not
+    # opted in", REGARDLESS of whether "uat" appears in
+    # `pipeline.default_gates` — the deliberate per-repo half of the opt-in
+    # (the other half is adding "uat" to the gate list itself, which is
+    # fleet-wide). Substitution variables available in the template — see
+    # `resolve_uat_preview_url` — are `{pr_branch_slug}` (best-effort
+    # Cloudflare-Pages branch-alias slug), `{branch}` (raw branch name),
+    # `{issue_number}`, `{pr_number}`, and `{repo}`. An unknown `{...}`
+    # placeholder in the template is left unrendered rather than raising, so
+    # a typo shows up as a visibly broken URL instead of crashing the gate.
+    uat_preview: str | None = None
+
+    def resolve_uat_preview_url(
+        self,
+        *,
+        branch: str | None = None,
+        issue_number: int | None = None,
+        pr_number: int | None = None,
+    ) -> str | None:
+        """Render this repo's `uat_preview` template for one PR.
+
+        Returns ``None`` when `uat_preview` is unset (repo hasn't opted in).
+        Never raises: an unresolvable `{placeholder}` in the template leaves
+        it unrendered rather than raising ``KeyError`` — see the field
+        docstring.
+        """
+        if not self.uat_preview:
+            return None
+        try:
+            return self.uat_preview.format_map(
+                _UatPreviewVars(
+                    pr_branch_slug=_cloudflare_branch_slug(branch) if branch else "",
+                    branch=branch or "",
+                    issue_number=issue_number if issue_number is not None else "",
+                    pr_number=pr_number if pr_number is not None else "",
+                    repo=self.name,
+                )
+            )
+        except (ValueError, IndexError):
+            # `str.format_map` can still raise on malformed format specs
+            # (e.g. a stray "{}" or "{0}") that `_UatPreviewVars.__missing__`
+            # can't intercept — fall back to the raw template rather than
+            # taking down the merge gate over a typo in coordinator.yml.
+            return self.uat_preview
 
     def resolve_new_issue_guidance(self, repo_path: Path) -> str:
         """Return the new-issue guidance string for this repo.
@@ -556,6 +632,18 @@ class Assignment:
     # everywhere by construction — never add a bare `is not None` check here.
     test_state: str | None = None
     test_reason: str | None = None
+    # #2687: human UAT (User Acceptance Test) verdict for type="work"
+    # assignments on a repo with `Repo.uat_preview` configured — a deliberate
+    # per-repo opt-in, unlike the Test gate above which every repo shares.
+    # None | "passed" | "failed". Recorded via `coord uat <id> --passed|
+    # --failed [--note TEXT]`, mirroring the Test gate's verdict shape (see
+    # `coord.state.record_uat_verdict`). Gated by `coord.merge_queue.
+    # requires_uat`/`evaluate_uat_verdict` — unlike the Test/Review gates,
+    # this one carries no SHA/patch-id staleness tracking: it's a human's
+    # judgment on the rendered preview, not a re-runnable measurement, so
+    # there's nothing to mechanically re-verify against a moved SHA.
+    uat_state: str | None = None
+    uat_reason: str | None = None
     # #1479: staleness anchor for a terminal (passed/skipped) Test-gate
     # verdict — captured once, best-effort, when the verdict is recorded
     # (``coord.state._record_test_verdict_local``). Mirrors the review gate's

@@ -3854,6 +3854,281 @@ class TestSmokeGate:
         assert items[1].target_branch_head_sha == "main-sha-shared"
 
 
+class TestUatGate:
+    """#2687: the pre-merge UAT gate. Two-part opt-in — "uat" must be in the
+    effective gate list AND the entry's own repo must have ``uat_preview``
+    configured — so a repo that hasn't opted in is unaffected even if
+    ``pipeline.default_gates`` grows "uat" fleet-wide."""
+
+    @staticmethod
+    def _config(
+        *,
+        gates: list[str] | None = None,
+        uat_preview: str | None = "https://{pr_branch_slug}.example.pages.dev/",
+        repo_name: str = "api",
+    ):
+        """A minimal config-like object with a real Repo behind ``.repo()``."""
+        from dataclasses import dataclass, field as dc_field
+
+        from coord.models import Repo
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+            _repo: Repo | None = None
+
+            def repo(self, name: str):
+                return self._repo if self._repo and self._repo.name == name else None
+
+        cfg = _Cfg()
+        # Default gates deliberately isolate the UAT gate — no "review"/"test"
+        # in the default list, and no `reviews` attribute on this fake config
+        # at all, so requires_review/requires_smoke both no-op and these
+        # tests observe the uat gate alone, mirroring TestSmokeGate's own
+        # review-disabled-by-default isolation.
+        cfg.pipeline.default_gates = gates if gates is not None else ["uat", "merge"]
+        cfg._repo = Repo(name=repo_name, github="acme/api", uat_preview=uat_preview)
+        return cfg
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(
+        aid: str = "w1", *, uat_state: str | None = None, uat_reason: str | None = None,
+        dispatched_at: float | None = None,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+            uat_state=uat_state,
+            uat_reason=uat_reason,
+            dispatched_at=dispatched_at,
+        )
+
+    # ── requires_uat ──
+
+    def test_requires_uat_true_when_gate_and_repo_both_opt_in(self) -> None:
+        cfg = self._config(gates=["review", "uat", "merge"])
+        assert mq.requires_uat(_q("a"), cfg) is True
+
+    def test_requires_uat_false_when_gate_absent(self) -> None:
+        cfg = self._config(gates=["review", "merge"])
+        assert mq.requires_uat(_q("a"), cfg) is False
+
+    def test_requires_uat_false_when_repo_has_no_uat_preview(self) -> None:
+        # The fleet-wide gate list opts in, but THIS repo hasn't — the
+        # "ship the mechanism with the default off everywhere" contract.
+        cfg = self._config(gates=["review", "uat", "merge"], uat_preview=None)
+        assert mq.requires_uat(_q("a"), cfg) is False
+
+    def test_requires_uat_false_for_a_different_repo(self) -> None:
+        cfg = self._config(gates=["review", "uat", "merge"], repo_name="other-repo")
+        assert mq.requires_uat(_q("a", repo="api"), cfg) is False
+
+    def test_requires_uat_false_when_no_pipeline(self) -> None:
+        from dataclasses import dataclass
+        @dataclass
+        class _NoPipelineCfg:
+            pass
+        assert mq.requires_uat(_q("a"), _NoPipelineCfg()) is False
+
+    def test_requires_uat_entry_override_bypasses_default(self) -> None:
+        # #1213-style per-issue override: an entry whose snapshotted
+        # required_gates drops "uat" bypasses the gate even though the
+        # default policy requires it.
+        cfg = self._config(gates=["uat", "merge"])
+        entry = _q("a", required_gates=["merge"])
+        assert mq.requires_uat(entry, cfg) is False
+
+    def test_requires_uat_empty_entry_gates_falls_back_to_default(self) -> None:
+        cfg = self._config(gates=["uat", "merge"])
+        assert mq.requires_uat(_q("a", required_gates=[]), cfg) is True
+
+    # ── evaluate_uat_verdict ──
+
+    def test_evaluate_uat_verdict_missing_names_preview_and_command(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "uat verdict missing" in message
+        assert "preview: https://worker-w1.example.pages.dev/" in message
+        assert "coord uat w1 --passed|--failed" in message
+
+    def test_evaluate_uat_verdict_passed(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state="passed")
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is True
+        assert message == ""
+
+    def test_evaluate_uat_verdict_failed_carries_reason(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state="failed", uat_reason="logo is cropped")
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "uat verdict FAILED: logo is cropped" in message
+
+    def test_evaluate_uat_verdict_fails_closed_with_no_work_assignment(self) -> None:
+        # Unlike evaluate_smoke_verdict (fails open), an unidentifiable work
+        # chain must NOT pass a gate that exists to force a human decision.
+        cfg = self._config()
+        board = self._board()
+        ok, _ = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+
+    def test_evaluate_uat_verdict_prefers_most_recently_dispatched_verdict(self) -> None:
+        # A bounce/fix round's fresh work assignment is a NEW thing to look
+        # at — an older sibling's stale "passed" must not paper over it.
+        cfg = self._config()
+        old = self._work("w1", uat_state="passed", dispatched_at=1.0)
+        new = self._work("w2", uat_state="failed", uat_reason="regressed", dispatched_at=2.0)
+        # Both must chain to the same entry via review_of_assignment_id or
+        # branch — simplest: give them the SAME assignment_id chain by
+        # reusing _chain_work_ids' branch-match path (same branch as entry).
+        new.branch = "worker/w1"
+        board = self._board(completed=[old, new])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "regressed" in message
+
+    # ── merge_gate_failures / passes_merge_gates ──
+
+    def test_merge_gate_failures_includes_uat(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        failures = mq.merge_gate_failures(_q("w1"), cfg, board)
+        assert any(f.gate == "uat" for f in failures)
+        uat_failure = next(f for f in failures if f.gate == "uat")
+        assert "coord uat" in uat_failure.waiver_flag
+
+    def test_passes_merge_gates_false_when_uat_missing(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(_q("w1"), cfg, board) is False
+
+    def test_passes_merge_gates_true_when_uat_passed(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", uat_state="passed")
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(_q("w1"), cfg, board) is True
+
+    def test_passes_merge_gates_true_when_repo_not_opted_in(self) -> None:
+        cfg = self._config(uat_preview=None)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(_q("w1"), cfg, board) is True
+
+    # ── live process() wiring ──
+
+    def test_process_emits_uat_required_event_and_halts_merge(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "opened" in kinds
+        assert "uat_required" in kinds
+        assert "merged" not in kinds
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        assert items[0].error is not None
+        assert items[0].error.startswith("uat verdict missing")
+
+    def test_process_proceeds_when_uat_passed(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1", uat_state="passed")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert items[0].state == MERGED
+
+    def test_process_skip_uat_bypasses_the_gate(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1", uat_state=None)])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, skip_uat=True)
+
+        assert any(e.kind == "merged" for e in events)
+        assert not any(e.kind == "uat_required" for e in events)
+
+    def test_dry_run_previews_uat_block(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        events = process(items, FakeGh(), config=cfg, board=board, dry_run=True)
+
+        blocked = [e for e in events if e.kind == "uat_required"]
+        assert len(blocked) == 1
+        assert "(dry run)" in blocked[0].message
+        assert "uat verdict missing" in blocked[0].message
+
+    # ── _bypassed_gates / gate-bypass audit ──
+
+    def test_bypassed_gates_reports_uat_when_configured_and_dropped(self) -> None:
+        cfg = self._config(gates=["review", "uat", "merge"])
+        cfg.reviews = type("_R", (), {"enabled": False})()  # keep review out of it
+        entry = _q("a", required_gates=["merge"])
+        assert "uat" in mq._bypassed_gates(entry, cfg)
+
+    def test_bypassed_gates_omits_uat_when_repo_not_opted_in(self) -> None:
+        cfg = self._config(gates=["review", "uat", "merge"], uat_preview=None)
+        cfg.reviews = type("_R", (), {"enabled": False})()
+        entry = _q("a", required_gates=["merge"])
+        assert "uat" not in mq._bypassed_gates(entry, cfg)
+
+    # ── display_error recompute (#420) ──
+
+    def test_display_error_clears_once_uat_verdict_recorded(self) -> None:
+        cfg = self._config()
+        entry = _q("w1", size=10)
+        entry.error = "uat verdict missing — preview: https://x.example.pages.dev/ — run: coord uat w1 --passed|--failed"
+        board = self._board(completed=[self._work("w1", uat_state="passed")])
+        assert mq.display_error(entry, board, cfg) is None
+
+    def test_display_error_recomputes_uat_failure_message(self) -> None:
+        cfg = self._config()
+        entry = _q("w1", size=10)
+        entry.error = "uat verdict missing — run: coord uat w1 --passed|--failed"
+        board = self._board(completed=[self._work("w1", uat_state="failed", uat_reason="broken layout")])
+        live = mq.display_error(entry, board, cfg)
+        assert live is not None
+        assert "broken layout" in live
+
+    def test_display_error_returns_none_when_gate_no_longer_required(self) -> None:
+        # The repo dropped uat_preview after the error was stored — the
+        # stale block must clear, not keep quoting a gate that no longer
+        # applies.
+        cfg = self._config(uat_preview=None)
+        entry = _q("w1", size=10)
+        entry.error = "uat verdict missing — run: coord uat w1 --passed|--failed"
+        board = self._board(completed=[self._work("w1", uat_state=None)])
+        assert mq.display_error(entry, board, cfg) is None
+
+
 class TestGateBypassAudit:
     """#1213: a per-issue label override honoured by requires_review /
     requires_smoke merges without the bypassed gate(s), and every bypass

@@ -1228,6 +1228,16 @@ class PipelineConfig:
 
         ``label`` may be ``None`` (no matching tracked label found on the
         issue) — in that case the configured ``default_gates`` are returned.
+
+        #2687: ``"uat"`` is a recognised gate name here alongside ``"test"``/
+        ``"review"``/``"merge"`` — it may appear in ``default_gates`` or any
+        label's gate list like any other gate. Ordered between ``"review"``
+        and ``"merge"`` when present. Unlike the other three, its
+        *enforcement* additionally requires the specific repo to have
+        ``Repo.uat_preview`` configured (see
+        ``coord.merge_queue.requires_uat``) — so listing ``"uat"`` here is
+        necessary but not sufficient; it is the fleet-wide half of a
+        two-part per-repo opt-in.
         """
         if label and label in self.labels:
             return list(self.labels[label])
@@ -2247,6 +2257,20 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if repo_provider is not None and not isinstance(repo_provider, str):
             raise ConfigError(f"repos[{i}].provider must be a string")
 
+        # #2687: uat_preview — per-PR preview URL template, and this repo's
+        # opt-in into the pre-merge UAT gate (`coord.merge_queue.
+        # requires_uat`). Absent (None) means "not opted in" regardless of
+        # whether "uat" appears in `pipeline.default_gates` — see
+        # `Repo.uat_preview`'s docstring.
+        uat_preview = entry.get("uat_preview")
+        if uat_preview is not None and not isinstance(uat_preview, str):
+            raise ConfigError(f"repos[{i}].uat_preview must be a string")
+        if isinstance(uat_preview, str) and not uat_preview.strip():
+            raise ConfigError(
+                f"repos[{i}].uat_preview must be a non-empty string (omit "
+                "the key entirely to leave the UAT gate off for this repo)"
+            )
+
         repos.append(
             Repo(
                 name=name,
@@ -2265,6 +2289,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 new_issue_guidance=new_issue_guidance,
                 artifact_paths=artifact_paths,
                 provider=repo_provider,
+                uat_preview=uat_preview,
             )
         )
     return repos

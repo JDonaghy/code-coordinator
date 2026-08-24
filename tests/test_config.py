@@ -432,6 +432,121 @@ def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── uat_preview (#2687) ──────────────────────────────────────────────────────
+
+
+def test_uat_preview_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_preview: 'https://{pr_branch_slug}.natal-chart-3ew.pages.dev/'\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").uat_preview == (
+        "https://{pr_branch_slug}.natal-chart-3ew.pages.dev/"
+    )
+
+
+def test_uat_preview_default_none(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").uat_preview is None
+
+
+def test_uat_preview_non_string_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    uat_preview: 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="uat_preview must be a string"):
+        load(p)
+
+
+def test_uat_preview_empty_string_rejected(tmp_path: Path) -> None:
+    # An explicit but blank uat_preview is almost certainly a copy-paste
+    # mistake, not "opt out" — omitting the key entirely is how a repo opts
+    # out, so a blank value is rejected loudly instead of silently disabling
+    # the gate.
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    uat_preview: ''\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="uat_preview must be a non-empty string"):
+        load(p)
+
+
+def test_uat_preview_resolve_url_substitutes_branch_slug() -> None:
+    from coord.models import Repo
+
+    repo = Repo(
+        name="natal-chart", github="acme/natal-chart",
+        uat_preview="https://{pr_branch_slug}.natal-chart-3ew.pages.dev/",
+    )
+    url = repo.resolve_uat_preview_url(branch="issue-42-fix-chart-colors")
+    assert url == "https://issue-42-fix-chart-colors.natal-chart-3ew.pages.dev/"
+
+
+def test_uat_preview_resolve_url_slugifies_branch_for_cloudflare() -> None:
+    from coord.models import Repo
+
+    repo = Repo(
+        name="natal-chart", github="acme/natal-chart",
+        uat_preview="https://{pr_branch_slug}.example.pages.dev/",
+    )
+    # Slashes and uppercase must fold into Cloudflare's lowercase-hyphen
+    # branch-alias shape (see Repo.resolve_uat_preview_url's docstring for
+    # the caveat that this is UNVERIFIED against a live deployment).
+    url = repo.resolve_uat_preview_url(branch="Issue/42_Fix-Chart")
+    assert url == "https://issue-42-fix-chart.example.pages.dev/"
+
+
+def test_uat_preview_resolve_url_returns_none_when_unset() -> None:
+    from coord.models import Repo
+
+    repo = Repo(name="api", github="acme/api")
+    assert repo.resolve_uat_preview_url(branch="worker/w1") is None
+
+
+def test_uat_preview_resolve_url_other_substitutions() -> None:
+    from coord.models import Repo
+
+    repo = Repo(
+        name="api", github="acme/api",
+        uat_preview="https://preview/{repo}/{issue_number}/{pr_number}/{branch}",
+    )
+    url = repo.resolve_uat_preview_url(branch="b1", issue_number=42, pr_number=7)
+    assert url == "https://preview/api/42/7/b1"
+
+
+def test_uat_preview_resolve_url_unknown_placeholder_left_verbatim() -> None:
+    # A typo in the template must not crash the merge gate — see
+    # Repo.uat_preview's docstring.
+    from coord.models import Repo
+
+    repo = Repo(
+        name="api", github="acme/api",
+        uat_preview="https://{typo_field}.example.pages.dev/",
+    )
+    url = repo.resolve_uat_preview_url(branch="b1")
+    assert url == "https://{typo_field}.example.pages.dev/"
+
+
 # ── Config path resolution (~/.coord/coordinator.yml) ────────────────────────
 
 

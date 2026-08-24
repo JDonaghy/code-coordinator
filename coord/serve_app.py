@@ -2542,6 +2542,34 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/uat-verdict": {
+            "post": {
+                "summary": "Record a pre-merge UAT-gate verdict (#2687)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "uat_state": {"type": "string", "nullable": True},
+                                    "uat_reason": {"type": "string", "nullable": True},
+                                },
+                                "required": ["assignment_id", "uat_state"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
         "/review-reaffirm": {
             "post": {
                 "summary": (
@@ -5189,6 +5217,30 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_uat_verdict(request: Request) -> Response:
+        # #2687: record a pre-merge UAT-gate verdict on the shared DB.
+        # Mirrors post_acceptance_verdict — a plain single-row UPDATE with
+        # no `gh` calls, so (unlike post_test_verdict) no threadpool needed.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._record_uat_verdict_local(
+                assignment_id=body["assignment_id"],
+                uat_state=body["uat_state"],
+                uat_reason=body.get("uat_reason"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "uat-verdict write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_review_reaffirm(request: Request) -> Response:
         # #1488: re-point an approved review's review_head_sha/review_patch_id
         # to the branch's current head, on the shared DB. Mirrors
@@ -7694,6 +7746,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/uat-verdict", post_uat_verdict, methods=["POST"]),
         Route("/review-reaffirm", post_review_reaffirm, methods=["POST"]),
         Route("/acceptance-verdict", post_acceptance_verdict, methods=["POST"]),
         Route("/acceptance-record", post_acceptance_record, methods=["POST"]),

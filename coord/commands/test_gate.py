@@ -695,6 +695,95 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
     )
 
 
+@click.command(
+    help=(
+        "Record a pre-merge UAT (User Acceptance Test) verdict (#2687).\n\n"
+        "For repos that opt in via `uat_preview` in coordinator.yml, `coord "
+        "merge` refuses to merge ASSIGNMENT_ID's PR until this records a "
+        "--passed verdict — the gate exists so a human looks at the PR's "
+        "deployed preview (the URL coord.merge_queue.evaluate_uat_verdict "
+        "prints alongside the block) before a customer does. Modelled "
+        "directly on `coord test --passed|--fail`."
+    )
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--passed", "verdict", flag_value="passed", help="Mark the UAT gate as passed.")
+@click.option("--failed", "verdict", flag_value="failed", help="Mark the UAT gate as failed.")
+@click.option(
+    "--note", default="",
+    help=(
+        "Note describing the verdict — e.g. why it failed. Carried into "
+        "the failure the same way `coord test --fail --reason` is: recorded "
+        "on the board and added to the issue's context digest so the next "
+        "worker sees it without re-fetching the PR."
+    ),
+)
+def uat(assignment_id: str, config_path: Path, verdict: str | None, note: str) -> None:
+    from coord.board_service import read_board
+    from coord.state import record_uat_verdict
+
+    if verdict is None:
+        click.echo("error: specify --passed or --failed", err=True)
+        sys.exit(1)
+
+    cfg = _load_config(config_path)
+    # #590 Phase 2 / #1337: same daemon-or-local self-routing as `coord test`
+    # — read_board() resolves the daemon's board on a thin client, and
+    # record_uat_verdict routes its write the same way.
+    board = read_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None or not repo.uat_preview:
+        # Not a hard error: an operator may still want a manual verdict on
+        # record for a repo that hasn't (yet) opted in — but the merge gate
+        # (coord.merge_queue.requires_uat) won't enforce it either way, so
+        # say so rather than implying this verdict blocks anything.
+        click.echo(
+            f"warning: {assignment.repo_name!r} has no uat_preview configured "
+            "in coordinator.yml — recording the verdict, but coord merge "
+            "will not enforce this gate for this repo.",
+            err=True,
+        )
+    else:
+        pr_number = None
+        try:
+            from coord.db import get_connection  # noqa: PLC0415
+
+            row = get_connection().execute(
+                "SELECT pr_number FROM merge_queue WHERE assignment_id=?",
+                (assignment_id,),
+            ).fetchone()
+            pr_number = row["pr_number"] if row else None
+        except Exception:  # noqa: BLE001 — best-effort; annotation only
+            pr_number = None
+        preview_url = repo.resolve_uat_preview_url(
+            branch=assignment.branch,
+            issue_number=assignment.issue_number,
+            pr_number=pr_number,
+        )
+        if preview_url:
+            click.echo(f"  preview: {preview_url}")
+
+    record_uat_verdict(
+        assignment_id=assignment_id,
+        uat_state=verdict,
+        uat_reason=(note.strip() or None) if verdict == "failed" else None,
+    )
+    click.echo(
+        f"UAT gate {verdict.upper()} for {assignment.repo_name} #{assignment.issue_number}"
+    )
+    if verdict == "failed" and note.strip():
+        click.echo(f"  note: {note.strip()}")
+    elif verdict == "passed":
+        click.echo("  Run: coord merge to proceed")
+
+
 def _test_plan_via_daemon(svc, params: dict) -> None:
     """#851: run ``coord test-plan`` on the daemon host (the assignment + its
     cached ``test_plan`` live in the daemon's canonical DB, not a thin

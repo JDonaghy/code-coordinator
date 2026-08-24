@@ -104,6 +104,11 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.review_posted_at,
         a.test_state,
         a.test_reason,
+        # #2687: same seam-writer-owned exclusion as test_state/test_reason
+        # above — record_uat_verdict is the single-row writer; see the
+        # _UPSERT_SQL comment for why these are absent from ON CONFLICT.
+        a.uat_state,
+        a.uat_reason,
         a.review_verdict,
         # #1456: audit trail when the coordinator overrode the reviewer.
         a.review_verdict_original,
@@ -133,7 +138,7 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, review_verdict,
+        review_posted_at, test_state, test_reason, uat_state, uat_reason, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
         review_patch_id, review_scoped, review_scope_base_sha,
         cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason
@@ -143,7 +148,7 @@ _UPSERT_SQL = """
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?, ?
@@ -1417,6 +1422,104 @@ def _record_test_verdict_local(
             row["issue_number"],
             f"Test FAILED: {test_reason.strip()}",
             source="test",
+        )
+
+
+def record_uat_verdict(
+    *,
+    assignment_id: str,
+    uat_state: str | None,
+    uat_reason: str | None = None,
+) -> None:
+    """Record a UAT-gate verdict on one assignment — routes to the daemon when set.
+
+    #2687: the single-row analogue of :func:`record_test_verdict`, for
+    ``coord uat <id> --passed|--failed [--note TEXT]``. Deliberately
+    narrower than the Test gate's verdict: only ``"passed"``/``"failed"``
+    (no ``"skipped"``/``"running"``) — a human either looked at the preview
+    and it's fine, or it isn't; there is no "trivial, nothing to look at"
+    case the way a code change can be, and no unattended driver claims a
+    UAT verdict on its own.
+
+    ``uat_state=None`` clears the verdict back to ``NULL``, mirroring
+    ``record_test_verdict``'s reset case — used to un-stick a merge queue
+    entry rather than force a fresh ``--passed``/``--failed``.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/uat-verdict",
+        {
+            "assignment_id": assignment_id,
+            "uat_state": uat_state,
+            "uat_reason": uat_reason,
+        },
+    )
+    if resp is not None:
+        return
+    _record_uat_verdict_local(
+        assignment_id=assignment_id,
+        uat_state=uat_state,
+        uat_reason=uat_reason,
+    )
+
+
+def _record_uat_verdict_local(
+    *,
+    assignment_id: str,
+    uat_state: str | None,
+    uat_reason: str | None = None,
+) -> None:
+    """UPDATE the assignment's uat_state/uat_reason.
+
+    #2687: single-row writer, mirroring
+    :func:`_record_test_verdict_local` — kept deliberately simpler: no
+    legacy mirror column, no SHA/patch-id staleness anchor (a UAT verdict
+    isn't a re-runnable measurement — see ``coord.models.Assignment.
+    uat_state``'s docstring for why), just the verdict, an audit row, and
+    (on a failure) a durable issue-context entry so the next agent on the
+    issue sees WHY without re-fetching the PR.
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET uat_state=?, uat_reason=? WHERE assignment_id=?",
+        (uat_state, uat_reason, assignment_id),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments "
+        "WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+
+    if row is not None and uat_state is not None:
+        # Mirrors record_test_verdict's `test_state is not None` guard —
+        # clearing a verdict (uat_state=None) is a reset, not an event.
+        _record_audit(
+            tier="business",
+            category="test",
+            event_type=f"uat_{uat_state}",
+            actor="user",
+            summary=f"UAT {uat_state}: {row['repo_name']}#{row['issue_number']}",
+            repo=row["repo_name"],
+            issue=row["issue_number"],
+            assignment_id=assignment_id,
+            machine=row["machine_name"],
+            details={"uat_reason": uat_reason},
+        )
+
+    # #2687: a failed UAT verdict is "actionable feedback on the PR the
+    # same way a failed test verdict is" (the issue's own wording) — carry
+    # it into the per-issue digest exactly like record_test_verdict's
+    # "Test FAILED" entry does, so the next worker/reviewer on this issue
+    # sees it without re-fetching the PR.
+    if uat_state == "failed" and (uat_reason or "").strip() and row is not None:
+        _add_issue_context_entry_local(
+            row["repo_name"],
+            row["issue_number"],
+            f"UAT FAILED: {uat_reason.strip()}",
+            source="uat",
         )
 
 
