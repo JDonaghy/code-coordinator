@@ -40,10 +40,28 @@ def _editable_source_root(dist_name: str) -> Path | None:
     substring match on ``__file__`` (a non-editable install into a venv
     satisfies that too, and its metadata IS trustworthy since it's a
     frozen snapshot rather than a claim about live source).
+
+    #2728: the URL's path component must go through
+    ``urllib.request.url2pathname`` (platform-dispatched), not a bare
+    ``urllib.parse.unquote``. pip writes this URL via
+    ``pathname2url``/``path_to_url``, which on Windows produces
+    ``file:///C:/Users/...`` — ``urlparse`` yields a path of
+    ``/C:/Users/...``, and handing that straight to ``pathlib.Path`` does
+    NOT recover ``C:\\Users\\...``: Windows path parsing only recognises a
+    drive letter at the very start of the string, so a leading slash before
+    ``C:`` makes the whole thing parse as a driveless, rooted path (a
+    literal top-level folder named ``C:``) that can never exist. ``root
+    .is_dir()`` then reads False on every Windows editable install, no
+    exception raised, and ``_resolve_version`` silently falls through to
+    the frozen ``.dist-info`` snapshot — the exact pre-#2010 symptom,
+    reintroduced Windows-only. ``url2pathname`` is ``unquote`` verbatim on
+    POSIX (no behaviour change there) and is ``nturl2path.url2pathname`` on
+    Windows, which strips that leading slash before the drive letter.
     """
     import json  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
-    from urllib.parse import unquote, urlparse  # noqa: PLC0415
+    from urllib.parse import urlparse  # noqa: PLC0415
+    from urllib.request import url2pathname  # noqa: PLC0415
 
     try:
         raw = Distribution.from_name(dist_name).read_text("direct_url.json")
@@ -55,7 +73,7 @@ def _editable_source_root(dist_name: str) -> Path | None:
     parsed = urlparse(info.get("url", ""))
     if parsed.scheme != "file" or not parsed.path:
         return None
-    root = Path(unquote(parsed.path))
+    root = Path(url2pathname(parsed.path))
     return root if root.is_dir() else None
 
 
