@@ -65,6 +65,8 @@
       "test_state": null,
       "test_toolchain": null,
       "type": "work",
+      "uat_reason": null,
+      "uat_state": null,
       "unreachable_count": 0,
       "verdict_source": null,
       "verdict_source_reason": null
@@ -134,6 +136,8 @@
       "test_state": null,
       "test_toolchain": null,
       "type": "review",
+      "uat_reason": null,
+      "uat_state": null,
       "unreachable_count": 0,
       "verdict_source": null,
       "verdict_source_reason": null
@@ -214,6 +218,8 @@
       "test_state": "passed",
       "test_toolchain": null,
       "type": "work",
+      "uat_reason": null,
+      "uat_state": null,
       "unreachable_count": 0,
       "verdict_source": null,
       "verdict_source_reason": null
