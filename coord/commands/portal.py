@@ -209,24 +209,48 @@ def portal_push(config_path, submission_id: str, revision: int, status: str) -> 
 @portal_group.command("link")
 @_CONFIG_OPTION
 @click.argument("repo")
-@click.argument("milestone_number", type=int)
-@click.argument("submission_id", required=False)
+@click.argument("target", metavar="MILESTONE_NUMBER", required=False, default=None)
+@click.argument("submission_id", required=False, default=None)
+@click.option(
+    "--issue", "issue_number", type=int, default=None,
+    help=(
+        "Link REPO's single ISSUE_NUMBER instead of a milestone (#2665) — "
+        "for a one-off decomposition that produced a milestone-less issue. "
+        "Mutually exclusive with MILESTONE_NUMBER; pass SUBMISSION_ID as "
+        "the sole remaining positional, e.g. `coord portal link REPO "
+        "--issue N SUBMISSION_ID`."
+    ),
+)
 def portal_link(
-    config_path, repo: str, milestone_number: int, submission_id: str | None
+    config_path,
+    repo: str,
+    target: str | None,
+    submission_id: str | None,
+    issue_number: int | None,
 ) -> None:
-    """Record, or read, one milestone's portal submission_id link (#2507).
+    """Record, or read, one milestone's (or, with --issue, one issue's)
+    portal submission_id link (#2507, #2665).
 
-    With SUBMISSION_ID: link REPO's milestone MILESTONE_NUMBER to it.
-    Operator-run — submission creation is driven by the portal's own intake
-    flow, not by coord, so there is currently no automatic way for coord to
-    learn a submission exists at all.
+    With SUBMISSION_ID: link REPO's milestone MILESTONE_NUMBER — or, with
+    --issue, REPO's single ISSUE_NUMBER — to it. Operator-run — submission
+    creation is driven by the portal's own intake flow, not by coord, so
+    there is currently no automatic way for coord to learn a submission
+    exists at all.
 
     Without SUBMISSION_ID: report the current link, mirroring `coord gate-a`'s
     read/write dual-mode shape.
 
-    Nothing downstream resolves this automatically yet — PDR-3's auto-push
-    and PDR-4's verdict consumer (the epic's later legs, #2506) are what will
-    read it once they exist.
+    The milestone form (`coord portal link REPO MILESTONE_NUMBER
+    [SUBMISSION_ID]`) is unchanged since #2507. The `--issue` form exists
+    because a one-off issue decomposition has no milestone to key a link off
+    of — see #2665's filing for why minting a synthetic single-item
+    milestone instead was rejected: it would put every small request under
+    the `coord milestone` gates (B/C/D), which are deliberately for
+    milestone-shaped work.
+
+    Consumers: PDR-3's auto-push, PDR-4's verdict consumer, and #2588's
+    status fold (the epic's later legs, #2506) all resolve through whichever
+    shape is on file.
     """
     _refuse_if_thin_client("link")
 
@@ -239,28 +263,71 @@ def portal_link(
         click.secho(f"error: unknown repo {repo!r}", fg="red")
         raise SystemExit(2)
 
+    milestone_number: int | None = None
+    if issue_number is not None:
+        if submission_id is not None:
+            click.secho(
+                "error: pass MILESTONE_NUMBER or --issue, not both", fg="red"
+            )
+            raise SystemExit(2)
+        # With --issue, the single remaining positional (if any) is the
+        # submission_id — MILESTONE_NUMBER's slot is unused in this form.
+        submission_id = target
+    elif target is not None:
+        try:
+            milestone_number = int(target)
+        except ValueError:
+            click.secho(
+                f"error: MILESTONE_NUMBER must be an integer, got {target!r} "
+                "(use --issue N to link a single issue instead)",
+                fg="red",
+            )
+            raise SystemExit(2)
+    else:
+        click.secho("error: pass MILESTONE_NUMBER or --issue N", fg="red")
+        raise SystemExit(2)
+
+    target_desc = (
+        f"ms-{milestone_number}" if milestone_number is not None else f"issue #{issue_number}"
+    )
+
     if submission_id is None:
-        link = portal_store.get_milestone_link(
-            repo_name=repo_cfg.name, milestone_number=milestone_number
+        link = (
+            portal_store.get_milestone_link(
+                repo_name=repo_cfg.name, milestone_number=milestone_number
+            )
+            if milestone_number is not None
+            else portal_store.get_issue_link(
+                repo_name=repo_cfg.name, issue_number=issue_number
+            )
         )
         if link is None:
-            click.echo(f"{repo_cfg.name} ms-{milestone_number}: not linked")
+            click.echo(f"{repo_cfg.name} {target_desc}: not linked")
             raise SystemExit(1)
         when = datetime.datetime.fromtimestamp(
             link.linked_at, tz=datetime.timezone.utc
         ).strftime("%Y-%m-%d %H:%M UTC")
         click.echo(
-            f"{repo_cfg.name} ms-{milestone_number}: "
+            f"{repo_cfg.name} {target_desc}: "
             f"submission_id={link.submission_id} "
             f"(linked by {link.actor or 'unknown'} at {when})"
         )
         return
 
-    link = portal_store.link_milestone(
-        repo_name=repo_cfg.name,
-        milestone_number=milestone_number,
-        submission_id=submission_id,
-        actor=_actor(),
+    link = (
+        portal_store.link_milestone(
+            repo_name=repo_cfg.name,
+            milestone_number=milestone_number,
+            submission_id=submission_id,
+            actor=_actor(),
+        )
+        if milestone_number is not None
+        else portal_store.link_issue(
+            repo_name=repo_cfg.name,
+            issue_number=issue_number,
+            submission_id=submission_id,
+            actor=_actor(),
+        )
     )
     record_audit(
         tier="business",
@@ -268,17 +335,18 @@ def portal_link(
         event_type="portal_link",
         actor=link.actor,
         summary=(
-            f"linked {repo_cfg.name} ms-{milestone_number} to portal "
+            f"linked {repo_cfg.name} {target_desc} to portal "
             f"submission {submission_id}"
         ),
         repo=repo_cfg.name,
         details={
             "milestone_number": milestone_number,
+            "issue_number": issue_number,
             "submission_id": submission_id,
         },
     )
     click.secho(
-        f"linked: {repo_cfg.name} ms-{milestone_number} -> "
+        f"linked: {repo_cfg.name} {target_desc} -> "
         f"submission_id={submission_id}",
         fg="green",
     )
@@ -342,17 +410,23 @@ def portal_decompose_chat(config_path, submission_id: str, machine_override: str
 @click.argument("repo")
 @click.argument("tracking_issue", type=int)
 def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
-    """Publish REPO's local Gate-A mock bundle for TRACKING_ISSUE's milestone now.
+    """Publish REPO's local Gate-A mock bundle for TRACKING_ISSUE now.
+
+    TRACKING_ISSUE's milestone is resolved from GitHub and, if it has one,
+    this publishes ``tests/acceptance/ms-NN/``. A milestone-less issue
+    (#2665's one-off decomposition) instead publishes its own
+    ``tests/acceptance/issue-NN/`` bug-lane bundle, resolved through an
+    ``--issue``-scoped ``coord portal link`` rather than a milestone one —
+    same command, same flow, only the resolved shape differs.
 
     The on-demand counterpart to PDR-3's merge-triggered auto-push
     (``coord.merge_queue._maybe_push_design_round``): that path only fires
     once a `type="mock-author"` PR actually merges, which leaves a real gap
     for iterating on a local ``coord acceptance mock ... --amend`` before
     it's merged, or re-publishing after a manual edit. This uploads whatever
-    is currently on THIS machine's local checkout under
-    ``tests/acceptance/ms-NN/`` — ``contract.md`` plus every ``mocks/*.html``
-    fixture, uncommitted changes included — no merge required. That's the
-    whole point of "on demand".
+    is currently on THIS machine's local checkout — ``contract.md`` plus
+    every ``mocks/*.html`` fixture, uncommitted changes included — no merge
+    required. That's the whole point of "on demand".
 
     Reuses PDR-3's shared upload+enqueue helper
     (:func:`coord.portal_sync.push_design_round_bundle`) as-is — only where
@@ -380,6 +454,7 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
         raise SystemExit(1)
 
     from coord import github_ops, portal_store  # noqa: PLC0415
+    from coord.acceptance import issue_dirname, ms_dirname  # noqa: PLC0415
     from coord.portal_sync import PortalSyncError, push_design_round_bundle  # noqa: PLC0415
     from coord.test_orchestrator import find_local_repo_path  # noqa: PLC0415
 
@@ -391,21 +466,32 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
 
     milestone = (issue_data or {}).get("milestone") or {}
     milestone_number = milestone.get("number")
-    if milestone_number is None:
-        click.secho(
-            f"#{tracking_issue} is not scoped to a milestone — nothing to publish",
-            fg="red",
-        )
-        raise SystemExit(1)
 
-    link = portal_store.get_milestone_link(
-        repo_name=repo_cfg.name, milestone_number=milestone_number
-    )
+    if milestone_number is not None:
+        link = portal_store.get_milestone_link(
+            repo_name=repo_cfg.name, milestone_number=milestone_number
+        )
+        target_desc = f"ms-{milestone_number}"
+        bundle_dirname = ms_dirname(milestone_number)
+        link_hint = f"coord portal link {repo_cfg.name} {milestone_number} <submission_id>"
+        bundle_title = milestone.get("title") or f"ms-{milestone_number}"
+    else:
+        # #2665: no milestone — resolve the one-off issue-scoped link
+        # instead of refusing outright.
+        link = portal_store.get_issue_link(
+            repo_name=repo_cfg.name, issue_number=tracking_issue
+        )
+        target_desc = f"issue #{tracking_issue}"
+        bundle_dirname = issue_dirname(tracking_issue)
+        link_hint = (
+            f"coord portal link {repo_cfg.name} --issue {tracking_issue} <submission_id>"
+        )
+        bundle_title = issue_data.get("title") or f"issue-{tracking_issue}"
+
     if link is None:
         click.secho(
-            f"{repo_cfg.name} ms-{milestone_number} has no portal submission linked — "
-            f"run `coord portal link {repo_cfg.name} {milestone_number} <submission_id>` "
-            "first",
+            f"{repo_cfg.name} {target_desc} has no portal submission linked — "
+            f"run `{link_hint}` first",
             fg="red",
         )
         raise SystemExit(1)
@@ -420,14 +506,14 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
         raise SystemExit(1)
 
     try:
-        files = _collect_local_mock_bundle_files(repo_dir, milestone_number)
+        files = _collect_local_mock_bundle_files(repo_dir, bundle_dirname)
     except _MockBundleReadError as exc:
         click.secho(f"could not read local mock bundle: {exc}", fg="red")
         raise SystemExit(1) from exc
     if not files:
         click.secho(
             f"no mock bundle found under {repo_dir}/tests/acceptance/"
-            f"ms-{milestone_number}/ — nothing to publish",
+            f"{bundle_dirname}/ — nothing to publish",
             fg="red",
         )
         raise SystemExit(1)
@@ -437,7 +523,7 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
             client,
             link.submission_id,
             files,
-            milestone_title=milestone.get("title") or f"ms-{milestone_number}",
+            milestone_title=bundle_title,
             tracking_issue_title=issue_data.get("title") or "",
             tracking_issue_body=issue_data.get("body") or "",
         )
@@ -449,7 +535,7 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
         raise SystemExit(1) from exc
 
     click.secho(
-        f"published: {repo_cfg.name} ms-{milestone_number} -> "
+        f"published: {repo_cfg.name} {target_desc} -> "
         f"submission {link.submission_id} (seq={row.seq}, bundle_key={bundle_key}, "
         f"{len(files)} file(s): {', '.join(sorted(files))})",
         fg="green",
@@ -457,7 +543,8 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
 
 
 class _MockBundleReadError(Exception):
-    """A file under the local `ms-NN` acceptance dir could not be read as text.
+    """A file under the local acceptance dir (``ms-NN`` or, since #2665,
+    ``issue-NN``) could not be read as text.
 
     Raised by `_collect_local_mock_bundle_files` in place of a raw
     `UnicodeDecodeError` — mocks are machine-rendered HTML so this is
@@ -467,8 +554,13 @@ class _MockBundleReadError(Exception):
     """
 
 
-def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
+def _collect_local_mock_bundle_files(repo_dir, bundle_dirname: str) -> dict:
     """Read a rendered Gate-A bundle off the LOCAL checkout at *repo_dir*.
+
+    *bundle_dirname* is the acceptance subdirectory name — ``ms_dirname(N)``
+    for a milestone-scoped bundle or, since #2665, ``issue_dirname(N)`` for a
+    one-off issue's bug-lane bundle; this function itself is agnostic to
+    which.
 
     PDR-5's on-demand counterpart to
     :func:`coord.mock_author.collect_mock_bundle_files`, which reads a
@@ -484,21 +576,19 @@ def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
     (#2513 review follow-up) — a file that lights the menu item up must be
     a file this command actually publishes, or the operator gets an
     enabled button whose dispatch dies with "nothing to publish". Empty when
-    the ``ms-NN`` acceptance directory doesn't exist locally at all —
-    callers treat that as an error (unlike the merge-triggered path's
-    "nothing to push", this command is operator-invoked and should say why
-    it did nothing rather than no-op quietly).
+    the acceptance directory doesn't exist locally at all — callers treat
+    that as an error (unlike the merge-triggered path's "nothing to push",
+    this command is operator-invoked and should say why it did nothing
+    rather than no-op quietly).
     """
     from pathlib import Path  # noqa: PLC0415
 
-    from coord.acceptance import ms_dirname  # noqa: PLC0415
-
-    ms_dir = Path(repo_dir) / "tests" / "acceptance" / ms_dirname(milestone_number)
+    bundle_dir = Path(repo_dir) / "tests" / "acceptance" / bundle_dirname
     files: dict = {}
-    contract_path = ms_dir / "contract.md"
+    contract_path = bundle_dir / "contract.md"
     if contract_path.is_file():
         files["contract.md"] = _read_text_or_raise(contract_path)
-    mocks_dir = ms_dir / "mocks"
+    mocks_dir = bundle_dir / "mocks"
     if mocks_dir.is_dir():
         for p in sorted(mocks_dir.iterdir()):
             if p.is_file() and p.suffix.lower() == ".html":

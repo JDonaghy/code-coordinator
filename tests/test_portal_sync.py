@@ -965,6 +965,35 @@ def test_changes_requested_dispatches_amend_and_marks_the_event_consumed(monkeyp
     assert portal_store.unhandled_events() == []
 
 
+def test_changes_requested_for_an_issue_scoped_link_skips_tracking_lookup(monkeypatch):
+    """#2665: a milestone-less issue link IS its own tracking issue — no
+    ``_resolve_tracking_issue`` reverse lookup needed (and none attempted:
+    monkeypatched to blow up if called, to prove it)."""
+    portal_store.link_issue(
+        repo_name="acme-portal", issue_number=77, submission_id=SUB
+    )
+
+    def boom(*_a, **_kw):
+        raise AssertionError("_resolve_tracking_issue must not be called for an issue link")
+
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", boom)
+    calls = []
+
+    def fake_dispatch(repo_name, tracking_issue_number, config, *, amend_briefing=None, **_):
+        calls.append((repo_name, tracking_issue_number, amend_briefing))
+        return ("assignment-1", "machine-1")
+
+    monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(pages=[_changes_requested_page()])
+    result = sync_tick(config=config, client=client)
+
+    assert result.verdicts_consumed == 1
+    assert calls == [("acme-portal", 77, "make it blue")]
+    assert portal_store.unhandled_events() == []
+
+
 def test_approved_verdict_is_left_unconsumed_not_auto_decided(monkeypatch):
     """#2509's open policy question: an `approved` verdict must not silently
     auto-record Gate A here — it stays unhandled instead of being acted on."""
@@ -1336,6 +1365,25 @@ def _issue(number: int, state: str) -> dict:
     return {"number": number, "state": state}
 
 
+class TestSingleIssueAsList:
+    """#2665: `_single_issue_as_list` is `_milestone_issues`'s one-issue
+    counterpart — wraps a single GitHub read in the `[{"number", "state"}]`
+    shape `fold_submission_status` expects."""
+
+    def test_wraps_the_issue_in_a_one_member_list(self, monkeypatch):
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda repo, number: {"number": number, "state": "OPEN", "title": "t"},
+        )
+        result = portal_sync._single_issue_as_list(FakeRepoCfg(), 77)
+        assert result == [{"number": 77, "state": "OPEN", "title": "t"}]
+
+    def test_raises_when_the_issue_cannot_be_read(self, monkeypatch):
+        monkeypatch.setattr("coord.github_ops.get_issue", lambda repo, number: {})
+        with pytest.raises(RuntimeError, match="could not be read"):
+            portal_sync._single_issue_as_list(FakeRepoCfg(), 77)
+
+
 class TestFoldSubmissionStatus:
     """Pure: no I/O, no portal_store, no config."""
 
@@ -1541,6 +1589,94 @@ class TestFoldStatusForMilestone:
         assert len(rows) == 1
 
 
+class TestFoldStatusForIssue:
+    """#2665: the one-off-issue counterpart of `TestFoldStatusForMilestone` —
+    same never-raises contract, same churn guard, just folding a single
+    milestone-less issue instead of a milestone's members."""
+
+    def test_unlinked_issue_is_a_visible_no_op(self):
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+
+        assert result.submission_id is None
+        assert result.status is None
+        assert result.row is None
+        assert result.failed is False
+        assert "no portal link recorded" in result.reason
+        assert "--issue" in result.reason
+
+    def test_repo_not_in_config_is_a_visible_no_op(self):
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        config = FakeConfig({})  # "acme-portal" not registered
+
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+
+        assert result.submission_id == SUB
+        assert result.row is None
+        assert result.failed is False
+        assert "coordinator.yml" in result.reason
+
+    def test_github_read_failure_surfaces_without_raising(self, monkeypatch):
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+
+        def boom(repo_cfg, issue_number):
+            raise RuntimeError("gh api rate limited")
+
+        monkeypatch.setattr(portal_sync, "_single_issue_as_list", boom)
+
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+
+        assert result.submission_id == SUB
+        assert result.row is None
+        assert result.failed is True
+        assert "gh api rate limited" in result.reason
+
+    def test_open_issue_folds_planned_then_closed_folds_shipped(self, monkeypatch):
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_single_issue_as_list", lambda *a: [_issue(77, "OPEN")]
+        )
+
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+        assert result.status == "planned"
+        assert result.row is not None
+        assert result.row.fields["status"] == "planned"
+
+        monkeypatch.setattr(
+            portal_sync, "_single_issue_as_list", lambda *a: [_issue(77, "CLOSED")]
+        )
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+        assert result.status == "shipped"
+        assert result.row is not None
+        assert result.row.fields["status"] == "shipped"
+
+    def test_unchanged_status_does_not_re_notify(self, monkeypatch):
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_single_issue_as_list", lambda *a: [_issue(77, "OPEN")]
+        )
+
+        first = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+        assert first.status == "planned"
+        assert first.row is not None
+
+        second = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+        assert second.status == "planned"
+        assert second.row is None
+        assert "unchanged" in second.reason
+
+
 def _board_with_started(repo_name: str, issue_numbers: set) -> "object":
     from coord.models import Assignment, Board
 
@@ -1585,6 +1721,30 @@ class TestSyncSubmissionStatuses:
         assert by_submission["sub-a"].row is not None
         # The other link's GitHub failure doesn't stop this one from folding.
         assert by_submission["sub-b"].failed is True
+
+    def test_folds_a_mix_of_milestone_and_issue_scoped_links(self, monkeypatch):
+        """#2665: `sync_submission_statuses` must route each link to the
+        right fold — milestone-scoped through `fold_status_for_milestone`,
+        issue-scoped through `fold_status_for_issue` — independently."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id="sub-ms"
+        )
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id="sub-issue"
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+        monkeypatch.setattr(
+            portal_sync, "_single_issue_as_list", lambda *a: [_issue(77, "OPEN")]
+        )
+
+        results = portal_sync.sync_submission_statuses(config)
+
+        by_submission = {r.submission_id: r for r in results}
+        assert by_submission["sub-ms"].status == "shipped"
+        assert by_submission["sub-issue"].status == "planned"
 
 
 class TestSyncTickStatusFold:

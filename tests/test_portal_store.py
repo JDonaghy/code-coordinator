@@ -79,6 +79,69 @@ class TestPortalLinkFromDict:
         assert link.milestone_number == 3
 
 
+class TestPortalLinkIssueScoped:
+    """#2665: a one-off issue decomposition (no milestone) links via
+    ``issue_number`` instead — exactly one of ``milestone_number`` /
+    ``issue_number`` is ever set."""
+
+    def test_round_trips_through_to_dict(self) -> None:
+        from coord.portal_store import PortalLink
+
+        link = PortalLink(
+            repo_name="acme-portal",
+            issue_number=42,
+            submission_id="sub_abc123",
+            linked_at=1000.0,
+            actor="john",
+        )
+        again = PortalLink.from_dict(link.to_dict())
+        assert again == link
+        assert again.milestone_number is None
+
+    def test_rejects_both_milestone_number_and_issue_number(self) -> None:
+        from coord.portal_store import PortalLink
+
+        assert PortalLink.from_dict(
+            {
+                "repo_name": "acme-portal",
+                "milestone_number": 3,
+                "issue_number": 42,
+                "submission_id": "sub_1",
+            }
+        ) is None
+
+    def test_rejects_neither_milestone_number_nor_issue_number(self) -> None:
+        from coord.portal_store import PortalLink
+
+        assert PortalLink.from_dict(
+            {"repo_name": "acme-portal", "submission_id": "sub_1"}
+        ) is None
+
+    def test_an_old_milestone_only_row_still_decodes_unchanged(self) -> None:
+        """The dict-shape widening must not disturb a record written before
+        #2665, which never had an ``issue_number`` key at all."""
+        from coord.portal_store import PortalLink
+
+        link = PortalLink.from_dict(
+            {
+                "repo_name": "acme-portal",
+                "milestone_number": 3,
+                "submission_id": "sub_1",
+            }
+        )
+        assert link is not None
+        assert link.milestone_number == 3
+        assert link.issue_number is None
+
+    def test_target_desc(self) -> None:
+        from coord.portal_store import PortalLink
+
+        ms_link = PortalLink(repo_name="r", milestone_number=3, submission_id="s")
+        issue_link = PortalLink(repo_name="r", issue_number=42, submission_id="s")
+        assert ms_link.target_desc == "ms-3"
+        assert issue_link.target_desc == "issue #42"
+
+
 class TestLinkMilestone:
     def test_link_then_get(self, coord_db) -> None:
         from coord.portal_store import get_milestone_link, link_milestone
@@ -159,10 +222,71 @@ class TestLinkMilestone:
         )
 
 
+class TestLinkIssue:
+    """#2665: the one-off-issue counterpart to ``TestLinkMilestone`` — a
+    decomposition that produced a single milestone-less issue."""
+
+    def test_link_then_get(self, coord_db) -> None:
+        from coord.portal_store import get_issue_link, link_issue
+
+        link_issue(
+            repo_name="acme-portal",
+            issue_number=42,
+            submission_id="sub_abc123",
+            actor="john",
+            now=1000.0,
+        )
+        found = get_issue_link(repo_name="acme-portal", issue_number=42)
+        assert found is not None
+        assert found.submission_id == "sub_abc123"
+        assert found.actor == "john"
+        assert found.linked_at == 1000.0
+        assert found.milestone_number is None
+
+    def test_get_returns_none_when_unlinked(self, coord_db) -> None:
+        from coord.portal_store import get_issue_link
+
+        assert get_issue_link(repo_name="acme-portal", issue_number=42) is None
+
+    def test_relink_overwrites_not_appends(self, coord_db) -> None:
+        from coord.portal_store import get_issue_link, link_issue, list_milestone_links
+
+        link_issue(repo_name="acme-portal", issue_number=42, submission_id="sub_typo")
+        link_issue(repo_name="acme-portal", issue_number=42, submission_id="sub_fixed")
+        links = [
+            link
+            for link in list_milestone_links()
+            if link.repo_name == "acme-portal" and link.issue_number == 42
+        ]
+        assert len(links) == 1
+        assert links[0].submission_id == "sub_fixed"
+        assert (
+            get_issue_link(repo_name="acme-portal", issue_number=42).submission_id
+            == "sub_fixed"
+        )
+
+    def test_a_milestone_link_and_a_same_numbered_issue_link_coexist(
+        self, coord_db
+    ) -> None:
+        """ms-3 and issue #3 are different keys — no cross-talk (#2665)."""
+        from coord.portal_store import get_issue_link, get_milestone_link, link_issue, link_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=3, submission_id="sub_ms3")
+        link_issue(repo_name="acme-portal", issue_number=3, submission_id="sub_issue3")
+        assert (
+            get_milestone_link(repo_name="acme-portal", milestone_number=3).submission_id
+            == "sub_ms3"
+        )
+        assert (
+            get_issue_link(repo_name="acme-portal", issue_number=3).submission_id
+            == "sub_issue3"
+        )
+
+
 class TestGetLinkBySubmission:
     """The reverse lookup #2509's verdict consumer needs: an inbound event
     carries only `submission_id` and must resolve back to `(repo,
-    milestone)`."""
+    milestone)` — or, since #2665, `(repo, issue)`."""
 
     def test_finds_the_link_by_submission_id(self, coord_db) -> None:
         from coord.portal_store import get_link_by_submission, link_milestone
@@ -174,6 +298,16 @@ class TestGetLinkBySubmission:
         assert found is not None
         assert found.repo_name == "acme-portal"
         assert found.milestone_number == 5
+
+    def test_finds_an_issue_scoped_link_by_submission_id(self, coord_db) -> None:
+        from coord.portal_store import get_link_by_submission, link_issue
+
+        link_issue(repo_name="acme-portal", issue_number=42, submission_id="sub_xyz")
+        found = get_link_by_submission("sub_xyz")
+        assert found is not None
+        assert found.repo_name == "acme-portal"
+        assert found.issue_number == 42
+        assert found.milestone_number is None
 
     def test_unknown_submission_id_is_a_clean_none(self, coord_db) -> None:
         from coord.portal_store import get_link_by_submission
@@ -296,7 +430,36 @@ class TestStatePersistenceDirect:
         with pytest.raises(ValueError):
             _save_portal_link_local({"submission_id": "sub_1"})
 
+    def test_record_with_neither_milestone_nor_issue_is_rejected(self, coord_db) -> None:
+        """#2665: repo_name alone is no longer enough — a record must pick a
+        target."""
+        from coord.state import _save_portal_link_local
+
+        with pytest.raises(ValueError):
+            _save_portal_link_local({"repo_name": "acme-portal", "submission_id": "sub_1"})
+
+    def test_record_with_both_milestone_and_issue_is_rejected(self, coord_db) -> None:
+        from coord.state import _save_portal_link_local
+
+        with pytest.raises(ValueError):
+            _save_portal_link_local(
+                {
+                    "repo_name": "acme-portal",
+                    "milestone_number": 3,
+                    "issue_number": 42,
+                    "submission_id": "sub_1",
+                }
+            )
+
     def test_list_is_empty_by_default(self, coord_db) -> None:
         from coord.state import list_portal_links
 
         assert list_portal_links() == []
+
+    def test_get_requires_exactly_one_of_milestone_or_issue(self, coord_db) -> None:
+        from coord.state import get_portal_link
+
+        with pytest.raises(ValueError):
+            get_portal_link(repo_name="acme-portal")
+        with pytest.raises(ValueError):
+            get_portal_link(repo_name="acme-portal", milestone_number=3, issue_number=42)

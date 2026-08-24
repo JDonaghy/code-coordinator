@@ -3924,11 +3924,21 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
 
 # ── #2507: milestone ↔ portal submission linkage ────────────────────────────
 #
-# One JSON record per ``(repo_name, milestone_number)`` under the
-# ``portal_links`` board_meta key — the same seam and the same
+# One JSON record per ``(repo_name, milestone_number)`` — or, since #2665,
+# per ``(repo_name, issue_number)`` for a one-off issue with no milestone —
+# under the ``portal_links`` board_meta key — the same seam and the same
 # whole-list-rewrite shape as ``gate_a_approvals`` above (the row count is
-# "milestones actually linked to a portal submission", i.e. single digits,
-# and one board read answers "does this milestone have a submission_id").
+# "milestones/issues actually linked to a portal submission", i.e. single
+# digits, and one board read answers "does this milestone/issue have a
+# submission_id").
+#
+# #2665 widened the record's DICT SHAPE (a nullable ``issue_number``
+# alongside the now-also-nullable ``milestone_number``, exactly one of the
+# two set) rather than adding a second board_meta key or a schema migration
+# — this seam only ever knows plain dicts, so a new optional field is a
+# free, backward-compatible widening: an old row simply never has
+# ``issue_number`` and decodes exactly as before (see
+# :meth:`coord.portal_store.PortalLink.from_dict`).
 #
 # Unlike ``gate_a_approvals``, this is deliberately LOCAL ONLY — no
 # ``_route_write``/``_board_service`` daemon routing. The rest of the portal
@@ -3948,33 +3958,53 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
 
 
 def save_portal_link(record: dict) -> None:
-    """Upsert one milestone's portal ``submission_id`` link.
+    """Upsert one milestone's (or, since #2665, one issue's) portal
+    ``submission_id`` link.
 
-    Keyed on ``(repo_name, milestone_number)``; an existing link for that
-    pair is replaced wholesale — relinking a milestone to a different
-    ``submission_id`` is a plain overwrite, matching
-    :func:`save_gate_a_approval`'s semantics for the same reason (exactly one
-    live link per milestone).
+    Keyed on ``(repo_name, milestone_number)`` or ``(repo_name,
+    issue_number)`` — whichever the record carries; an existing link for
+    that pair is replaced wholesale — relinking is a plain overwrite,
+    matching :func:`save_gate_a_approval`'s semantics for the same reason
+    (exactly one live link per milestone/issue).
     """
     _save_portal_link_local(record)
 
 
+def _link_target_key(link: dict) -> tuple:
+    """The ``(kind, repo_name, number)`` identity a link is keyed on —
+    ``"ms"`` when ``milestone_number`` is set, ``"issue"`` otherwise (#2665).
+    Shared by the save-time dedupe and by callers that need to compare two
+    raw link dicts for "same target."
+    """
+    milestone_number = _as_int(link.get("milestone_number"))
+    if milestone_number is not None:
+        return ("ms", link.get("repo_name"), milestone_number)
+    return ("issue", link.get("repo_name"), _as_int(link.get("issue_number")))
+
+
 def _save_portal_link_local(record: dict) -> None:
     repo_name = record.get("repo_name")
+    if not isinstance(repo_name, str) or not repo_name:
+        raise ValueError("portal link needs repo_name")
     milestone_number = record.get("milestone_number")
-    if not isinstance(repo_name, str) or not repo_name or milestone_number is None:
-        raise ValueError("portal link needs repo_name + milestone_number")
-    milestone_number = int(milestone_number)
-    record = {**record, "milestone_number": milestone_number}
+    issue_number = record.get("issue_number")
+    has_milestone = milestone_number is not None
+    has_issue = issue_number is not None
+    if has_milestone == has_issue:  # both set, or neither
+        raise ValueError(
+            "portal link needs exactly one of milestone_number or issue_number"
+        )
+    record = {
+        **record,
+        "milestone_number": int(milestone_number) if has_milestone else None,
+        "issue_number": int(issue_number) if has_issue else None,
+    }
 
     conn = get_connection()
     with conn:
         links = _load_portal_links_raw(conn)
-        key = (repo_name, milestone_number)
-        remaining = [
-            link for link in links
-            if (link.get("repo_name"), _as_int(link.get("milestone_number"))) != key
-        ]
+        key = _link_target_key(record)
+        remaining = [link for link in links if _link_target_key(link) != key]
         remaining.append(record)
         conn.execute(
             "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
@@ -3984,23 +4014,34 @@ def _save_portal_link_local(record: dict) -> None:
 
 
 def list_portal_links() -> list[dict]:
-    """Every recorded milestone ↔ submission link (local DB only)."""
+    """Every recorded milestone- or issue-scoped submission link (local DB
+    only, #2665)."""
     conn = get_connection()
     return _load_portal_links_raw(conn)
 
 
-def get_portal_link(*, repo_name: str, milestone_number: int) -> dict | None:
-    """One milestone's portal link, or ``None`` if nobody has recorded one.
+def get_portal_link(
+    *, repo_name: str, milestone_number: int | None = None, issue_number: int | None = None
+) -> dict | None:
+    """One milestone's or one issue's portal link, or ``None`` if nobody has
+    recorded one (#2665). Pass exactly one of ``milestone_number`` /
+    ``issue_number``.
 
     Local-DB only, like :func:`list_portal_links` — see the section docstring
     above for why this does not route to the daemon like
     :func:`get_gate_a_approval` does.
     """
+    if (milestone_number is None) == (issue_number is None):
+        raise ValueError(
+            "get_portal_link needs exactly one of milestone_number or issue_number"
+        )
     for link in list_portal_links():
-        if (
-            link.get("repo_name") == repo_name
-            and _as_int(link.get("milestone_number")) == milestone_number
-        ):
+        if link.get("repo_name") != repo_name:
+            continue
+        if milestone_number is not None:
+            if _as_int(link.get("milestone_number")) == milestone_number:
+                return link
+        elif _as_int(link.get("issue_number")) == issue_number:
             return link
     return None
 

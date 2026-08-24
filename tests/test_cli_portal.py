@@ -274,6 +274,92 @@ def test_link_rejects_unknown_repo(config_path):
     assert "unknown repo" in result.output
 
 
+# ── #2665: one-off issue (no milestone) linkage ─────────────────────────────
+
+
+def test_link_issue_reports_unlinked_by_default(config_path):
+    result = run(
+        "portal", "link", "--config", config_path, "coord", "--issue", "42"
+    )
+    assert result.exit_code != 0
+    assert "not linked" in result.output
+    assert "issue #42" in result.output
+
+
+def test_link_issue_writes_then_reads_back(config_path):
+    write = run(
+        "portal", "link", "--config", config_path, "coord",
+        "--issue", "42", "sub_abc123",
+    )
+    assert write.exit_code == 0, write.output
+    assert "linked" in write.output
+    assert "issue #42" in write.output
+    assert "sub_abc123" in write.output
+
+    read = run(
+        "portal", "link", "--config", config_path, "coord", "--issue", "42"
+    )
+    assert read.exit_code == 0, read.output
+    assert "submission_id=sub_abc123" in read.output
+
+
+def test_link_issue_relink_overwrites_not_appends(config_path):
+    run(
+        "portal", "link", "--config", config_path, "coord",
+        "--issue", "42", "sub_typo",
+    )
+    run(
+        "portal", "link", "--config", config_path, "coord",
+        "--issue", "42", "sub_fixed",
+    )
+
+    read = run(
+        "portal", "link", "--config", config_path, "coord", "--issue", "42"
+    )
+    assert read.exit_code == 0, read.output
+    assert "submission_id=sub_fixed" in read.output
+    assert "sub_typo" not in read.output
+
+
+def test_link_issue_does_not_collide_with_a_same_numbered_milestone(config_path):
+    """Issue #3 and milestone 3 are different keys — no cross-talk (#2665)."""
+    run("portal", "link", "--config", config_path, "coord", "3", "sub_ms3")
+    run(
+        "portal", "link", "--config", config_path, "coord",
+        "--issue", "3", "sub_issue3",
+    )
+
+    ms = run("portal", "link", "--config", config_path, "coord", "3")
+    issue = run(
+        "portal", "link", "--config", config_path, "coord", "--issue", "3"
+    )
+    assert "submission_id=sub_ms3" in ms.output
+    assert "submission_id=sub_issue3" in issue.output
+
+
+def test_link_rejects_both_milestone_number_and_issue(config_path):
+    result = run(
+        "portal", "link", "--config", config_path, "coord",
+        "3", "sub_1", "--issue", "42",
+    )
+    assert result.exit_code != 0
+    assert "not both" in result.output
+
+
+def test_link_rejects_neither_milestone_number_nor_issue(config_path):
+    result = run("portal", "link", "--config", config_path, "coord")
+    assert result.exit_code != 0
+    assert "MILESTONE_NUMBER or --issue" in result.output
+
+
+def test_link_rejects_a_non_integer_milestone_number(config_path):
+    result = run(
+        "portal", "link", "--config", config_path, "coord", "not-a-number"
+    )
+    assert result.exit_code != 0
+    assert "must be an integer" in result.output
+
+
 # ── #2533 (ms-67 PB-3): pull an approved submission into a decomposition chat ──
 
 
@@ -583,14 +669,25 @@ def _stub_get_issue(*, milestone_number: int | None = 9, title="Q3 push", body="
     return _get_issue
 
 
-def _mock_bundle_dir(tmp_path, *, milestone_number: int = 9, with_index: bool = False):
+def _mock_bundle_dir(
+    tmp_path,
+    *,
+    milestone_number: int | None = 9,
+    issue_number: int | None = None,
+    with_index: bool = False,
+):
     """A local checkout at ``tmp_path/repo`` with a rendered Gate-A bundle
-    on disk — the shape `publish-mocks` reads directly, no `gh` involved."""
+    on disk — the shape `publish-mocks` reads directly, no `gh` involved.
+
+    Pass ``issue_number`` instead of ``milestone_number`` for a #2665
+    one-off-issue bug-lane bundle (``tests/acceptance/issue-NN/``).
+    """
     repo_dir = tmp_path / "repo"
-    ms_dir = repo_dir / "tests" / "acceptance" / f"ms-{milestone_number}"
-    ms_dir.mkdir(parents=True)
-    (ms_dir / "contract.md").write_text("# contract\n")
-    mocks_dir = ms_dir / "mocks"
+    dirname = f"issue-{issue_number}" if issue_number is not None else f"ms-{milestone_number}"
+    bundle_dir = repo_dir / "tests" / "acceptance" / dirname
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "contract.md").write_text("# contract\n")
+    mocks_dir = bundle_dir / "mocks"
     mocks_dir.mkdir()
     (mocks_dir / "screen.html").write_text("<html>screen</html>")
     if with_index:
@@ -650,13 +747,58 @@ def test_publish_mocks_errors_when_no_portal_link(config_path, monkeypatch):
     assert "coord portal link" in result.output
 
 
-def test_publish_mocks_errors_when_milestone_unresolved(config_path, monkeypatch):
+def test_publish_mocks_errors_when_milestone_less_issue_has_no_link(
+    config_path, monkeypatch
+):
+    """#2665: a milestone-less tracking issue no longer fails outright —
+    it falls back to an issue-scoped `coord portal link --issue` lookup,
+    which (with none recorded here) reports the fix to run, naming
+    `--issue`."""
     monkeypatch.setattr(
         "coord.github_ops.get_issue", _stub_get_issue(milestone_number=None)
     )
     result = run("portal", "publish-mocks", "--config", config_path, "coord", "3")
     assert result.exit_code != 0
-    assert "not scoped to a milestone" in result.output
+    assert "issue #3" in result.output
+    assert "--issue 3" in result.output
+
+
+def test_publish_mocks_uploads_and_enqueues_for_an_issue_scoped_link(
+    tmp_path, monkeypatch
+):
+    """#2665: the one-off-issue counterpart of
+    `test_publish_mocks_uploads_and_enqueues` below — a milestone-less
+    tracking issue, linked via `--issue`, publishes its
+    `tests/acceptance/issue-NN/` bug-lane bundle."""
+    from coord import portal_store
+
+    repo_dir = _mock_bundle_dir(tmp_path, issue_number=3, with_index=True)
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_issue(repo_name="coord", issue_number=3, submission_id="sub_1")
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue", _stub_get_issue(milestone_number=None)
+    )
+
+    seen_upload: dict = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        seen_upload["files"] = (json or {}).get("files")
+        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+
+    monkeypatch.setattr("httpx.post", _post)
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code == 0, result.output
+    assert "published" in result.output
+    assert "issue #3" in result.output
+    assert "sub_1" in result.output
+    assert set(seen_upload["files"]) == {
+        "contract.md", "mocks/screen.html", "mocks/index.html",
+    }
+
+    rows = portal_store.outbox_for_submission("sub_1")
+    assert len(rows) == 1
+    assert rows[0].kind == "design_round"
 
 
 def test_publish_mocks_errors_when_no_local_checkout(config_path, monkeypatch):

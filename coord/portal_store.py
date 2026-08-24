@@ -936,20 +936,20 @@ def clear_error() -> None:
     _update_sync_state(last_error="")
 
 
-# ── #2507: milestone ↔ portal submission linkage ────────────────────────────
+# ── #2507 / #2665: milestone ↔ portal submission linkage ───────────────────
 #
 # Every table above is part of the sync bridge's own SQLite schema
 # (``coord.db``'s ``_ensure_schema``) and, per the module docstring, is
-# deliberately daemon-host-only. The link between a coord milestone and a
-# portal ``submission_id`` is a DIFFERENT kind of fact — nothing here creates
-# or drives it (the portal's own intake flow does, out of coord's sight) —
-# but it still needs the same durability and the same "read anywhere, write
-# on the daemon host" story, so it is persisted through
-# :mod:`coord.state`'s ``portal_links`` board_meta seam (same shape as
-# ``coord.gate_a``'s ``GateAApproval`` / ``gate_a_approvals``) rather than a
-# fifth table here. This is the domain half — :mod:`coord.state` only knows
-# plain dicts, this is where the dict shape is pinned down and given a
-# tolerant decoder.
+# deliberately daemon-host-only. The link between a coord milestone (or,
+# since #2665, a single milestone-less issue) and a portal ``submission_id``
+# is a DIFFERENT kind of fact — nothing here creates or drives it (the
+# portal's own intake flow does, out of coord's sight) — but it still needs
+# the same durability and the same "read anywhere, write on the daemon host"
+# story, so it is persisted through :mod:`coord.state`'s ``portal_links``
+# board_meta seam (same shape as ``coord.gate_a``'s ``GateAApproval`` /
+# ``gate_a_approvals``) rather than a fifth table here. This is the domain
+# half — :mod:`coord.state` only knows plain dicts, this is where the dict
+# shape is pinned down and given a tolerant decoder.
 #
 # Consumers: PDR-3's auto-push (resolve a milestone's outbox destination) and
 # PDR-4's verdict consumer (resolve an inbound portal event back to a
@@ -957,33 +957,56 @@ def clear_error() -> None:
 # (#2507 — confirmed by grep, ``submission_id`` appeared in neither
 # ``coord/config.py``, ``coord/milestone*.py``, nor ``coord/gate_a.py``
 # before this).
+#
+# #2665: a one-off issue decomposition — a single issue filed with no
+# milestone — could never be linked at all, since every link was keyed on a
+# milestone number. Rather than mint a synthetic single-item milestone for
+# every small request (rejected explicitly — see ``coord portal link``'s
+# docstring in ``coord.commands.portal`` for why), the link itself now
+# carries EITHER a ``milestone_number`` OR an ``issue_number``, never both.
+# This is a dict-shape widening, not a schema migration: the board_meta seam
+# only ever knew plain dicts, so an old row with only ``milestone_number``
+# still decodes unchanged (``issue_number`` simply reads back ``None``).
 
 _LINK_SCHEMA = 1
 
 
 @dataclass(frozen=True)
 class PortalLink:
-    """One durable ``(repo_name, milestone_number)`` → portal ``submission_id``
-    mapping, set by an operator with ``coord portal link`` once a submission
-    exists on the portal side.
+    """One durable ``(repo_name, milestone_number)`` OR ``(repo_name,
+    issue_number)`` → portal ``submission_id`` mapping (#2665), set by an
+    operator with ``coord portal link`` once a submission exists on the
+    portal side. Exactly one of ``milestone_number`` / ``issue_number`` is
+    set — never both, never neither.
     """
 
     repo_name: str
-    milestone_number: int
     submission_id: str
     linked_at: float = 0.0
     actor: str = ""
     schema: int = _LINK_SCHEMA
+    milestone_number: int | None = None
+    issue_number: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "repo_name": self.repo_name,
             "milestone_number": self.milestone_number,
+            "issue_number": self.issue_number,
             "submission_id": self.submission_id,
             "linked_at": self.linked_at,
             "actor": self.actor,
             "schema": self.schema,
         }
+
+    @property
+    def target_desc(self) -> str:
+        """A short, human-readable label for whichever target this link is
+        scoped to — ``"ms-3"`` or ``"issue #42"`` — for CLI output and error
+        messages that must read correctly either way (#2665)."""
+        if self.milestone_number is not None:
+            return f"ms-{self.milestone_number}"
+        return f"issue #{self.issue_number}"
 
     @classmethod
     def from_dict(cls, raw: Any) -> "PortalLink | None":
@@ -992,7 +1015,10 @@ class PortalLink:
         Same posture as :meth:`coord.gate_a.GateAApproval.from_dict`: a
         record written by a newer schema, or a corrupt one, degrades to "no
         link recorded" rather than crashing a caller that resolves one
-        milestone at a time.
+        milestone/issue at a time. Requires EXACTLY one of
+        ``milestone_number`` / ``issue_number`` to be present (#2665) — a
+        record with both, or neither, is not a shape this build understands
+        either.
         """
         if not isinstance(raw, dict):
             return None
@@ -1002,17 +1028,19 @@ class PortalLink:
         if not isinstance(repo_name, str) or not repo_name:
             return None
         milestone_number = _as_int_or_none(raw.get("milestone_number"))
-        if milestone_number is None:
+        issue_number = _as_int_or_none(raw.get("issue_number"))
+        if (milestone_number is None) == (issue_number is None):  # both or neither
             return None
         submission_id = raw.get("submission_id")
         if not isinstance(submission_id, str) or not submission_id:
             return None
         return cls(
             repo_name=repo_name,
-            milestone_number=milestone_number,
             submission_id=submission_id,
             linked_at=float(raw.get("linked_at") or 0.0),
             actor=str(raw.get("actor") or ""),
+            milestone_number=milestone_number,
+            issue_number=issue_number,
         )
 
 
@@ -1039,14 +1067,58 @@ def link_milestone(
     submission_id, or correcting an id entered against the wrong milestone —
     not an error case.
     """
+    return _link_target(
+        repo_name=repo_name,
+        milestone_number=int(milestone_number),
+        issue_number=None,
+        submission_id=submission_id,
+        actor=actor,
+        now=now,
+    )
+
+
+def link_issue(
+    *,
+    repo_name: str,
+    issue_number: int,
+    submission_id: str,
+    actor: str = "",
+    now: float | None = None,
+) -> PortalLink:
+    """Record (or overwrite) the portal submission_id for one milestone-less
+    issue (#2665) — the one-off-decomposition counterpart to
+    :func:`link_milestone`, for a decomposition that produced a single issue
+    with no milestone to hang a link off of. Same overwrite-not-append
+    semantics, same reason.
+    """
+    return _link_target(
+        repo_name=repo_name,
+        milestone_number=None,
+        issue_number=int(issue_number),
+        submission_id=submission_id,
+        actor=actor,
+        now=now,
+    )
+
+
+def _link_target(
+    *,
+    repo_name: str,
+    milestone_number: int | None,
+    issue_number: int | None,
+    submission_id: str,
+    actor: str,
+    now: float | None,
+) -> PortalLink:
     from coord import state  # noqa: PLC0415
 
     record = PortalLink(
         repo_name=repo_name,
-        milestone_number=int(milestone_number),
         submission_id=submission_id,
         linked_at=time.time() if now is None else now,
         actor=actor,
+        milestone_number=milestone_number,
+        issue_number=issue_number,
     )
     state.save_portal_link(record.to_dict())
     return record
@@ -1060,8 +1132,27 @@ def get_milestone_link(*, repo_name: str, milestone_number: int) -> PortalLink |
     return PortalLink.from_dict(raw) if raw is not None else None
 
 
+def get_issue_link(*, repo_name: str, issue_number: int) -> PortalLink | None:
+    """The current portal link for one milestone-less issue, or ``None`` if
+    unlinked (#2665) — the one-off-decomposition counterpart to
+    :func:`get_milestone_link`.
+    """
+    from coord import state  # noqa: PLC0415
+
+    raw = state.get_portal_link(repo_name=repo_name, issue_number=issue_number)
+    return PortalLink.from_dict(raw) if raw is not None else None
+
+
 def list_milestone_links() -> list[PortalLink]:
-    """Every recorded milestone ↔ submission link."""
+    """Every recorded link — milestone-scoped AND, since #2665, issue-scoped.
+
+    The name predates #2665's issue-scoped shape; kept as-is (rather than
+    renamed) since it is the established read-everything seam callers
+    already use (:func:`get_link_by_submission`,
+    :func:`coord.portal_sync.sync_submission_statuses`) — each of them
+    branches on ``link.milestone_number is not None`` vs
+    ``link.issue_number is not None`` to tell the two shapes apart.
+    """
     from coord import state  # noqa: PLC0415
 
     links = [PortalLink.from_dict(raw) for raw in state.list_portal_links()]
@@ -1069,16 +1160,17 @@ def list_milestone_links() -> list[PortalLink]:
 
 
 def get_link_by_submission(submission_id: str) -> PortalLink | None:
-    """Reverse lookup: the milestone link for a portal ``submission_id``, if any.
+    """Reverse lookup: the link for a portal ``submission_id``, if any —
+    whether it is scoped to a milestone or (#2665) a single issue.
 
-    :func:`link_milestone` / :func:`get_milestone_link` only index the
-    forward direction (milestone → submission_id), which is all PDR-3's
-    auto-push needs. PDR-4's verdict consumer needs the other direction —
-    an inbound event carries only ``submission_id`` and must resolve back to
-    the ``(repo_name, milestone_number)`` coord dispatches against. Links are
-    few enough (one per submission a customer has ever been sent to) that a
-    linear scan of :func:`list_milestone_links` is simply the read path — no
-    new index, no new table.
+    :func:`link_milestone` / :func:`get_milestone_link` (and their
+    issue-scoped counterparts) only index the forward direction (milestone
+    or issue → submission_id), which is all PDR-3's auto-push needs. PDR-4's
+    verdict consumer needs the other direction — an inbound event carries
+    only ``submission_id`` and must resolve back to where coord dispatches
+    against. Links are few enough (one per submission a customer has ever
+    been sent to) that a linear scan of :func:`list_milestone_links` is
+    simply the read path — no new index, no new table.
     """
     for link in list_milestone_links():
         if link.submission_id == submission_id:

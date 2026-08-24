@@ -521,6 +521,25 @@ def _milestone_issues(repo_cfg: Any, milestone_number: int) -> list[dict[str, An
     return github_ops.get_milestone_issues(repo_cfg.github, title, state="all")
 
 
+def _single_issue_as_list(repo_cfg: Any, issue_number: int) -> list[dict[str, Any]]:
+    """The one-issue counterpart to :func:`_milestone_issues` (#2665): wraps
+    a single milestone-less issue in the same ``[{"number", "state", ...}]``
+    shape :func:`fold_submission_status` expects, so an issue-scoped link
+    folds through the exact same pure fold a milestone-scoped one does — just
+    with a fixed, one-member list instead of a `gh issue list --milestone`
+    read.
+
+    Raises on a GitHub read failure, same posture as :func:`_milestone_issues` —
+    the fail-open handling lives in the caller.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    issue = github_ops.get_issue(repo_cfg.github, issue_number)
+    if not issue or issue.get("number") is None:
+        raise RuntimeError(f"issue #{issue_number} could not be read from GitHub")
+    return [issue]
+
+
 def _last_queued_status(submission_id: str) -> str | None:
     """The status of the most recently queued STATUS row for *submission_id*
     (any outbox state — pending, applied, rejected, held), or ``None`` if
@@ -605,7 +624,68 @@ def fold_status_for_milestone(
             f"no portal link recorded for {repo_name} ms-{milestone_number} "
             "(coord portal link) — nothing to push",
         )
+    return _fold_status_for_link(
+        config, repo_name, link,
+        issues_fn=lambda repo_cfg: _milestone_issues(repo_cfg, milestone_number),
+        empty_reason=f"ms-{milestone_number} has no issues yet — nothing to fold",
+        read_failure_label=f"ms-{milestone_number}'s issues",
+        board=board, now=now,
+    )
 
+
+def fold_status_for_issue(
+    config: Any,
+    repo_name: str,
+    issue_number: int,
+    *,
+    board: Any = None,
+    now: float | None = None,
+) -> StatusFoldResult:
+    """The one-off-issue counterpart to :func:`fold_status_for_milestone`
+    (#2665) — resolve, fold, and (if changed) enqueue the customer status for
+    the portal submission linked to a single milestone-less issue
+    (``(repo_name, issue_number)``, ``coord portal link --issue``).
+
+    Same never-raises contract and churn guard as the milestone form; the
+    only difference is the GitHub read behind it —
+    :func:`_single_issue_as_list` (one issue) instead of `gh issue list
+    --milestone` (every issue under a milestone) — feeding the exact same
+    pure :func:`fold_submission_status` fold with a one-member list, which is
+    what keeps "planned / in-progress / shipped" identical between the two
+    shapes: a lone issue folds exactly like a milestone with one member.
+    """
+    link = portal_store.get_issue_link(repo_name=repo_name, issue_number=issue_number)
+    if link is None:
+        return StatusFoldResult(
+            None, None,
+            f"no portal link recorded for {repo_name} issue #{issue_number} "
+            "(coord portal link --issue) — nothing to push",
+        )
+    return _fold_status_for_link(
+        config, repo_name, link,
+        issues_fn=lambda repo_cfg: _single_issue_as_list(repo_cfg, issue_number),
+        empty_reason=f"issue #{issue_number} could not be read — nothing to fold",
+        read_failure_label=f"issue #{issue_number}",
+        board=board, now=now,
+    )
+
+
+def _fold_status_for_link(
+    config: Any,
+    repo_name: str,
+    link: "portal_store.PortalLink",
+    *,
+    issues_fn: Any,
+    empty_reason: str,
+    read_failure_label: str,
+    board: Any,
+    now: float | None,
+) -> StatusFoldResult:
+    """Shared tail of :func:`fold_status_for_milestone` /
+    :func:`fold_status_for_issue` (#2665): everything downstream of "the link
+    is resolved" is identical between the two shapes — only how the member
+    issue(s) are read off GitHub (*issues_fn*) differs.
+    """
     repo_cfg = config.repo(repo_name) if config is not None else None
     if repo_cfg is None:
         return StatusFoldResult(
@@ -613,19 +693,16 @@ def fold_status_for_milestone(
         )
 
     try:
-        issues = _milestone_issues(repo_cfg, milestone_number)
+        issues = issues_fn(repo_cfg)
     except Exception as exc:  # noqa: BLE001 — a GitHub read failure must not raise into a merge
         return StatusFoldResult(
             link.submission_id, None,
-            f"could not read ms-{milestone_number}'s issues: {exc}",
+            f"could not read {read_failure_label}: {exc}",
             failed=True,
         )
 
     if not issues:
-        return StatusFoldResult(
-            link.submission_id, None,
-            f"ms-{milestone_number} has no issues yet — nothing to fold",
-        )
+        return StatusFoldResult(link.submission_id, None, empty_reason)
 
     started = _started_issue_numbers(board, repo_name)
     status = fold_submission_status(issues, started)
@@ -648,7 +725,8 @@ def fold_status_for_milestone(
 def sync_submission_statuses(
     config: Any, *, board: Any = None, now: float | None = None,
 ) -> list[StatusFoldResult]:
-    """Fold + auto-push status for every linked milestone (#2588).
+    """Fold + auto-push status for every linked milestone or issue (#2588,
+    widened for #2665).
 
     Requires *config* (a real :class:`coord.config.Config`, ``.repo(name)``
     and all) to resolve each link's repo — same "no config, no-op" contract
@@ -657,18 +735,28 @@ def sync_submission_statuses(
     portal sync``) has no repo topology to resolve against.
 
     Never raises: every link is folded independently through
-    :func:`fold_status_for_milestone`, which itself never raises, so one
-    broken link (an unresolvable repo, a GitHub outage) can never stop the
-    rest from folding.
+    :func:`fold_status_for_milestone` or :func:`fold_status_for_issue`
+    (chosen by which of ``milestone_number``/``issue_number`` the link
+    carries), both of which never raise, so one broken link (an unresolvable
+    repo, a GitHub outage) can never stop the rest from folding.
     """
     if config is None:
         return []
-    return [
-        fold_status_for_milestone(
-            config, link.repo_name, link.milestone_number, board=board, now=now,
-        )
-        for link in portal_store.list_milestone_links()
-    ]
+    results = []
+    for link in portal_store.list_milestone_links():
+        if link.milestone_number is not None:
+            results.append(
+                fold_status_for_milestone(
+                    config, link.repo_name, link.milestone_number, board=board, now=now,
+                )
+            )
+        else:
+            results.append(
+                fold_status_for_issue(
+                    config, link.repo_name, link.issue_number, board=board, now=now,
+                )
+            )
+    return results
 
 
 # ── the ordering guard ──────────────────────────────────────────────────────
@@ -1106,12 +1194,18 @@ def _amend_from_verdict(config: Any, event: "portal_store.PortalEvent") -> None:
             f"linked repo {link.repo_name!r} is not in coordinator.yml"
         )
 
-    tracking_issue_number = _resolve_tracking_issue(repo_cfg, link.milestone_number)
-    if tracking_issue_number is None:
-        raise RuntimeError(
-            f"could not resolve a tracking (epic) issue for milestone "
-            f"{link.milestone_number} in {link.repo_name!r}"
-        )
+    if link.issue_number is not None:
+        # #2665: an issue-scoped link has no milestone to resolve a tracking
+        # (epic) issue FROM — the linked issue already IS the one this
+        # amendment targets, no reverse lookup needed.
+        tracking_issue_number: int | None = link.issue_number
+    else:
+        tracking_issue_number = _resolve_tracking_issue(repo_cfg, link.milestone_number)
+        if tracking_issue_number is None:
+            raise RuntimeError(
+                f"could not resolve a tracking (epic) issue for milestone "
+                f"{link.milestone_number} in {link.repo_name!r}"
+            )
 
     comment = _signoff_comment(event)
     amend_text = comment or (
