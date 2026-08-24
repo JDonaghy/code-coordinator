@@ -25,6 +25,8 @@ from coord.agent import (
     AssignmentSpec,
     default_worker_command,
 )
+
+from .conftest import py_worker_argv
 from coord.cli import main
 from coord import state as state_mod
 from coord import merge_queue as mq
@@ -145,7 +147,7 @@ def _init_repo(path: Path) -> Path:
 
 def _server(tmp_path: Path, *, argv: list[str] | None = None, repo_path: Path | None = None) -> AgentServer:
     if argv is None:
-        argv = ["/bin/sh", "-c", "echo plan-output"]
+        argv = py_worker_argv("print('plan-output')")
     rp = repo_path or _init_repo(tmp_path / "repo")
     return AgentServer(
         machine_name="test",
@@ -197,8 +199,12 @@ class TestAssignPlanMode:
         captured_cwds: list[str] = []
 
         def capturing_command(spec: AssignmentSpec) -> list[str]:
-            # Print the cwd (the process's working directory)
-            return ["/bin/sh", "-c", f"echo cwd=$PWD"]
+            # Print the cwd (the process's working directory), read from the
+            # $PWD env var — the same env var the shell `echo cwd=$PWD` form
+            # used to read (`_worker_subprocess_env` sets it explicitly).
+            return py_worker_argv(
+                "import os; print('cwd=' + os.environ.get('PWD', ''))"
+            )
 
         server = AgentServer(
             machine_name="test",

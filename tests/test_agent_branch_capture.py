@@ -9,6 +9,8 @@ import pytest
 
 from coord.agent import ADVISORY, DONE, FAILED, AgentServer, AssignmentSpec
 
+from .conftest import NOOP_WORKER_ARGV
+
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -39,7 +41,7 @@ def test_branch_captured_from_worktree(
         repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -67,7 +69,7 @@ def test_worktree_path_stored_on_assignment(
         repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -91,7 +93,7 @@ def test_main_repo_untouched_by_worker(
         repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -130,7 +132,7 @@ def test_fresh_branch_ignores_existing_local_branch(
         repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -166,7 +168,7 @@ def test_fresh_branch_false_reuses_existing_branch(
         repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -231,7 +233,7 @@ def test_local_only_leftover_branch_not_reused_when_origin_exists(
         repos=["api"],
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(clone),
@@ -280,7 +282,7 @@ def test_origin_branch_reset_to_remote_tip_on_continuation(
         repos=["api"],
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(clone),
@@ -306,7 +308,7 @@ def test_worktree_setup_failure_marks_assignment_failed(tmp_path: Path) -> None:
         repos=["api"],
         repo_paths={"api": str(not_a_repo)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(not_a_repo),
@@ -334,7 +336,7 @@ def test_target_branch_overrides_slugified_title(
         machine_name="t", repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec1 = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),
@@ -377,7 +379,7 @@ def test_no_target_branch_uses_slugified_title(
         machine_name="t", repos=["api"],
         repo_paths={"api": str(repo_clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api", repo_path=str(repo_clone),

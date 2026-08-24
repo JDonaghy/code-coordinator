@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,8 @@ from coord.agent import (
     is_runtime_ceiling_reason,
 )
 
+from .conftest import noop_default_worker_command
+
 
 def _init_repo(path: Path) -> Path:
     """Create a minimal git repo with one commit so worktrees can be created."""
@@ -69,7 +72,7 @@ def _spec(repo_path: Path, **overrides) -> AssignmentSpec:
 
 def _server(tmp_path: Path, *, argv: list[str] | None = None, repo_path: Path | None = None, **kwargs) -> AgentServer:
     if argv is None:
-        argv = ["/bin/sh", "-c", "echo worker-output"]
+        argv = [sys.executable, "-c", "print('worker-output')"]
     # Ensure we have a git repo for worktree support
     rp = repo_path or _init_repo(tmp_path / "repo")
     return AgentServer(
@@ -244,7 +247,7 @@ def test_assign_success(tmp_path: Path) -> None:
 
 def test_assign_failure_marks_failed(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
-    server = _server(tmp_path, argv=["/bin/sh", "-c", "echo nope; exit 7"], repo_path=repo)
+    server = _server(tmp_path, argv=[sys.executable, "-c", "import sys; print('nope'); sys.exit(7)"], repo_path=repo)
     a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
     assert final.status == FAILED
@@ -267,7 +270,7 @@ def test_running_agent_kills_and_marks_a_leg_that_outlives_the_runtime_ceiling(
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "sleep 300"],
+        argv=[sys.executable, "-c", "import time; time.sleep(300)"],
         repo_path=repo,
         runtime_ceiling_s=3.0,  # comfortably under one 5s reap poll interval
     )
@@ -297,7 +300,7 @@ def test_running_agent_with_a_generous_ceiling_finishes_untouched(tmp_path: Path
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "echo hi; exit 0"],
+        argv=[sys.executable, "-c", "print('hi')"],
         repo_path=repo,
         runtime_ceiling_s=6.0 * 3600.0,
     )
@@ -344,7 +347,7 @@ def test_initial_briefing_is_written_to_worker_stdin(tmp_path: Path) -> None:
     # Read exactly one line from stdin into the log, then exit.
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "read line; echo $line"],
+        argv=[sys.executable, "-c", "import sys; print(sys.stdin.readline().rstrip(chr(10)))"],
         repo_path=repo,
     )
     a = server.assign(_spec(repo, briefing="hello world"))
@@ -361,7 +364,7 @@ def test_inject_message_writes_to_worker_stdin(tmp_path: Path) -> None:
     # Worker reads two lines (initial briefing + injection) then exits.
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "read a; echo got1=$a; read b; echo got2=$b"],
+        argv=[sys.executable, "-c", "import sys; a = sys.stdin.readline().rstrip(chr(10)); print('got1=' + a); b = sys.stdin.readline().rstrip(chr(10)); print('got2=' + b)"],
         repo_path=repo,
     )
     a = server.assign(_spec(repo, briefing="first"))
@@ -392,7 +395,7 @@ def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "echo worker-output"],
+        argv=[sys.executable, "-c", "print('worker-output')"],
         repo_path=repo,
         bash_wrap_spawn=True,
     )
@@ -416,7 +419,13 @@ def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
     assert final.status == ADVISORY
     assert captured, "Popen was not called"
     assert captured[0][:2] == ["bash", "-c"]
-    assert captured[0][2] == "exec /bin/sh -c 'echo worker-output'"
+    # #2725: the inner argv is now the portable `sys.executable -c '<script>'`
+    # form rather than `/bin/sh -c '<script>'`; compute the expected
+    # shlex-quoted form rather than hardcoding it, since the exact quoting
+    # depends on `sys.executable`'s path.
+    assert captured[0][2] == "exec " + shlex.join(
+        [sys.executable, "-c", "print('worker-output')"]
+    )
     # The wrapped command still produced the worker's output.
     assert "worker-output" in Path(final.log_path).read_text()
     server.shutdown()
@@ -429,7 +438,7 @@ def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "echo worker-output"],
+        argv=[sys.executable, "-c", "print('worker-output')"],
         repo_path=repo,
         bash_wrap_spawn=False,
     )
@@ -451,7 +460,7 @@ def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
         agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
     # Worker makes no commits → advisory (#448)
     assert final.status == ADVISORY
-    assert captured and captured[0] == ["/bin/sh", "-c", "echo worker-output"]
+    assert captured and captured[0] == [sys.executable, "-c", "print('worker-output')"]
     server.shutdown()
 
 
@@ -579,7 +588,7 @@ def test_pty_spawn_sets_pwd_to_repo_path(tmp_path: Path) -> None:
 
     class _QuickExitPtyProvider(ClaudePtyProvider):
         def build_command(self, spec, *, resolved_model=None, **_kwargs):
-            return ["/bin/sh", "-c", "exit 0"]
+            return [sys.executable, "-c", "import sys; sys.exit(0)"]
 
         def initial_input(self, spec):
             # Falsy → _spawn_pty skips the readiness-wait + paste dance
@@ -600,7 +609,7 @@ def test_pty_spawn_sets_pwd_to_repo_path(tmp_path: Path) -> None:
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('unused')"],
         repo_paths={"api": str(repo)},
         providers={"claude-pty": _QuickExitPtyProvider()},
     )
@@ -646,7 +655,7 @@ def test_inject_message_on_finished_assignment_raises(tmp_path: Path) -> None:
 
 def test_cancel_running_assignment(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
-    server = _server(tmp_path, argv=["/bin/sh", "-c", "sleep 30"], repo_path=repo)
+    server = _server(tmp_path, argv=[sys.executable, "-c", "import time; time.sleep(30)"], repo_path=repo)
     a = server.assign(_spec(repo))
     # Wait until it's actually running so cancel has something to terminate.
     for _ in range(50):
@@ -877,7 +886,7 @@ def test_clean_worktrees_keeps_running(tmp_path: Path) -> None:
     """Worktrees for running assignments are never touched."""
     repo = _init_repo(tmp_path / "repo")
     # Use a worker that sleeps long enough for us to inspect state.
-    server = _server(tmp_path, argv=["/bin/sh", "-c", "sleep 10"], repo_path=repo)
+    server = _server(tmp_path, argv=[sys.executable, "-c", "import time; time.sleep(10)"], repo_path=repo)
     a = server.assign(_spec(repo))
 
     # Give the worker a moment to start and create its worktree.
@@ -1373,7 +1382,7 @@ def test_assign_wires_the_review_deny_list_into_the_real_dispatch(tmp_path: Path
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: default_worker_command(spec, binary="/bin/true"),
+        worker_command=noop_default_worker_command,
         repo_paths={"api": str(repo)},
     )
     spec = _spec(repo, type="review")
@@ -1426,6 +1435,33 @@ _posix_repo_path_skip = pytest.mark.skipif(
     sys.platform == "win32",
     reason="feeds a POSIX-absolute repo_path into a native pathlib.Path — "
     "POSIX-only fixture shape, no Windows port yet (#2684)",
+)
+
+# #2725: a handful of tests point `ProviderDef.binary` (and so
+# `ClaudeProvider`/`OpenCodeProvider.build_command`'s `argv[0]`) at a stub
+# script and spawn it for REAL through `AgentServer.assign()`, to prove the
+# wire-resolved binary path actually reaches the spawned process — not just
+# a `build_command()` unit check. Unlike the fake-worker shapes this issue
+# fixes elsewhere in this file (`/bin/true`, `/bin/sh -c script`,
+# `#!/bin/sh` scripts invoked via `[sys.executable, str(script)]`),
+# `argv[0]` here is fixed by *production* code
+# (`coord/providers/{claude,opencode}.py`: `argv = [binary, ...]`) to a
+# single string with no room to prepend `sys.executable` — so there is no
+# portable stand-in reachable from `tests/` alone. A bare `.sh` shebang
+# script fails on Windows with `[WinError 193] %1 is not a valid Win32
+# application` (the exact failure this issue reports); a `.bat`/`.cmd`
+# alternative does NOT help either — `CreateProcess` (what
+# `subprocess.Popen` calls without `shell=True`, exactly as
+# `AgentServer._spawn` invokes it) does not run batch files directly, only
+# `cmd.exe /c` does, so that would fail with the same WinError. Making this
+# portable needs a `coord/providers` change (e.g. an interpreter-aware
+# binary resolution), which is out of this ticket's `tests/`-only scope —
+# noted here rather than silently worked around.
+_posix_binary_spawn_skip = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="spawns a stub script directly as ProviderDef.binary (argv[0]) — "
+    "no portable stand-in without a coord/providers change, no Windows "
+    "port yet (#2725)",
 )
 
 
@@ -1502,8 +1538,9 @@ def test_assign_wires_the_base_checkout_guard_into_the_real_dispatch(tmp_path: P
     all and a worker's only constraint was its subprocess cwd.
 
     The base checkout is asserted clean afterwards too: the worker here is
-    ``/bin/true`` (never touches the filesystem), so this also pins that a
-    normal, well-behaved dispatch leaves the base checkout untouched.
+    a portable no-op (``noop_default_worker_command``, #2725 — never touches
+    the filesystem), so this also pins that a normal, well-behaved dispatch
+    leaves the base checkout untouched.
     """
     repo = _init_repo(tmp_path / "repo")
     server = AgentServer(
@@ -1511,7 +1548,7 @@ def test_assign_wires_the_base_checkout_guard_into_the_real_dispatch(tmp_path: P
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: default_worker_command(spec, binary="/bin/true"),
+        worker_command=noop_default_worker_command,
         repo_paths={"api": str(repo)},
     )
     spec = _spec(repo)
@@ -1963,13 +2000,13 @@ def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
         "session_id": session_id,
         "apiKeySource": "test",
     })
-    worker_sh = f'echo \'{init_line}\'; exit 0'
+    worker_py = f"print({init_line!r})"
     server = AgentServer(
         machine_name="test",
         repos=["api"],
         repo_paths={"api": str(repo)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
 
     spec = AssignmentSpec(
@@ -2027,15 +2064,15 @@ def test_reap_logs_graphify_invocation_count(tmp_path: Path) -> None:
         },
     })
     result_line = json.dumps({"type": "result", "subtype": "success", "is_error": False})
-    worker_sh = (
-        f"echo '{graphify_call}'; echo '{unrelated_call}'; echo '{result_line}'; exit 0"
+    worker_py = "; ".join(
+        f"print({line!r})" for line in (graphify_call, unrelated_call, result_line)
     )
     server = AgentServer(
         machine_name="test",
         repos=["api"],
         repo_paths={"api": str(repo)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -2080,8 +2117,8 @@ def test_reap_logs_graphify_query_outcome(tmp_path: Path) -> None:
             "content": [{
                 "type": "tool_result",
                 "tool_use_id": "tu_hit",
-                # Single line on purpose: the fake worker echoes these through
-                # `/bin/sh`, whose `echo` expands `\n` and would split the JSON.
+                # Single line on purpose: the fake worker prints these one
+                # per line, so an embedded `\n` would split the JSON.
                 "content": "Traversal: BFS depth=2 | Start: [x] | 7 nodes found",
             }],
         },
@@ -2109,17 +2146,17 @@ def test_reap_logs_graphify_query_outcome(tmp_path: Path) -> None:
         },
     })
     result_line = json.dumps({"type": "result", "subtype": "success", "is_error": False})
-    worker_sh = "; ".join(
-        f"echo '{line}'"
+    worker_py = "; ".join(
+        f"print({line!r})"
         for line in (hit_call, hit_result, empty_call, empty_result, result_line)
-    ) + "; exit 0"
+    )
 
     server = AgentServer(
         machine_name="test",
         repos=["api"],
         repo_paths={"api": str(repo)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -2258,7 +2295,7 @@ def _make_done_assignment(
         machine_name="test",
         repos=[repo_name],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={repo_name: str(tmp_path / "repo")},
         artifact_paths={repo_name: ["target/debug/mybinary*", "*.d"]},
     )
@@ -2354,7 +2391,7 @@ def test_stash_artifacts_noop_when_no_patterns(tmp_path: Path) -> None:
         machine_name="test",
         repos=["api"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"api": str(tmp_path / "repo")},
         artifact_paths={},  # empty
     )
@@ -2391,7 +2428,7 @@ def test_stash_artifacts_prefers_spec_over_server_config(tmp_path: Path) -> None
         machine_name="test",
         repos=["api"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"api": str(tmp_path / "repo")},
         artifact_paths={"api": ["old_pattern/*.txt"]},  # Server's fallback config
     )
@@ -2441,7 +2478,7 @@ def test_stash_artifacts_falls_back_to_server_config_when_spec_empty(
         machine_name="test",
         repos=["api"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"api": str(tmp_path / "repo")},
         artifact_paths={"api": ["fallback_pattern/*.txt"]},
     )
@@ -2506,7 +2543,7 @@ def test_stash_artifacts_skips_build_intermediates_and_dedupes_hash_copies(
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
     )
@@ -2553,7 +2590,7 @@ def test_stash_artifacts_keeps_lone_hash_suffixed_binary(tmp_path: Path) -> None
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
     )
@@ -2799,7 +2836,7 @@ def test_stash_artifacts_scoped_spec_stashes_only_named_binary(
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         # Server-wide config: the broad glob
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
@@ -2856,7 +2893,7 @@ def test_stash_artifacts_no_spec_override_uses_repo_wide_glob(
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
     )
@@ -2926,7 +2963,7 @@ def test_stash_artifacts_narrows_using_worker_own_smoke_tests_log(
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
     )
@@ -2987,7 +3024,7 @@ def test_stash_artifacts_no_log_path_falls_back_to_full_glob(
         machine_name="test",
         repos=["quadraui"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"quadraui": str(tmp_path / "repo")},
         artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
     )
@@ -3224,7 +3261,7 @@ def test_find_live_worktree_expands_tilde_repo_path(
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo worker-output"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('worker-output')"],
         repo_paths={"api": "~/repo"},
     )
 
@@ -3892,7 +3929,7 @@ def test_stash_artifacts_build_command_runs_before_glob(tmp_path: Path) -> None:
         machine_name="test",
         repos=["myapp"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"myapp": str(tmp_path / "repo")},
         artifact_paths={"myapp": ["target/debug/myapp-tui", "target/debug/myapp-gui"]},
         build_commands={"myapp": build_script},
@@ -3950,7 +3987,7 @@ def test_stash_artifacts_build_command_logged_on_failure(tmp_path: Path) -> None
         machine_name="test",
         repos=["myapp"],
         state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('ok')"],
         repo_paths={"myapp": str(tmp_path / "repo")},
         artifact_paths={"myapp": ["target/debug/mybin"]},
         build_commands={"myapp": "exit 42"},  # Deliberate failure.
@@ -4010,7 +4047,7 @@ def test_reap_worker_stash_miss_stays_done_with_diagnostic(tmp_path: Path) -> No
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "git commit --allow-empty -m onward >/dev/null; exit 0"],
+        argv=[sys.executable, "-c", "import subprocess; subprocess.run(['git', 'commit', '--allow-empty', '-m', 'onward'], stdout=subprocess.DEVNULL)"],
         repo_path=repo,
         artifact_paths={"api": ["target/debug/missing-gui"]},
     )
@@ -4037,7 +4074,7 @@ def test_reap_review_type_gets_no_stash_diagnostic(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "exit 0"],
+        argv=[sys.executable, "-c", "import sys; sys.exit(0)"],
         repo_path=repo,
         artifact_paths={"api": ["target/debug/missing-gui"]},
     )
@@ -4099,7 +4136,7 @@ def test_reap_status_reflects_post_rescue_branch_state(tmp_path: Path) -> None:
     repo = _init_repo_with_remote(tmp_path / "repo")
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "echo dirty >> README; exit 0"],
+        argv=[sys.executable, "-c", "open('README', 'a').write('dirty' + chr(10))"],
         repo_path=repo,
     )
 
@@ -4131,7 +4168,7 @@ def test_reap_stays_advisory_when_rescue_commit_never_reaches_origin(
     repo = _init_repo(tmp_path / "repo")  # no `origin` remote configured
     server = _server(
         tmp_path,
-        argv=["/bin/sh", "-c", "echo dirty >> README; exit 0"],
+        argv=[sys.executable, "-c", "open('README', 'a').write('dirty' + chr(10))"],
         repo_path=repo,
     )
 
@@ -4226,7 +4263,7 @@ def _make_provider(
         def build_command(self, spec, *, resolved_model=None, **_kwargs):
             if build_argv is not None:
                 return list(build_argv)
-            return ["/bin/sh", "-c", "echo provider-argv"]
+            return [sys.executable, "-c", "print('provider-argv')"]
 
         def initial_input(self, spec):
             if initial_input_bytes is not None:
@@ -4264,7 +4301,7 @@ class TestProviderLayerDispatch:
         import coord.agent as agent_mod
 
         repo = _init_repo(tmp_path / "repo")
-        sentinel_argv = ["/bin/sh", "-c", "echo legacy-path"]
+        sentinel_argv = [sys.executable, "-c", "print('legacy-path')"]
 
         captured: list[list[str]] = []
         real_popen = agent_mod.subprocess.Popen
@@ -4300,7 +4337,7 @@ class TestProviderLayerDispatch:
         repo = _init_repo(tmp_path / "repo")
         server = _server(
             tmp_path,
-            argv=["/bin/sh", "-c", "read line; echo $line"],
+            argv=[sys.executable, "-c", "import sys; print(sys.stdin.readline().rstrip(chr(10)))"],
             repo_path=repo,
         )
         # No provider set → legacy path
@@ -4318,8 +4355,8 @@ class TestProviderLayerDispatch:
         import coord.agent as agent_mod
 
         repo = _init_repo(tmp_path / "repo")
-        provider_argv = ["/bin/sh", "-c", "echo provider-path"]
-        legacy_argv = ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-APPEAR"]
+        provider_argv = [sys.executable, "-c", "print('provider-path')"]
+        legacy_argv = [sys.executable, "-c", "print('legacy-SHOULD-NOT-APPEAR')"]
         fake_provider = _make_provider(build_argv=provider_argv)
 
         captured: list[list[str]] = []
@@ -4378,7 +4415,7 @@ class TestProviderLayerDispatch:
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('unused')"],
             repo_paths={"api": str(repo)},
             providers={"myprovider": fake_provider},
             bash_wrap_spawn=False,
@@ -4414,7 +4451,7 @@ class TestProviderLayerDispatch:
         import coord.agent as agent_mod
 
         repo = _init_repo(tmp_path / "repo")
-        legacy_argv = ["/bin/sh", "-c", "echo legacy-fallback"]
+        legacy_argv = [sys.executable, "-c", "print('legacy-fallback')"]
         captured: list[list[str]] = []
         real_popen = agent_mod.subprocess.Popen
 
@@ -4450,6 +4487,8 @@ class TestProviderLayerDispatch:
         )
         server.shutdown()
 
+    @pytest.mark.posix_only
+    @_posix_binary_spawn_skip
     def test_config_free_agent_executes_opencode_via_wire_provider_def(
         self, tmp_path: Path
     ) -> None:
@@ -4487,7 +4526,7 @@ class TestProviderLayerDispatch:
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('legacy-SHOULD-NOT-RUN')"],
             repo_paths={"api": str(repo)},
             bash_wrap_spawn=False,
         )
@@ -4543,14 +4582,14 @@ class TestProviderLayerDispatch:
         ).encode()
 
         fake_provider = _make_provider(
-            build_argv=["/bin/sh", "-c", "read line; echo $line"],
+            build_argv=[sys.executable, "-c", "import sys; print(sys.stdin.readline().rstrip(chr(10)))"],
             initial_input_bytes=custom_bytes,
         )
         server = AgentServer(
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "read line; echo $line"],
+            worker_command=lambda spec: [sys.executable, "-c", "import sys; print(sys.stdin.readline().rstrip(chr(10)))"],
             repo_paths={"api": str(repo)},
             providers={"myprovider": fake_provider},
         )
@@ -4561,6 +4600,8 @@ class TestProviderLayerDispatch:
         assert custom_briefing in log, f"provider.initial_input bytes not in log: {log!r}"
         server.shutdown()
 
+    @pytest.mark.posix_only
+    @_posix_binary_spawn_skip
     def test_provider_definition_env_reaches_actual_spawn_env(self, tmp_path: Path) -> None:
         """#1706: ProviderDef.env, threaded through build_provider() into a
         real ClaudeProvider, must land in the ACTUAL spawned worker
@@ -4585,7 +4626,7 @@ class TestProviderLayerDispatch:
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('legacy-SHOULD-NOT-RUN')"],
             repo_paths={"api": str(repo)},
             providers={"myprovider": provider},
             bash_wrap_spawn=False,
@@ -4619,7 +4660,7 @@ class TestProviderLayerDispatch:
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('legacy-SHOULD-NOT-RUN')"],
             repo_paths={"api": str(repo)},
             providers={"myprovider": provider},
             bash_wrap_spawn=False,
@@ -4694,7 +4735,7 @@ class TestCapabilityGates:
         # plan type is read-only — safe even on providers that don't enforce deny list
         unsafe_provider = _make_provider(
             enforces_deny_list=False,
-            build_argv=["/bin/sh", "-c", "exit 0"],
+            build_argv=[sys.executable, "-c", "import sys; sys.exit(0)"],
         )
         server = AgentServer(
             machine_name="test",
@@ -4733,7 +4774,7 @@ class TestCapabilityGates:
         repo = _init_repo(tmp_path / "repo")
         resumable_provider = _make_provider(
             resume=True,
-            build_argv=["/bin/sh", "-c", "exit 0"],
+            build_argv=[sys.executable, "-c", "import sys; sys.exit(0)"],
         )
         server = AgentServer(
             machine_name="test",
@@ -4795,7 +4836,7 @@ class TestCapabilityGates:
         # stays RUNNING long enough for inject_message to be called.
         no_inject_provider = _make_provider(
             inject=False,
-            build_argv=["/bin/sh", "-c", "read line; echo done"],
+            build_argv=[sys.executable, "-c", "import sys; sys.stdin.readline(); print('done')"],
         )
         server = AgentServer(
             machine_name="test",
@@ -4826,7 +4867,7 @@ class TestCapabilityGates:
         # Provider with inject=True (the default); worker reads two lines.
         inject_provider = _make_provider(
             inject=True,
-            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+            build_argv=[sys.executable, "-c", "import sys; sys.stdin.readline(); print(sys.stdin.readline().rstrip(chr(10)))"],
         )
         server = AgentServer(
             machine_name="test",
@@ -4870,7 +4911,7 @@ class TestCapabilityGates:
             inject=False,
             # argv-only briefing (like opencode) — nothing more is ever
             # written to stdin by the harness for this provider.
-            build_argv=["/bin/sh", "-c", "cat >/dev/null; echo done"],
+            build_argv=[sys.executable, "-c", "import sys; sys.stdin.read(); print('done')"],
             initial_input_bytes=b"",
         )
         server = AgentServer(
@@ -4905,7 +4946,7 @@ class TestCapabilityGates:
         repo = _init_repo(tmp_path / "repo")
         inject_provider = _make_provider(
             inject=True,
-            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+            build_argv=[sys.executable, "-c", "import sys; sys.stdin.readline(); print(sys.stdin.readline().rstrip(chr(10)))"],
         )
         server = AgentServer(
             machine_name="test",
@@ -4938,7 +4979,7 @@ class TestCapabilityGates:
         repo = _init_repo(tmp_path / "repo")
         server = _server(
             tmp_path,
-            argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+            argv=[sys.executable, "-c", "import sys; sys.stdin.readline(); print(sys.stdin.readline().rstrip(chr(10)))"],
             repo_path=repo,
         )
         a = server.assign(_spec(repo))  # no provider → legacy path
@@ -6071,7 +6112,7 @@ class TestConfigHotReload:
             capabilities=["python"],
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo worker-output"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('worker-output')"],
             repo_paths={"api": str(api)},
             health_config=cfg,
             worktree_writable_settings_files=[],
@@ -6258,8 +6299,11 @@ class TestConfigHotReload:
             # Blocks until the sentinel appears, so the assignment is
             # genuinely RUNNING while the config changes underneath it.
             worker_command=lambda spec: [
-                "/bin/sh", "-c",
-                f"while [ ! -f {tmp_path / 'go'} ]; do sleep 0.05; done; echo done",
+                sys.executable, "-c",
+                "import os, time\n"
+                f"while not os.path.exists({str(tmp_path / 'go')!r}): "
+                "time.sleep(0.05)\n"
+                "print('done')",
             ],
             repo_paths={"api": str(api)},
             artifact_paths={"api": ["target/release/api"]},
@@ -6396,6 +6440,8 @@ class TestConfigHotReload:
 
     # ── #2326: providers.definitions is hot too ─────────────────────────────
 
+    @pytest.mark.posix_only
+    @_posix_binary_spawn_skip
     def test_provider_registry_is_hot_reloaded_when_not_in_flight(
         self, tmp_path: Path
     ) -> None:
@@ -6428,7 +6474,7 @@ class TestConfigHotReload:
             repos=["api"],
             state_dir=tmp_path / "state",
             worker_command=lambda spec: [
-                "/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"
+                sys.executable, "-c", "print('legacy-SHOULD-NOT-RUN')"
             ],
             repo_paths={"api": str(api)},
             providers={
@@ -6474,6 +6520,8 @@ class TestConfigHotReload:
         finally:
             server.shutdown()
 
+    @pytest.mark.posix_only
+    @_posix_binary_spawn_skip
     def test_in_flight_provider_is_pinned_across_a_reload(
         self, tmp_path: Path
     ) -> None:
@@ -6508,7 +6556,7 @@ class TestConfigHotReload:
             capabilities=["python"],
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy"],
+            worker_command=lambda spec: [sys.executable, "-c", "print('legacy')"],
             repo_paths={"api": str(api)},
             providers={
                 "myprovider": build_provider(
