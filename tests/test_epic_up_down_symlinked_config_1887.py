@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import POSIX_BASH
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EPIC_UP = REPO_ROOT / "scripts" / "azure-workers" / "epic-up.sh"
 EPIC_DOWN = REPO_ROOT / "scripts" / "azure-workers" / "epic-down.sh"
@@ -123,7 +125,7 @@ def _run_remote_block(body: str, home: Path, *args: str):
 
     driver = f"set -euo pipefail\n{body}\n"
     return subprocess.run(
-        ["bash", "-c", driver, "bash", *args],
+        [POSIX_BASH, "-c", driver, "bash", *args],
         capture_output=True,
         text=True,
         timeout=30,

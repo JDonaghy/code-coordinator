@@ -34,6 +34,8 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import POSIX_BASH
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord-test-runner.sh"
 
 
@@ -74,7 +76,7 @@ def _commit(repo: Path, paths: dict[str, str], message: str) -> None:
 
 def _run(repo: Path, *extra_args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(SCRIPT), str(repo), "--base-ref", "base", *extra_args],
+        [POSIX_BASH, str(SCRIPT), str(repo), "--base-ref", "base", *extra_args],
         capture_output=True,
         text=True,
         timeout=30,

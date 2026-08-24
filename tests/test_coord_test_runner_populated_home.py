@@ -50,6 +50,8 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import POSIX_BASH
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "coord-test-runner.sh"
 HARNESS = REPO_ROOT / "scripts" / "run_tests_in_populated_home.sh"
@@ -226,7 +228,7 @@ def _run(repo: Path, *extra_args: str, **fake_env: str) -> subprocess.CompletedP
     env.update(fake_env)
     return subprocess.run(
         [
-            "bash", str(SCRIPT), str(repo),
+            POSIX_BASH, str(SCRIPT), str(repo),
             "--base-ref", "base",
             "--repo", "code-coordinator",
             *extra_args,
@@ -649,7 +651,7 @@ def test_the_fallback_arm_never_grows_a_populated_home_arm(tmp_path: Path) -> No
 
     result = subprocess.run(
         [
-            "bash", str(SCRIPT), str(r),
+            POSIX_BASH, str(SCRIPT), str(r),
             "--base-ref", "base",
             "--repo", "quadraui",
             "--fallback-command", "true",
