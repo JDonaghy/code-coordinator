@@ -190,6 +190,8 @@ coord release propagate --cordon-max-deferrals N   # #2240: consecutive deferral
                                            # (default 2; 0 re-arms the deadlock)
 coord release propagate --cordon-cooldown S # #2240: seconds cordoning stays off after
                                            # a self-release (default 1800)
+coord release propagate --min-behind N     # #2583: hold below N releases behind PyPI —
+                                           # see "Auto-roll threshold gate" below
 coord release rollback --yes               # one command: every agent back one generation
 ```
 
@@ -1454,6 +1456,85 @@ on *every* tick while the fleet stays idle is expected while a fire attempt
 is in flight or repeatedly failing to confirm — it costs nothing against an
 already-active unit — but the marker itself must still clear well within
 the hour; if it does not, that is where to look.
+
+### Auto-roll threshold gate (`propagation.min_releases_behind`, #2583)
+
+Everything above attempts a roll on **any** delta at all — one release
+behind is enough to cordon, drain, and restart every agent. That is fine on
+a healthy propagation lane, but it means every quiescent moment, however
+brief, gets spent on the smallest possible roll instead of accumulating
+into a less frequent, larger one. `propagation.min_releases_behind` in
+`coordinator.yml` (or `--min-behind` on either command, which overrides it
+per-invocation) holds a run below a configured delta instead:
+
+```yaml
+propagation:
+  min_releases_behind: 10   # operator's stated target
+```
+
+**Default is `1` — unset means byte-identical to today.** No `propagation:`
+block, or an explicit `min_releases_behind: 1`, changes nothing: any delta
+still rolls, subject to the same quiescence/cordon rules as always. Raising
+it is opt-in, and specifically opt-in to a *fleet-wide* config value, not a
+per-timer flag — both `coord-release-propagate.timer` and
+`coord-release-window.timer` read the same `coordinator.yml`, so setting it
+once governs both.
+
+**A held run is a REPORTED no-op, never a silent one.** Below the
+threshold, `coord release propagate` and `coord release nightly-window`
+both print (and journal, as `STATUS_HOLDING`/`status: "holding"`) a line
+shaped exactly like:
+
+```
+⊖ 2026-08-24 03:00:01  v0.5.226  holding
+    holding: 4 behind, threshold 10
+```
+
+so a deliberately-held fleet reads unambiguously differently from a dead
+timer (`coord release history` / `coord release window-history` — see
+#2045, the incident this distinction exists to prevent). **Holding never
+touches anything**: `coord release propagate` takes no cordon and calls no
+per-host lane executor; `coord release nightly-window` neither sets, fires,
+nor clears the #2587 roll-pending marker — an existing marker (set before
+the threshold was raised, or by a since-lowered one) is left exactly as it
+was for a later, above-threshold run to pick back up.
+
+**The delta is the real PyPI count, not an estimate.** It reuses
+`coord.health.pypi.releases_behind` — the same computation `coord health`'s
+`agent_version` check already runs on every machine's own `/health` — so
+"N behind" here is the actual number of published releases being held
+back, never a second, disagreeing implementation. (`coord.release_cordon.
+version_drift`, used elsewhere for cordoning and `needs_roll`, is a
+deliberately *different*, network-free patch-arithmetic estimate built for
+decisions that run on every tick; this gate is the opposite case — an
+operator-set threshold checked once per run — so it pays for one extra PyPI
+read instead.) An unresolvable delta (the daemon's version unreadable, the
+index unreachable) gates OPEN, not held: #1834's rule that missing data is
+never evidence of agreement applies here too, so a fleet that genuinely
+needs a roll is never silently frozen by a probe failure.
+
+**Prefer `coord-release-window.timer` as the vehicle.** The 20-minute
+propagate timer *also* honours this gate (`--min-behind` and the config
+key both apply to it directly), but the nightly window is the better fit:
+it is the one place a roll is *created* on a schedule you control (03:00),
+rather than attempted every 20 minutes against whatever the fleet's busy
+state happens to be. See the evidence in issue #2583 itself: dellserver is
+both the daemon host and a work machine, so it is rarely quiescent, and a
+20-minute timer cordoning it repeatedly without ever landing a window is
+pure churn the nightly window avoids by design.
+
+**Do not raise this above `1` on a stale propagation lane.** Between
+2026-08-13 and 2026-08-21 at least six defects in this exact lane were
+fixed — #2187/#2178 (a verified roll reported as `propagate-failed`),
+#2240 (the cordon deadlock above), #2403 (an idle host wrongly deferred),
+#2490 (no path back after a cooldown), #2052. A fleet running an OLD build
+of this lane is running the buggy version of the exact mechanism a large,
+infrequent roll stresses hardest. **Roll the fleet to current by hand
+first** (`coord release propagate` / `coord release nightly-window`,
+watched), confirm the lane behaves correctly on a fixed codebase, and only
+then set `min_releases_behind` above 1 — otherwise the very first automated
+threshold roll is the largest delta the lane has ever attempted, against
+code known to have bugs in exactly that path.
 
 ## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
 

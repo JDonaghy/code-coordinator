@@ -123,6 +123,23 @@
 # habit — it is NOT wired into this unit any more (no more ExecStopPost=):
 # #2587 never stops the timer in the first place, so there is nothing here
 # for it to guarantee restarted.
+#
+# MIN-RELEASES-BEHIND GATE (#2583) — OFF BY DEFAULT, NOT SET HERE
+# -----------------------------------------------------------------
+# This unit is the PREFERRED vehicle for the #2583 threshold: it is the one
+# place `coord release nightly-window` itself decides whether the daemon
+# host needs a roll at all, so a `propagation.min_releases_behind` set in
+# coordinator.yml (or a `--min-behind` appended to `ExecStart=` below) holds
+# it there — no roll-pending marker set, no `coord release propagate`
+# subprocess spawned — until the daemon is genuinely that many releases
+# behind PyPI's latest. Left unset here on purpose: `min_releases_behind=1`
+# (any delta at all, today's behaviour) is the safe default until an
+# operator deliberately raises it — see `docs/AGENT_OPERATIONS.md`'s
+# "Auto-roll threshold gate" section for why the CURRENT fleet must take one
+# manual roll first, onto a fixed propagation lane, before this is ever
+# turned up. A held run reports `holding: N behind, threshold M` in its own
+# journal (`coord release window-history`) and exits 0, same as a normal
+# `roll-pending`/`up-to-date` outcome.
 
 [Unit]
 Description=Release window: set/fire the #2587 roll-pending marker on the daemon host

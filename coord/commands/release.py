@@ -182,6 +182,60 @@ def _resolve_expected(expected: str | None, *, use_pypi: bool, index_url: str,
     return latest.raw, None
 
 
+def _resolve_min_behind(min_behind_override: int | None, config) -> int:
+    """The effective ``min_releases_behind`` for this run (#2583).
+
+    ``--min-behind`` wins outright; otherwise ``propagation.
+    min_releases_behind`` from ``coordinator.yml``; otherwise ``1`` — any
+    delta at all, today's behaviour. An absent ``propagation:`` block (the
+    common case until this is deliberately turned on, see
+    ``docs/AGENT_OPERATIONS.md``) resolves to that same default via
+    :class:`coord.config.PropagationConfig`'s own field default, so this is
+    really just "flag beats config, config beats 1" spelled out for the two
+    call sites (`release_propagate`/`release_nightly_window`) that need it.
+    """
+    if min_behind_override is not None:
+        return min_behind_override
+    return getattr(getattr(config, "propagation", None), "min_releases_behind", 1)
+
+
+def _releases_behind_count(
+    current_version: str | None, *, index_url: str, timeout: float,
+) -> tuple[int | None, str | None]:
+    """``(releases_behind, warning)`` for *current_version* against PyPI's
+    simple index — the #2583 min-releases-behind gate's own delta.
+
+    Reuses :func:`coord.health.pypi.releases_behind` — the SAME comparison
+    ``coord/health/checks/agent_install.py``'s ``agent_version`` check runs
+    on every machine's own ``/health`` — rather than a second
+    version-comparison path. ``coord.release_cordon.version_drift`` is
+    deliberately NOT reused here: it is a cheap, network-free
+    PATCH-ARITHMETIC *estimate* built for decisions that run on every tick
+    and must survive a network hiccup (cordoning, ``needs_roll``) — #2583's
+    gate is the opposite case, an operator-set threshold checked once per
+    run, so it is worth the extra PyPI read to answer with the actual count
+    of published releases being held back instead of a guess.
+
+    ``(None, warning)`` when *current_version* is unknown/unparseable or the
+    index is unreachable — the caller must treat that as "cannot confirm
+    holding" and gate OPEN (proceed exactly as if this gate did not exist),
+    never hold on missing data.
+    """
+    if not current_version:
+        return None, "current version unknown; not holding on it"
+    from coord.health.pypi import latest_release_any, parse_version  # noqa: PLC0415
+    from coord.health.pypi import releases_behind as _count_behind  # noqa: PLC0415
+
+    try:
+        _project, _latest, finals = latest_release_any(index_url=index_url, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — read-only; gate open on failure
+        return None, f"could not read the PyPI simple index ({exc}); not holding on it"
+    installed = parse_version(current_version)
+    if installed is None:
+        return None, f"could not parse version {current_version!r}; not holding on it"
+    return _count_behind(installed, finals), None
+
+
 @release_group.command(
     "verify",
     help=(
@@ -714,6 +768,12 @@ def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
               help="Seconds after a #2240 release before cordoning may resume "
                    "(default 1800). Without it the next run re-cordons — the "
                    "hosts are still behind — and the deadlock re-arms.")
+@click.option("--min-behind", "min_behind_override", default=None, type=int,
+              help="#2583: hold this run — no cordon, no host touched — below "
+                   "this many releases behind PyPI's latest. Default: "
+                   "propagation.min_releases_behind in coordinator.yml, or 1 "
+                   "if that is unset — any delta at all rolls, today's "
+                   "behaviour.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the propagation record as JSON.")
 def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions are elsewhere
     config_path: Path,
@@ -732,6 +792,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     drain_deadline: float | None,
     cordon_max_deferrals: int | None,
     cordon_cooldown: float | None,
+    min_behind_override: int | None,
     as_json: bool,
 ) -> None:
     """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
@@ -908,6 +969,37 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # does not move the "unorderable fleet" REFUSAL, which stays below the
     # deferral branch on purpose (see its own comment).
     daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
+
+    # ── 3a. #2583 min-releases-behind gate ────────────────────────────────
+    #
+    # Below this threshold, this run is a REPORTED no-op. Checked here —
+    # after the daemon's own version is known, but BEFORE cordoning (3b) and
+    # BEFORE the busy-fleet defer branch below — so a held run genuinely
+    # cordons nothing and touches no host (the #2583 acceptance bar).
+    # `effective_min_behind <= 1` (the default: no `propagation:` block, no
+    # `--min-behind`) skips the PyPI read entirely — any delta at all rolls,
+    # exactly like before this gate existed.
+    effective_min_behind = _resolve_min_behind(min_behind_override, config)
+    record.min_releases_behind = effective_min_behind
+    if effective_min_behind > 1:
+        daemon_current = (
+            _python_lane_versions(before, [daemon_name], record.target_version)
+            .get(daemon_name)
+            if daemon_name else None
+        )
+        behind, behind_warning = _releases_behind_count(
+            daemon_current, index_url=index_url, timeout=10.0
+        )
+        record.releases_behind = behind
+        if behind_warning:
+            click.echo(f"warning: {behind_warning}", err=True)
+        if behind is not None and behind < effective_min_behind:
+            # `render_record` (called by `_finish` below) prints the
+            # "holding: N behind, threshold M" line itself — same pattern
+            # `STATUS_DEFERRED`'s "window: ..." reason uses, one place that
+            # renders a status's own detail rather than a second echo here
+            # that could drift from it.
+            _finish(rp.STATUS_HOLDING, 0)
 
     # ── 3b. cordon the hosts that are behind, so they DRAIN (#2101) ──────
     #
@@ -2801,6 +2893,12 @@ def _escalate_window(record, *, reason: str) -> None:
                    "coord-drive-queue.timer` after a hand-stopped timer is one "
                    "recognisable command rather than a new one to remember. "
                    "Every other option is ignored with this flag.")
+@click.option("--min-behind", "min_behind_override", default=None, type=int,
+              help="#2583: hold this run — no marker set, no host touched — "
+                   "below this many releases behind PyPI's latest. Default: "
+                   "propagation.min_releases_behind in coordinator.yml, or 1 "
+                   "if that is unset — any delta at all rolls, today's "
+                   "behaviour.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the window record as JSON.")
 def release_nightly_window(
     config_path: Path,
@@ -2811,6 +2909,7 @@ def release_nightly_window(
     poll_interval: float,
     dry_run: bool,
     ensure_queue_running: bool,
+    min_behind_override: int | None,
     as_json: bool,
 ) -> None:
     """One nightly-window attempt. Exit 0 on up-to-date/roll-pending/rolled/
@@ -2926,6 +3025,14 @@ def release_nightly_window(
         report, [daemon_name], record.target_version
     ).get(daemon_name)
 
+    # #2583: resolved here, ahead of the up-to-date check below, so the
+    # journal always records what threshold this run actually used —
+    # whether or not a roll turned out to be needed at all. The network
+    # read this gate needs (`_releases_behind_count`) is still deferred
+    # until it is actually relevant — see the gate below.
+    effective_min_behind = _resolve_min_behind(min_behind_override, config)
+    record.min_releases_behind = effective_min_behind
+
     # ── 2. acceptance 3 — already current, so nothing EXTERNAL is touched:
     #      no systemctl call, no `coord release propagate` subprocess. A
     #      pending marker IS cleared here, though (never left standing) — if
@@ -2944,6 +3051,30 @@ def release_nightly_window(
         if read_roll_pending() is not None:
             clear_roll_pending()
         _finish(rw.STATUS_UP_TO_DATE, 0)
+
+    # ── 2b. #2583 min-releases-behind gate ────────────────────────────────
+    #
+    # A roll IS needed, but not yet enough of one: below this threshold this
+    # run is a REPORTED no-op that touches NEITHER the roll-pending marker
+    # NOR `coord release propagate` — an existing marker (set before this
+    # gate existed, or by a lower threshold) is left exactly as it is for a
+    # later, above-threshold run to pick back up; nothing here clears it or
+    # fires it. `effective_min_behind <= 1` (the default) skips the PyPI
+    # read entirely, same as `release_propagate`'s identical gate.
+    if effective_min_behind > 1:
+        behind, behind_warning = _releases_behind_count(
+            record.daemon_version, index_url=index_url, timeout=10.0
+        )
+        record.releases_behind = behind
+        if behind_warning:
+            click.echo(f"warning: {behind_warning}", err=True)
+        if behind is not None and behind < effective_min_behind:
+            # `render_record` (called by `_finish` below) prints the
+            # "holding: N behind, threshold M" line itself — same pattern
+            # `STATUS_UP_TO_DATE`'s daemon-host line uses, one place that
+            # renders a status's own detail rather than a second echo here
+            # that could drift from it.
+            _finish(rw.STATUS_HOLDING, 0)
 
     existing = read_roll_pending()
 

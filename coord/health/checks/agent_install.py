@@ -182,6 +182,7 @@ def probe_agent_venv(ctx: HealthContext) -> CheckResult:
 )
 def probe_agent_version(ctx: HealthContext) -> CheckResult:
     from coord.health.pypi import latest_release, parse_version  # noqa: PLC0415
+    from coord.health.pypi import releases_behind as _releases_behind  # noqa: PLC0415
 
     th = ctx.thresholds
     python = resolve_agent_python(ctx)
@@ -243,7 +244,10 @@ def probe_agent_version(ctx: HealthContext) -> CheckResult:
             values={"python": str(python), "installed": installed_raw},
         )
 
-    behind = sum(1 for v in finals if v > installed)
+    # #2583: shared with `coord release propagate`/`nightly-window`'s own
+    # min-releases-behind gate — one computation of "how far behind", not
+    # a second one that could quietly disagree with this check's own number.
+    behind = _releases_behind(installed, finals)
     if behind >= th.agent_version_crit_behind:
         severity = Severity.CRIT
     elif behind >= th.agent_version_warn_behind:
