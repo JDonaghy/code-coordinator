@@ -540,6 +540,12 @@ def test_safety_gate_refuses_write_capable_types_on_unverified_provider(
     server.shutdown()
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="reaches AgentServer._spawn_pty, which lazily `import pty` "
+    "(stdlib, Unix-only) — POSIX-only, no Windows port yet (#2684)",
+)
 @pytest.mark.parametrize(
     "spec_type", ["plan", "refinement", "test-chat", "new-issue-chat"]
 )
@@ -635,7 +641,10 @@ def test_default_path_uses_legacy_worker_command_when_no_providers(
     captured: list[list[str]] = []
 
     def recording_builder(spec: AssignmentSpec) -> list[str]:
-        argv = ["/bin/sh", "-c", "echo legacy-output"]
+        # A real, portable child process rather than `/bin/sh -c echo` —
+        # this exercises actual routing/spawn, and `/bin/sh` doesn't exist
+        # on Windows (#2684). `sys.executable` is guaranteed present.
+        argv = [sys.executable, "-c", "print('legacy-output')"]
         captured.append(argv)
         return argv
 
@@ -659,7 +668,7 @@ def test_default_path_uses_legacy_worker_command_when_no_providers(
     final = server.wait_for(record.id, timeout=10.0)
     # Worker makes no commits → advisory (#448)
     assert final.status in ("done", "advisory")
-    assert captured == [["/bin/sh", "-c", "echo legacy-output"]]
+    assert captured == [[sys.executable, "-c", "print('legacy-output')"]]
     log = Path(final.log_path).read_text()
     assert "legacy-output" in log
     # And the log header is the legacy header (no `provider=` field).
@@ -686,6 +695,12 @@ def test_default_provider_selection_is_claude(tmp_path: Path) -> None:
 # ── PTY spawn smoke test (mocked claude binary) ──────────────────────────────
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="reaches AgentServer._spawn_pty, which lazily `import pty` "
+    "(stdlib, Unix-only) — POSIX-only, no Windows port yet (#2684)",
+)
 def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
     """The PTY branch actually runs when spec.provider names a ClaudePtyProvider.
 
@@ -817,6 +832,12 @@ class _SlowReadinessPtyProvider(ClaudePtyProvider):
         return ["/bin/sh", "-c", "sleep 6"]
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="reaches AgentServer._spawn_pty, which lazily `import pty` "
+    "(stdlib, Unix-only) — POSIX-only, no Windows port yet (#2684)",
+)
 def test_pty_assign_returns_immediately_without_blocking_on_readiness(
     tmp_path: Path,
 ) -> None:

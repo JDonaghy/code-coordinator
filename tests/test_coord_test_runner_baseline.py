@@ -37,9 +37,25 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# #2684: the module under test IS a bash script (scripts/coord-test-runner.sh),
+# invoked here via `bash`, which in turn probes/execs `$WT/.venv/bin/python`
+# and `$WT/.venv/bin/coord` — themselves `#!/usr/bin/env bash` fakes planted
+# by the `repo` fixture and run directly off PATH, with no `bash` prefix, so
+# their shebang is what makes them executable at all. That is category (1)
+# from #2684 twice over (the runner itself, plus every fake it shells out
+# to), and coord-test-runner.sh is a POSIX Test-stage/CI tool with no
+# Windows port planned — "do not add a bash dependency to the Windows job"
+# rules out fixing this by requiring bash there. No Windows port yet.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="exercises scripts/coord-test-runner.sh (a bash script) via "
+    "bash-script fakes executed directly off PATH — POSIX-only (#2684)",
+)
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord-test-runner.sh"
 

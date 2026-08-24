@@ -26,6 +26,19 @@ from coord.agent import (
     _worker_subprocess_env,
 )
 
+# #2684: every PATH fixture below must be joined/split on `os.pathsep`
+# (`;` on Windows, `:` elsewhere) — a literal `:`-joined string is silently
+# treated as ONE opaque PATH entry on Windows (nothing to split on), so the
+# strip finds nothing to remove and `env["PATH"]` comes back unstripped and
+# unsplit (the exact `assert '/home/john/.local/bin' in ['/home/john/.coord
+# -venv/bin:...']` shape from the #2684 Windows job — a single-element list
+# is `str.split` finding no separator). The `/home/john/...` literals
+# themselves are fine as-is: `_pinned_venv_bin_dirs` resolves them with
+# `os.path.realpath`, which normalises a POSIX-shaped absolute string
+# consistently on any platform without requiring the path to exist.
+def _path(*parts: str) -> str:
+    return os.pathsep.join(parts)
+
 
 def test_pinned_venv_stripped_even_when_prefix_equals_base_prefix() -> None:
     """The core #2569 regression: the OLD strip only fired when
@@ -36,7 +49,9 @@ def test_pinned_venv_stripped_even_when_prefix_equals_base_prefix() -> None:
     env = _worker_subprocess_env(
         {
             "HOME": "/home/john",
-            "PATH": "/home/john/.coord-venv/bin:/usr/local/bin:/usr/bin:/bin",
+            "PATH": _path(
+                "/home/john/.coord-venv/bin", "/usr/local/bin", "/usr/bin", "/bin"
+            ),
         },
         prefix="/usr",
         base_prefix="/usr",  # heuristic does NOT fire
@@ -53,9 +68,13 @@ def test_pinned_venv_stripped_matches_incident_path_shape() -> None:
     env = _worker_subprocess_env(
         {
             "HOME": "/home/john",
-            "PATH": (
-                "/home/john/.coord-venv/bin:/usr/local/bin:/usr/bin:/bin:"
-                "/home/john/.local/bin:/home/john/.cargo/bin"
+            "PATH": _path(
+                "/home/john/.coord-venv/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/home/john/.local/bin",
+                "/home/john/.cargo/bin",
             ),
         },
         prefix="/usr",
@@ -80,7 +99,7 @@ def test_pinned_venv_stripped_via_blue_green_symlink(tmp_path: Path) -> None:
 
     # PATH carries the symlink name.
     env = _worker_subprocess_env(
-        {"HOME": str(home), "PATH": f"{home}/.coord-venv/bin:/usr/bin"},
+        {"HOME": str(home), "PATH": _path(f"{home}/.coord-venv/bin", "/usr/bin")},
         prefix="/usr",
         base_prefix="/usr",
     )
@@ -90,7 +109,7 @@ def test_pinned_venv_stripped_via_blue_green_symlink(tmp_path: Path) -> None:
 
     # PATH carries the already-resolved real path instead of the symlink.
     env2 = _worker_subprocess_env(
-        {"HOME": str(home), "PATH": f"{green}/bin:/usr/bin"},
+        {"HOME": str(home), "PATH": _path(f"{green}/bin", "/usr/bin")},
         prefix="/usr",
         base_prefix="/usr",
     )
@@ -123,7 +142,7 @@ def test_provider_env_reintroducing_pinned_venv_is_re_strippable() -> None:
     assert "/home/john/.coord-venv/bin" not in env["PATH"].split(os.pathsep)
 
     # Simulate a provider.env() override reintroducing the pinned venv.
-    env.update({"PATH": "/home/john/.coord-venv/bin:/usr/bin"})
+    env.update({"PATH": _path("/home/john/.coord-venv/bin", "/usr/bin")})
     assert "/home/john/.coord-venv/bin" in env["PATH"].split(os.pathsep)
 
     # The spawn-site re-strip closes the loophole.
@@ -146,9 +165,9 @@ def test_pinned_venv_dirs_falls_back_to_process_home_when_env_has_none() -> None
     "path_value",
     [
         "/home/john/.coord-venv/bin",
-        "/home/john/.coord-venv/bin:/usr/bin",
-        "/usr/bin:/home/john/.coord-venv/bin",
-        "/usr/bin:/home/john/.coord-venv/bin:/home/john/.local/bin",
+        _path("/home/john/.coord-venv/bin", "/usr/bin"),
+        _path("/usr/bin", "/home/john/.coord-venv/bin"),
+        _path("/usr/bin", "/home/john/.coord-venv/bin", "/home/john/.local/bin"),
     ],
 )
 def test_no_worker_env_ever_carries_pinned_venv_on_path(path_value: str) -> None:

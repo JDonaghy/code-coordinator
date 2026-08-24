@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -155,7 +156,13 @@ class TestInstallerCopyMatches:
         )
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="deploy/node-shim.sh is a `#!/usr/bin/env bash` script, symlinked "
+    "and executed directly off PATH (no explicit `bash` invocation) — "
+    "POSIX-only, no Windows port yet (#2684)",
+)
 class TestShimResolution:
     def test_resolves_newest_installed_when_alias_is_symbolic(
         self, tmp_path: Path

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1410,13 +1411,34 @@ def test_sealed_write_guard_tools_dedupes():
 
 # ── #1642: base-checkout write guard ─────────────────────────────────────────
 
+# #2684: `_base_checkout_write_guard_tools` runs its input through
+# `Path(repo_path).expanduser()`, and these tests feed it POSIX-style
+# absolute paths (`/home/john/...`) — the only shape a real spec.repo_path
+# ever takes today (every documented deployment is Linux/macOS/WSL). On a
+# native-Windows `pathlib.Path`, a leading-`/` string is NOT treated as
+# absolute-from-root the way it is on POSIX (`str(WindowsPath("/home/john"))`
+# renders as `\home\john`, which fails the function's own
+# `normalized.startswith("/")` check), so the function harmlessly returns
+# `[]` instead of the expected guard patterns. That's a mismatch between the
+# test's POSIX-shaped fixture input and the host running it, not a
+# production bug reachable from any real deployment — no Windows port yet.
+_posix_repo_path_skip = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="feeds a POSIX-absolute repo_path into a native pathlib.Path — "
+    "POSIX-only fixture shape, no Windows port yet (#2684)",
+)
 
+
+@pytest.mark.posix_only
+@_posix_repo_path_skip
 def test_base_checkout_write_guard_tools_blocks_edit_and_write():
     patterns = _base_checkout_write_guard_tools("/home/john/src/api")
     assert "Edit(//home/john/src/api/**)" in patterns
     assert "Write(//home/john/src/api/**)" in patterns
 
 
+@pytest.mark.posix_only
+@_posix_repo_path_skip
 def test_base_checkout_write_guard_tools_strips_trailing_slash():
     """A trailing slash on repo_path must not produce a double-slash pattern
     (Edit(//home/john/src/api//**)) that would fail to match anything."""
@@ -1436,6 +1458,8 @@ def test_base_checkout_write_guard_tools_empty_for_relative_path():
     assert _base_checkout_write_guard_tools("relative/repo") == []
 
 
+@pytest.mark.posix_only
+@_posix_repo_path_skip
 def test_base_checkout_write_guard_tools_expands_tilde(monkeypatch):
     """Regression for the #1642 fix-review finding: production
     spec.repo_path is the raw, un-expanded string straight from
@@ -1531,6 +1555,8 @@ def test_default_worker_command_omits_sealed_guard_when_not_sealed() -> None:
     assert "tests/acceptance/" not in disallowed
 
 
+@pytest.mark.posix_only
+@_posix_repo_path_skip
 def test_default_worker_command_blocks_base_checkout_writes() -> None:
     """#1642: a worker given a correct worktree can still construct an
     absolute path back into the shared base checkout (spec.repo_path) and
@@ -1591,6 +1617,8 @@ def test_default_worker_command_blocks_sealed_oracle_writes() -> None:
     assert "Edit" in argv[allowed_idx + 1]
 
 
+@pytest.mark.posix_only
+@_posix_repo_path_skip
 def test_default_worker_command_mock_author_not_sealed() -> None:
     """mock-author's entire job is writing under tests/acceptance/ — dispatch.py
     never adds it to files_forbidden for that type, so it must get no

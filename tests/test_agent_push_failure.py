@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -226,7 +227,21 @@ def repo_with_rejecting_remote(tmp_path: Path) -> tuple[Path, Path]:
     #1797 hit in production (`remote: Invalid username or token. Password
     authentication is not supported for Git operations.`), reproduced
     deterministically with no network and no real credentials involved.
+
+    #2684: POSIX-only. This fixture toggles the hook on and off with
+    ``chmod``, and the worker commands driven by it are ``#!/bin/sh``
+    scripts run through ``/bin/sh -c`` — none of which is portable. Worse,
+    NTFS has no POSIX executable bit, so the chmod-based "briefly disable
+    the hook to land the initial commit" trick is a no-op on Windows: the
+    hook stays live throughout, and even the *setup* push above fails,
+    which is exactly the "ERROR at setup" shape from the #2684 Windows
+    job. No Windows port yet.
     """
+    if sys.platform == "win32":
+        pytest.skip(
+            "POSIX-only: pre-receive hook + chmod-based enable/disable "
+            "has no NTFS equivalent (#2684)"
+        )
     origin = tmp_path / "origin.git"
     origin.mkdir()
     _git(origin, "init", "--bare", "-b", "main")
