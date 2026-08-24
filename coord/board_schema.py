@@ -34,11 +34,15 @@ implementation detail underneath them:
   :func:`project_row` decodes it on the way out.
 
 The field **names, order, and types were generated from the pre-#1849
-generated spec**, so the first commit is provably a no-op on the wire (see
-``tests/test_board_schema.py::test_board_wire_byte_identical_to_golden``).
+generated spec**, so the change that introduced this file was provably a no-op
+on the wire: ``tests/test_board_fixture.py::test_board_sample_fixture_is_up_to_date``
+still reproduces the *unmodified* #748 golden fixture byte-for-byte.
 
-Field order matters: ``/board``'s JSON object key order is this file's field
-order, and the #748 golden fixture is compared byte-for-byte.
+**Field order is part of the contract** — ``/board``'s JSON object key order is
+this file's declaration order.  The golden fixture is written with
+``sort_keys=True`` and so cannot see that; the ordering half is pinned by
+``tests/test_board_schema.py::test_board_wire_key_order_is_the_declared_field_order``.
+Keep new fields in DDL order, and **append** rather than insert.
 
 Nullability convention (inherited verbatim from the ``PRAGMA table_info``
 walk it replaces): a column SQLite reports ``notnull=1`` is a required field
@@ -61,6 +65,7 @@ from typing import Any, Union
 #: What the read path actually hands the projection.  ``sqlite3.Row`` is *not*
 #: a ``Mapping`` (see :func:`_as_dict`), so it has to be named explicitly.
 RowLike = Union[Mapping[str, Any], sqlite3.Row]
+
 
 @dataclasses.dataclass(kw_only=True)
 class BoardAssignment:
