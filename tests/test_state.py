@@ -2076,6 +2076,73 @@ class TestTestVerdictStalenessAnchor:
         assert row["test_state"] == "passed"
         assert row["test_base_sha"] is None
 
+    def test_retest_with_gh_exception_clears_stale_anchors_from_prior_verdict(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2706: a RE-test whose `gh` probes raise must NOT leave the
+        PREVIOUS verdict's anchors standing. A prior passing verdict left
+        real SHAs in these columns; if the re-test's probes fail and the
+        write is skipped, the new verdict is silently attributed to a
+        branch/base it never tested — worse than NULL, which the merge gate
+        already treats as "staleness tracking unavailable" and skips."""
+        self._seed_assignment(coord_db)
+        coord_db.execute(
+            "UPDATE assignments SET test_head_sha='stale-head', "
+            "test_base_sha='stale-base', test_patch_id='stale-patch' "
+            "WHERE assignment_id='aid-1'"
+        )
+        coord_db.commit()
+        self._config(monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: (_ for _ in ()).throw(RuntimeError("rate limited")),
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_state, test_head_sha, test_base_sha, test_patch_id "
+            "FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] == "passed"
+        assert row["test_head_sha"] is None
+        assert row["test_base_sha"] is None
+        assert row["test_patch_id"] is None
+
+    def test_retest_with_probes_returning_none_clears_stale_anchors(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """The observed quadraui#595 failure mode: the probes don't raise,
+        they just all come back `None` (a secondary rate-limit 403 that
+        `get_branch_sha`/`get_branch_patch_id` swallow into `None` rather
+        than raising). The old `if head is None and base is None and
+        patch_id is None: return` guard treated this identically to "nothing
+        to capture" and skipped the write — which is right for a first
+        verdict (nothing to lose) but wrong for a re-test (loses the fact
+        that the standing anchors are now stale)."""
+        self._seed_assignment(coord_db)
+        coord_db.execute(
+            "UPDATE assignments SET test_head_sha='stale-head', "
+            "test_base_sha='stale-base', test_patch_id='stale-patch' "
+            "WHERE assignment_id='aid-1'"
+        )
+        coord_db.commit()
+        self._config(monkeypatch)
+        monkeypatch.setattr("coord.github_ops.get_branch_sha", lambda repo, branch: None)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_patch_id", lambda repo, base, branch: None,
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_head_sha, test_base_sha, test_patch_id "
+            "FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_head_sha"] is None
+        assert row["test_base_sha"] is None
+        assert row["test_patch_id"] is None
+
     def test_repo_not_in_config_leaves_anchor_null(self, coord_db, monkeypatch) -> None:
         self._seed_assignment(coord_db)
 
@@ -2092,6 +2159,37 @@ class TestTestVerdictStalenessAnchor:
             "SELECT test_base_sha FROM assignments WHERE assignment_id='aid-1'"
         ).fetchone()
         assert row["test_base_sha"] is None
+
+    def test_repo_not_in_config_on_retest_clears_stale_anchor(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2706: same guarantee as the `gh`-probe-failure cases, but for the
+        repo-unresolvable-in-config path — it must also null out a prior
+        verdict's anchors on a re-test rather than silently leaving them."""
+        self._seed_assignment(coord_db)
+        coord_db.execute(
+            "UPDATE assignments SET test_head_sha='stale-head', "
+            "test_base_sha='stale-base', test_patch_id='stale-patch' "
+            "WHERE assignment_id='aid-1'"
+        )
+        coord_db.commit()
+
+        class _EmptyCfg:
+            def repo(self, name):
+                return None
+
+        from coord import config as _config_mod
+        monkeypatch.setattr(_config_mod, "load", lambda *a, **k: _EmptyCfg())
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_head_sha, test_base_sha, test_patch_id "
+            "FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_head_sha"] is None
+        assert row["test_base_sha"] is None
+        assert row["test_patch_id"] is None
 
     def test_milestone_repo_resolves_feature_branch_as_base(
         self, coord_db, monkeypatch
