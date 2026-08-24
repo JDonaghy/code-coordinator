@@ -301,6 +301,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         rework_bypass: false,
         // #541
         issue_finder: None,
+        // #2642
+        doc_tab_picker: None,
         // Leg 3c / A3 (#517, #581)
         armed_for_test_verdict: std::collections::HashMap::new(),
         pending_test_fix: None,

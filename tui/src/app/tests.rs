@@ -51713,6 +51713,175 @@ Milestone tracking issue.
         }
     }
 
+    // ── #2642 (ms-65 §… quick-pick): Ctrl+E open-tabs picker ─────────────
+    //
+    // The dead `‹`/`›` overflow-marker bug, end to end: a scrolled-out tab
+    // is now two keys away (Ctrl+E, type to filter, Enter) rather than
+    // stuck behind decoration that only ever activated its neighbour.
+
+    /// The whole bug, end to end: #101 is scrolled out of the strip at a
+    /// narrow width, Ctrl+E opens a picker that still lists it, and
+    /// activating it from there brings it back on screen.
+    #[test]
+    fn ctrl_e_picker_reaches_a_board_tab_scrolled_out_of_the_strip() {
+        let mut driver = three_pinned_tabs_driver(80, 40);
+        assert_eq!(active_tab_number(&driver), Some(103));
+        assert!(
+            !driver.screen_contains("#101 Fix login race timeout"),
+            "precondition: #101 is scrolled out of the overflowing strip:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#101 Fix login race timeout"),
+            "#2642: Ctrl+E opens a picker listing every open tab, including \
+             ones scrolled out of the strip:\n{}",
+            driver.screen()
+        );
+
+        for ch in "101".chars() {
+            driver.type_char(ch);
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("#101 Fix login race timeout"),
+            "#2642: typing filters the list down to the matching row:\n{}",
+            driver.screen()
+        );
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(101),
+            "#2642: activating #101 from the picker makes it the active tab:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("[#101 "),
+            "#2642: …and #101's strip entry is now on screen — activation \
+             (same `activate_board_doc_tab` entry point a click already \
+             uses) brings it into view regardless of the strip's own \
+             scroll geometry:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Typing narrows the list; Esc cancels with the active tab (and
+    /// everything else) exactly as it was before the picker opened.
+    #[test]
+    fn typing_in_the_doc_tab_picker_filters_and_esc_cancels_with_no_change() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+        assert_eq!(active_tab_number(&driver), Some(103));
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(driver.screen_contains("#101 Fix login race timeout"));
+        assert!(driver.screen_contains("#102 Auth token refresh bug"));
+        assert!(driver.screen_contains("#103 Race condition in poller"));
+
+        for ch in "102".chars() {
+            driver.type_char(ch);
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("#102 Auth token refresh bug"),
+            "#2642: typing filters the list down to the matching row:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("#101 Fix login race timeout")
+                && !driver.screen_contains("#103 Race condition in poller"),
+            "…and hides every non-matching row:\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(103),
+            "#2642: Esc cancels — the active tab is whatever it was before \
+             the picker opened, never whatever the query happened to be \
+             filtered to:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("Open tabs"),
+            "#2642: the picker itself is closed after Esc:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The picker reads the FOCUSED panel's own tab set — Pipeline's, while
+    /// Pipeline is active — never Board's, even though a Board tab is open
+    /// at the same time on a shared issue number range.
+    #[test]
+    fn ctrl_e_picker_on_pipeline_reads_pipelines_own_tabs_not_boards() {
+        let mut app = pipeline_doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_pipeline_doc_tab(("claude-coordinator".to_string(), 102), true);
+        app.open_pipeline_doc_tab(("claude-coordinator".to_string(), 103), true);
+        app.active_view = SidebarView::Pipeline;
+
+        let mut driver =
+            quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#102 Auth token refresh bug"),
+            "#2642: the Pipeline picker lists Pipeline's OWN open tabs:\n{}",
+            driver.screen()
+        );
+        assert!(driver.screen_contains("#103 Race condition in poller"));
+        assert!(
+            !driver.screen_contains("#101 Fix login race timeout"),
+            "#2642: …never the Board panel's tab set, even though #101 is \
+             open there at the same time:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 split panes: with two Board panes open, the picker lists the
+    /// FOCUSED pane's tabs only — never the other pane's.
+    #[test]
+    fn ctrl_e_picker_on_a_split_board_panel_lists_only_the_focused_panes_tabs() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        assert!(
+            app.split_board_pane_right(),
+            "precondition: `Ctrl-W v` splits an unsplit Board panel"
+        );
+        // The new (right) pane takes focus (contract §9), so this lands
+        // in the pane the left pane's #101/#102 never see.
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 103), true);
+
+        let mut driver =
+            quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.render();
+
+        driver.ctrl_char('e');
+        driver.render();
+        assert!(
+            driver.screen_contains("#103 Race condition in poller"),
+            "#2642: the picker lists the FOCUSED (right) pane's own tab, \
+             #103:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("#101 Fix login race timeout")
+                && !driver.screen_contains("#102 Auth token refresh bug"),
+            "#2642: …never the OTHER pane's tabs:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #2285 (ms-65 §5): per-tab detail sub-state ───────────────────────
     //
     // The sealed acceptance slice drives these clauses through `TuiDriver` on

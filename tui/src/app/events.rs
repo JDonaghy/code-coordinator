@@ -952,6 +952,81 @@ impl CoordApp {
             return Reaction::Redraw;
         }
 
+        // ── #2642: Ctrl+E doc-tab picker — open/close toggle ────────────────
+        // Supersedes the dead `‹`/`›` overflow markers baked into the
+        // Board/Pipeline doc-tab strip (`bake_doc_tab_overflow_markers`,
+        // render.rs) as the way to reach a tab scrolled out of view — two
+        // keys, never dependent on the strip's geometry. Scoped to Board and
+        // Pipeline, the only panels with a doc-tab strip at all; a no-op
+        // (no picker opens) when that panel currently has zero tabs, mirroring
+        // `open_command_palette`'s own "nothing registered" no-op.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            let pty_active = (self.active_view == SidebarView::Board
+                && self.board_detail_tab == BoardDetailTab::Terminal
+                && self.detail_terminal_focused)
+                || (self.active_view == SidebarView::Pipeline
+                    && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    && self.detail_terminal_focused);
+            if matches!(key, Key::Char('e') | Key::Char('E'))
+                && modifiers.ctrl
+                && !modifiers.alt
+                && !pty_active
+                && !self.any_blocking_modal_active()
+                && self.issue_finder.is_none()
+            {
+                if self.doc_tab_picker.is_some() {
+                    self.doc_tab_picker = None;
+                } else {
+                    match self.active_view {
+                        SidebarView::Board => self.open_doc_tab_picker(PanelScope::Board),
+                        SidebarView::Pipeline => self.open_doc_tab_picker(PanelScope::Pipeline),
+                        _ => {}
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #2642: doc-tab picker owns ALL input while open ─────────────────
+        // Same "one modal owns ALL input while open" contract as the issue
+        // finder above and the command palette below — every event (not just
+        // keys the palette recognises) is swallowed while this is `Some`, so
+        // clicks on the panel underneath can't leak through.
+        if let Some(mut picker) = self.doc_tab_picker.take() {
+            if let UiEvent::KeyPressed { .. } = &event {
+                let main = ctx.main_bounds();
+                let lh = backend.line_height();
+                let popup = Self::doc_tab_picker_popup_rect(main);
+                let visible_rows = if lh > 0.0 {
+                    ((popup.height / lh) as usize).saturating_sub(PALETTE_CHROME_ROWS)
+                } else {
+                    10
+                };
+                match picker.palette.handle(&event, visible_rows) {
+                    DualModePaletteEvent::Cancelled => {}
+                    DualModePaletteEvent::ItemConfirmed { idx } => {
+                        let query = picker.palette.query().to_string();
+                        self.confirm_doc_tab_picker(picker.scope, picker.pane, idx, &query);
+                    }
+                    DualModePaletteEvent::QueryChanged { value } => {
+                        let items =
+                            self.doc_tab_picker_items_for(picker.scope, picker.pane, &value);
+                        picker.palette.set_items(items);
+                        self.doc_tab_picker = Some(picker);
+                    }
+                    DualModePaletteEvent::TextConfirmed { .. }
+                    | DualModePaletteEvent::ModeToggled { .. }
+                    | DualModePaletteEvent::Consumed
+                    | DualModePaletteEvent::Ignored => {
+                        self.doc_tab_picker = Some(picker);
+                    }
+                }
+            } else {
+                self.doc_tab_picker = Some(picker);
+            }
+            return Reaction::Redraw;
+        }
+
         // ── #1033: `L` opens/focuses the Sessions panel ───────────────────────
         // Retired the #628 fleet-wide live-sessions overlay in favor of the
         // always-visible Sessions panel (#1032) — `L` now just switches/
@@ -5066,15 +5141,23 @@ impl CoordApp {
                             if let Some(strip) = self.board_doc_tab_strip(tab_main_b.width) {
                                 let refs: Vec<&str> =
                                     strip.tabs.iter().map(|t| t.label.as_str()).collect();
-                                if let Some(kind) = resolve_doc_tab_click(
+                                // #2642: a right-click on a baked `‹`/`›`
+                                // marker opens no menu — there is no tab
+                                // under it to act on, and (unlike the
+                                // left-click arm below) a right-click isn't
+                                // the picker's own open gesture either.
+                                let idx = match resolve_doc_tab_click(
                                     &refs,
                                     tab_main_b.x,
                                     pos.x,
                                     strip.scroll_offset,
                                 ) {
-                                    let idx = match kind {
-                                        TabClickKind::Close(idx) | TabClickKind::Body(idx) => idx,
-                                    };
+                                    Some(TabClickKind::Close(idx) | TabClickKind::Body(idx)) => {
+                                        Some(idx)
+                                    }
+                                    Some(TabClickKind::Overflow(_)) | None => None,
+                                };
+                                if let Some(idx) = idx {
                                     let is_pinned = !self.board_doc_tabs().is_preview(idx);
                                     // Anchor the menu at a WHOLE row, TWO
                                     // rows below the clicked (fractional,
@@ -5319,7 +5402,10 @@ impl CoordApp {
                     Some(TabClickKind::Close(idx) | TabClickKind::Body(idx)) => {
                         self.close_board_doc_tab(idx)
                     }
-                    None => false,
+                    // #2642: middle-clicking a `‹`/`›` marker closes nothing —
+                    // there's no tab under it, only the picker's own
+                    // (left-click) open gesture applies there.
+                    Some(TabClickKind::Overflow(_)) | None => false,
                 }
             }
 
@@ -6404,6 +6490,12 @@ impl CoordApp {
                             strip.tabs.iter().map(|t| t.label.as_str()).collect();
                         // #4: clicking a tab's `×` closes it; clicking its
                         // BODY activates it (§2b/§2e's open-or-activate path).
+                        // #2642: clicking a baked `‹`/`›` overflow marker
+                        // opens the open-tabs picker instead of activating
+                        // (or, for `‹`, closing) whichever tab it happens to
+                        // be painted into — the whole point of the picker is
+                        // that reaching a scrolled-out-of-view tab no longer
+                        // depends on the strip's geometry.
                         return match resolve_doc_tab_click(
                             &refs,
                             main_b.x,
@@ -6412,6 +6504,10 @@ impl CoordApp {
                         ) {
                             Some(TabClickKind::Close(idx)) => self.close_board_doc_tab(idx),
                             Some(TabClickKind::Body(idx)) => self.activate_board_doc_tab(idx),
+                            Some(TabClickKind::Overflow(_)) => {
+                                self.open_doc_tab_picker(PanelScope::Board);
+                                true
+                            }
                             None => false,
                         };
                     }
@@ -6501,7 +6597,9 @@ impl CoordApp {
                             strip.tabs.iter().map(|t| t.label.as_str()).collect();
                         // Clicking a tab's `×` closes it; clicking its BODY
                         // activates it — same split as the Board arm's own
-                        // `resolve_doc_tab_click` call.
+                        // `resolve_doc_tab_click` call. #2642: a `‹`/`›`
+                        // marker click opens the picker instead (same
+                        // reasoning as the Board arm above).
                         return match resolve_doc_tab_click(
                             &refs,
                             main_b.x,
@@ -6510,6 +6608,10 @@ impl CoordApp {
                         ) {
                             Some(TabClickKind::Close(idx)) => self.close_pipeline_doc_tab(idx),
                             Some(TabClickKind::Body(idx)) => self.activate_pipeline_doc_tab(idx),
+                            Some(TabClickKind::Overflow(_)) => {
+                                self.open_doc_tab_picker(PanelScope::Pipeline);
+                                true
+                            }
                             None => false,
                         };
                     }
