@@ -61,6 +61,22 @@
 # Read the journal it writes with `coord release history`, not just
 # `journalctl`: the JSONL record survives a half-installed venv and is the
 # thing that makes "the fleet reached that version" checkable after the fact.
+#
+# MIN-RELEASES-BEHIND GATE (#2583) — OFF BY DEFAULT, NOT SET HERE
+# -----------------------------------------------------------------
+# `coord release propagate` (and `coord release nightly-window`, below)
+# support holding a run below a configurable delta —
+# `propagation.min_releases_behind` in coordinator.yml, or `--min-behind` on
+# either command — instead of attempting a roll on ANY delta at all (today's
+# default, `min_releases_behind=1`, unchanged unless configured). This
+# `ExecStart=` deliberately does NOT pass `--min-behind`: the threshold is
+# meant to be set (or left alone) via coordinator.yml so both this timer and
+# `coord-release-window.service` read the SAME value, and — per
+# `docs/AGENT_OPERATIONS.md`'s "Auto-roll threshold gate" section — must NOT
+# be raised above 1 on a fleet that has not first taken one manual roll onto
+# a fixed propagation lane. Below the threshold, this unit's own run reports
+# `holding: N behind, threshold M` and exits 0, exactly like an ordinary
+# deferral — no cordon, no host touched.
 
 [Unit]
 Description=Propagate the released version to the fleet at the next quiescent window (#1835)
