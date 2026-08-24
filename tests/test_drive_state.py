@@ -1265,3 +1265,67 @@ def test_project_test_mode_is_empty_when_the_issue_is_not_cached():
     for."""
     state = project({"assignments": [], "issues": []}, REPO, 1392, make_config())
     assert state.issue_test_mode == ""
+
+
+# ── #2681: scratch_dir must not reach os.getuid() unconditionally ────────────
+
+
+def test_scratch_dir_keys_on_getuid_when_available(monkeypatch, tmp_path):
+    """Unchanged POSIX/macOS behaviour: the real uid, not a fallback."""
+    import os
+
+    from coord import drive_state
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    d = drive_state.scratch_dir()
+    assert d == tmp_path / f"coord-drive-issue-{os.getuid()}"
+    assert d.is_dir()
+
+
+def test_scratch_dir_falls_back_to_username_without_getuid(monkeypatch, tmp_path):
+    """Windows has no ``os.getuid`` — :func:`scratch_dir` must degrade to a
+    different per-user token rather than raising ``AttributeError`` and
+    aborting the whole board-read path (#2681)."""
+    from coord import drive_state
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delattr(drive_state.os, "getuid", raising=False)
+    monkeypatch.setattr(drive_state.getpass, "getuser", lambda: "alice")
+
+    d = drive_state.scratch_dir()
+    assert d == tmp_path / "coord-drive-issue-alice"
+    assert d.is_dir()
+
+
+def test_scratch_dir_falls_back_to_placeholder_when_getuser_also_fails(
+    monkeypatch, tmp_path
+):
+    """Neither uid nor login name resolvable — degrade to a fixed token
+    rather than raising (#2681)."""
+    from coord import drive_state
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delattr(drive_state.os, "getuid", raising=False)
+
+    def _boom():
+        raise OSError("no login name")
+
+    monkeypatch.setattr(drive_state.getpass, "getuser", _boom)
+
+    d = drive_state.scratch_dir()
+    assert d == tmp_path / "coord-drive-issue-unknown"
+
+
+def test_scratch_dir_falls_back_to_tempfile_gettempdir_without_tmpdir(
+    monkeypatch, tmp_path
+):
+    """No ``TMPDIR`` set: use :func:`tempfile.gettempdir` — which resolves
+    the platform-correct default itself — rather than a hardcoded ``/tmp``
+    that never existed on Windows (#2681)."""
+    from coord import drive_state
+
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(drive_state.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    d = drive_state.scratch_dir()
+    assert d.parent == tmp_path

@@ -132,6 +132,22 @@ def _running_under_systemd() -> bool:
     return bool(os.environ.get("INVOCATION_ID"))
 
 
+def _systemctl_env() -> dict[str, str]:
+    """``os.environ`` overlaid with a best-effort ``XDG_RUNTIME_DIR`` default
+    for the ``systemctl --user`` calls below.
+
+    ``XDG_RUNTIME_DIR`` is an XDG/systemd concept with no Windows meaning --
+    and ``os.getuid()`` doesn't exist there either, so the unguarded default
+    raised ``AttributeError`` at call time on win32 (#2681). None of these
+    call sites are reachable on Windows anyway (there is no ``systemctl``),
+    so the default is simply skipped there rather than invented.
+    """
+    env = dict(os.environ)
+    if sys.platform != "win32":
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return env
+
+
 def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
     """Best-effort ``systemctl --user restart <unit>``, run from *inside*
     the unit's own process.
@@ -150,11 +166,10 @@ def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
     whether the restart actually completed; the caller's process is about
     to exit either way, so there is nothing left here to poll for.
     """
-    env = dict(os.environ)
     # Should already be set for a process systemd itself started, but
     # setting it explicitly costs nothing and matches the SSH-driven
     # fallback in agent_ops.py, where it IS load-bearing.
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env = _systemctl_env()
     try:
         subprocess.Popen(
             ["systemctl", "--user", "restart", unit],
@@ -214,8 +229,7 @@ def _unit_listen_port(unit: str) -> str | None:
     systemctl on PATH, no user bus, unit not installed, or an ExecStart with
     no ``--port`` on it.
     """
-    env = dict(os.environ)
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env = _systemctl_env()
     try:
         result = subprocess.run(
             ["systemctl", "--user", "show", unit, "--property=ExecStart"],
@@ -306,8 +320,7 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
     call, is what actually decides the outcome now, exactly as its own
     docstring paragraph above argues it should.
     """
-    env = dict(os.environ)
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env = _systemctl_env()
     try:
         result = subprocess.run(
             ["systemctl", "--user", "restart", "--no-block", unit],
