@@ -37,7 +37,7 @@ from coord._board_mapping import (
 from coord.audit import record_audit as _record_audit
 from coord.board_service import resolve as _board_service_resolve
 from coord.board_service import route_write as _route_write
-from coord.db import get_connection, retry_on_locked
+from coord.db import get_connection, is_lock_contention_error, retry_on_locked
 from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
@@ -3354,13 +3354,39 @@ def _mark_review_posted_local(assignment_id: str) -> None:
     """Local-DB write for :func:`mark_review_posted`.
 
     Called directly by the daemon endpoint so it never re-routes back over HTTP.
+
+    #2689: this fires from `post_orphaned_review_findings` *after* the review
+    findings have already been posted to GitHub — it is bookkeeping, not the
+    posting itself. Momentary lock contention here (a concurrent writer
+    elsewhere in the daemon) used to raise straight out as a 503, which the
+    notify loop then treated as a failed post and retried — risking a
+    duplicate GitHub comment for what was really just a local flag that
+    couldn't be set yet. `retry_on_locked` absorbs the transient case; if the
+    lock never clears, log loudly and return rather than raising — a real
+    schema-drift bug still surfaces via the `is_lock_contention_error` guard
+    below.
     """
     conn = get_connection()
-    conn.execute(
-        "UPDATE assignments SET review_posted_at=? WHERE assignment_id=?",
-        (time.time(), assignment_id),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            "UPDATE assignments SET review_posted_at=? WHERE assignment_id=?",
+            (time.time(), assignment_id),
+        )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: marking review-posted for assignment %s hit a lock that "
+            "never cleared after retrying; the findings were already posted "
+            "to GitHub, so not failing the call: %s",
+            assignment_id, exc,
+        )
+        return
     row = conn.execute(
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
@@ -4403,7 +4429,25 @@ def _apply_issue_labels_local(
     new_labels, changed = github_ops.change_issue_labels(
         slug, issue_number, add=add, remove=remove
     )
-    _update_issue_labels_local(repo_name, issue_number, new_labels)
+
+    # #2689: same shape as `_create_issue_local`/`_edit_issue_content_local`
+    # — the GitHub label write above already landed and is irreversible, so
+    # a lock that outlasts the retry budget on the cache mirror must not
+    # fail the call.
+    try:
+        retry_on_locked(
+            lambda: _update_issue_labels_local(repo_name, issue_number, new_labels)
+        )
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: cache mirror for relabeled issue %s#%s hit a lock that "
+            "never cleared after retrying; the GitHub label change already "
+            "succeeded, so not failing the call — the cache row will catch "
+            "up on the next sync: %s",
+            repo_name, issue_number, exc,
+        )
     return new_labels, changed
 
 
@@ -4462,33 +4506,57 @@ def _create_issue_local(
 
     # Mirror the new issue into the local cache (best-effort in intent — the
     # GitHub write above is authoritative and a missing row just gets filled
-    # on the next sync — but left unguarded, matching the sibling
-    # _edit_issue_content_local's cache write: a real typo/schema-drift bug
-    # in this hand-written SQL should surface, not vanish behind a bare except).
+    # on the next sync — but the SQL itself stays unguarded against real bugs:
+    # a typo/schema-drift error in this hand-written SQL should still surface,
+    # not vanish behind a bare except).
+    #
+    # #2689: the GitHub write above already landed and is irreversible — a
+    # 503 here used to read to the caller as "nothing happened," and the
+    # natural response (retry) filed a duplicate issue. `retry_on_locked`
+    # absorbs transient lock contention (a concurrent writer elsewhere in the
+    # daemon, not a real bug); if it's still locked after the retry budget,
+    # log loudly and return the already-created result anyway rather than
+    # raising — the missing cache row self-heals on the next sync, but a
+    # duplicate GitHub issue does not.
     conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO issues
-            (repo_name, number, title, body, state, labels, synced_at,
-             milestone_number, milestone_title)
-        VALUES (?, ?, ?, ?, 'open', ?, ?, NULL, NULL)
-        ON CONFLICT (repo_name, number) DO UPDATE SET
-            title     = excluded.title,
-            body      = excluded.body,
-            state     = 'open',
-            labels    = excluded.labels,
-            synced_at = excluded.synced_at
-        """,
-        (
-            repo_name,
-            result["number"],
-            title,
-            body,
-            json.dumps(sorted(labels or [])),
-            time.time(),
-        ),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO issues
+                (repo_name, number, title, body, state, labels, synced_at,
+                 milestone_number, milestone_title)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, NULL, NULL)
+            ON CONFLICT (repo_name, number) DO UPDATE SET
+                title     = excluded.title,
+                body      = excluded.body,
+                state     = 'open',
+                labels    = excluded.labels,
+                synced_at = excluded.synced_at
+            """,
+            (
+                repo_name,
+                result["number"],
+                title,
+                body,
+                json.dumps(sorted(labels or [])),
+                time.time(),
+            ),
+        )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: cache mirror for newly-created issue %s#%s hit a lock "
+            "that never cleared after retrying; GitHub issue creation already "
+            "succeeded, so not failing the call — the cache row will catch "
+            "up on the next sync: %s",
+            repo_name, result.get("number"), exc,
+        )
     return result
 
 
@@ -4695,6 +4763,10 @@ def _edit_issue_content_local(
 
     # Mirror into the cache (best-effort: the tracker write above is
     # authoritative; a missing cache row just gets filled on the next sync).
+    #
+    # #2689: same shape as `_create_issue_local` — the GitHub write above is
+    # irreversible and already landed, so a lock that outlasts the retry
+    # budget must not turn into a 503 that reads as "nothing happened."
     conn = get_connection()
     sets: list[str] = []
     params: list[object] = []
@@ -4705,11 +4777,26 @@ def _edit_issue_content_local(
         sets.append("body = ?")
         params.append(body)
     params.extend([repo_name, issue_number])
-    conn.execute(
-        f"UPDATE issues SET {', '.join(sets)} WHERE repo_name = ? AND number = ?",
-        tuple(params),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            f"UPDATE issues SET {', '.join(sets)} WHERE repo_name = ? AND number = ?",
+            tuple(params),
+        )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: cache mirror for edited issue %s#%s hit a lock that "
+            "never cleared after retrying; the GitHub edit already "
+            "succeeded, so not failing the call — the cache row will catch "
+            "up on the next sync: %s",
+            repo_name, issue_number, exc,
+        )
     return True
 
 
@@ -4775,13 +4862,32 @@ def _assign_issue_milestone_local(
 
     # Mirror into the cache (best-effort in intent — the tracker write above is
     # authoritative; a missing cache row just gets filled on the next sync).
+    #
+    # #2689: same shape as `_create_issue_local` — the tracker write above is
+    # irreversible and already landed, so a lock that outlasts the retry
+    # budget must not fail the call.
     conn = get_connection()
-    conn.execute(
-        "UPDATE issues SET milestone_number = ?, milestone_title = ?"
-        " WHERE repo_name = ? AND number = ?",
-        (milestone_number, milestone_title, repo_name, issue_number),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            "UPDATE issues SET milestone_number = ?, milestone_title = ?"
+            " WHERE repo_name = ? AND number = ?",
+            (milestone_number, milestone_title, repo_name, issue_number),
+        )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: cache mirror for milestone assignment on %s#%s hit a "
+            "lock that never cleared after retrying; the tracker write "
+            "already succeeded, so not failing the call — the cache row "
+            "will catch up on the next sync: %s",
+            repo_name, issue_number, exc,
+        )
 
 
 def unassign_issue_milestone(
@@ -4831,13 +4937,31 @@ def _unassign_issue_milestone_local(
     slug = repo_github or repo_name
     github_ops.unassign_issue_milestone(slug, issue_number)
 
+    # #2689: same shape as `_assign_issue_milestone_local` — the tracker
+    # write above is irreversible and already landed, so a lock that
+    # outlasts the retry budget must not fail the call.
     conn = get_connection()
-    conn.execute(
-        "UPDATE issues SET milestone_number = NULL, milestone_title = NULL"
-        " WHERE repo_name = ? AND number = ?",
-        (repo_name, issue_number),
-    )
-    conn.commit()
+
+    def _write() -> None:
+        conn.execute(
+            "UPDATE issues SET milestone_number = NULL, milestone_title = NULL"
+            " WHERE repo_name = ? AND number = ?",
+            (repo_name, issue_number),
+        )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sqlite3.OperationalError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2689: cache mirror for milestone removal on %s#%s hit a lock "
+            "that never cleared after retrying; the tracker write already "
+            "succeeded, so not failing the call — the cache row will catch "
+            "up on the next sync: %s",
+            repo_name, issue_number, exc,
+        )
 
 
 def close_issue(

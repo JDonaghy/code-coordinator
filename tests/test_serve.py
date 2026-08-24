@@ -2785,6 +2785,63 @@ def test_serve_issue_create_writes_backend_and_cache(
     assert json.loads(row["labels"]) == ["bug"]
 
 
+class _AlwaysLockedConn:
+    """Wraps a real connection, making every ``execute()`` raise
+    `database is locked` — simulates sustained contention (a concurrent
+    writer that never lets go within the retry budget)."""
+
+    def __init__(self, real_conn) -> None:
+        self._real = real_conn
+
+    def execute(self, *args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_serve_issue_create_returns_200_under_sustained_lock_contention(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#2689 core regression, at the handler level: before the fix, a lock
+    that outlasted the cache-mirror write's retry budget propagated out of
+    `_create_issue_local` as a bare `OperationalError`, which
+    `post_issue_create`'s blanket `except Exception` turned into a 503 —
+    even though the GitHub issue had already been created. The natural
+    response to that 503 (retry the command) filed a duplicate issue. The
+    handler must now return 200 with the issue number, not 503, once the
+    upstream GitHub write has already landed."""
+    calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.create_issue",
+        lambda repo, title, body, *, labels=None: (
+            calls.append((repo, title, body, labels))
+            or {"number": 99, "url": "https://github.com/owner/api/issues/99"}
+        ),
+    )
+    monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+    monkeypatch.setattr(
+        "coord.state.get_connection", lambda: _AlwaysLockedConn(rw_db)
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-create",
+            json={
+                "repo_name": "api",
+                "title": "new issue",
+                "body": "issue body",
+                "labels": ["bug"],
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"number": 99, "url": "https://github.com/owner/api/issues/99"}
+    assert calls == [("owner/api", "new issue", "issue body", ["bug"])], (
+        "GitHub create_issue must be called exactly once — no duplicate filing"
+    )
+
+
 def test_edit_issue_content_routes_when_service_set(coord_db, monkeypatch):
     from coord import client as cc
     from coord import state
