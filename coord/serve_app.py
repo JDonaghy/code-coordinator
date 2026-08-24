@@ -3066,6 +3066,36 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/issue-comment": {
+            "post": {
+                "summary": (
+                    "Post a plain comment on an issue through the tracker seam "
+                    "(#2643) — state-free, unlike /issue-close and /issue-reopen"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                    "repo_github": {"type": "string", "nullable": True},
+                                },
+                                "required": ["repo_name", "issue_number", "body"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field"},
+                    "503": {"description": "GitHub write failed"},
+                },
+            }
+        },
         "/issue-close": {
             "post": {
                 "summary": "Close an issue (optionally with a comment) through the tracker seam (#1003)",
@@ -5779,6 +5809,34 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"updated": True})
 
+    async def post_issue_comment(request: Request) -> Response:
+        # #2643: post a plain comment through the tracker seam — the
+        # state-free write /issue-close and /issue-reopen don't cover on
+        # their own (their `comment` param only fires alongside a state
+        # change, and only no-ops usefully when the issue is already in the
+        # target state). Client sends (repo_name, issue_number, body,
+        # repo_github?) and gets back {"updated": true}.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._comment_on_issue_local(
+                body["repo_name"],
+                body["issue_number"],
+                body["body"],
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-comment write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"updated": True})
+
     async def post_issue_close(request: Request) -> Response:
         # #1003: close an issue (optionally posting a comment first) through
         # the tracker seam — the "Close / archive plan" Plans-panel action's
@@ -7663,6 +7721,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route(
             "/issue-milestone-remove", post_issue_milestone_remove, methods=["POST"]
         ),
+        Route("/issue-comment", post_issue_comment, methods=["POST"]),
         Route("/issue-close", post_issue_close, methods=["POST"]),
         Route("/issue-reopen", post_issue_reopen, methods=["POST"]),
         Route("/milestone-edit", post_milestone_edit, methods=["POST"]),
