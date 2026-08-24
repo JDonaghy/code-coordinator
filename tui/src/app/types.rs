@@ -823,6 +823,12 @@ pub(crate) struct BoardPayload {
     /// and on daemons older than #1753, which never emit this key.
     #[serde(default)]
     pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
+    /// #2608: the machine-local roll-pending marker — see `RollPending`'s
+    /// doc comment. `#[serde(default)]` leaves this `None` both when the key
+    /// is absent (daemon predates #2608) and when it is explicit JSON
+    /// `null` (no roll pending).
+    #[serde(default)]
+    pub(crate) roll_pending: Option<RollPending>,
     /// #2532 (ms-67 contract §5): portal submissions ready for
     /// decomposition into coordinator work — `signoff.approved` today.
     /// Server-computed (`coord/approved_work.py`, injected by
@@ -1759,6 +1765,39 @@ pub(crate) struct PlanRosterEntry {
 /// produces when the key is absent entirely) and the Plans panel renders
 /// exactly as it did before this field existed — no header strip, full rect
 /// to the roster.
+/// #2608: the machine-local fleet-roll marker, surfaced on the `/board`
+/// payload's optional `roll_pending` key — same shape as
+/// `coord.drive_queue.RollPending.to_dict()`. Set by `coord release
+/// propagate`/`nightly-window`, read every tick by
+/// `coord.drive_queue.plan_tick` (via the shell's `read_roll_pending`),
+/// which refuses to LAUNCH a new drive while this is live — reconciliation
+/// (steps 1/1b) runs unaffected. `None` — via `#[serde(default)]`, covering
+/// both an absent key (a daemon predating #2608) and an explicit JSON
+/// `null` (no roll pending right now) — means the Queue panel renders
+/// exactly as it did before this field existed: no banner, no layout shift.
+/// Deliberately not folded into the alert/escalation channel: a queue held
+/// for a roll is expected, self-clearing behaviour, never surfaced as
+/// broken (mirrors `coord drive-queue status`'s own non-alarming rendering
+/// of this same marker).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct RollPending {
+    /// The version this roll targets.
+    pub(crate) target_version: String,
+    /// `time.time()` epoch when the marker was set — the TTL's origin.
+    pub(crate) set_at: f64,
+    /// Free text naming who/why set it ("nightly-window" / "propagate").
+    #[serde(default)]
+    pub(crate) reason: String,
+    #[serde(default)]
+    pub(crate) ttl_seconds: f64,
+    #[serde(default)]
+    pub(crate) max_deferrals: i64,
+    /// Consecutive ticks that observed the marker still pending and the
+    /// fleet still busy — bumped by the shell each tick it defers the roll.
+    #[serde(default)]
+    pub(crate) deferrals: i64,
+}
+
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub(crate) struct GoalHeader {
     /// True iff the daemon located and parsed a GOAL.md this tick.
@@ -2611,6 +2650,10 @@ pub struct BoardData {
     /// overlay and Pipeline-row menu items. Empty on the local-SQLite-mode
     /// read path and on daemons older than #1753.
     pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
+    /// #2608: mirrors `BoardPayload::roll_pending` — see `RollPending`'s doc
+    /// comment. `None` on the local-SQLite-mode read path (no daemon to read
+    /// the marker file from) and on daemons older than #2608.
+    pub(crate) roll_pending: Option<RollPending>,
     /// #2532: mirrors `BoardPayload::approved_submissions` — portal
     /// submissions ready for decomposition. Empty on the local-SQLite-mode
     /// read path (no daemon to compute the server-resolved `repos`) and on

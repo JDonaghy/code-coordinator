@@ -1452,6 +1452,82 @@ def test_goal_header_failure_does_not_blank_board(file_db: Path, valid_config_pa
     assert board["round_number"] == 7  # rest of the board is untouched
 
 
+# ── #2608: roll_pending in /board payload ────────────────────────────────────
+
+
+def test_roll_pending_in_board_payload_when_live(
+    file_db: Path, valid_config_path: Path
+):
+    """#2608: with a live roll-pending marker on this host, /board carries a
+    `roll_pending` object shaped like `RollPending.to_dict()` — target
+    version, reason, and the deferral/TTL bookkeeping the TUI needs to
+    explain the wait, not just flag that one exists.
+    """
+    from coord.commands.drive_queue import write_roll_pending
+    from coord.drive_queue import RollPending
+
+    write_roll_pending(
+        RollPending(
+            target_version="0.5.235",
+            set_at=1000.0,
+            reason="nightly-window",
+            ttl_seconds=3600.0,
+            max_deferrals=20,
+            deferrals=3,
+        )
+    )
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert board["roll_pending"] is not None
+    pending = board["roll_pending"]
+    assert pending["target_version"] == "0.5.235"
+    assert pending["reason"] == "nightly-window"
+    assert pending["set_at"] == 1000.0
+    assert pending["ttl_seconds"] == 3600.0
+    assert pending["max_deferrals"] == 20
+    assert pending["deferrals"] == 3
+
+
+def test_roll_pending_absent_from_board_payload_when_none(
+    file_db: Path, valid_config_path: Path
+):
+    """#2608: with no marker file, `roll_pending` is `null` — the TUI must
+    render exactly its pre-#2608 Queue panel in this case, no empty banner,
+    no layout shift.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "roll_pending" in board
+    assert board["roll_pending"] is None
+
+
+def test_roll_pending_read_failure_does_not_blank_board(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """#2608: a raising `read_roll_pending()` degrades to `roll_pending: null`
+    rather than 503ing (or blanking) the rest of the board — same fail-open
+    posture as `goal_header` above."""
+    import coord.commands.drive_queue as dq_cmd
+
+    def _boom():
+        raise RuntimeError("roll_pending.json parsing exploded")
+
+    monkeypatch.setattr(dq_cmd, "read_roll_pending", _boom)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert board["roll_pending"] is None
+    assert board["round_number"] == 7  # rest of the board is untouched
+
+
 def _make_finished_milestone_db(path: Path) -> None:
     """Seed a milestone (#7, "Wrapped up") whose tracking epic AND every
     work-order child are closed, but the milestone itself is still open on
@@ -6472,6 +6548,7 @@ def test_board_payload_regression(file_db: Path, valid_config_path: Path):
         "plan_roster",
         "plan_roster_supported",
         "goal_header",
+        "roll_pending",
     ):
         assert key in board, f"server-enrichment key '{key}' missing from /board"
     assert board["plan_roster_supported"] is True
