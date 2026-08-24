@@ -175,13 +175,18 @@ exit "${FAKE_ACCEPTANCE_EXIT:-0}"
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
     ).stdout.strip()
 
 
 def _executable(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -203,8 +208,10 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@t.com")
     _git(r, "config", "user.name", "Test")
-    (r / "tests" / "test_ambient.py").write_text("def test_one():\n    assert True\n")
-    (r / "README.md").write_text("init\n")
+    (r / "tests" / "test_ambient.py").write_text(
+        "def test_one():\n    assert True\n", encoding="utf-8"
+    )
+    (r / "README.md").write_text("init\n", encoding="utf-8")
     (r / "scripts").mkdir(parents=True)
     shutil.copy2(HARNESS, r / HARNESS_REL)
     _git(r, "add", "-A")
@@ -213,7 +220,8 @@ def repo(tmp_path: Path) -> Path:
 
     # The branch commit: it edits a python test file, so the arm is in scope.
     (r / "tests" / "test_ambient.py").write_text(
-        "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"
+        "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n",
+        encoding="utf-8",
     )
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "branch change")
@@ -235,6 +243,7 @@ def _run(repo: Path, *extra_args: str, **fake_env: str) -> subprocess.CompletedP
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=180,
         env=env,
     )
@@ -264,7 +273,7 @@ def test_print_routing_says_the_arm_is_skipped_for_a_diff_with_no_test_files(
 ) -> None:
     """A branch touching only ``coord/**`` still runs pytest, but has nothing for
     this arm to re-run — and that must be *stated*, not inferred from silence."""
-    (repo / "coord" / "thing.py").write_text("x = 1\n")
+    (repo / "coord" / "thing.py").write_text("x = 1\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "--amend", "-qm", "coord-only change")
     # Undo the test-file edit so the diff really is coord/**-only.
@@ -288,7 +297,9 @@ def test_the_sealed_acceptance_suite_is_not_in_the_arms_scope(repo: Path) -> Non
     every concurrent branch (the quadraui#554/#490 failure mode #2180 closes)."""
     acc = repo / "tests" / "acceptance" / "ms-99"
     acc.mkdir(parents=True)
-    (acc / "test_sealed.py").write_text("def test_sealed():\n    assert True\n")
+    (acc / "test_sealed.py").write_text(
+        "def test_sealed():\n    assert True\n", encoding="utf-8"
+    )
     _git(repo, "checkout", "base", "--", "tests/test_ambient.py")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "a sealed acceptance test only")
@@ -321,7 +332,7 @@ def test_a_green_branch_runs_the_arm_over_only_the_diff_scoped_test_files(
         "the populated-$HOME arm never ran — a green python arm must always "
         "reach it (or say why it was skipped)"
     )
-    invocation = argv_log.read_text().strip()
+    invocation = argv_log.read_text(encoding="utf-8").strip()
     assert invocation.endswith("tests/test_ambient.py"), invocation
     # Scoped, not the suite: no bare `tests/` directory argument, and none of
     # the full run's markers.
@@ -344,7 +355,7 @@ def test_the_arm_really_runs_under_the_three_knobs(repo: Path, tmp_path: Path) -
     assert result.returncode == 0, (result.stdout, result.stderr)
     recorded = dict(
         line.split("=", 1)
-        for line in env_log.read_text().splitlines()
+        for line in env_log.read_text(encoding="utf-8").splitlines()
         if "=" in line
     )
     assert recorded["client_toml"] == "yes", recorded
@@ -497,7 +508,7 @@ def test_a_diff_with_no_python_test_files_skips_the_arm_out_loud(repo: Path) -> 
     a branch touching no python tests skips the arm and SAYS so, so nobody reads
     a green report and assumes the arm covered them."""
     _git(repo, "checkout", "base", "--", "tests/test_ambient.py")
-    (repo / "coord" / "thing.py").write_text("x = 1\n")
+    (repo / "coord" / "thing.py").write_text("x = 1\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "coord-only change")
 
@@ -548,7 +559,7 @@ import pathlib
 def test_the_fleet_config_cache_is_a_real_one():
     """Green under an ordinary $HOME, red under the harness's synthesized one."""
     cache = pathlib.Path.home() / ".coord" / "coordinator.remote.yml"
-    assert not (cache.exists() and "fleet-only-repo" in cache.read_text())
+    assert not (cache.exists() and "fleet-only-repo" in cache.read_text(encoding="utf-8"))
 '''
 
 
@@ -584,13 +595,17 @@ def test_end_to_end_a_really_ambient_sensitive_test_reddens_the_arm(
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@t.com")
     _git(r, "config", "user.name", "Test")
-    (r / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    (r / "tests" / "test_ok.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
     shutil.copy2(HARNESS, r / HARNESS_REL)
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "initial")
     _git(r, "tag", "base")
 
-    (r / "tests" / "test_ambient_sensitive.py").write_text(_AMBIENT_SENSITIVE_TEST)
+    (r / "tests" / "test_ambient_sensitive.py").write_text(
+        _AMBIENT_SENSITIVE_TEST, encoding="utf-8"
+    )
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "add an ambient-sensitive test")
 
@@ -641,11 +656,11 @@ def test_the_fallback_arm_never_grows_a_populated_home_arm(tmp_path: Path) -> No
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@t.com")
     _git(r, "config", "user.name", "Test")
-    (r / "README.md").write_text("init\n")
+    (r / "README.md").write_text("init\n", encoding="utf-8")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "initial")
     _git(r, "tag", "base")
-    (r / "src" / "lib.rs").write_text("x\n")
+    (r / "src" / "lib.rs").write_text("x\n", encoding="utf-8")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "src change")
 
@@ -659,6 +674,7 @@ def test_the_fallback_arm_never_grows_a_populated_home_arm(tmp_path: Path) -> No
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
     )
 

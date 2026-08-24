@@ -89,7 +89,7 @@ def _init_repo(path: Path) -> Path:
         check=True,
         capture_output=True,
     )
-    (path / "README").write_text("init\n")
+    (path / "README").write_text("init\n", encoding="utf-8")
     subprocess.run(
         ["git", "add", "README"], cwd=str(path), check=True, capture_output=True
     )
@@ -563,7 +563,11 @@ def test_claude_p_path_unchanged(tmp_path) -> None:
     )
     record = server.assign(spec)
     final = server.wait_for(record.id, timeout=15.0)
-    log_text = Path(final.log_path).read_text(errors="replace")
+    # The content here is asserted on (LEGACY_BRIEFING membership, the
+    # bracketed-paste byte check below), so this reads strict UTF-8 — the
+    # same encoding coord/agent.py's _append_log_line writes with — rather
+    # than errors="replace", which is reserved for diagnostic-only reads.
+    log_text = Path(final.log_path).read_text(encoding="utf-8")
     # The legacy path used a stdin pipe + stream-json — NO bracketed paste.
     assert BRACKETED_PASTE_START not in log_text.encode("utf-8")
     assert BRACKETED_PASTE_END not in log_text.encode("utf-8")
@@ -621,7 +625,7 @@ def test_interactive_launcher_has_no_completion_sentinel_watcher() -> None:
     (structurally the same as the git-floor reading commits).  So the guard bans
     the live-stream markers but permits the file-based verdict parse.
     """
-    interactive_src = Path("coord/interactive.py").read_text()
+    interactive_src = Path("coord/interactive.py").read_text(encoding="utf-8")
     # Sanity: the module exists and exports the launcher.
     assert "launch_human_attended_interactive" in interactive_src
     # Markers that only make sense if something watches the LIVE output stream to

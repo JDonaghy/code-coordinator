@@ -742,7 +742,7 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
     # Rust: gate_a_contract_exists_for builds the same path via four
     # `.join()` calls — extract the literal segments and rebuild the
     # equivalent path to prove no drift.
-    rust_src = TUI_PIPELINE_RS.read_text()
+    rust_src = TUI_PIPELINE_RS.read_text(encoding="utf-8")
     fn_match = re.search(
         r"fn gate_a_contract_exists_for.*?\n    \}\n", rust_src, re.S
     )
@@ -5646,7 +5646,9 @@ def test_driver_refuses_a_second_run_on_the_same_issue(driver_factory, tmp_path)
     """A per-issue lock: two drivers on the same issue would double-dispatch."""
     held = FileLock(tmp_path / f"lock-{REPO}-{ISSUE}")
     held.acquire(timeout=0.0)
-    (tmp_path / f"holder-{REPO}-{ISSUE}").write_text("someone else (pid 1)\n")
+    (tmp_path / f"holder-{REPO}-{ISSUE}").write_text(
+        "someone else (pid 1)\n", encoding="utf-8"
+    )
     try:
         driver = driver_factory([board(status="merged")])
         with pytest.raises(DriveError) as exc:
@@ -5709,7 +5711,7 @@ def test_driver_writes_the_per_issue_run_log(driver_factory, tmp_path):
     )
     driver.run()
     log = tmp_path / f"{REPO}-{ISSUE}.log"
-    assert log.exists() and "ok" in log.read_text()
+    assert log.exists() and "ok" in log.read_text(encoding="utf-8")
 
 
 def test_die_exit_message_is_written_to_the_run_log_not_just_the_pane(
@@ -5734,7 +5736,7 @@ def test_die_exit_message_is_written_to_the_run_log_not_just_the_pane(
     monkeypatch.setattr("coord.drive.decide", fake_decide)
     exit_code = driver.run()
     assert exit_code == EXIT_TERMINAL_FAILURE
-    log_text = (tmp_path / f"{REPO}-{ISSUE}.log").read_text()
+    log_text = (tmp_path / f"{REPO}-{ISSUE}.log").read_text(encoding="utf-8")
     assert "merge attempted 3 times without landing." in log_text
     assert "Last board state: status='CONFLICT' reason='rebase failed'" in log_text
 
@@ -5763,7 +5765,7 @@ def test_driver_writes_a_start_marker_even_when_the_loop_never_spawns_anything(
     assert driver.recorded == []  # never spawned a `coord` subcommand
     log = tmp_path / f"{REPO}-{ISSUE}.log"
     assert log.exists()
-    assert "drive loop started" in log.read_text()
+    assert "drive loop started" in log.read_text(encoding="utf-8")
 
 
 def test_a_die_on_error_action_raises_a_drive_error(driver_factory, monkeypatch):
@@ -6357,6 +6359,7 @@ def test_python_dash_m_coord_cli_prints_version_and_exits_0():
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=30,
     )
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -6382,6 +6385,7 @@ def test_coord_argv_fallback_argv_is_actually_executable(monkeypatch):
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=30,
     )
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
