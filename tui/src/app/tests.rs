@@ -41755,7 +41755,7 @@ Milestone tracking issue.
         let mock = MockBoardService::start(audit_page_json_two_entries());
         let _guard = set_test_board_service(mock.url(), None);
 
-        let rx = spawn_audit_fetch(None, None, None);
+        let rx = spawn_audit_fetch(None, None, None, None);
         let outcome = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("spawn_audit_fetch must deliver an outcome before the timeout");
@@ -43697,6 +43697,161 @@ Milestone tracking issue.
             matches!(reaction, Reaction::Exit),
             "Esc on an unfiltered Audit panel (no detail pane, no focused \
              filter) must fall through to the global quit — got {reaction:?}"
+        );
+    }
+
+    // ── #2653: Audit panel tier filter (default Business, `T` cycle) ───────
+    //
+    // No sealed acceptance slice exists for #2653 either (same situation
+    // `#1040`'s comment above describes) — full in-crate coverage lives here.
+
+    #[test]
+    fn audit_tier_cycles_business_operational_all() {
+        assert_eq!(AuditTier::Business.next(), AuditTier::Operational);
+        assert_eq!(AuditTier::Operational.next(), AuditTier::All);
+        assert_eq!(AuditTier::All.next(), AuditTier::Business);
+    }
+
+    #[test]
+    fn audit_tier_query_value_none_only_for_all() {
+        assert_eq!(AuditTier::Business.query_value(), Some("business"));
+        assert_eq!(AuditTier::Operational.query_value(), Some("operational"));
+        assert_eq!(AuditTier::All.query_value(), None);
+    }
+
+    #[test]
+    fn audit_tier_defaults_to_business_and_does_not_read_as_filtered() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        assert_eq!(
+            app.audit_tier,
+            AuditTier::Business,
+            "#2653: the Audit panel must default to the business tier — the \
+             un-filtered stream is ~96% forge_availability telemetry (#1896 \
+             Phase 0) and drowns real board transitions"
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Tier: business"),
+            "sidebar must show the default tier selection:\n{screen}"
+        );
+        assert!(
+            screen.contains("T=tier"),
+            "status-bar hint must advertise the 'T' key:\n{screen}"
+        );
+        assert!(
+            !screen.contains("(filtered)"),
+            "#2653: the new `business` default must NOT permanently pin the \
+             \" (filtered)\" suffix on — that suffix means \"you changed \
+             something from its default\", and an untouched fresh session \
+             has changed nothing:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_capital_t_key_cycles_tier_and_updates_hints() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.type_char('T');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Tier: operational"),
+            "contract-adjacent: first 'T' press must cycle Business -> \
+             Operational, reflected in the sidebar:\n{screen}"
+        );
+        assert!(
+            screen.contains("(filtered)"),
+            "sidebar count line must flag as filtered once a non-default \
+             tier is selected:\n{screen}"
+        );
+
+        driver.type_char('T');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Tier: all"),
+            "second 'T' press must cycle Operational -> All:\n{screen}"
+        );
+        assert!(
+            screen.contains("(filtered)"),
+            "the `all` tier is also non-default and must still read as \
+             filtered:\n{screen}"
+        );
+
+        driver.type_char('T');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Tier: business"),
+            "third 'T' press must cycle All back to Business:\n{screen}"
+        );
+        assert!(
+            !screen.contains("(filtered)"),
+            "cycling back to the default tier (with every other filter \
+             still at its default) must drop the filtered suffix:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_esc_clears_tier_back_to_business() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.audit_tier = AuditTier::All;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        assert!(
+            driver.screen_contains("(filtered)"),
+            "non-default tier must read as filtered before Esc:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.press_named(NamedKey::Escape);
+        driver.render();
+
+        assert!(
+            !matches!(reaction, Reaction::Exit),
+            "Esc must clear the active tier filter rather than quit — got \
+             {reaction:?}"
+        );
+        let screen = driver.screen();
+        assert!(screen.contains("Tier: business"), "tier must reset to business:\n{screen}");
+        assert!(!screen.contains("(filtered)"), "no filter must remain active:\n{screen}");
+    }
+
+    #[test]
+    fn spawn_audit_fetch_sends_tier_param() {
+        let mock = MockBoardService::start(audit_page_json_two_entries());
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let rx = spawn_audit_fetch(None, None, None, Some("business"));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_audit_fetch must deliver an outcome before the timeout");
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the mock server; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].contains("tier=business"),
+            "#2653: spawn_audit_fetch must forward the tier filter as a \
+             `tier=` query param; got {:?}",
+            requests[0]
         );
     }
 

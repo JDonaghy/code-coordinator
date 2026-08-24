@@ -1133,8 +1133,12 @@ impl CoordApp {
                     let type_filter = self.audit_type_filter.query.trim();
                     let type_filter =
                         if type_filter.is_empty() { None } else { Some(type_filter) };
+                    // #2653: tier defaults to `Business`, so most fetches DO
+                    // send a `tier=business` param now — that's the whole
+                    // point (see AuditTier's doc comment).
+                    let tier = self.audit_tier.query_value();
                     self.audit_fetch_rx =
-                        Some(spawn_audit_fetch(since, category, type_filter));
+                        Some(spawn_audit_fetch(since, category, type_filter, tier));
                 }
             }
         }

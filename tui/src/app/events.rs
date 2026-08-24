@@ -2771,6 +2771,10 @@ impl CoordApp {
                     {
                         self.audit_time_range = AuditTimeRange::All;
                         self.audit_category = AuditCategory::All;
+                        // #2653: clears back to `Business` (the default),
+                        // not `All` — `audit_filters_active` compares tier
+                        // against its own default, same as this reset does.
+                        self.audit_tier = AuditTier::default();
                         self.audit_type_filter.clear();
                         self.on_audit_filters_changed();
                         needs_redraw = true;
@@ -3026,6 +3030,22 @@ impl CoordApp {
                             && !self.audit_type_filter.focused =>
                     {
                         self.audit_category = self.audit_category.next();
+                        self.on_audit_filters_changed();
+                        needs_redraw = true;
+                    }
+                    // #2653: `T` cycles the tier filter (Business →
+                    // Operational → All → …) and re-arms the fetch — reaches
+                    // the `forge_availability` operational-tier rows the
+                    // default `Business` view now hides. Capital `T` is free
+                    // in this view (lowercase `t` is time-range just above;
+                    // `T` elsewhere in this file is scoped to
+                    // `SidebarView::Pipeline`, so there's no collision).
+                    Key::Char('T')
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open
+                            && !self.audit_type_filter.focused =>
+                    {
+                        self.audit_tier = self.audit_tier.next();
                         self.on_audit_filters_changed();
                         needs_redraw = true;
                     }
