@@ -2397,6 +2397,19 @@ class TestStalledPipelineHealthCheck:
         assert "vimcode#602" in result.detail
         assert result.values["rows"][0]["assignment_id"] == "work-602"
 
+    def test_is_a_network_cost_check(self) -> None:
+        """For every already-`done` head, `detect_stalled_pipeline` calls
+        `github_ops.work_is_terminal` — a real `gh` CLI round-trip per row —
+        so this must be excluded from the ~2s cheap-check budget. Registered
+        as `cost=COST_CHEAP` (the default), this check would run silently
+        inside the automatic per-agent `/health` poll, which explicitly
+        calls `build_context(..., allow_network=False, ...)` to avoid doing
+        network work on every 5-minute tick, and would also break the
+        documented `coord health --no-network` promise (#2679 review)."""
+        from coord.health import registry as reg
+
+        assert reg.get("stalled_pipeline").cost == reg.COST_NETWORK
+
     def test_disappears_once_the_review_is_no_longer_stalled(
         self, config: Config, coord_db
     ) -> None:

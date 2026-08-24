@@ -32,7 +32,7 @@ pass reaching them, so persistence there is a milder signal.
 from __future__ import annotations
 
 from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import check
+from coord.health.registry import COST_NETWORK, check
 
 # Reason kinds `detect_stalled_pipeline` flags that cannot self-resolve: no
 # drive session owns them once it has exited, so nothing but a fresh
@@ -52,11 +52,17 @@ TERMINAL_STALL_REASONS = frozenset(
     scope="machine",
     title="stalled pipeline rows",
     order=22,
+    cost=COST_NETWORK,
     description=(
         "Pipeline rows `detect_stalled_pipeline` would flag right now, "
         "re-derived from live board state on every run — independent of "
         "the one-shot GitHub-comment `notified` ledger, so a row already "
-        "announced once does not go invisible (#2679)."
+        "announced once does not go invisible (#2679). Marked "
+        "`cost=network`: for every already-`done` head, `detect_stalled_"
+        "pipeline` calls `github_ops.work_is_terminal`, a real `gh` CLI "
+        "round-trip per row, so this is excluded from the cheap set and "
+        "`coord health --no-network` (and the automatic per-agent "
+        "`/health` poll, which runs with `allow_network=False`) skip it."
     ),
 )
 def probe_stalled_pipeline(ctx: HealthContext) -> CheckResult:
