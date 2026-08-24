@@ -27,9 +27,11 @@ Everything here is a pure function over a board payload except
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -733,6 +735,28 @@ def pick_machine(
 # ── board fetch (the one I/O boundary) ───────────────────────────────────────
 
 
+def _scratch_user_token() -> str:
+    """A per-user token for :func:`scratch_dir`'s collision avoidance, valid
+    on both POSIX and Windows (#2681).
+
+    ``os.getuid()`` is POSIX-only -- Windows has no numeric uid concept, so
+    the attribute simply doesn't exist there and the bare call raised
+    ``AttributeError`` at import-adjacent call time, aborting the whole
+    board-read path.  The uid's only job here is separating scratch dirs
+    between users sharing the same temp root; any stable, unique-per-user
+    string satisfies that contract equally well.  Prefer the real uid when
+    available (unchanged behaviour on POSIX/macOS); fall back to the login
+    name on Windows, and to a fixed placeholder in the vanishingly rare case
+    neither is readable, so this never raises.
+    """
+    if hasattr(os, "getuid"):
+        return str(os.getuid())
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
 def scratch_dir() -> Path:
     """Per-user scratch directory shared by every ``coord drive`` run.
 
@@ -746,8 +770,16 @@ def scratch_dir() -> Path:
     alongside a ``coord drive`` on the same issue.  Renaming the directory
     would have silently disabled that mutual exclusion for exactly as long as
     an old checkout existed anywhere in the fleet.
+
+    The temp root is ``TMPDIR`` when set (unchanged POSIX behaviour), else
+    :func:`tempfile.gettempdir` -- which resolves the platform-correct default
+    itself (``/tmp`` on POSIX, ``%TEMP%``/``%TMP%`` on Windows) rather than the
+    old hardcoded ``/tmp`` fallback, which never existed on Windows (#2681).
     """
-    base = Path(os.environ.get("TMPDIR", "/tmp")) / f"coord-drive-issue-{os.getuid()}"
+    base = (
+        Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+        / f"coord-drive-issue-{_scratch_user_token()}"
+    )
     base.mkdir(parents=True, exist_ok=True)
     return base
 

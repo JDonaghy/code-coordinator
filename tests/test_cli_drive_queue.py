@@ -3520,6 +3520,12 @@ def test_a_cleared_cordon_drops_its_stale_queue_alert(cli, seed, launches, monke
     assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="_run_resume_probe's timeout kill goes through os.killpg/getpgid + "
+    "signal.SIGKILL (coord/commands/drive_queue.py) — process-group reaping "
+    "is POSIX-only until Job Objects land, owned by #1163, not this issue",
+)
 def test_a_hanging_probe_is_killed_and_treated_as_a_failure(cli, seed, launches):
     """The REAL `_run_resume_probe`, against a command that never returns.
 

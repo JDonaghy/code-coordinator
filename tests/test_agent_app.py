@@ -769,3 +769,41 @@ def test_metrics_no_psutil(tmp_path):
             sys.modules.pop("psutil", None)
         else:
             sys.modules["psutil"] = original
+
+
+# ── #2681: XDG_RUNTIME_DIR default must not reach os.getuid() on win32 ───────
+
+
+def test_systemctl_env_sets_xdg_runtime_dir_on_posix(monkeypatch):
+    import os
+
+    from coord import agent_app
+
+    monkeypatch.setattr(agent_app.sys, "platform", "linux")
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+    env = agent_app._systemctl_env()
+    assert env["XDG_RUNTIME_DIR"] == f"/run/user/{os.getuid()}"
+
+
+def test_systemctl_env_preserves_an_existing_xdg_runtime_dir(monkeypatch):
+    from coord import agent_app
+
+    monkeypatch.setattr(agent_app.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/custom")
+
+    env = agent_app._systemctl_env()
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/custom"
+
+
+def test_systemctl_env_skips_xdg_runtime_dir_on_win32(monkeypatch):
+    """Windows has neither the XDG concept nor ``os.getuid`` — the default
+    must be skipped outright rather than raising ``AttributeError`` (#2681)."""
+    from coord import agent_app
+
+    monkeypatch.setattr(agent_app.sys, "platform", "win32")
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delattr(agent_app.os, "getuid", raising=False)
+
+    env = agent_app._systemctl_env()
+    assert "XDG_RUNTIME_DIR" not in env
