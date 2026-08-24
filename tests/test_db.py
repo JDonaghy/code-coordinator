@@ -449,6 +449,157 @@ class TestDriveQueueResumesColumn:
         assert entry["resumes"] == 1
 
 
+# ── drive_queue.max_fix_rounds / no_acceptance columns (#2604, #2589, #2675) ─
+#
+# #2604 and #2589 each appended an `ALTER TABLE` to `_migrate_add_columns`
+# but neither bumped `_DB_SCHEMA_VERSION` (#2675) — so `_open()`'s version
+# gate (`_read_schema_version(conn) < _DB_SCHEMA_VERSION`) treated every
+# database already at version 2 as fully caught up and skipped
+# `_ensure_schema` — and therefore `_migrate_add_columns` — ENTIRELY, on
+# every open, forever. Every sibling class above calls `_ensure_schema`
+# directly, bypassing that exact gate, so none of them would have caught
+# this. These tests go through `db_mod._open()` instead — the real
+# production entry point — against a database seeded at schema_version 2,
+# exactly what every real ``~/.coord/coord.db`` looked like when #2604 and
+# #2589 shipped.
+
+_PRE_2604_DRIVE_QUEUE_TABLE = """
+    CREATE TABLE drive_queue (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_name     TEXT    NOT NULL,
+        issue_number  INTEGER NOT NULL,
+        position      INTEGER NOT NULL,
+        machine       TEXT,
+        after_json    TEXT    NOT NULL DEFAULT '[]',
+        state         TEXT    NOT NULL DEFAULT 'waiting',
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        deferrals     INTEGER NOT NULL DEFAULT 0,
+        last_reason   TEXT    NOT NULL DEFAULT '',
+        reason_at     REAL,
+        session_name  TEXT,
+        launched_at   REAL,
+        enqueued_at   REAL    NOT NULL,
+        hold_after    INTEGER NOT NULL DEFAULT 0,
+        hold_reason   TEXT    NOT NULL DEFAULT '',
+        resume_when   TEXT    NOT NULL DEFAULT '',
+        hold_state    TEXT    NOT NULL DEFAULT '',
+        hold_probes   INTEGER NOT NULL DEFAULT 0,
+        launch_host   TEXT    NOT NULL DEFAULT '',
+        hold_scope    TEXT    NOT NULL DEFAULT 'entry',
+        resumes       INTEGER NOT NULL DEFAULT 0,
+        retry_backoff_at REAL,
+        UNIQUE(repo_name, issue_number)
+    )
+"""
+
+_MAX_FIX_ROUNDS_AND_NO_ACCEPTANCE_COLUMNS = {"max_fix_rounds", "no_acceptance"}
+
+
+def _seed_pre_2604_database(db_path: Path) -> None:
+    """Write a real on-disk database at schema_version 2 — exactly what
+    every ``~/.coord/coord.db`` looked like right up to the #2675 incident,
+    including one pre-existing row (the shape that broke: a row that reads
+    back fine right up until a query names one of the two missing columns).
+    """
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    raw.execute("INSERT INTO schema_version VALUES (2)")
+    raw.execute(_PRE_2604_DRIVE_QUEUE_TABLE)
+    raw.execute(
+        "INSERT INTO drive_queue "
+        "(repo_name, issue_number, position, after_json, enqueued_at) "
+        "VALUES ('api', 7, 0, '[]', 100.0)"
+    )
+    raw.commit()
+    raw.close()
+
+
+class TestDriveQueueMaxFixRoundsAndNoAcceptanceColumns:
+    def test_existing_version_2_database_gains_them_on_open(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact #2675 repro. `coord drive-queue list`/`tick` SELECT
+        ``max_fix_rounds, no_acceptance`` unconditionally
+        (``coord/state.py``'s ``_DRIVE_QUEUE_COLUMNS``) — a database that
+        never gains these columns makes the whole queue unreadable and
+        undrivable, forever, on every existing installation.
+        """
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2604_database(db_path)
+
+        before = sqlite3.connect(str(db_path))
+        cols_before = {
+            r[1] for r in before.execute("PRAGMA table_info(drive_queue)")
+        }
+        before.close()
+        assert not (_MAX_FIX_ROUNDS_AND_NO_ACCEPTANCE_COLUMNS & cols_before)
+
+        conn = db_mod._open(db_path)
+        try:
+            cols_after = {
+                r[1] for r in conn.execute("PRAGMA table_info(drive_queue)")
+            }
+            assert _MAX_FIX_ROUNDS_AND_NO_ACCEPTANCE_COLUMNS <= cols_after
+
+            row = conn.execute(
+                "SELECT max_fix_rounds, no_acceptance FROM drive_queue "
+                "WHERE issue_number = 7"
+            ).fetchone()
+            # A row predating these columns reads as "no override" —
+            # max_fix_rounds NULL, no_acceptance 0 — never a silent
+            # behavior change for an entry that never asked for one.
+            assert row["max_fix_rounds"] is None
+            assert row["no_acceptance"] == 0
+
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            assert version == db_mod._DB_SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_migration_is_idempotent(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2604_database(db_path)
+
+        for _ in range(3):
+            conn = db_mod._open(db_path)
+            conn.close()
+
+        conn = db_mod._open(db_path)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(drive_queue)")}
+            assert _MAX_FIX_ROUNDS_AND_NO_ACCEPTANCE_COLUMNS <= cols
+        finally:
+            conn.close()
+
+    def test_state_accessors_read_the_upgraded_columns(
+        self, tmp_path: Path
+    ) -> None:
+        """``coord drive-queue add --max-fix-rounds/--no-acceptance`` and
+        ``list``/``tick`` go through ``coord.state``'s ``_local`` helpers —
+        confirm the upgraded columns are actually usable through that path,
+        not just present in ``PRAGMA table_info``.
+        """
+        from coord import state
+
+        db_path = tmp_path / "coord.db"
+        _seed_pre_2604_database(db_path)
+
+        conn = db_mod._open(db_path)
+        override_connection(conn)
+        try:
+            state._enqueue_drive_queue_local(
+                "api", 11, max_fix_rounds=5, no_acceptance=True
+            )
+            rows = state._list_drive_queue_local()
+        finally:
+            close()
+        entry = next(r for r in rows if r["issue_number"] == 11)
+        assert entry["max_fix_rounds"] == 5
+        assert entry["no_acceptance"] == 1
+
+
 # ── merge_queue.ci_infra_reruns column (#1892) ──────────────────────────────
 
 _PRE_1892_MERGE_QUEUE_TABLE = """

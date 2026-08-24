@@ -180,12 +180,21 @@ def retry_on_locked(
 
 # #2598: bumped from the original unversioned "1" written by every process
 # forever. Read by _read_schema_version()/_open() as the target a database
-# must reach before _open() can skip its write path entirely. Whoever adds
-# the NEXT one-shot migration (another _migrate_* or _backfill_* function
-# meant to run once per database, not once per process) must bump this too
-# — otherwise an already-caught-up database (version == _DB_SCHEMA_VERSION)
-# will never run it, because the whole write path is gated on this compare.
-_DB_SCHEMA_VERSION = 2
+# must reach before _open() can skip its write path entirely. Bump this for
+# ANY addition that a database already at the current version would
+# otherwise never receive — a new one-shot _migrate_*/_backfill_* function,
+# **or a new entry appended to the `_migrate_add_columns` list** (#2675:
+# #2604 and #2589 each appended an `ALTER TABLE ... ADD COLUMN` there
+# without bumping this, so every database already at version 2 read
+# `_read_schema_version(conn) < _DB_SCHEMA_VERSION` as False and skipped
+# `_ensure_schema` — and therefore `_migrate_add_columns` — entirely,
+# permanently missing both columns. `_migrate_add_columns` itself is safe to
+# call repeatedly (idempotent, swallows the "column already exists" error),
+# but that only matters if `_open()` actually calls it — an already-
+# caught-up database (version == _DB_SCHEMA_VERSION) never will, because the
+# whole write path is gated on this compare. There is no exemption: if you
+# touched `_migrate_add_columns`, bump this.
+_DB_SCHEMA_VERSION = 3
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -201,10 +210,12 @@ def _read_schema_version(conn: sqlite3.Connection) -> int:
     table (every row holds the same value, so MAX is that value — junk rows
     don't change the answer) or the post-#2598 constrained table (exactly
     one row). A pre-#2598 database therefore reads as version 1, which is
-    ``< _DB_SCHEMA_VERSION`` (2) — so it takes the write path exactly once
-    more, which is what collapses its schema_version duplicates and applies
-    the PRIMARY KEY (see _fix_schema_version_table). Every open after that
-    reads 2 and skips the write path entirely.
+    ``< _DB_SCHEMA_VERSION`` — so it takes the write path exactly once more,
+    which is what collapses its schema_version duplicates and applies the
+    PRIMARY KEY (see _fix_schema_version_table). Every open after that reads
+    the current ``_DB_SCHEMA_VERSION`` and skips the write path entirely —
+    until the next bump (#2675: that skip is exactly what silently dropped
+    two `_migrate_add_columns` entries when they landed without one).
     """
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
