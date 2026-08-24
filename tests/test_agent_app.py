@@ -775,21 +775,33 @@ def test_metrics_no_psutil(tmp_path):
 
 
 def test_systemctl_env_sets_xdg_runtime_dir_on_posix(monkeypatch):
-    import os
-
+    """#2729: this test fakes ``sys.platform`` to exercise the POSIX branch on
+    any host, including a real Windows CI runner — but faking the platform
+    doesn't fake away a genuinely missing stdlib attribute. ``os.getuid`` must
+    be stubbed too (not just relied on as the real function), or this crashes
+    with ``AttributeError`` on win32 despite the platform mock, since both the
+    production code *and* the assertion below would otherwise reach the real
+    (there: absent) ``os.getuid``."""
     from coord import agent_app
 
     monkeypatch.setattr(agent_app.sys, "platform", "linux")
+    monkeypatch.setattr(agent_app.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
 
     env = agent_app._systemctl_env()
-    assert env["XDG_RUNTIME_DIR"] == f"/run/user/{os.getuid()}"
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
 
 
 def test_systemctl_env_preserves_an_existing_xdg_runtime_dir(monkeypatch):
+    """#2729: ``dict.setdefault``'s default argument is evaluated eagerly
+    regardless of whether the key is already present, so
+    ``f"/run/user/{os.getuid()}"`` still gets built even though this test
+    expects it to be discarded — stub ``os.getuid`` for the same reason as
+    above rather than relying on the real (possibly absent) function."""
     from coord import agent_app
 
     monkeypatch.setattr(agent_app.sys, "platform", "linux")
+    monkeypatch.setattr(agent_app.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/custom")
 
     env = agent_app._systemctl_env()

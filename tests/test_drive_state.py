@@ -1311,14 +1311,24 @@ def test_project_test_mode_is_empty_when_the_issue_is_not_cached():
 
 
 def test_scratch_dir_keys_on_getuid_when_available(monkeypatch, tmp_path):
-    """Unchanged POSIX/macOS behaviour: the real uid, not a fallback."""
-    import os
+    """Unchanged POSIX/macOS behaviour: the real uid, not a fallback.
 
+    #2729: this used to call the real ``os.getuid()`` directly in the
+    assertion, with nothing stubbed. On real POSIX/macOS that happens to
+    equal what ``scratch_dir()`` itself resolves to, but on a genuine
+    Windows host ``os.getuid`` doesn't exist as an attribute at all -- so
+    the assertion crashed with ``AttributeError`` before it could even
+    compare anything, independent of ``scratch_dir()``'s own (already
+    Windows-safe) fallback logic. Stubbing ``os.getuid`` to a fixed value
+    makes the test exercise the "getuid available" branch deterministically
+    on every host, including one where the real attribute is absent.
+    """
     from coord import drive_state
 
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(drive_state.os, "getuid", lambda: 1000, raising=False)
     d = drive_state.scratch_dir()
-    assert d == tmp_path / f"coord-drive-issue-{os.getuid()}"
+    assert d == tmp_path / "coord-drive-issue-1000"
     assert d.is_dir()
 
 

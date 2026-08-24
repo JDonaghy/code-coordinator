@@ -215,10 +215,21 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 def _systemctl_env() -> dict[str, str]:
+    """``os.environ`` overlaid with a best-effort ``XDG_RUNTIME_DIR`` default
+    for the ``systemctl --user`` calls this module makes.
+
+    ``os.getuid()`` is POSIX-only -- unguarded, this raised ``AttributeError``
+    on win32 even though ``SYSTEMCTL`` is already ``None`` there in real
+    production runs (there is no ``systemctl`` to resolve), because tests
+    patch ``SYSTEMCTL`` directly to exercise the subprocess-calling paths on
+    every platform (#2729, same shape as coord/agent_app.py's #2681 fix). The
+    default is simply skipped on win32 rather than invented.
+    """
     env = dict(os.environ)
     # A bare `systemctl --user` silently no-ops without this over ssh/cron/
     # systemd-timer contexts (#2561's PATH lesson, same shape for XDG).
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if sys.platform != "win32":
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     return env
 
 
