@@ -47,11 +47,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use quadraui::primitives::split_tree::SplitDirection;
-use quadraui::SplitTree;
+use quadraui::{PaletteItem, SplitTree, StyledSpan, StyledText};
 use serde::{Deserialize, Serialize};
 
 use crate::app::drive_queue::repo_alias;
-use crate::app::format::trunc;
+use crate::app::format::{fuzzy_score, trunc};
 use crate::app::types::{BoardData, BoardDetailTab, PipelineDetailTab};
 
 /// Which panel's document set a tab belongs to.
@@ -1560,13 +1560,22 @@ pub(crate) fn doc_tab_close_col(label: &str) -> Option<usize> {
 }
 
 /// Which part of a tab a resolved click landed on — contract §4's
-/// "clicking a tab's `×` closes it; clicking its body activates it".
+/// "clicking a tab's `×` closes it; clicking its body activates it", plus
+/// §4 (#2642)'s "clicking a baked `‹`/`›` overflow marker opens the
+/// open-tabs picker instead of activating the tab it's painted into".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabClickKind {
     /// Click landed on the tab's `×` close glyph. Index is into the strip.
     Close(usize),
     /// Click landed anywhere else on the tab. Index is into the strip.
     Body(usize),
+    /// Click landed on a `‹`/`›` overflow marker (#2283) baked into the
+    /// boundary tab's label by [`crate::app::CoordApp::board_doc_tab_strip`]
+    /// / `pipeline_doc_tab_strip`. Index is the strip index of the tab the
+    /// marker is baked into — irrelevant to callers, which route this
+    /// straight to opening the #2642 quick-pick regardless of which tab it
+    /// landed on.
+    Overflow(usize),
 }
 
 /// Resolve a click at `click_x` (same coordinate space as `origin_x`)
@@ -1591,10 +1600,28 @@ pub(crate) fn resolve_doc_tab_click(
 ) -> Option<TabClickKind> {
     let mut cursor = origin_x;
     for (i, label) in labels.iter().enumerate().skip(scroll_offset) {
-        let width = label.chars().count() as f32;
+        let chars: Vec<char> = label.chars().collect();
+        let width = chars.len() as f32;
         let end = cursor + width;
         if click_x >= cursor && click_x < end {
             let offset_in_tab = (click_x - cursor).floor() as usize;
+            // #2642: a `‹`/`›` overflow marker is baked into column 0 or the
+            // very last column of the boundary tab's label
+            // (`bake_doc_tab_overflow_markers`, render.rs) — check those two
+            // fixed positions before falling through to close/body so a
+            // click there routes to the picker instead of activating (or, for
+            // `‹`, closing — column 0 never carries the close glyph, but the
+            // check still has to win the race) the tab it happens to be
+            // painted into.
+            if offset_in_tab == 0 && chars.first() == Some(&SCROLL_LEFT_MARKER) {
+                return Some(TabClickKind::Overflow(i));
+            }
+            if !chars.is_empty()
+                && offset_in_tab == chars.len() - 1
+                && chars.last() == Some(&SCROLL_RIGHT_MARKER)
+            {
+                return Some(TabClickKind::Overflow(i));
+            }
             return Some(match doc_tab_close_col(label) {
                 Some(close_col) if close_col == offset_in_tab => TabClickKind::Close(i),
                 _ => TabClickKind::Body(i),
@@ -1603,6 +1630,100 @@ pub(crate) fn resolve_doc_tab_click(
         cursor = end;
     }
     None
+}
+
+// ── #2642 (ms-65 §… quick-pick): Ctrl+E open-tabs picker ─────────────────
+
+/// One row of the Ctrl+E open-tabs picker — everything needed to render a
+/// [`PaletteItem`] and, on activation, resolve back to a strip index for
+/// `CoordApp::activate_board_doc_tab` / `activate_pipeline_doc_tab` (the
+/// same entry points a click on the strip already uses, so preview/pin
+/// semantics and the #2288 pane routing can't drift).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocTabPickerRow {
+    /// Index into the strip this row was built from — NOT the index into
+    /// whatever filtered subset a picker is currently showing.
+    pub(crate) strip_idx: usize,
+    pub(crate) repo: String,
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) is_active: bool,
+    pub(crate) is_preview: bool,
+}
+
+/// Contract: "the repo alias when the open set spans more than one repo" —
+/// the exact same rule [`doc_tab_label`]'s callers apply to the strip
+/// itself (`board_doc_tab_bar_for_pane` / `pipeline_doc_tab_bar`,
+/// render.rs), so the picker's rows and the strip's tabs never disagree on
+/// when a repo prefix is warranted.
+pub(crate) fn doc_tab_picker_show_repo(rows: &[DocTabPickerRow]) -> bool {
+    rows.first()
+        .map(|first| rows.iter().any(|r| r.repo != first.repo))
+        .unwrap_or(false)
+}
+
+/// Filter `rows` by `query` — contract: "Filtering matches on number and
+/// title." Empty query returns every row, in strip order (the "unfiltered
+/// initial list" convention every other picker in this file follows). A
+/// non-empty query fuzzy-matches (same [`fuzzy_score`] the global issue
+/// finder uses) against `"#<number> <title>"`, best score first, ties
+/// broken by strip order so the result stays stable as the user keeps
+/// typing.
+pub(crate) fn filter_doc_tab_picker_rows(
+    rows: Vec<DocTabPickerRow>,
+    query: &str,
+) -> Vec<DocTabPickerRow> {
+    if query.is_empty() {
+        return rows;
+    }
+    let mut scored: Vec<(u32, DocTabPickerRow)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let haystack = format!("#{} {}", row.number, row.title);
+            let (score, _) = fuzzy_score(query, &haystack)?;
+            Some((score, row))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.strip_idx.cmp(&b.1.strip_idx)));
+    scored.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Render `rows` as `PaletteItem`s — contract: "Rows list the open tabs in
+/// strip order: issue number, title, and the repo alias when the open set
+/// spans more than one repo... Mark the active tab, and the preview tab the
+/// way the strip does." Mirrors [`doc_tab_label`]'s `∘ ` preview marker and
+/// `[...]` active brackets rather than re-deriving a second presentation
+/// for the same two facts.
+pub(crate) fn doc_tab_picker_items(rows: &[DocTabPickerRow], show_repo: bool) -> Vec<PaletteItem> {
+    rows.iter()
+        .map(|row| {
+            let mut inner = String::new();
+            if row.is_preview {
+                inner.push_str(PREVIEW_MARKER);
+            }
+            if show_repo {
+                let basename = row.repo.rsplit('/').next().unwrap_or(&row.repo);
+                inner.push_str(&repo_alias(basename));
+            }
+            inner.push_str(&format!("#{} {}", row.number, row.title));
+            let text = if row.is_active {
+                format!("[{inner}]")
+            } else {
+                inner
+            };
+            PaletteItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::plain(text)],
+                },
+                detail: None,
+                icon: None,
+                match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1953,6 +2074,45 @@ mod tests {
         // A click before origin_x (where the hidden tab would have been)
         // never resolves to the hidden tab.
         assert_eq!(resolve_doc_tab_click(&labels, 10.0, 8.0, 1), None);
+    }
+
+    #[test]
+    fn resolve_doc_tab_click_routes_overflow_markers_to_picker() {
+        // #2642: a left marker baked into column 0 of the FIRST visible
+        // tab's label, and a right marker baked into the LAST column of
+        // the LAST visible tab's label — exactly what
+        // `bake_doc_tab_overflow_markers` (render.rs) produces.
+        let labels = [format!("{SCROLL_LEFT_MARKER}ab×d"), format!("ef×h{SCROLL_RIGHT_MARKER}")];
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        // Column 0 of the first tab: the `‹` marker, not its body.
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 10.5, 0),
+            Some(TabClickKind::Overflow(0))
+        );
+        // Body / close columns of the SAME (marker-carrying) label are
+        // unaffected — everything just shifts one column right.
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 11.5, 0),
+            Some(TabClickKind::Body(0))
+        );
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 13.5, 0),
+            Some(TabClickKind::Close(0))
+        );
+        // The last column of the second tab: the `›` marker.
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 19.5, 0),
+            Some(TabClickKind::Overflow(1))
+        );
+        // Body / close columns of that label are unaffected.
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 15.5, 0),
+            Some(TabClickKind::Body(1))
+        );
+        assert_eq!(
+            resolve_doc_tab_click(&refs, 10.0, 17.5, 0),
+            Some(TabClickKind::Close(1))
+        );
     }
 
     // ── per-document sub-state: contract §5 (#2285) ──────────────────────

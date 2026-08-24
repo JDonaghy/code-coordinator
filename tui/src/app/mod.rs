@@ -165,9 +165,9 @@ pub(crate) mod approved;
 pub(crate) mod doc_tabs;
 #[allow(unused_imports)]
 use self::doc_tabs::{
-    doc_tab_label, resolve_doc_tab_click, DetailSubState, DocKey, DocTabs, PanelScope,
-    TabClickKind, DOC_TAB_LABEL_COLS, PANE_DIVIDER_CHAR, SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
-    SPLIT_DOC_TAB_LABEL_COLS,
+    doc_tab_label, resolve_doc_tab_click, DetailSubState, DocKey, DocTabPickerRow, DocTabs,
+    PanelScope, TabClickKind, DOC_TAB_LABEL_COLS, PANE_DIVIDER_CHAR, SCROLL_LEFT_MARKER,
+    SCROLL_RIGHT_MARKER, SPLIT_DOC_TAB_LABEL_COLS,
 };
 #[allow(unused_imports)]
 use self::types::*;
@@ -353,6 +353,28 @@ impl SidebarFilter {
             has_focus: self.focused,
         }
     }
+}
+
+// ─── #2642: Ctrl+E doc-tab open-tabs picker ────────────────────────────────────
+
+/// State for the Ctrl+E "open tabs" quick-pick — composes quadraui's
+/// `Palette` primitive (via `DualModePaletteController`, the same wrapper
+/// `command_palette` already drives, see `plans.rs`) rather than a
+/// hand-rolled overlay like [`IssueFinder`] above.
+///
+/// Supersedes the dead `‹`/`›` overflow markers baked into the Board/
+/// Pipeline doc-tab strip as the way to reach a tab scrolled out of view.
+struct DocTabPickerState {
+    /// Which panel's tab set this picker is listing — Board or Pipeline.
+    scope: PanelScope,
+    /// Board only: the pane the picker was opened from
+    /// (`board_render_pane()` at open time). Pinned rather than re-read
+    /// live: nothing can move focus while this modal owns all input, so it
+    /// never goes stale, and pinning it is what lets every row-activating
+    /// callback act on the SAME pane the rows were built from. Meaningless
+    /// for Pipeline (`PaneSet` never splits there) — always `0`.
+    pane: usize,
+    palette: DualModePaletteController,
 }
 
 // ─── Issue fuzzy finder ───────────────────────────────────────────────────────
@@ -3668,6 +3690,12 @@ pub struct CoordApp {
     /// with Esc or Enter (Enter also navigates to the selected issue).
     issue_finder: Option<IssueFinder>,
 
+    // ── #2642: Ctrl+E doc-tab open-tabs picker ────────────────────────────
+    /// Active state of the doc-tab quick-pick. `None` when closed. Opened
+    /// with Ctrl+E from the Board or Pipeline view; closed with Esc or Enter
+    /// (Enter also activates the selected tab).
+    doc_tab_picker: Option<DocTabPickerState>,
+
     // ── #217 Theming ─────────────────────────────────────────────────────────
     /// Resolved colour palette, derived from `settings.theme` (and an optional
     /// `~/.coord/theme.toml` override file) at startup and after each settings
@@ -4123,6 +4151,8 @@ impl CoordApp {
             rework_bypass: false,
             // #541: global issue fuzzy finder — closed by default.
             issue_finder: None,
+            // #2642: doc-tab picker — closed by default.
+            doc_tab_picker: None,
             // Leg 3c / A3 (#517, #581): test-verdict routing.
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
@@ -7207,6 +7237,144 @@ impl CoordApp {
         self.checkpoint_all_detail_sub_state();
         if let Err(e) = self.doc_tabs.save() {
             eprintln!("coord-tui: failed to persist doc tabs: {e}");
+        }
+    }
+
+    // ── #2642 (ms-65 §…): Ctrl+E open-tabs picker ─────────────────────────
+
+    /// Open-tab rows for `scope`'s picker, in strip order — `pane` selects
+    /// which Board pane (ignored for Pipeline, which never splits). Same
+    /// title lookups `board_doc_tab_bar_for_pane` / `pipeline_doc_tab_bar`
+    /// (render.rs) use, so a row here always matches what the strip itself
+    /// would paint.
+    fn doc_tab_picker_rows(&self, scope: PanelScope, pane: usize) -> Vec<DocTabPickerRow> {
+        match scope {
+            PanelScope::Board => {
+                let group = self.doc_tabs.panes(PanelScope::Board).pane(pane);
+                group
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (repo, number))| DocTabPickerRow {
+                        strip_idx: idx,
+                        repo: repo.clone(),
+                        number: *number,
+                        title: self
+                            .board_issue_group_for(repo, *number)
+                            .map(|g| g.issue_title.clone())
+                            .unwrap_or_default(),
+                        is_active: group.active_index() == Some(idx),
+                        is_preview: group.is_preview(idx),
+                    })
+                    .collect()
+            }
+            PanelScope::Pipeline => {
+                let group = self.pipeline_doc_tabs();
+                group
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (repo, number))| DocTabPickerRow {
+                        strip_idx: idx,
+                        repo: repo.clone(),
+                        number: *number,
+                        title: self
+                            .pipeline_issue_for(repo, *number)
+                            .map(|pi| pi.title.clone())
+                            .unwrap_or_default(),
+                        is_active: group.active_index() == Some(idx),
+                        is_preview: group.is_preview(idx),
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// `scope`/`pane`'s picker rows, filtered by `query` and rendered as
+    /// `PaletteItem`s — the source both [`Self::open_doc_tab_picker`] (empty
+    /// query) and the `QueryChanged` re-filter in `events.rs` call.
+    fn doc_tab_picker_items_for(
+        &self,
+        scope: PanelScope,
+        pane: usize,
+        query: &str,
+    ) -> Vec<quadraui::PaletteItem> {
+        let rows = self.doc_tab_picker_rows(scope, pane);
+        let show_repo = doc_tabs::doc_tab_picker_show_repo(&rows);
+        let filtered = doc_tabs::filter_doc_tab_picker_rows(rows, query);
+        doc_tabs::doc_tab_picker_items(&filtered, show_repo)
+    }
+
+    /// Popup geometry for the picker — the same centered-inset formula as
+    /// `plans.rs`'s `help_overlay_rect` (no separate label row needed here,
+    /// unlike `command_palette_popup_rect`: the picker's title lives in the
+    /// `Palette` primitive's own `title` field). Reimplemented rather than
+    /// shared because `help_overlay_rect` is private to the `plans` module
+    /// and this picker isn't Plans-scoped.
+    pub(crate) fn doc_tab_picker_popup_rect(main: Rect) -> Rect {
+        let w = (main.width - 4.0).max(20.0).min(main.width);
+        let h = (main.height - 2.0).max(10.0).min(main.height);
+        let x = main.x + (main.width - w) * 0.5;
+        let y = main.y + (main.height - h) * 0.5;
+        Rect::new(x, y, w, h)
+    }
+
+    /// Paint the picker — a no-op when closed.
+    pub(crate) fn render_doc_tab_picker(&self, backend: &mut dyn Backend, main: Rect) {
+        let Some(picker) = &self.doc_tab_picker else {
+            return;
+        };
+        let popup = Self::doc_tab_picker_popup_rect(main);
+        picker.palette.render(popup, backend);
+    }
+
+    /// Open the picker for `scope` (contract: `Ctrl+E`). No-op — and no
+    /// picker opens — when that panel currently has zero doc tabs open,
+    /// mirroring `open_command_palette`'s "nothing registered" no-op.
+    fn open_doc_tab_picker(&mut self, scope: PanelScope) {
+        let pane = match scope {
+            PanelScope::Board => self.board_render_pane(),
+            PanelScope::Pipeline => 0,
+        };
+        let items = self.doc_tab_picker_items_for(scope, pane, "");
+        if items.is_empty() {
+            return;
+        }
+        self.doc_tab_picker = Some(DocTabPickerState {
+            scope,
+            pane,
+            palette: DualModePaletteController::new("Open tabs", None, items)
+                .with_id("doc-tab-picker"),
+        });
+    }
+
+    /// Confirm the picker's `idx`-th CURRENTLY FILTERED row (i.e. the same
+    /// `query` the palette was last filtered against — mirrors
+    /// `activate_command_palette_action`'s own re-derive-from-query
+    /// pattern) — activates the corresponding tab via the exact entry point
+    /// ([`Self::activate_board_doc_tab`] / [`Self::activate_pipeline_doc_tab`])
+    /// a click on the strip itself already uses, so preview/pin semantics
+    /// and the #2288 pane routing can't drift. A stale/out-of-range `idx`
+    /// (nothing else can move the query while the picker owns all input, so
+    /// this should never actually happen) is a silent no-op.
+    fn confirm_doc_tab_picker(
+        &mut self,
+        scope: PanelScope,
+        pane: usize,
+        idx: usize,
+        query: &str,
+    ) -> bool {
+        let rows = doc_tabs::filter_doc_tab_picker_rows(
+            self.doc_tab_picker_rows(scope, pane),
+            query,
+        );
+        let Some(row) = rows.get(idx) else {
+            return false;
+        };
+        let strip_idx = row.strip_idx;
+        match scope {
+            PanelScope::Board => self.activate_board_doc_tab(strip_idx),
+            PanelScope::Pipeline => self.activate_pipeline_doc_tab(strip_idx),
         }
     }
 

@@ -676,6 +676,11 @@ impl ShellApp for CoordApp {
         // above — a global overlay, not scoped to any one view's main
         // content. No-op when closed.
         self.render_fleet_health_overlay(backend, layout.main_content_bounds);
+
+        // ── #2642: Ctrl+E doc-tab picker (topmost) ───────────────────────
+        // Same z-order reasoning as the issue finder / command palette
+        // above. No-op when closed.
+        self.render_doc_tab_picker(backend, layout.main_content_bounds);
     }
 
     fn handle(

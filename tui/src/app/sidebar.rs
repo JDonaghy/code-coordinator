@@ -245,6 +245,9 @@ impl CoordApp {
             // ALL input while open, same posture as the drive-queue one
             // just above.
             || self.pending_gate_a_changes_note.is_some()
+            // #2642: the Ctrl+E doc-tab picker owns ALL input while open —
+            // same posture as the command palette above.
+            || self.doc_tab_picker.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
