@@ -726,8 +726,9 @@ class QueueEntry:
     def from_row(cls, row: Mapping[str, Any]) -> "QueueEntry":
         """Type one raw queue row.
 
-        ``after_json`` arrives as a real list over the wire (DQ-1 put it in
-        ``coord.dao._JSON_COLUMNS``) but as a JSON *string* when a caller
+        ``after_json`` arrives as a real list over the wire (it is typed
+        ``list[str]`` on ``coord.board_schema.BoardDriveQueueEntry``) but as
+        a JSON *string* when a caller
         reads the table directly, so both are accepted; anything unparseable
         degrades to ``()`` rather than blowing up the whole tick.
         """

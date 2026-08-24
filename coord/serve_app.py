@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import sqlite3
 import sys
 import threading
 from dataclasses import asdict, dataclass, fields
@@ -61,12 +60,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from coord import __version__
+from coord import __version__, board_schema
 from coord.config import Config
 from coord.config_reload import reload_config_if_stale
-from coord.dao import _DROP_COLUMNS, _JSON_COLUMNS, SCHEMA_VERSION, CoordStore
-from coord.db import _ensure_schema
-from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes, sqlite_table_schema
+from coord.dao import SCHEMA_VERSION, CoordStore
+from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 
 # Default port for the coordination daemon (agent=7433, dashboard=7434).
 SERVE_PORT = 7435
@@ -1841,36 +1839,22 @@ def _milestone_progress_tick(config: Config) -> list[str]:
 
 
 def _board_response_schema(components: dict) -> dict:
-    """#757: the `GET /board` response schema, built straight from the live
-    (migrated) SQLite DDL — not a dataclass. Per
-    ``scripts/gen_board_fixture.py``: "the wire schema *is* the SQLite DDL",
-    so this introspects the exact same schema + JSON/dropped-column tables
-    (``coord.dao._JSON_COLUMNS`` / ``_DROP_COLUMNS``) that
-    ``SqliteStore.board_projection()`` uses, rather than hand-duplicating the
-    column list here where it could drift.
+    """#757/#1849: the `GET /board` response schema, built from the explicit
+    wire DTOs in ``coord/board_schema.py``.
+
+    Until #1849 this ``PRAGMA``-introspected a freshly-migrated in-memory
+    SQLite DB, so the published contract *was* the DDL and every
+    ``coord/db.py`` migration was a silent wire change with three clients
+    downstream of it (the Rust TUI, the webapp, ``coord/client.py``). The same
+    dataclasses now drive both the schema published here and the projection
+    ``SqliteStore.board_projection()`` builds (via ``coord.dao._decode_row``),
+    so the two cannot drift and neither depends on the storage engine's type
+    system.
     """
     from coord.merge_queue import PlannedMerge, StagingItem  # noqa: PLC0415
 
-    conn = sqlite3.connect(":memory:")
-    try:
-        _ensure_schema(conn)
-        for table, key in (
-            ("assignments", "BoardAssignment"),
-            ("machines", "BoardMachine"),
-            ("merge_queue", "BoardMergeQueueEntry"),
-            ("proposals", "BoardProposal"),
-            ("issues", "BoardIssue"),
-            ("drive_escalations", "BoardDriveEscalation"),
-            ("drive_queue", "BoardDriveQueueEntry"),
-        ):
-            components[key] = sqlite_table_schema(
-                conn,
-                table,
-                drop=frozenset(_DROP_COLUMNS.get(table, ())),
-                json_columns=frozenset(_JSON_COLUMNS.get(table, ())),
-            )
-    finally:
-        conn.close()
+    for cls in board_schema.BOARD_PROJECTIONS.values():
+        dataclass_schema(cls, components)
 
     planned_merge_ref = dataclass_schema(PlannedMerge, components)
     staging_item_ref = dataclass_schema(StagingItem, components)

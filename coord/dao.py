@@ -33,6 +33,13 @@ All SQLite idioms (``sqlite3.Row``, JSON-encoded TEXT columns, the ``mode=ro``
 URI) are encapsulated here: read methods return plain Python dicts with JSON
 columns decoded to native lists/objects, so neither the wire format nor a future
 non-SQLite backend inherits any SQLite-only idiom.
+
+#1849: the *shape* of those dicts is no longer this module's business either.
+The seven board projections are defined by the dataclasses in
+``coord/board_schema.py``, and :func:`_decode_row` projects each row through
+its DTO — so the ``GET /board`` wire contract is a property of the declared
+schema rather than of whichever storage engine (and whichever migration state)
+happens to be underneath.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from coord import board_schema
 from coord.db import DB_PATH
 
 # Bump when the /board payload shape changes incompatibly.  Clients may branch
@@ -87,39 +95,16 @@ def _board_retention_cutoff(now: float | None = None) -> float | None:
         return None
     return (time.time() if now is None else now) - days * 86400.0
 
-# JSON-encoded columns per table — decoded to native objects on read so no
-# SQLite idiom (JSON-in-TEXT) leaks past the DAO.  Columns added by later ALTER
-# migrations are picked up automatically via ``SELECT *``; only JSON ones need
-# listing here.
-_JSON_COLUMNS: dict[str, set[str]] = {
-    "assignments": {
-        "files_allowed",
-        "files_forbidden",
-        "required_gates",
-        "plan",
-        "smoke_tests",
-        "test_plan",
-        # NOTE: review_findings is deliberately NOT decoded — the coord-tui
-        # client consumes it as a raw JSON string (Option<String>), so it must
-        # stay a string on the wire.
-    },
-    "proposals": {"files_likely", "required_gates"},
-    "merge_queue": {"required_gates"},
-    "issues": {"labels"},
-    "machines": {"capabilities", "repos"},
-    # #1753: the drive queue's pre-req list — ["repo#N", ...] on the wire, a
-    # JSON string in SQLite.
-    "drive_queue": {"after_json"},
-}
 
-# Columns omitted from the board projection.  ``assignments.briefing`` is ~8 MB
-# of an ~12 MB live payload and is NOT part of the board view (the TUI's board
-# query never selects it; the Python mapper defaults it to ""), so dropping it
-# keeps refreshes fast over Tailscale.  A per-assignment endpoint can serve full
-# briefings later if a detail view needs them.
-_DROP_COLUMNS: dict[str, set[str]] = {
-    "assignments": {"briefing"},
-}
+# #1849: the wire shape of the seven board projections is defined by the
+# dataclasses in ``coord/board_schema.py``, NOT by whatever columns
+# ``SELECT *`` happens to return.  The hand-curated ``_JSON_COLUMNS`` /
+# ``_DROP_COLUMNS`` tables that used to live here (patches over the leak) are
+# gone: a JSON-encoded TEXT column is now a field typed ``list[str]``/``dict``
+# on its DTO, and a column the board must not carry (e.g.
+# ``assignments.briefing``, ~8 MB of an ~12 MB live payload) is simply absent
+# from the DTO.  ``review_findings`` stays a plain ``str`` field on purpose —
+# the coord-tui client consumes it as a raw JSON string (``Option<String>``).
 
 
 @runtime_checkable
@@ -241,25 +226,21 @@ _KEEP_INDEX_COLUMNS = (
 
 
 def _decode_row(table: str, row: sqlite3.Row, *, full: bool = False) -> dict:
-    """sqlite3.Row → plain dict with that table's JSON columns decoded.
+    """sqlite3.Row → the plain dict the wire carries.
 
-    ``full=True`` keeps the :data:`_DROP_COLUMNS` fields (e.g.
-    ``assignments.briefing``) — used by the single-resource *detail* reads
-    (#1336/#1337), which serve the complete row; the collection projection
-    stays slim.
+    #1849: for the seven board tables this projects the row through that
+    table's DTO in ``coord/board_schema.py`` — only declared fields survive,
+    in declared order, with JSON-encoded TEXT columns decoded — so a later
+    ``ALTER TABLE ... ADD COLUMN`` cannot silently widen ``/board``.  A table
+    with no DTO (e.g. ``notifications``) is passed through unchanged, exactly
+    as before.
+
+    ``full=True`` keeps every column (including ones the board projection
+    omits, e.g. ``assignments.briefing``) and applies only the JSON decoding —
+    used by the single-resource *detail* reads (#1336/#1337), which serve the
+    complete row; the collection projection stays slim.
     """
-    d = dict(row)
-    if not full:
-        for col in _DROP_COLUMNS.get(table, ()):
-            d.pop(col, None)
-    for col in _JSON_COLUMNS.get(table, ()):
-        val = d.get(col)
-        if isinstance(val, (str, bytes, bytearray)):
-            try:
-                d[col] = json.loads(val) if val else None
-            except (json.JSONDecodeError, TypeError):
-                d[col] = None
-    return d
+    return board_schema.decode_row(table, row, full=full)
 
 
 class SqliteStore:

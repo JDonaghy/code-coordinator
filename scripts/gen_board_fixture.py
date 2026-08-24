@@ -1,11 +1,11 @@
 """Generate the golden `/board` fixture used by both sides of the wire seam (#748).
 
-The `/board` payload is `SELECT * FROM <table>` shipped as raw SQLite rows
-(`coord/dao.py`).  The wire schema *is* the SQLite DDL (`coord/db.py`), and the
-Rust structs (`tui/src/app/types.rs`) are hand-typed mirrors of DB columns.  A
-single type mismatch (the classic case: a SQLite `INTEGER` boolean vs a Rust
-`bool`) fails the **entire** `BoardPayload` parse and blanks the board
-(#632/#546/#628).
+The `/board` payload is each board table projected through its explicit wire
+DTO in `coord/board_schema.py` (#1849 — before that the wire schema literally
+*was* the SQLite DDL).  The Rust structs (`tui/src/app/types.rs`) are
+hand-typed mirrors of those DTOs.  A single type mismatch (the classic case: a
+SQLite `INTEGER` boolean vs a Rust `bool`) fails the **entire** `BoardPayload`
+parse and blanks the board (#632/#546/#628).
 
 This script builds a representative, freshly-migrated coord.db (headless +
 interactive assignments, a review, a merge-queue row, a proposal, an open
@@ -21,8 +21,9 @@ That committed fixture is read by BOTH sides of the seam:
   identical to what this generator produces *right now*, so the fixture can
   never silently drift from the schema that created it.
 
-Regenerate after any `coord/db.py` schema change that should be reflected in
-the golden fixture:
+Regenerate after any `coord/board_schema.py` change that should be reflected
+in the golden fixture (a `coord/db.py` migration on its own no longer moves
+the wire — see tests/test_board_schema.py):
 
     .venv/bin/python scripts/gen_board_fixture.py
 """
@@ -146,8 +147,9 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     # populated one (pinned machine, a decoded `after_json` LIST, non-zero
     # attempts/deferrals, a `last_reason` string, a REAL `launched_at`).
     # The `after_json` column in particular is the trap this guards: it is a
-    # JSON *string* in SQLite and a decoded array on the wire (see
-    # `coord.dao._JSON_COLUMNS`), so a Rust field typed `Vec<String>` without
+    # JSON *string* in SQLite and a decoded array on the wire (it is typed
+    # `list[str]` on `coord.board_schema.BoardDriveQueueEntry`), so a Rust
+    # field typed `Vec<String>` without
     # the `after_json` rename silently stays empty — and a field typed
     # `String` fails the whole BoardPayload parse and blanks every panel.
     conn.execute(

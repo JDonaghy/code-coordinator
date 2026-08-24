@@ -145,14 +145,14 @@ def test_serve_openapi_fully_specifies_board(tmp_path: Path) -> None:
     assignments_item = board_schema["properties"]["assignments"]["items"]
     assert assignments_item["$ref"] == "#/components/schemas/BoardAssignment"
     board_assignment = spec["components"]["schemas"]["BoardAssignment"]
-    # Real SQLite columns show up with real types, and the wire-dropped
-    # `briefing` column (coord.dao._DROP_COLUMNS) is absent.
+    # Declared DTO fields show up with real types, and `briefing` — absent
+    # from coord.board_schema.BoardAssignment — is off the wire.
     assert board_assignment["properties"]["assignment_id"] == {
         "type": "string", "nullable": True,
     }
     assert board_assignment["properties"]["issue_number"]["type"] == "integer"
     assert "briefing" not in board_assignment["properties"]
-    # A JSON-decoded column (coord.dao._JSON_COLUMNS) is typed as an array,
+    # A JSON-decoded column (typed `list[str]` on the DTO) is an array,
     # not a raw string.
     assert board_assignment["properties"]["files_allowed"]["type"] == "array"
 

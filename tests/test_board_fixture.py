@@ -1,10 +1,15 @@
 """#748: golden /board fixture freshness + the INTEGER-bool producer guard.
 
-Closes the #632 blank-board class: the wire schema *is* the SQLite DDL
-(coord/db.py) and the Rust structs (tui/src/app/types.rs) are hand-typed
-mirrors of DB columns. One unguarded type mismatch — classically a SQLite
-INTEGER boolean parsed into a strict Rust `bool` — fails the ENTIRE
-BoardPayload parse and blanks the whole TUI board.
+Closes the #632 blank-board class: the Rust structs (tui/src/app/types.rs)
+are hand-typed mirrors of the wire, and one unguarded type mismatch —
+classically a SQLite INTEGER boolean parsed into a strict Rust `bool` —
+fails the ENTIRE BoardPayload parse and blanks the whole TUI board.
+
+#1849 moved the wire contract itself off the DDL and into explicit DTOs
+(coord/board_schema.py); the DTO-side half of this guard — every
+INTEGER-backed boolean stays a JSON integer whatever the storage engine
+does — lives in tests/test_board_schema.py. This file keeps the
+consumer-side half, against the real types.rs.
 
 This file is the Python half of a same-fixture, both-sides-of-the-wire
 check:
