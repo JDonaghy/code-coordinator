@@ -21,6 +21,11 @@ from coord import client as coord_client
 from coord import machine_pause
 from coord.cli import main
 
+# Captured at import time, before the `_no_real_pause_store` autouse conftest
+# fixture (per-test) monkeypatches `machine_pause._state_path` to a sandboxed
+# redirect -- this reference always names the real, unpatched implementation.
+_real_state_path = machine_pause._state_path
+
 
 @pytest.fixture
 def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -29,6 +34,28 @@ def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     coord_dir = tmp_path / ".coord"
     coord_dir.mkdir()
     return tmp_path
+
+
+def test_state_path_windows_routes_through_platform_state_root(monkeypatch) -> None:
+    """#2683 (W3): this used to build ``Path(os.environ.get("HOME", "/tmp"))``
+    directly -- correct on POSIX, but Windows sets ``USERPROFILE``, not
+    reliably ``HOME``, so that silently fell back to ``/tmp``, which resolves
+    nowhere useful there. It must now resolve via
+    ``coord.platform_paths.default_coord_dir()`` (which uses ``platformdirs``
+    on win32) exactly like every other on-disk state root in this package.
+    """
+    import sys
+
+    import platformdirs
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setattr(
+        platformdirs,
+        "user_data_dir",
+        lambda appname, appauthor=None, **kwargs: r"C:\Users\bob\AppData\Local\coord",
+    )
+    assert _real_state_path() == Path(r"C:\Users\bob\AppData\Local\coord") / "paused_machines.json"
 
 
 def test_pause_accepts_config_option(tmp_home: Path, tmp_path: Path) -> None:

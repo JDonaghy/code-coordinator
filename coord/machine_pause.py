@@ -138,6 +138,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from coord.platform_paths import default_coord_dir
+
 if TYPE_CHECKING:
     from coord.models import Machine, QuietHours
 
@@ -154,11 +156,22 @@ _STATE_FILENAME = "paused_machines.json"
 def _state_path() -> Path:
     """Return the absolute path to the pause-state file.
 
-    Lives under ``$HOME/.coord/`` so it sits alongside the rest of the
-    runtime state (`assignments.db`, `agent_state.json`, etc.).
+    Lives alongside the rest of the runtime state (`assignments.db`,
+    `agent_state.json`, etc.) under the coordinator's platform-appropriate
+    state root.
+
+    #2683 (W3): this used to build ``Path(os.environ.get("HOME", "/tmp"))``
+    directly -- correct on POSIX, but Windows sets ``USERPROFILE``, not
+    reliably ``HOME``, so a bare-``HOME`` read silently fell back to
+    ``"/tmp"``, which resolves nowhere useful there. `default_coord_dir()`
+    is the one seam every other on-disk state root in this package already
+    derives from (`coord.db.COORD_DIR`, `coord.state.COORD_DIR`,
+    `coord.config.USER_CONFIG_PATH`) -- it resolves via `Path.home()`
+    (which honours `USERPROFILE` on Windows, `HOME` on POSIX) rather than a
+    raw environment-variable read, so there is no silent fallback to a path
+    that happens to exist but means nothing.
     """
-    home = Path(os.environ.get("HOME", "/tmp")).expanduser()
-    return home / ".coord" / _STATE_FILENAME
+    return default_coord_dir() / _STATE_FILENAME
 
 
 def paused_set(

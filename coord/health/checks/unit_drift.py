@@ -99,6 +99,17 @@ _RELEASE_MARKERS = ("/.local/bin", "/.coord-venv/bin")
 
 _PATH_LINE_RE = re.compile(r"^Environment\s*=\s*PATH=(.*)$", re.MULTILINE)
 
+# #2683 (W3): this is the delimiter of the PATH *value written inside a
+# systemd unit file*, not the delimiter of the current process's own PATH
+# env var. systemd only runs on Linux, so an `Environment=PATH=...` line is
+# unconditionally `:`-joined no matter what platform is running this health
+# check (e.g. a dev box auditing a fleet member's unit file, or this
+# module's own cross-platform test suite) -- `os.pathsep` would be wrong
+# here on Windows, where it resolves to `;` and would silently fail to
+# split content that is still colon-joined. Deliberately a named constant,
+# not `os.pathsep`, and not the bare literal the #2683 audit flagged.
+_SYSTEMD_PATH_SEP = ":"
+
 # #1928: a template placeholder, e.g. `<MACHINE_NAME>` or `<PORT>` — see
 # `deploy/coord-agent.service`. Uppercase-with-underscores by convention so
 # it can never collide with a real systemd directive or value.
@@ -437,7 +448,7 @@ def find_path_shadow(installed_text: str) -> str | None:
     matches = _PATH_LINE_RE.findall(installed_text)
     if not matches:
         return None
-    entries = [e for e in matches[-1].split(":") if e]
+    entries = [e for e in matches[-1].split(_SYSTEMD_PATH_SEP) if e]
 
     release_idx = None
     for idx, entry in enumerate(entries):
