@@ -50834,6 +50834,8 @@ Milestone tracking issue.
 
     /// The open set spanning more than one repo makes every label carry its
     /// repo prefix, so `#101` in one repo can't be read as `#101` in another.
+    /// #2641: the prefix is the Queue grid's two-letter alias joined
+    /// directly to `#N` (`CC#101`), not the full repo name with a space.
     #[test]
     fn board_doc_tab_labels_carry_the_repo_prefix_across_repos() {
         let mut app = doc_tab_app(DOC_TAB_TWO_REPO_JSON);
@@ -50841,7 +50843,7 @@ Milestone tracking issue.
         let single = app.board_doc_tab_labels();
         assert_eq!(single.len(), 1);
         assert!(
-            !single[0].contains("claude-coordinator"),
+            !single[0].contains("CC#"),
             "one repo open → bare labels, got {single:?}"
         );
 
@@ -50849,8 +50851,71 @@ Milestone tracking issue.
         let labels = app.board_doc_tab_labels();
         assert_eq!(labels.len(), 2);
         assert!(
-            labels.iter().all(|l| l.contains("claude-coordinator") || l.contains("coord-portal")),
-            "#2282: once the open set spans two repos every label carries its repo, got {labels:?}"
+            labels.iter().all(|l| l.contains("CC#101") || l.contains("CP#7")),
+            "#2641: once the open set spans two repos every label carries its alias joined to #N, got {labels:?}"
+        );
+        assert!(
+            labels.iter().all(|l| !l.contains("claude-coordinator") && !l.contains("coord-portal")),
+            "#2641: the full repo name must not leak through, got {labels:?}"
+        );
+    }
+
+    /// Pipeline counterpart of `board_doc_tab_labels_carry_the_repo_prefix_across_repos`,
+    /// with a wrinkle Board's fixture can't exercise: the Pipeline strip's
+    /// tab keys are `pipeline_repos` **slugs** (`JDonaghy/coord-web`), not
+    /// local repo names. #2641: aliasing a slug naively (without stripping
+    /// the `owner/` part first) would give `JCW`-ish garbage — this asserts
+    /// the rendered prefix is the clean `CW#26`, and that the raw slug never
+    /// reaches the screen.
+    #[test]
+    fn pipeline_doc_tab_strip_aliases_a_slug_spelled_repo() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 26,
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                repo_slug: "JDonaghy/coord-web".to_string(),
+                coord_repo: Some("coord-web".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+                body_truncated: false,
+                body_len: None,
+            },
+            PipelineIssue {
+                number: 200,
+                title: "Unrelated issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+                body_truncated: false,
+                body_len: None,
+            },
+        ];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Pipeline;
+
+        app.open_pipeline_doc_tab(("JDonaghy/coord-web".to_string(), 26), true);
+        app.open_pipeline_doc_tab(("acme/api".to_string(), 200), true);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CW#26"),
+            "#2641: the Pipeline tab strip must alias a slug-spelled repo \
+             (JDonaghy/coord-web → CW) joined directly to #26, got:\n{screen}"
+        );
+        assert!(
+            !screen.contains("JDonaghy/coord-web") && !screen.contains("JDonaghy"),
+            "#2641: the raw owner/repo slug must not leak into the tab strip:\n{screen}"
         );
     }
 
