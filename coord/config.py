@@ -1293,6 +1293,32 @@ class MergeConfig:
 
 
 @dataclass
+class PropagationConfig:
+    """``propagation:`` — the #2583 min-releases-behind auto-roll gate.
+
+    ``min_releases_behind`` holds `coord release propagate` and `coord
+    release nightly-window` as a REPORTED no-op (see each command's own
+    ``--min-behind`` flag, which overrides this per-invocation) until the
+    fleet has fallen at least this many releases behind PyPI's latest —
+    counted the same way ``coord health``'s ``agent_version`` check counts
+    it (:func:`coord.health.pypi.releases_behind`), never a second
+    version-comparison path.
+
+    Default **1**: any delta at all is enough, which is exactly today's
+    behaviour — an absent ``propagation:`` block (or an explicit
+    ``min_releases_behind: 1``) changes nothing. Raising it is opt-in, and
+    deliberately not done by flipping this default: see
+    ``docs/AGENT_OPERATIONS.md``'s "Auto-roll threshold gate" section for
+    why the *current* fleet must take one manual roll onto a fixed
+    propagation lane before this is ever set above 1 — the old, buggy lane
+    is what is running until that happens, and raising the threshold first
+    would aim it at the largest delta it has ever seen.
+    """
+
+    min_releases_behind: int = 1
+
+
+@dataclass
 class MilestoneConfig:
     """Milestone-driven-workflow configuration (#767 / #769 Phase 1).
 
@@ -2004,6 +2030,9 @@ class Config:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    # #2583 — absent block == min_releases_behind=1 == today's behaviour
+    # (any delta at all rolls, subject to quiescence/cordon as before).
+    propagation: PropagationConfig = field(default_factory=PropagationConfig)
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
@@ -2080,6 +2109,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     budget = _parse_budget(raw.get("budget"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
     merge = _parse_merge(raw.get("merge"))
+    propagation = _parse_propagation(raw.get("propagation"))
     milestone = _parse_milestone(raw.get("milestone"))
     audit = _parse_audit(raw.get("audit"))
     pricing = _parse_pricing(raw.get("pricing"))
@@ -2102,6 +2132,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         budget=budget,
         ci_store=ci_store,
         merge=merge,
+        propagation=propagation,
         milestone=milestone,
         providers=providers,
         audit=audit,
@@ -3511,6 +3542,38 @@ def _parse_merge(raw: Any) -> MergeConfig:
                 "merge.sibling_overlap_aging_hours must be a non-negative number"
             )
         cfg.sibling_overlap_aging_hours = float(value)
+    return cfg
+
+
+def _parse_propagation(raw: Any) -> PropagationConfig:
+    """Parse the optional ``propagation:`` block from coordinator.yml (#2583).
+
+    An absent block returns ``PropagationConfig()`` — ``min_releases_behind=1``
+    — preserving existing behaviour: `coord release propagate` and `coord
+    release nightly-window` act on any delta at all, exactly as before this
+    gate existed.
+    """
+    if raw is None:
+        return PropagationConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'propagation' must be a mapping")
+
+    known = {f.name for f in fields(PropagationConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"unknown propagation option(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(known))})"
+        )
+
+    cfg = PropagationConfig()
+    if "min_releases_behind" in raw:
+        value = raw["min_releases_behind"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(
+                "propagation.min_releases_behind must be an integer >= 1"
+            )
+        cfg.min_releases_behind = value
     return cfg
 
 

@@ -504,10 +504,19 @@ STATUS_ROLLED = "rolled"
 STATUS_VERIFIED = "verified"
 STATUS_ROLLED_BACK = "rolled-back"
 STATUS_FAILED = "failed"
+#: #2583: the fleet needs a roll (there is a delta) but that delta has not
+#: yet reached ``propagation.min_releases_behind``/``--min-behind`` — a
+#: REPORTED no-op, deliberately distinct from :data:`STATUS_DEFERRED` (which
+#: means "busy, would roll if it could"). A holding run cordons nothing and
+#: touches no host; see `coord/commands/release.py`'s gate for where this is
+#: decided.
+STATUS_HOLDING = "holding"
 
 #: Statuses that mean "this attempt changed nothing on any host". Used by the
 #: renderer to keep a long quiet night readable.
-NO_OP_STATUSES: frozenset[str] = frozenset({STATUS_DEFERRED, STATUS_UP_TO_DATE})
+NO_OP_STATUSES: frozenset[str] = frozenset(
+    {STATUS_DEFERRED, STATUS_UP_TO_DATE, STATUS_HOLDING}
+)
 
 #: Board assignment statuses that count as live work. Mirrors the set
 #: ``coord/agent_app.py``'s ``/update`` refuses on, deliberately: propagation
@@ -1205,6 +1214,14 @@ class PropagationRecord:
     cordons: dict = field(default_factory=dict)
     rolled_back: list[str] = field(default_factory=list)
     released_holds: list[str] = field(default_factory=list)
+    #: #2583: the min-releases-behind gate's own readings for this run —
+    #: ``min_releases_behind`` is whatever this run resolved (flag > config >
+    #: default 1), ``releases_behind`` is the delta it measured, ``None``
+    #: when the gate was never evaluated (``min_releases_behind <= 1``, the
+    #: default — no second PyPI read is spent on a threshold that would
+    #: never hold anything).
+    releases_behind: int | None = None
+    min_releases_behind: int | None = None
     finished_at: float | None = None
     error: str | None = None
     dry_run: bool = False
@@ -1214,7 +1231,9 @@ class PropagationRecord:
 
     @property
     def ok(self) -> bool:
-        return self.status in (STATUS_VERIFIED, STATUS_DEFERRED, STATUS_UP_TO_DATE)
+        return self.status in (
+            STATUS_VERIFIED, STATUS_DEFERRED, STATUS_UP_TO_DATE, STATUS_HOLDING,
+        )
 
 
 def journal_path(state_dir: Path) -> Path:
@@ -1326,6 +1345,7 @@ _STATUS_MARK = {
     STATUS_VERIFIED: "✓",
     STATUS_UP_TO_DATE: "=",
     STATUS_DEFERRED: "·",
+    STATUS_HOLDING: "⊖",
     STATUS_ROLLED: "~",
     STATUS_ROLLED_BACK: "↩",
     STATUS_FAILED: "✗",
@@ -1342,6 +1362,14 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
     lines = [
         f"{mark} {prefix}{_stamp(data.get('started_at'))}  v{version}  {status}"
     ]
+
+    # #2583: a held run must read as "deliberately holding at N behind",
+    # never as a silent no-op indistinguishable from a dead timer.
+    if status == STATUS_HOLDING:
+        lines.append(
+            f"    holding: {data.get('releases_behind')} behind, "
+            f"threshold {data.get('min_releases_behind')}"
+        )
 
     quiescence = data.get("quiescence") or {}
     if quiescence.get("reason"):

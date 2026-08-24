@@ -60,6 +60,10 @@ def test_ok_statuses_are_exactly_the_happy_and_correctly_inert_ones():
         # #2587: a set marker is a GOOD outcome — the drive-queue tick, not
         # this command, fires the actual roll at the next inter-drive gap.
         rw.STATUS_ROLL_PENDING,
+        # #2583: holding below the min-releases-behind threshold is also a
+        # GOOD, correctly-inert outcome — not a night propagation failed to
+        # happen, but one that deliberately declined to.
+        rw.STATUS_HOLDING,
     }
 
 

@@ -230,3 +230,25 @@ def latest_release_any(
     # Every name resolved (no network/index error) but none has a single
     # final release — an honest "nothing here", not a failure.
     return names[-1], None, []
+
+
+def releases_behind(installed: Version, finals: list[Version]) -> int:
+    """How many entries in *finals* are strictly newer than *installed*.
+
+    The ONE place "how far behind is this install" gets computed — shared by
+    ``coord.health.checks.agent_install``'s ``agent_version`` check and
+    ``coord release propagate``/``coord release nightly-window``'s #2583
+    min-releases-behind auto-roll gate, so there is exactly one answer to
+    "how many releases behind" rather than two that can quietly disagree
+    (``coord.release_cordon.version_drift`` is a deliberately DIFFERENT,
+    network-free patch-arithmetic *estimate* used elsewhere for cheap,
+    every-tick decisions — not a second implementation of this count; see
+    its own docstring).
+
+    Takes already-parsed :class:`Version` objects, not raw strings: both
+    existing call sites parse ``installed`` themselves already (to grade an
+    unparseable version as UNKNOWN rather than 0), so accepting a
+    :class:`Version` here keeps that judgement call with the caller instead
+    of duplicating it.
+    """
+    return sum(1 for v in finals if v > installed)

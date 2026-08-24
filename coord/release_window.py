@@ -165,12 +165,20 @@ STATUS_ERROR = "error"
 #: STATUS_DRAIN_TIMEOUT — the loud, failing outcome it replaces for the
 #: still-busy case — must never be confused with it.
 STATUS_ROLL_PENDING = "roll-pending"
+#: #2583: the daemon host needs a roll (there is a delta) but it has not yet
+#: reached ``propagation.min_releases_behind``/``--min-behind`` — a
+#: REPORTED no-op. Deliberately distinct from the drain-era
+#: :data:`STATUS_DRAIN_TIMEOUT`/:data:`STATUS_PROPAGATE_DEFERRED` (both mean
+#: "tried and could not"): holding never sets or touches the roll-pending
+#: marker at all, so it is a GOOD outcome, same tier as
+#: :data:`STATUS_ROLL_PENDING`.
+STATUS_HOLDING = "holding"
 
 #: Statuses meaning "this window did what it was for, or correctly had
 #: nothing to do" — everything else is a night propagation was supposed to
 #: happen and did not (trap 3: loud, not silent).
 OK_STATUSES = frozenset(
-    {STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN, STATUS_ROLL_PENDING}
+    {STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN, STATUS_ROLL_PENDING, STATUS_HOLDING}
 )
 
 #: The inverse of OK_STATUSES, spelled out for readability at call sites.
@@ -245,6 +253,12 @@ class WindowRecord:
     #: `coord.commands.release._latest_propagate_record_since`) — there is
     #: then nothing to join to.
     propagate_started_at: float | None = None
+    #: #2583: this run's own readings of the min-releases-behind gate — see
+    #: `coord.release_propagate.PropagationRecord`'s twin fields for the
+    #: same shape and reasoning. ``None`` when the gate was never evaluated
+    #: (``min_releases_behind <= 1``, the default).
+    releases_behind: int | None = None
+    min_releases_behind: int | None = None
     finished_at: float | None = None
     error: str | None = None
     dry_run: bool = False
@@ -351,6 +365,7 @@ _STATUS_MARK = {
     STATUS_PROPAGATE_FAILED: "✗",
     STATUS_ERROR: "✗",
     STATUS_ROLL_PENDING: "…",
+    STATUS_HOLDING: "⊖",
 }
 
 
@@ -369,6 +384,13 @@ def render_record(record: WindowRecord | Mapping[str, Any]) -> list[str]:
         lines.append(
             f"    daemon host: {data['daemon_host']} "
             f"(was v{data.get('daemon_version') or '?'})"
+        )
+    # #2583: a held run must read as "deliberately holding at N behind",
+    # never as a silent no-op indistinguishable from a dead timer.
+    if status == STATUS_HOLDING:
+        lines.append(
+            f"    holding: {data.get('releases_behind')} behind, "
+            f"threshold {data.get('min_releases_behind')}"
         )
     if data.get("queue_stopped") is not None:
         lines.append(
