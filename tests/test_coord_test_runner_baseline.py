@@ -156,7 +156,12 @@ exit "${FAKE_ACCEPTANCE_EXIT:-0}"
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
     ).stdout.strip()
 
 
@@ -177,25 +182,27 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@t.com")
     _git(r, "config", "user.name", "Test")
-    (r / "tests" / "test_ambient.py").write_text("def test_one():\n    assert True\n")
-    (r / "README.md").write_text("init\n")
+    (r / "tests" / "test_ambient.py").write_text(
+        "def test_one():\n    assert True\n", encoding="utf-8"
+    )
+    (r / "README.md").write_text("init\n", encoding="utf-8")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "initial")
     _git(r, "tag", "base")
 
     # One branch commit under coord/** — routing sends this to the python arm.
-    (r / "coord" / "thing.py").write_text("x = 1\n")
+    (r / "coord" / "thing.py").write_text("x = 1\n", encoding="utf-8")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "branch change")
 
     venv_bin = r / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     fake = venv_bin / "python"
-    fake.write_text(_FAKE_PYTHON)
+    fake.write_text(_FAKE_PYTHON, encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     fake_coord = venv_bin / "coord"
-    fake_coord.write_text(_FAKE_COORD)
+    fake_coord.write_text(_FAKE_COORD, encoding="utf-8")
     fake_coord.chmod(fake_coord.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return r
 
@@ -208,6 +215,7 @@ def _run(repo: Path, **fake_env: str) -> subprocess.CompletedProcess[str]:
         ["bash", str(SCRIPT), str(repo), "--base-ref", "base", "--repo", "code-coordinator"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=120,
         env=env,
     )
@@ -310,7 +318,9 @@ def test_branch_new_test_file_can_never_be_baseline_red(repo: Path) -> None:
     brand-new broken test would be excused as "pre-existing" — the worst possible
     version of this bug.
     """
-    (repo / "tests" / "test_new.py").write_text("def test_new():\n    assert False\n")
+    (repo / "tests" / "test_new.py").write_text(
+        "def test_new():\n    assert False\n", encoding="utf-8"
+    )
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "add a new test")
 
@@ -369,6 +379,7 @@ def test_missing_base_ref_reports_fail_uncompared(repo: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=120,
         env={**os.environ, "FAKE_BRANCH_FAILED": BRANCH_FAILED,
              "FAKE_BASELINE_FAILED": BRANCH_FAILED},
@@ -518,7 +529,7 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
         "the python arm never invoked the fake `coord` at all — "
         "run_python_acceptance_ci did not run"
     )
-    invocation = argv_log.read_text().strip()
+    invocation = argv_log.read_text(encoding="utf-8").strip()
     assert "acceptance run" in invocation
     assert "--repo claude-coordinator" in invocation
     assert "--all" in invocation
@@ -540,7 +551,7 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
     # from PATH by the driver's shell — the branch venv's bin/ must be
     # prepended, or the daemon's systemd-user PATH supplies a pytest with
     # none of this repo's deps (or none at all).
-    recorded_path = path_log.read_text().strip()
+    recorded_path = path_log.read_text(encoding="utf-8").strip()
     assert recorded_path.startswith(str(repo / ".venv" / "bin") + os.pathsep), (
         "run_python_acceptance_ci did not prepend the venv's bin/ to PATH — "
         "the cli-pytest route's bare `pytest` would resolve outside the "
@@ -556,7 +567,7 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
     # (issue-2235's second Test leg, 2026-08-15). The runner must invoke
     # `coord` like a CI runner: scratch $HOME (no client.toml) and the
     # service env vars stripped.
-    recorded_env = env_log.read_text()
+    recorded_env = env_log.read_text(encoding="utf-8")
     assert "COORD_SERVICE_URL=<unset>" in recorded_env, (
         "run_python_acceptance_ci leaked COORD_SERVICE_URL through to "
         "`coord` — _load_config's thin-client branch will fetch the remote "

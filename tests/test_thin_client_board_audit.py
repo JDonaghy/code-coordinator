@@ -93,7 +93,7 @@ def _find_calls(
     any ``from <module> import X as Y`` alias where <module> is in
     *source_modules*.
     """
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     # local (possibly aliased) name -> canonical function name.
     alias_map: dict[str, str] = {}

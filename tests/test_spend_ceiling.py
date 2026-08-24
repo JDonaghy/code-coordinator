@@ -132,14 +132,15 @@ def test_meter_fails_open_on_every_unknowable_case(tmp_path: Path) -> None:
     # An interactive (claude-pty) leg's log is not stream-json (#1710) — the
     # documented limit: this ceiling does not cap interactive sessions.
     tty = tmp_path / "interactive.log"
-    tty.write_text("some tty output\nnot json at all\n")
+    tty.write_text("some tty output\nnot json at all\n", encoding="utf-8")
     assert LiveCostMeter(tty).read() is None
 
     # Priceable-looking but the model is unrecognized → never guessed at a
     # tier, never priced as $0.
     unknown = tmp_path / "unknown-model.log"
     unknown.write_text(
-        _assistant("m1", model="some-other-vendor-model", output_tokens=100_000) + "\n"
+        _assistant("m1", model="some-other-vendor-model", output_tokens=100_000) + "\n",
+        encoding="utf-8",
     )
     assert LiveCostMeter(unknown).read() is None
 
@@ -156,7 +157,7 @@ def test_meter_estimates_from_per_turn_usage_before_any_result_event(
     """
     log = tmp_path / "running.log"
     # 1M output tokens at the opus rate ($25/1M) — no result event yet.
-    log.write_text(_assistant("m1", output_tokens=1_000_000) + "\n")
+    log.write_text(_assistant("m1", output_tokens=1_000_000) + "\n", encoding="utf-8")
     assert LiveCostMeter(log).read() == pytest.approx(25.0)
 
 
@@ -172,7 +173,8 @@ def test_meter_dedupes_the_repeated_assistant_events_for_one_message(
             _assistant("msg_a", output_tokens=1_000_000),
             _assistant("msg_a", output_tokens=1_000_000),
             _assistant("msg_a", output_tokens=1_000_000),
-        ]) + "\n"
+        ]) + "\n",
+        encoding="utf-8",
     )
     assert LiveCostMeter(log).read() == pytest.approx(25.0)
 
@@ -184,18 +186,21 @@ def test_meter_reads_incrementally_and_survives_a_partial_trailing_line(
     transcript each time — and a line the worker is mid-way through writing
     must be buffered, not dropped."""
     log = tmp_path / "growing.log"
-    log.write_text("# argv=claude -p\n" + _assistant("m1", output_tokens=400_000) + "\n")
+    log.write_text(
+        "# argv=claude -p\n" + _assistant("m1", output_tokens=400_000) + "\n",
+        encoding="utf-8",
+    )
     meter = LiveCostMeter(log)
     assert meter.read() == pytest.approx(10.0)
 
     # Append a half-written line: the total must not move, and the fragment
     # must not be lost.
     partial = _assistant("m2", output_tokens=400_000)
-    with open(log, "a") as fh:
+    with open(log, "a", encoding="utf-8") as fh:
         fh.write(partial[: len(partial) // 2])
     assert meter.read() == pytest.approx(10.0)
 
-    with open(log, "a") as fh:
+    with open(log, "a", encoding="utf-8") as fh:
         fh.write(partial[len(partial) // 2:] + "\n")
     assert meter.read() == pytest.approx(20.0)
 
@@ -203,7 +208,8 @@ def test_meter_reads_incrementally_and_survives_a_partial_trailing_line(
 def test_terminal_result_event_supersedes_the_estimate(tmp_path: Path) -> None:
     log = tmp_path / "finished.log"
     log.write_text(
-        _assistant("m1", output_tokens=1_000_000) + "\n" + _result(3.25) + "\n"
+        _assistant("m1", output_tokens=1_000_000) + "\n" + _result(3.25) + "\n",
+        encoding="utf-8",
     )
     assert LiveCostMeter(log).read() == pytest.approx(3.25)
 
@@ -291,7 +297,7 @@ def test_watchdog_warns_before_it_kills(tmp_path: Path) -> None:
     """A `STATUS:` warning at a fraction of the ceiling gives an observer a
     chance to intervene, and makes the kill legible after the fact."""
     log = tmp_path / "leg.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
     proc = _FakeProc()
     code, killed = _drive(
         log, proc=proc, ceiling=8.0, read_cost=_scripted([7.0, 7.5, 9.0]),
@@ -299,7 +305,7 @@ def test_watchdog_warns_before_it_kills(tmp_path: Path) -> None:
 
     assert code == SPEND_CEILING_EXIT
     assert killed  # the process group really was signalled
-    text = log.read_text()
+    text = log.read_text(encoding="utf-8")
     assert "STATUS: spend $7.00 has passed 80% of the $8.00 per-leg ceiling" in text
     assert "SIGKILL — spend ceiling breached ($9.00 of $8.00)" in text
     # The warning fires once, not on every poll.
@@ -312,14 +318,14 @@ def test_watchdog_never_kills_on_an_unreadable_cost(tmp_path: Path) -> None:
     The ceiling here is absurdly low, so only the `None` reading protects it.
     """
     log = tmp_path / "leg.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
     proc = _FakeProc(die_after=5)
     code, killed = _drive(
         log, proc=proc, ceiling=0.01, read_cost=lambda: None,
     )
     assert code == _NATURAL_EXIT
     assert killed == []
-    assert "spend ceiling" not in log.read_text()
+    assert "spend ceiling" not in log.read_text(encoding="utf-8")
 
 
 def test_watchdog_does_not_kill_a_leg_that_already_emitted_its_result(
@@ -328,7 +334,7 @@ def test_watchdog_does_not_kill_a_leg_that_already_emitted_its_result(
     """Once the worker is logically done the money is already spent; killing
     then would only mislabel a completed leg as a ceiling kill."""
     log = tmp_path / "leg.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
     proc = _FakeProc()
     code, _ = _drive(
         log, proc=proc, ceiling=1.0,
@@ -339,14 +345,14 @@ def test_watchdog_does_not_kill_a_leg_that_already_emitted_its_result(
     # The existing post-result grace path owns this leg, and it reports the
     # work as logically complete (0), not as a ceiling kill.
     assert code == 0
-    assert "spend ceiling breached" not in log.read_text()
+    assert "spend ceiling breached" not in log.read_text(encoding="utf-8")
 
 
 def test_watchdog_is_inert_with_no_ceiling_configured(tmp_path: Path) -> None:
     """The no-config parity requirement, at the loop level: with no ceiling
     the cost reader is never even consulted."""
     log = tmp_path / "leg.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
     proc = _FakeProc(die_after=3)
     reads = {"n": 0}
 
@@ -365,7 +371,12 @@ def test_watchdog_is_inert_with_no_ceiling_configured(tmp_path: Path) -> None:
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
     ).stdout.strip()
 
 
@@ -376,7 +387,7 @@ def repo_local_only(tmp_path: Path) -> Path:
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "t@t.com")
     _git(repo, "config", "user.name", "Test")
-    (repo / "README").write_text("init\n")
+    (repo / "README").write_text("init\n", encoding="utf-8")
     _git(repo, "add", "README")
     _git(repo, "commit", "-m", "initial")
     return repo
@@ -439,7 +450,7 @@ def test_running_agent_kills_and_marks_a_leg_that_crosses_the_ceiling(
     assert final.usage_limit_reason is None
     assert final.api_error_reason is None
     # And the kill is narrated in the worker's own log.
-    log_text = Path(final.log_path).read_text()
+    log_text = Path(final.log_path).read_text(encoding="utf-8")
     assert "spend ceiling breached" in log_text
     # The reason rides the /status wire, which is how the coordinator ever
     # learns about it.
@@ -495,7 +506,7 @@ def test_running_agent_leaves_a_cheap_leg_completely_alone(
     assert final.status != FAILED
     assert final.exit_code != SPEND_CEILING_EXIT
     assert final.spend_ceiling_reason is None
-    assert "spend ceiling" not in Path(final.log_path).read_text()
+    assert "spend ceiling" not in Path(final.log_path).read_text(encoding="utf-8")
     server.shutdown()
 
 
