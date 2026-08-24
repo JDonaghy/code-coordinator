@@ -50,6 +50,7 @@ use quadraui::primitives::split_tree::SplitDirection;
 use quadraui::SplitTree;
 use serde::{Deserialize, Serialize};
 
+use crate::app::drive_queue::repo_alias;
 use crate::app::format::trunc;
 use crate::app::types::{BoardData, BoardDetailTab, PipelineDetailTab};
 
@@ -1472,13 +1473,16 @@ pub(crate) fn known_doc_keys(data: &BoardData) -> HashSet<DocKey> {
 /// Shape, outermost first:
 ///
 /// ```text
-/// active   [∘ <repo> #101 Fix login race… ×]␠
-/// inactive  ∘ <repo> #101 Fix login race… ×␠
-///           ^ ^      ^                    ^
-///           | |      |                    └─ §2d close glyph (TAB_CLOSE_CHAR)
-///           | |      └─ `#<N> <title>` truncated to `max_cols` columns
-///           | └─ repo prefix, only when the open set spans >1 repo
+/// active   [∘ CW#101 Fix login race… ×]␠
+/// inactive  ∘ CW#101 Fix login race… ×␠
+///           ^ ^^                     ^
+///           | |└─ `#<N> <title>` truncated to `max_cols` columns
+///           | └─ #2641: repo alias (repo_alias, `owner/` stripped first),
+///           |    joined directly to `#N` with no space — only when the
+///           |    open set spans >1 repo
 ///           └─ §1 preview marker, only on the preview tab
+///
+/// (`×` at the end is the §2d close glyph, TAB_CLOSE_CHAR.)
 /// ```
 ///
 /// `max_cols` is [`DOC_TAB_LABEL_COLS`] (20, §2b) for an undivided strip
@@ -1515,8 +1519,13 @@ pub(crate) fn doc_tab_label(
         inner.push_str(PREVIEW_MARKER);
     }
     if show_repo {
-        inner.push_str(repo);
-        inner.push(' ');
+        // #2641: the Pipeline strip's tab keys are the `pipeline_repos` slug
+        // (`JDonaghy/coord-web`), while the Board strip's are the local repo
+        // name (`coord-web`) — strip any `owner/` prefix before aliasing so
+        // both land on the same two-letter alias the Queue grid uses
+        // (`coord-web` → `CW`), joined directly to `#N` with no space.
+        let basename = repo.rsplit('/').next().unwrap_or(repo);
+        inner.push_str(&repo_alias(basename));
     }
     inner.push_str(&base);
     inner.push(' ');
@@ -2073,9 +2082,32 @@ mod tests {
 
     #[test]
     fn multi_repo_labels_carry_the_repo_prefix() {
+        // #2641: the prefix is the two-letter repo alias joined directly to
+        // `#N`, not the full repo name with a separating space.
         let label = doc_tab_label("quadraui", 597, "Preview tier", true, false, false, DOC_TAB_LABEL_COLS);
         assert!(
-            label.starts_with("quadraui #597 Preview tier"),
+            label.starts_with("Q#597 Preview tier"),
+            "got {label:?}"
+        );
+    }
+
+    #[test]
+    fn multi_repo_label_strips_an_owner_slug_prefix_before_aliasing() {
+        // #2641: the Pipeline strip's tab keys are `pipeline_repos` slugs
+        // (`JDonaghy/coord-web`) — aliasing the slug naively would give
+        // `JCW`-ish garbage, so the `owner/` part must be stripped first.
+        let label = doc_tab_label(
+            "JDonaghy/coord-web",
+            26,
+            "Fix the thing",
+            true,
+            false,
+            false,
+            DOC_TAB_LABEL_COLS,
+        );
+        assert!(label.starts_with("CW#26 Fix the thing"), "got {label:?}");
+        assert!(
+            !label.contains("JDonaghy") && !label.contains("coord-web"),
             "got {label:?}"
         );
     }
