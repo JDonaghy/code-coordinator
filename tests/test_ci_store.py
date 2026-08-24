@@ -17,6 +17,7 @@ import pytest
 
 from coord import github_ops
 from coord.ci_github import GitHubCi
+from coord.forge_availability import _flush_all_ok_aggregates
 from coord.ci_store import (
     CheckRun,
     JobRun,
@@ -763,6 +764,7 @@ class TestGitHubCiForgeAvailabilityRecording:
         store = GitHubCi()
         with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
             store.list_checks_for_pr("acme/api", 42)
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
 
         rows = self._rows(coord_db)
         assert len(rows) == 1
@@ -781,6 +783,7 @@ class TestGitHubCiForgeAvailabilityRecording:
         with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
             store.list_checks_for_pr("acme/api", 42)
             store.list_checks_for_pr("acme/api", 42)  # cache hit
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
 
         assert len(self._rows(coord_db)) == 1
 

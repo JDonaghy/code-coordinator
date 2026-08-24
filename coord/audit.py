@@ -25,6 +25,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -275,11 +276,8 @@ def _maybe_trim(conn) -> None:
     oldest rows past that count after every insert.
 
     Default (``max_rows=0``) is unlimited — this is a no-op in the common
-    case.  Config is re-loaded on every call rather than cached: audit
-    writes are not hot-loop-frequency (one per board transition, not per
-    daemon tick), so the extra YAML parse is cheap relative to the SQLite
-    round-trip it accompanies, and it means a config edit takes effect on
-    the next write without a process restart.
+    case.  Config is read via :func:`_cached_config` rather than re-parsed
+    on every call — see that function's docstring for why (#2654).
     """
     max_rows = _resolve_max_rows()
     if max_rows <= 0:
@@ -292,14 +290,63 @@ def _maybe_trim(conn) -> None:
     conn.commit()
 
 
+# ── #2654: cached config reads for the two per-write resolvers below ───────
+#
+# `_resolve_level` and `_resolve_max_rows` both used to call `coord.config.
+# load()` — a full disk read + `yaml.safe_load` + `parse_mapping()`
+# validation — on literally every `record_audit()` call: once for the level
+# gate, again (via `_maybe_trim`) after every successful insert. That
+# docstring used to justify it as "audit writes are not hot-loop-frequency
+# (one per board transition, not per daemon tick)" — #1896's forge-
+# availability instrumentation made that false: ~2,900 writes/hour measured
+# on a busy host, each paying two full parse-and-validate cycles against a
+# config that is tens of KB on the daemon host.
+#
+# Cached by *resolved path + mtime* rather than a time-based TTL — an mtime
+# check is a single stat() syscall, cheaper even than a TTL comparison, and
+# it preserves the exact promise the old docstring made ("a config edit
+# takes effect on the next write without a process restart") instead of
+# only approximating it within some TTL window.
+_config_cache: dict[str, tuple[tuple[float, int], Any]] = {}
+_config_cache_lock = threading.Lock()
+
+
+def _cached_config() -> Any:
+    """Return the parsed ``coordinator.yml``, cached by resolved path+mtime.
+
+    Falls through to an uncached, un-memoized :func:`coord.config.load` (and
+    lets any exception propagate) when the resolved path can't even be
+    ``stat()``'d — both call sites below already wrap this in a broad
+    ``except Exception`` for exactly that "no resolvable config" case.
+    """
+    from coord.config import load as _load_config  # noqa: PLC0415
+    from coord.config import resolve_config_path  # noqa: PLC0415
+
+    path = resolve_config_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _load_config()
+
+    key = str(path)
+    stamp = (st.st_mtime, st.st_size)
+    with _config_cache_lock:
+        cached = _config_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+
+    cfg = _load_config(path)
+    with _config_cache_lock:
+        _config_cache[key] = (stamp, cfg)
+    return cfg
+
+
 def _resolve_max_rows() -> int:
     """Read ``audit.max_rows`` from coordinator.yml.  Returns 0 (unlimited)
     on any failure — a missing/invalid config must not block audit writes,
     let alone the board mutation that triggered them."""
     try:
-        from coord.config import load as _load_config  # noqa: PLC0415
-
-        cfg = _load_config()
+        cfg = _cached_config()
         return max(0, int(cfg.audit.max_rows))
     except Exception:  # noqa: BLE001 — best-effort; unlimited is the safe default
         return 0
@@ -310,9 +357,7 @@ def _resolve_level() -> str:
     (the default — capture everything) on any failure, so a missing/invalid
     config never silently suppresses audit rows."""
     try:
-        from coord.config import load as _load_config  # noqa: PLC0415
-
-        cfg = _load_config()
+        cfg = _cached_config()
         level = cfg.audit.level
         return level if level in _VALID_TIERS else "operational"
     except Exception:  # noqa: BLE001 — best-effort; capture-everything is the safe default

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from coord import github_ops
+from coord.forge_availability import _flush_all_ok_aggregates
 
 # Captured at import time — the real function object, immune to the conftest
 # autouse `_non_terminal_work` stub which reassigns the module attribute.
@@ -1683,6 +1684,9 @@ class TestGhForgeAvailabilityRecording:
             return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
         ):
             github_ops._gh("issue", "view", "1")
+        # #2654: "ok" observations buffer in-process and flush on bucket
+        # roll/atexit/an interesting outcome rather than writing immediately.
+        _flush_all_ok_aggregates()
 
         row = coord_db.execute(
             "SELECT * FROM audit_log WHERE category='forge_availability'"
@@ -1690,7 +1694,7 @@ class TestGhForgeAvailabilityRecording:
         assert row is not None
         details = json.loads(row["details_json"])
         assert details["outcome"] == "ok"
-        assert details["duration_s"] >= 0
+        assert details["duration_s_total"] >= 0  # #2654: aggregate field, not per-call
 
     def test_gh_not_found_records_unreachable(self, coord_db) -> None:
         with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
@@ -1763,6 +1767,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         with patch("coord.github_ops.subprocess.run",
                     return_value=MagicMock(returncode=0, stdout="", stderr="")):
             github_ops.close_issue("acme/api", 42, force=True)
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
         assert details[-1]["argv0"] == "issue"
@@ -1789,6 +1794,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         with patch("coord.github_ops.subprocess.run",
                     return_value=MagicMock(returncode=0, stdout="", stderr="")):
             github_ops.reopen_issue("acme/api", 42)
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
 
@@ -1808,6 +1814,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         with patch("coord.github_ops.subprocess.run",
                     return_value=MagicMock(returncode=0, stdout="", stderr="")):
             github_ops.edit_issue("acme/api", 42, title="new title")
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
         assert details[-1]["argv0"] == "issue"
@@ -1826,6 +1833,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         with patch("coord.github_ops.subprocess.run",
                     return_value=MagicMock(returncode=0, stdout="", stderr="")):
             assert github_ops.rerun_workflow_run("acme/api", "12345") is True
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
         assert details[-1]["argv0"] == "run"
@@ -1840,6 +1848,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         with patch("coord.github_ops.subprocess.run",
                     return_value=MagicMock(returncode=0, stdout="", stderr="")):
             assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is True
+        _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
         assert details[-1]["argv0"] == "run"
