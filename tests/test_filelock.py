@@ -137,6 +137,16 @@ def test_windows_backend_non_contention_error_propagates(monkeypatch, tmp_path) 
     assert not isinstance(exc_info.value, LockBusy)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="forces sys.platform='linux' to pin the real (uninjected) POSIX "
+    "fcntl backend, but coord.filelock reads the genuine sys.platform "
+    "process-wide -- on an actual Windows host the monkeypatch doesn't make "
+    "fcntl exist, so `import fcntl` in _lock_exclusive_nonblocking/_unlock "
+    "raises ModuleNotFoundError regardless (#2729). The msvcrt backend this "
+    "host would really use is covered separately by the fake_windows-backed "
+    "tests above.",
+)
 def test_posix_backend_contention_and_release(tmp_path, monkeypatch) -> None:
     """Sanity check on the real (POSIX) backend this suite always runs under --
     guards against the branch in ``_lock_exclusive_nonblocking``/``_unlock``

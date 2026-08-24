@@ -154,21 +154,24 @@ def test_pty_marker_bytes_sync_with_provider_string() -> None:
 
 # ── _wait_for_proc_or_result ─────────────────────────────────────────────────
 
-# #2729: every test below whose ``killpg`` recorder actually fires exercises
-# `_wait_for_proc_or_result`'s real, uninjected `signal.SIGKILL`/`SIGTERM`
-# constants -- `killpg` itself is injected per-test, but the signal VALUES
-# handed to it are built inside `coord/agent.py`'s own module body from its
-# own module-level `signal` import, which has no `SIGKILL` attribute on
-# win32 at all ("Availability: Unix", per the stdlib docs) -- so the real
-# (non-test) function raises `AttributeError` there regardless of the
-# injected callable. This is the process-group reaper CP-7 (#1163) owns the
-# Job Objects port for, per #2729/#2680's explicit bucket-b boundary: skip
-# rather than shim. Tests where the watchdog/ceiling never actually fires
-# (``calls == []``) never reach those lines and need no skip.
+# #2729 (review iteration 1): only tests whose kill escalation reaches the
+# real `signal.SIGKILL` constant need this skip -- `coord/agent.py`'s own
+# module-level `signal` import has no `SIGKILL` attribute on win32 at all
+# ("Availability: Unix", per the stdlib docs), so the real (non-test)
+# function raises `AttributeError` there regardless of the injected
+# `killpg` callable. `signal.SIGTERM`, unlike `SIGKILL`, IS defined on
+# win32 -- so a test whose escalation stops at a single SIGTERM (the fake
+# proc "honors" that kill, so the retry `proc.wait()` never times out and
+# the SIGKILL-escalation branch a few lines further down is never reached)
+# does not need this skip and is left unmarked below to keep real Windows
+# coverage on that path. This is the process-group reaper CP-7 (#1163) owns
+# the Job Objects port for, per #2729/#2680's explicit bucket-b boundary:
+# skip rather than shim. Tests where the watchdog/ceiling never actually
+# fires (``calls == []``) never reach those lines either and need no skip.
 _WIN32_REAPER_SKIP = pytest.mark.skipif(
     sys.platform == "win32",
     reason="_wait_for_proc_or_result's kill escalation reaches the real "
-    "signal.SIGKILL/SIGTERM (coord/agent.py) even with killpg() injected -- "
+    "signal.SIGKILL (coord/agent.py) even with killpg() injected -- "
     "process-group reaping is POSIX-only until Job Objects (Windows-native "
     "attended sessions) land, owned by #1163, not this issue",
 )
@@ -276,10 +279,14 @@ def test_clean_exit_returns_proc_exit_code(tmp_path: Path) -> None:
     assert code == 42
 
 
-@_WIN32_REAPER_SKIP
 def test_force_kills_when_result_seen_then_proc_hangs(tmp_path: Path) -> None:
     """The fix for #228: worker emits result, proc.wait keeps timing out,
-    so we SIGTERM the group and return 0."""
+    so we SIGTERM the group and return 0.
+
+    No `_WIN32_REAPER_SKIP` needed: the fake proc honors the single SIGTERM
+    (`exit_after_kill=True`), so the retry `proc.wait()` never times out and
+    the real `signal.SIGKILL` branch below it is never reached -- only
+    `signal.SIGTERM`, which IS defined on win32, gets evaluated (#2729)."""
     log_path = str(tmp_path / "log")
     proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
     record, calls, set_proc = _make_killpg_recorder()
@@ -357,10 +364,13 @@ def test_max_wait_safety_net_sigkills_and_marks_failed(tmp_path: Path) -> None:
     assert "max-wait" in Path(log_path).read_text()
 
 
-@_WIN32_REAPER_SKIP
 def test_result_detected_mid_wait_only_kills_after_grace(tmp_path: Path) -> None:
     """If the worker emits the result mid-wait but might still exit cleanly,
-    we wait the grace period before escalating."""
+    we wait the grace period before escalating.
+
+    No `_WIN32_REAPER_SKIP` needed: `exit_after_kill=True` on the fake proc
+    means the single SIGTERM is honored and `signal.SIGKILL` is never
+    reached -- see the comment on `_WIN32_REAPER_SKIP` above (#2729)."""
     log_path = str(tmp_path / "log")
     proc = _FakeProc(exit_after_calls=None, exit_after_kill=True)
     record, calls, set_proc = _make_killpg_recorder()
@@ -719,7 +729,6 @@ def test_host_sleep_detected_via_wall_monotonic_divergence(tmp_path: Path) -> No
     assert "host sleep detected" in text
 
 
-@_WIN32_REAPER_SKIP
 def test_host_sleep_check_gated_on_result_seen_at_is_none(tmp_path: Path) -> None:
     """Review finding (non-blocking, #2638 iteration 1): the host-sleep check
     must be gated on `result_seen_at is None`, exactly like the runtime
@@ -727,6 +736,11 @@ def test_host_sleep_check_gated_on_result_seen_at_is_none(tmp_path: Path) -> Non
     suspend/resume that straddles the short post-result grace-period
     teardown would kill and mislabel an already-finished leg as a host-sleep
     kill instead of letting it land DONE via the ordinary grace-period path.
+
+    No `_WIN32_REAPER_SKIP` needed: the grace-period teardown that actually
+    fires here escalates only to the single SIGTERM (`exit_after_kill=True`
+    on the fake proc), never to `signal.SIGKILL` — see the comment on
+    `_WIN32_REAPER_SKIP` above (#2729).
 
     Sequence: the worker's result is seen on the FIRST poll (so
     `result_seen_at` is set before any divergence is measured); the SECOND
