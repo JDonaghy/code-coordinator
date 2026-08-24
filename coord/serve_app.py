@@ -2051,6 +2051,31 @@ def _board_response_schema(components: dict) -> dict:
                 },
                 "required": ["available"],
             },
+            "roll_pending": {
+                "type": ["object", "null"],
+                "description": (
+                    "#2608: the machine-local fleet-roll marker "
+                    "(`~/.coord/roll_pending.json` on THIS daemon host), same "
+                    "shape as `coord.drive_queue.RollPending.to_dict()`. Set "
+                    "by `coord release propagate`/`nightly-window`; watched by "
+                    "`coord.drive_queue.plan_tick`, which refuses to launch a "
+                    "new drive while it's live (reconciliation runs "
+                    "unaffected). `null` when no roll is pending — a client "
+                    "must render nothing extra in that case, not an empty "
+                    "banner. Deliberately NOT the alert/escalation channel: a "
+                    "queue held for a roll is expected, self-clearing "
+                    "behaviour, never surfaced as broken."
+                ),
+                "properties": {
+                    "target_version": {"type": "string"},
+                    "set_at": {"type": "number", "description": "time.time() epoch when set"},
+                    "reason": {"type": "string"},
+                    "ttl_seconds": {"type": "number"},
+                    "max_deferrals": {"type": "integer"},
+                    "deferrals": {"type": "integer"},
+                },
+                "required": ["target_version", "set_at"],
+            },
             "milestone_work_orders": {
                 "type": "array",
                 "description": (
@@ -4612,6 +4637,29 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 projection["goal_header"] = _read_goal_header()
             except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
                 projection["goal_header"] = {"available": False}
+            # #2608: surface the machine-local roll-pending marker (set by
+            # `coord release propagate`/`nightly-window`, watched by
+            # `coord.drive_queue.plan_tick`) on the board payload, so the TUI
+            # Queue panel can render "deliberately held for a roll" instead of
+            # leaving a held queue indistinguishable from a stalled one. The
+            # marker lives in this HOST's `~/.coord/roll_pending.json` — read
+            # it straight from local state rather than plumbing it cross-
+            # machine, since `coord-serve.service` and `coord-drive-queue.
+            # timer` already co-locate (#2587's own reasoning). Sibling key,
+            # same shape as `RollPending.to_dict()`; `None` when no roll is
+            # pending. Fail-open, mirroring `read_roll_pending`'s own
+            # fail-soft posture: an unreadable/corrupt marker must read as "no
+            # roll pending" here too, never blank the board.
+            try:
+                from coord.commands.drive_queue import (  # noqa: PLC0415
+                    read_roll_pending as _read_roll_pending,
+                )
+                _roll_pending = _read_roll_pending()
+                projection["roll_pending"] = (
+                    _roll_pending.to_dict() if _roll_pending is not None else None
+                )
+            except Exception:  # noqa: BLE001 — advisory-only; never blank the board
+                projection["roll_pending"] = None
             # #1337 invariant 2: no collection endpoint returns unbounded text.
             # #1791 adds a second bound — collection CARDINALITY, not just
             # per-row width — dropping old terminal `assignments` rows (and

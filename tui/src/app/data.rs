@@ -1857,6 +1857,10 @@ pub(crate) fn load_data() -> BoardData {
         // segment renders "QUEUE: empty" (which is the truth for this
         // client, and never a fabricated alert) on this path.
         Vec::new(),
+        // #2608: local SQLite path has no daemon to read the machine-local
+        // roll-pending marker from either — same posture as `drive_queue`
+        // above. `None`; the Queue panel renders no roll banner on this path.
+        None,
         // #2532: the `approved_submissions` join (portal submission →
         // #2531's project↔repo mapping) is server-side only, same posture
         // as `drive_queue` above. Pass empty; the Approved panel renders
@@ -1903,6 +1907,7 @@ pub(crate) fn assemble_board_data(
     escalations: Vec<EscalationEntry>,
     fleet_health: FleetHealthBlock,
     drive_queue: Vec<BoardDriveQueueEntry>,
+    roll_pending: Option<RollPending>,
     approved_submissions: Vec<ApprovedSubmission>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
@@ -2047,6 +2052,7 @@ pub(crate) fn assemble_board_data(
         escalations,
         fleet_health,
         drive_queue,
+        roll_pending,
         approved_submissions,
     }
 }
@@ -2809,6 +2815,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // `#[serde(default)]`) on daemons that predate #1753, which never
         // emit this key at all.
         payload.drive_queue,
+        // #2608: the machine-local roll-pending marker; `None` (via
+        // `#[serde(default)]`) on daemons that predate #2608, or when no
+        // roll is currently pending.
+        payload.roll_pending,
         // #2532: server-computed approved-submissions list (repos already
         // resolved via #2531's project↔repo mapping); empty (via
         // `#[serde(default)]`) on daemons that predate #2532.

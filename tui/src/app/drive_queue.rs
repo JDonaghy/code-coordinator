@@ -392,7 +392,170 @@ pub(crate) fn drive_queue_status_text(entries: &[BoardDriveQueueEntry]) -> Strin
     }
 }
 
+/// #2608: what a live [`RollPending`] marker is actually waiting on, in the
+/// same terms `coord.drive_queue.plan_tick` itself watches — either "N
+/// entries still occupying a slot" (the inter-drive gap the tick fires the
+/// roll on) or, once nothing is occupying a slot, the deferral/TTL bound
+/// that will eventually force an escalation. Pure over the board rows the
+/// TUI already has (`summarize_drive_queue`'s `running` count is this
+/// client's best board-visible proxy for the tick's own `TickPlan.occupied`
+/// — the exact reconciliation verdict behind that count is server-side
+/// only) — no clock, no self, directly testable.
+pub(crate) fn roll_pending_wait_text(pending: &RollPending, entries: &[BoardDriveQueueEntry]) -> String {
+    let occupied = summarize_drive_queue(entries).running;
+    if occupied > 0 {
+        format!(
+            "{occupied} entr{} still occupying a slot",
+            if occupied == 1 { "y" } else { "ies" }
+        )
+    } else {
+        format!(
+            "{}/{} deferrals so far, {}",
+            pending.deferrals,
+            pending.max_deferrals,
+            if pending.ttl_seconds > 0.0 {
+                "bounded by a TTL"
+            } else {
+                "no TTL bound"
+            },
+        )
+    }
+}
+
+/// #2608: the compact status-bar sentence for a live roll-pending marker —
+/// "alongside `drive_queue_status_text`", not folded into it, per the
+/// design note: a queue held for a roll is a distinct, non-alarming state,
+/// not a variant of QUEUE's own running/waiting/stalled/held/blocked
+/// vocabulary.
+pub(crate) fn roll_pending_status_text(
+    pending: &RollPending,
+    entries: &[BoardDriveQueueEntry],
+) -> String {
+    format!(
+        "ROLL PENDING: v{} — {}",
+        pending.target_version,
+        roll_pending_wait_text(pending, entries),
+    )
+}
+
+/// #2608: the two-line Queue-panel banner — headline (version + reason) and
+/// detail (age + wait condition). `now` is an explicit parameter (mirrors
+/// [`format_age`]) so this stays a pure, directly-testable function; the
+/// paint call site supplies `SystemTime::now()`.
+pub(crate) fn roll_pending_banner_lines(
+    pending: &RollPending,
+    entries: &[BoardDriveQueueEntry],
+    now: f64,
+) -> Vec<String> {
+    let reason = if pending.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", pending.reason)
+    };
+    let headline = format!("⧗ FLEET ROLL PENDING — v{}{reason}", pending.target_version);
+    let age = format_age(Some(pending.set_at), now);
+    let wait = roll_pending_wait_text(pending, entries);
+    let detail = if age.is_empty() {
+        format!("Launching is deliberately held — waiting on {wait}.")
+    } else {
+        format!("Launching is deliberately held — set {age}, waiting on {wait}.")
+    };
+    vec![headline, detail]
+}
+
 impl CoordApp {
+    /// #2608: the always-visible status-bar segment for a live roll-pending
+    /// marker — `None` (nothing pushed) when no roll is pending, so an
+    /// operator on a pre-#2608 daemon (or simply between rolls) sees exactly
+    /// today's bar. Calm blue — the same palette `DriveQueueLevel::Normal`
+    /// uses — deliberately never the amber/red the QUEUE segment itself
+    /// escalates to: a queue held for a roll is expected, self-clearing
+    /// behaviour, not an alert (mirrors `coord drive-queue status`'s own
+    /// non-alarming rendering of this marker, and stays clear of the
+    /// alert/escalation channel entirely).
+    pub(crate) fn roll_pending_status_bar_segment(&self) -> Option<StatusBarSegment> {
+        let pending = self.data.roll_pending.as_ref()?;
+        Some(StatusBarSegment {
+            text: format!(
+                " {} ",
+                roll_pending_status_text(pending, &self.data.drive_queue)
+            ),
+            fg: Color::rgb(200, 220, 255),
+            bg: Color::rgb(40, 60, 90),
+            bold: false,
+            action_id: None,
+        })
+    }
+
+    /// #2608: rect for the roll-pending banner carved off the top of the
+    /// Queue panel — mirrors `plans.rs`'s `plans_goal_header_rect` (same
+    /// "a couple of rows, capped at 30% of the panel" shape).
+    fn queue_roll_pending_banner_rect(main: Rect, lh: f32) -> Rect {
+        if lh <= 0.0 {
+            return Rect::new(main.x, main.y, main.width, 0.0);
+        }
+        let want_rows = 2.0_f32;
+        let max_h = (main.height * 0.30).max(lh);
+        let h = (want_rows * lh).min(max_h);
+        Rect::new(main.x, main.y, main.width, h)
+    }
+
+    /// #2608: the remainder of the Queue panel below the roll-pending
+    /// banner — mirrors `plans.rs`'s `plans_list_rect_below_goal_header`.
+    fn queue_rect_below_roll_pending_banner(rect: Rect, banner_rect: Rect) -> Rect {
+        Rect::new(
+            rect.x,
+            rect.y + banner_rect.height,
+            rect.width,
+            (rect.height - banner_rect.height).max(0.0),
+        )
+    }
+
+    /// #2608: paint the roll-pending banner — read-only, not part of the
+    /// selectable grid below it. Only called when `self.data.roll_pending`
+    /// is `Some`.
+    fn render_roll_pending_banner(&self, backend: &mut dyn Backend, rect: Rect, pending: &RollPending) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let lines = roll_pending_banner_lines(pending, &self.data.drive_queue, now);
+        let items: Vec<ListItem> = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        line,
+                        if i == 0 {
+                            Color::rgb(150, 190, 255)
+                        } else {
+                            Color::rgb(160, 175, 195)
+                        },
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: if i == 0 { Decoration::Header } else { Decoration::Normal },
+            })
+            .collect();
+        backend.draw_list(
+            rect,
+            &ListView {
+                id: WidgetId::new("queue-roll-pending-banner"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+    }
+
     /// The persistent status-bar segment — ALWAYS present, in every view,
     /// regardless of depth (see [`drive_queue_status_text`]). Carries no
     /// `action_id`: reached by right-clicking the status bar, per the module
@@ -1295,6 +1458,23 @@ impl CoordApp {
         *self.queue_table_layout.borrow_mut() = None;
         self.queue_separator_rect.set(None);
         *self.queue_detail_scrollbar.borrow_mut() = None;
+
+        // #2608: carve the roll-pending banner off the top of `rect` FIRST,
+        // before either of the empty/non-empty branches below — a roll can
+        // be pending against an otherwise-idle queue (the empty-rows early
+        // return) just as easily as a busy one, and #2608's whole point is
+        // that this must render in both cases. `rect` is shadowed with the
+        // remainder so every rect computed below this point (list/detail
+        // split, empty-state message) already accounts for it; absent, this
+        // is a no-op identity — no banner, no layout shift, byte-identical
+        // to the pre-#2608 panel.
+        let rect = if let Some(pending) = &self.data.roll_pending {
+            let banner_rect = Self::queue_roll_pending_banner_rect(rect, lh);
+            self.render_roll_pending_banner(backend, banner_rect, pending);
+            Self::queue_rect_below_roll_pending_banner(rect, banner_rect)
+        } else {
+            rect
+        };
 
         let rows = self.queue_rows();
         if rows.is_empty() {
@@ -2949,6 +3129,99 @@ mod tests {
         assert!(app.queue_context_target().is_none());
     }
 
+    // ── #2608: roll-pending pure functions ───────────────────────────────
+
+    fn pending(target_version: &str, reason: &str) -> RollPending {
+        RollPending {
+            target_version: target_version.to_string(),
+            set_at: 1_000.0,
+            reason: reason.to_string(),
+            ttl_seconds: 3600.0,
+            max_deferrals: 20,
+            deferrals: 3,
+        }
+    }
+
+    #[test]
+    fn roll_pending_wait_text_names_occupying_entries_when_any_are_running() {
+        let rows = vec![
+            entry(1, 0, QUEUE_STATE_RUNNING, &[]),
+            entry(2, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        assert_eq!(
+            roll_pending_wait_text(&pending("0.5.235", "nightly-window"), &rows),
+            "1 entry still occupying a slot"
+        );
+    }
+
+    #[test]
+    fn roll_pending_wait_text_pluralizes_multiple_occupying_entries() {
+        let rows = vec![
+            entry(1, 0, QUEUE_STATE_RUNNING, &[]),
+            entry(2, 1, QUEUE_STATE_RUNNING, &[]),
+        ];
+        assert_eq!(
+            roll_pending_wait_text(&pending("0.5.235", "nightly-window"), &rows),
+            "2 entries still occupying a slot"
+        );
+    }
+
+    #[test]
+    fn roll_pending_wait_text_falls_back_to_deferral_bound_when_nothing_occupies_a_slot() {
+        // Nothing running (only a waiting row) — the tick could fire on its
+        // very next pass, so the wait condition is the deferral/TTL bound
+        // rather than a live occupant.
+        let rows = vec![entry(1, 0, QUEUE_STATE_WAITING, &[])];
+        assert_eq!(
+            roll_pending_wait_text(&pending("0.5.235", "nightly-window"), &rows),
+            "3/20 deferrals so far, bounded by a TTL"
+        );
+    }
+
+    #[test]
+    fn roll_pending_wait_text_reports_unbounded_ttl() {
+        let mut p = pending("0.5.235", "nightly-window");
+        p.ttl_seconds = 0.0;
+        assert_eq!(
+            roll_pending_wait_text(&p, &[]),
+            "3/20 deferrals so far, no TTL bound"
+        );
+    }
+
+    #[test]
+    fn roll_pending_status_text_names_version_and_wait_condition() {
+        let rows = vec![entry(1, 0, QUEUE_STATE_RUNNING, &[])];
+        assert_eq!(
+            roll_pending_status_text(&pending("0.5.235", "nightly-window"), &rows),
+            "ROLL PENDING: v0.5.235 — 1 entry still occupying a slot"
+        );
+    }
+
+    #[test]
+    fn roll_pending_banner_lines_carry_version_reason_age_and_wait_condition() {
+        let rows = vec![entry(1, 0, QUEUE_STATE_RUNNING, &[])];
+        // `now` 65s after `set_at` (1_000.0) → "1m ago" via `format_age`.
+        let lines = roll_pending_banner_lines(&pending("0.5.235", "nightly-window"), &rows, 1_065.0);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("0.5.235") && lines[0].contains("nightly-window"),
+            "headline must carry the target version and reason: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("1m ago") && lines[1].contains("occupying a slot"),
+            "detail must carry the age and the wait condition: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn roll_pending_banner_lines_omit_reason_parenthetical_when_blank() {
+        let lines = roll_pending_banner_lines(&pending("0.5.235", ""), &[], 1_000.0);
+        assert!(
+            !lines[0].contains("()"),
+            "an empty reason must not leave a bare '()' in the headline: {lines:?}"
+        );
+    }
+
     // ── TuiDriver black-box (#1755 acceptance) ───────────────────────────
 
     /// Build a `CoordApp` whose Pipeline view is populated and whose queue is
@@ -3800,6 +4073,102 @@ mod tests {
             menu.contains("Resume"),
             "right-click on a held row must offer Resume:\n{menu}"
         );
+    }
+
+    // ── #2608: roll-pending marker surfaced on the Queue panel + status bar ─
+
+    /// Acceptance: with a live marker in the board payload, the Queue panel
+    /// renders target version, reason, and the wait condition — and the
+    /// status-bar segment does too, alongside (not instead of) `QUEUE:`.
+    #[test]
+    fn tuidriver_queue_panel_and_status_bar_show_a_live_roll_pending_marker() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![entry(1754, 0, QUEUE_STATE_RUNNING, &[])],
+            roll_pending: Some(pending("0.5.235", "nightly-window")),
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Queue;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 240, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("ROLL PENDING") && screen.contains("0.5.235"),
+            "status bar must carry a roll-pending segment naming the target \
+             version:\n{screen}"
+        );
+        assert!(
+            screen.contains("QUEUE:"),
+            "…without displacing the existing QUEUE: segment:\n{screen}"
+        );
+        assert!(
+            screen.contains("FLEET ROLL PENDING") && screen.contains("0.5.235"),
+            "Queue panel banner must name the target version:\n{screen}"
+        );
+        assert!(
+            screen.contains("nightly-window"),
+            "…and the reason:\n{screen}"
+        );
+        assert!(
+            screen.contains("occupying a slot"),
+            "…and what launching is waiting on:\n{screen}"
+        );
+    }
+
+    /// Acceptance: the banner must render even when the queue itself has no
+    /// pending rows — #2608's own incident was a marker set against a queue
+    /// that was ABOUT to go idle, and a roll can just as easily be pending
+    /// against an already-idle queue. The empty-queue early return in
+    /// `render_queue_panel` must not skip it.
+    #[test]
+    fn tuidriver_queue_panel_shows_roll_pending_banner_over_an_empty_queue() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            drive_queue: Vec::new(),
+            roll_pending: Some(pending("0.5.235", "nightly-window")),
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Queue;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 240, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("FLEET ROLL PENDING") && screen.contains("0.5.235"),
+            "the banner must render over an otherwise-empty queue:\n{screen}"
+        );
+        assert!(
+            screen.contains("drive queue is empty") || screen.contains("Drive queue is empty"),
+            "…without hiding the existing empty-queue message:\n{screen}"
+        );
+    }
+
+    /// Acceptance: with no marker, the panel renders exactly as it does
+    /// today — no empty banner, no layout shift.
+    #[test]
+    fn tuidriver_queue_panel_omits_roll_pending_banner_when_absent() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![entry(1754, 0, QUEUE_STATE_RUNNING, &[])],
+            roll_pending: None,
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Queue;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 240, 40);
+        let screen = driver.screen();
+
+        assert!(
+            !screen.contains("ROLL PENDING") && !screen.contains("FLEET ROLL PENDING"),
+            "no marker must mean no roll-pending text anywhere on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn roll_pending_status_bar_segment_is_none_when_no_marker_is_pending() {
+        let app = make_test_app(BoardData::default());
+        assert!(app.roll_pending_status_bar_segment().is_none());
     }
 
     // ── #2043 fix: `queue_clamp_h_scroll` resize self-heal ─────────────────

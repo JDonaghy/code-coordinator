@@ -9089,6 +9089,16 @@ impl CoordApp {
         // "(coord health for detail)" hint — the least load-bearing text on
         // the bar. Neither verdict is ever hidden.
         left.push(self.drive_queue_status_bar_segment());
+        // #2608: a live roll-pending marker is its own segment, right next to
+        // `drive_queue_status_bar_segment` (same priority tier — both are
+        // queue-launch state) — never folded into it, so a queue held for a
+        // roll never rides QUEUE's own escalation vocabulary
+        // (STALLED/HELD/BLOCKED). `None` (nothing pushed) when no roll is
+        // pending, same "absent, not empty" posture as the fleet-escalation
+        // segment below.
+        if let Some(seg) = self.roll_pending_status_bar_segment() {
+            left.push(seg);
+        }
         left.push(self.fleet_health_status_bar_segment());
         // #2374: fleet-level escalations (release-cordon / drive-queue
         // sentinel rows in `self.data.escalations`, keyed by a `"("`-prefixed

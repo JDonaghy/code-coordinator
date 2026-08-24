@@ -591,6 +591,7 @@ fn board_data_from_payload(payload: BoardPayload) -> BoardData {
         escalations: payload.escalations,
         fleet_health: payload.fleet_health,
         drive_queue: payload.drive_queue,
+        roll_pending: payload.roll_pending,
         approved_submissions: payload.approved_submissions,
     }
 }
