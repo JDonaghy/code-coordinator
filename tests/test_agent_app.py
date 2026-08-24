@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 from starlette.testclient import TestClient
 
 from coord.agent import AgentServer
 from coord.agent_app import build_app
+
+from .conftest import py_worker_argv
 
 
 def _init_repo(path: Path) -> Path:
@@ -37,7 +40,7 @@ def _client(
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: argv or ["/bin/sh", "-c", "echo ok"],
+        worker_command=lambda spec: argv or py_worker_argv("print('ok')"),
         repo_paths=repo_paths if repo_paths is not None else {"api": str(rp)},
         artifact_paths=artifact_paths,
     )
@@ -113,7 +116,9 @@ def test_assign_unknown_repo(tmp_path: Path) -> None:
 
 def test_cancel_endpoint(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
-    client, server = _client(tmp_path, argv=["/bin/sh", "-c", "sleep 30"], repo_path=repo)
+    client, server = _client(
+        tmp_path, argv=py_worker_argv("import time; time.sleep(30)"), repo_path=repo
+    )
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
     aid = r.json()["id"]
 
@@ -142,7 +147,13 @@ def test_inject_endpoint_delivers_message(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(
         tmp_path,
-        argv=["/bin/sh", "-c", "read a; echo got1=$a; read b; echo got2=$b"],
+        argv=py_worker_argv(
+            "import sys\n"
+            "a = sys.stdin.readline().rstrip(chr(10))\n"
+            "print('got1=' + a)\n"
+            "b = sys.stdin.readline().rstrip(chr(10))\n"
+            "print('got2=' + b)\n"
+        ),
         repo_path=repo,
     )
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
@@ -246,7 +257,9 @@ def test_health_surfaces_version_and_last_update(tmp_path: Path) -> None:
 
 def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
-    client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo hello-from-worker"], repo_path=repo)
+    client, server = _client(
+        tmp_path, argv=py_worker_argv("print('hello-from-worker')"), repo_path=repo
+    )
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
     aid = r.json()["id"]
     server.wait_for(aid)
@@ -270,7 +283,9 @@ def test_logs_endpoint_supports_since(tmp_path: Path) -> None:
     choosing an offset well inside the log (not at the very end).
     """
     repo = _init_repo(tmp_path / "repo")
-    client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo line"], repo_path=repo)
+    client, server = _client(
+        tmp_path, argv=py_worker_argv("print('line')"), repo_path=repo
+    )
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
     aid = r.json()["id"]
     server.wait_for(aid)
@@ -343,12 +358,15 @@ def test_status_returns_200_with_truncated_log(tmp_path: Path) -> None:
         repo_paths={"api": str(repo)},
         # Worker writes one complete stream-json event then sleeps so the
         # assignment stays RUNNING while we poll /status.
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"x\",\"session_id\":\"s\"}'; "
-            "printf '%s' '{\"type\":\"assistant\",\"partial'; "  # truncated last line
-            "sleep 30",
-        ],
+        worker_command=lambda spec: py_worker_argv(
+            "import sys, time\n"
+            "sys.stdout.write("
+            "'{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"x\",\"session_id\":\"s\"}'"
+            " + chr(10))\n"
+            "sys.stdout.write('{\"type\":\"assistant\",\"partial')\n"  # truncated last line
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        ),
     )
     app = build_app(server)
     from coord.agent import AssignmentSpec

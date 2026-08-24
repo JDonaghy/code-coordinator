@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -320,6 +321,87 @@ def output_and_stderr(result) -> str:
     except ValueError:
         err = ""
     return result.output + err
+
+
+# ── Portable fake-worker helpers (#2725) ─────────────────────────────────
+#
+# ``AgentServer.assign()`` spawns whatever argv ``worker_command`` returns as
+# a REAL child process (``coord/agent.py``'s ``subprocess.Popen``). Fixtures
+# across the suite stood in for the real ``claude -p`` worker with
+# hand-rolled POSIX argvs — ``["/bin/true"]``, ``["/bin/sh", "-c", script]``,
+# or a ``#!/bin/sh`` shebang script executed directly as argv[0]. All three
+# shapes fail to spawn on Windows (``[WinError 193] %1 is not a valid Win32
+# application``) since there is no POSIX shell or shebang interpreter on
+# PATH there. ``sys.executable`` — the interpreter already running pytest —
+# is guaranteed present on every platform, so every fake worker below routes
+# through it instead. Import these from ``conftest`` rather than
+# reintroducing a POSIX-only literal at a new call site.
+
+NOOP_WORKER_ARGV: list[str] = [sys.executable, "-c", ""]
+"""Portable replacement for the POSIX-only ``["/bin/true"]`` no-op worker:
+spawns a real child process that does nothing and exits 0."""
+
+
+def py_worker_argv(script: str) -> list[str]:
+    """Portable replacement for ``["/bin/sh", "-c", script]``.
+
+    ``script`` is an inline PYTHON snippet (not shell) executed via
+    ``sys.executable -c``. Translate the shell script's observable
+    behaviour (stdout, exit code, stdin reads, file writes) into equivalent
+    Python — e.g. ``"echo ok"`` -> ``"print('ok')"``, ``"exit 7"`` ->
+    ``"import sys; sys.exit(7)"``, ``"read line; echo $line"`` ->
+    ``"import sys; print(sys.stdin.readline().rstrip(chr(10)))"``.
+    """
+    return [sys.executable, "-c", script]
+
+
+def write_fake_worker_script(path: Path, script: str) -> Path:
+    """Write a portable stand-in for a ``#!/bin/sh`` shebang fake-worker
+    script at `path` (conventionally ``tmp_path / "fake-claude.py"`` — note
+    the ``.py`` suffix). `script` is Python, run via ``sys.executable``, so
+    the file needs no shebang line and no execute bit.
+
+    Returns `path` unchanged, for chaining straight into an argv:
+    ``[sys.executable, str(write_fake_worker_script(stub, script))]``.
+    Callers that previously asserted ``captured_argv[0] == str(stub)``
+    (checking that a *specific binary* — e.g. a wire-resolved provider
+    binary — was the one actually executed) must update that assertion:
+    with this shape ``argv[0]`` is ``sys.executable`` and the stub path is
+    ``argv[1]``, so assert ``str(stub) in captured_argv`` (or
+    ``captured_argv[1] == str(stub)``) instead — the intent (this exact
+    binary ran, not some other one) is unchanged.
+    """
+    path.write_text(script)
+    return path
+
+
+def noop_default_worker_command(spec, **kwargs) -> list[str]:
+    """Portable replacement for
+    ``default_worker_command(spec, binary="/bin/true")``.
+
+    Several tests dispatch through the REAL ``coord.agent.default_worker_command``
+    (to exercise its actual flag-building — ``--disallowedTools``, deny-list
+    patterns, ``--allowedTools``, etc. — end to end) while substituting
+    ``/bin/true`` for the real ``claude`` binary so nothing external actually
+    runs. ``default_worker_command`` returns ``[binary, "-p", briefing, ...
+    many more flags...]`` with ``binary`` fixed at position 0, so we can't
+    just swap in ``sys.executable`` there — followed by all those flags, the
+    interpreter would try to parse ``-p`` etc. as ITS OWN options and fail.
+
+    Instead this builds the real argv (the ``binary=`` value passed to
+    ``default_worker_command`` is irrelevant here — it never actually runs)
+    and replaces position 0..2 with ``sys.executable -c "<exit 0>"``.
+    ``python -c CMD`` terminates python's own option parsing at CMD — every
+    argument after it (the real ``-p``, ``--disallowedTools``, ...) becomes
+    the script's OWN ``sys.argv``, not a python flag, so it's inert.  The
+    logged header (``shlex.join(argv)``, see ``AgentServer._spawn``) still
+    contains every flag verbatim after the substituted prefix, so assertions
+    like ``"--disallowedTools" in header`` are unaffected.
+    """
+    from coord.agent import default_worker_command  # noqa: PLC0415
+
+    argv = default_worker_command(spec, binary="unused-noop-binary", **kwargs)
+    return [sys.executable, "-c", "import sys; sys.exit(0)", *argv[1:]]
 
 
 VALID_CONFIG = """\

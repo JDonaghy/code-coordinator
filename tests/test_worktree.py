@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from coord.agent import (
     AssignmentSpec,
     _slugify,
 )
+
+from .conftest import NOOP_WORKER_ARGV
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -68,7 +71,7 @@ def repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
 
 def _server(tmp_path: Path, repo_path: Path, *, argv: list[str] | None = None) -> AgentServer:
     if argv is None:
-        argv = ["/bin/true"]
+        argv = NOOP_WORKER_ARGV
     return AgentServer(
         machine_name="t",
         repos=["api"],
@@ -89,6 +92,18 @@ def _spec(repo_path: Path, **overrides) -> AssignmentSpec:
     )
     base.update(overrides)
     return AssignmentSpec(**base)
+
+
+# Portable replacement for the POSIX-only
+# `"echo <line> >> README && git add README && git commit -m '<msg>'"`
+# shell one-liner (#2725): appends a line to README then commits it, via
+# real `git` subprocess calls rather than shell redirection/chaining.
+_COMMIT_ONE_LINE_SCRIPT = (
+    "import subprocess\n"
+    "open('README', 'a').write({line!r} + chr(10))\n"
+    "subprocess.run(['git', 'add', 'README'], check=True)\n"
+    "subprocess.run(['git', 'commit', '-m', {msg!r}], check=True)\n"
+)
 
 
 # ── _slugify tests ────────────────────────────────────────────────────────
@@ -122,8 +137,16 @@ class TestWorktreeCreation:
         server = _server(
             tmp_path, repo,
             # Worker checks it's in a worktree (not the main repo) and writes canary
-            argv=["/bin/sh", "-c",
-                  f"test -f README && git rev-parse --abbrev-ref HEAD > {canary}"],
+            argv=[
+                sys.executable, "-c",
+                "import os, subprocess\n"
+                "if os.path.exists('README'):\n"
+                "    r = subprocess.run(\n"
+                "        ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],\n"
+                "        capture_output=True, text=True, check=True,\n"
+                "    )\n"
+                f"    open({str(canary)!r}, 'w').write(r.stdout)\n",
+            ],
         )
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
@@ -158,7 +181,10 @@ class TestWorktreeCreation:
         cwd_file = tmp_path / "cwd.txt"
         server = _server(
             tmp_path, repo,
-            argv=["/bin/sh", "-c", f"pwd > {cwd_file}"],
+            argv=[
+                sys.executable, "-c",
+                f"import os; open({str(cwd_file)!r}, 'w').write(os.getcwd())",
+            ],
         )
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
@@ -183,7 +209,10 @@ class TestWorktreeCleanup:
         server.shutdown()
 
     def test_worktree_removed_after_failure(self, tmp_path: Path, repo: Path) -> None:
-        server = _server(tmp_path, repo, argv=["/bin/sh", "-c", "exit 1"])
+        server = _server(
+            tmp_path, repo,
+            argv=[sys.executable, "-c", "import sys; sys.exit(1)"],
+        )
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
         assert final.status == FAILED
@@ -225,8 +254,7 @@ class TestWorktreeWithRemote:
         local, remote = repo_with_remote
         server = _server(
             tmp_path, local,
-            argv=["/bin/sh", "-c",
-                  "echo change >> README && git add README && git commit -m 'work'"],
+            argv=[sys.executable, "-c", _COMMIT_ONE_LINE_SCRIPT.format(line="change", msg="work")],
         )
         a = server.assign(_spec(local, issue_number=5, issue_title="test push"))
         final = server.wait_for(a.id, timeout=10)
@@ -243,7 +271,7 @@ class TestWorktreeWithRemote:
         local, remote = repo_with_remote
         server = _server(
             tmp_path, local,
-            argv=["/bin/sh", "-c", "exit 1"],
+            argv=[sys.executable, "-c", "import sys; sys.exit(1)"],
         )
         a = server.assign(_spec(local, issue_number=6, issue_title="fail no push"))
         final = server.wait_for(a.id, timeout=10)
@@ -276,8 +304,7 @@ class TestWorktreeWithRemote:
 
         server = _server(
             tmp_path, local,
-            argv=["/bin/sh", "-c",
-                  "echo change >> README && git add README && git commit -m 'work'"],
+            argv=[sys.executable, "-c", _COMMIT_ONE_LINE_SCRIPT.format(line="change", msg="work")],
         )
         with mock.patch.object(agent_mod, "_git", side_effect=_git_push_timeout):
             a = server.assign(_spec(local, issue_number=8, issue_title="push timeout"))
@@ -297,8 +324,7 @@ class TestWorktreeWithRemote:
         # First run: create and push a branch
         server1 = _server(
             tmp_path, local,
-            argv=["/bin/sh", "-c",
-                  "echo v1 >> README && git add README && git commit -m 'v1'"],
+            argv=[sys.executable, "-c", _COMMIT_ONE_LINE_SCRIPT.format(line="v1", msg="v1")],
         )
         a1 = server1.assign(_spec(local, issue_number=7, issue_title="retry test"))
         final1 = server1.wait_for(a1.id, timeout=10)
@@ -311,8 +337,9 @@ class TestWorktreeWithRemote:
             machine_name="t",
             repos=["api"],
             state_dir=tmp_path / "state2",
-            worker_command=lambda spec: ["/bin/sh", "-c",
-                                          "echo v2 >> README && git add README && git commit -m 'v2'"],
+            worker_command=lambda spec: [
+                sys.executable, "-c", _COMMIT_ONE_LINE_SCRIPT.format(line="v2", msg="v2")
+            ],
             repo_paths={"api": str(local)},
         )
         a2 = server2.assign(_spec(local, issue_number=7, issue_title="retry test"))
@@ -330,7 +357,7 @@ class TestWorktreeSetupFailure:
             machine_name="t",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/true"],
+            worker_command=lambda spec: NOOP_WORKER_ARGV,
             repo_paths={"api": str(not_a_repo)},
         )
         a = server.assign(_spec(not_a_repo))
@@ -346,7 +373,9 @@ class TestWorktreeSetupFailure:
             machine_name="t",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/sh", "-c", f"touch {canary}"],
+            worker_command=lambda spec: [
+                sys.executable, "-c", f"open({str(canary)!r}, 'w').close()"
+            ],
             repo_paths={"api": str(not_a_repo)},
         )
         a = server.assign(_spec(not_a_repo))
@@ -420,7 +449,7 @@ class TestWorktreeStartupPrune:
             machine_name="t",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/true"],
+            worker_command=lambda spec: NOOP_WORKER_ARGV,
             repo_paths={"api": str(repo)},
         )
         # If prune failed silently, we still succeed
@@ -446,7 +475,7 @@ class TestWorktreeStartupPrune:
             machine_name="t",
             repos=["api"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/true"],
+            worker_command=lambda spec: NOOP_WORKER_ARGV,
             repo_paths={"api": nonexistent},
         )
         # Direct call — this is what's actually being regression-tested.
@@ -469,7 +498,7 @@ class TestWorktreeStartupPrune:
             machine_name="t",
             repos=["api", "sdk"],
             state_dir=tmp_path / "state",
-            worker_command=lambda spec: ["/bin/true"],
+            worker_command=lambda spec: NOOP_WORKER_ARGV,
             repo_paths={"api": str(repo), "sdk": nonexistent},
         )
         # Direct call — must not raise even though "sdk" path is missing.
@@ -484,7 +513,10 @@ class TestParallelWorktrees:
         """Two assignments on the same repo with different issues should work in parallel."""
         import time
 
-        server = _server(tmp_path, repo, argv=["/bin/sh", "-c", "sleep 0.5"])
+        server = _server(
+            tmp_path, repo,
+            argv=[sys.executable, "-c", "import time; time.sleep(0.5)"],
+        )
         a1 = server.assign(_spec(repo, issue_number=10, issue_title="first"))
         a2 = server.assign(_spec(repo, issue_number=11, issue_title="second"))
 

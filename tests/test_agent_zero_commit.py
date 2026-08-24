@@ -12,6 +12,7 @@ the safe middle ground: the operator decides whether to re-dispatch or close.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,8 @@ from coord.agent import (
     AssignmentSpec,
     _looks_like_policy_refusal,
 )
+
+from .conftest import NOOP_WORKER_ARGV
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -71,6 +74,21 @@ def repo_local_only(tmp_path: Path) -> Path:
     return repo
 
 
+# Portable replacement for the POSIX-only
+# `"git config ... && git config ... && echo <content> > <filename> && git add
+# <filename> && git commit -m '<message>'"` shell chain (#2725): writes a
+# file and commits it via real `git` subprocess calls rather than shell
+# redirection/chaining.
+_COMMIT_FILE_SCRIPT = (
+    "import subprocess\n"
+    "subprocess.run(['git', 'config', 'user.email', 'w@w.com'], check=True)\n"
+    "subprocess.run(['git', 'config', 'user.name', 'Worker'], check=True)\n"
+    "open({filename!r}, 'w').write({content!r} + chr(10))\n"
+    "subprocess.run(['git', 'add', {filename!r}], check=True)\n"
+    "subprocess.run(['git', 'commit', '-m', {message!r}], check=True)\n"
+)
+
+
 # ── 0-commit exits → ADVISORY ─────────────────────────────────────────────────
 
 
@@ -88,7 +106,7 @@ def test_zero_commit_clean_exit_is_advisory_with_remote(
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
         # Worker exits cleanly but makes no git commits.
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -123,7 +141,7 @@ def test_zero_commit_clean_exit_is_advisory_local_fallback(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -153,7 +171,7 @@ def test_advisory_reason_appears_in_log(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -222,19 +240,15 @@ def test_nonzero_commit_clean_exit_is_done_with_remote(
     clone, _origin = repo_with_remote
 
     # Worker script: add a file, commit it, then exit.
-    worker_sh = (
-        "git config user.email w@w.com && "
-        "git config user.name Worker && "
-        "echo change > change.txt && "
-        "git add change.txt && "
-        "git commit -m 'real work'"
+    worker_py = _COMMIT_FILE_SCRIPT.format(
+        filename="change.txt", content="change", message="real work"
     )
     server = AgentServer(
         machine_name="t",
         repos=["api"],
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -261,19 +275,15 @@ def test_nonzero_commit_clean_exit_is_done_local_fallback(
     tmp_path: Path, repo_local_only: Path
 ) -> None:
     """Non-zero commits on a local-only repo → DONE via local branch fallback."""
-    worker_sh = (
-        "git config user.email w@w.com && "
-        "git config user.name Worker && "
-        "echo fix > fix.txt && "
-        "git add fix.txt && "
-        "git commit -m 'local fix'"
+    worker_py = _COMMIT_FILE_SCRIPT.format(
+        filename="fix.txt", content="fix", message="local fix"
     )
     server = AgentServer(
         machine_name="t",
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -308,7 +318,7 @@ def test_nonzero_exit_is_failed_regardless_of_commits(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "exit 1"],
+        worker_command=lambda spec: [sys.executable, "-c", "import sys; sys.exit(1)"],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -363,7 +373,7 @@ def test_conflict_fix_zero_commits_is_done_not_advisory(
         state_dir=tmp_path / "state",
         # Worker exits cleanly without adding new commits (simulates a
         # conflict-fix that already ran git push --force-with-lease itself).
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -400,7 +410,7 @@ def test_advisory_counted_as_completed_in_health(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -452,7 +462,7 @@ def test_analysis_deliverable_zero_commit_is_done_not_advisory(
         # Worker exits cleanly, writes nothing, but DOES emit a stream-json
         # `result` event carrying its final diagnosis — exactly what
         # `claude -p --output-format stream-json` produces.
-        worker_command=lambda spec: ["/bin/sh", "-c", f"printf '%s\\n' '{_RESULT_LINE}'"],
+        worker_command=lambda spec: [sys.executable, "-c", f"print({_RESULT_LINE!r})"],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -489,7 +499,7 @@ def test_analysis_deliverable_label_appears_in_log(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/true"],
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -524,7 +534,7 @@ def test_unlabelled_zero_commit_is_still_advisory_exactly_as_before(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", f"printf '%s\\n' '{_RESULT_LINE}'"],
+        worker_command=lambda spec: [sys.executable, "-c", f"print({_RESULT_LINE!r})"],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -622,7 +632,7 @@ def test_policy_refusal_zero_commit_is_refused_policy_not_advisory(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+            sys.executable, "-c", f"print({_POLICY_REFUSAL_RESULT_LINE!r})"
         ],
     )
     spec = AssignmentSpec(
@@ -660,7 +670,7 @@ def test_policy_refusal_reason_appears_in_log(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+            sys.executable, "-c", f"print({_POLICY_REFUSAL_RESULT_LINE!r})"
         ],
     )
     spec = AssignmentSpec(
@@ -696,7 +706,7 @@ def test_stuck_zero_commit_without_policy_markers_is_still_advisory(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c", f"printf '%s\\n' '{_STUCK_RESULT_LINE}'"
+            sys.executable, "-c", f"print({_STUCK_RESULT_LINE!r})"
         ],
     )
     spec = AssignmentSpec(
@@ -727,20 +737,18 @@ def test_nonzero_commit_with_claude_md_mention_is_still_done(
     never be reclassified — this check only ever fires on the 0-commit
     shape."""
     clone, _origin = repo_with_remote
-    worker_sh = (
-        "git config user.email w@w.com && "
-        "git config user.name Worker && "
-        "echo change > change.txt && "
-        "git add change.txt && "
-        "git commit -m 'real work' && "
-        f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+    worker_py = (
+        _COMMIT_FILE_SCRIPT.format(
+            filename="change.txt", content="change", message="real work"
+        )
+        + f"print({_POLICY_REFUSAL_RESULT_LINE!r})\n"
     )
     server = AgentServer(
         machine_name="t",
         repos=["api"],
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -804,7 +812,7 @@ def test_health_counts_refused_policy_as_completed(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+            sys.executable, "-c", f"print({_POLICY_REFUSAL_RESULT_LINE!r})"
         ],
     )
     spec = AssignmentSpec(
@@ -882,8 +890,8 @@ def test_truncated_zero_commit_is_failed_not_advisory(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'max_tokens'}'",
+            sys.executable, "-c",
+            f"print({_TRUNCATED_RESULT_LINE % 'max_tokens'!r})",
         ],
     )
     spec = AssignmentSpec(
@@ -925,8 +933,8 @@ def test_truncation_reason_appears_in_log(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'length'}'",
+            sys.executable, "-c",
+            f"print({_TRUNCATED_RESULT_LINE % 'length'!r})",
         ],
     )
     spec = AssignmentSpec(
@@ -981,20 +989,18 @@ def test_nonzero_commit_with_truncated_stop_reason_is_still_done(
     must never be reclassified — this check only ever fires on the 0-commit
     shape, exactly like the policy-refusal and analysis-deliverable checks."""
     clone, _origin = repo_with_remote
-    worker_sh = (
-        "git config user.email w@w.com && "
-        "git config user.name Worker && "
-        "echo change > change.txt && "
-        "git add change.txt && "
-        "git commit -m 'real work' && "
-        f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'max_tokens'}'"
+    worker_py = (
+        _COMMIT_FILE_SCRIPT.format(
+            filename="change.txt", content="change", message="real work"
+        )
+        + f"print({_TRUNCATED_RESULT_LINE % 'max_tokens'!r})\n"
     )
     server = AgentServer(
         machine_name="t",
         repos=["api"],
         repo_paths={"api": str(clone)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        worker_command=lambda spec: [sys.executable, "-c", worker_py],
     )
     spec = AssignmentSpec(
         repo_name="api",
