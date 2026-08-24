@@ -4815,6 +4815,66 @@ def _close_issue_local(
     github_ops.close_issue(slug, issue_number, comment=comment, force=force)
 
 
+def comment_on_issue(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Post a plain comment on an issue through the issue-tracker seam
+    (#2643, mirrors ``close_issue``).
+
+    Routes to the daemon (``POST /issue-comment``) when ``board_service`` is
+    set, else writes locally. The actual TRACKER write (GitHub via ``gh``
+    today) lives in the ``_local`` impl, so the backend stays behind one
+    seam.
+
+    Unlike ``close_issue``/``reopen_issue``, this never touches issue state
+    — an open issue stays open, a closed issue stays closed. It's the
+    state-free write those two lack a standalone route for: previously the
+    only way to post a comment without a close/reopen was
+    ``close_issue(..., comment=...)`` on an *already-closed* issue (the close
+    itself no-ops, but the comment still posts) — that trick doesn't exist
+    for an open issue.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-comment",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "body": body,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return
+    _comment_on_issue_local(repo_name, issue_number, body, repo_github=repo_github)
+
+
+def _comment_on_issue_local(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): post the comment via ``github_ops``.
+
+    The daemon endpoint (``POST /issue-comment``) calls this function
+    directly — it never recurses back out over HTTP.
+    ``github_ops.post_issue_comment`` already does the #873 capture-at-write
+    into the durable ``issue_comments`` mirror, so no separate mirror step
+    is needed here.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.post_issue_comment(slug, issue_number, body)
+
+
 def reopen_issue(
     repo_name: str,
     issue_number: int,

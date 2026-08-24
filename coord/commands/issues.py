@@ -347,6 +347,60 @@ def issue_reopen_cmd(
 
 
 @issue_group.command(
+    "comment",
+    help=(
+        "Post a plain comment on an issue through the backend-agnostic seam "
+        "(#2643). REPO is the local repo name from coordinator.yml; ISSUE is "
+        "the GH issue number.\n\n"
+        "State-free — unlike `close`/`reopen`, the issue's open/closed state "
+        "is never touched. This is the route for 'say something on this "
+        "issue without changing its state', which previously had no "
+        "coverage for an open issue (the `close --comment` workaround only "
+        "posts-without-closing when the issue is already closed).\n\n"
+        "Use --body-file for long markdown bodies (avoids shell-quoting "
+        "issues). '-' reads from stdin. Routes through the daemon seam so "
+        "agents never need to call `gh issue comment` directly."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option("--body", default=None, help="Comment body (markdown).")
+@click.option(
+    "--body-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read the body from a file. '-' = stdin.",
+)
+@_CONFIG_OPTION
+def issue_comment_cmd(
+    repo: str,
+    issue: int,
+    body: str | None,
+    body_file: Path | None,
+    config_path: Path,
+) -> None:
+    if body is not None and body_file is not None:
+        click.echo("error: --body and --body-file are mutually exclusive", err=True)
+        sys.exit(2)
+    if body_file is not None:
+        body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+    if not body:
+        click.echo("error: provide --body or --body-file", err=True)
+        sys.exit(2)
+
+    cfg = _load_config(config_path)
+    slug = _resolve_repo_slug(cfg, repo)
+    from coord.state import comment_on_issue  # noqa: PLC0415
+
+    try:
+        comment_on_issue(repo, issue, body, repo_github=slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue comment failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"#{issue} ({slug}) commented")
+
+
+@issue_group.command(
     "create",
     help=(
         "Create a new GitHub issue through the backend-agnostic seam. REPO "
