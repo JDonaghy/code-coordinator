@@ -708,6 +708,46 @@ def test_merge_entry_prefers_the_raw_rows_ci_flaky_reason_over_the_plans_generic
     assert state.merge_reason.startswith("CI re-checking:")
 
 
+def test_merge_entry_prefers_the_raw_rows_ci_pending_reason_over_the_plans_generic_one():
+    """#2712: same recovery, for the sibling CI_PENDING_PREFIX
+    classification, at the seam the existing #1891 decider tests never
+    actually exercise — they construct `IssueState(merge_reason=...)`
+    directly, bypassing this projection entirely. On a normal daemon-backed
+    board, `serve_app.board()` calls `merge_queue.plan()` unconditionally, so
+    a `merge_plan` entry is essentially always present — and its fresh
+    re-derivation can land on a different reading of the SAME still-running
+    checks than the raw row's last live `coord merge` attempt saw (e.g.
+    "checks failed: ..." vs. "CI running: ..."). Without this recovery,
+    `_decide_merge`'s `is_ci_pending_reason` wait arm (coord/drive.py) is
+    unreachable whenever a plan entry is present: the drive burns its whole
+    `--max-merge-attempts` budget on a CI run that was never actually done,
+    and dies via `_die()` — the exact accounting failure #1891 was filed to
+    fix."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "BLOCKED",
+                "reason": "checks failed: test (3.12) (failure)",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": "CI running: test (3.12), test (3.13), no-gh-on-path",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason.startswith("CI running:")
+
+
 def test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue():
     """#1505 review fix: `merge_queue.plan()` collapses CONFLICT into
     NEEDS_ATTENTION for display, and `merge_plan` is what a normal

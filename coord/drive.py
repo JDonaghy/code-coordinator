@@ -4609,6 +4609,23 @@ class Driver:
                 # session.
                 if action.exit_code in (EXIT_ESCALATED, EXIT_DEAD_END):
                     self._post_escalation_comment(state, action.message)
+                # #2712: `self.log`/`self.warn` only reach `self.out`/
+                # `self.err` (the tmux pane for a `--tmux` drive), which is
+                # destroyed the instant the session exits — the exact moment
+                # this branch runs. Without also appending to `_run_log`
+                # (`scratch_dir()/<repo>-<issue>.log`, the file that survives
+                # the pane), a `_die(...)` exit's explanation — including
+                # `merge attempted N times without landing` and its captured
+                # diagnostic — is recorded nowhere: the log simply stops
+                # after the last narrated action with no reason given, which
+                # reads as "stalled" rather than "failed".
+                prefix = "" if action.exit_code == EXIT_OK else "!! "
+                self._append_run_log(
+                    "".join(
+                        f"{self._stamp()}  {prefix}{line}\n"
+                        for line in action.message.splitlines()
+                    )
+                )
                 if action.exit_code == EXIT_OK:
                     for line in action.message.splitlines():
                         self.log(line)
