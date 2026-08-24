@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from coord.commands.status import diagnose
 from coord.forge_availability import (
+    _flush_all_ok_aggregates,
     record_ci_check_fetch,
     record_gh_call,
     record_merge_gate_refusal,
@@ -45,6 +46,11 @@ def test_reports_uptime_and_refusals_over_seeded_observations(coord_db) -> None:
                                message="build (failure)")
     record_merge_gate_refusal(repo="api", issue=2, reason="checks_pending",
                                message="e2e still running")
+    # #2654: "ok" observations buffer in-process and flush on bucket roll,
+    # atexit, or before an interesting outcome -- in real usage the
+    # producer and `coord diagnose` are different processes, so atexit has
+    # already run by the time diagnose reads the trail. Force that here.
+    _flush_all_ok_aggregates()
 
     out = _run("--window-days", "7")
 
@@ -68,6 +74,7 @@ def test_window_days_narrows_what_is_summarized(coord_db) -> None:
     )
     coord_db.commit()
     record_gh_call(("new",), outcome="ok", duration_s=0.1)
+    _flush_all_ok_aggregates()
 
     out = _run("--window-days", "30")
 
