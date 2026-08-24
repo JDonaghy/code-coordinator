@@ -1664,13 +1664,29 @@ def _stamp_test_staleness_anchor(
     doesn't need, since a rebase onto a moved base can break tests without
     the branch's own diff changing at all.
 
-    Entirely best-effort and side-effect-free on failure: repo not found in
-    config, ``gh`` unauthenticated/unreachable, or any other error just
-    leaves the three columns NULL, which the merge-queue gate already treats
-    as "staleness tracking unavailable" and skips the check — the same
+    Entirely best-effort and side-effect-free *content-wise* on failure: repo
+    not found in config, ``gh`` unauthenticated/unreachable, or any other
+    error leaves the three columns NULL, which the merge-queue gate already
+    treats as "staleness tracking unavailable" and skips the check — the same
     fail-open convention #821/#1475 established. Never raises, so a `gh`
     hiccup can't fail the verdict write it rides along with.
+
+    #2706: the write itself is NOT skippable, even when every probe came
+    back empty. This function only ever runs for a *terminal* verdict
+    (passed/skipped, gated by the caller), and on a re-test the three
+    columns already hold the PREVIOUS verdict's anchors. Returning early on
+    an all-``None`` capture — as this used to do — left that previous
+    verdict's SHAs standing under the new one, silently misattributing it to
+    a branch/base it never tested (worse than the NULL this was trying to
+    avoid: NULL fails open, a stale anchor is a false positive the merge
+    gate acts on). Mirrors #1629's treatment of ``test_toolchain`` in
+    :func:`_record_test_verdict_local`: write unconditionally, in every
+    outcome, so a fresh verdict can never inherit stale anchors from the one
+    before it.
     """
+    test_head_sha: str | None = None
+    test_base_sha: str | None = None
+    test_patch_id: str | None = None
     try:
         from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
         from coord import config as _config  # noqa: PLC0415
@@ -1678,25 +1694,21 @@ def _stamp_test_staleness_anchor(
 
         config = _config.load()
         repo_cfg = config.repo(repo_name)
-        if repo_cfg is None:
-            return
+        if repo_cfg is not None:
+            # Milestone-aware base (#934) — shared with
+            # coord.merge_queue.enqueue_approved_work's identical resolution
+            # (#1479-review) so the two can't drift apart. Only pays for the
+            # extra `gh` lookup when the repo actually opted into the git
+            # model.
+            target_branch = resolve_base_branch_for_issue_number(
+                repo_cfg, repo_cfg.github, issue_number,
+            )
 
-        # Milestone-aware base (#934) — shared with
-        # coord.merge_queue.enqueue_approved_work's identical resolution
-        # (#1479-review) so the two can't drift apart. Only pays for the
-        # extra `gh` lookup when the repo actually opted into the git model.
-        target_branch = resolve_base_branch_for_issue_number(
-            repo_cfg, repo_cfg.github, issue_number,
-        )
-
-        test_head_sha = _gho.get_branch_sha(repo_cfg.github, branch)
-        test_base_sha = _gho.get_branch_sha(repo_cfg.github, target_branch)
-        test_patch_id = _gho.get_branch_patch_id(repo_cfg.github, target_branch, branch)
+            test_head_sha = _gho.get_branch_sha(repo_cfg.github, branch)
+            test_base_sha = _gho.get_branch_sha(repo_cfg.github, target_branch)
+            test_patch_id = _gho.get_branch_patch_id(repo_cfg.github, target_branch, branch)
     except Exception:  # noqa: BLE001 — best-effort anchor; see docstring.
-        return
-
-    if test_head_sha is None and test_base_sha is None and test_patch_id is None:
-        return  # nothing captured — don't bother writing an all-NULL row
+        test_head_sha = test_base_sha = test_patch_id = None
 
     conn = get_connection()
     conn.execute(
