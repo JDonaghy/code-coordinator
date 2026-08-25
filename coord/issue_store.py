@@ -41,7 +41,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from coord import github_ops
+from coord import github_ops, sql
 from coord.comments import (
     EVENT_ADVISORY,
     EVENT_COMPLETION,
@@ -270,7 +270,8 @@ def _update_local_state(
         fields.append("exit_code=?")
         params.append(exit_code)
     params.append(assignment_id)
-    conn.execute(
+    sql.execute(
+        conn,
         f"UPDATE assignments SET {', '.join(fields)} WHERE assignment_id=?",
         tuple(params),
     )
@@ -299,14 +300,23 @@ def _record_notification(
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
-        """INSERT OR REPLACE INTO notifications
-                (assignment_id, event, branch, posted_at)
-           VALUES (?, ?, ?, ?)""",
+    # #2721: was `INSERT OR REPLACE`. Every column of `notifications` is
+    # `(assignment_id PRIMARY KEY, event, branch, posted_at)` and every one
+    # of them is supplied here, so DELETE+INSERT's "unmentioned columns reset
+    # to defaults" hazard cannot fire — there is no unmentioned column and no
+    # other table has an FK onto `notifications` for an ON DELETE cascade to
+    # touch. `sql.upsert`'s default DO UPDATE SET (every non-conflict column)
+    # is therefore behaviourally identical to the old REPLACE, portably.
+    sql.upsert(
+        conn,
+        "notifications",
+        ["assignment_id", "event", "branch", "posted_at"],
         (assignment_id, event, branch, time.time()),
+        conflict_columns=["assignment_id"],
     )
     conn.commit()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -670,7 +680,8 @@ def _assignment_type_local(assignment_id: str) -> str | None:
 
     try:
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(
+            conn,
             "SELECT type FROM assignments WHERE assignment_id = ?",
             (assignment_id,),
         ).fetchone()
@@ -688,7 +699,8 @@ def _read_review_verdict_local(assignment_id: str) -> str | None:
     from coord.state import get_connection  # noqa: PLC0415
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT review_verdict FROM assignments WHERE assignment_id = ?",
         (assignment_id,),
     ).fetchone()
@@ -751,7 +763,8 @@ def _persist_review_verdict(record: ResultRecord) -> bool:
                 from coord.state import get_connection  # noqa: PLC0415
 
                 conn = get_connection()
-                conn.execute(
+                sql.execute(
+                    conn,
                     "UPDATE assignments SET review_verdict=? WHERE assignment_id=?",
                     (record.verdict, record.assignment_id),
                 )
@@ -771,7 +784,8 @@ def _persist_review_verdict(record: ResultRecord) -> bool:
                     from coord.state import get_connection  # noqa: PLC0415
 
                     conn = get_connection()
-                    row = conn.execute(
+                    row = sql.execute(
+                        conn,
                         "SELECT repo_name, issue_number, machine_name FROM assignments "
                         "WHERE assignment_id=?",
                         (record.assignment_id,),
@@ -816,7 +830,8 @@ def _read_verdict_source_local(assignment_id: str) -> tuple[str | None, str | No
     from coord.state import get_connection  # noqa: PLC0415
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT verdict_source, verdict_source_reason FROM assignments "
         "WHERE assignment_id = ?",
         (assignment_id,),
@@ -881,7 +896,8 @@ def _persist_verdict_source(record: ResultRecord) -> None:
     for attempt in range(1, attempts + 1):
         try:
             conn = get_connection()
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE assignments SET verdict_source=?, verdict_source_reason=? "
                 "WHERE assignment_id=?",
                 (source, reason, record.assignment_id),
@@ -934,7 +950,8 @@ def get_audit_runs_for_epic(repo_name: str, epic_issue_number: int) -> list[dict
 
     try:
         conn = get_connection()
-        rows = conn.execute(
+        rows = sql.execute(
+            conn,
             "SELECT assignment_id, audit_run_number, audit_goals_json, "
             "audit_bottom_line, dispatched_at FROM assignments "
             "WHERE repo_name=? AND issue_number=? AND type='audit' "
@@ -996,7 +1013,8 @@ def _read_audit_run_local(assignment_id: str) -> int | None:
     from coord.state import get_connection  # noqa: PLC0415
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT audit_run_number FROM assignments WHERE assignment_id = ?",
         (assignment_id,),
     ).fetchone()
@@ -1025,7 +1043,8 @@ def _persist_audit_result(record: ResultRecord, *, run_number: int) -> None:
             from coord.state import get_connection  # noqa: PLC0415
 
             conn = get_connection()
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE assignments SET audit_goals_json=?, audit_bottom_line=?, "
                 "audit_run_number=? WHERE assignment_id=?",
                 (

@@ -2129,3 +2129,75 @@ class TestAuditHook:
         review_row = [r for r in rows if r["category"] == "review"][0]
         assert review_row["event_type"] == "review_approve"
         assert review_row["actor"] == "worker"
+
+
+# ── #2721: `notifications` write now goes through the dialect seam ─────────
+#
+# `_record_notification`'s `INSERT OR REPLACE` became `coord.sql.upsert` (see
+# `coord/issue_store.py`) — the PR asserts that's a no-behaviour-change
+# rewrite because every column of `notifications` is always supplied. This
+# pins that: re-notifying the same assignment_id must UPDATE the existing
+# row in place (same outward effect `INSERT OR REPLACE` had) rather than
+# raising a conflict error or leaving a stale value behind.
+
+
+def _notification_row(assignment_id: str):
+    return state_mod.get_connection().execute(
+        "SELECT * FROM notifications WHERE assignment_id=?", (assignment_id,),
+    ).fetchone()
+
+
+class TestNotificationUpsertSeam:
+    def test_renotifying_same_assignment_updates_in_place(self) -> None:
+        _seed_running_assignment("aid-notif-upsert")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-notif-upsert",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=1,
+                    commits_ahead=0,
+                    branch="issue-7-first",
+                )
+            )
+        first = _notification_row("aid-notif-upsert")
+        assert first["event"] == "failure"
+        assert first["branch"] == "issue-7-first"
+
+        # Re-seed as "running" so the second post_completion has a row to
+        # transition again, then notify a different outcome for the same
+        # assignment_id — this is exactly the `INSERT OR REPLACE` conflict
+        # path the seam rewrite must preserve.
+        _seed_running_assignment("aid-notif-upsert", issue_title="retry")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-notif-upsert",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=3,
+                    branch="issue-7-second",
+                )
+            )
+        second = _notification_row("aid-notif-upsert")
+        # Exactly one row for this assignment_id (an unrewritten REPLACE, or
+        # a naive INSERT, would either error on the PK conflict or — if that
+        # were swallowed — leave two rows behind).
+        assert (
+            state_mod.get_connection()
+            .execute(
+                "SELECT COUNT(*) AS n FROM notifications WHERE assignment_id=?",
+                ("aid-notif-upsert",),
+            )
+            .fetchone()["n"]
+            == 1
+        )
+        assert second["event"] == "completion"
+        assert second["branch"] == "issue-7-second"
+        assert second["posted_at"] >= first["posted_at"]
