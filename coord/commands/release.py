@@ -758,12 +758,13 @@ def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
               help="Seconds a host may fail to drain before the cordon "
                    "escalates loudly (default 5400).")
 @click.option("--cordon-max-deferrals", default=None, type=int,
-              help="#2240: consecutive DEFERRED runs that may hold a cordon "
-                   "for the same target before it is released outright "
-                   "(default 2). A cordon that has failed to produce a window "
-                   "twice running is not draining anything — it is blocking "
-                   "the review dispatch it is waiting for. 0 disables the "
-                   "bound and re-arms the deadlock.")
+              help="#2240/#2741: consecutive DEFERRED runs with an UNCHANGED "
+                   "busy signal that may hold a cordon for the same target "
+                   "before it is released outright (default 2) — a cordon "
+                   "does not itself block follow-on dispatch (a review still "
+                   "routes onto a cordoned host), so this bound is a genuine "
+                   "stall detector, not a workaround for blocked dispatch. "
+                   "0 disables the bound and re-arms the deadlock.")
 @click.option("--cordon-cooldown", default=None, type=float,
               help="Seconds after a #2240 release before cordoning may resume "
                    "(default 1800). Without it the next run re-cordons — the "
@@ -2355,13 +2356,25 @@ def release_cordon(
     except Exception:  # noqa: BLE001 — a listing must not fail on the journal
         pressure = rc.DeferralPressure()
     if pressure.consecutive:
-        click.echo(
-            f"\n! {rc.describe_deferral_pressure(pressure)}: these cordons "
-            "have not produced a rollable window. A cordon that has failed "
-            "twice running is blocking the work it is waiting for (#2240) — "
-            f"`coord release propagate` releases it by itself after "
-            f"{rc.DEFAULT_MAX_DEFERRALS}."
-        )
+        if pressure.progressed:
+            stall_note = (
+                "the fleet's busy signal has changed between at least two of "
+                "those runs — legs completing, new ones dispatching — so this "
+                "reads as a converging drain, not a stall (#2741); a cordon "
+                "does not itself block follow-on dispatch (a review still "
+                "routes onto a cordoned host)"
+            )
+        else:
+            stall_note = (
+                "these cordons have not produced a rollable window, and the "
+                "fleet's busy signal has held identical across every one of "
+                "those runs — a cordon does not itself block follow-on "
+                "dispatch (a review still routes onto a cordoned host), so "
+                "this is read as a genuine stall. `coord release propagate` "
+                f"releases it outright after {rc.DEFAULT_MAX_DEFERRALS} "
+                "(#2240/#2741)"
+            )
+        click.echo(f"\n! {rc.describe_deferral_pressure(pressure)}: {stall_note}.")
     if stuck_hosts:
         _echo_stuck_hosts(stuck_hosts, stuck_target)
     click.echo(

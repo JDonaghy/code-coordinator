@@ -101,6 +101,24 @@ def _verified(target="0.5.77"):
     return {"status": rp.STATUS_VERIFIED, "target_version": target, "cordons": {}}
 
 
+def _busy(kind, subject, host=None, detail=""):
+    """One `Quiescence.busy` entry, exactly as `Busy.to_dict()`/`asdict`
+    journals it (#2741)."""
+    return {"kind": kind, "subject": subject, "detail": detail, "host": host}
+
+
+def _deferred_with_busy(target="0.5.77", *, cordoned=("server",), busy=(),
+                         released_at=0.0):
+    """A `_deferred()` record that also carries a `quiescence.busy` snapshot
+    — what `deferral_pressure`'s #2741 progress check actually reads. Real
+    records always carry this (`record.quiescence = quiescence.to_dict()` is
+    written on every run); `_deferred()` omits it on purpose to exercise the
+    "no snapshot at all" fallback path elsewhere in this file."""
+    record = _deferred(target, cordoned=cordoned, released_at=released_at)
+    record["quiescence"] = {"busy": list(busy)}
+    return record
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # The re-spelled constant. `release_cordon` stays import-free of the
 # propagation shell (same seam, same reason, as `_SEVERITY_RANK` there), so
@@ -233,6 +251,84 @@ def test_describe_deferral_pressure_defaults_to_the_pressures_own_value() -> Non
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# #2741: a deferral count alone cannot tell a genuine deadlock apart from a
+# drain that is converging normally — the v0.5.244 roll deferred twice while
+# two reviews were actively dispatching onto the cordoned hosts, and #2240's
+# release fired anyway on the theory that a review "cannot be dispatched
+# onto a cordoned host". `deferral_pressure` now also compares each
+# deferred, cordoned run's journalled busy signal against the others in the
+# streak (`DeferralPressure.progressed`), and `plan_cordons` requires BOTH
+# the count *and* an unchanged signal before it releases anything.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_progress_is_detected_when_the_busy_signal_changes_between_deferrals() -> None:
+    """The exact #2741 evidence: a review dispatched onto elitebook, then a
+    different review dispatched onto dellserver, across two deferred ticks
+    that both held the same cordon. That is a converging drain, and it must
+    read as one."""
+    records = [
+        _deferred_with_busy(
+            cordoned=("dellserver", "elitebook"),
+            busy=[_busy("live RUNNING assignment", "elitebook:2729", host="elitebook")],
+        ),
+        _deferred_with_busy(
+            cordoned=("dellserver", "elitebook"),
+            busy=[_busy("live RUNNING assignment", "dellserver:2730", host="dellserver")],
+        ),
+    ]
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.consecutive == 2
+    assert pressure.progressed is True
+
+
+def test_no_progress_is_detected_when_the_busy_signal_never_changes() -> None:
+    """The genuine #2240 shape: the SAME between-legs row, unattributable
+    and unmoving, on every tick. This is what "stalled" actually looks
+    like, and it must still read that way."""
+    stuck = [_busy("drive-queue entry running", "claude-coordinator#2230")]
+    records = [
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=stuck),
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=stuck),
+    ]
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.consecutive == 2
+    assert pressure.progressed is False
+
+
+def test_progress_needs_at_least_two_readable_snapshots() -> None:
+    """One tick proves nothing either way, and a record from before this
+    field existed (or written by an older `coord` mid-roll) carries no
+    `quiescence.busy` at all — both must fail toward the pre-#2741 default
+    (`progressed=False`) rather than manufacture a claim they cannot back."""
+    one_tick = [_deferred_with_busy(busy=[_busy("x", "y")])]
+    assert rc.deferral_pressure(one_tick, target_version="0.5.77").progressed is False
+
+    no_snapshot_at_all = [_deferred(), _deferred()]  # no "quiescence" key
+    assert (
+        rc.deferral_pressure(no_snapshot_at_all, target_version="0.5.77").progressed
+        is False
+    )
+
+
+def test_detail_wording_alone_does_not_count_as_progress() -> None:
+    """Same (kind, subject, host) with different prose in `detail` — e.g.
+    "between legs" phrasing that varies run to run — must not be read as
+    different work. Comparing the full dict would produce exactly that false
+    positive."""
+    records = [
+        _deferred_with_busy(busy=[
+            _busy("drive-queue entry running", "api#7", host="server", detail="a"),
+        ]),
+        _deferred_with_busy(busy=[
+            _busy("drive-queue entry running", "api#7", host="server", detail="b"),
+        ]),
+    ]
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.progressed is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Fix 1b: acting on the count. `plan_cordons` is pure — the clock is passed
 # in — so the whole release/cooldown cycle is testable without a fleet.
 # ══════════════════════════════════════════════════════════════════════════
@@ -286,6 +382,29 @@ def test_the_cordon_is_released_at_the_bound() -> None:
     # reconstruct from the propagation journal.
     assert "v0.5.77" in plan.released.message
     assert "review" in plan.released.message
+
+
+def test_the_release_does_not_fire_while_the_drain_is_progressing() -> None:
+    """#2741: the direct regression. Reaching `max_deferrals` is necessary
+    but no longer sufficient — a streak whose busy signal actually changed
+    (`progressed=True`, from `deferral_pressure` comparing consecutive
+    journalled snapshots) must keep draining instead of being released out
+    from under itself, exactly what happened on the v0.5.244 roll."""
+    plan = rc.plan_cordons(
+        target_version="0.5.77",
+        host_versions={
+            "dellserver": "0.5.70", "elitebook": "0.5.70", "precision": "0.5.70",
+        },
+        existing=_live("dellserver", "elitebook", "precision"),
+        now=100.0,
+        pressure=rc.DeferralPressure(
+            consecutive=rc.DEFAULT_MAX_DEFERRALS, progressed=True
+        ),
+    )
+    assert plan.released is None
+    assert {c.machine for c in plan.cordon} == {
+        "dellserver", "elitebook", "precision",
+    }, "the drain must keep being tried, same as any normal in-progress cordon"
 
 
 def test_the_cooldown_stops_the_next_run_re_cordoning() -> None:
@@ -667,6 +786,31 @@ def _stub_board(monkeypatch, *, drive_queue=(), assignments=(), issues=()):
     )
 
 
+def _stub_board_sequence(monkeypatch, boards):
+    """Like `_stub_board`, but a DIFFERENT board on each successive
+    `_fetch_board()` call (repeating the last one once exhausted) — #2741
+    needs this to simulate a drive actually advancing (a different live
+    assignment on each propagate tick) rather than the same static state
+    `_stub_board` freezes in place.
+    """
+    calls = {"n": 0}
+
+    def _fetch_board():
+        index = min(calls["n"], len(boards) - 1)
+        calls["n"] += 1
+        board = boards[index]
+        return (
+            {
+                "drive_queue": list(board.get("drive_queue") or ()),
+                "assignments": list(board.get("assignments") or ()),
+                "issues": list(board.get("issues") or ()),
+            },
+            None,
+        )
+
+    monkeypatch.setattr(release_cmd, "_fetch_board", _fetch_board)
+
+
 def _serve_health(name):
     return {
         "version": "0.5.70",
@@ -780,6 +924,69 @@ def test_a_between_legs_entry_no_longer_holds_the_fleet_forever(
     assert released["released_at"] > 0
     assert released["released"]["hosts"] == ["laptop", "server"]
     assert "CORDON RELEASED" in "\n".join(rp.render_record(records[-2]))
+
+
+def test_a_converging_drain_is_not_cut_short_by_the_deadlock_release(
+    tmp_home, valid_config_path, monkeypatch, tmp_path
+):
+    """#2741, reproduced end to end. The real evidence (v0.5.244, 2026-08-24):
+    two DIFFERENT reviews dispatched onto the two cordoned hosts, 8 and 17
+    minutes before the deadlock release fired anyway on the theory that "a
+    review cannot be dispatched onto a cordoned host". Modelled here as a
+    live (attributable) assignment on EACH cordoned host that changes —
+    a different issue every tick — so the fleet is fully busy on every
+    single tick (same as the genuine-deadlock test above: it must still
+    defer, #2101 is not being repealed) but the busy signal itself is never
+    the same twice. That is a converging drain, not a stall, and unlike the
+    test above the release must NOT fire even once `max_deferrals` worth of
+    deferred ticks have gone by.
+    """
+    state_dir = _stub_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda machine, **kw: pytest.fail("nothing may roll over a busy fleet"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.5.70"], "server": ["0.5.70"]})
+    tick_count = rc.DEFAULT_MAX_DEFERRALS + 2
+    _stub_board_sequence(
+        monkeypatch,
+        [
+            {
+                "assignments": [
+                    {"repo_name": "api", "issue_number": 2729 + i,
+                     "machine_name": "laptop", "status": "RUNNING",
+                     "dispatched_at": float(i)},
+                    {"repo_name": "api", "issue_number": 2740 + i,
+                     "machine_name": "server", "status": "RUNNING",
+                     "dispatched_at": float(i)},
+                ],
+            }
+            for i in range(tick_count)
+        ],
+    )
+
+    for tick in range(tick_count):
+        result = _propagate(valid_config_path)
+        assert result.exit_code == 0, result.output
+        assert "CORDON RELEASED" not in result.output, (
+            f"tick {tick}: released mid-convergence — {result.output}"
+        )
+        assert mp.cordoned_names() == {"laptop", "server"}, (
+            f"tick {tick}: the drain is genuinely progressing — it must "
+            "still be tried, not released out from under itself"
+        )
+
+    records = rp.read_records(state_dir)
+    assert [r["status"] for r in records] == [rp.STATUS_DEFERRED] * tick_count
+    assert all(not r["cordons"].get("released") for r in records), (
+        "no run in this streak should have released anything — the busy "
+        "signal changed on every single tick"
+    )
+    # The pressure computation itself agrees, for anyone reading the journal
+    # directly rather than trusting the CLI's own refusal to release.
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.consecutive == tick_count
+    assert pressure.progressed is True
 
 
 def test_the_pre_fix_behaviour_really_does_repeat_forever(
