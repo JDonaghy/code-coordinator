@@ -108,13 +108,15 @@ def _busy(kind, subject, host=None, detail=""):
 
 
 def _deferred_with_busy(target="0.5.77", *, cordoned=("server",), busy=(),
-                         released_at=0.0):
+                         released_at=0.0, max_deferrals=None):
     """A `_deferred()` record that also carries a `quiescence.busy` snapshot
     — what `deferral_pressure`'s #2741 progress check actually reads. Real
     records always carry this (`record.quiescence = quiescence.to_dict()` is
     written on every run); `_deferred()` omits it on purpose to exercise the
     "no snapshot at all" fallback path elsewhere in this file."""
-    record = _deferred(target, cordoned=cordoned, released_at=released_at)
+    record = _deferred(
+        target, cordoned=cordoned, released_at=released_at, max_deferrals=max_deferrals
+    )
     record["quiescence"] = {"busy": list(busy)}
     return record
 
@@ -326,6 +328,65 @@ def test_detail_wording_alone_does_not_count_as_progress() -> None:
     ]
     pressure = rc.deferral_pressure(records, target_version="0.5.77")
     assert pressure.progressed is False
+
+
+def test_progress_ages_out_once_the_streak_outlasts_the_window() -> None:
+    """Fix-review finding on #2741 itself: the first cut compared signatures
+    across the WHOLE streak, so one early, genuine change (a review leg
+    handing off to a fix leg — different `Busy` signature, correctly read
+    as progress at the time) permanently poisoned `progressed` to `True` for
+    the rest of the streak — even after the very NEXT leg wedged forever
+    (a worker that crashed without ever updating its assignment row) and
+    every tick after that kept re-affirming the same stale signature. That
+    is exactly the indefinite hang #2240 exists to end, reintroduced by
+    #2741's own safeguard.
+
+    `progressed` must instead be judged over a bounded trailing window (the
+    newest `max_deferrals` signatures — the same span the release count
+    itself is checked against): a stall that develops AFTER some earlier
+    progress must age that earlier evidence out and read as a stall again.
+    """
+    signature_a = [_busy("live RUNNING assignment", "hostA:100", host="hostA")]
+    signature_b = [_busy("live RUNNING assignment", "hostB:200", host="hostB")]
+    # Oldest-first, exactly as `read_records` returns them: one genuine
+    # change (A -> B), then B held identical for several more ticks — the
+    # worker on hostB never updates its assignment row again.
+    records = [
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=signature_a),
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=signature_b),
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=signature_b),
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=signature_b),
+        _deferred_with_busy(
+            cordoned=("dellserver", "elitebook"), busy=signature_b, max_deferrals=2,
+        ),
+    ]
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.consecutive == 5, "the streak itself is still unbounded"
+    assert pressure.max_deferrals == 2
+    # The two MOST RECENT ticks both carry signature B — no evidence of
+    # progress within the trailing window, even though the streak as a
+    # whole did change once, long enough ago that it has aged out.
+    assert pressure.progressed is False, (
+        "one early change must not permanently mask a later stall"
+    )
+
+
+def test_progress_within_the_window_still_counts() -> None:
+    """The flip side of the aging-out test above: while the change is still
+    INSIDE the trailing window, it must keep reading as progress — the
+    bound must not become so tight it re-breaks the #2741 fix it is
+    protecting."""
+    signature_a = [_busy("live RUNNING assignment", "hostA:100", host="hostA")]
+    signature_b = [_busy("live RUNNING assignment", "hostB:200", host="hostB")]
+    records = [
+        _deferred_with_busy(cordoned=("dellserver", "elitebook"), busy=signature_a),
+        _deferred_with_busy(
+            cordoned=("dellserver", "elitebook"), busy=signature_b, max_deferrals=2,
+        ),
+    ]
+    pressure = rc.deferral_pressure(records, target_version="0.5.77")
+    assert pressure.consecutive == 2
+    assert pressure.progressed is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -987,6 +1048,123 @@ def test_a_converging_drain_is_not_cut_short_by_the_deadlock_release(
     pressure = rc.deferral_pressure(records, target_version="0.5.77")
     assert pressure.consecutive == tick_count
     assert pressure.progressed is True
+
+
+def test_a_stall_after_progress_still_releases(
+    tmp_home, valid_config_path, monkeypatch, tmp_path
+):
+    """Fix-review finding on #2741 itself, end to end. The canonical real
+    deadlock shape the reviewer named: a drive makes genuine progress once
+    (review leg #100/#200 hands off to a fix leg #101/#201 — a different
+    `Busy` signature, correctly read as convergence) and then the FIX LEG's
+    worker crashes without ever updating its assignment row. Every tick
+    after that observes the exact same #101/#201 `RUNNING` assignments,
+    unchanged.
+
+    Pre-fix-review: `progressed` compared signatures across the WHOLE
+    streak, so the one earlier hop (#100/#200 -> #101/#201) stayed in the
+    comparison set forever and kept `progressed=True` no matter how long
+    the fleet had actually been wedged on #101/#201 since — the release
+    could never fire and the fleet sat cordoned indefinitely, exactly the
+    #2240 failure this issue is about. Post-fix: the comparison is bounded
+    to the trailing `max_deferrals` window, so once enough ticks have gone
+    by that the early change ages out, the now-genuinely-stalled window is
+    read correctly and the release fires.
+
+    A `deferral_pressure` reading at tick N is computed from the journal
+    AS IT STOOD BEFORE tick N ran (that tick's own busy signature is only
+    ever compared FROM the next tick onward), so with `max_deferrals=2` it
+    takes four ticks, not three, to reach the state described above: tick 0
+    writes signature A; tick 1 writes signature B (the prior journal has
+    only A, too few readable snapshots to claim progress either way, and
+    the count is still below the bound); tick 2 writes signature B again
+    (the prior journal is [A, B] — genuinely different, so `progressed` is
+    correctly `True` and nothing releases yet); only at tick 3, reading a
+    prior journal of [A, B, B], is the trailing two-tick window finally
+    [B, B] — unchanged — and the release fires.
+    """
+    state_dir = _stub_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda machine, **kw: pytest.fail("nothing may roll over a busy fleet"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.5.70"], "server": ["0.5.70"]})
+    progressing_board = {
+        "assignments": [
+            {"repo_name": "api", "issue_number": 100,
+             "machine_name": "laptop", "status": "RUNNING"},
+            {"repo_name": "api", "issue_number": 200,
+             "machine_name": "server", "status": "RUNNING"},
+        ],
+    }
+    # The SAME two assignment rows, unchanged, on every tick from here on —
+    # `_stub_board_sequence` repeats the last entry once its list is
+    # exhausted, modelling the fix leg's worker having crashed without ever
+    # updating them.
+    wedged_board = {
+        "assignments": [
+            {"repo_name": "api", "issue_number": 101,
+             "machine_name": "laptop", "status": "RUNNING"},
+            {"repo_name": "api", "issue_number": 201,
+             "machine_name": "server", "status": "RUNNING"},
+        ],
+    }
+    _stub_board_sequence(monkeypatch, [progressing_board, wedged_board])
+
+    # tick 0: cordons, defers on #100/#200. Journal so far: [A].
+    first = _propagate(valid_config_path)
+    assert first.exit_code == 0, first.output
+    assert "CORDON RELEASED" not in first.output
+    assert mp.cordoned_names() == {"laptop", "server"}
+
+    # tick 1: #100/#200 -> #101/#201. Prior journal is [A] — one readable
+    # snapshot proves nothing either way, and the count (1) is still below
+    # `max_deferrals` — so this cannot release regardless. Journal now [A, B].
+    second = _propagate(valid_config_path)
+    assert second.exit_code == 0, second.output
+    assert "CORDON RELEASED" not in second.output, (
+        "released before there was even enough evidence to judge — "
+        + second.output
+    )
+    assert mp.cordoned_names() == {"laptop", "server"}
+
+    # tick 2: #101/#201 again. Prior journal is [A, B] — genuinely
+    # different, real convergence — must NOT release even though the count
+    # has now reached `max_deferrals`. Journal now [A, B, B].
+    third = _propagate(valid_config_path)
+    assert third.exit_code == 0, third.output
+    assert "CORDON RELEASED" not in third.output, (
+        "released while the drain was still converging — " + third.output
+    )
+    assert mp.cordoned_names() == {"laptop", "server"}
+
+    # tick 3: #101/#201 yet again — the fix leg is wedged. Prior journal is
+    # [A, B, B]: the trailing two-tick window is [B, B], unchanged, even
+    # though the streak as a whole did change once, further back. This is
+    # now a genuine stall and must self-release, same as the plain
+    # between-legs deadlock does.
+    fourth = _propagate(valid_config_path)
+    assert fourth.exit_code == 0, fourth.output
+    assert "CORDON RELEASED" in fourth.output, (
+        "a stall that developed AFTER earlier progress must still be "
+        "detected — " + fourth.output
+    )
+    assert mp.cordoned_names() == set(), (
+        "this is the state that, pre-fix-review, needed `coord release "
+        "cordon --clear --all` by hand forever — one early hop had "
+        "permanently masked the later stall"
+    )
+
+    records = rp.read_records(state_dir)
+    assert [r["status"] for r in records] == [rp.STATUS_DEFERRED] * 4
+    # Recomputed on the journal as it stood BEFORE the releasing tick — the
+    # exact state that tick's own decision was based on.
+    pressure = rc.deferral_pressure(records[:-1], target_version="0.5.77")
+    assert pressure.consecutive == 3
+    assert pressure.progressed is False, (
+        "the trailing window (the two most recent of the three prior ticks) "
+        "is unchanged, even though the streak changed once further back"
+    )
 
 
 def test_the_pre_fix_behaviour_really_does_repeat_forever(

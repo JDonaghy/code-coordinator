@@ -155,20 +155,31 @@ Two consecutive deferrals is not, on its own, evidence of anything —
 `propagate`'s tick interval is shorter than a normal review/fix/smoke leg
 takes to run, so a *healthy*, converging drain reliably produces at least one
 or two deferred ticks while it finishes. The distinguishing signal is
-**whether the fleet's own busy signal changed between those ticks**
-(:func:`deferral_pressure`'s ``progressed``, from comparing each deferred
-run's journalled :class:`~coord.release_propagate.Quiescence` snapshot
-against the others in the same streak): a different assignment, a different
-queue key, a different host — anything — means legs are completing and new
-ones are being dispatched, i.e. the drain is doing exactly what it is
-supposed to. Only a streak whose busy signal is *identical* on every single
-tick is the condition the blunt reasoning above actually describes, and
+**whether the fleet's own busy signal changed within the trailing window
+that count is measured over** (:func:`deferral_pressure`'s ``progressed``,
+from comparing each deferred run's journalled
+:class:`~coord.release_propagate.Quiescence` snapshot against the OTHER
+SNAPSHOTS IN THAT SAME TRAILING WINDOW — the newest ``max_deferrals`` of
+them, the same span the tick count itself is checked against, not the whole
+streak back to the last release): a different assignment, a different queue
+key, a different host — anything — means legs are completing and new ones
+are being dispatched, i.e. the drain is doing exactly what it is supposed
+to. Only a WINDOW whose busy signal is *identical* on every tick inside it
+is the condition the blunt reasoning above actually describes, and
 :func:`plan_cordons` now requires that in addition to the tick count before
-it releases anything. Data too sparse or too old to carry a ``quiescence``
-snapshot degrades to the pre-#2741 behaviour (releases on count alone) —
-never the reverse, which would fail toward holding the fleet cordoned longer
-on missing data, the same wrong direction #2101's read-side failures already
-refuse everywhere else in this module.
+it releases anything. Windowed on purpose, not "changed anywhere in the
+whole streak": an unbounded comparison lets one early, genuine hop (review
+leg -> fix leg producing a different signature) permanently poison
+``progressed`` to ``True`` even after the very next leg wedges forever and
+every later tick repeats the same stale signature — exactly the indefinite
+hang #2240 exists to end, reintroduced by #2741's own first cut. A stall
+that develops after some earlier progress now ages out of the window and
+reads as a stall again, rather than being masked by history outside the
+window that stopped being relevant. Data too sparse or too old to carry a
+``quiescence`` snapshot degrades to the pre-#2741 behaviour (releases on
+count alone) — never the reverse, which would fail toward holding the fleet
+cordoned longer on missing data, the same wrong direction #2101's read-side
+failures already refuse everywhere else in this module.
 
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
@@ -619,15 +630,27 @@ class DeferralPressure:
     #: this field existed, or when there is no matched run at all.
     max_deferrals: int = DEFAULT_MAX_DEFERRALS
     #: #2741: did the fleet's own busy signal (each deferred run's journalled
-    #: ``quiescence`` snapshot) actually CHANGE somewhere across this streak?
-    #: True only when at least two runs in the streak carried a readable
-    #: snapshot and those snapshots were not all identical — positive
-    #: evidence that legs are completing and new ones are being dispatched,
-    #: i.e. the drain is converging rather than stuck. Defaults to ``False``
-    #: (no evidence of progress, same as the pre-#2741 read) for a record too
-    #: old or too sparse to carry the snapshot at all — "unreadable degrades
-    #: toward the existing behaviour, never toward a stronger claim" is the
-    #: same rule the rest of this module follows on a read failure.
+    #: ``quiescence`` snapshot) actually CHANGE somewhere within the
+    #: TRAILING WINDOW this pressure reading is checked over — the newest
+    #: ``max_deferrals`` cordoned-deferral snapshots, the same span
+    #: ``consecutive >= max_deferrals`` is itself counting, NOT the whole
+    #: streak back to the last release? True only when at least two runs in
+    #: that window carried a readable snapshot and those snapshots were not
+    #: all identical — positive evidence that legs are completing and new
+    #: ones are being dispatched, i.e. the drain is converging rather than
+    #: stuck. Bounded on purpose: comparing across the unbounded streak let
+    #: one early, genuine change permanently poison this to ``True`` even
+    #: after a later leg wedged forever and every subsequent tick repeated
+    #: the same stale signature — the streak resets only on a non-deferral,
+    #: a version change, or a release, so an unbounded read could never
+    #: recover from that inside one streak. Windowing means a stall that
+    #: develops AFTER some earlier progress ages out of the evidence and
+    #: reads as a stall again, same as if it had happened alone. Defaults to
+    #: ``False`` (no evidence of progress, same as the pre-#2741 read) for a
+    #: record too old or too sparse to carry the snapshot at all —
+    #: "unreadable degrades toward the existing behaviour, never toward a
+    #: stronger claim" is the same rule the rest of this module follows on a
+    #: read failure.
     progressed: bool = False
 
     def cooling_for(self, now: float, cooldown: float) -> float:
@@ -667,15 +690,27 @@ class DeadlockRelease:
         version = f"v{self.target_version}" if self.target_version else "the release"
         who = ", ".join(self.hosts) if self.hosts else "no host (already clear)"
         minutes = self.cooldown_seconds / 60.0
+        # #2741 review: `progressed` only ever looks at the newest
+        # `max_deferrals` cordoned-deferral signatures (see
+        # `deferral_pressure`), not the whole streak — so when the streak
+        # ran longer than that (e.g. an earlier release attempt was itself
+        # blocked by evidence that has since aged out), "every one of them"
+        # would overclaim. Name the actual window that was checked.
+        window_desc = (
+            "every one of them"
+            if self.consecutive_deferrals <= self.max_deferrals
+            else f"the most recent {self.max_deferrals} of them"
+        )
         return (
             f"CORDON RELEASED (#2240/#2741): {self.consecutive_deferrals} "
             f"consecutive propagate runs deferred {version} while holding a "
-            f"cordon, and the fleet's busy signal held IDENTICAL across every "
-            f"one of them — no leg completed, no new leg dispatched. That is a "
-            f"genuine stall, not a cordon blocking dispatch (a review for "
-            f"in-flight work already routes onto a cordoned host regardless — "
-            f"only NEW drive launches are gated) and not a converging drain "
-            f"that just hasn't hit a quiescent tick yet. Uncordoning {who} and "
+            f"cordon, and the fleet's busy signal held IDENTICAL across "
+            f"{window_desc} — no leg completed, no new leg dispatched. That "
+            f"is a genuine stall, not a cordon blocking dispatch (a review "
+            f"for in-flight work already routes onto a cordoned host "
+            f"regardless — only NEW drive launches are gated) and not a "
+            f"converging drain that just hasn't hit a quiescent tick yet. "
+            f"Uncordoning {who} and "
             f"not cordoning again for {minutes:.0f}m, so whatever is actually "
             f"wedged has a window to be noticed and fixed; the roll will be "
             f"retried after that."
@@ -709,6 +744,22 @@ def _busy_signature(record: Mapping[str, Any]) -> frozenset[tuple[str, str, str 
     fleet really did have a quiescent moment recorded, which is itself
     meaningful (arguably a converging drain), and must not be confused with
     "we have no idea what this run saw".
+
+    #2741 review: can a record this function is actually called against (a
+    ``DEFERRED`` record that HELD a cordon — see the caller in
+    :func:`deferral_pressure`) ever carry a *readable but empty* ``busy``
+    list, i.e. ``frozenset()``? No, by construction of the one place that
+    writes ``STATUS_DEFERRED``: every branch that finishes with
+    ``STATUS_DEFERRED`` does so because ``fully_busy`` or a non-empty
+    ``still_busy``/``busy_hosts`` held, and all three are derived from
+    ``quiescence.busy`` being non-empty (see
+    ``coord.commands.release.release_propagate``, the one caller of
+    ``_finish(rp.STATUS_DEFERRED, ...)``). So a well-formed deferred+cordoned
+    record cannot carry an empty-but-readable snapshot today; if that
+    invariant is ever broken elsewhere, the frozenset() it produces would
+    still only ever read as "changed" relative to a DIFFERENT non-empty
+    snapshot, which the trailing-window bound in :func:`deferral_pressure`
+    already limits the blast radius of (see that function's docstring).
     """
     quiescence = record.get("quiescence")
     if not isinstance(quiescence, Mapping):
@@ -769,6 +820,25 @@ def deferral_pressure(
     has simply not yet hit a fully-quiescent tick. See the module docstring's
     "#2741" section for the incident that showed the count-alone read firing
     while two reviews were actively dispatching onto the cordoned hosts.
+
+    Review of the first #2741 cut: comparing signatures across the WHOLE
+    streak lets one early, genuine change permanently poison ``progressed``
+    to ``True`` — a drive can advance once (review leg -> fix leg, a
+    different signature) and then wedge forever on the very next leg (a
+    worker that crashes without ever updating its assignment row), and every
+    tick after that keeps re-affirming the same stale signature. Because the
+    comparison looked at "changed anywhere, ever", that one earlier hop was
+    enough to block the deadlock-release for the rest of the streak — no
+    matter how many ticks the fleet had actually been stuck since. That is
+    the exact failure #2240 exists to end, defeated by #2741's own
+    safeguard. So the comparison is now bounded to the same trailing window
+    :func:`plan_cordons` actually acts on: only the newest ``max_deferrals``
+    cordoned-deferral signatures (the ones ``consecutive >= max_deferrals``
+    is itself counting) are considered. A stall that develops AFTER some
+    earlier progress ages out of the window exactly when that progress
+    stops being recent enough to matter, so it reads as a stall again —
+    while a streak still shorter than the window behaves exactly as before
+    (the window is the whole streak so far).
     """
     want = normalize_version(target_version)
     consecutive = 0
@@ -808,11 +878,26 @@ def deferral_pressure(
             signature = _busy_signature(raw)
             if signature is not None:
                 signatures.append(signature)
-    # Positive evidence only: at least two readable snapshots in the streak,
+    effective_max_deferrals = (
+        DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
+    )
+    # `signatures` was built newest-first (the walk itself is newest-first),
+    # so the first `effective_max_deferrals` entries ARE the trailing window
+    # — the same one `consecutive >= max_deferrals` counts against. Bounded
+    # on purpose (see the docstring's "#2741 review" section): a signature
+    # that changed once, long enough ago to have aged out of this window,
+    # must not keep reading as "progress" forever. `effective_max_deferrals
+    # <= 0` (an operator running `--cordon-max-deferrals 0`, #2101's
+    # original re-arm-immediately knob) slices to an empty window, which
+    # safely defaults `progressed` to `False` below — harmless either way,
+    # since `plan_cordons`'s own `max_deferrals > 0` guard already keeps the
+    # release path unreachable whenever that knob is 0.
+    window = signatures[:max(effective_max_deferrals, 0)]
+    # Positive evidence only: at least two readable snapshots in the window,
     # and they were not all the same. Fewer than two, or none readable at
     # all, leaves `progressed` at its safe default (False) — see the field's
     # own docstring for why that direction, not the reverse, is safe.
-    progressed = len(signatures) >= 2 and len(set(signatures)) > 1
+    progressed = len(window) >= 2 and len(set(window)) > 1
     return DeferralPressure(
         consecutive=consecutive,
         last_release_at=last_release_at,
