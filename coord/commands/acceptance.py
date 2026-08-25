@@ -22,8 +22,9 @@ Subcommands:
   caused #1314. **Requires no acceptance driver at all** — unlike ``run``/
   ``record`` above, mock-authoring only needs ``gh`` + a machine to dispatch
   to, so it works before ``acceptance.drivers`` has an entry for the repo
-  (see :func:`coord.acceptance.acceptance_capability_gap`'s sibling
-  ``_resolve_driver``, which ``run``/``record`` call and ``mock`` does not).
+  (see this module's :func:`_resolve_driver`, the sibling of
+  :func:`coord.acceptance.acceptance_capability_gap`, which ``run``/``record``
+  call and ``mock`` does not).
   **Refuses outright from a thin client** (:func:`_refuse_if_thin_client_mock`,
   #2018) — mirrors ``coord.commands.portal._refuse_if_thin_client``: the
   ``gh`` calls this dispatch makes are plain local ``subprocess`` calls, not

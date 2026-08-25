@@ -1180,16 +1180,14 @@ def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
         ),
     ))
 
-    # Mirrors `coord.config.SEALED_ACCEPTANCE_DIR` / `AcceptanceConfig.
-    # sealed_paths` — a plain literal here (not an import) keeps this
-    # module's only dependency on `coord.config`'s shape at the `cfg`
-    # parameter `gather_facts` already takes duck-typed, not a hard import.
-    sealed = ["tests/acceptance/", *acc.entrypoints]
-    out.append(Finding(
-        layer="oracle", check="oracle.sealed_paths_resolvable", severity=OK,
-        summary=f"sealed path set resolves: {', '.join(sealed)}",
-    ))
-
+    # Sealed-path resolvability is NOT reported as its own finding: the only
+    # way it can actually fail is a declared `entrypoint:` missing from disk,
+    # and that is already exactly what `oracle.entrypoint_missing` below
+    # checks (with the CRIT + fix a broken driver deserves). A standalone
+    # "sealed paths resolve" finding hardcoded to OK right next to that CRIT
+    # branch would just contradict it in the same report for the same repo —
+    # see #2748 review — so the entrypoint branch below is the one and only
+    # signal for this.
     if not acc.entrypoints:
         out.append(Finding(
             layer="oracle", check="oracle.entrypoint_not_required", severity=OK,
@@ -1641,8 +1639,9 @@ def doctor_summary_lines(
     missing ``test_command``, a repo no machine declares — is equally visible
     from a config read that costs nothing and needs no fleet, so duplicating it
     into the fleet report buys no new information while burying the finding
-    that does. ``coord repo doctor <name>`` reports all five layers; this
-    reports the one that needed a live probe to discover.
+    that does. ``coord repo doctor <name>`` reports all six layers (the five
+    core layers plus the optional ``oracle`` layer, #2748); this reports the
+    one that needed a live probe to discover.
     """
     out: list[tuple[bool, str]] = []
     for f in report.findings:

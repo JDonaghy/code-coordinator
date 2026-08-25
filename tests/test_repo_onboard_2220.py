@@ -556,7 +556,7 @@ class TestOracleLayer:
         report = ro.evaluate(facts)
         checks = _checks(report)
         assert "oracle.driver_declared" in checks
-        assert "oracle.sealed_paths_resolvable" in checks
+        assert "oracle.sealed_paths_resolvable" not in checks
         assert "oracle.entrypoint_not_required" in checks
         assert "oracle.fixture_server_not_needed" in checks
         assert report.ok
@@ -572,7 +572,14 @@ class TestOracleLayer:
             ),
         )
         report = ro.evaluate(facts)
-        assert "oracle.entrypoint_missing" in _checks(report)
+        checks = _checks(report)
+        assert "oracle.entrypoint_missing" in checks
+        # #2748 review: this finding used to run alongside a hardcoded-OK
+        # `oracle.sealed_paths_resolvable` for the very same declared path,
+        # so the same report simultaneously claimed the path "resolves" and
+        # "does not exist". That finding is gone now — the entrypoint branch
+        # is the only signal for sealed-path resolvability.
+        assert "oracle.sealed_paths_resolvable" not in checks
         assert not report.ok
         f = next(f for f in report.findings if f.check == "oracle.entrypoint_missing")
         assert "tui/tests/acceptance.rs" in f.summary

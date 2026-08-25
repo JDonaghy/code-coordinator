@@ -713,7 +713,9 @@ def _write_acceptance_driver_entry(*, target: Path, name: str, ci_template: str)
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(
             f"refusing to write acceptance.drivers.{name}: the edited config "
-            f"does not parse ({exc}). {target} is unchanged."
+            f"does not parse ({exc}). {target} is unchanged — but the repo/"
+            f"machine onboarding above already succeeded. Add the driver by "
+            f"hand, then `coord repo doctor {name}` to confirm it resolves."
         ) from exc
     finally:
         probe_path.unlink(missing_ok=True)
@@ -723,7 +725,9 @@ def _write_acceptance_driver_entry(*, target: Path, name: str, ci_template: str)
         raise click.ClickException(
             f"refusing to write acceptance.drivers.{name}: the edit parsed "
             f"but does not resolve to a {spec['kind']!r} driver for {name!r}. "
-            f"{target} is unchanged."
+            f"{target} is unchanged — but the repo/machine onboarding above "
+            f"already succeeded. Add the driver by hand, then `coord repo "
+            f"doctor {name}` to confirm it resolves."
         )
 
     target.write_text(updated, encoding="utf-8")
