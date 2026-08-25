@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from coord import sql
 from coord.platform_paths import default_coord_dir
 
 COORD_DIR = default_coord_dir()
@@ -65,10 +66,8 @@ def _open(path: Path) -> sqlite3.Connection:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
+    sql.apply_connection_setup(conn)
+    sql.apply_row_factory(conn)
     # #2598: _ensure_schema/_maybe_migrate_json/_migrate_gate_order/
     # _backfill_orphaned_review_verdicts are convergent one-time operations,
     # not per-open invariants — but every one of them ran unconditionally on
@@ -228,7 +227,7 @@ def _read_schema_version(conn: sqlite3.Connection) -> int:
     two `_migrate_add_columns` entries when they landed without one).
     """
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        row = sql.execute(conn, "SELECT MAX(version) FROM schema_version").fetchone()
     except sqlite3.OperationalError:
         return 0  # table doesn't exist yet
     if row is None or row[0] is None:
@@ -250,21 +249,41 @@ def _fix_schema_version_table(conn: sqlite3.Connection) -> None:
     Safe to call against any existing shape: the old broken table (any
     number of duplicate rows, no constraint), the new constrained table
     (already migrated — a no-op), or no table at all (fresh database).
+
+    The duplicate-row shape is SQLite-only legacy debt (#2724): it can only
+    exist on a database that lived through the pre-#2598 unconstrained
+    ``INSERT OR IGNORE`` era, which no Postgres deployment ever did. A
+    Postgres connection therefore skips straight to ensuring the
+    constrained table exists, with none of the collapse dance.
     """
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    dialect = sql.detect_dialect(conn)
+    if dialect != sql.DIALECT_SQLITE:
+        sql.executescript(
+            conn, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
+        )
+        conn.commit()
+        return
+    row = sql.execute(
+        conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'"
     ).fetchone()
     if row is not None and "PRIMARY KEY" in (row[0] or ""):
         return  # already the constrained post-#2598 shape
-    conn.executescript(
+    sql.executescript(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
         CREATE TABLE schema_version_new (version INTEGER PRIMARY KEY);
-        INSERT OR IGNORE INTO schema_version_new
-            SELECT DISTINCT version FROM schema_version;
+        """,
+    )
+    sql.insert_ignore_select(
+        conn, "schema_version_new", "SELECT DISTINCT version FROM schema_version"
+    )
+    sql.executescript(
+        conn,
+        """
         DROP TABLE schema_version;
         ALTER TABLE schema_version_new RENAME TO schema_version;
-        """
+        """,
     )
     conn.commit()
 
@@ -278,15 +297,17 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     REPLACE`` would do here, since they only dedupe on a *matching* primary
     key, and a version bump's whole point is that the key changes).
     """
-    conn.execute("DELETE FROM schema_version")
-    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+    sql.execute(conn, "DELETE FROM schema_version")
+    sql.execute(conn, "INSERT INTO schema_version (version) VALUES (?)", (version,))
     conn.commit()
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create all tables and indexes if they don't already exist."""
-    _fix_schema_version_table(conn)
-    conn.executescript("""
+# Every ``__AUTOPK_DDL__`` sentinel below is substituted at schema-creation
+# time (see :func:`_ensure_schema`) with the dialect-appropriate
+# auto-incrementing-integer-primary-key DDL from
+# :func:`coord.sql.autoincrement_pk_ddl` -- this file names no backend's
+# schema syntax directly (#2724).
+_SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS assignments (
             assignment_id TEXT PRIMARY KEY,
             machine_name TEXT NOT NULL,
@@ -355,7 +376,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS split_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id __AUTOPK_DDL__,
             split_proposal_id INTEGER NOT NULL REFERENCES split_proposals(id),
             title TEXT NOT NULL,
             scope TEXT NOT NULL,
@@ -363,7 +384,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS merge_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id __AUTOPK_DDL__,
             assignment_id TEXT NOT NULL,
             repo_name TEXT NOT NULL,
             repo_github TEXT NOT NULL,
@@ -394,7 +415,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id __AUTOPK_DDL__,
             started_at TEXT,
             ended_at TEXT,
             clean_shutdown INTEGER DEFAULT 0,
@@ -448,7 +469,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- Modeled on issue_context above: additive, no UPDATE/DELETE
         -- except the opportunistic audit.max_rows trim in coord/audit.py.
         CREATE TABLE IF NOT EXISTS audit_log (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            __AUTOPK_DDL__,
             ts            REAL    NOT NULL,
             tier          TEXT    NOT NULL,
             category      TEXT    NOT NULL,
@@ -485,7 +506,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- rest of this schema's timestamp columns. body_ref is reserved,
         -- unused for now — the future Azure-blob offload seam.
         CREATE TABLE IF NOT EXISTS issue_comments (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                  __AUTOPK_DDL__,
             gh_comment_id       INTEGER UNIQUE,
             repo_name           TEXT    NOT NULL,
             issue_number        INTEGER NOT NULL,
@@ -513,7 +534,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- whole record exists to be read by a human via the Pipeline row's
         -- right-click menu, not machine-parsed.
         CREATE TABLE IF NOT EXISTS drive_escalations (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               __AUTOPK_DDL__,
             repo_name        TEXT    NOT NULL,
             issue_number     INTEGER NOT NULL,
             stage            TEXT    NOT NULL DEFAULT 'merge',
@@ -567,7 +588,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- `dellserver`).  `_reconcile_running` treats a mismatch as UNKNOWN,
         -- never as dead — see coord/drive_queue.py.
         CREATE TABLE IF NOT EXISTS drive_queue (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            __AUTOPK_DDL__,
             repo_name     TEXT    NOT NULL,
             issue_number  INTEGER NOT NULL,
             position      INTEGER NOT NULL,
@@ -754,7 +775,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- to send it until that is true.  '' for a row that announces
         -- nothing.
         CREATE TABLE IF NOT EXISTS portal_outbox (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            __AUTOPK_DDL__,
             submission_id TEXT    NOT NULL,
             seq           INTEGER NOT NULL,
             revision      INTEGER NOT NULL,
@@ -848,7 +869,24 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON portal_outbox(state, submission_id, seq);
         CREATE INDEX IF NOT EXISTS idx_portal_events_submission
             ON portal_events(submission_id);
-    """)
+"""
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create all tables and indexes if they don't already exist.
+
+    ``_SCHEMA_SQL``'s 8 auto-incrementing primary key columns are written
+    as the dialect-neutral sentinel ``__AUTOPK_DDL__`` rather than literal
+    ``INTEGER PRIMARY KEY AUTOINCREMENT`` text (#2724) -- the actual DDL
+    fragment for *conn*'s dialect comes from
+    :func:`coord.sql.autoincrement_pk_ddl`, so this module names no
+    backend-specific schema syntax itself.
+    """
+    _fix_schema_version_table(conn)
+    dialect = sql.detect_dialect(conn)
+    pk_ddl = sql.autoincrement_pk_ddl(dialect)
+    schema_sql = _SCHEMA_SQL.replace("__AUTOPK_DDL__", pk_ddl)
+    sql.executescript(conn, schema_sql)
     conn.commit()
     # Column-level migrations for existing databases.  SQLite does not support
     # "ADD COLUMN IF NOT EXISTS", so we catch OperationalError instead.
@@ -1225,9 +1263,9 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
     Safe to call on databases that already have the columns — the
     OperationalError raised by SQLite is silently swallowed.
     """
-    for sql in _MIGRATE_ADD_COLUMNS:
+    for ddl in _MIGRATE_ADD_COLUMNS:
         try:
-            conn.execute(sql)
+            sql.execute(conn, ddl)
             conn.commit()
         except sqlite3.OperationalError:
             pass  # Column already exists
@@ -1243,15 +1281,15 @@ def _maybe_migrate_json(conn: sqlite3.Connection) -> None:
     (e.g. from stale code, test fixtures, or an agent writing legacy state).
     """
     # Marker check must come first — bail out immediately if migration already ran.
-    cursor = conn.execute(
-        "SELECT value FROM board_meta WHERE key='json_migrated'"
+    cursor = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key='json_migrated'"
     )
     if cursor.fetchone() is not None:
         return
     dispatched_json = COORD_DIR / "dispatched.json"
     if not dispatched_json.exists():
         return
-    cursor = conn.execute("SELECT COUNT(*) FROM assignments")
+    cursor = sql.execute(conn, "SELECT COUNT(*) FROM assignments")
     if cursor.fetchone()[0] > 0:
         return
     try:
@@ -1283,13 +1321,15 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
             except Exception:  # noqa: BLE001
                 pass
         for rec in dispatched_data:
-            conn.execute(
-                """INSERT OR IGNORE INTO assignments (
-                    assignment_id, machine_name, repo_name, repo_github,
-                    issue_number, issue_title, status, type, briefing,
-                    files_allowed, model, dispatched_at, review_of_assignment_id,
-                    required_gates
-                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)""",
+            sql.insert_ignore(
+                conn,
+                "assignments",
+                [
+                    "assignment_id", "machine_name", "repo_name", "repo_github",
+                    "issue_number", "issue_title", "status", "type", "briefing",
+                    "files_allowed", "model", "dispatched_at",
+                    "review_of_assignment_id", "required_gates",
+                ],
                 (
                     rec.get("assignment_id", ""),
                     rec.get("machine_name", ""),
@@ -1297,6 +1337,7 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     rec.get("repo_github"),
                     rec.get("issue_number", 0),
                     rec.get("issue_title", ""),
+                    "running",
                     rec.get("type", "work"),
                     rec.get("briefing", ""),
                     json.dumps(rec.get("files_likely", [])),
@@ -1312,12 +1353,13 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
             try:
                 notified: dict[str, dict] = json.loads(notified_json.read_text())
                 for aid, info in notified.items():
-                    conn.execute(
-                        """INSERT OR REPLACE INTO notifications
-                           (assignment_id, event, branch, posted_at)
-                           VALUES (?, ?, ?, ?)""",
+                    sql.upsert(
+                        conn,
+                        "notifications",
+                        ["assignment_id", "event", "branch", "posted_at"],
                         (aid, info.get("event", ""), info.get("branch"),
                          info.get("posted_at", _time.time())),
+                        conflict_columns=["assignment_id"],
                     )
             except Exception:  # noqa: BLE001
                 pass
@@ -1333,19 +1375,18 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     aid = a.get("assignment_id")
                     if not aid:
                         continue
-                    conn.execute(
-                        """INSERT OR REPLACE INTO assignments (
-                            assignment_id, machine_name, repo_name, repo_github,
-                            issue_number, issue_title, status, type, branch, pr_url,
-                            briefing, files_allowed, files_forbidden, model,
-                            dispatched_at, finished_at, smoke_test, smoke_test_reason,
-                            review_state, review_of_assignment_id, review_target,
-                            required_gates, plan, unreachable_count, exit_code
-                        ) VALUES (
-                            ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?,  ?, ?, ?, ?,
-                            ?, ?, ?,     ?, ?, ?, ?
-                        )""",
+                    sql.upsert(
+                        conn,
+                        "assignments",
+                        [
+                            "assignment_id", "machine_name", "repo_name", "repo_github",
+                            "issue_number", "issue_title", "status", "type", "branch",
+                            "pr_url", "briefing", "files_allowed", "files_forbidden",
+                            "model", "dispatched_at", "finished_at", "smoke_test",
+                            "smoke_test_reason", "review_state", "review_of_assignment_id",
+                            "review_target", "required_gates", "plan",
+                            "unreachable_count", "exit_code",
+                        ],
                         (
                             aid,
                             a.get("machine_name", ""),
@@ -1373,14 +1414,18 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                             a.get("unreachable_count", 0),
                             a.get("exit_code"),
                         ),
+                        conflict_columns=["assignment_id"],
                     )
                 round_number = board_data.get("round_number", 0)
-                conn.execute(
-                    "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', ?)",
-                    (str(round_number),),
+                sql.upsert(
+                    conn, "board_meta", ["key", "value"],
+                    ("round_number", str(round_number)),
+                    conflict_columns=["key"],
                 )
-                conn.execute(
-                    "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+                sql.upsert(
+                    conn, "board_meta", ["key", "value"],
+                    ("board_initialized", "1"),
+                    conflict_columns=["key"],
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1389,11 +1434,14 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         if proposals_json.exists():
             try:
                 for p in json.loads(proposals_json.read_text()):
-                    conn.execute(
-                        """INSERT OR IGNORE INTO proposals
-                           (id, machine_name, repo_name, issue_number, issue_title,
-                            rationale, files_likely, briefing, model, type, required_gates)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    sql.insert_ignore(
+                        conn,
+                        "proposals",
+                        [
+                            "id", "machine_name", "repo_name", "issue_number",
+                            "issue_title", "rationale", "files_likely", "briefing",
+                            "model", "type", "required_gates",
+                        ],
                         (
                             p.get("id"), p.get("machine_name", ""), p.get("repo_name", ""),
                             p.get("issue_number", 0), p.get("issue_title", ""),
@@ -1409,15 +1457,16 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         if splits_json.exists():
             try:
                 for s in json.loads(splits_json.read_text()):
-                    conn.execute(
-                        """INSERT OR IGNORE INTO split_proposals
-                           (id, repo_name, issue_number, issue_title, rationale)
-                           VALUES (?, ?, ?, ?, ?)""",
+                    sql.insert_ignore(
+                        conn,
+                        "split_proposals",
+                        ["id", "repo_name", "issue_number", "issue_title", "rationale"],
                         (s.get("id"), s.get("repo_name", ""), s.get("issue_number", 0),
                          s.get("issue_title", ""), s.get("rationale", "")),
                     )
                     for chunk in s.get("chunks", []):
-                        conn.execute(
+                        sql.execute(
+                            conn,
                             """INSERT INTO split_chunks
                                (split_proposal_id, title, scope, files_likely)
                                VALUES (?, ?, ?, ?)""",
@@ -1431,8 +1480,10 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         if plans_json.exists():
             try:
                 for aid, plan_dict in json.loads(plans_json.read_text()).items():
-                    conn.execute(
-                        "INSERT OR IGNORE INTO plans (assignment_id, plan_data) VALUES (?, ?)",
+                    sql.insert_ignore(
+                        conn,
+                        "plans",
+                        ["assignment_id", "plan_data"],
                         (aid, json.dumps(plan_dict)),
                     )
             except Exception:  # noqa: BLE001
@@ -1442,7 +1493,8 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         if session_json.exists():
             try:
                 sess = json.loads(session_json.read_text())
-                conn.execute(
+                sql.execute(
+                    conn,
                     """INSERT INTO sessions
                        (started_at, ended_at, clean_shutdown,
                         completed_this_session, issues_closed, total_cost_usd)
@@ -1463,7 +1515,8 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         if merge_queue_json.exists():
             try:
                 for entry in json.loads(merge_queue_json.read_text()):
-                    conn.execute(
+                    sql.execute(
+                        conn,
                         """INSERT INTO merge_queue (
                             assignment_id, repo_name, repo_github, branch,
                             target_branch, issue_number, issue_title, state,
@@ -1486,9 +1539,10 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
         # Checked at the top of _maybe_migrate_json(), so JSON files reappearing
         # later (stale code, test fixtures, agent writing legacy state) won't
         # re-trigger the migration.
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('json_migrated', ?)",
-            (str(_time.time()),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("json_migrated", str(_time.time())),
+            conflict_columns=["key"],
         )
 
         # Rename JSON files to .bak so migration doesn't re-run
@@ -1528,15 +1582,18 @@ def _migrate_gate_order(conn: sqlite3.Connection) -> None:
     """
     _OLD = '["review", "test", "merge"]'
     _NEW = '["test", "review", "merge"]'
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE assignments SET required_gates = ? WHERE required_gates = ?",
         (_NEW, _OLD),
     )
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE proposals SET required_gates = ? WHERE required_gates = ?",
         (_NEW, _OLD),
     )
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE board_meta SET value = ? "
         "WHERE key = 'pipeline_default_gates' AND value = ?",
         (_NEW, _OLD),
@@ -1592,7 +1649,8 @@ def _backfill_orphaned_review_verdicts(conn: sqlite3.Connection) -> int:
          ORDER BY r.dispatched_at DESC
          LIMIT 1
     """
-    cur = conn.execute(
+    cur = sql.execute(
+        conn,
         f"""
         UPDATE assignments
            SET review_verdict = ({_LATEST_VERDICT}),
