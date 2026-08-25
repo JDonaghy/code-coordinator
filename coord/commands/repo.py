@@ -1,5 +1,6 @@
-"""``coord repo add`` / ``coord repo doctor`` — onboarding a repo, and
-checking that it actually happened (#2220).
+"""``coord repo add`` / ``coord repo create`` / ``coord repo doctor`` —
+creating and onboarding a repo, and checking that it actually happened
+(#2220, #2747).
 
 Onboarding a repo is ~14 steps across five layers (config, three machines,
 GitHub, the repo's own contents, the graph) with no command, no checklist and
@@ -8,19 +9,33 @@ silently**. ``stick-demo`` sat two-thirds onboarded until ``stick-demo#1`` died
 of it, having burned both drive attempts, while ``coord config``, ``coord
 status`` and ``coord assign --dry-run`` all reported the dispatch as fine.
 
-Of the two commands here the **second is the one that matters**. A runbook is
-the weakest available answer and this codebase already has the proof:
-``docs/GRAPHIFY_SETUP.md`` is exactly that shape, and graphify has still fallen
-by the wayside more than once because nothing checks it. What holds is a
-checkable gate — ``coord diagnose --graph``, ``coord doctor``, ``coord release
-verify`` all work because they answer *is it true right now*, not *did you
-remember*.
+Of the three commands here **``doctor`` is the one that matters most**. A
+runbook is the weakest available answer and this codebase already has the
+proof: ``docs/GRAPHIFY_SETUP.md`` is exactly that shape, and graphify has
+still fallen by the wayside more than once because nothing checks it. What
+holds is a checkable gate — ``coord diagnose --graph``, ``coord doctor``,
+``coord release verify`` all work because they answer *is it true right now*,
+not *did you remember*.
 
 ``coord repo add`` therefore does only the mechanical, safely-automatable parts
 and **prints the residue it deliberately did not do**, rather than pretending
 completeness. The parts it skips (clone, agent restart, CLAUDE.md, CI workflow)
 are the ones a wrong guess makes worse, and they are exactly what ``coord repo
 doctor`` then verifies.
+
+``coord repo add`` also requires the repo to already exist — the only way to
+make one was a raw ``gh repo create``, exactly the habit the backend-agnostic
+forge seam (``docs/FORGE_MIGRATION.md``) exists to stop, and one workers can't
+do at all (``gh`` is deny-listed for them). ``coord repo create`` (IL-1,
+#2747) closes that gap: it creates the remote through the seam
+(``coord.github_ops``, never a raw ``gh`` call site outside it) and seeds the
+three residue items that are actual traps rather than chores — no CI on
+``pull_request`` blocks every merge forever, no CLAUDE.md makes the review
+gate structurally empty, no ``.githooks/`` leaves every worktree graph-blind
+— then chains into ``coord repo add`` for the rest. What's left afterward is
+genuinely 3 items a human must still do (down from ``add``'s 8): clone on
+each machine, commit+push the coordinator.yml edit, and ``coord repo doctor
+--fix``.
 """
 
 from __future__ import annotations
@@ -42,6 +57,317 @@ from coord.fleet_config_health import TRACKED_CONFIG_REL, default_settings_dir
 @click.group("repo", help="Add a repo to the fleet, and verify it is actually onboarded.")
 def repo_group() -> None:
     """Repo onboarding (#2220)."""
+
+
+# ── Seed content for a freshly created repo (IL-1, #2747) ───────────────────
+#
+# `coord repo add` prints 8 residue items a human must do by hand; three of
+# them are traps, not chores (see the module docstring's #2747 addendum
+# below `coord repo create`). This section is what fills those three in
+# automatically: a CLAUDE.md skeleton, a CI workflow that triggers on
+# `pull_request` (so `expects_checks()` never reads "CI exists" while zero
+# checks arrive — the trap that blocks EVERY merge in a repo forever), and
+# the `.githooks/` port (so worktrees get a linked graph from commit one
+# instead of every worker silently falling back to grep).
+#
+# The `.githooks/*` bodies are copied verbatim from THIS repo's own
+# `.githooks/` — they are generic (no code-coordinator-specific paths or
+# names, see docs/GRAPHIFY_SETUP.md) — and embedded here as string literals
+# rather than read off disk at runtime: coord ships to worker machines as a
+# PyPI install (docs/AGENT_OPERATIONS.md's `~/.coord-venv` invariant), which
+# has no `.githooks/` sibling directory to read; only this source checkout
+# does. Nothing currently checks the two copies don't drift — if this repo's
+# own `.githooks/` changes, update these to match.
+
+_GITHOOKS_LIB_SH = """\
+# Shared helpers for the versioned hooks in this directory.  Sourced, not run.
+#
+# WHY THESE HOOKS EXIST AT ALL: setting `core.hooksPath` REPLACES `.git/hooks`
+# wholesale — git stops looking there entirely.  graphify installs post-commit,
+# post-checkout, and post-merge into `$GIT_COMMON_DIR/hooks/`, so every one of
+# them needs a counterpart here or it is silently disabled.  (Shipping only
+# post-checkout killed graphify's commit/merge rebuilds on the operator box for
+# about an hour — caught by `coord diagnose --graph` reporting the repo's own
+# graph STALE right after a merge.)
+#
+# Each hook here is a thin shim: skip in linked worktrees, otherwise hand off
+# to the machine-local graphify hook, which pins an absolute interpreter path
+# and therefore must never be committed.
+
+# Absolute path, whether git handed us a relative one or not.
+gfy_abs() {
+    case "$1" in
+        /*) printf '%s\\n' "$1" ;;
+        *)  printf '%s\\n' "$PWD/$1" ;;
+    esac
+}
+
+gfy_common_dir() {
+    gfy_abs "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)"
+}
+
+# True in a linked worktree (its per-worktree git dir differs from the common one).
+gfy_is_linked_worktree() {
+    _gd=$(gfy_abs "$(git rev-parse --git-dir 2>/dev/null || echo .git)")
+    [ "$_gd" != "$(gfy_common_dir)" ]
+}
+
+# Hand off to the machine-local hook of the same name, if present.
+gfy_chain() {
+    _name=$1
+    shift
+    _local="$(gfy_common_dir)/hooks/$_name"
+    if [ -x "$_local" ]; then
+        exec "$_local" "$@"
+    fi
+    exit 0
+}
+"""
+
+_GITHOOKS_POST_CHECKOUT = """\
+#!/bin/sh
+# Versioned post-checkout hook — enabled per machine with:
+#
+#     git config core.hooksPath .githooks
+#
+# Purpose: make the graphify knowledge graph usable from a *linked worktree*.
+#
+# `graphify-out/` is gitignored by design (only `graphify-out/.gitignore` is
+# tracked — the graph is multi-MB, rewritten on every commit, and would
+# conflict across parallel worker branches).  So `git worktree add` gives a
+# worktree an EMPTY `graphify-out/`, and `graphify query` — which resolves
+# `graphify-out/graph.json` strictly relative to cwd, with no upward walk and
+# no `--graph` override — fails there.  Every agent working in a worktree is
+# graph-blind.
+#
+# Git runs this hook on `git worktree add` (verified: cwd = the new worktree,
+# $3 = 1), which is why the bootstrap lives here rather than in coord's
+# dispatch code: one implementation covers coord's remote `worktree add` call
+# sites, Claude Code's `.claude/worktrees/`, review worktrees, and anything
+# created by hand — on every machine, with no creator-side changes.
+#
+# The fix is symlinking the base checkout's graph *contents* into the
+# worktree's `graphify-out/` — never replacing the directory itself.  A
+# worker branch differs from the base by a handful of files, so the base
+# graph is the right answer for "where is X handled / what calls this"
+# navigation.  It is NOT the right answer for "did my change land" — the
+# linked graph reflects the base checkout's HEAD, not the worktree's edits.
+#
+# #1617: an earlier version of this hook replaced the whole `graphify-out/`
+# directory with a symlink to the base checkout.  `git worktree add`
+# materialises `graphify-out/` with only the tracked `.gitignore` checked
+# out (everything else in the directory is untracked-and-ignored), and
+# `rm -rf graphify-out` before `ln -sfn` deleted that tracked file out from
+# under git — leaving `git status` showing a deleted tracked file *and* an
+# untracked, machine-local, absolute-path symlink.  Every worktree's own
+# rescue-commit machinery then committed both.  `graphify-out/.gitignore` is
+# `*` / `!.gitignore`, so anything placed *inside* the directory is already
+# invisible to git for free — the fix is to keep the directory (and its
+# tracked `.gitignore`) and symlink each entry of the base graph into it
+# instead of swapping the directory out from under git.
+#
+# See .githooks/_lib.sh for why every graphify hook needs a shim here.
+
+set -u
+. "$(dirname "$0")/_lib.sh"
+
+# $3 == 1 means a branch checkout (not a file checkout).  `git worktree add`
+# sets it.  Anything else is not our business.
+if [ "${3:-0}" != "1" ]; then
+    exit 0
+fi
+
+if gfy_is_linked_worktree; then
+    # The base checkout is the parent of the common git dir.
+    _base=$(CDPATH= cd -- "$(dirname -- "$(gfy_common_dir)")" 2>/dev/null && pwd) || _base=""
+    if [ -n "$_base" ] && [ -f "$_base/graphify-out/graph.json" ]; then
+        # Only bootstrap when graph.json here is absent, or is itself a
+        # symlink from a previous run of this hook (idempotent re-link on a
+        # later checkout in the same worktree).  If a REAL graph was built
+        # in this worktree, leave it alone.
+        if [ ! -e graphify-out/graph.json ] || [ -L graphify-out/graph.json ]; then
+            # `git worktree add` already checked out the tracked
+            # graphify-out/.gitignore, materialising the directory — never
+            # remove it, only add symlinks alongside it.
+            mkdir -p graphify-out 2>/dev/null
+            _linked=0
+            for _entry in "$_base"/graphify-out/* "$_base"/graphify-out/.[!.]*; do
+                [ -e "$_entry" ] || continue
+                _name=$(basename -- "$_entry")
+                # .gitignore is the tracked file that keeps this directory
+                # self-ignoring — never shadow it with a symlink to the
+                # base's copy.
+                [ "$_name" = ".gitignore" ] && continue
+                ln -sfn "$_entry" "graphify-out/$_name" 2>/dev/null && _linked=1
+            done
+            [ "$_linked" = "1" ] &&
+                echo "[graphify] linked graphify-out/* -> $_base/graphify-out/* (read-only base graph)"
+        fi
+    fi
+    # Never rebuild in a linked worktree.  Two reasons, both load-bearing:
+    #   1. graphify-out/graph.json (and friends) are symlinks to the SHARED
+    #      base graph — a rebuild here would overwrite it from a
+    #      feature-branch tree.
+    #   2. A worktree can be reaped mid-rebuild, which is how the graphify
+    #      hook's own "burns a full AST pass and then dies with ENOENT"
+    #      comment came to be.
+    exit 0
+fi
+
+gfy_chain post-checkout "$@"
+"""
+
+_GITHOOKS_POST_COMMIT = """\
+#!/bin/sh
+# Versioned post-commit shim.
+#
+# core.hooksPath REPLACES .git/hooks wholesale, so without this file
+# graphify's post-commit rebuild is silently DISABLED on any machine that opts
+# into the versioned hooks.  See .githooks/_lib.sh.
+#
+# Linked worktrees never rebuild: graphify-out there is a symlink to the base
+# checkout's SHARED graph, so a rebuild would overwrite it from a
+# feature-branch tree — and a worktree can be reaped mid-rebuild.
+
+set -u
+. "$(dirname "$0")/_lib.sh"
+
+if gfy_is_linked_worktree; then
+    exit 0
+fi
+
+gfy_chain post-commit "$@"
+"""
+
+_GITHOOKS_POST_MERGE = """\
+#!/bin/sh
+# Versioned post-merge shim.
+#
+# core.hooksPath REPLACES .git/hooks wholesale, so without this file
+# graphify's post-merge rebuild is silently DISABLED on any machine that opts
+# into the versioned hooks.  See .githooks/_lib.sh.
+#
+# Linked worktrees never rebuild: graphify-out there is a symlink to the base
+# checkout's SHARED graph, so a rebuild would overwrite it from a
+# feature-branch tree — and a worktree can be reaped mid-rebuild.
+
+set -u
+. "$(dirname "$0")/_lib.sh"
+
+if gfy_is_linked_worktree; then
+    exit 0
+fi
+
+gfy_chain post-merge "$@"
+"""
+
+# `--template`/per-stack default for the seeded CI workflow (#2747's
+# proposal point 2). `generic` is the default and the only one guaranteed to
+# report a GREEN check on a repo with no application code yet — `python`/
+# `node` run a real build+test command and are meant for a repo whose stack
+# IS decided at creation time (a red first check on an empty repo is a worse
+# start than an honest placeholder).
+_CI_TEMPLATES: dict[str, str] = {
+    "generic": """\
+name: CI
+on:
+  pull_request:
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "no build/test command configured yet (coord repo create --template generic)."
+          echo "this workflow exists so expects_checks() sees a real, reporting check —"
+          echo "replace it with the repo's real CI once the stack is decided."
+""",
+    "python": """\
+name: CI
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest
+""",
+    "node": """\
+name: CI
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm test --if-present
+""",
+}
+
+
+def _render_claude_md_skeleton(name: str) -> str:
+    """A minimal ``CLAUDE.md`` for a just-created repo (#2747).
+
+    Deliberately a skeleton, not a guess: this repo's stack is explicitly out
+    of scope for ``coord repo create`` (IL-4 / the intake session decides
+    it). But an ABSENT ``CLAUDE.md`` is worse than an empty one — the
+    adversarial review prompt is assembled from it, so a repo with none
+    enforces nothing while reading as covered. Each ``TODO`` names exactly
+    what to fill in and why it matters downstream.
+    """
+    return f"""\
+# {name}
+
+TODO: one paragraph on what this repo is and does.
+
+## Stack
+
+TODO: language(s), framework(s), package manager. Undecided as of
+`coord repo create` — this file is what the adversarial review prompt and
+the Test agent are assembled from, so fill this in before the first real
+feature PR lands, or reviews on this repo enforce nothing.
+
+## Development
+
+TODO: how to install dependencies and run the app locally.
+
+## Testing
+
+TODO: the test command, and where tests live. Every PR that changes
+user-visible behavior should ship a black-box test that drives the running
+app and asserts on its output, not just unit tests on internals.
+
+## Conventions
+
+TODO: language version, formatter/linter, commit message style.
+"""
+
+
+def _seed_files(name: str, ci_template: str) -> list[tuple[str, str, bool]]:
+    """The ``(path, content, executable)`` triples :func:`coord.github_ops.
+    create_commit_with_files` seeds into a freshly created repo (#2747):
+    ``CLAUDE.md``, a CI workflow that triggers on ``pull_request``, and the
+    ``.githooks/`` port. The three ``.githooks/*`` shims are executable —
+    everything else is a plain file.
+    """
+    return [
+        ("CLAUDE.md", _render_claude_md_skeleton(name), False),
+        (".github/workflows/ci.yml", _CI_TEMPLATES[ci_template], False),
+        (".githooks/_lib.sh", _GITHOOKS_LIB_SH, False),
+        (".githooks/post-checkout", _GITHOOKS_POST_CHECKOUT, True),
+        (".githooks/post-commit", _GITHOOKS_POST_COMMIT, True),
+        (".githooks/post-merge", _GITHOOKS_POST_MERGE, True),
+    ]
 
 
 def _resolve_write_target(explicit: Path | None) -> Path:
@@ -126,6 +452,55 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     dry_run: bool,  # noqa: FBT001
     config_path: Path | None,
 ) -> None:
+    result = _do_repo_add_core(
+        name=name,
+        github_slug=github_slug,
+        machines_csv=machines_csv,
+        repo_path_tmpl=repo_path_tmpl,
+        default_branch_override=default_branch_override,
+        build_command=build_command,
+        test_command=test_command,
+        do_labels=do_labels,
+        dry_run=dry_run,
+        config_path=config_path,
+    )
+    _print_add_residue(
+        target=result["target"], machines=result["machines"],
+        repo_path_tmpl=repo_path_tmpl, name=name,
+    )
+
+
+def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can set
+    *,
+    name: str,
+    github_slug: str,
+    machines_csv: str | None,
+    repo_path_tmpl: str | None,
+    default_branch_override: str | None,
+    build_command: str | None,
+    test_command: str | None,
+    do_labels: bool,
+    dry_run: bool,
+    config_path: Path | None,
+) -> dict:
+    """Everything ``coord repo add`` does except printing the residue block —
+    write the ``coordinator.yml`` entry, add the repo to its machines, and
+    (optionally) create the ``coord``/tier labels.
+
+    Factored out of the ``repo_add`` click command so ``coord repo create``
+    (#2747) can reuse the exact same write path — same seatbelt, same
+    machine-name validation, same idempotent label creation — while printing
+    a SHORTER residue afterward, because it already seeded the three things
+    that make up half of ``repo add``'s residue list (CLAUDE.md, the CI
+    workflow, ``.githooks/``). ``repo_add`` itself is now a thin wrapper:
+    call this, then print the full 8-item residue.
+
+    Returns ``{"target": Path, "machines": list[str], "landed": list[str],
+    "default_branch": str}`` — everything either caller's residue printer
+    needs. Raises :class:`click.ClickException` on any refusal (unknown repo
+    name collision, unknown machine, unreadable default branch, an edit that
+    would not parse) — same as the command itself used to.
+    """
     from coord.config import load as load_config  # noqa: PLC0415
     from coord.repo_edit import (  # noqa: PLC0415
         RepoEditError,
@@ -253,7 +628,22 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         for failure in label_failures:
             click.echo(f"⚠ label creation failed — {failure}", err=True)
 
-    # ── Residue: what this command deliberately did NOT do ───────────────
+    return {
+        "target": target,
+        "machines": machines,
+        "landed": landed,
+        "default_branch": default_branch,
+    }
+
+
+def _print_add_residue(
+    *, target: Path, machines: list[str], repo_path_tmpl: str | None, name: str,
+) -> None:
+    """The full 8-item residue block ``coord repo add`` prints — what it
+    deliberately did NOT do, factored out of the command so ``coord repo
+    create`` (#2747) can print its own shorter list instead (see
+    :func:`_print_create_residue`) after the same core write.
+    """
     click.echo("")
     click.echo("NOT DONE — these need a human, and `coord repo doctor` checks each:")
     tracked = default_settings_dir() / TRACKED_CONFIG_REL
@@ -317,6 +707,218 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         "step 7 — pointing core.hooksPath at a .githooks/ that does not "
         "exist silently disables every hook in the checkout, so --fix refuses "
         "until the hooks are ported."
+    )
+    click.echo("")
+    click.echo(f"Then: coord repo doctor {name}")
+
+
+@repo_group.command(
+    "create",
+    help=(
+        "Create a NEW repo through the forge seam, seed it (CLAUDE.md, a "
+        "pull_request-triggered CI workflow, .githooks/), then chain into "
+        "`coord repo add`. IL-1 (#2747): shrinks `repo add`'s 8-item human "
+        "residue down to 3 — the clone on each machine, the coord-settings "
+        "commit+push, and `coord repo doctor --fix`. Never shells out to "
+        "`gh` directly outside coord.github_ops, so a future GitLab backend "
+        "is a driver swap, not a rewrite — and workers, for whom `gh` is "
+        "deny-listed, can use this too."
+    ),
+)
+@click.argument("name")
+@click.option("--github", "github_slug", required=True, help="owner/repo to create on GitHub.")
+@click.option(
+    "--private", is_flag=True, default=False,
+    help="Create the GitHub repo private. Default: public.",
+)
+@click.option("--description", default=None, help="GitHub repo description.")
+@click.option(
+    "--template", "ci_template", type=click.Choice(sorted(_CI_TEMPLATES)),
+    default="generic", show_default=True,
+    help=(
+        "Which CI workflow to seed. `generic` reports a green placeholder "
+        "check and is right when the stack isn't decided yet; `python`/"
+        "`node` run a real build+test command and expect the repo to "
+        "already have that stack's project files (a red first check on an "
+        "otherwise-empty repo is a worse start than an honest placeholder)."
+    ),
+)
+@click.option(
+    "--machines", "machines_csv", default=None,
+    help="Comma-separated machine names that should serve this repo.",
+)
+@click.option(
+    "--repo-path", "repo_path_tmpl", default=None,
+    help="Path to the clone on each machine. Default: ~/src/<name>.",
+)
+@click.option("--build-command", default=None, help="repos[].build_command.")
+@click.option("--test-command", default=None, help="repos[].test_command.")
+@click.option(
+    "--labels/--no-labels", "do_labels", default=True, show_default=True,
+    help="Create the `coord` and tier:small/tier:large labels on GitHub.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Create nothing on GitHub or in coordinator.yml — print what would happen.",
+)
+@click.option(
+    "--config", "config_path", type=click.Path(path_type=Path), default=None,
+    help="coordinator.yml to edit. Default: the coord-settings tracked file.",
+)
+def repo_create(  # noqa: PLR0913 — one option per thing the command can set
+    name: str,
+    github_slug: str,
+    private: bool,  # noqa: FBT001
+    description: str | None,
+    ci_template: str,
+    machines_csv: str | None,
+    repo_path_tmpl: str | None,
+    build_command: str | None,
+    test_command: str | None,
+    do_labels: bool,  # noqa: FBT001
+    dry_run: bool,  # noqa: FBT001
+    config_path: Path | None,
+) -> None:
+    from coord import github_ops  # noqa: PLC0415
+    from coord.config import load as load_config  # noqa: PLC0415
+
+    # ── Pre-flight, BEFORE any GitHub side effect ─────────────────────────
+    # The same checks `coord repo add` makes, run here FIRST too: a config
+    # collision or an unknown machine name must never leave an orphaned,
+    # just-created-but-unconfigured GitHub repo behind. `_do_repo_add_core`
+    # (called below, after creation) re-checks all of this from scratch —
+    # this pre-flight is belt-and-suspenders, not the seatbelt itself.
+    target = _resolve_write_target(config_path)
+    try:
+        cfg = load_config(target)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"{target} does not currently load: {exc}") from exc
+
+    if cfg.repo(name) is not None:
+        raise click.ClickException(
+            f"repo {name!r} already has a repos[] entry in {target} — use "
+            f"`coord repo doctor {name}` to find what is actually missing."
+        )
+
+    known = {m.name for m in cfg.machines}
+    machines = [m.strip() for m in (machines_csv or "").split(",") if m.strip()]
+    unknown = [m for m in machines if m not in known]
+    if unknown:
+        raise click.ClickException(
+            f"unknown machine(s) {unknown} — coordinator.yml has {sorted(known)}"
+        )
+
+    try:
+        exists = github_ops.repo_exists(github_slug)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"could not check whether {github_slug} already exists on GitHub: "
+            f"{exc}. Fix `gh` auth and retry."
+        ) from exc
+    if exists:
+        raise click.ClickException(
+            f"{github_slug} already exists on GitHub — `coord repo create` is "
+            f"for a NEW repo. Use `coord repo add --github {github_slug} ...` "
+            "to onboard an existing one instead."
+        )
+
+    if dry_run:
+        click.echo(
+            f"--dry-run: would create {github_slug} "
+            f"({'private' if private else 'public'}), seed CLAUDE.md + "
+            f"the {ci_template!r} CI workflow + .githooks/, then run the "
+            f"equivalent of `coord repo add {name} --github {github_slug}`"
+        )
+        return
+
+    # ── Create + seed, through the forge seam only ────────────────────────
+    click.echo(
+        f"creating {github_slug} on GitHub "
+        f"({'private' if private else 'public'})..."
+    )
+    created = github_ops.create_repo(github_slug, private=private, description=description)
+    default_branch = created.get("default_branch") or "main"
+    click.echo(
+        f"✓ created {created.get('url') or github_slug} "
+        f"(default branch: {default_branch})"
+    )
+
+    click.echo(
+        "seeding CLAUDE.md, .github/workflows/ci.yml "
+        f"(--template {ci_template}), and .githooks/..."
+    )
+    files = _seed_files(name, ci_template)
+    try:
+        github_ops.create_commit_with_files(
+            github_slug, default_branch, files,
+            message="coord repo create: seed CLAUDE.md, CI workflow, .githooks (#2747)",
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"{github_slug} was created but seeding failed: {exc}. The repo "
+            "now EXISTS on GitHub but has no CLAUDE.md/CI/.githooks yet — fix "
+            "the underlying problem (likely `gh` auth/rate-limit), then "
+            "either seed it by hand or re-run `coord repo create` with the "
+            "same --github: none of the seed files exist there yet, so a "
+            "retry won't conflict. Finish onboarding yourself with `coord "
+            f"repo add {name} --github {github_slug}`."
+        ) from exc
+    click.echo(f"✓ seeded {len(files)} file(s) on {default_branch}")
+
+    # ── Chain into the exact write path `coord repo add` uses ────────────
+    result = _do_repo_add_core(
+        name=name,
+        github_slug=github_slug,
+        machines_csv=machines_csv,
+        repo_path_tmpl=repo_path_tmpl,
+        default_branch_override=None,
+        build_command=build_command,
+        test_command=test_command,
+        do_labels=do_labels,
+        dry_run=False,
+        config_path=config_path,
+    )
+    _print_create_residue(
+        target=result["target"], machines=result["machines"],
+        repo_path_tmpl=repo_path_tmpl, name=name,
+    )
+
+
+def _print_create_residue(
+    *, target: Path, machines: list[str], repo_path_tmpl: str | None, name: str,
+) -> None:
+    """The shrunk, 3-item residue ``coord repo create`` prints (#2747) —
+    ``repo add``'s 8 minus the 3 traps this command already closed
+    (CLAUDE.md, the ``pull_request`` CI trigger, ``.githooks/``) and the
+    narration lines that were never gating (the #2299 "no restart needed"
+    explainer, and the test_command/smoke_tests note).
+    """
+    click.echo("")
+    click.echo(
+        "NOT DONE — 3 things still need a human (down from `repo add`'s 8 — "
+        "CLAUDE.md, the CI workflow, and .githooks/ are already seeded):"
+    )
+    tracked = default_settings_dir() / TRACKED_CONFIG_REL
+    if target == tracked:
+        click.echo(
+            f"  1. commit + push in {default_settings_dir()}, then `git pull` on "
+            "the daemon host — the fleet runs the COMMITTED config"
+        )
+    else:
+        click.echo(
+            f"  1. commit + push {target} wherever it is tracked, then `git "
+            "pull` on the daemon host — the fleet runs the COMMITTED config"
+        )
+    for machine in machines or ["<each machine>"]:
+        click.echo(
+            f"  2. clone the repo to {repo_path_tmpl or f'~/src/{name}'} on "
+            f"{machine} — this is the worker WORKTREE BASE"
+        )
+    click.echo(
+        f"  3. once cloned everywhere: `coord repo doctor {name} --fix` "
+        "builds the graph (`graphify update .`) and sets `core.hooksPath "
+        ".githooks` on every machine that runs workers. Idempotent; safe to "
+        "re-run."
     )
     click.echo("")
     click.echo(f"Then: coord repo doctor {name}")
