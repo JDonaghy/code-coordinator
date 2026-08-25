@@ -1464,6 +1464,192 @@ def create_remote_branch(repo: str, branch: str, sha: str) -> bool:
         return False
 
 
+# ── Repo creation, the forge seam (IL-1, #2747) ─────────────────────────────
+#
+# `coord repo add` requires the repo to already exist on GitHub — the only
+# way to make one was a raw `gh repo create`, exactly the habit the
+# backend-agnostic forge seam exists to stop, and one workers can't do at
+# all (`gh` is deny-listed for them). These three functions are that seam's
+# GitHub backend: `create_repo` (mirrors `create_issue`/`create_milestone` —
+# the single place this module shells out to `gh repo create`, so a GitLab
+# backend later replaces this one function instead of every call site) plus
+# `repo_exists` (the pre-flight `coord repo create` uses to refuse reusing an
+# existing repo) and `create_commit_with_files` (seeds CLAUDE.md, the CI
+# workflow, and the ported `.githooks/*` in one commit via the Git Data API —
+# not the Contents API `update_repo_file` uses, because that API always
+# writes files at mode 100644 and silently strips the executable bit the
+# `.githooks/post-*` shims need to run at all as git hooks).
+
+
+def repo_exists(repo: str) -> bool:
+    """True when *repo* (``owner/name``) already exists on GitHub.
+
+    `coord repo create`'s pre-flight: creation is for a NEW repo, and an
+    existing one should go through `coord repo add` instead — reusing a name
+    would silently seed CLAUDE.md/CI/.githooks on top of someone else's repo.
+    Raises on anything that isn't a clean 404 (auth, network, rate-limit) —
+    a false "doesn't exist" here is what would let `create_repo` attempt a
+    create against a repo that's merely unreadable right now, which then
+    fails with `gh`'s much less clear "name already exists" error instead of
+    surfacing the real (auth/network) problem immediately.
+    """
+    try:
+        _gh("api", f"repos/{repo}")
+        return True
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        # Same broad match :func:`repo_file_exists` uses — real `gh` 404 text
+        # varies by version/endpoint ("HTTP 404: Not Found", "gh: Not Found
+        # (HTTP 404)", ...), so match on either signal rather than one exact
+        # phrasing.
+        if "not found" in msg or "404" in msg:
+            return False
+        raise
+
+
+def create_repo(
+    repo: str, *, private: bool = False, description: str | None = None,
+) -> dict:
+    """Create a new GitHub repository via ``gh repo create`` (#2747).
+
+    Passes *repo* as a full ``owner/name`` slug and neither ``--clone`` nor
+    ``--source`` — ``gh`` then creates the remote repo directly with no local
+    checkout involved, which matters here: this runs from whatever directory
+    the caller happens to be in (a worker's worktree, an operator's shell),
+    and must never touch it.
+
+    Always creates with ``--add-readme`` so the repo has a real default-branch
+    commit to seed onto immediately after: an empty repo has zero refs, and
+    the Git Data API :func:`create_commit_with_files` uses needs a parent
+    commit + base tree to build the seed commit on top of — there is nothing
+    to branch from otherwise.
+
+    Returns ``{"name", "full_name", "url", "default_branch"}`` read back from
+    the API (not parsed from ``gh``'s prose stdout). Raises
+    ``RuntimeError``/:class:`GhError` on failure, including the name already
+    being taken — callers that want idempotency should check
+    :func:`repo_exists` first.
+    """
+    args = ["repo", "create", repo, "--private" if private else "--public", "--add-readme"]
+    if description:
+        args += ["--description", description]
+    _gh(*args)
+    data = _gh_json("api", f"repos/{repo}", default=None)
+    if not isinstance(data, dict) or not data.get("default_branch"):
+        raise RuntimeError(f"repos/{repo}: created but could not read it back")
+    return {
+        "name": data.get("name"),
+        "full_name": data.get("full_name"),
+        "url": data.get("html_url"),
+        "default_branch": data.get("default_branch"),
+    }
+
+
+def _gh_input_json(*args: str, body: str) -> Any:
+    """Like :func:`_gh_json` but pipes *body* via stdin (``gh api --input -``)
+    for endpoints whose payload — a nested tree/commit object, here — can't be
+    expressed with :func:`_gh`'s flat ``-f key=value`` args. Records the same
+    #1896 forge-availability observation as :func:`_gh`, for the same reason
+    :func:`edit_issue`/:func:`close_issue` do their own stdin plumbing instead
+    of routing through it.
+    """
+    full_args = [*args, "--input", "-"]
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *full_args], input=body, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(full_args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
+        raise GhError(f"gh {' '.join(full_args)} failed: {exc}") from exc
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(full_args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        raise RuntimeError(f"gh {' '.join(full_args)} failed: {stderr}")
+    record_gh_call(tuple(full_args), outcome="ok", duration_s=duration)
+    return _json_loads_or(result.stdout, default={})
+
+
+def create_commit_with_files(
+    repo: str,
+    branch: str,
+    files: list[tuple[str, str, bool]],
+    message: str,
+) -> str:
+    """Commit multiple new files to *branch* in a single commit via the Git
+    Data API (blob -> tree -> commit -> ref update) — the write half of
+    seeding a freshly created repo (#2747).
+
+    *files* is ``[(path, content, executable), ...]``. Each file becomes a
+    blob and a tree entry at mode ``100755`` (executable) or ``100644``
+    (not) — the ``.githooks/post-*`` shims need the former to run as git
+    hooks at all, which is exactly what :func:`update_repo_file`'s
+    Contents-API PUT can't express (it always writes 100644). One commit for
+    the whole seed rather than one Contents-API commit per file.
+
+    Reads *branch*'s current tip as the sole parent, so this must run against
+    a branch that already has at least one commit (:func:`create_repo`'s
+    ``--add-readme`` guarantees that for a repo it just created). Returns the
+    new commit sha. Raises ``RuntimeError`` on any step's failure — a partial
+    seed (some blobs created, no commit) is possible on a mid-way failure,
+    but never a *corrupt* one: nothing is written to *branch* until the final
+    ref update, which is the one step that can't partially apply.
+    """
+    import base64
+
+    ref = _gh_json("api", f"repos/{repo}/git/refs/heads/{branch}", default={})
+    parent_sha = ((ref or {}).get("object") or {}).get("sha")
+    if not parent_sha:
+        raise RuntimeError(f"repos/{repo}: could not resolve branch {branch!r} head")
+    parent_commit = _gh_json("api", f"repos/{repo}/git/commits/{parent_sha}", default={})
+    base_tree = (parent_commit or {}).get("tree", {}).get("sha")
+    if not base_tree:
+        raise RuntimeError(f"repos/{repo}: could not resolve base tree for {parent_sha}")
+
+    tree_entries = []
+    for path, content, executable in files:
+        blob = _gh_json(
+            "api", f"repos/{repo}/git/blobs",
+            "-f", f"content={base64.b64encode(content.encode()).decode()}",
+            "-f", "encoding=base64",
+            default={},
+        )
+        blob_sha = (blob or {}).get("sha")
+        if not blob_sha:
+            raise RuntimeError(f"repos/{repo}: blob create failed for {path!r}")
+        tree_entries.append({
+            "path": path,
+            "mode": "100755" if executable else "100644",
+            "type": "blob",
+            "sha": blob_sha,
+        })
+
+    new_tree = _gh_input_json(
+        "api", f"repos/{repo}/git/trees",
+        body=json.dumps({"base_tree": base_tree, "tree": tree_entries}),
+    )
+    tree_sha = (new_tree or {}).get("sha")
+    if not tree_sha:
+        raise RuntimeError(f"repos/{repo}: tree create failed")
+
+    new_commit = _gh_input_json(
+        "api", f"repos/{repo}/git/commits",
+        body=json.dumps({"message": message, "tree": tree_sha, "parents": [parent_sha]}),
+    )
+    commit_sha = (new_commit or {}).get("sha")
+    if not commit_sha:
+        raise RuntimeError(f"repos/{repo}: commit create failed")
+
+    _gh(
+        "api", "-X", "PATCH", f"repos/{repo}/git/refs/heads/{branch}",
+        "-f", f"sha={commit_sha}",
+    )
+    return commit_sha
+
+
 def get_default_branch_head(repo: str, branch: str) -> str:
     """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
     raw = _gh("api", f"repos/{repo}/branches/{branch}")
