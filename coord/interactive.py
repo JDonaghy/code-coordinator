@@ -1422,7 +1422,11 @@ def launch_human_attended_interactive(
 ) -> int:
     """Run *argv* attached to the current TTY with *briefing* pre-filled.
 
-    Used exclusively by ``coord assign --interactive``.  The function
+    Shared by every human-attended interactive launcher: ``coord assign
+    --interactive`` (the original caller), its ``--milestone-chat-of``
+    flavour (`coord.commands.dispatch_workers._dispatch_milestone_chat_of`,
+    #1029), and ``coord portal decompose-chat --interactive`` (#2750, IL-4:
+    `coord.commands.portal._run_decompose_chat_interactive`).  The function
     returns the child's exit code; the caller decides what (if anything)
     to record on the board.  No GitHub comments are posted from inside
     this function — the human owns the session lifecycle.

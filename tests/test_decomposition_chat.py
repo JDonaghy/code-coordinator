@@ -721,3 +721,67 @@ def test_cli_interactive_refuses_when_submission_not_approved():
         result = runner.invoke(portal_group, ["decompose-chat", "sub_missing", "--interactive"])
     assert result.exit_code == 1
     assert "not a currently-approved" in result.output
+
+
+def test_cli_dry_run_rejected_without_interactive():
+    """--dry-run only makes sense paired with --interactive — mirrors
+    `coord assign --interactive --milestone-chat-of --dry-run`'s own seam,
+    which is likewise interactive-only."""
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    runner = CliRunner()
+    result = runner.invoke(portal_group, ["decompose-chat", "sub_1", "--dry-run"])
+    assert result.exit_code == 2
+    assert "--dry-run only applies with --interactive" in result.output
+
+
+def test_cli_interactive_dry_run_builds_dispatch_without_launching():
+    """#2750 fix round: `--interactive --dry-run` must build the real
+    spec/argv/system-prompt wiring and print it, WITHOUT attaching tmux or
+    persisting an assignment — the `_run_decompose_chat_interactive`
+    counterpart to `test_milestone_chat_of_dry_run_builds_dispatch`
+    (tests/test_cli_assign.py), which is the established precedent this
+    mirrors. In particular this asserts the explicit
+    `system_prompt=DECOMPOSITION_CHAT_SYSTEM_PROMPT + build_deny_prompt(...)`
+    / `allowed_tools="Read,Bash"` override actually reaches
+    `ClaudePtyProvider.build_command` — necessary because that provider's
+    own `spec.type` branch table has no `"decomposition-chat"` case, so a
+    silent regression there would otherwise fall through to the generic
+    work-shaped branch undetected.
+    """
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    runner = CliRunner()
+    local = _machine("here", ["api"])
+    cfg = Config(repos=[_repo("api")], machines=[local])
+    with patch("coord.commands.portal._load_config", return_value=cfg), patch(
+        "coord.decomposition_chat.resolve_approved_submission", return_value=SUBMISSION
+    ), patch("coord.test_orchestrator.local_machine", return_value=local), patch(
+        "coord.board_service.resolve", return_value=None
+    ), patch(
+        "coord.state.record_dispatched_assignment"
+    ) as mock_record, patch(
+        "coord.interactive.launch_human_attended_interactive"
+    ) as mock_launch:
+        result = runner.invoke(
+            portal_group,
+            ["decompose-chat", "sub_2f6a1c", "--interactive", "--discuss", "--dry-run"],
+        )
+    assert result.exit_code == 0, result.output
+    assert "INTAKE SESSION: sub_2f6a1c" in result.output
+    assert "MODE: DISCUSS" in result.output
+    assert "(dry run — not launched)" in result.output
+    assert "would exec:" in result.output
+    # The explicit system_prompt/allowed_tools override actually reached
+    # ClaudePtyProvider.build_command (it has no "decomposition-chat"
+    # branch of its own, so this is the whole point of passing them
+    # explicitly rather than relying on spec.type inference).
+    assert "decomposition steward" in result.output.lower()
+    assert "Read,Bash" in result.output
+    # Dry-run must not attach tmux or persist a board row.
+    mock_launch.assert_not_called()
+    mock_record.assert_not_called()

@@ -614,6 +614,43 @@ def fetch_portal_link(
     return link if isinstance(link, dict) else None
 
 
+def fetch_portal_ledger(
+    svc: ServiceConfig, submission_id: str, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict:
+    """GET ``/portal-ledger`` from the daemon *svc* points at — the running-
+    context payload :func:`coord.portal_store.render_ledger_payload` builds
+    locally, routed through the daemon for a thin client (#2751).
+
+    Factored out of two independent near-verbatim copies (#2750 fix round):
+    `coord.commands.portal._fetch_ledger_payload_remote` (the ``coord
+    portal ledger`` CLI render) and `coord.decomposition_chat.
+    _fetch_ledger_payload_remote` (the intake session's own briefing
+    builder, `fetch_running_context`) agreed on the same GET/params/
+    header/timeout/``resp.json()["payload"]`` wire shape but maintained it
+    in two places — exactly the split-brain-waiting-to-happen this repo's
+    own rule warns about ("if two surfaces answer the same question, they
+    must call the same function"). Both already reach into this module for
+    other daemon calls, so this is the natural shared home.
+
+    Deliberately does **not** follow the fail-soft-to-``None`` convention
+    most of this module's other ``fetch_*`` helpers use (mirroring
+    :func:`fetch_milestone_gate`'s reasoning): a briefing that silently
+    rendered as "empty" on a daemon hiccup would be indistinguishable from
+    "genuinely nothing on file yet", which is actively misleading rather
+    than merely unavailable. Raises ``httpx.HTTPError`` on a transport/HTTP
+    failure and ``KeyError``/``ValueError`` on a malformed body; callers
+    let the failure surface rather than swallowing it.
+    """
+    resp = httpx.get(
+        f"{svc.url}/portal-ledger",
+        params={"submission_id": submission_id},
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["payload"]
+
+
 def fetch_milestone_gate(
     svc: ServiceConfig,
     repo_name: str,

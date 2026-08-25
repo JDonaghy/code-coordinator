@@ -153,29 +153,6 @@ def select_discuss_mode(
     )
 
 
-def _fetch_ledger_payload_remote(svc: Any, submission_id: str) -> dict[str, Any]:
-    """GET ``/portal-ledger`` from the daemon *svc* points at.
-
-    Deliberate near-duplicate of :func:`coord.commands.portal.
-    _fetch_ledger_payload_remote` — this module can't import a command
-    module's private helper without inverting the normal command->core
-    import direction, and the call is small enough (one GET) that
-    duplicating it here is cheaper than the alternative. Keep the two in
-    sync if the ``/portal-ledger`` wire shape ever changes.
-    """
-    import httpx  # noqa: PLC0415
-
-    headers = {"Authorization": f"Bearer {svc.token}"} if svc.token else {}
-    resp = httpx.get(
-        f"{svc.url}/portal-ledger",
-        params={"submission_id": submission_id},
-        headers=headers,
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return resp.json()["payload"]
-
-
 def fetch_running_context(submission_id: str) -> dict[str, Any]:
     """*submission_id*'s running-context ledger payload (#2749's four-layer
     store), routed through the daemon when this machine is a thin client —
@@ -183,12 +160,21 @@ def fetch_running_context(submission_id: str) -> dict[str, Any]:
     briefing built on ANY machine sees the exact same context a daemon-host
     invocation would (#2750's own "Done when": a different session, on a
     different machine, briefed with everything so far).
+
+    The daemon GET itself is :func:`coord.client.fetch_portal_ledger` —
+    shared with `coord portal ledger`'s own remote read (#2750 fix round:
+    the two used to carry independent near-verbatim copies of the same
+    GET/params/header/wire-shape logic; factored into `coord.client`'s
+    `fetch_*` family, which both callers already reach into for other
+    daemon calls, so the two can't drift on the wire shape again).
     """
     from coord import board_service  # noqa: PLC0415
 
     svc = board_service.resolve()
     if svc is not None:
-        return _fetch_ledger_payload_remote(svc, submission_id)
+        from coord.client import fetch_portal_ledger  # noqa: PLC0415
+
+        return fetch_portal_ledger(svc, submission_id)
     from coord import portal_store  # noqa: PLC0415
 
     return portal_store.render_ledger_payload(submission_id)
