@@ -28,6 +28,104 @@ def test_linux_resolves_to_dot_coord_back_compat(monkeypatch) -> None:
     assert default_coord_dir() == Path.home() / ".coord"
 
 
+# ── #2776: ``$COORD_DIR`` override ──────────────────────────────────────────
+#
+# The load-bearing half of the fix: on Windows, ``platformdirs.
+# user_data_dir`` resolves the real shell folder via ``SHGetFolderPathW`` and
+# honours *no* environment variable -- not ``HOME``, not ``USERPROFILE``, not
+# ``LOCALAPPDATA``. Without an override checked before the ``sys.platform``
+# branch, nothing (a test fixture, a wrapper script, an operator) could ever
+# redirect the state root on that platform. These tests pin the override on
+# every platform this module distinguishes, and confirm leaving it unset
+# reproduces today's byte-for-byte POSIX/native-dir behaviour.
+
+
+def test_coord_dir_override_wins_on_posix(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    override = tmp_path / "posix-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+    assert default_coord_dir() == override
+
+
+def test_coord_dir_override_wins_on_windows_without_touching_platformdirs(
+    monkeypatch, tmp_path
+) -> None:
+    """The override is checked *before* the ``sys.platform`` branch, so it
+    must win even though ``platformdirs`` is never given the chance to run
+    (and would explode on this Linux CI box if it were -- see module
+    docstring)."""
+    import platformdirs
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("platformdirs.user_data_dir should not be called")
+
+    monkeypatch.setattr(platformdirs, "user_data_dir", explode)
+
+    override = tmp_path / "win-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+    assert default_coord_dir() == override
+
+
+def test_coord_dir_override_wins_on_darwin(monkeypatch, tmp_path) -> None:
+    import platformdirs
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("platformdirs.user_data_dir should not be called")
+
+    monkeypatch.setattr(platformdirs, "user_data_dir", explode)
+
+    override = tmp_path / "darwin-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+    assert default_coord_dir() == override
+
+
+def test_coord_dir_override_expands_user(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("COORD_DIR", "~/coord-override")
+    assert default_coord_dir() == Path.home() / "coord-override"
+
+
+def test_coord_dir_override_computed_fresh_not_cached(monkeypatch, tmp_path) -> None:
+    """Must be re-read on every call (not memoised) -- a test fixture that
+    sets it after another module has already imported ``default_coord_dir``
+    still has to take effect."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("COORD_DIR", raising=False)
+    assert default_coord_dir() == Path.home() / ".coord"
+
+    override = tmp_path / "late-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+    assert default_coord_dir() == override
+
+
+def test_coord_dir_unset_preserves_posix_default(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("COORD_DIR", raising=False)
+    assert default_coord_dir() == Path.home() / ".coord"
+
+
+def test_coord_dir_unset_preserves_native_dir_default(monkeypatch) -> None:
+    import platformdirs
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("COORD_DIR", raising=False)
+    calls = []
+
+    def fake_user_data_dir(appname, appauthor=None, **kwargs):
+        calls.append((appname, appauthor))
+        return r"C:\Users\bob\AppData\Local\coord"
+
+    monkeypatch.setattr(platformdirs, "user_data_dir", fake_user_data_dir)
+
+    result = default_coord_dir()
+    assert calls == [("coord", False)]
+    assert result == Path(r"C:\Users\bob\AppData\Local\coord")
+
+
 def test_other_posix_platform_resolves_to_dot_coord(monkeypatch) -> None:
     """Any sys.platform other than win32/darwin is treated as POSIX back-compat."""
     monkeypatch.setattr(sys, "platform", "freebsd13")
