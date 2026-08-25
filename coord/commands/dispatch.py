@@ -1585,9 +1585,11 @@ def chat_continue(
     claude_session_id = None
     if _resolve_svc() is None:
         try:
+            from coord import sql as _sql  # noqa: PLC0415
             from coord.db import get_connection as _get_conn  # noqa: PLC0415
 
-            _row = _get_conn().execute(
+            _row = _sql.execute(
+                _get_conn(),
                 "SELECT claude_session_id FROM assignments WHERE assignment_id = ?",
                 (prior_assignment_id,),
             ).fetchone()
