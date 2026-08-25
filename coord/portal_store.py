@@ -42,7 +42,17 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
+
+from coord import sql
+
+#: A DB-API row as the three ``_*_from_row`` helpers below need it: index by
+#: column name (``row["col"]``). ``sqlite3.Row`` and psycopg's ``dict_row``
+#: rows (plain ``dict``s) both satisfy this, so the helpers name neither
+#: driver's concrete row type directly (#2719's row-factory abstraction —
+#: ``coord.sql.row_factory_for``/``apply_row_factory`` is what actually picks
+#: the factory; this is just the shape both choices produce).
+Row = Mapping[str, Any]
 
 # Outbox row states. `pending` rows are retried each pass, up to
 # coord.portal_sync.MAX_PUSH_ATTEMPTS; `rejected` rows are terminal and need
@@ -86,7 +96,7 @@ class PortalEvent:
     handled_at: float | None = None
 
 
-def _event_from_row(row: sqlite3.Row) -> PortalEvent:
+def _event_from_row(row: Row) -> PortalEvent:
     try:
         payload = json.loads(row["payload_json"])
     except (ValueError, TypeError):
@@ -136,13 +146,18 @@ def record_events(
         if not event_id:
             event_id = _synthetic_event_id(record)
             unidentified += 1
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO portal_events
-                (event_id, submission_id, kind, occurred_at, payload_json,
-                 received_at, handled_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL)
-            """,
+        cur = sql.insert_ignore(
+            conn,
+            "portal_events",
+            [
+                "event_id",
+                "submission_id",
+                "kind",
+                "occurred_at",
+                "payload_json",
+                "received_at",
+                "handled_at",
+            ],
             (
                 event_id,
                 str(record.get("submission_id") or ""),
@@ -150,6 +165,7 @@ def record_events(
                 str(record.get("at") or record.get("occurred_at") or ""),
                 _stable_json(record),
                 stamp,
+                None,
             ),
         )
         inserted += cur.rowcount or 0
@@ -194,11 +210,12 @@ def _synthetic_event_id(event: dict[str, Any]) -> str:
 
 def unhandled_events(limit: int = 100) -> list[PortalEvent]:
     """Events pulled but not yet consumed by anything coord-side, oldest first."""
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         """
         SELECT * FROM portal_events
          WHERE handled_at IS NULL
-         ORDER BY received_at ASC, rowid ASC
+         ORDER BY received_at ASC, event_id ASC
          LIMIT ?
         """,
         (limit,),
@@ -224,20 +241,22 @@ def signoff_events() -> list[PortalEvent]:
     looks at the payload — so this stays a cheap indexed-ish scan and the
     verdict-shape guesswork lives in exactly one place.
     """
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         """
         SELECT * FROM portal_events
          WHERE kind = 'signoff' OR kind LIKE 'signoff.%'
-         ORDER BY received_at ASC, rowid ASC
-        """
+         ORDER BY received_at ASC, event_id ASC
+        """,
     ).fetchall()
     return [_event_from_row(r) for r in rows]
 
 
 def events_after_verdict_watermark(
-    received_at: float, rowid: int, *, limit: int = 100
-) -> list[tuple[int, PortalEvent]]:
-    """Events strictly after ``(received_at, rowid)``, oldest first, with rowid.
+    received_at: float, after_event_id: str, *, limit: int = 100
+) -> list[tuple[str, PortalEvent]]:
+    """Events strictly after ``(received_at, after_event_id)``, oldest first,
+    with each row's own ``event_id``.
 
     The verdict consumer's (#2509) OWN scan, independent of the shared
     ``handled_at`` column that :func:`unhandled_events` filters on. That
@@ -253,29 +272,41 @@ def events_after_verdict_watermark(
     *looked at*, whether or not it acted, so a pile of non-actionable events
     cannot block the ones behind it.
 
-    Returns ``(rowid, event)`` pairs (not just events) so the caller can
+    Returns ``(event_id, event)`` pairs (not just events) so the caller can
     advance the watermark to the exact row it stopped at without a second
-    query. ``rowid`` is SQLite's own implicit rowid — stable and unique
-    because ``portal_events``' primary key is the (non-integer) ``event_id``,
-    not ``rowid`` itself, so declaring the primary key never aliased it away.
+    query. Ordering ties on ``received_at`` (routine: :func:`record_events`
+    stamps every row of one pulled page with the SAME ``received_at``) used
+    to break on SQLite's implicit ``rowid`` — Postgres has no such thing
+    (#2723, Phase C slice 5/7 of #1948), and the seam only ever runs against a
+    real DB-API connection, so the tiebreak has to be an explicit column.
+    ``portal_events``' own primary key, ``event_id``, is that column: it is
+    unique per row (guaranteed by the PK) so ``(received_at, event_id)`` is
+    still a total order, which is all pagination actually needs — every row
+    is visited exactly once as the watermark strictly advances through it,
+    same as with ``rowid``. What it does NOT preserve is insertion order
+    among same-``received_at`` rows (event_id's own sort order, not arrival
+    order, now decides who is "later") — a real, deliberate behaviour change,
+    not a pure translation.
     """
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         """
-        SELECT rowid, * FROM portal_events
+        SELECT * FROM portal_events
          WHERE received_at > ?
-            OR (received_at = ? AND rowid > ?)
-         ORDER BY received_at ASC, rowid ASC
+            OR (received_at = ? AND event_id > ?)
+         ORDER BY received_at ASC, event_id ASC
          LIMIT ?
         """,
-        (received_at, received_at, rowid, limit),
+        (received_at, received_at, after_event_id, limit),
     ).fetchall()
-    return [(r["rowid"], _event_from_row(r)) for r in rows]
+    return [(r["event_id"], _event_from_row(r)) for r in rows]
 
 
 def mark_event_handled(event_id: str, *, now: float | None = None) -> None:
     """Stamp an event as consumed. Idempotent — re-stamping is a plain UPDATE."""
     conn = _conn()
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE portal_events SET handled_at = ? WHERE event_id = ?",
         (time.time() if now is None else now, event_id),
     )
@@ -296,11 +327,12 @@ def events_for_submission(submission_id: str) -> list[PortalEvent]:
     """
     if not submission_id:
         return []
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         """
         SELECT * FROM portal_events
          WHERE submission_id = ?
-         ORDER BY received_at ASC, rowid ASC
+         ORDER BY received_at ASC, event_id ASC
         """,
         (submission_id,),
     ).fetchall()
@@ -316,12 +348,13 @@ def all_event_submission_ids() -> list[str]:
     from the derived table would only ever find what the (possibly broken)
     mirror fold already wrote there.
     """
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         """
         SELECT DISTINCT submission_id FROM portal_events
          WHERE submission_id != ''
          ORDER BY submission_id ASC
-        """
+        """,
     ).fetchall()
     return [r["submission_id"] for r in rows]
 
@@ -343,7 +376,8 @@ def replace_customer_json(
     stamp = time.time() if now is None else now
     conn = _conn()
     _ensure_submission_row(conn, submission_id, stamp)
-    conn.execute(
+    sql.execute(
+        conn,
         """
         UPDATE portal_submissions
            SET customer_json = ?, updated_at = ?
@@ -371,7 +405,8 @@ def mirror_customer_facts(
     stamp = time.time() if now is None else now
     conn = _conn()
     _ensure_submission_row(conn, submission_id, stamp)
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT customer_json FROM portal_submissions WHERE submission_id = ?",
         (submission_id,),
     ).fetchone()
@@ -382,7 +417,8 @@ def mirror_customer_facts(
     if not isinstance(current, dict):
         current = {}
     current.update(facts)
-    conn.execute(
+    sql.execute(
+        conn,
         """
         UPDATE portal_submissions
            SET customer_json = ?, updated_at = ?
@@ -418,7 +454,7 @@ class SubmissionRecord:
     updated_at: float
 
 
-def _submission_from_row(row: sqlite3.Row) -> SubmissionRecord:
+def _submission_from_row(row: Row) -> SubmissionRecord:
     try:
         customer = json.loads(row["customer_json"])
     except (ValueError, TypeError):
@@ -440,18 +476,17 @@ def _submission_from_row(row: sqlite3.Row) -> SubmissionRecord:
 def _ensure_submission_row(
     conn: sqlite3.Connection, submission_id: str, stamp: float
 ) -> None:
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO portal_submissions
-            (submission_id, first_seen_at, updated_at)
-        VALUES (?, ?, ?)
-        """,
+    sql.insert_ignore(
+        conn,
+        "portal_submissions",
+        ["submission_id", "first_seen_at", "updated_at"],
         (submission_id, stamp, stamp),
     )
 
 
 def get_submission(submission_id: str) -> SubmissionRecord | None:
-    row = _conn().execute(
+    row = sql.execute(
+        _conn(),
         "SELECT * FROM portal_submissions WHERE submission_id = ?",
         (submission_id,),
     ).fetchone()
@@ -459,8 +494,9 @@ def get_submission(submission_id: str) -> SubmissionRecord | None:
 
 
 def list_submissions() -> list[SubmissionRecord]:
-    rows = _conn().execute(
-        "SELECT * FROM portal_submissions ORDER BY first_seen_at ASC, submission_id ASC"
+    rows = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_submissions ORDER BY first_seen_at ASC, submission_id ASC",
     ).fetchall()
     return [_submission_from_row(r) for r in rows]
 
@@ -480,7 +516,8 @@ def seed_revision(submission_id: str, revision: int, *, now: float | None = None
     stamp = time.time() if now is None else now
     conn = _conn()
     _ensure_submission_row(conn, submission_id, stamp)
-    conn.execute(
+    sql.execute(
+        conn,
         """
         UPDATE portal_submissions
            SET last_revision = MAX(last_revision, ?), updated_at = ?
@@ -513,7 +550,7 @@ class OutboxRow:
     sent_at: float | None
 
 
-def _outbox_from_row(row: sqlite3.Row) -> OutboxRow:
+def _outbox_from_row(row: Row) -> OutboxRow:
     try:
         fields = json.loads(row["fields_json"])
     except (ValueError, TypeError):
@@ -558,14 +595,16 @@ def enqueue(
     conn = _conn()
     with conn:  # one transaction: allocate + insert
         _ensure_submission_row(conn, submission_id, stamp)
-        row = conn.execute(
+        row = sql.execute(
+            conn,
             "SELECT last_revision, last_seq FROM portal_submissions "
             "WHERE submission_id = ?",
             (submission_id,),
         ).fetchone()
         revision = int(row["last_revision"]) + 1
         seq = int(row["last_seq"]) + 1
-        conn.execute(
+        sql.execute(
+            conn,
             """
             UPDATE portal_submissions
                SET last_revision = ?, last_seq = ?, updated_at = ?
@@ -573,7 +612,8 @@ def enqueue(
             """,
             (revision, seq, stamp, submission_id),
         )
-        cur = conn.execute(
+        new_id = sql.insert_returning_id(
+            conn,
             """
             INSERT INTO portal_outbox
                 (submission_id, seq, revision, kind, fields_json, announces,
@@ -591,10 +631,11 @@ def enqueue(
                 STATE_PENDING,
                 stamp,
             ),
+            pk_column="id",
         )
-        row_id = int(cur.lastrowid or 0)
-    stored = _conn().execute(
-        "SELECT * FROM portal_outbox WHERE id = ?", (row_id,)
+        row_id = int(new_id or 0)
+    stored = sql.execute(
+        _conn(), "SELECT * FROM portal_outbox WHERE id = ?", (row_id,)
     ).fetchone()
     return _outbox_from_row(stored)
 
@@ -608,19 +649,22 @@ def pending_outbox(limit: int | None = None) -> list[OutboxRow]:
     stuck design round must not let its own `awaiting-signoff` overtake it,
     and must not stall a different customer's submission.
     """
-    sql = (
+    # Named `query`, not `sql` — this module imports `coord.sql` as `sql`.
+    query = (
         "SELECT * FROM portal_outbox WHERE state = ? "
         "ORDER BY submission_id ASC, seq ASC"
     )
     params: tuple[Any, ...] = (STATE_PENDING,)
     if limit is not None:
-        sql += " LIMIT ?"
+        query += " LIMIT ?"
         params += (limit,)
-    return [_outbox_from_row(r) for r in _conn().execute(sql, params).fetchall()]
+    rows = sql.execute(_conn(), query, params).fetchall()
+    return [_outbox_from_row(r) for r in rows]
 
 
 def outbox_for_submission(submission_id: str) -> list[OutboxRow]:
-    rows = _conn().execute(
+    rows = sql.execute(
+        _conn(),
         "SELECT * FROM portal_outbox WHERE submission_id = ? ORDER BY seq ASC",
         (submission_id,),
     ).fetchall()
@@ -638,7 +682,8 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
     stamp = time.time() if now is None else now
     conn = _conn()
     with conn:
-        conn.execute(
+        sql.execute(
+            conn,
             """
             UPDATE portal_outbox
                SET state = ?, reason = '', sent_at = ?, attempts = attempts + 1
@@ -648,14 +693,16 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
         )
         _ensure_submission_row(conn, row.submission_id, stamp)
         if row.kind == "status":
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE portal_submissions SET last_status = ?, updated_at = ? "
                 "WHERE submission_id = ?",
                 (str(row.fields.get("status", "")), stamp, row.submission_id),
             )
         elif row.kind == "design_round":
             round_no = _round_number(row.fields)
-            conn.execute(
+            sql.execute(
+                conn,
                 """
                 UPDATE portal_submissions
                    SET design_round = MAX(design_round, ?), updated_at = ?
@@ -664,13 +711,15 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
                 (round_no, stamp, row.submission_id),
             )
         elif row.kind == "question":
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE portal_submissions SET open_question = ?, updated_at = ? "
                 "WHERE submission_id = ?",
                 (str(row.fields.get("question", "")), stamp, row.submission_id),
             )
         elif row.kind == "preview":
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE portal_submissions SET preview_url = ?, updated_at = ? "
                 "WHERE submission_id = ?",
                 (str(row.fields.get("preview_url", "")), stamp, row.submission_id),
@@ -702,7 +751,8 @@ def mark_rejected(row: OutboxRow, reason: str, *, now: float | None = None) -> N
     error no amount of waiting fixes.
     """
     conn = _conn()
-    conn.execute(
+    sql.execute(
+        conn,
         """
         UPDATE portal_outbox
            SET state = ?, reason = ?, sent_at = ?, attempts = attempts + 1
@@ -733,18 +783,21 @@ def reallocate_revision(row: OutboxRow, reason: str, *, now: float | None = None
     stamp = time.time() if now is None else now
     conn = _conn()
     with conn:
-        current = conn.execute(
+        current = sql.execute(
+            conn,
             "SELECT last_revision FROM portal_submissions WHERE submission_id = ?",
             (row.submission_id,),
         ).fetchone()
         base = int(current["last_revision"]) if current else row.revision
         revision = max(base, row.revision) + 1
-        conn.execute(
+        sql.execute(
+            conn,
             "UPDATE portal_submissions SET last_revision = ?, updated_at = ? "
             "WHERE submission_id = ?",
             (revision, stamp, row.submission_id),
         )
-        conn.execute(
+        sql.execute(
+            conn,
             """
             UPDATE portal_outbox
                SET revision = ?, attempts = attempts + 1, reason = ?
@@ -768,7 +821,8 @@ def requeue(submission_id: str, seq: int, *, now: float | None = None) -> Outbox
     watermark by now. Returns ``None`` if there is no such row.
     """
     conn = _conn()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT * FROM portal_outbox WHERE submission_id = ? AND seq = ?",
         (submission_id, seq),
     ).fetchone()
@@ -776,18 +830,21 @@ def requeue(submission_id: str, seq: int, *, now: float | None = None) -> Outbox
         return None
     stamp = time.time() if now is None else now
     with conn:
-        current = conn.execute(
+        current = sql.execute(
+            conn,
             "SELECT last_revision FROM portal_submissions WHERE submission_id = ?",
             (submission_id,),
         ).fetchone()
         base = int(current["last_revision"]) if current else int(row["revision"])
         revision = max(base, int(row["revision"])) + 1
-        conn.execute(
+        sql.execute(
+            conn,
             "UPDATE portal_submissions SET last_revision = ?, updated_at = ? "
             "WHERE submission_id = ?",
             (revision, stamp, submission_id),
         )
-        conn.execute(
+        sql.execute(
+            conn,
             """
             UPDATE portal_outbox
                SET state = ?, revision = ?, attempts = 0, reason = '', sent_at = NULL
@@ -795,8 +852,8 @@ def requeue(submission_id: str, seq: int, *, now: float | None = None) -> Outbox
             """,
             (STATE_PENDING, revision, row["id"]),
         )
-    updated = conn.execute(
-        "SELECT * FROM portal_outbox WHERE id = ?", (row["id"],)
+    updated = sql.execute(
+        conn, "SELECT * FROM portal_outbox WHERE id = ?", (row["id"],)
     ).fetchone()
     return _outbox_from_row(updated)
 
@@ -808,7 +865,8 @@ def note_attempt(row: OutboxRow, reason: str) -> None:
     revision)`` again, which is why a retry can never duplicate a fact.
     """
     conn = _conn()
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE portal_outbox SET attempts = attempts + 1, reason = ? WHERE id = ?",
         (reason[:500], row.id),
     )
@@ -823,7 +881,8 @@ def note_hold(row: OutboxRow, reason: str) -> None:
     "coord deliberately has not asked yet".
     """
     conn = _conn()
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE portal_outbox SET reason = ? WHERE id = ?",
         (reason[:500], row.id),
     )
@@ -843,12 +902,16 @@ class SyncState:
     last_heartbeat_at: float | None = None
     last_error: str = ""
     verdict_watermark_at: float = 0.0
-    verdict_watermark_rowid: int = 0
+    # Column is still named `verdict_watermark_rowid` in `coord.db`'s schema
+    # (a schema rename is out of scope for this slice) but, since #2723,
+    # holds `portal_events.event_id` — see `get_verdict_watermark` — so the
+    # type is `str`, not `int`.
+    verdict_watermark_rowid: str = ""
 
 
 def get_sync_state() -> SyncState:
-    row = _conn().execute(
-        "SELECT * FROM portal_sync_state WHERE id = 1"
+    row = sql.execute(
+        _conn(), "SELECT * FROM portal_sync_state WHERE id = 1"
     ).fetchone()
     if row is None:
         return SyncState()
@@ -859,7 +922,7 @@ def get_sync_state() -> SyncState:
         last_heartbeat_at=row["last_heartbeat_at"],
         last_error=row["last_error"] or "",
         verdict_watermark_at=row["verdict_watermark_at"] or 0.0,
-        verdict_watermark_rowid=row["verdict_watermark_rowid"] or 0,
+        verdict_watermark_rowid=row["verdict_watermark_rowid"] or "",
     )
 
 
@@ -867,11 +930,10 @@ def _update_sync_state(**columns: Any) -> None:
     if not columns:
         return
     conn = _conn()
-    conn.execute(
-        "INSERT OR IGNORE INTO portal_sync_state (id, last_error) VALUES (1, '')"
-    )
+    sql.insert_ignore(conn, "portal_sync_state", ["id", "last_error"], (1, ""))
     assignments = ", ".join(f"{name} = ?" for name in columns)
-    conn.execute(
+    sql.execute(
+        conn,
         f"UPDATE portal_sync_state SET {assignments} WHERE id = 1",  # noqa: S608
         tuple(columns.values()),
     )
@@ -890,26 +952,33 @@ def note_pull(*, now: float | None = None) -> None:
     _update_sync_state(last_pull_at=time.time() if now is None else now)
 
 
-def get_verdict_watermark() -> tuple[float, int]:
-    """The verdict consumer's own read position, ``(0.0, 0)`` if never set.
+def get_verdict_watermark() -> tuple[float, str]:
+    """The verdict consumer's own read position, ``(0.0, "")`` if never set.
 
-    ``(0.0, 0)`` sorts before every real ``portal_events`` row (``received_at``
-    is a wall-clock epoch stamp, ``rowid`` starts at 1), so a fresh database
-    or one predating this column reads as "nothing scanned yet" and the next
+    ``(0.0, "")`` sorts before every real ``portal_events`` row: ``received_at``
+    is a wall-clock epoch stamp (always ``> 0.0``), and the empty string
+    sorts before any real ``event_id`` (never empty — see
+    :func:`_event_id_of`/:func:`_synthetic_event_id`). So a fresh database or
+    one predating this column reads as "nothing scanned yet" and the next
     scan starts from the very beginning of the inbox — see
     :func:`events_after_verdict_watermark`.
+
+    Was ``(0.0, 0)`` / an int rowid before #2723: SQLite's implicit ``rowid``
+    doesn't exist under Postgres, so the tiebreak moved to ``event_id``
+    (``portal_events``' own primary key) and the sentinel moved with it.
     """
-    row = _conn().execute(
+    row = sql.execute(
+        _conn(),
         "SELECT verdict_watermark_at, verdict_watermark_rowid "
-        "FROM portal_sync_state WHERE id = 1"
+        "FROM portal_sync_state WHERE id = 1",
     ).fetchone()
     if row is None or row["verdict_watermark_at"] is None:
-        return (0.0, 0)
-    return (row["verdict_watermark_at"], row["verdict_watermark_rowid"] or 0)
+        return (0.0, "")
+    return (row["verdict_watermark_at"], row["verdict_watermark_rowid"] or "")
 
 
-def set_verdict_watermark(received_at: float, rowid: int) -> None:
-    """Advance the verdict consumer's read position past ``(received_at, rowid)``.
+def set_verdict_watermark(received_at: float, event_id: str) -> None:
+    """Advance the verdict consumer's read position past ``(received_at, event_id)``.
 
     Called after a scan has looked at that row — regardless of whether it was
     acted on — so a run of non-actionable events cannot make this consumer
@@ -917,7 +986,7 @@ def set_verdict_watermark(received_at: float, rowid: int) -> None:
     :func:`mark_event_handled`, which is shared, per-event bookkeeping for
     whatever future consumer looks at ``handled_at`` next.
     """
-    _update_sync_state(verdict_watermark_at=received_at, verdict_watermark_rowid=rowid)
+    _update_sync_state(verdict_watermark_at=received_at, verdict_watermark_rowid=event_id)
 
 
 def note_push(*, now: float | None = None) -> None:

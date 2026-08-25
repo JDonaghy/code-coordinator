@@ -348,9 +348,15 @@ class TestEventsForSubmission:
             ]
         )
         events = events_for_submission("sub_1")
-        assert [e.event_id for e in events] == ["e2", "e1"]  # insertion order,
-        # since both share the same `received_at` stamp — real pulls arrive
-        # on separate ticks and so get distinct, ordering `received_at`s.
+        # #2723: both rows share the same `received_at` stamp (one
+        # `record_events` call = one `time.time()` read for the whole page),
+        # so this exercises the tiebreak. Real pulls arrive on separate ticks
+        # and so get distinct, ordering `received_at`s — the tiebreak only
+        # ever matters for same-page rows like these two. Pre-#2723 this
+        # broke on SQLite's implicit `rowid` (insertion order: "e2", "e1");
+        # Postgres has no `rowid`, so the tiebreak is now `event_id` (the
+        # table's own PK) — a real ordering change, called out in #2723.
+        assert [e.event_id for e in events] == ["e1", "e2"]
 
     def test_only_returns_the_named_submission(self, coord_db) -> None:
         from coord.portal_store import events_for_submission, record_events
@@ -463,3 +469,136 @@ class TestStatePersistenceDirect:
             get_portal_link(repo_name="acme-portal")
         with pytest.raises(ValueError):
             get_portal_link(repo_name="acme-portal", milestone_number=3, issue_number=42)
+
+
+class TestEventsAfterVerdictWatermarkPagination:
+    """#2723 (Phase C slice 5/7 of #1948): the seam migration replaced the
+    `(received_at, rowid)` tiebreak `events_after_verdict_watermark` pages on
+    with `(received_at, event_id)` — SQLite's implicit `rowid` has no
+    Postgres equivalent, but `portal_events.event_id` is the table's own
+    primary key, so it is unique per row and `(received_at, event_id)` stays
+    a TOTAL order. That is exactly the property a watermark scan needs to
+    neither skip nor repeat a row while paging: every row is visited exactly
+    once as the cursor strictly advances through a fixed total order,
+    regardless of what the tiebreak column actually contains.
+
+    These tests drive `events_after_verdict_watermark` the way
+    `coord.portal_sync._consume_verdicts` does — repeatedly, feeding each
+    page's last `(received_at, event_id)` back in as the next call's cursor —
+    and check the UNION of every page for exactly the accounting properties
+    that matter: nothing missing, nothing seen twice.
+    """
+
+    def _drain(self, *, limit: int) -> list[str]:
+        """Page from the PERSISTED watermark (`get_verdict_watermark`) to the
+        end, the same cursor `coord.portal_sync._consume_verdicts` uses —
+        and leave the watermark advanced at the end, so a second `_drain`
+        call is a genuine "what's new since last time" check."""
+        from coord.portal_store import (
+            events_after_verdict_watermark,
+            get_verdict_watermark,
+            set_verdict_watermark,
+        )
+
+        received_at, event_id = get_verdict_watermark()
+        seen: list[str] = []
+        for _ in range(1000):  # generous cap; a real bug would loop forever
+            page = events_after_verdict_watermark(received_at, event_id, limit=limit)
+            if not page:
+                break
+            for eid, event in page:
+                seen.append(eid)
+                received_at, event_id = event.received_at, eid
+        set_verdict_watermark(received_at, event_id)
+        return seen
+
+    def test_all_rows_share_one_received_at_no_skip_no_repeat(self, coord_db) -> None:
+        """The realistic worst case: one `record_events` page, so EVERY row
+        ties on `received_at` and the scan lives entirely off the tiebreak.
+        """
+        from coord.portal_store import record_events
+
+        event_ids = [f"e{i:03d}" for i in range(37)]
+        record_events(
+            [{"id": eid, "submission_id": "sub_1", "type": "noise"} for eid in event_ids],
+            now=100.0,
+        )
+
+        seen = self._drain(limit=5)  # small page, forces many round trips
+
+        assert sorted(seen) == sorted(event_ids)  # nothing skipped
+        assert len(seen) == len(set(seen))  # nothing repeated
+        # And the traversal order is the declared total order.
+        assert seen == sorted(event_ids)
+
+    def test_mixed_ties_and_distinct_timestamps_no_skip_no_repeat(self, coord_db) -> None:
+        """Several `record_events` pages (distinct `received_at`s, mirroring
+        separate pull ticks), each internally tied — the scan must stitch
+        pages together without dropping or re-visiting a row at the
+        boundary."""
+        from coord.portal_store import record_events
+
+        batches = [
+            (100.0, ["b0", "a1", "c2"]),
+            (100.0, ["z9", "y8"]),  # SAME received_at as the batch above
+            (200.0, ["m5", "m1", "m3"]),
+            (50.0, ["early"]),  # earlier than everything already inserted
+        ]
+        all_ids: list[str] = []
+        for received_at, ids in batches:
+            record_events(
+                [{"id": eid, "submission_id": "sub_1", "type": "noise"} for eid in ids],
+                now=received_at,
+            )
+            all_ids.extend(ids)
+
+        seen = self._drain(limit=2)  # smaller than every batch
+
+        assert sorted(seen) == sorted(all_ids)
+        assert len(seen) == len(set(seen))
+
+    def test_a_second_drain_from_the_advanced_watermark_returns_nothing(
+        self, coord_db
+    ) -> None:
+        """Once the watermark has caught up, re-scanning from where it
+        stopped must not re-surface anything already visited."""
+        from coord.portal_store import record_events
+
+        record_events(
+            [
+                {"id": "e1", "submission_id": "sub_1", "type": "noise"},
+                {"id": "e2", "submission_id": "sub_1", "type": "noise"},
+            ],
+            now=100.0,
+        )
+        first = self._drain(limit=100)
+        assert sorted(first) == ["e1", "e2"]
+
+        second = self._drain(limit=100)
+        assert second == []  # nothing new since the watermark already caught up
+
+
+class TestEnqueueSeamMigration:
+    """#2723: `enqueue()`'s `INSERT INTO portal_outbox` used to read back its
+    new row's id via `cursor.lastrowid`; it now goes through
+    `coord.sql.insert_returning_id` (the seam's portable lastrowid/RETURNING
+    helper). Pin that the returned `OutboxRow.id` is real and actually
+    resolves to the stored row, not just a non-crashing call."""
+
+    def test_returned_id_round_trips_to_the_stored_row(self, coord_db) -> None:
+        from coord.portal_store import outbox_for_submission, enqueue
+
+        row = enqueue("sub_1", "status", {"status": "in_progress"})
+        assert isinstance(row.id, int)
+        assert row.id > 0
+
+        [stored] = outbox_for_submission("sub_1")
+        assert stored.id == row.id
+        assert stored.fields == {"status": "in_progress"}
+
+    def test_successive_enqueues_get_distinct_increasing_ids(self, coord_db) -> None:
+        from coord.portal_store import enqueue
+
+        first = enqueue("sub_1", "status", {"status": "a"})
+        second = enqueue("sub_1", "status", {"status": "b"})
+        assert second.id > first.id

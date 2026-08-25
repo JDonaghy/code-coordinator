@@ -808,11 +808,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- private watermark sidesteps that: it advances past every event
         -- this consumer has looked at, acted on or not, so a pile of
         -- non-actionable events cannot block the ones behind it.
-        -- `(received_at, rowid)` mirrors `unhandled_events`'s own tiebreaker
-        -- ordering.
+        -- `(received_at, event_id)` mirrors `unhandled_events`'s own
+        -- tiebreaker ordering. `verdict_watermark_rowid` held a SQLite
+        -- `rowid` before #2723 (Phase C slice 5/7 of #1948); Postgres has no
+        -- `rowid`, so coord/portal_store.py now stores `portal_events`' own
+        -- primary key (`event_id`, TEXT) here instead — column name kept
+        -- as-is, a rename is a separate schema migration this slice did not
+        -- take on.
         -- Both NULL until the first tick with this column runs (an empty
         -- `~/.coord/coord.db` or one predating this migration), read as
-        -- `(0.0, 0)` — before every real event's `received_at`/`rowid`.
+        -- `(0.0, "")` — before every real event's `received_at`/`event_id`.
         CREATE TABLE IF NOT EXISTS portal_sync_state (
             id                    INTEGER PRIMARY KEY CHECK (id = 1),
             pull_cursor           TEXT,
