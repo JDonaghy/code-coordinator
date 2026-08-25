@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import socket
@@ -1529,6 +1530,12 @@ def create_repo(
     ``RuntimeError``/:class:`GhError` on failure, including the name already
     being taken — callers that want idempotency should check
     :func:`repo_exists` first.
+
+    Note there is an inherent TOCTOU gap between a caller's
+    :func:`repo_exists` pre-flight and this call — accepted, not overlooked:
+    nothing else touches GitHub in between (so the window is small) and
+    ``gh repo create``'s own "name already exists" error is a reasonable
+    fallback if the race is actually hit.
     """
     args = ["repo", "create", repo, "--private" if private else "--public", "--add-readme"]
     if description:
@@ -1598,8 +1605,6 @@ def create_commit_with_files(
     but never a *corrupt* one: nothing is written to *branch* until the final
     ref update, which is the one step that can't partially apply.
     """
-    import base64
-
     ref = _gh_json("api", f"repos/{repo}/git/refs/heads/{branch}", default={})
     parent_sha = ((ref or {}).get("object") or {}).get("sha")
     if not parent_sha:

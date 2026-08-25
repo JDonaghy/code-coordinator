@@ -10,7 +10,9 @@ gate structurally empty, no ``.githooks/`` leaves every worktree graph-blind).
 These tests are the ones that matter most: that `coord repo create` never
 touches GitHub before its local pre-flight checks pass, that a create failing
 partway through is reported honestly rather than silently, and that the
-residue it prints is genuinely the shrunk 3-item list — not the full 8.
+residue it prints is genuinely the shrunk 4-item list — not the full 8, and
+not so shrunk that it drops the per-machine coord-settings `git pull` that
+clears `coord repo doctor`'s `agent_repo_skew` CRIT.
 """
 
 from __future__ import annotations
@@ -164,13 +166,20 @@ class TestRepoCreateCommand:
             "coord", "tier:small", "tier:large",
         ]
 
-        # The residue is shrunk to 3 items, not repo add's 8 — CLAUDE.md/CI/
+        # The residue is shrunk to 4 items, not repo add's 8 — CLAUDE.md/CI/
         # .githooks must read as ALREADY done, not as outstanding residue.
-        assert "3 things still need a human" in result.output
+        assert "4 things still need a human" in result.output
         assert "already seeded" in result.output
         assert "add a CLAUDE.md to the repo" not in result.output
         assert "GRAPH, versioned half" not in result.output
         assert "coord repo doctor grocery --fix" in result.output
+        # The per-machine coord-settings `git pull` must survive — dropping
+        # it leaves every non-daemon machine's agent serving a stale
+        # coordinator.yml with nothing telling the operator to expect the
+        # resulting `agent_repo_skew` CRIT (review finding on #2747).
+        assert "agent_repo_skew" in result.output
+        for machine in ("laptop", "dellserver"):
+            assert f"coord-settings checkout on {machine}" in result.output
 
     def test_private_flag_and_description_are_forwarded(self, config_path, monkeypatch):
         calls = _stub_create(monkeypatch)
@@ -290,6 +299,36 @@ class TestRepoCreateCommand:
         # not be touched — a half-seeded repo should not silently look
         # onboarded.
         assert calls["create_repo"] != []
+        assert config_path.read_text() == before
+        from coord.config import load
+
+        assert load(config_path).repo("grocery") is None
+
+    def test_create_repo_failure_is_a_clean_click_exception(
+        self, config_path, monkeypatch
+    ):
+        """`gh repo create` failing (rate-limit, a name race, a forbidden
+        owner, a network blip) must surface as the same kind of actionable
+        `click.ClickException` every other failure path in this command
+        produces — not a raw traceback (review finding on #2747)."""
+        calls = _stub_create(monkeypatch)
+
+        def _boom(repo, *, private=False, description=None):
+            calls["create_repo"].append(
+                {"repo": repo, "private": private, "description": description}
+            )
+            raise RuntimeError("gh: secondary rate limit")
+
+        monkeypatch.setattr(github_ops, "create_repo", _boom)
+        before = config_path.read_text()
+
+        result = CliRunner().invoke(
+            repo_create, ["grocery", "--github", "acme/grocery", "--config", str(config_path)],
+        )
+        assert result.exit_code != 0
+        assert "could not create acme/grocery" in result.output
+        assert "secondary rate limit" in result.output
+        assert calls["seed"] == []
         assert config_path.read_text() == before
         from coord.config import load
 
