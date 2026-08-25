@@ -353,3 +353,97 @@ class TestPollUntilTerminal:
             )
 
         assert outcome.status == "timeout"
+
+
+# ── #2743 regression: _apply_label_change must echo its success message ──────
+
+
+class TestApplyLabelChangeEchoesSuccess:
+    """#2743 regression guard.
+
+    The first cut of this issue's poll-loop dedupe spliced ``PollOutcome`` /
+    ``poll_until_terminal`` into the *middle* of ``_apply_label_change``,
+    orphaning that function's closing ``click.echo(success_message)`` to the
+    end of the module as unreachable dead code underneath
+    ``poll_until_terminal``'s ``return``. Every lifecycle label command that
+    routes through the helper (``coord ready``, ``coord backlog``, ``coord
+    test --mode ...``) then exited 0 while printing *nothing at all* — a
+    silent success, which is worse than a loud failure for a command whose
+    only output is its confirmation line.
+
+    The CLI-level tests in ``tests/test_cli_issue_create_label.py`` and
+    ``tests/test_coord_test.py`` caught it, but they each exercise one
+    caller; this pins the shared helper's contract directly so the next
+    edit to the tail of ``_common.py`` can't quietly drop it again.
+    """
+
+    CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+"""
+
+    def _config(self, tmp_path):
+        p = tmp_path / "coordinator.yml"
+        p.write_text(self.CONFIG_YAML)
+        return p
+
+    def test_echoes_success_message_when_labels_changed(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from coord.commands._common import _apply_label_change
+
+        with patch("coord.state.apply_issue_labels", return_value=(["coord"], True)):
+            _apply_label_change(
+                "api", 10, self._config(tmp_path),
+                add={"status:ready"},
+                remove_if_present=set(),
+                success_message="issue #10 is now ready",
+                no_op_message="already ready",
+            )
+
+        assert "issue #10 is now ready" in capsys.readouterr().out
+
+    def test_echoes_no_op_message_and_not_success_when_unchanged(self, tmp_path, capsys):
+        """The no-op branch returns early — it must print the no-op line and
+        must NOT also print the success line."""
+        from unittest.mock import patch
+
+        from coord.commands._common import _apply_label_change
+
+        with patch("coord.state.apply_issue_labels", return_value=(["coord"], False)):
+            _apply_label_change(
+                "api", 10, self._config(tmp_path),
+                add={"status:ready"},
+                remove_if_present=set(),
+                success_message="issue #10 is now ready",
+                no_op_message="already ready",
+            )
+
+        out = capsys.readouterr().out
+        assert "already ready" in out
+        assert "issue #10 is now ready" not in out
+
+    def test_echoes_success_when_unchanged_but_no_no_op_message(self, tmp_path, capsys):
+        """With no ``no_op_message`` configured, an unchanged delta still falls
+        through to the success line rather than printing nothing."""
+        from unittest.mock import patch
+
+        from coord.commands._common import _apply_label_change
+
+        with patch("coord.state.apply_issue_labels", return_value=(["coord"], False)):
+            _apply_label_change(
+                "api", 10, self._config(tmp_path),
+                add={"status:ready"},
+                remove_if_present=set(),
+                success_message="issue #10 is now ready",
+            )
+
+        assert "issue #10 is now ready" in capsys.readouterr().out
