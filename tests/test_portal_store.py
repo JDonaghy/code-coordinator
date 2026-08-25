@@ -578,6 +578,46 @@ class TestEventsAfterVerdictWatermarkPagination:
         assert second == []  # nothing new since the watermark already caught up
 
 
+class TestVerdictWatermarkEventIdIsAlwaysText:
+    """#2723 review fix: `verdict_watermark_rowid` used to be declared
+    `INTEGER` in `coord.db`'s schema even though this slice repointed it at
+    `portal_events.event_id` — a TEXT primary key that is frequently
+    non-numeric (`_synthetic_event_id` mints `sha256:<hash>` ids for any
+    event the portal didn't give an id). An `INTEGER` column silently
+    coerces a numeric-looking string to SQLite's `integer` storage class on
+    write (manifest typing), masking the bug locally while Postgres would
+    reject a `sha256:...` id outright. Pin that the round trip preserves the
+    exact string for both a hash-style id and a numeric-looking one, and
+    that `get_verdict_watermark`'s return type is always `str`.
+    """
+
+    def test_synthetic_sha256_style_event_id_round_trips_as_str(self, coord_db) -> None:
+        from coord.portal_store import get_verdict_watermark, set_verdict_watermark
+
+        synthetic_id = "sha256:" + "ab" * 16
+        set_verdict_watermark(100.0, synthetic_id)
+
+        received_at, event_id = get_verdict_watermark()
+
+        assert received_at == 100.0
+        assert event_id == synthetic_id
+        assert isinstance(event_id, str)
+
+    def test_numeric_looking_event_id_round_trips_as_str_not_int(self, coord_db) -> None:
+        """A portal-provided numeric id (valid per `_event_id_of`'s
+        docstring) must not come back as an `int` — the column is TEXT, and
+        `get_verdict_watermark` is typed `-> tuple[float, str]`."""
+        from coord.portal_store import get_verdict_watermark, set_verdict_watermark
+
+        set_verdict_watermark(200.0, "42")
+
+        received_at, event_id = get_verdict_watermark()
+
+        assert received_at == 200.0
+        assert event_id == "42"
+        assert isinstance(event_id, str)
+
+
 class TestEnqueueSeamMigration:
     """#2723: `enqueue()`'s `INSERT INTO portal_outbox` used to read back its
     new row's id via `cursor.lastrowid`; it now goes through

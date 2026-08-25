@@ -826,7 +826,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_heartbeat_at     REAL,
             last_error            TEXT NOT NULL DEFAULT '',
             verdict_watermark_at    REAL,
-            verdict_watermark_rowid INTEGER
+            verdict_watermark_rowid TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
@@ -1184,15 +1184,20 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # #2509 review fix: the verdict consumer's own read position into
     # `portal_events` — see the CREATE TABLE comment above for why it
     # cannot reuse the shared `handled_at` column. NULL (read as
-    # `(0.0, 0)`, before every real event) for every database predating
+    # `(0.0, "")`, before every real event) for every database predating
     # this migration, which replays the full existing inbox exactly once
     # on upgrade — safe: re-scanning a non-actionable event is a no-op,
     # and `_consume_verdicts` skips (never re-dispatches) any event
     # whose `handled_at` is already set, so an already-consumed
     # `changes_requested` event from before this migration is walked
     # past, not re-sent — see `coord.portal_sync._consume_verdicts`.
+    # `verdict_watermark_rowid` is TEXT (not INTEGER) despite the name:
+    # #2723 (Phase C slice 5/7 of #1948) repointed it at
+    # `portal_events.event_id`, a TEXT primary key that is frequently
+    # non-numeric (`_synthetic_event_id` mints `sha256:<hash>` ids) — an
+    # INTEGER column would reject those outright under Postgres.
     "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_at REAL",
-    "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid INTEGER",
+    "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid TEXT",
     # #2604: see the CREATE TABLE comment above — a per-entry
     # `--max-fix-rounds` override for the tick's `coord drive --tmux`
     # launch. NULL for every row predating this migration, read
