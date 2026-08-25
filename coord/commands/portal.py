@@ -443,6 +443,19 @@ def portal_link(
     "--interval", default=15, show_default=True, type=int,
     help="With --wait: seconds between polls.",
 )
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help=(
+        "Only with --interactive: build the spec/argv/briefing and print "
+        "what would be launched, without attaching tmux or persisting an "
+        "assignment — mirrors `coord assign --interactive "
+        "--milestone-chat-of --dry-run`'s seam so the wiring can be "
+        "asserted on without taking over a TTY."
+    ),
+)
 def portal_decompose_chat(
     config_path,
     submission_id: str,
@@ -452,6 +465,7 @@ def portal_decompose_chat(
     wait_for_completion: bool,
     timeout: int,
     interval: int,
+    dry_run: bool,
 ) -> None:
     """Dispatch a ``type="decomposition-chat"`` session for SUBMISSION_ID (#2533).
 
@@ -487,8 +501,14 @@ def portal_decompose_chat(
 
     **--interactive** (#2750): launches a human-attended tmux session on
     THIS machine instead — see that option's help for the local-only
-    constraint and the thin-client caveat.
+    constraint and the thin-client caveat. **--dry-run** (only meaningful
+    with --interactive) builds the spec/argv/briefing and prints them
+    without attaching tmux or persisting an assignment — see that option's
+    help.
     """
+    if dry_run and not interactive_flag:
+        click.echo("error: --dry-run only applies with --interactive", err=True)
+        raise SystemExit(2)
     if interactive_flag:
         if wait_for_completion or machine_override:
             click.echo(
@@ -498,7 +518,9 @@ def portal_decompose_chat(
             )
             raise SystemExit(2)
         cfg = _load_config(config_path)
-        _run_decompose_chat_interactive(cfg, submission_id, discuss=discuss_flag)
+        _run_decompose_chat_interactive(
+            cfg, submission_id, discuss=discuss_flag, dry_run=dry_run
+        )
         return
 
     _refuse_if_thin_client("decompose-chat")
@@ -523,7 +545,7 @@ def portal_decompose_chat(
 
 
 def _run_decompose_chat_interactive(
-    cfg, submission_id: str, *, discuss: bool | None
+    cfg, submission_id: str, *, discuss: bool | None, dry_run: bool = False
 ) -> None:
     """#2750 (IL-4): human-attended, tmux-attached intake session for
     SUBMISSION_ID — the ``--interactive`` counterpart to the headless
@@ -536,6 +558,17 @@ def _run_decompose_chat_interactive(
     `coord assign --interactive` flavour, since ``coord portal
     decompose-chat`` is #2750's own stated per-dispatch surface ("takes only
     --machine, so there is no per-dispatch way to ask for anything else").
+
+    **dry_run** mirrors that same precedent's own ``--dry-run`` seam
+    (`_dispatch_milestone_chat_of`, asserted on by
+    `test_milestone_chat_of_dry_run_builds_dispatch`): build the
+    `AssignmentSpec`, the explicit `system_prompt`/`allowed_tools` override,
+    and the final `argv`, print them, and return — WITHOUT attaching tmux,
+    calling `record_dispatched_assignment`, or touching the board. This is
+    what lets the spec/argv/system-prompt wiring (in particular the
+    `ClaudePtyProvider.build_command` explicit-override branch below, since
+    that provider has no `"decomposition-chat"` case of its own) be asserted
+    on in a test without taking over a TTY.
 
     **Local-only** (#2750's own stated limit — Track B / #486 is remote):
     resolved via :func:`coord.test_orchestrator.local_machine`, and refuses
@@ -691,6 +724,14 @@ def _run_decompose_chat_interactive(
     click.echo(f"  why: {discuss_reason}")
     click.echo(f"  assignment id: {assignment_id}")
     click.echo(f"  cwd: {repo_path} (live checkout — read-only, no worktree)")
+    if dry_run:
+        # Mirrors `_dispatch_milestone_chat_of`'s own --dry-run seam: stop
+        # here, before any tmux/launch or board mutation, so a test can
+        # assert on the built spec/argv/system-prompt without taking over a
+        # TTY or persisting an assignment.
+        click.echo("  (dry run — not launched)")
+        click.echo(f"  would exec: {argv}")
+        return
 
     dc_assignment = _AssignmentDc(
         machine_name=machine.name,
@@ -1460,32 +1501,6 @@ def portal_requeue(submission_id: str, seq: int) -> None:
 # it's set).
 
 
-def _fetch_ledger_payload_remote(svc, submission_id: str) -> dict:
-    """GET ``/portal-ledger`` from the daemon *svc* points at.
-
-    Deliberately inline here rather than added to :mod:`coord.client`'s
-    ``fetch_*`` family: this seam has exactly one caller and no other module
-    needs it, so a tiny local ``httpx`` call keeps the daemon-routing
-    footprint of this issue to files it already touches. Raises
-    ``httpx.HTTPError`` on a transport/HTTP failure — unlike
-    :func:`coord.client.fetch_portal_link`'s fail-soft-to-``None``, a
-    briefing that silently rendered as "empty" on a daemon hiccup would be
-    actively misleading (indistinguishable from "genuinely nothing on
-    file"), so this lets the failure surface instead.
-    """
-    import httpx  # noqa: PLC0415
-
-    headers = {"Authorization": f"Bearer {svc.token}"} if svc.token else {}
-    resp = httpx.get(
-        f"{svc.url}/portal-ledger",
-        params={"submission_id": submission_id},
-        headers=headers,
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return resp.json()["payload"]
-
-
 def _render_ledger_text(payload: dict) -> str:
     """The human-readable rendering of :func:`coord.portal_store.
     render_ledger_payload`'s dict shape — used identically whether *payload*
@@ -1552,7 +1567,9 @@ def portal_ledger(submission_id: str, as_json: bool) -> None:
 
     svc = board_service.resolve()
     if svc is not None:
-        payload = _fetch_ledger_payload_remote(svc, submission_id)
+        from coord.client import fetch_portal_ledger  # noqa: PLC0415
+
+        payload = fetch_portal_ledger(svc, submission_id)
     else:
         from coord import portal_store  # noqa: PLC0415
 
