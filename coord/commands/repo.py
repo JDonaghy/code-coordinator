@@ -317,6 +317,34 @@ jobs:
 }
 
 
+# #2748 (IL-2): per-stack `acceptance.drivers.<repo>` entry, keyed by the
+# same ``--template`` the CI workflow already uses — the stack decision that
+# picks a CI template is the SAME decision that picks an oracle-loop driver
+# (`coord.acceptance_drivers.SUPPORTED_KINDS`), so deriving one from the
+# other closes IL-2's residue item 6 instead of leaving it as a step nobody
+# performs. ``generic`` has no entry (the stack isn't decided yet — a driver
+# would be as much of a guess as the CI template deliberately isn't). Each
+# ``run:`` uses the ``{ms}`` template (:func:`coord.acceptance_drivers.
+# render_run_command`) so ``coord acceptance run --issue N`` scopes to one
+# milestone's slice, matching every hand-authored driver in this fleet's own
+# ``coordinator.yml``.
+_ACCEPTANCE_DRIVER_TEMPLATES: dict[str, dict[str, str]] = {
+    "python": {
+        "kind": "cli-pytest",
+        "run": "pytest tests/acceptance/{ms}",
+        "mock": "*.out",
+        "capability": "python",
+    },
+    "node": {
+        "kind": "web-playwright",
+        "run": "npx playwright test tests/acceptance/{ms}",
+        "setup": "npm ci",
+        "mock": "*.html",
+        "capability": "browser",
+    },
+}
+
+
 def _render_claude_md_skeleton(name: str) -> str:
     """A minimal ``CLAUDE.md`` for a just-created repo (#2747).
 
@@ -638,6 +666,70 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
     }
 
 
+def _write_acceptance_driver_entry(*, target: Path, name: str, ci_template: str) -> bool:
+    """Write ``acceptance.drivers.<name>`` into *target* for the stack
+    *ci_template* selected (#2748, IL-2), or do nothing for ``generic``
+    (stack undecided — a driver would be as much of a guess as the CI
+    template deliberately isn't).
+
+    Returns whether an entry was written. Same seatbelt shape as
+    :func:`_do_repo_add_core`'s own write: edit, re-parse into a TEMP file,
+    confirm the driver actually resolves for *name*, only THEN write
+    *target* — a plausible-looking edit that silently failed to parse (or
+    landed under the wrong key) is worse than not writing at all, since
+    nothing else re-checks this afterward.
+    """
+    spec = _ACCEPTANCE_DRIVER_TEMPLATES.get(ci_template)
+    if spec is None:
+        return False
+
+    from coord.config import load as load_config  # noqa: PLC0415
+    from coord.repo_edit import (  # noqa: PLC0415
+        RepoEditError,
+        insert_acceptance_driver_entry,
+        render_acceptance_driver_entry,
+    )
+
+    original = target.read_text(encoding="utf-8")
+    entry = render_acceptance_driver_entry(
+        name, spec["kind"], spec["run"],
+        setup=spec.get("setup", ""), mock=spec.get("mock", ""),
+        capability=spec.get("capability", ""),
+    )
+    try:
+        updated = insert_acceptance_driver_entry(original, entry)
+    except RepoEditError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".yml", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(updated)
+        probe_path = Path(fh.name)
+    try:
+        new_cfg = load_config(probe_path)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"refusing to write acceptance.drivers.{name}: the edited config "
+            f"does not parse ({exc}). {target} is unchanged."
+        ) from exc
+    finally:
+        probe_path.unlink(missing_ok=True)
+
+    driver = new_cfg.acceptance.driver_for(name)
+    if driver is None or driver.kind != spec["kind"]:
+        raise click.ClickException(
+            f"refusing to write acceptance.drivers.{name}: the edit parsed "
+            f"but does not resolve to a {spec['kind']!r} driver for {name!r}. "
+            f"{target} is unchanged."
+        )
+
+    target.write_text(updated, encoding="utf-8")
+    return True
+
+
 def _print_add_residue(
     *, target: Path, machines: list[str], repo_path_tmpl: str | None, name: str,
 ) -> None:
@@ -891,14 +983,29 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
         dry_run=False,
         config_path=config_path,
     )
+    # #2748 (IL-2): a stack-appropriate acceptance.drivers entry, so the repo
+    # is oracle-loop-ready on day one instead of residue item 6 nobody
+    # performs. `generic` writes nothing — see
+    # `_write_acceptance_driver_entry`'s docstring.
+    driver_written = _write_acceptance_driver_entry(
+        target=result["target"], name=name, ci_template=ci_template,
+    )
+    if driver_written:
+        click.echo(
+            f"✓ wrote acceptance.drivers.{name} "
+            f"({_ACCEPTANCE_DRIVER_TEMPLATES[ci_template]['kind']})"
+        )
+
     _print_create_residue(
         target=result["target"], machines=result["machines"],
         repo_path_tmpl=repo_path_tmpl, name=name,
+        driver_written=driver_written,
     )
 
 
 def _print_create_residue(
     *, target: Path, machines: list[str], repo_path_tmpl: str | None, name: str,
+    driver_written: bool = False,
 ) -> None:
     """The shrunk residue ``coord repo create`` prints (#2747) — ``repo
     add``'s 8 minus the 3 traps this command already closed (CLAUDE.md, the
@@ -950,12 +1057,22 @@ def _print_create_residue(
         ".githooks` on every machine that runs workers. Idempotent; safe to "
         "re-run."
     )
-    click.echo(
-        "  Also worth doing by hand, not doctor-checked: set "
-        "`test_command`/`ci_command` and `smoke_tests.capability_rules` for "
-        "this repo's paths, and (if it joins the oracle loop) "
-        "`acceptance.drivers`."
-    )
+    if driver_written:
+        click.echo(
+            "  Also worth doing by hand, not doctor-checked: set "
+            "`test_command`/`ci_command` and `smoke_tests.capability_rules` "
+            "for this repo's paths. `acceptance.drivers` is already written "
+            "(#2748) — `coord repo doctor` reports its readiness as layer 6."
+        )
+    else:
+        click.echo(
+            "  Also worth doing by hand, not doctor-checked: set "
+            "`test_command`/`ci_command` and `smoke_tests.capability_rules` "
+            "for this repo's paths, and (if it joins the oracle loop) "
+            "`acceptance.drivers` — `--template python|node` writes one "
+            "automatically; `--template generic` leaves it for later since "
+            "the stack isn't decided yet (#2748)."
+        )
     click.echo("")
     click.echo(f"Then: coord repo doctor {name}")
 
@@ -963,12 +1080,15 @@ def _print_create_residue(
 @repo_group.command(
     "doctor",
     help=(
-        "Probe all five onboarding layers for a repo and report per-layer "
-        "status. Reads LIVE state — each agent's /health repo list, the labels "
-        "that exist on GitHub, whether any workflow triggers on pull_request, "
-        "and (since #2237) each machine's graph readiness rather than only "
-        "this one's — not config. Exits non-zero on any CRIT so it can gate. "
-        "Use --fix to repair the machine-local half of the graph layer."
+        "Probe all onboarding layers for a repo and report per-layer "
+        "status — the five a repo must clear (config, machines, GitHub, "
+        "contents, graph) plus the sixth, optional oracle-loop-readiness "
+        "layer (#2748). Reads LIVE state — each agent's /health repo list, "
+        "the labels that exist on GitHub, whether any workflow triggers on "
+        "pull_request, and (since #2237) each machine's graph readiness "
+        "rather than only this one's — not config. Exits non-zero on any "
+        "CRIT so it can gate. Use --fix to repair the machine-local half "
+        "of the graph layer."
     ),
 )
 @click.argument("name")

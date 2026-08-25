@@ -530,6 +530,191 @@ class TestGraphLayer:
         assert not (f.fix or "").strip().startswith("git config")
 
 
+class TestOracleLayer:
+    """#2748 (IL-2): layer 6, oracle-loop readiness. Never CRITs on "no
+    driver at all" — `coord acceptance mock` needs none — only on a driver
+    that claims to be wired but demonstrably is not."""
+
+    def test_no_driver_configured_is_a_warn_not_a_crit(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.no_driver" in _checks(report)
+        assert report.ok  # a repo with no driver at all is not a failure
+        f = next(f for f in report.findings if f.check == "oracle.no_driver")
+        assert "coord acceptance mock" in f.summary
+        assert "coord repo create" in (f.fix or "")
+
+    def test_directory_discovered_driver_needs_no_entrypoint(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(configured=True, kinds=["cli-pytest"]),
+        )
+        report = ro.evaluate(facts)
+        checks = _checks(report)
+        assert "oracle.driver_declared" in checks
+        assert "oracle.sealed_paths_resolvable" in checks
+        assert "oracle.entrypoint_not_required" in checks
+        assert "oracle.fixture_server_not_needed" in checks
+        assert report.ok
+
+    def test_missing_entrypoint_on_disk_is_crit(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["tui-tuidriver"],
+                entrypoints=["tui/tests/acceptance.rs"],
+                entrypoints_missing=["tui/tests/acceptance.rs"],
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.entrypoint_missing" in _checks(report)
+        assert not report.ok
+        f = next(f for f in report.findings if f.check == "oracle.entrypoint_missing")
+        assert "tui/tests/acceptance.rs" in f.summary
+        assert "1552" in f.summary
+
+    def test_entrypoint_present_on_disk_is_ok(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["tui-tuidriver"],
+                entrypoints=["tui/tests/acceptance.rs"], entrypoints_missing=[],
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.entrypoint_present" in _checks(report)
+        assert report.ok
+
+    def test_entrypoint_declared_but_not_probed_is_unknown_not_a_pass(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["tui-tuidriver"],
+                entrypoints=["tui/tests/acceptance.rs"], entrypoints_missing=None,
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.entrypoint_not_probed" in _checks(report)
+        assert "oracle.entrypoint_present" not in _checks(report)
+        assert report.ok  # UNKNOWN must never gate
+
+    def test_web_playwright_flags_the_unshipped_fixture_server(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["web-playwright"],
+                fixture_server_dependent=True,
+            ),
+        )
+        report = ro.evaluate(facts)
+        f = next(f for f in report.findings if f.check == "oracle.fixture_server_unmet")
+        assert f.severity == ro.WARN
+        assert "1538" in f.summary
+        assert report.ok  # a smoke net is a WARN, not a hard gate
+
+    def test_cli_pytest_does_not_flag_a_fixture_server_dependency(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(configured=True, kinds=["cli-pytest"]),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.fixture_server_unmet" not in _checks(report)
+        assert "oracle.fixture_server_not_needed" in _checks(report)
+
+    def test_gather_acceptance_facts_detects_a_missing_entrypoint_on_a_real_clone(
+        self, tmp_path
+    ):
+        """End-to-end through `gather_facts`: a driver with a declared
+        `entrypoint:` that does not exist in the local clone must surface as
+        `entrypoint_missing`, not a silent `entrypoint_present`."""
+        config = SEEDED_CONFIG + """\
+
+acceptance:
+  drivers:
+    newrepo:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance"
+      entrypoint: tui/tests/acceptance.rs
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(config)
+        cfg = load_config(p)
+        clone = tmp_path / "clone"
+        clone.mkdir()
+
+        facts = ro.gather_facts(
+            cfg, "newrepo", statuses=[], probe_github=False, local_clone=clone,
+        )
+        assert facts.acceptance.configured
+        assert facts.acceptance.kinds == ["tui-tuidriver"]
+        assert facts.acceptance.entrypoints_missing == ["tui/tests/acceptance.rs"]
+
+        report = ro.evaluate(facts)
+        assert "oracle.entrypoint_missing" in _checks(report)
+
+    def test_gather_acceptance_facts_confirms_an_existing_entrypoint(self, tmp_path):
+        config = SEEDED_CONFIG + """\
+
+acceptance:
+  drivers:
+    newrepo:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance"
+      entrypoint: tui/tests/acceptance.rs
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(config)
+        cfg = load_config(p)
+        clone = tmp_path / "clone"
+        (clone / "tui" / "tests").mkdir(parents=True)
+        (clone / "tui" / "tests" / "acceptance.rs").write_text("// wired\n")
+
+        facts = ro.gather_facts(
+            cfg, "newrepo", statuses=[], probe_github=False, local_clone=clone,
+        )
+        assert facts.acceptance.entrypoints_missing == []
+
+        report = ro.evaluate(facts)
+        assert "oracle.entrypoint_present" in _checks(report)
+
+    def test_gather_acceptance_facts_derives_fixture_dependency_from_kind(
+        self, tmp_path
+    ):
+        """`fixture_server_dependent` must be DERIVED from the driver's
+        `kind` (via `coord.acceptance_drivers.FIXTURE_SERVER_DEPENDENT_KINDS`)
+        by `gather_acceptance_facts`, not left for every caller to guess."""
+        config = SEEDED_CONFIG + """\
+
+acceptance:
+  drivers:
+    newrepo:
+      kind: web-playwright
+      run: "npx playwright test tests/acceptance"
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(config)
+        cfg = load_config(p)
+
+        facts = ro.gather_facts(cfg, "newrepo", statuses=[], probe_github=False)
+        assert facts.acceptance.fixture_server_dependent is True
+
+        report = ro.evaluate(facts)
+        assert "oracle.fixture_server_unmet" in _checks(report)
+
+    def test_unconfigured_repo_never_reaches_the_oracle_layer(self):
+        report = ro.evaluate(ro.RepoFacts(name="ghost", configured=False))
+        assert "oracle.no_driver" not in _checks(report)
+
+
 class TestDoctorFolding:
     """``coord doctor`` folds in the LIVE layer only — see
     :func:`coord.repo_onboard.doctor_summary_lines`."""

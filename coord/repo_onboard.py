@@ -34,6 +34,15 @@ The five layers, and what each one silently costs when missed:
    order. A half-installed machine looks identical to a working one; it just
    answers from grep.
 
+A sixth, optional layer — **oracle** (#2748, IL-2) — reports oracle-loop
+readiness: whether ``acceptance.drivers`` declares this repo, whether its
+declared ``entrypoint:`` (if any) actually exists on disk, and whether its
+driver depends on an input that hasn't shipped yet (``web-playwright``'s
+fixture server, #1538). Unlike the five layers above, having NO acceptance
+driver at all is not a defect — ``coord acceptance mock`` (Gate A) needs
+none — so this layer never CRITs on absence, only on a driver that claims
+to be wired but demonstrably is not.
+
 Shape mirrors :mod:`coord.fleet_config_health` and :mod:`coord.graph_health`:
 a **facts** layer that does the I/O, a **pure** evaluator over those facts, and
 a renderer. The split is what makes the black-box test in
@@ -56,9 +65,11 @@ UNKNOWN = "unknown"
 _SEVERITY_MARK = {CRIT: "✗ CRIT", WARN: "⚠ WARN", OK: "✓", UNKNOWN: "?"}
 _SEVERITY_RANK = {CRIT: 0, WARN: 1, UNKNOWN: 2, OK: 3}
 
-# The five layers, in onboarding order. Rendered in this order so the report
-# reads like the runbook it replaces.
-LAYERS: tuple[str, ...] = ("config", "machines", "github", "contents", "graph")
+# The onboarding layers, in onboarding order. Rendered in this order so the
+# report reads like the runbook it replaces. #2748 (IL-2) added `oracle` as
+# layer 6 — optional/advanced, so it renders last, after the five layers
+# every repo must clear.
+LAYERS: tuple[str, ...] = ("config", "machines", "github", "contents", "graph", "oracle")
 
 # GitHub labels onboarding creates / requires.
 COORD_LABEL = "coord"
@@ -216,6 +227,43 @@ class GraphFacts:
 
 
 @dataclass
+class AcceptanceFacts:
+    """Oracle-loop readiness for one repo (#2748, IL-2 — layer 6).
+
+    Distinct from whether the repo can author Gate-A mocks/contracts at all:
+    ``coord acceptance mock`` needs no driver (only ``gh`` + a machine to
+    dispatch to — see ``coord/commands/acceptance.py``'s module docstring).
+    This is specifically about whether ``coord acceptance run``/``record``
+    can actually EXECUTE the sealed suite — a strictly later, optional
+    milestone in a repo's onboarding, and one CLAUDE.md is explicit is a
+    "legitimate and useful intermediate state — not a failure" to be
+    missing.
+    """
+
+    configured: bool = False
+    # One entry per kind in play: the flat driver's own kind, or one per
+    # route for a routed repo (#1125) — deduped, declaration order
+    # preserved. Empty when `configured` is False.
+    kinds: list[str] = field(default_factory=list)
+    routed: bool = False
+    # Every declared `entrypoint:` (#1552) across the driver/its routes —
+    # see `AcceptanceConfig.entrypoints`. Empty for an all-directory-
+    # discovered driver (cli-pytest, web-playwright) — that is normal, not
+    # a defect.
+    entrypoints: list[str] = field(default_factory=list)
+    # Which of `entrypoints` do NOT exist on disk. `None` means "not probed
+    # here" (no local clone was given to `gather_facts`) — a skip, never a
+    # proven-clean pass, mirroring `GraphFacts.probed`.
+    entrypoints_missing: list[str] | None = None
+    # True when ANY kind in play is fixture-server dependent (today, just
+    # `web-playwright` — see `coord.acceptance_drivers.
+    # FIXTURE_SERVER_DEPENDENT_KINDS`): the driver shipped (#1539) but the
+    # deterministic seeded-board fixture server it needs (#1538) has not,
+    # so a run against a live fleet is a smoke net, not a pinned oracle.
+    fixture_server_dependent: bool = False
+
+
+@dataclass
 class RepoFacts:
     """Everything :func:`evaluate` needs, and nothing it has to fetch itself."""
 
@@ -230,7 +278,7 @@ class RepoFacts:
     smoke_command: str | None = None
     smoke_command_source: str | None = None
     capability_rule_count: int = 0
-    has_acceptance_driver: bool = False
+    acceptance: AcceptanceFacts = field(default_factory=AcceptanceFacts)
     machines: list[MachineFacts] = field(default_factory=list)
     gh: GithubFacts = field(default_factory=GithubFacts)
     graph: GraphFacts = field(default_factory=GraphFacts)
@@ -542,6 +590,54 @@ def machine_facts_from_statuses(cfg, repo_name: str, statuses) -> list[MachineFa
     return out
 
 
+def gather_acceptance_facts(
+    acceptance_cfg, repo_name: str, local_clone: Path | None,
+) -> AcceptanceFacts:
+    """Oracle-loop readiness facts for *repo_name* (#2748, IL-2).
+
+    Pure config-read plus, when *local_clone* is given, a filesystem check
+    for whether every declared ``entrypoint:`` (#1552) actually exists —
+    the difference between "declared" and "present" is exactly the #1552
+    failure mode: a slice that isn't registered/wired compiles into
+    nothing and silently reports zero tests. ``entrypoints_missing`` stays
+    ``None`` (not ``[]``) when *local_clone* is ``None`` — a skip, never a
+    proven-clean pass, mirroring :func:`gather_graph_facts`'s own
+    ``probed`` convention.
+    """
+    from coord.acceptance_drivers import FIXTURE_SERVER_DEPENDENT_KINDS  # noqa: PLC0415
+
+    drivers = getattr(acceptance_cfg, "drivers", None) or {}
+    entry = drivers.get(repo_name)
+    if entry is None:
+        return AcceptanceFacts(configured=False)
+
+    routes = getattr(entry, "routes", None) or []
+    kinds: list[str] = []
+    for cfg in ([entry] if not routes else routes):
+        k = (getattr(cfg, "kind", "") or "").strip()
+        if k and k not in kinds:
+            kinds.append(k)
+
+    entrypoints: list[str] = []
+    for cfg in [entry, *routes]:
+        ep = (getattr(cfg, "entrypoint", "") or "").strip()
+        if ep and ep not in entrypoints:
+            entrypoints.append(ep)
+
+    missing: list[str] | None = None
+    if local_clone is not None and entrypoints:
+        missing = [ep for ep in entrypoints if not (local_clone / ep).exists()]
+
+    return AcceptanceFacts(
+        configured=True,
+        kinds=kinds,
+        routed=bool(routes),
+        entrypoints=entrypoints,
+        entrypoints_missing=missing,
+        fixture_server_dependent=any(k in FIXTURE_SERVER_DEPENDENT_KINDS for k in kinds),
+    )
+
+
 def gather_facts(
     cfg,
     repo_name: str,
@@ -578,9 +674,9 @@ def gather_facts(
         facts.smoke_command_source = resolved.source
         facts.capability_rule_count = len(smoke_cfg.capability_rules or [])
 
-    acceptance = getattr(cfg, "acceptance", None)
-    drivers = getattr(acceptance, "drivers", None) or {}
-    facts.has_acceptance_driver = repo_name in drivers
+    facts.acceptance = gather_acceptance_facts(
+        getattr(cfg, "acceptance", None), repo_name, local_clone,
+    )
 
     facts.machines = machine_facts_from_statuses(cfg, repo_name, statuses or [])
 
@@ -1039,6 +1135,123 @@ def evaluate_contents(facts: RepoFacts) -> list[Finding]:
     return out
 
 
+def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
+    """Layer 6 — oracle-loop readiness (#2748, IL-2).
+
+    Deliberately never CRITs on "no driver at all": `coord acceptance mock`
+    (Gate A mock/contract authoring) needs no driver, so a repo that can
+    author mocks but cannot yet run a sealed suite is a legitimate,
+    common intermediate state — CLAUDE.md is explicit that this must read
+    as informational, not a failure. The one thing that DOES CRIT here is a
+    driver that claims to be wired but demonstrably is not (a declared
+    `entrypoint:` missing from disk) — that is not an absent feature, it is
+    a broken one: `coord acceptance run`/`record` would silently report
+    zero tests forever (#1552).
+    """
+    out: list[Finding] = []
+    acc = facts.acceptance
+
+    if not acc.configured:
+        out.append(Finding(
+            layer="oracle", check="oracle.no_driver", severity=WARN,
+            summary=(
+                "no acceptance driver configured under `acceptance.drivers."
+                f"{facts.name}` — `coord acceptance mock` (Gate A mock/contract "
+                "authoring) still works with no driver at all, but `coord "
+                "acceptance run`/`record` cannot execute a sealed suite until "
+                "one is added. A legitimate intermediate state, not a failure, "
+                "for a repo that hasn't joined the oracle loop yet"
+            ),
+            fix=(
+                "add acceptance.drivers." + facts.name + " in coordinator.yml — "
+                "`coord repo create --template python|node` writes one "
+                "automatically for a NEW repo (#2748); see docs/ORACLE_LOOP.md "
+                "for an existing one"
+            ),
+        ))
+        return out
+
+    kinds_str = ", ".join(acc.kinds) if acc.kinds else "(no kind declared)"
+    out.append(Finding(
+        layer="oracle", check="oracle.driver_declared", severity=OK,
+        summary=(
+            f"acceptance driver declared: {kinds_str}"
+            + (" (routed)" if acc.routed else "")
+        ),
+    ))
+
+    # Mirrors `coord.config.SEALED_ACCEPTANCE_DIR` / `AcceptanceConfig.
+    # sealed_paths` — a plain literal here (not an import) keeps this
+    # module's only dependency on `coord.config`'s shape at the `cfg`
+    # parameter `gather_facts` already takes duck-typed, not a hard import.
+    sealed = ["tests/acceptance/", *acc.entrypoints]
+    out.append(Finding(
+        layer="oracle", check="oracle.sealed_paths_resolvable", severity=OK,
+        summary=f"sealed path set resolves: {', '.join(sealed)}",
+    ))
+
+    if not acc.entrypoints:
+        out.append(Finding(
+            layer="oracle", check="oracle.entrypoint_not_required", severity=OK,
+            summary=(
+                f"no `entrypoint:` declared — {kinds_str} discovers the sealed "
+                "suite by directory, not a registered crate root"
+            ),
+        ))
+    elif acc.entrypoints_missing is None:
+        out.append(Finding(
+            layer="oracle", check="oracle.entrypoint_not_probed", severity=UNKNOWN,
+            summary=(
+                f"declared entrypoint(s) {', '.join(acc.entrypoints)} not "
+                "checked — no local clone available here to look for them"
+            ),
+        ))
+    elif acc.entrypoints_missing:
+        out.append(Finding(
+            layer="oracle", check="oracle.entrypoint_missing", severity=CRIT,
+            summary=(
+                f"declared entrypoint(s) {', '.join(acc.entrypoints_missing)} do "
+                "not exist in the local checkout — the sealed suite is entirely "
+                "unwired; any slice authored under tests/acceptance/ silently "
+                "compiles into nothing and reports zero tests (#1552)"
+            ),
+            fix=(
+                "create the missing entrypoint file(s), or register them per "
+                "AcceptanceDriverConfig.entrypoint's docstring "
+                "(coord/config.py)"
+            ),
+        ))
+    else:
+        out.append(Finding(
+            layer="oracle", check="oracle.entrypoint_present", severity=OK,
+            summary=f"entrypoint(s) present: {', '.join(acc.entrypoints)}",
+        ))
+
+    if acc.fixture_server_dependent:
+        out.append(Finding(
+            layer="oracle", check="oracle.fixture_server_unmet", severity=WARN,
+            summary=(
+                f"{kinds_str} depends on the deterministic seeded-board "
+                "fixture server (#1538), which has not shipped — runs "
+                "execute against whatever the live fleet is doing right now, "
+                "a smoke net rather than a pinned oracle (CLAUDE.md's "
+                "web-playwright section)"
+            ),
+            fix=(
+                "none available yet — #1538/milestone #51 is the fixture-"
+                "server work; until it lands, treat this driver's verdicts as "
+                "advisory, not a trust gate"
+            ),
+        ))
+    else:
+        out.append(Finding(
+            layer="oracle", check="oracle.fixture_server_not_needed", severity=OK,
+            summary=f"{kinds_str} run deterministically — no unshipped fixture-server dependency",
+        ))
+
+    return out
+
+
 def _evaluate_graph_fleet(facts: RepoFacts, *, local_is_covered: bool = False) -> list[Finding]:
     """Layer 5, per machine that runs workers for this repo (#2237 items 2+4).
 
@@ -1331,7 +1544,7 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
 
 
 def evaluate(facts: RepoFacts) -> RepoDoctorReport:
-    """Run all five layers over *facts*. Pure — no I/O, no network."""
+    """Run every layer over *facts*. Pure — no I/O, no network."""
     findings: list[Finding] = []
     findings.extend(evaluate_config(facts))
     if facts.configured:
@@ -1339,6 +1552,7 @@ def evaluate(facts: RepoFacts) -> RepoDoctorReport:
         findings.extend(evaluate_github(facts))
         findings.extend(evaluate_contents(facts))
         findings.extend(evaluate_graph(facts))
+        findings.extend(evaluate_oracle(facts))
     return RepoDoctorReport(repo_name=facts.name, findings=findings)
 
 
@@ -1351,6 +1565,7 @@ _LAYER_TITLES = {
     "github": "3 — GitHub (labels + pull_request trigger)",
     "contents": "4 — repo contents",
     "graph": "5 — graph",
+    "oracle": "6 — oracle-loop readiness (optional; #2748)",
 }
 
 

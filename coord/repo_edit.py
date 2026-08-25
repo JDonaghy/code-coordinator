@@ -108,6 +108,100 @@ def insert_repo_entry(text: str, entry: str) -> str:
     return "".join(lines)
 
 
+# ── #2748 (IL-2): `acceptance.drivers.<repo>` ─────────────────────────────────
+
+
+def render_acceptance_driver_entry(
+    repo_name: str,
+    kind: str,
+    run: str,
+    *,
+    setup: str = "",
+    mock: str = "",
+    capability: str = "",
+    entrypoint: str = "",
+) -> str:
+    """The ``acceptance.drivers.<repo_name>:`` YAML fragment for a freshly
+    created repo (#2748, IL-2) — mirrors :func:`render_repo_entry`'s "only
+    what the caller can determine correctly" restraint, but every field a
+    driver needs to actually RUN is knowable from the stack alone (see
+    ``coord.commands.repo._ACCEPTANCE_DRIVER_TEMPLATES``), unlike
+    ``ci_command``/``coordinator_only_files`` on the repo entry itself.
+
+    4-space/6-space indentation matches the ``acceptance: / drivers: /
+    <repo>: / <field>:`` nesting documented in docs/ORACLE_LOOP.md and used
+    by every hand-authored fleet config today.
+    """
+    lines = [f"    {repo_name}:", f"      kind: {kind}"]
+    if setup:
+        lines.append(f'      setup: "{setup}"')
+    lines.append(f'      run: "{run}"')
+    if mock:
+        lines.append(f'      mock: "{mock}"')
+    if capability:
+        lines.append(f"      capability: {capability}")
+    if entrypoint:
+        lines.append(f"      entrypoint: {entrypoint}")
+    return "\n".join(lines) + "\n"
+
+
+def insert_acceptance_driver_entry(text: str, entry: str) -> str:
+    """Insert *entry* (one :func:`render_acceptance_driver_entry` block)
+    under ``acceptance: / drivers:`` in *text*, preserving comments — same
+    contract as :func:`insert_repo_entry`.
+
+    Unlike ``repos:``/``machines:``, ``acceptance:`` is an ADVANCED,
+    optional block: most of this project's own history predates it, and a
+    fleet that has never touched the oracle loop has no ``acceptance:`` key
+    at all (see ``tests/test_repo_add.py``'s fixture, which has neither).
+    So this creates whatever is missing rather than requiring it exist
+    first — a fresh ``acceptance:\\n  drivers:\\n`` block when there is no
+    top-level ``acceptance:`` key yet, or just the ``drivers:`` child when
+    ``acceptance:`` exists but is childless (hand-added for some other
+    reason, or a future field lands there before ``drivers:`` does).
+    """
+    lines = text.splitlines(keepends=True)
+    block = entry if entry.endswith("\n") else entry + "\n"
+
+    try:
+        start, end = _find_block(lines, "acceptance")
+    except RepoEditError:
+        # No `acceptance:` top-level block at all — append a fresh one.
+        prefix = "" if (lines and not lines[-1].strip()) else "\n"
+        lines.append(prefix + "acceptance:\n  drivers:\n" + block)
+        return "".join(lines)
+
+    drivers_line = None
+    for i in range(start + 1, end):
+        if re.match(r"^\s{2}drivers:\s*(\{\})?\s*$", lines[i]):
+            drivers_line = i
+            # An inline empty flow mapping (`drivers: {}`) — rewrite it to
+            # block form so the entry can be inserted as a child on the
+            # next line, rather than appending a SECOND `drivers:` key
+            # below (a duplicate key that would silently override this one
+            # in most YAML loaders and discard the entry being added).
+            if lines[i].strip() != "drivers:":
+                lines[i] = "  drivers:\n"
+            break
+    if drivers_line is None:
+        # `acceptance:` exists but has no `drivers:` child yet.
+        lines[start + 1:start + 1] = ["  drivers:\n"]
+        drivers_line = start + 1
+        end += 1
+
+    # End of the `drivers:` mapping — the first line back at <=2-space
+    # indent (a sibling of `drivers:` itself), or the end of the
+    # `acceptance:` block.
+    insert_at = drivers_line + 1
+    while insert_at < end:
+        line = lines[insert_at]
+        if line.strip() and re.match(r"^\s{0,2}\S", line):
+            break
+        insert_at += 1
+    lines[insert_at:insert_at] = [block]
+    return "".join(lines)
+
+
 def _machine_entry_range(lines: list[str], machine: str) -> tuple[int, int]:
     """``(start, end)`` line indices of one machine's entry inside ``machines:``."""
     m_start, m_end = _find_block(lines, "machines")
