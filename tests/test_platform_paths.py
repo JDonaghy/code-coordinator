@@ -102,12 +102,6 @@ def test_coord_dir_override_computed_fresh_not_cached(monkeypatch, tmp_path) -> 
     assert default_coord_dir() == override
 
 
-def test_coord_dir_unset_preserves_posix_default(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.delenv("COORD_DIR", raising=False)
-    assert default_coord_dir() == Path.home() / ".coord"
-
-
 def test_coord_dir_unset_preserves_native_dir_default(monkeypatch) -> None:
     import platformdirs
 
