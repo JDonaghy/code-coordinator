@@ -18,6 +18,7 @@ independent ``Path.home() / ".coord"`` literals.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -32,10 +33,29 @@ _NATIVE_DIR_PLATFORMS = ("win32", "darwin")
 def default_coord_dir() -> Path:
     """Resolve the coordinator's state root for the current platform.
 
-    POSIX (Linux, and any other non-Windows/non-macOS *nix) keeps ``~/.coord``
-    for back-compat with every existing deployment. Windows and macOS resolve
-    through ``platformdirs`` to their OS-native application-data directory.
+    ``$COORD_DIR`` overrides on *every* platform, checked before the
+    ``sys.platform`` branch below -- the same seam
+    ``coord.notifier.store.state_path``/``coord.commands.drive_queue.
+    roll_pending_path`` already use for their own state files (#1632,
+    #2587). It exists because (a)/(b)/(c) of #2776 stack into one un-
+    isolatable machine-global store on Windows: ``platformdirs.
+    user_data_dir`` there resolves through ``SHGetFolderPathW``, which reads
+    the real shell folder and honours *no* environment variable -- not
+    ``HOME``, not ``USERPROFILE``, not even ``LOCALAPPDATA`` -- so nothing
+    downstream of this function could redirect it without one. Computed
+    fresh on every call (not a module-level constant) so a test can
+    override it via ``monkeypatch.setenv`` without also having to fight a
+    value baked in at import time -- see ``default_settings_dir``'s
+    docstring in ``coord/fleet_config_health.py`` for the same reasoning.
+
+    Absent an override: POSIX (Linux, and any other non-Windows/non-macOS
+    *nix) keeps ``~/.coord`` for back-compat with every existing deployment.
+    Windows and macOS resolve through ``platformdirs`` to their OS-native
+    application-data directory.
     """
+    override = os.environ.get("COORD_DIR")
+    if override:
+        return Path(override).expanduser()
     if sys.platform in _NATIVE_DIR_PLATFORMS:
         import platformdirs  # noqa: PLC0415 -- keep this leaf module import-light on POSIX
 

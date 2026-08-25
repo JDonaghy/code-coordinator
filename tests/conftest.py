@@ -538,6 +538,24 @@ def _no_real_pause_store(monkeypatch, tmp_path):
     Exact equality of ``$HOME`` sidesteps that: once a test has pointed
     ``$HOME`` anywhere else, this backs off unconditionally, wherever that
     elsewhere is.
+
+    #2776: the ``$HOME``-equality check above is POSIX-only logic wearing a
+    platform-neutral name. ``default_coord_dir()`` (``coord/platform_paths.
+    py``) resolves the Windows state root through ``platformdirs`` ->
+    ``SHGetFolderPathW``, which reads the real shell folder and honours no
+    environment variable at all — not ``HOME``, not ``USERPROFILE``. On
+    ``windows-latest`` ``$HOME`` is normally unset, so ``current_home is not
+    None`` is false, the branch above never fires, and every test in the
+    session shares one real, machine-global ``paused_machines.json`` — the
+    exact #2101 hazard this fixture exists to prevent, just unguarded on
+    that platform. The 20 modules that isolate via
+    ``monkeypatch.setenv("HOME", tmp_path)`` don't save it either: that env
+    var redirects nothing on Windows, so ``machine_pause._state_path()``
+    still resolves to the one shared file regardless. Redirect
+    unconditionally on ``win32`` instead of trusting ``$HOME`` there at
+    all — there is no ``$HOME``-shaped signal on that platform worth
+    trusting in the first place. POSIX keeps the exact ``$HOME``-equality
+    check above, unchanged: #2615 and #2170 are both encoded in it.
     """
     from coord import machine_pause  # noqa: PLC0415
 
@@ -546,6 +564,9 @@ def _no_real_pause_store(monkeypatch, tmp_path):
 
     def _guarded() -> Path:
         resolved = original()
+        if sys.platform == "win32":
+            sandbox.mkdir(parents=True, exist_ok=True)
+            return sandbox / resolved.name
         current_home = os.environ.get("HOME")
         try:
             if (
