@@ -551,32 +551,111 @@ def _no_real_pause_store(monkeypatch, tmp_path):
     that platform. The 20 modules that isolate via
     ``monkeypatch.setenv("HOME", tmp_path)`` don't save it either: that env
     var redirects nothing on Windows, so ``machine_pause._state_path()``
-    still resolves to the one shared file regardless. Redirect
-    unconditionally on ``win32`` instead of trusting ``$HOME`` there at
-    all — there is no ``$HOME``-shaped signal on that platform worth
-    trusting in the first place. POSIX keeps the exact ``$HOME``-equality
-    check above, unchanged: #2615 and #2170 are both encoded in it.
+    still resolves to the one shared file regardless.
+
+    The first cut of this fix branched on ``sys.platform == "win32"``
+    directly. That is correct on a *real* Windows runner, but it made the
+    guard untestable pre-Windows-CI: the issue's own local reproduction (a
+    pytest plugin — ``winsim.py`` — that fakes ``default_coord_dir()`` to
+    always return one fixed global root, mirroring what ``platformdirs``
+    does on Windows, *without* touching ``sys.platform``) runs with
+    ``sys.platform`` still ``"linux"`` throughout. (Flipping ``sys.platform``
+    for real in that repro doesn't work either — it breaks unrelated lazy,
+    ``msvcrt``-guarded imports elsewhere, e.g. ``click._winconsole``, that
+    only resolve correctly while genuinely on Linux, so any module
+    importing ``click`` after the flip fails to collect at all.) A branch
+    keyed on ``sys.platform`` therefore never engaged under that repro, and
+    it kept reproducing the original failures after the "fix" too.
+
+    Trusting an observed *behaviour* instead of the platform string fixes
+    that: probe whether ``$HOME`` is actually load-bearing for this
+    resolution by re-resolving under a different ``$HOME`` value and
+    comparing. On POSIX — real, or under this repro's unfaked
+    ``default_coord_dir()`` — the two resolutions differ, so nothing
+    changes here: the ``$HOME``-equality check above still governs, #2615
+    and #2170 intact. On real ``win32``, and identically under this
+    repro's faked ``default_coord_dir()`` (which ignores ``$HOME`` on
+    purpose, exactly like ``platformdirs`` does), the probe comes back
+    identical, so this redirects unconditionally — regardless of what
+    ``sys.platform`` happens to read — which is what lets the *exact*,
+    unmodified reproduction from the issue demonstrate the fix locally.
+
+    One more wrinkle the probe alone doesn't cover: some tests (e.g.
+    ``tests/test_quiet_hours_store_2146.py``) reach past the public API and
+    read the on-disk file back at a hardcoded ``$HOME / ".coord" /
+    "paused_machines.json"`` path, to assert on the raw JSON. Those tests
+    already point ``$HOME`` at their own private ``tmp_path`` (the
+    20-module isolation pattern), so when the probe says ``$HOME`` isn't
+    load-bearing *and* a test has pointed it somewhere private (not the
+    ambient snapshot), this mirrors the POSIX ``~/.coord`` layout under
+    that private directory instead of the fixture's own unrelated sandbox
+    — same isolation guarantee, but at the path such a test already
+    expects. When no test has claimed ``$HOME`` at all (the common
+    ``windows-latest`` case: unset, or still the ambient snapshot), there
+    is nothing to mirror under, so this falls back to the fixture's own
+    private sandbox, exactly as before.
+
+    A test that has taken explicit control via the ``$COORD_DIR`` override
+    this issue adds (``coord/platform_paths.py``) is trusted outright and
+    skips all of the above — the same way the sibling ``_no_real_*``
+    fixtures below trust their own env-var seams.
     """
     from coord import machine_pause  # noqa: PLC0415
 
     original = machine_pause._state_path
     sandbox = tmp_path / "pause-store"
 
+    def _sandboxed(name: str) -> Path:
+        sandbox.mkdir(parents=True, exist_ok=True)
+        return sandbox / name
+
     def _guarded() -> Path:
         resolved = original()
-        if sys.platform == "win32":
-            sandbox.mkdir(parents=True, exist_ok=True)
-            return sandbox / resolved.name
+
+        if os.environ.get("COORD_DIR"):
+            # A test has taken explicit control via the documented
+            # override seam (#2776) — trust it, don't second-guess it.
+            return resolved
+
         current_home = os.environ.get("HOME")
+        is_ambient_home = False
         try:
-            if (
+            is_ambient_home = (
                 current_home is not None
                 and Path(current_home).resolve() == _AMBIENT_HOME_AT_COLLECTION
-            ):
-                sandbox.mkdir(parents=True, exist_ok=True)
-                return sandbox / resolved.name
+            )
         except OSError:
             pass
+
+        # Probe: does changing $HOME actually change what this resolves
+        # to? If not, there is no $HOME-shaped signal here worth trusting
+        # (real win32, or a repro faking the same env-immunity) and we
+        # must redirect unconditionally.
+        _unset = object()
+        saved_home = os.environ.get("HOME", _unset)
+        os.environ["HOME"] = f"{current_home or ''}/__coord_home_probe__"
+        try:
+            probed = original()
+        finally:
+            if saved_home is _unset:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+        home_is_load_bearing = probed != resolved
+
+        if not home_is_load_bearing:
+            if current_home is not None and not is_ambient_home:
+                # A test claimed $HOME as its own private isolation dir,
+                # but this platform's resolution ignores $HOME outright --
+                # mirror the POSIX layout under that private dir so an
+                # on-disk assertion built against it stays meaningful.
+                mirror = Path(current_home) / ".coord"
+                mirror.mkdir(parents=True, exist_ok=True)
+                return mirror / resolved.name
+            return _sandboxed(resolved.name)
+
+        if is_ambient_home:
+            return _sandboxed(resolved.name)
         return resolved
 
     monkeypatch.setattr(machine_pause, "_state_path", _guarded)
