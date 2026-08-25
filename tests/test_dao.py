@@ -112,3 +112,37 @@ def test_coordstore_is_runtime_checkable_against_sqlite_store(read_db: Path) -> 
     methods were dropped from both the protocol and the class."""
     store = SqliteStore(read_db)
     assert isinstance(store, CoordStore)
+
+
+def test_connect_opens_a_genuinely_read_only_connection(read_db: Path) -> None:
+    """#2766: ``_connect()`` now sets up the connection via
+    ``coord.sql.apply_connection_setup(conn, read_only=True)`` instead of a
+    bare ``PRAGMA query_only=ON``. Guard that the seam call still produces a
+    connection that refuses writes -- the whole point of ``SqliteStore``
+    never touching the live board DB it reads."""
+    store = SqliteStore(read_db)
+    conn = store._connect()
+    try:
+        with pytest.raises(sqlite3.Error):
+            conn.execute("INSERT INTO board_meta (key, value) VALUES ('x', 'y')")
+    finally:
+        conn.close()
+
+
+def test_audit_recent_count_fails_open_when_table_missing(tmp_path: Path) -> None:
+    """#2766: ``_audit_recent_count`` used to catch ``sqlite3.Error``
+    directly; it now catches ``coord.sql.driver_error(conn)``. Guard that the
+    fail-open behaviour (#1037: a missing/pre-migration ``audit_log`` table
+    must never blow up the board) survives the seam migration."""
+    p = tmp_path / "no_audit_log.db"
+    conn = sqlite3.connect(str(p))
+    conn.execute("CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+
+    store = SqliteStore(p)
+    ro_conn = store._connect()
+    try:
+        assert store._audit_recent_count(ro_conn) == 0
+    finally:
+        ro_conn.close()

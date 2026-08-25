@@ -29,10 +29,24 @@ singleton): it opens the DB with ``mode=ro`` + ``PRAGMA query_only`` and never
 runs schema/migration DDL, so it is safe to point at a live ``coord.db`` that
 the coordinator process is writing in WAL mode.
 
-All SQLite idioms (``sqlite3.Row``, JSON-encoded TEXT columns, the ``mode=ro``
-URI) are encapsulated here: read methods return plain Python dicts with JSON
-columns decoded to native lists/objects, so neither the wire format nor a future
-non-SQLite backend inherits any SQLite-only idiom.
+#2766: every statement this module runs routes through ``coord.sql`` (the
+dialect seam, #2719/#1948) rather than calling ``conn.execute()`` directly —
+paramstyle translation, the row factory, and connection setup are the seam's
+job now, not hand-rolled here. Two decisions worth recording (see the PR):
+the ``mode=ro`` URI itself stays in this module's ``_connect()`` rather than
+moving into the seam, because ``SqliteStore`` is *already* the class that
+names its concrete backend — there is no live Postgres connection factory
+yet for the seam to branch on, so a second implementation (e.g.
+``PostgresStore``) would own its own connection factory rather than this one
+growing a dialect branch ahead of that backend existing. The read-only
+``PRAGMA query_only=ON`` (no Postgres connect-time equivalent — see
+``sql.apply_connection_setup``'s ``read_only`` flag) and ``busy_timeout``
+both now come from that one seam call instead of two bare PRAGMAs.
+
+All SQLite idioms (JSON-encoded TEXT columns, the ``mode=ro`` URI) that
+remain are encapsulated here: read methods return plain Python dicts with
+JSON columns decoded to native lists/objects, so neither the wire format nor
+a future non-SQLite backend inherits any SQLite-only idiom.
 
 #1849: the *shape* of those dicts is no longer this module's business either.
 The seven board projections are defined by the dataclasses in
@@ -52,7 +66,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from coord import board_schema
+from coord import board_schema, sql
 from coord.db import DB_PATH
 
 # Bump when the /board payload shape changes incompatibly.  Clients may branch
@@ -225,8 +239,9 @@ _KEEP_INDEX_COLUMNS = (
 )
 
 
-def _decode_row(table: str, row: sqlite3.Row, *, full: bool = False) -> dict:
-    """sqlite3.Row → the plain dict the wire carries.
+def _decode_row(table: str, row: board_schema.RowLike, *, full: bool = False) -> dict:
+    """A DB-API row (``sqlite3.Row``, or a future dialect's mapping row) →
+    the plain dict the wire carries.
 
     #1849: for the seven board tables this projects the row through that
     table's DTO in ``coord/board_schema.py`` — only declared fields survive,
@@ -257,31 +272,36 @@ class SqliteStore:
 
     # ── connection ────────────────────────────────────────────────────────────
     def _connect(self) -> sqlite3.Connection:
+        # #2766: the `mode=ro` URI is a SQLite-only spelling of "open
+        # read-only" and stays here rather than in the seam — see the module
+        # docstring's decision note. Everything downstream of "how do I get
+        # a connection" (row factory, connection-setup pragmas) routes
+        # through `coord.sql`.
         uri = f"file:{self._path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only=ON")
+        sql.apply_row_factory(conn)
         # #2159: without a busy_timeout SQLite fails a locked read INSTANTLY
         # (the default is 0ms) instead of waiting out a writer's momentary
         # hold — this is the daemon's `/board` read path, hit by every thin
         # client's `coord drive-queue tick`, `coord notify`, and the web
         # dashboard, so it is also the connection most exposed to lock
-        # contention scaling with the fleet. Same value as the writer
-        # connection's own `busy_timeout` (`coord.db._open`), so a read-only
-        # request waits out a writer exactly as long as another writer would.
-        conn.execute("PRAGMA busy_timeout=5000")
+        # contention scaling with the fleet. `read_only=True` also sets
+        # `PRAGMA query_only=ON` instead of the writer's WAL/foreign_keys
+        # pragmas (a `mode=ro` connection can't write the WAL toggle) — see
+        # `sql.apply_connection_setup`.
+        sql.apply_connection_setup(conn, read_only=True)
         return conn
 
     # ── internal builders (take an open connection) ────────────────────────────
     def _table(self, conn: sqlite3.Connection, table: str, order: str | None = None) -> list[dict]:
-        sql = f"SELECT * FROM {table}"  # noqa: S608 — table names are literals, not user input
+        stmt = f"SELECT * FROM {table}"  # noqa: S608 — table names are literals, not user input
         if order:
-            sql += f" ORDER BY {order}"
-        return [_decode_row(table, r) for r in conn.execute(sql).fetchall()]
+            stmt += f" ORDER BY {order}"
+        return [_decode_row(table, r) for r in sql.execute(conn, stmt).fetchall()]
 
     def _plans(self, conn: sqlite3.Connection) -> dict[str, Any]:
         out: dict[str, Any] = {}
-        for r in conn.execute("SELECT assignment_id, plan_data FROM plans").fetchall():
+        for r in sql.execute(conn, "SELECT assignment_id, plan_data FROM plans").fetchall():
             try:
                 out[r["assignment_id"]] = json.loads(r["plan_data"])
             except (json.JSONDecodeError, TypeError):
@@ -291,10 +311,13 @@ class SqliteStore:
     def _board_meta(self, conn: sqlite3.Connection) -> dict[str, str]:
         # Served as raw strings; each client parses the keys it knows (the TUI
         # JSON-decodes pipeline_* keys, mirroring its local-SQLite behaviour).
-        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM board_meta").fetchall()}
+        rows = sql.execute(conn, "SELECT key, value FROM board_meta").fetchall()
+        return {r["key"]: r["value"] for r in rows}
 
     def _round_number(self, conn: sqlite3.Connection) -> int:
-        row = conn.execute("SELECT value FROM board_meta WHERE key = 'round_number'").fetchone()
+        row = sql.execute(
+            conn, "SELECT value FROM board_meta WHERE key = 'round_number'"
+        ).fetchone()
         try:
             return int(row["value"]) if row else 0
         except (TypeError, ValueError):
@@ -311,11 +334,11 @@ class SqliteStore:
         """
         try:
             cutoff = time.time() - _AUDIT_RECENT_WINDOW_SECONDS
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM audit_log WHERE ts >= ?", (cutoff,)
+            row = sql.execute(
+                conn, "SELECT COUNT(*) AS n FROM audit_log WHERE ts >= ?", (cutoff,)
             ).fetchone()
             return int(row["n"]) if row else 0
-        except sqlite3.Error:
+        except sql.driver_error(conn):
             return 0
 
     # ── public reads ────────────────────────────────────────────────────────────
@@ -373,7 +396,8 @@ class SqliteStore:
         so it can never grow with board size.  Zero third-party I/O.
         """
         with closing(self._connect()) as conn:
-            row = conn.execute(
+            row = sql.execute(
+                conn,
                 "SELECT * FROM assignments WHERE assignment_id = ?",
                 (assignment_id,),
             ).fetchone()
@@ -382,7 +406,8 @@ class SqliteStore:
     def get_issue(self, repo_name: str, number: int) -> dict | None:
         """One full issue row (labels decoded, full ``body``), or ``None``."""
         with closing(self._connect()) as conn:
-            row = conn.execute(
+            row = sql.execute(
+                conn,
                 "SELECT * FROM issues WHERE repo_name = ? AND number = ?",
                 (repo_name, number),
             ).fetchone()
@@ -393,24 +418,26 @@ class SqliteStore:
         :func:`compute_board_keep_ids`)."""
         index = [
             dict(r)
-            for r in conn.execute(f"SELECT {_KEEP_INDEX_COLUMNS} FROM assignments").fetchall()
+            for r in sql.execute(
+                conn, f"SELECT {_KEEP_INDEX_COLUMNS} FROM assignments"
+            ).fetchall()
         ]
         mq_ids = {
             r["assignment_id"]
-            for r in conn.execute("SELECT assignment_id FROM merge_queue").fetchall()
+            for r in sql.execute(conn, "SELECT assignment_id FROM merge_queue").fetchall()
             if r["assignment_id"]
         }
         open_keys = {
             (r["repo_name"], r["number"])
-            for r in conn.execute(
-                "SELECT repo_name, number FROM issues WHERE LOWER(state) != 'closed'"
+            for r in sql.execute(
+                conn, "SELECT repo_name, number FROM issues WHERE LOWER(state) != 'closed'"
             ).fetchall()
         }
         return compute_board_keep_ids(index, mq_ids, open_keys, cutoff)
 
     def _capped_assignments(self, conn: sqlite3.Connection, keep: set[str] | None) -> list[dict]:
-        rows = conn.execute(
-            "SELECT * FROM assignments ORDER BY dispatched_at DESC"
+        rows = sql.execute(
+            conn, "SELECT * FROM assignments ORDER BY dispatched_at DESC"
         ).fetchall()
         if keep is None:
             return [_decode_row("assignments", r) for r in rows]
@@ -423,7 +450,7 @@ class SqliteStore:
     def _capped_notifications(
         self, conn: sqlite3.Connection, keep: set[str] | None, cutoff: float | None
     ) -> list[dict]:
-        rows = conn.execute("SELECT * FROM notifications").fetchall()
+        rows = sql.execute(conn, "SELECT * FROM notifications").fetchall()
         if cutoff is None:
             return [_decode_row("notifications", r) for r in rows]
         out: list[dict] = []

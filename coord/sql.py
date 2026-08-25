@@ -392,7 +392,7 @@ def autoincrement_pk_ddl(dialect: str) -> str:
 FLAG_COLUMN_DDL = "INTEGER DEFAULT 0"
 
 
-def apply_connection_setup(conn: Any) -> None:
+def apply_connection_setup(conn: Any, *, read_only: bool = False) -> None:
     """Run backend-specific one-time connection setup (#2724).
 
     SQLite: ``PRAGMA journal_mode=WAL`` / ``busy_timeout=5000`` /
@@ -402,14 +402,57 @@ def apply_connection_setup(conn: Any) -> None:
     server/schema-level, not something a client connection opts into via a
     pragma). Postgres: no-op, so this is safe to call unconditionally right
     after ``connect()`` regardless of which backend is live.
+
+    *read_only* (#2766): set by a caller whose connection is opened purely
+    for reads -- e.g. ``coord/dao.py``'s ``SqliteStore``, which owns a
+    ``mode=ro`` connection pointed at the daemon's live, WAL-mode database.
+    SQLite: skips ``journal_mode``/``foreign_keys`` (a ``mode=ro`` connection
+    cannot write the WAL toggle -- attempting to costs an "attempt to write
+    a readonly database" error -- and referential integrity is the writer's
+    concern, not a read-only reader's) and instead sets ``PRAGMA
+    query_only=ON``, a belt-and-suspenders guard against an accidental write
+    ever reaching a connection meant to never issue one. ``busy_timeout`` is
+    still set either way, so a read-only reader waits out a writer's
+    momentary lock hold exactly as long as the writer connection itself
+    would. Postgres: no-op regardless of *read_only* -- there is no
+    read-only connection factory live yet for this seam to branch on, so
+    the read-only intent has no effect here until one exists (a future
+    Postgres bring-up would express it as ``SET SESSION CHARACTERISTICS AS
+    TRANSACTION READ ONLY`` or a read-only role, not a connect-time pragma).
     """
     dialect = detect_dialect(conn)
     if dialect == DIALECT_SQLITE:
-        conn.execute("PRAGMA journal_mode=WAL")
+        if read_only:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
     elif dialect != DIALECT_POSTGRES:
         raise UnsupportedDialectError(dialect)
+
+
+def driver_error(conn: Any) -> type[BaseException]:
+    """The DB-API ``Error`` base class *conn*'s driver raises (#2766).
+
+    Every DB-API 2.0 driver exposes a module-level ``Error`` that is the
+    root of that driver's whole exception hierarchy (``OperationalError``,
+    ``IntegrityError``, ...), so ``except sql.driver_error(conn):`` replaces
+    a driver-named ``except sqlite3.Error:`` without narrowing what gets
+    caught -- and, unlike the hardcoded sqlite3 name, keeps catching under
+    Postgres instead of silently going fail-open once a psycopg connection
+    is the one in play.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        import sqlite3
+
+        return sqlite3.Error
+    if dialect == DIALECT_POSTGRES:
+        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+
+        return psycopg.Error
+    raise UnsupportedDialectError(dialect)
 
 
 def insert_ignore_select(conn: Any, table: str, select_sql: str) -> Any:
