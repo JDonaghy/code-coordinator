@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from coord import sql
 from coord.config import (
     Config,
     ConfigError,
@@ -134,7 +135,7 @@ def _note_withheld_snapshot(config: Config, config_path: Path) -> None:
         conn = get_connection()
         existing = [
             str(row[0])
-            for row in conn.execute("SELECT name FROM machines ORDER BY name")
+            for row in sql.execute(conn, "SELECT name FROM machines ORDER BY name")
         ]
     except Exception:  # noqa: BLE001 — advisory only; never break the command
         return
@@ -191,58 +192,68 @@ def _save_config_snapshot(config: Config, config_path: Path | None = None) -> No
     try:
         from coord.db import get_connection
         conn = get_connection()
-        conn.execute("DELETE FROM machines")
+        sql.execute(conn, "DELETE FROM machines")
         for m in config.machines:
-            conn.execute(
+            sql.execute(
+                conn,
                 "INSERT INTO machines (name, host, capabilities, repos) VALUES (?, ?, ?, ?)",
                 (m.name, m.host, json.dumps(m.capabilities), json.dumps(m.repos)),
             )
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_default_gates', ?)",
-            (json.dumps(list(config.pipeline.default_gates)),),
+        # #2719/#2720: was `INSERT OR REPLACE`. `board_meta` has exactly two
+        # columns (key PK, value) and every site here always supplies both,
+        # so DELETE+INSERT and INSERT...ON CONFLICT DO UPDATE are
+        # observationally identical -- no column is ever left to reset to a
+        # default, and nothing has a foreign key onto board_meta for an
+        # ON DELETE cascade to fire. Safe like-for-like semantics.
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_default_gates", json.dumps(list(config.pipeline.default_gates))),
+            conflict_columns=["key"],
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_tracked_labels', ?)",
-            (json.dumps(config.pipeline.tracked_labels()),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_tracked_labels", json.dumps(config.pipeline.tracked_labels())),
+            conflict_columns=["key"],
         )
         # Repo name → GitHub slug map: the TUI pipeline panel uses this to
         # translate a `gh search issues` repository.nameWithOwner back into
         # the coord-local repo name expected by `coord assign`.
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_repos', ?)",
-            (json.dumps({r.name: r.github for r in config.repos}),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_repos", json.dumps({r.name: r.github for r in config.repos})),
+            conflict_columns=["key"],
         )
         # #296: run_cmd per repo — TUI surfaces this in the Test stage
         # detail panel as the "Run" row so the tester knows what to launch.
         # Only repos that have a run_cmd are included; absent → no entry.
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_repo_run_cmds', ?)",
-            (json.dumps({r.name: r.run_cmd for r in config.repos if r.run_cmd is not None}),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (
+                "pipeline_repo_run_cmds",
+                json.dumps({r.name: r.run_cmd for r in config.repos if r.run_cmd is not None}),
+            ),
+            conflict_columns=["key"],
         )
         # Whether the pipeline includes a Plan gate before Work. Sourced
         # from dispatch.require_plan — when true, the TUI prepends a Plan
         # stage and Work [Go] becomes "approve plan" rather than fresh
         # dispatch.
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_require_plan', ?)",
-            ("1" if config.dispatch.require_plan else "0",),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_require_plan", "1" if config.dispatch.require_plan else "0"),
+            conflict_columns=["key"],
         )
         # #803: models config snapshot — TUI reads this to show which model
         # tier will be used for an interactive --fix-of without needing to
         # parse coordinator.yml itself.
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_models', ?)",
-            (json.dumps({
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_models", json.dumps({
                 "default": config.models.default,
                 "escalation": config.models.escalation,
                 "escalate_fix_model": config.pipeline.escalate_fix_model,
-            }),),
+            })),
+            conflict_columns=["key"],
         )
         # #349: repo_name → local-checkout path for the machine running this
         # coordinator.  Used by the TUI to read git branch HEADs when
@@ -265,10 +276,10 @@ def _save_config_snapshot(config: Config, config_path: Path | None = None) -> No
                         p = m.repo_path(rn)
                         if p:
                             repo_paths_map[rn] = str(Path(p).expanduser())
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_repo_paths', ?)",
-            (json.dumps(repo_paths_map),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_repo_paths", json.dumps(repo_paths_map)),
+            conflict_columns=["key"],
         )
         # #1151: repo_name -> route `match` globs, for repos whose acceptance
         # driver is *routed* (acceptance.drivers.<repo>.routes non-empty,
@@ -288,10 +299,10 @@ def _save_config_snapshot(config: Config, config_path: Path | None = None) -> No
             for repo_name, driver in config.acceptance.drivers.items()
             if driver.routes
         }
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('pipeline_acceptance_routes', ?)",
-            (json.dumps(acceptance_routes_map),),
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("pipeline_acceptance_routes", json.dumps(acceptance_routes_map)),
+            conflict_columns=["key"],
         )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
