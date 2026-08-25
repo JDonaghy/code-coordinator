@@ -470,6 +470,180 @@ class TestStatePersistenceDirect:
         with pytest.raises(ValueError):
             get_portal_link(repo_name="acme-portal", milestone_number=3, issue_number=42)
 
+    def test_write_routes_to_the_daemon_when_configured(self, monkeypatch) -> None:
+        """#2751: a `type="decomposition-chat"` session dispatched to a thin
+        client must not write its `coord portal link` into a local DB nobody
+        reads — same posture as `save_gate_a_approval`
+        (`tests/test_gate_a.py::TestPersistence::
+        test_write_routes_to_the_daemon_when_configured`)."""
+        from coord import client as cc
+        from coord import state
+
+        monkeypatch.setattr(
+            cc,
+            "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc,
+            "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            )
+            or {"ok": True},
+        )
+        record = {
+            "repo_name": "acme-portal",
+            "milestone_number": 3,
+            "issue_number": None,
+            "submission_id": "sub_abc123",
+        }
+        state.save_portal_link(record)
+        assert captured["path"] == "/portal-link"
+        assert captured["payload"] == {"record": record}
+        assert state.list_portal_links() == []  # routed → no local write
+
+    def test_read_routes_to_the_daemon_when_configured(self, monkeypatch) -> None:
+        from coord import client as cc
+        from coord import state
+
+        monkeypatch.setattr(
+            cc,
+            "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        captured: dict = {}
+
+        def _fake_get(url, *, params, headers, timeout):
+            captured.update(url=url, params=params)
+
+            class _Resp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "link": {
+                            "repo_name": "acme-portal",
+                            "milestone_number": 3,
+                            "submission_id": "sub_abc123",
+                        }
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", _fake_get)
+        link = state.get_portal_link(repo_name="acme-portal", milestone_number=3)
+        assert captured["url"] == "http://d:7435/portal-link"
+        assert captured["params"] == {"repo_name": "acme-portal", "milestone_number": 3}
+        assert link["submission_id"] == "sub_abc123"
+
+    def test_unreachable_daemon_reads_as_not_linked(self, monkeypatch) -> None:
+        """Fails soft, mirroring `fetch_gate_a_approval`: "couldn't ask"
+        collapses to "not linked", which is exactly what the CLI already
+        reports for a genuinely unlinked milestone/issue."""
+        import httpx
+
+        from coord import client as cc
+
+        def _boom(*a, **k):
+            raise httpx.ConnectError("nope")
+
+        monkeypatch.setattr(cc.httpx, "get", _boom)
+        assert (
+            cc.fetch_portal_link(
+                cc.ServiceConfig("http://d:7435"), "acme-portal", milestone_number=3
+            )
+            is None
+        )
+
+
+def test_daemon_portal_link_endpoints(tmp_path) -> None:
+    """#2751: POST/GET `/portal-link` — the thin-client seam a
+    `type="decomposition-chat"` session needs to run its mandatory
+    `coord portal link` step from any machine, mirroring
+    `tests/test_gate_a.py::test_daemon_gate_a_approval_endpoints`."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db, state
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-link.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    ms_record = {
+        "repo_name": "api",
+        "milestone_number": 3,
+        "issue_number": None,
+        "submission_id": "sub_abc123",
+        "linked_at": 0.0,
+        "actor": "tester",
+        "schema": 1,
+    }
+    issue_record = {
+        "repo_name": "api",
+        "milestone_number": None,
+        "issue_number": 42,
+        "submission_id": "sub_def456",
+        "linked_at": 0.0,
+        "actor": "tester",
+        "schema": 1,
+    }
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing = cli.get(
+            "/portal-link", params={"repo_name": "api", "milestone_number": 3}
+        )
+        ok_ms = cli.post("/portal-link", json={"record": ms_record})
+        ok_issue = cli.post("/portal-link", json={"record": issue_record})
+        bad = cli.post("/portal-link", json={"record": "not-an-object"})
+        found_ms = cli.get(
+            "/portal-link", params={"repo_name": "api", "milestone_number": 3}
+        )
+        found_issue = cli.get(
+            "/portal-link", params={"repo_name": "api", "issue_number": 42}
+        )
+        other = cli.get(
+            "/portal-link", params={"repo_name": "api", "milestone_number": 99}
+        )
+        bad_params_neither = cli.get("/portal-link", params={"repo_name": "api"})
+        bad_params_both = cli.get(
+            "/portal-link",
+            params={"repo_name": "api", "milestone_number": 3, "issue_number": 42},
+        )
+
+    assert missing.json() == {"link": None}
+    assert ok_ms.status_code == 200
+    assert ok_issue.status_code == 200
+    assert bad.status_code == 400
+    assert found_ms.json()["link"] == ms_record
+    assert found_issue.json()["link"] == issue_record
+    assert other.json() == {"link": None}
+    assert bad_params_neither.status_code == 400
+    assert bad_params_both.status_code == 400
+    assert (
+        state._get_portal_link_local(
+            repo_name="api", milestone_number=3, issue_number=None
+        )
+        == ms_record
+    )
+
 
 class TestEventsAfterVerdictWatermarkPagination:
     """#2723 (Phase C slice 5/7 of #1948): the seam migration replaced the

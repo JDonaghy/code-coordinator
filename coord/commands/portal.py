@@ -17,16 +17,27 @@ operator see and drive it without waiting for a tick:
 * ``requeue`` revives a row the drain retired after burning its retry budget.
 
 The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``,
-``requeue``) read and write the daemon's own ``~/.coord/coord.db`` and are
-therefore **daemon-host commands**. Run from a thin client they used to silently
-operate on that box's empty local DB, which is not where the bridge lives —
-producing a normal-looking "nothing pending" instead of an error (#2336).
-Every one of them now calls :func:`_refuse_if_thin_client` first, which
-raises a loud, explicit error instead when ``board_service`` is configured
-(i.e. this machine is a thin client per ``coord/client.py``'s bootstrap
-contract) rather than silently reading the wrong box's empty tables. There is
-no daemon-proxy for these yet (Option A in #2336 — a bigger lift, left for a
-follow-up); this is the "fail loud instead of running wrong" half.
+``requeue``, ``publish-mocks``, ``remirror``) read and write the daemon's own
+``~/.coord/coord.db`` and are therefore **daemon-host commands**. Run from a
+thin client they used to silently operate on that box's empty local DB, which
+is not where the bridge lives — producing a normal-looking "nothing pending"
+instead of an error (#2336). Every one of them now calls
+:func:`_refuse_if_thin_client` first, which raises a loud, explicit error
+instead when ``board_service`` is configured (i.e. this machine is a thin
+client per ``coord/client.py``'s bootstrap contract) rather than silently
+reading the wrong box's empty tables. There is no daemon-proxy for most of
+these yet (Option A in #2336 — a bigger lift, left for a follow-up); this is
+the "fail loud instead of running wrong" half.
+
+**``link`` is the first exception (#2751).** A ``type="decomposition-chat"``
+session can be dispatched to any machine that claims the submission's mapped
+repo(s) — not just the daemon host — and its system prompt treats
+``coord portal link`` as a mandatory, non-optional step. So unlike the
+commands above, ``link`` now routes its read/write through the daemon
+(``GET``/``POST /portal-link`` in ``coord/serve_app.py``, via
+``coord.state.get_portal_link``/``save_portal_link``) instead of refusing.
+The remaining agent-reachable write, ``publish-mocks``, is left on the
+refuse-outright side for now — same follow-up Option A above.
 """
 
 from __future__ import annotations
@@ -251,9 +262,17 @@ def portal_link(
     Consumers: PDR-3's auto-push, PDR-4's verdict consumer, and #2588's
     status fold (the epic's later legs, #2506) all resolve through whichever
     shape is on file.
-    """
-    _refuse_if_thin_client("link")
 
+    **Not thin-client-refused (#2751).** Unlike every other state-touching
+    ``coord portal`` command below, this one routes through the daemon
+    (``GET``/``POST /portal-link``, ``coord.state.get_portal_link`` /
+    ``save_portal_link``) instead of calling ``_refuse_if_thin_client`` —
+    a ``type="decomposition-chat"`` session can be dispatched to any machine
+    that claims the submission's mapped repo(s), not just the daemon host,
+    and its system prompt treats this exact command as a mandatory,
+    non-optional step. See ``coord/state.py``'s ``portal_links`` section for
+    why the rest of the bridge's state stays local-only for now.
+    """
     from coord import portal_store  # noqa: PLC0415
     from coord.audit import record_audit  # noqa: PLC0415
 

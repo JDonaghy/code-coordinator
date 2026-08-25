@@ -576,6 +576,44 @@ def fetch_gate_a_approval(
     return None
 
 
+def fetch_portal_link(
+    svc: ServiceConfig,
+    repo_name: str,
+    *,
+    milestone_number: int | None = None,
+    issue_number: int | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET one milestone's (or, with ``issue_number``, one issue's) portal
+    ``submission_id`` link (#2751). Pass exactly one of ``milestone_number``
+    / ``issue_number`` — same contract as :func:`coord.state.get_portal_link`.
+
+    Fail-soft to ``None`` on any transport/HTTP/decode error, mirroring
+    :func:`fetch_gate_a_approval`. "Couldn't ask" collapsing to "not linked"
+    matches the CLI's own pre-existing read for a genuinely unlinked
+    milestone/issue, so a daemon hiccup degrades to the same message an
+    operator would already see rather than a traceback.
+    """
+    params: dict[str, str | int] = {"repo_name": repo_name}
+    if milestone_number is not None:
+        params["milestone_number"] = milestone_number
+    if issue_number is not None:
+        params["issue_number"] = issue_number
+    try:
+        resp = httpx.get(
+            f"{svc.url}/portal-link",
+            params=params,
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    link = data.get("link") if isinstance(data, dict) else None
+    return link if isinstance(link, dict) else None
+
+
 def fetch_milestone_gate(
     svc: ServiceConfig,
     repo_name: str,
