@@ -525,9 +525,11 @@ def _issue_body(repo_name: str, issue_number: int) -> str:
     except Exception:  # noqa: BLE001 — see docstring
         pass
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
-        row = get_connection().execute(
+        row = sql.execute(
+            get_connection(),
             "SELECT body FROM issues WHERE repo_name = ? AND number = ?",
             (repo_name, int(issue_number)),
         ).fetchone()
@@ -578,10 +580,12 @@ def _mirror_issue_body(repo_name: str, issue_number: int, body: str) -> None:
     `overlap-report`, should see the same answer without a second round-trip.
     """
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
-        conn.execute(
+        sql.execute(
+            conn,
             "UPDATE issues SET body = ?, synced_at = ? "
             "WHERE repo_name = ? AND number = ?",
             (body, time.time(), repo_name, int(issue_number)),
@@ -603,9 +607,11 @@ def _issue_body_synced_at(repo_name: str, issue_number: int) -> float | None:
     why re-reading them all live is out of scope).
     """
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
-        row = get_connection().execute(
+        row = sql.execute(
+            get_connection(),
             "SELECT synced_at FROM issues WHERE repo_name = ? AND number = ?",
             (repo_name, int(issue_number)),
         ).fetchone()
@@ -2295,11 +2301,12 @@ def _local_issue_rows() -> list[dict]:
     Fail-soft: an unreadable/absent table degrades to ``[]``, which puts the
     daemon host back on the assignment-only signals rather than aborting.
     """
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     try:
-        rows = get_connection().execute(
-            "SELECT repo_name, number, state FROM issues"
+        rows = sql.execute(
+            get_connection(), "SELECT repo_name, number, state FROM issues"
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []
@@ -2324,11 +2331,12 @@ def _local_merge_queue_rows() -> list[dict]:
     Fail-soft: an unreadable table degrades to ``[]``, same posture as
     :func:`_local_issue_rows`.
     """
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     try:
-        rows = get_connection().execute(
-            "SELECT repo_name, issue_number, error FROM merge_queue"
+        rows = sql.execute(
+            get_connection(), "SELECT repo_name, issue_number, error FROM merge_queue"
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []

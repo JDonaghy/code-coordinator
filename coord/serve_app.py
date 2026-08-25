@@ -690,6 +690,7 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
     """
     import logging  # noqa: PLC0415
 
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     log = logging.getLogger("coord.serve")
@@ -698,7 +699,7 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
     # WAL mode is not available on :memory: databases (used in tests).
     # Detect by querying the current journal mode and skip gracefully.
     try:
-        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        journal_mode = sql.execute(conn, "PRAGMA journal_mode").fetchone()[0]
     except Exception:  # noqa: BLE001
         journal_mode = "unknown"
 
@@ -710,7 +711,7 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
         return {"busy": 0, "log": 0, "checkpointed": 0, "skipped": True}
 
     try:
-        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        row = sql.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         busy, log_pages, checkpointed = (row[0], row[1], row[2]) if row else (0, 0, 0)
     except Exception:  # noqa: BLE001 — a missed checkpoint is not fatal
         log.warning("wal-checkpoint tick failed", exc_info=True)

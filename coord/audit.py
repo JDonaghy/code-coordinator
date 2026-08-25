@@ -31,6 +31,7 @@ import threading
 import time
 from typing import Any
 
+from coord import sql
 from coord.db import get_connection, is_lock_contention_error, retry_on_locked
 
 _log = logging.getLogger(__name__)
@@ -138,7 +139,8 @@ def _record_audit_unsafe(
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(
+            conn,
             """INSERT INTO audit_log (
                 ts, tier, category, event_type, actor,
                 repo, issue, assignment_id, machine, summary, details_json
@@ -282,7 +284,8 @@ def _maybe_trim(conn) -> None:
     max_rows = _resolve_max_rows()
     if max_rows <= 0:
         return
-    conn.execute(
+    sql.execute(
+        conn,
         "DELETE FROM audit_log WHERE id NOT IN "
         "(SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)",
         (max_rows,),
@@ -465,7 +468,8 @@ def query_audit_log(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     conn = get_connection()
     # Fetch one extra row to detect has_more without a second COUNT query.
-    rows = conn.execute(
+    rows = sql.execute(
+        conn,
         f"SELECT {', '.join(_AUDIT_COLUMNS)} FROM audit_log {where} "
         "ORDER BY ts DESC, id DESC LIMIT ?",
         (*params, limit + 1),

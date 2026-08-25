@@ -429,10 +429,12 @@ def pull_artifact(
             None,
         )
     else:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(
+            conn,
             "SELECT machine_name, repo_name, branch, issue_number, issue_title "
             "FROM assignments WHERE assignment_id = ?",
             (assignment_id,),
@@ -672,6 +674,7 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
     5. Removes the worktree (best-effort).
     6. Kills the tmux session with ``tmux kill-session -t coord-<id>``.
     """
+    from coord import sql  # noqa: PLC0415
     from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
     from coord.agent import _commits_ahead  # noqa: PLC0415
     from coord.interactive import tmux_session_name  # noqa: PLC0415
@@ -751,7 +754,8 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
         # 3. Update DB.
         try:
             conn = get_connection()
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE assignments SET status=?, finished_at=? "
                 "WHERE assignment_id=? AND status IN ('running', 'pending')",
                 (terminal_status, now, assignment_id),
@@ -864,6 +868,7 @@ def sessions_cmd(
         list_coord_tmux_sessions,
         TMUX_SESSION_PREFIX,
     )
+    from coord import sql  # noqa: PLC0415
     from coord.state import get_connection  # noqa: PLC0415
 
     # Track which machine each session lives on (None => local) so the TUI /
@@ -961,7 +966,8 @@ def sessions_cmd(
                 machine_name = a.get("machine_name")
         elif _db_conn is not None:
             try:
-                row = _db_conn.execute(
+                row = sql.execute(
+                    _db_conn,
                     "SELECT issue_number, repo_name, issue_title, machine_name "
                     "FROM assignments WHERE assignment_id=?",
                     (assignment_id,),
@@ -1203,9 +1209,11 @@ def reattach(assignment_id: str, config_path: Path) -> None:
             review_of_assignment_id_val = str(_roi) if _roi else None
     else:
         try:
+            from coord import sql  # noqa: PLC0415
             from coord.state import get_connection as _gc  # noqa: PLC0415
             conn = _gc()
-            row = conn.execute(
+            row = sql.execute(
+                conn,
                 "SELECT issue_number, repo_name, repo_github, machine_name, "
                 "type, branch, review_of_assignment_id "
                 "FROM assignments WHERE assignment_id=?",

@@ -403,13 +403,15 @@ def generate_plan(
     This function does NOT persist the plan — call ``coord.state.set_test_plan``
     after receiving the return value.
     """
+    from coord import sql  # noqa: PLC0415 — lazy to avoid circular imports
     from coord.db import get_connection  # noqa: PLC0415 — lazy to avoid circular imports
 
     FALLBACK: dict = {"steps": [], "blockers": ["plan generation failed"]}
 
     # ── Look up the assignment ────────────────────────────────────────────
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT machine_name, repo_name, repo_github, issue_number, branch, pr_url "
         "FROM assignments WHERE assignment_id = ?",
         (assignment_id,),

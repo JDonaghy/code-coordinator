@@ -172,11 +172,13 @@ def _backfill_is_interactive(rows: list[AssignmentGateRow]) -> None:
     if not ids:
         return
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
         placeholders = ",".join("?" for _ in ids)
-        found = conn.execute(
+        found = sql.execute(
+            conn,
             f"SELECT assignment_id, is_interactive FROM assignments "
             f"WHERE assignment_id IN ({placeholders})",
             ids,

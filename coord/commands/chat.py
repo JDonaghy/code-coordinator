@@ -110,13 +110,15 @@ def refine_chat(repo: str, issue: int, machine: str | None, config_path: Path) -
 @_CONFIG_OPTION
 def test_chat(work_assignment_id: str, machine: str | None, config_path: Path) -> None:
     """Dispatch a test-chat session for a completed work assignment."""
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     cfg = _load_config(config_path)
 
     # Look up the work assignment to resolve the repo name.
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT repo_name FROM assignments WHERE assignment_id=?",
         (work_assignment_id,),
     ).fetchone()

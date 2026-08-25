@@ -449,11 +449,13 @@ def _maybe_prune(*, force: bool = False) -> None:
         return
     _last_prune_at = now
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         cutoff = now - RETENTION_DAYS * 86400.0
         conn = get_connection()
-        conn.execute(
+        sql.execute(
+            conn,
             "DELETE FROM audit_log WHERE category = ? AND ts < ?",
             (CATEGORY, cutoff),
         )
