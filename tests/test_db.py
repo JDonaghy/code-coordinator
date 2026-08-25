@@ -79,6 +79,33 @@ class TestSchemaCreation:
         ).fetchall()
         assert len(rows) >= len(self.EXPECTED_TABLES)
 
+    def test_autoincrement_pk_columns_actually_autoincrement(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """#2724: ``_SCHEMA_SQL``'s 8 ``id`` columns are written as the
+        dialect-neutral ``__AUTOPK_DDL__`` sentinel and substituted with
+        ``coord.sql.autoincrement_pk_ddl(dialect)`` at ``_ensure_schema()``
+        time -- if that substitution silently failed to run (e.g. the
+        sentinel text drifted out of sync between ``_SCHEMA_SQL`` and the
+        ``.replace()`` call), SQLite would create the column as a literal
+        ``__AUTOPK_DDL__``-named/typed thing instead of an integer primary
+        key, and this insert would either raise or fail to assign
+        monotonic ids. ``merge_queue`` is one of the 8 sites.
+        """
+        cur1 = isolated_conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            " issue_number, issue_title) VALUES ('a1', 'api', 'x/api', 'b1', 'main', 1, 't')"
+        )
+        cur2 = isolated_conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            " issue_number, issue_title) VALUES ('a2', 'api', 'x/api', 'b2', 'main', 2, 't')"
+        )
+        isolated_conn.commit()
+        assert cur1.lastrowid is not None
+        assert cur2.lastrowid == cur1.lastrowid + 1
+
 
 # ── issue_comments (#873) ────────────────────────────────────────────────────
 
@@ -1226,6 +1253,115 @@ class TestJsonMigration:
         assert len(rows) == 0, (
             "Migration re-triggered after marker was set; stale data was imported"
         )
+
+    def test_migration_imports_board_proposals_splits_plans_session_and_merge_queue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#2724: exercises every ``_migrate_json`` branch not already covered
+        above -- board.json (whose per-row write was ``INSERT OR REPLACE``,
+        now ``sql.upsert``), proposals/split_proposals/plans (``INSERT OR
+        IGNORE``, now ``sql.insert_ignore``), and split_chunks/sessions/
+        merge_queue (plain ``INSERT``, now ``sql.execute``) -- all migrated
+        off raw ``conn.execute()`` onto the coord.sql dialect seam. Also
+        covers board.json listing the same ``assignment_id`` in both
+        ``active`` and ``completed`` (a real shape the legacy writer
+        produced), which exercises ``sql.upsert``'s ON CONFLICT DO UPDATE
+        path, not just a first insert.
+        """
+        monkeypatch.setattr(db_mod, "COORD_DIR", tmp_path)
+        self._write_json(tmp_path / "dispatched.json", [])
+
+        board_data = {
+            "round_number": 7,
+            "active": [
+                {
+                    "assignment_id": "dup-1",
+                    "machine_name": "laptop",
+                    "repo_name": "api",
+                    "issue_number": 5,
+                    "issue_title": "first pass",
+                    "status": "running",
+                    "type": "work",
+                },
+            ],
+            "completed": [
+                {
+                    "assignment_id": "dup-1",
+                    "machine_name": "laptop",
+                    "repo_name": "api",
+                    "issue_number": 5,
+                    "issue_title": "first pass",
+                    "status": "done",
+                    "type": "work",
+                    "exit_code": 0,
+                },
+            ],
+        }
+        self._write_json(tmp_path / "board.json", board_data)
+        self._write_json(
+            tmp_path / "pending_proposals.json",
+            [{"id": 1, "machine_name": "m", "repo_name": "api", "issue_number": 9,
+              "issue_title": "prop"}],
+        )
+        self._write_json(
+            tmp_path / "pending_splits.json",
+            [{"id": 2, "repo_name": "api", "issue_number": 10, "issue_title": "split",
+              "chunks": [{"title": "chunk A", "scope": "part A"}]}],
+        )
+        self._write_json(tmp_path / "plans.json", {"dup-1": {"steps": ["a", "b"]}})
+        self._write_json(
+            tmp_path / "session.json",
+            {"started_at": "t0", "ended_at": "t1", "clean_shutdown": True,
+             "total_cost_usd": 1.5},
+        )
+        self._write_json(
+            tmp_path / "merge_queue.json",
+            [{"assignment_id": "dup-1", "repo_name": "api", "repo_github": "acme/api",
+              "branch": "issue-5", "target_branch": "main", "issue_number": 5,
+              "issue_title": "first pass", "state": "pending"}],
+        )
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        db_mod._migrate_json(conn)
+
+        a_rows = conn.execute("SELECT * FROM assignments").fetchall()
+        assert len(a_rows) == 1  # the duplicate assignment_id upserted, not duplicated
+        assert a_rows[0]["status"] == "done"  # completed's row is the later upsert
+        assert a_rows[0]["exit_code"] == 0
+
+        round_row = conn.execute(
+            "SELECT value FROM board_meta WHERE key='round_number'"
+        ).fetchone()
+        assert round_row["value"] == "7"
+        init_row = conn.execute(
+            "SELECT value FROM board_meta WHERE key='board_initialized'"
+        ).fetchone()
+        assert init_row["value"] == "1"
+
+        p_rows = conn.execute("SELECT * FROM proposals").fetchall()
+        assert len(p_rows) == 1
+        assert p_rows[0]["issue_title"] == "prop"
+
+        sp_rows = conn.execute("SELECT * FROM split_proposals").fetchall()
+        assert len(sp_rows) == 1
+        sc_rows = conn.execute("SELECT * FROM split_chunks").fetchall()
+        assert len(sc_rows) == 1
+        assert sc_rows[0]["title"] == "chunk A"
+
+        plan_rows = conn.execute("SELECT * FROM plans").fetchall()
+        assert len(plan_rows) == 1
+        assert json.loads(plan_rows[0]["plan_data"]) == {"steps": ["a", "b"]}
+
+        sess_rows = conn.execute("SELECT * FROM sessions").fetchall()
+        assert len(sess_rows) == 1
+        assert sess_rows[0]["clean_shutdown"] == 1
+        assert sess_rows[0]["total_cost_usd"] == 1.5
+
+        mq_rows = conn.execute("SELECT * FROM merge_queue").fetchall()
+        assert len(mq_rows) == 1
+        assert mq_rows[0]["branch"] == "issue-5"
 
 
 # ── Gate-order migration (Test-before-Review reorder) ─────────────────────────
