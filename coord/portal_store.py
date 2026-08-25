@@ -725,6 +725,29 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
                 (str(row.fields.get("preview_url", "")), stamp, row.submission_id),
             )
 
+    if row.kind == "question":
+        # #2749: the ledger's own record of "a question as it was ACTUALLY
+        # pushed" — written here, not at enqueue time, because this point is
+        # only reached once the portal has confirmed it, matching the Ledger
+        # layer's contract (issue #2749's design section: "questions as
+        # actually pushed"). `row.revision` is the key
+        # `_consume_questions` later pairs an answer back to. Deliberately
+        # OUTSIDE the `with conn:` block above: `append_ledger_entry` opens
+        # its own transaction, and nesting a second `with conn:` on the same
+        # connection would commit the block above early rather than
+        # atomically with it — a `question_pushed` ledger row lagging one
+        # crash-window behind the confirmed push it describes is a much
+        # smaller risk than that.
+        append_ledger_entry(
+            row.submission_id,
+            LEDGER_KIND_QUESTION_PUSHED,
+            question_revision=row.revision,
+            text=str(row.fields.get("question", "")),
+            actor="coord",
+            payload={"revision": row.revision},
+            now=stamp,
+        )
+
 
 def _round_number(fields: dict[str, Any]) -> int:
     """Best-effort round number out of a design_round payload; 1 if unstated.
@@ -989,6 +1012,59 @@ def set_verdict_watermark(received_at: float, event_id: str) -> None:
     _update_sync_state(verdict_watermark_at=received_at, verdict_watermark_rowid=event_id)
 
 
+def get_question_watermark() -> tuple[float, str]:
+    """The ``question.answered`` consumer's own read position (#2749) —
+    ``(0.0, "")`` if never set. Independent of ``verdict_watermark_*`` above:
+    a private watermark PER CONSUMER, not one shared cursor, is exactly what
+    lets :func:`coord.portal_sync._consume_verdicts` and
+    :func:`coord.portal_sync._consume_questions` each walk the same
+    ``portal_events`` inbox at their own pace without one starving the
+    other. See :func:`get_verdict_watermark`'s docstring for why the
+    sentinel is ``(0.0, "")`` and not ``(0.0, 0)``.
+    """
+    row = sql.execute(
+        _conn(),
+        "SELECT question_watermark_at, question_watermark_rowid "
+        "FROM portal_sync_state WHERE id = 1",
+    ).fetchone()
+    if row is None or row["question_watermark_at"] is None:
+        return (0.0, "")
+    return (row["question_watermark_at"], row["question_watermark_rowid"] or "")
+
+
+def set_question_watermark(received_at: float, event_id: str) -> None:
+    """Advance the question consumer's read position past ``(received_at,
+    event_id)`` — called after a scan has looked at that row, whatever kind
+    it turned out to be, same reasoning as :func:`set_verdict_watermark`.
+    """
+    _update_sync_state(question_watermark_at=received_at, question_watermark_rowid=event_id)
+
+
+def events_after_question_watermark(
+    received_at: float, after_event_id: str, *, limit: int = 100
+) -> list[tuple[str, "PortalEvent"]]:
+    """The question consumer's own paginated scan — identical query to
+    :func:`events_after_verdict_watermark`, against this consumer's own
+    watermark instead. See that function's docstring for the full "why a
+    private watermark instead of ``unhandled_events()``" rationale (#2509),
+    which applies here unchanged (#2749): every event kind this consumer
+    ignores would otherwise pile up ahead of the next real
+    ``question.answered`` event forever.
+    """
+    rows = sql.execute(
+        _conn(),
+        """
+        SELECT * FROM portal_events
+         WHERE received_at > ?
+            OR (received_at = ? AND event_id > ?)
+         ORDER BY received_at ASC, event_id ASC
+         LIMIT ?
+        """,
+        (received_at, received_at, after_event_id, limit),
+    ).fetchall()
+    return [(r["event_id"], _event_from_row(r)) for r in rows]
+
+
 def note_push(*, now: float | None = None) -> None:
     _update_sync_state(last_push_at=time.time() if now is None else now)
 
@@ -1245,3 +1321,569 @@ def get_link_by_submission(submission_id: str) -> PortalLink | None:
         if link.submission_id == submission_id:
             return link
     return None
+
+
+# ── the running-context ledger (#2749, IL-3, epic #2746) ────────────────────
+#
+# The keystone this module's docstring points at without naming: a four-layer
+# store that briefs every future intake iteration so no session ever has to
+# be revived from a prior one's transcript. See issue #2749's design section
+# for the full rationale (why iterated summarization, a flat log, and an
+# agent-authored ledger all fail) — not yet folded into
+# `docs/CUSTOMER_PORTAL.md`. Three durable layers below —
+# Ledger, Decisions, Narrative — plus a fourth, Briefing, which is rendered
+# on demand (`coord portal ledger`, `coord.commands.portal`) and owns no
+# storage of its own.
+#
+# OWNERSHIP, restated at this layer the same way the module docstring states
+# it for the four `portal_*` tables above: the LEDGER is written only from
+# something coord independently observed (a confirmed outbox push, a pulled
+# customer event) — never from an agent's own say-so, which is exactly the
+# failure mode ("an agent is the wrong writer for facts it does not solely
+# observe") the design section calls out. DECISIONS are the one layer an
+# agent DOES write, and only decisions — never the ledger — because a
+# decision is inherently the agent's own judgment call, not an observation.
+
+
+# ── layer 1: the ledger (coord-owned, append-only, verbatim) ────────────────
+
+LEDGER_KIND_QUESTION_PUSHED = "question_pushed"
+LEDGER_KIND_QUESTION_ANSWERED = "question_answered"
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """One coord-observed fact, exactly as observed — never edited, never
+    summarized. See the ``portal_ledger`` ``CREATE TABLE`` comment in
+    :mod:`coord.db` for the column-level contract.
+    """
+
+    id: int
+    submission_id: str
+    seq: int
+    kind: str
+    question_revision: int | None
+    text: str
+    actor: str
+    source_event_id: str | None
+    payload: dict[str, Any]
+    recorded_at: float
+
+
+def _ledger_from_row(row: Row) -> LedgerEntry:
+    try:
+        payload = json.loads(row["payload_json"])
+    except (ValueError, TypeError):
+        payload = {}
+    return LedgerEntry(
+        id=row["id"],
+        submission_id=row["submission_id"],
+        seq=row["seq"],
+        kind=row["kind"],
+        question_revision=row["question_revision"],
+        text=row["text"] or "",
+        actor=row["actor"] or "",
+        source_event_id=row["source_event_id"],
+        payload=payload if isinstance(payload, dict) else {},
+        recorded_at=row["recorded_at"],
+    )
+
+
+def append_ledger_entry(
+    submission_id: str,
+    kind: str,
+    *,
+    question_revision: int | None = None,
+    text: str = "",
+    actor: str = "",
+    source_event_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+    now: float | None = None,
+) -> LedgerEntry:
+    """Append one verbatim, coord-observed fact to *submission_id*'s ledger.
+
+    Idempotent when *source_event_id* is given (#2749): a second append for
+    the same ``(submission_id, kind, source_event_id)`` — e.g.
+    :func:`coord.portal_sync._consume_questions` re-processing an event
+    after a crash between this call and :func:`mark_event_handled` —
+    returns the ALREADY-stored row rather than duplicating it, via the
+    ``portal_ledger`` schema's ``UNIQUE(submission_id, kind,
+    source_event_id)`` constraint. Rows with no *source_event_id* (e.g.
+    ``LEDGER_KIND_QUESTION_PUSHED``, derived from an outbox transition
+    rather than a pulled event) are never deduped this way — nothing
+    re-invokes that call for the same push, and SQL's NULL != NULL means any
+    number of them coexist without colliding on the constraint.
+
+    Never mutates an existing row — this table has no ``UPDATE`` path at
+    all; a correction is a new row with a later ``seq``, not an edit of an
+    old one.
+    """
+    if not submission_id:
+        raise ValueError("ledger entry needs submission_id")
+    if not kind:
+        raise ValueError("ledger entry needs a kind")
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    with conn:
+        if source_event_id:
+            existing = sql.execute(
+                conn,
+                "SELECT * FROM portal_ledger WHERE submission_id = ? AND kind = ? "
+                "AND source_event_id = ?",
+                (submission_id, kind, source_event_id),
+            ).fetchone()
+            if existing is not None:
+                return _ledger_from_row(existing)
+        next_seq_row = sql.execute(
+            conn,
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM portal_ledger "
+            "WHERE submission_id = ?",
+            (submission_id,),
+        ).fetchone()
+        next_seq = int(next_seq_row["next_seq"])
+        new_id = sql.insert_returning_id(
+            conn,
+            """
+            INSERT INTO portal_ledger
+                (submission_id, seq, kind, question_revision, text, actor,
+                 source_event_id, payload_json, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                submission_id,
+                next_seq,
+                kind,
+                question_revision,
+                text,
+                actor,
+                source_event_id,
+                json.dumps(payload or {}, sort_keys=True),
+                stamp,
+            ),
+            pk_column="id",
+        )
+        row_id = int(new_id or 0)
+    stored = sql.execute(
+        _conn(), "SELECT * FROM portal_ledger WHERE id = ?", (row_id,)
+    ).fetchone()
+    return _ledger_from_row(stored)
+
+
+def ledger_for_submission(submission_id: str) -> list[LedgerEntry]:
+    """Every ledger entry for *submission_id*, oldest first — the full,
+    undamaged observational history :func:`coord.commands.portal.
+    portal_ledger` renders from."""
+    rows = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_ledger WHERE submission_id = ? ORDER BY seq ASC",
+        (submission_id,),
+    ).fetchall()
+    return [_ledger_from_row(r) for r in rows]
+
+
+# ── layer 2: decisions (agent-authored, operator-confirmed) ─────────────────
+
+DECISION_PROPOSED = "proposed"
+DECISION_CONFIRMED = "confirmed"
+DECISION_SUPERSEDED = "superseded"
+DECISION_REJECTED = "rejected"
+_DECISION_STATES = frozenset(
+    {DECISION_PROPOSED, DECISION_CONFIRMED, DECISION_SUPERSEDED, DECISION_REJECTED}
+)
+
+
+@dataclass(frozen=True)
+class DecisionEntry:
+    """One typed decision record and its current state. Never deleted; a
+    transition (confirm / reject / supersede) updates ``state`` in place but
+    leaves ``text`` — what was actually decided — untouched, so the
+    "current decisions" and "archive" halves of a rendered briefing
+    (:func:`coord.commands.portal.portal_ledger`) both read off the SAME
+    rows, filtered only by ``state``.
+    """
+
+    id: int
+    submission_id: str
+    seq: int
+    text: str
+    state: str
+    reason: str
+    superseded_by_seq: int | None
+    actor: str
+    recorded_at: float
+    updated_at: float
+
+    @property
+    def is_current(self) -> bool:
+        """True for a decision a briefing should surface as live guidance —
+        ``proposed`` (not yet operator-confirmed, but not contradicted
+        either) or ``confirmed``. False for ``superseded``/``rejected``,
+        which belong in the archive so a later iteration does not
+        re-litigate them (issue #2749's "without recorded rejections you
+        re-litigate")."""
+        return self.state in (DECISION_PROPOSED, DECISION_CONFIRMED)
+
+
+def _decision_from_row(row: Row) -> DecisionEntry:
+    return DecisionEntry(
+        id=row["id"],
+        submission_id=row["submission_id"],
+        seq=row["seq"],
+        text=row["text"] or "",
+        state=row["state"],
+        reason=row["reason"] or "",
+        superseded_by_seq=row["superseded_by_seq"],
+        actor=row["actor"] or "",
+        recorded_at=row["recorded_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _propose_decision_local(
+    submission_id: str, text: str, *, actor: str = "", now: float | None = None
+) -> DecisionEntry:
+    if not submission_id:
+        raise ValueError("decision needs submission_id")
+    if not text or not text.strip():
+        raise ValueError("decision needs non-empty text")
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    with conn:
+        next_seq_row = sql.execute(
+            conn,
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM portal_decisions "
+            "WHERE submission_id = ?",
+            (submission_id,),
+        ).fetchone()
+        next_seq = int(next_seq_row["next_seq"])
+        new_id = sql.insert_returning_id(
+            conn,
+            """
+            INSERT INTO portal_decisions
+                (submission_id, seq, text, state, reason, superseded_by_seq,
+                 actor, recorded_at, updated_at)
+            VALUES (?, ?, ?, ?, '', NULL, ?, ?, ?)
+            """,
+            (submission_id, next_seq, text.strip(), DECISION_PROPOSED, actor, stamp, stamp),
+            pk_column="id",
+        )
+        row_id = int(new_id or 0)
+    stored = sql.execute(
+        _conn(), "SELECT * FROM portal_decisions WHERE id = ?", (row_id,)
+    ).fetchone()
+    return _decision_from_row(stored)
+
+
+def _get_decision_local(submission_id: str, seq: int) -> DecisionEntry | None:
+    row = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_decisions WHERE submission_id = ? AND seq = ?",
+        (submission_id, seq),
+    ).fetchone()
+    return _decision_from_row(row) if row is not None else None
+
+
+def _transition_decision_local(
+    submission_id: str,
+    seq: int,
+    *,
+    state: str,
+    reason: str = "",
+    superseded_by_seq: int | None = None,
+    actor: str = "",
+    now: float | None = None,
+) -> DecisionEntry:
+    if state not in _DECISION_STATES:
+        raise ValueError(f"unknown decision state {state!r}")
+    if state == DECISION_REJECTED and not (reason and reason.strip()):
+        raise ValueError("a rejected decision must carry a reason")
+    existing = _get_decision_local(submission_id, seq)
+    if existing is None:
+        raise ValueError(
+            f"no decision {seq} recorded for submission {submission_id!r}"
+        )
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    with conn:
+        sql.execute(
+            conn,
+            """
+            UPDATE portal_decisions
+               SET state = ?, reason = ?, superseded_by_seq = ?, actor = ?,
+                   updated_at = ?
+             WHERE submission_id = ? AND seq = ?
+            """,
+            (
+                state,
+                reason.strip() if reason else "",
+                superseded_by_seq,
+                actor or existing.actor,
+                stamp,
+                submission_id,
+                seq,
+            ),
+        )
+    stored = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_decisions WHERE submission_id = ? AND seq = ?",
+        (submission_id, seq),
+    ).fetchone()
+    return _decision_from_row(stored)
+
+
+def _route_decision(action: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST *action* + *payload* to the daemon's ``/portal-decision`` seam,
+    or ``None`` if this process IS the daemon host (no ``board_service``
+    configured) — mirrors :func:`coord.state.save_portal_link`'s routing
+    exactly, just without a detour through :mod:`coord.state` (this table
+    isn't a ``board_meta`` blob, so there is nothing there to share).
+
+    This is the one write path in this module that IS daemon-routed — see
+    this section's module comment for why: an agent session recording its
+    own decision can land on any machine that claims the submission's
+    mapped repo(s), same as ``coord portal link`` (#2751), not just the
+    daemon host.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    return board_service.route_write(svc, "/portal-decision", {"action": action, **payload})
+
+
+def propose_decision(
+    submission_id: str, text: str, *, actor: str = "", now: float | None = None
+) -> DecisionEntry:
+    """Record a new, unconfirmed decision (#2749) — routes to the daemon
+    when ``board_service`` is configured (a thin client), else writes
+    locally. See :class:`DecisionEntry` for the state machine this is the
+    entry point into.
+    """
+    routed = _route_decision(
+        "propose", {"submission_id": submission_id, "text": text, "actor": actor}
+    )
+    if routed is not None:
+        return _decision_from_row(routed["entry"])
+    return _propose_decision_local(submission_id, text, actor=actor, now=now)
+
+
+def confirm_decision(
+    submission_id: str, seq: int, *, actor: str = "", now: float | None = None
+) -> DecisionEntry:
+    """Mark a proposed decision as operator-confirmed (#2749)."""
+    routed = _route_decision(
+        "confirm", {"submission_id": submission_id, "seq": seq, "actor": actor}
+    )
+    if routed is not None:
+        return _decision_from_row(routed["entry"])
+    return _transition_decision_local(
+        submission_id, seq, state=DECISION_CONFIRMED, actor=actor, now=now
+    )
+
+
+def reject_decision(
+    submission_id: str,
+    seq: int,
+    reason: str,
+    *,
+    actor: str = "",
+    now: float | None = None,
+) -> DecisionEntry:
+    """Reject a decision — *reason* is mandatory (#2749: "a rejection must
+    carry a reason") so a later iteration reads WHY, not just that it was
+    ruled out."""
+    routed = _route_decision(
+        "reject",
+        {"submission_id": submission_id, "seq": seq, "reason": reason, "actor": actor},
+    )
+    if routed is not None:
+        return _decision_from_row(routed["entry"])
+    return _transition_decision_local(
+        submission_id, seq, state=DECISION_REJECTED, reason=reason, actor=actor, now=now
+    )
+
+
+def supersede_decision(
+    submission_id: str,
+    seq: int,
+    *,
+    by_seq: int,
+    actor: str = "",
+    now: float | None = None,
+) -> DecisionEntry:
+    """Mark a decision superseded by a later one (``by_seq``) — used when a
+    fresh :func:`propose_decision` replaces an earlier call rather than
+    contradicting it outright (#2749: "iteration 2 chose Postgres, iteration
+    5 changed to SQLite" — both stay on record, only one is current)."""
+    routed = _route_decision(
+        "supersede",
+        {"submission_id": submission_id, "seq": seq, "by_seq": by_seq, "actor": actor},
+    )
+    if routed is not None:
+        return _decision_from_row(routed["entry"])
+    return _transition_decision_local(
+        submission_id,
+        seq,
+        state=DECISION_SUPERSEDED,
+        superseded_by_seq=by_seq,
+        actor=actor,
+        now=now,
+    )
+
+
+def decisions_for_submission(submission_id: str) -> list[DecisionEntry]:
+    """Every decision ever recorded for *submission_id*, oldest first —
+    local-DB-only read, same posture as :func:`ledger_for_submission` (the
+    daemon host is where `coord portal ledger` renders from)."""
+    rows = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_decisions WHERE submission_id = ? ORDER BY seq ASC",
+        (submission_id,),
+    ).fetchall()
+    return [_decision_from_row(r) for r in rows]
+
+
+# ── layer 3: narrative (agent-authored, regenerable, disposable) ────────────
+
+
+@dataclass(frozen=True)
+class NarrativeEntry:
+    """The current prose orientation for one submission — always the WHOLE
+    story, never a diff or an append. See the ``portal_narrative``
+    ``CREATE TABLE`` comment in :mod:`coord.db` for why this is a single
+    overwritten row rather than a history.
+    """
+
+    submission_id: str
+    text: str
+    actor: str
+    recorded_at: float
+
+
+def set_narrative(
+    submission_id: str, text: str, *, actor: str = "", now: float | None = None
+) -> NarrativeEntry:
+    """Overwrite *submission_id*'s narrative wholesale (#2749).
+
+    Deliberately a plain replace, not a merge or an append — the prior text
+    is never read back into producing the new one (this function's caller
+    regenerates it fresh each time, e.g. from the ledger + current
+    decisions), which is what keeps a wrong narrative merely regenerable.
+    """
+    if not submission_id:
+        raise ValueError("narrative needs submission_id")
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    sql.upsert(
+        conn,
+        "portal_narrative",
+        ["submission_id", "text", "actor", "recorded_at"],
+        (submission_id, text, actor, stamp),
+        conflict_columns=["submission_id"],
+    )
+    conn.commit()
+    return NarrativeEntry(submission_id=submission_id, text=text, actor=actor, recorded_at=stamp)
+
+
+def get_narrative(submission_id: str) -> NarrativeEntry | None:
+    """The current narrative for *submission_id*, or ``None`` if none has
+    ever been written."""
+    row = sql.execute(
+        _conn(), "SELECT * FROM portal_narrative WHERE submission_id = ?", (submission_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return NarrativeEntry(
+        submission_id=row["submission_id"],
+        text=row["text"] or "",
+        actor=row["actor"] or "",
+        recorded_at=row["recorded_at"],
+    )
+
+
+# ── layer 4: briefing (rendered on demand, owns no storage) ─────────────────
+
+
+def render_ledger_payload(submission_id: str) -> dict[str, Any]:
+    """Compose the three durable layers into one plain-dict briefing for
+    *submission_id* (#2749) — the shared shape both the local
+    ``coord portal ledger`` render and the daemon's ``GET /portal-ledger``
+    seam (:mod:`coord.serve_app`) build from, so a thin client rendering
+    from the daemon's JSON response sees EXACTLY what a daemon-host
+    invocation would have rendered locally.
+
+    Pairs each pushed question (keyed by its outbox ``revision``) with
+    whatever answer(s) were ledgered against that same
+    ``question_revision`` — an unanswered push has an empty ``answers``
+    list, which is exactly "still open." An answer whose revision matches
+    nothing on file (a malformed or ambiguous portal event, #2749's
+    :func:`coord.portal_sync._record_question_answer` never drops one just
+    because it can't be paired) lands in ``unpaired_answers`` instead of
+    being silently lost.
+    """
+    ledger = ledger_for_submission(submission_id)
+    decisions = decisions_for_submission(submission_id)
+    narrative = get_narrative(submission_id)
+
+    questions: dict[int | None, dict[str, Any]] = {}
+    unpaired_answers: list[LedgerEntry] = []
+    for entry in ledger:
+        if entry.kind == LEDGER_KIND_QUESTION_PUSHED:
+            questions.setdefault(
+                entry.question_revision, {"question": entry, "answers": []}
+            )
+        elif entry.kind == LEDGER_KIND_QUESTION_ANSWERED:
+            bucket = questions.get(entry.question_revision)
+            if bucket is not None:
+                bucket["answers"].append(entry)
+            else:
+                unpaired_answers.append(entry)
+
+    current_decisions = [d for d in decisions if d.is_current]
+    archived_decisions = [d for d in decisions if not d.is_current]
+
+    return {
+        "submission_id": submission_id,
+        "qa": [
+            {
+                "question_revision": revision,
+                "question": qa["question"].text,
+                "answers": [
+                    {"text": a.text, "actor": a.actor, "recorded_at": a.recorded_at}
+                    for a in qa["answers"]
+                ],
+            }
+            for revision, qa in questions.items()
+        ],
+        "unpaired_answers": [
+            {
+                "question_revision": a.question_revision,
+                "text": a.text,
+                "actor": a.actor,
+                "recorded_at": a.recorded_at,
+            }
+            for a in unpaired_answers
+        ],
+        "decisions": [
+            {
+                "seq": d.seq,
+                "text": d.text,
+                "state": d.state,
+                "reason": d.reason,
+                "superseded_by_seq": d.superseded_by_seq,
+                "actor": d.actor,
+            }
+            for d in current_decisions
+        ],
+        "archived_decisions": [
+            {
+                "seq": d.seq,
+                "text": d.text,
+                "state": d.state,
+                "reason": d.reason,
+                "superseded_by_seq": d.superseded_by_seq,
+                "actor": d.actor,
+            }
+            for d in archived_decisions
+        ],
+        "narrative": narrative.text if narrative else "",
+    }

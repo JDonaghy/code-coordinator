@@ -26,15 +26,22 @@ One pass, in this order:
    re-processes that event next tick rather than dropping the client's
    feedback or skipping past it. An ``approved`` verdict is deliberately
    left alone here — see :func:`_consume_verdicts`.
-3. **Fold status** (#2588) — every linked milestone (``coord portal link``,
+3. **Ledger question answers** (#2749, IL-3) — the running-context ledger's
+   consumer: walk events pulled but not yet scanned by THIS consumer (its
+   own watermark, independent of both ``handled_at`` and the verdict
+   consumer's watermark) and, for each ``question.answered`` event, append
+   an immutable ``portal_ledger`` row pairing the answer with the question
+   that prompted it, then nudge the submission's customer status off
+   ``needs-input``. See :func:`_consume_questions`.
+4. **Fold status** (#2588) — every linked milestone (``coord portal link``,
    #2507/PDR-1) has its issues folded into one customer status
    (:func:`fold_submission_status`: planned / in-progress / shipped) and,
    if it changed since the last push, enqueued — the automatic caller
    `enqueue_status` never had before this issue. See
    :func:`sync_submission_statuses`.
-4. **Push** — coord-authored facts from the outbox (design rounds · status ·
+5. **Push** — coord-authored facts from the outbox (design rounds · status ·
    open questions), one row at a time, in per-submission FIFO order.
-5. **Heartbeat** — say the daemon is alive.
+6. **Heartbeat** — say the daemon is alive.
 
 Each phase is independently guarded: a portal outage, a rejected field, or a
 malformed event can never crash the tick or silence the other two phases (the
@@ -177,6 +184,14 @@ MAX_VERDICTS_PER_TICK = 100
 #: tick forever.
 MAX_VERDICT_PAGES = 10
 
+#: The `question.answered` consumer's per-tick page size / page count
+#: (#2749) — same shape and same reasoning as `MAX_VERDICTS_PER_TICK` /
+#: `MAX_VERDICT_PAGES` just above: a private watermark walk, bounded per
+#: tick so a large one-time backlog drains over a handful of ticks rather
+#: than blocking the rest of the pass. See :func:`_consume_questions`.
+MAX_QUESTION_EVENTS_PER_TICK = 100
+MAX_QUESTION_PAGES = 10
+
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -185,6 +200,9 @@ class SyncResult:
     enabled: bool = True
     pulled: int = 0
     verdicts_consumed: int = 0
+    #: `question.answered` events ledgered this pass (#2749) — see
+    #: :func:`_consume_questions`.
+    questions_consumed: int = 0
     applied: int = 0
     rejected: int = 0
     held: int = 0
@@ -199,8 +217,8 @@ class SyncResult:
     def moved(self) -> bool:
         """True when this pass actually moved a row in either direction."""
         return bool(
-            self.pulled or self.verdicts_consumed or self.applied
-            or self.rejected or self.status_queued
+            self.pulled or self.verdicts_consumed or self.questions_consumed
+            or self.applied or self.rejected or self.status_queued
         )
 
     def summary(self) -> str:
@@ -214,6 +232,7 @@ class SyncResult:
         parts = [
             f"pulled={self.pulled}",
             f"verdicts_consumed={self.verdicts_consumed}",
+            f"questions_consumed={self.questions_consumed}",
             f"applied={self.applied}",
             f"rejected={self.rejected}",
             f"held={self.held}",
@@ -822,14 +841,16 @@ def sync_tick(
     (``coord.serve_app._portal_sync_tick``) always passes a freshly-built
     board; the ``coord portal sync`` CLI and most tests don't need to.
 
-    Five phases, independently isolated, deliberately in this order: pull
-    first (a sign-off verdict pulled now can be acted on this same tick),
-    then verdict consumption (#2509), then the automatic status fold (#2588
-    — runs BEFORE push so a status it just enqueued goes out with this same
-    tick's push rather than waiting a full cycle), then push, heartbeat last
-    but unconditionally — a pass that failed everything else still proves
-    the daemon is alive, and that is precisely the pass the portal most
-    needs to hear about.
+    Six phases, independently isolated, deliberately in this order: pull
+    first (a sign-off verdict — or a question's answer — pulled now can be
+    acted on this same tick), then verdict consumption (#2509), then
+    question-answer ledgering (#2749) — its own status nudge feeds the fold
+    right after it — then the automatic status fold (#2588 — runs BEFORE
+    push so a status it just enqueued goes out with this same tick's push
+    rather than waiting a full cycle), then push, heartbeat last but
+    unconditionally — a pass that failed everything else still proves the
+    daemon is alive, and that is precisely the pass the portal most needs to
+    hear about.
     """
     if client is None:
         try:
@@ -864,6 +885,18 @@ def sync_tick(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"verdicts: {exc}")
         logger.warning("portal sync: verdict consumption failed", exc_info=True)
+
+    # #2749 (IL-3): ledger every `question.answered` event pulled above (or
+    # by an earlier tick) — the running-context ledger's own consumer,
+    # isolated exactly like verdict consumption: a bad event must not
+    # silence the status fold, push, or heartbeat below.
+    questions_consumed = 0
+    try:
+        questions_consumed, question_errors = _consume_questions(config, now=now)
+        errors.extend(question_errors)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"questions: {exc}")
+        logger.warning("portal sync: question consumption failed", exc_info=True)
 
     # #2588: fold every linked milestone's issues into a customer status and
     # enqueue it if it changed — BEFORE push, so a freshly-folded row goes
@@ -925,6 +958,7 @@ def sync_tick(
         enabled=True,
         pulled=pulled,
         verdicts_consumed=verdicts_consumed,
+        questions_consumed=questions_consumed,
         applied=applied,
         rejected=rejected,
         held=held,
@@ -1331,6 +1365,227 @@ def _consume_verdicts(
 
     if (commit_at, commit_rowid) != (initial_at, initial_rowid):
         portal_store.set_verdict_watermark(commit_at, commit_rowid)
+    return consumed, errors
+
+
+# ── consuming portal question answers (#2749, IL-3) ─────────────────────────
+#
+# The gap this closes, stated plainly in the issue: every other kind of
+# pulled event either drives real coord-side work (`_consume_verdicts`
+# above) or sits in the inbox unread — including, until now, an answer to a
+# question coord itself raised (`enqueue_question` / `KIND_QUESTION`). The
+# client answered into a void: the event was pulled, stored, and left
+# `handled_at IS NULL` forever, same as any other kind this bridge doesn't
+# act on. This consumer is that missing read.
+#
+# Same private-watermark shape as `_consume_verdicts`, and for the identical
+# reason (`portal_store.get_question_watermark` / `set_question_watermark` /
+# `events_after_question_watermark`, independent of both the shared
+# `handled_at` column AND the verdict consumer's own watermark) — see that
+# function's module-section comment for the full "why not
+# `unhandled_events()`" rationale, reproduced there against 150 seeded
+# events. It applies unchanged here: a pile of non-actionable kinds must not
+# be able to starve a real `question.answered` event behind it.
+
+
+def _question_answer_fields(event: "portal_store.PortalEvent") -> dict[str, Any] | None:
+    """The verbatim answer *event* carries, or ``None`` if it isn't a
+    ``question.answered`` event.
+
+    coord-portal's own event contract for this (``src/questions.ts``, the
+    coord-portal repo, not this one) isn't shared with this repo as a
+    schema, so — same posture as :func:`_signoff_verdict` /
+    :func:`_signoff_comment` just above — this reads every plausible field
+    name rather than betting on one, and returns ``None`` (never raises) on
+    anything that doesn't look like an answer, leaving the event unhandled
+    for a human to look at rather than mis-filed.
+    """
+    kind = (event.kind or "").strip().lower()
+    if kind not in ("question.answered", "question_answered"):
+        return None
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    nested = payload.get("data")
+    if not isinstance(nested, dict):
+        nested = payload.get("fields")
+    sources = [s for s in (nested, payload) if isinstance(s, dict)]
+
+    def _first_str(*keys: str) -> str:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _first_int(*keys: str) -> int | None:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                    return int(value.strip())
+        return None
+
+    answer = _first_str("answer", "answer_text", "response", "text", "message")
+    if not answer:
+        return None
+    return {
+        "answer": answer,
+        "question_revision": _first_int("question_revision", "revision"),
+        "answered_by": _first_str("answered_by", "actor", "customer_name", "author")
+        or "customer",
+    }
+
+
+def _pushed_question_text(submission_id: str, question_revision: int | None) -> str:
+    """Best-effort verbatim text of the question *question_revision* asked,
+    read from the outbox record of what coord actually pushed.
+
+    ``""`` (never raises) when *question_revision* is ``None`` or matches no
+    queued question — the answer is still ledgered either way (see
+    :func:`_record_question_answer`); this only affects how well the ledger
+    entry is PAIRED, not whether the answer itself is recorded.
+    """
+    if question_revision is None:
+        return ""
+    for row in portal_store.outbox_for_submission(submission_id):
+        if row.kind == KIND_QUESTION and row.revision == question_revision:
+            return str(row.fields.get("question", ""))
+    return ""
+
+
+def _record_question_answer(config: Any, event: "portal_store.PortalEvent") -> None:
+    """Ledger one answered question's pairing and nudge the submission off
+    ``needs-input`` (#2749). Raises only on a genuine ledger-write failure
+    (a DB error) — the caller marks the event consumed only then, so a
+    write failure retries next tick like every other phase in this bridge.
+
+    Unlike :func:`_amend_from_verdict`, "no link on file" / "no matching
+    queued question" are not raise-worthy here: there is nothing to retry
+    into existence — the customer's answer is durably recorded either way,
+    just imperfectly paired or without the courtesy status nudge. Freezing
+    the watermark over that would hold every LATER answer hostage to one
+    unlinked submission forever, which is a worse outcome than a
+    best-effort pairing.
+    """
+    fields = _question_answer_fields(event)
+    if fields is None:
+        return
+    question_text = _pushed_question_text(event.submission_id, fields["question_revision"])
+    portal_store.append_ledger_entry(
+        event.submission_id,
+        portal_store.LEDGER_KIND_QUESTION_ANSWERED,
+        question_revision=fields["question_revision"],
+        text=fields["answer"],
+        actor=fields["answered_by"],
+        source_event_id=event.event_id,
+        payload={"event": event.payload, "question_text": question_text},
+    )
+
+    # Best-effort: nudge the submission's customer status off `needs-input`
+    # now, on the same tick, rather than leaving it to whatever the next
+    # unconditional status fold (`sync_submission_statuses`, step 3 of
+    # `sync_tick`) happens to compute — see this function's docstring.
+    # Never allowed to make the ledger append above look like it failed:
+    # everything past this point is caught and only logged.
+    if config is None:
+        return
+    try:
+        link = portal_store.get_link_by_submission(event.submission_id)
+        if link is None:
+            return
+        repo_cfg = config.repo(link.repo_name)
+        if repo_cfg is None:
+            return
+        if link.issue_number is not None:
+            fold_status_for_issue(config, link.repo_name, link.issue_number)
+        else:
+            fold_status_for_milestone(config, link.repo_name, link.milestone_number)
+    except Exception:  # noqa: BLE001 — a courtesy nudge, not the recorded fact itself
+        logger.warning(
+            "portal sync: could not fold status after answer for %s",
+            event.submission_id,
+            exc_info=True,
+        )
+
+
+def _consume_questions(
+    config: Any,
+    *,
+    limit: int = MAX_QUESTION_EVENTS_PER_TICK,
+    pages: int = MAX_QUESTION_PAGES,
+    now: float | None = None,
+) -> tuple[int, list[str]]:
+    """Walk the inbox from this consumer's OWN watermark, ledgering every
+    ``question.answered`` event found (#2749).
+
+    *config* is optional here, unlike :func:`_consume_verdicts` — the
+    ledger append itself needs no repo/dispatch context, only the "leave
+    needs-input" courtesy nudge does (:func:`_record_question_answer`
+    degrades that alone to a no-op with ``config=None``, matching the
+    documented test/CLI bypass :func:`sync_tick` already offers).
+
+    Same freeze-on-failure watermark discipline as :func:`_consume_verdicts`,
+    for the same reason: :func:`_record_question_answer` can raise on a
+    genuine ``append_ledger_entry`` DB failure (a locked database, say) —
+    exactly the kind of transient condition that deserves a retry, not a
+    permanent skip. So the commit point stops advancing at the first failure
+    in a page, same as the verdict consumer, rather than silently walking
+    past an event this pass never actually recorded. Events already looked
+    at earlier in the SAME pass are still processed (the scan itself keeps
+    going — one bad event must not stop the rest of the page) — only the
+    PERSISTED watermark holds still, so a crash or a still-locked database
+    re-processes that event next tick instead of losing it.
+    """
+    consumed = 0
+    errors: list[str] = []
+
+    initial_at, initial_rowid = portal_store.get_question_watermark()
+    commit_at, commit_rowid = initial_at, initial_rowid
+    scan_at, scan_rowid = initial_at, initial_rowid
+    blocked = False
+
+    for _page_num in range(pages):
+        page = portal_store.events_after_question_watermark(scan_at, scan_rowid, limit=limit)
+        if not page:
+            break
+        for rowid, event in page:
+            scan_at, scan_rowid = event.received_at, rowid
+            if event.handled_at is not None:
+                if not blocked:
+                    commit_at, commit_rowid = scan_at, scan_rowid
+                continue
+            try:
+                fields = _question_answer_fields(event)
+                if fields is None:
+                    if not blocked:
+                        commit_at, commit_rowid = scan_at, scan_rowid
+                    continue
+                _record_question_answer(config, event)
+            except Exception as exc:  # noqa: BLE001 — one bad event must not stop the page
+                errors.append(
+                    f"question {event.event_id} ({event.submission_id}): {exc}"
+                )
+                logger.warning(
+                    "portal sync: could not ledger question-answered event "
+                    "for submission %s",
+                    event.submission_id,
+                    exc_info=True,
+                )
+                blocked = True
+                continue
+            portal_store.mark_event_handled(event.event_id, now=now)
+            consumed += 1
+            if not blocked:
+                commit_at, commit_rowid = scan_at, scan_rowid
+        if blocked or len(page) < limit:
+            break
+
+    if (commit_at, commit_rowid) != (initial_at, initial_rowid):
+        portal_store.set_question_watermark(commit_at, commit_rowid)
     return consumed, errors
 
 

@@ -38,6 +38,15 @@ commands above, ``link`` now routes its read/write through the daemon
 ``coord.state.get_portal_link``/``save_portal_link``) instead of refusing.
 The remaining agent-reachable write, ``publish-mocks``, is left on the
 refuse-outright side for now — same follow-up Option A above.
+
+**``ledger`` and ``decision`` are the next two (#2749, IL-3, epic #2746).**
+The running-context ledger's whole point is that a fresh session on ANY
+machine can be briefed without a prior session's transcript, so ``ledger``
+(read) routes a ``GET /portal-ledger`` and ``decision propose``/``confirm``/
+``reject``/``supersede`` (the one write an agent session makes here) route a
+``POST /portal-decision`` — both through :mod:`coord.portal_store`, which
+checks ``board_service`` itself rather than calling
+:func:`_refuse_if_thin_client`. See that section below for the detail.
 """
 
 from __future__ import annotations
@@ -1139,4 +1148,212 @@ def portal_requeue(submission_id: str, seq: int) -> None:
     click.secho(
         f"requeued: {row.submission_id} seq={row.seq} rev={row.revision} {row.kind}",
         fg="green",
+    )
+
+
+# ── #2749 (IL-3, epic #2746): the running-context ledger ────────────────────
+#
+# `ledger` renders the four-layer briefing (issue #2749's design section —
+# not yet folded into `docs/CUSTOMER_PORTAL.md`). Unlike `outbox`/`events`
+# above, it is NOT thin-client-refused: the issue's "Done when" bar is
+# explicit that "a fresh session on
+# ANY machine can be briefed from that ledger", so — same #2751 exception as
+# `link` and `decision` below — it routes a GET to the daemon's
+# `/portal-ledger` seam when `board_service` is configured, and reads the
+# local DB directly on the daemon host itself. Either way the payload comes
+# from :func:`coord.portal_store.render_ledger_payload`, so a thin client
+# renders the EXACT same shape a daemon-host invocation would have.
+#
+# `decision` is the one WRITE path in this section, and — like `link` above
+# (#2751) — is also deliberately NOT thin-client-refused: an agent session
+# recording its own decision can land on any machine that claims the
+# submission's mapped repo(s), not just the daemon host, so it routes
+# through the daemon instead (`coord.portal_store.propose_decision` and
+# friends check `board_service` themselves and POST `/portal-decision` when
+# it's set).
+
+
+def _fetch_ledger_payload_remote(svc, submission_id: str) -> dict:
+    """GET ``/portal-ledger`` from the daemon *svc* points at.
+
+    Deliberately inline here rather than added to :mod:`coord.client`'s
+    ``fetch_*`` family: this seam has exactly one caller and no other module
+    needs it, so a tiny local ``httpx`` call keeps the daemon-routing
+    footprint of this issue to files it already touches. Raises
+    ``httpx.HTTPError`` on a transport/HTTP failure — unlike
+    :func:`coord.client.fetch_portal_link`'s fail-soft-to-``None``, a
+    briefing that silently rendered as "empty" on a daemon hiccup would be
+    actively misleading (indistinguishable from "genuinely nothing on
+    file"), so this lets the failure surface instead.
+    """
+    import httpx  # noqa: PLC0415
+
+    headers = {"Authorization": f"Bearer {svc.token}"} if svc.token else {}
+    resp = httpx.get(
+        f"{svc.url}/portal-ledger",
+        params={"submission_id": submission_id},
+        headers=headers,
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["payload"]
+
+
+def _render_ledger_text(payload: dict) -> str:
+    """The human-readable rendering of :func:`coord.portal_store.
+    render_ledger_payload`'s dict shape — used identically whether *payload*
+    came from a local read or the daemon's JSON response."""
+    lines = [f"# Running context — {payload['submission_id']}", "", "## Q&A"]
+    qa = payload["qa"]
+    unpaired = payload["unpaired_answers"]
+    if not qa and not unpaired:
+        lines.append("(none)")
+    for entry in qa:
+        label = entry["question_revision"]
+        label = label if label is not None else "?"
+        lines.append(f"- Q[{label}] {entry['question']}")
+        if entry["answers"]:
+            for a in entry["answers"]:
+                lines.append(f"    A: {a['text']}  (by {a['actor'] or 'customer'})")
+        else:
+            lines.append("    (unanswered — needs-input)")
+    for a in unpaired:
+        lines.append(
+            f"- A (unpaired, question_revision={a['question_revision']}): "
+            f"{a['text']}  (by {a['actor'] or 'customer'})"
+        )
+
+    lines += ["", "## Decisions"]
+    current = payload["decisions"]
+    if not current:
+        lines.append("(none)")
+    for d in current:
+        who = f"  (by {d['actor']})" if d["actor"] else ""
+        lines.append(f"- [{d['seq']}] {d['text']}  [{d['state']}]{who}")
+
+    archived = payload["archived_decisions"]
+    if archived:
+        lines += ["", "## Archive (superseded / rejected)"]
+        for d in archived:
+            if d["state"] == "rejected":
+                lines.append(f"- [{d['seq']}] {d['text']}  REJECTED: {d['reason']}")
+            else:
+                lines.append(
+                    f"- [{d['seq']}] {d['text']}  superseded by #{d['superseded_by_seq']}"
+                )
+
+    if payload["narrative"].strip():
+        lines += ["", "## Narrative", payload["narrative"]]
+
+    return "\n".join(lines)
+
+
+@portal_group.command("ledger")
+@click.argument("submission_id")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def portal_ledger(submission_id: str, as_json: bool) -> None:
+    """Render SUBMISSION_ID's running-context briefing (#2749).
+
+    Composes the three durable layers into the fourth (Briefing, which owns
+    no storage of its own): verbatim Q&A pairs from the ledger, current
+    decisions, an archive of superseded/rejected ones (with reasons — never
+    silently dropped), and the current narrative if one has been written.
+    This is what a fresh session on ANY machine should be briefed from
+    instead of a prior session's transcript — see the issue's "Done when".
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    if svc is not None:
+        payload = _fetch_ledger_payload_remote(svc, submission_id)
+    else:
+        from coord import portal_store  # noqa: PLC0415
+
+        payload = portal_store.render_ledger_payload(submission_id)
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    click.echo(_render_ledger_text(payload))
+
+
+@portal_group.group("decision")
+def portal_decision_group() -> None:
+    """Propose / confirm / reject / supersede a decision (#2749).
+
+    The one Decisions-layer write path a `type="work"` or decomposition-chat
+    session can call from ANY machine — not thin-client-refused, unlike
+    every other state-touching ``coord portal`` command in this file (see
+    ``link`` above for why, #2751): each subcommand routes through the
+    daemon's ``/portal-decision`` seam when ``board_service`` is configured.
+    """
+
+
+@portal_decision_group.command("propose")
+@click.argument("submission_id")
+@click.argument("text")
+def portal_decision_propose(submission_id: str, text: str) -> None:
+    """Record a new, unconfirmed decision for SUBMISSION_ID."""
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        entry = portal_store.propose_decision(submission_id, text, actor=_actor())
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(f"proposed: {submission_id} #{entry.seq} — {entry.text}", fg="green")
+
+
+@portal_decision_group.command("confirm")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+def portal_decision_confirm(submission_id: str, seq: int) -> None:
+    """Mark decision SEQ (for SUBMISSION_ID) operator-confirmed."""
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        entry = portal_store.confirm_decision(submission_id, seq, actor=_actor())
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(f"confirmed: {submission_id} #{entry.seq} — {entry.text}", fg="green")
+
+
+@portal_decision_group.command("reject")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+@click.argument("reason")
+def portal_decision_reject(submission_id: str, seq: int, reason: str) -> None:
+    """Reject decision SEQ (for SUBMISSION_ID) — REASON is mandatory.
+
+    #2749: "a rejection must carry a reason" — so a later iteration reads
+    WHY something was ruled out instead of proposing it again.
+    """
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        entry = portal_store.reject_decision(submission_id, seq, reason, actor=_actor())
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(f"rejected: {submission_id} #{entry.seq} — {entry.reason}", fg="green")
+
+
+@portal_decision_group.command("supersede")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+@click.argument("by_seq", type=int)
+def portal_decision_supersede(submission_id: str, seq: int, by_seq: int) -> None:
+    """Mark decision SEQ (for SUBMISSION_ID) superseded by decision BY_SEQ."""
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        entry = portal_store.supersede_decision(
+            submission_id, seq, by_seq=by_seq, actor=_actor()
+        )
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(
+        f"superseded: {submission_id} #{entry.seq} -> #{by_seq}", fg="green"
     )
