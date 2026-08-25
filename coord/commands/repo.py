@@ -33,9 +33,11 @@ three residue items that are actual traps rather than chores — no CI on
 ``pull_request`` blocks every merge forever, no CLAUDE.md makes the review
 gate structurally empty, no ``.githooks/`` leaves every worktree graph-blind
 — then chains into ``coord repo add`` for the rest. What's left afterward is
-genuinely 3 items a human must still do (down from ``add``'s 8): clone on
-each machine, commit+push the coordinator.yml edit, and ``coord repo doctor
---fix``.
+genuinely 4 items a human must still do (down from ``add``'s 8): clone on
+each machine, commit+push the coordinator.yml edit, ``git pull`` the
+coord-settings checkout on each machine that serves the repo (not just the
+daemon host — the doctor-checked ``machines.agent_repo_skew`` remedy), and
+``coord repo doctor --fix``.
 """
 
 from __future__ import annotations
@@ -718,8 +720,9 @@ def _print_add_residue(
         "Create a NEW repo through the forge seam, seed it (CLAUDE.md, a "
         "pull_request-triggered CI workflow, .githooks/), then chain into "
         "`coord repo add`. IL-1 (#2747): shrinks `repo add`'s 8-item human "
-        "residue down to 3 — the clone on each machine, the coord-settings "
-        "commit+push, and `coord repo doctor --fix`. Never shells out to "
+        "residue down to 4 — the clone on each machine, the coord-settings "
+        "commit+push, the per-machine coord-settings `git pull`, and `coord "
+        "repo doctor --fix`. Never shells out to "
         "`gh` directly outside coord.github_ops, so a future GitLab backend "
         "is a driver swap, not a rewrite — and workers, for whom `gh` is "
         "deny-listed, can use this too."
@@ -836,7 +839,17 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
         f"creating {github_slug} on GitHub "
         f"({'private' if private else 'public'})..."
     )
-    created = github_ops.create_repo(github_slug, private=private, description=description)
+    try:
+        created = github_ops.create_repo(
+            github_slug, private=private, description=description,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"could not create {github_slug} on GitHub: {exc}. Nothing was "
+            "created — fix the underlying problem (rate-limit, a name "
+            "collision, an invalid/forbidden owner, a transient network "
+            "blip) and retry."
+        ) from exc
     default_branch = created.get("default_branch") or "main"
     click.echo(
         f"✓ created {created.get('url') or github_slug} "
@@ -887,15 +900,21 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
 def _print_create_residue(
     *, target: Path, machines: list[str], repo_path_tmpl: str | None, name: str,
 ) -> None:
-    """The shrunk, 3-item residue ``coord repo create`` prints (#2747) —
-    ``repo add``'s 8 minus the 3 traps this command already closed
-    (CLAUDE.md, the ``pull_request`` CI trigger, ``.githooks/``) and the
-    narration lines that were never gating (the #2299 "no restart needed"
-    explainer, and the test_command/smoke_tests note).
+    """The shrunk residue ``coord repo create`` prints (#2747) — ``repo
+    add``'s 8 minus the 3 traps this command already closed (CLAUDE.md, the
+    ``pull_request`` CI trigger, ``.githooks/``) and the narration lines that
+    were never gating (the #2299 "no restart needed" explainer).
+
+    Still includes the per-machine coord-settings ``git pull`` (item 3
+    below): dropping it left every non-daemon machine's agent serving a
+    stale ``coordinator.yml`` with ``coord repo doctor``'s
+    ``machines.agent_repo_skew`` CRIT and nothing telling the operator to
+    expect or fix it (review finding on #2747) — this is a doctor-checked
+    remedy, not narration, so unlike the #2299 explainer it stays.
     """
     click.echo("")
     click.echo(
-        "NOT DONE — 3 things still need a human (down from `repo add`'s 8 — "
+        "NOT DONE — 4 things still need a human (down from `repo add`'s 8 — "
         "CLAUDE.md, the CI workflow, and .githooks/ are already seeded):"
     )
     tracked = default_settings_dir() / TRACKED_CONFIG_REL
@@ -914,11 +933,28 @@ def _print_create_residue(
             f"  2. clone the repo to {repo_path_tmpl or f'~/src/{name}'} on "
             f"{machine} — this is the worker WORKTREE BASE"
         )
+    for machine in machines or ["<each machine>"]:
+        click.echo(
+            f"  3. `git pull` the coord-settings checkout on {machine} too — "
+            "not just the daemon host. Each agent re-reads its own "
+            "coordinator.yml on the next /health poll (#2299, no restart "
+            "needed), but only the file actually on ITS disk; a machine "
+            "left behind here is exactly `coord repo doctor`'s "
+            "`machines.agent_repo_skew` CRIT (docs/AGENT_OPERATIONS.md: "
+            "\"if it persists: that agent's file is stale — `git pull` in "
+            "coord-settings on that machine\")."
+        )
     click.echo(
-        f"  3. once cloned everywhere: `coord repo doctor {name} --fix` "
+        f"  4. once cloned everywhere: `coord repo doctor {name} --fix` "
         "builds the graph (`graphify update .`) and sets `core.hooksPath "
         ".githooks` on every machine that runs workers. Idempotent; safe to "
         "re-run."
+    )
+    click.echo(
+        "  Also worth doing by hand, not doctor-checked: set "
+        "`test_command`/`ci_command` and `smoke_tests.capability_rules` for "
+        "this repo's paths, and (if it joins the oracle loop) "
+        "`acceptance.drivers`."
     )
     click.echo("")
     click.echo(f"Then: coord repo doctor {name}")
