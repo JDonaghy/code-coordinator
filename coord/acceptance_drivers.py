@@ -49,6 +49,20 @@ from pathlib import Path
 # adapter landing, but running it must fail loudly rather than silently no-op.
 SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
 
+# #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
+# but NOT yet a deterministic one, because an input they depend on hasn't
+# shipped. `web-playwright` is the one case today — the driver itself
+# landed (#1539), but the seeded-board fixture server it needs to run
+# against a fixed, known state (#1538) has not, so a run against a live
+# fleet observes whatever that fleet happens to be doing rather than a
+# pinned fixture (CLAUDE.md's web-playwright section: "a smoke net, not a
+# deterministic oracle"). `coord.repo_onboard`'s oracle-readiness layer
+# reads this to report the gap explicitly instead of a driver-present repo
+# silently reading as fully oracle-ready. Kept here (not in coord.config)
+# because it is exactly the kind of "which medium behaves how" fact this
+# module already owns — see the module docstring.
+FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
+
 # libtest's ``--format json`` per-line test-event stream (`cargo test -- -Z
 # unstable-options --format json`) event -> our normalized status.
 _LIBTEST_EVENT_STATUS = {"ok": "pass", "failed": "fail", "ignored": "skip"}

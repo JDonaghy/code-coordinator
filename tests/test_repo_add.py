@@ -217,6 +217,81 @@ class TestRepoCreateCommand:
         assert "pull_request" in ci_content
         assert "setup-python" in ci_content
 
+    def test_python_template_writes_a_cli_pytest_acceptance_driver(
+        self, config_path, monkeypatch,
+    ):
+        """#2748 (IL-2): the repo is oracle-loop-ready on day one — no
+        hand-editing coordinator.yml required."""
+        _stub_create(monkeypatch)
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "python",
+                "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "wrote acceptance.drivers.grocery (cli-pytest)" in result.output
+
+        from coord.config import load
+
+        cfg = load(config_path)
+        driver = cfg.acceptance.driver_for("grocery")
+        assert driver is not None
+        assert driver.kind == "cli-pytest"
+        assert driver.run == "pytest tests/acceptance/{ms}"
+        assert driver.capability == "python"
+
+        # Residue reflects that the driver is already handled, not pending.
+        assert "acceptance.drivers` is already written" in result.output
+
+    def test_node_template_writes_a_web_playwright_acceptance_driver(
+        self, config_path, monkeypatch,
+    ):
+        _stub_create(monkeypatch)
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "wrote acceptance.drivers.grocery (web-playwright)" in result.output
+
+        from coord.config import load
+
+        cfg = load(config_path)
+        driver = cfg.acceptance.driver_for("grocery")
+        assert driver is not None
+        assert driver.kind == "web-playwright"
+        assert driver.setup == "npm ci"
+        assert driver.capability == "browser"
+
+    def test_generic_template_writes_no_acceptance_driver(
+        self, config_path, monkeypatch,
+    ):
+        """`generic` means the stack isn't decided yet — a driver would be
+        as much of a guess as the CI template deliberately isn't."""
+        _stub_create(monkeypatch)
+        result = CliRunner().invoke(
+            repo_create,
+            ["grocery", "--github", "acme/grocery", "--config", str(config_path)],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "wrote acceptance.drivers" not in result.output
+
+        from coord.config import load
+
+        cfg = load(config_path)
+        assert cfg.acceptance.driver_for("grocery") is None
+        # Residue still names the manual step, since it wasn't automated.
+        assert "if it joins the oracle loop" in result.output
+        assert "acceptance.drivers`" in result.output
+
     def test_dry_run_touches_neither_github_nor_config(self, config_path, monkeypatch):
         calls = _stub_create(monkeypatch)
         before = config_path.read_text()

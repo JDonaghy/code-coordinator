@@ -70,6 +70,7 @@ import pytest
 from coord.acceptance import build_verdict
 from coord.acceptance_drivers import (
     DriverError,
+    FIXTURE_SERVER_DEPENDENT_KINDS,
     SUPPORTED_KINDS,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
@@ -193,6 +194,27 @@ class TestRunDriver:
     def test_timeout_raises_driver_error(self, tmp_path) -> None:
         with pytest.raises(DriverError, match="timed out"):
             run_driver("tui-tuidriver", "sleep 5", cwd=str(tmp_path), timeout=1)
+
+
+class TestFixtureServerDependentKinds:
+    """#2748 (IL-2): `coord repo doctor`'s oracle-readiness layer reads this
+    set to report the #1538 gap explicitly instead of a `web-playwright`
+    repo silently reading as fully oracle-ready once a driver is declared."""
+
+    def test_web_playwright_is_fixture_server_dependent(self) -> None:
+        assert "web-playwright" in FIXTURE_SERVER_DEPENDENT_KINDS
+
+    def test_only_kinds_this_module_actually_supports_are_listed(self) -> None:
+        # A kind declared here but not in SUPPORTED_KINDS would be an
+        # unreachable warning — repo_onboard would flag a dependency for a
+        # driver `run_driver` itself refuses to execute.
+        assert FIXTURE_SERVER_DEPENDENT_KINDS <= set(SUPPORTED_KINDS)
+
+    def test_deterministic_kinds_are_not_flagged(self) -> None:
+        # tui-tuidriver and cli-pytest run against a real local checkout —
+        # no external fixture dependency to flag.
+        assert "tui-tuidriver" not in FIXTURE_SERVER_DEPENDENT_KINDS
+        assert "cli-pytest" not in FIXTURE_SERVER_DEPENDENT_KINDS
 
 
 class TestRunDriverSetup:

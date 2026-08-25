@@ -2045,6 +2045,90 @@ class TestAcceptanceAuthorInteractive:
         assert "aid-1" in result.output
 
 
+class TestAcceptanceMockThinClientRefusal:
+    """#2018 / #2748 IL-2: `coord acceptance mock` used to silently no-op
+    from a thin client (exit 0, no output, no dispatch) — the operator's
+    laptop, which is where the customer/oracle loop is actually driven from
+    (docs/ORACLE_LOOP.md). It must now refuse loudly, naming the fix,
+    mirroring `coord.commands.portal._refuse_if_thin_client`."""
+
+    def test_refuses_on_a_thin_client(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("COORD_SERVICE_URL", "http://dellserver:7435")
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100", "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "must run on the daemon host" in result.output
+        assert "dellserver" in result.output
+        assert "#2018" in result.output
+
+    def test_never_calls_gh_or_dispatches_on_a_thin_client(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The refusal must fire BEFORE any `gh` call or dispatch attempt —
+        not just before the daemon write. A guard that ran after the `gh`
+        fetch would still leak an unauthenticated/wrong-identity call."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("COORD_SERVICE_URL", "http://dellserver:7435")
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        with patch("coord.github_ops.get_issue") as get_issue, \
+             patch("coord.dispatch.dispatch_with_retry") as dispatch:
+            result = CliRunner().invoke(main, [
+                "acceptance", "mock", "coord-tui", "100", "--config", str(config_path),
+            ])
+        assert result.exit_code != 0
+        get_issue.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_amend_mode_also_refuses(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("COORD_SERVICE_URL", "http://dellserver:7435")
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100", "--amend", "fix the CTA copy",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "must run on the daemon host" in result.output
+
+    def test_not_a_thin_client_is_unaffected(self, tmp_path: Path, monkeypatch) -> None:
+        """No `board_service` configured (the daemon host itself, or a
+        single-machine setup) must dispatch exactly as before — this is a
+        refusal for thin clients only, never a blanket regression."""
+        from unittest.mock import patch
+
+        from coord.models import Board
+
+        monkeypatch.delenv("COORD_SERVICE_URL", raising=False)
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        issue_data = {
+            "number": 100, "title": "Milestone tracker", "body": "",
+            "milestone": {"number": 9, "title": "Q3"},
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_data), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch(
+                 "coord.dispatch.dispatch_with_retry",
+                 return_value={"id": "mock-asg-1"},
+             ), \
+             patch("coord.dispatch.post_briefing"), \
+             patch("coord.state.record_dispatched"):
+            result = CliRunner().invoke(main, [
+                "acceptance", "mock", "coord-tui", "100", "--config", str(config_path),
+            ])
+        assert result.exit_code == 0, result.output
+
+
 class TestAcceptanceMock:
     """#930 (Gate A): `coord acceptance mock <repo> <tracking_issue>`
     dispatches the mock-author. Mocks `coord.github_ops`, `coord.

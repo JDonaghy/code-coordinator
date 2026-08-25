@@ -19,7 +19,17 @@ Subcommands:
   dispatch until that contract exists. ``--amend``/``--amend-file`` (#1315)
   instead dispatch a targeted correction to an already-merged contract — the
   properly-typed tool for that, replacing the ``type="work"`` fallback that
-  caused #1314.
+  caused #1314. **Requires no acceptance driver at all** — unlike ``run``/
+  ``record`` above, mock-authoring only needs ``gh`` + a machine to dispatch
+  to, so it works before ``acceptance.drivers`` has an entry for the repo
+  (see :func:`coord.acceptance.acceptance_capability_gap`'s sibling
+  ``_resolve_driver``, which ``run``/``record`` call and ``mock`` does not).
+  **Refuses outright from a thin client** (:func:`_refuse_if_thin_client_mock`,
+  #2018) — mirrors ``coord.commands.portal._refuse_if_thin_client``: the
+  ``gh`` calls this dispatch makes are plain local ``subprocess`` calls, not
+  routed through the daemon, so running this from the operator's laptop (a
+  thin client) used to either fail quietly or run with whatever ``gh``
+  identity happened to be on PATH there.
 """
 
 from __future__ import annotations
@@ -115,6 +125,56 @@ def _check_local_capability(driver_cfg, repo: str, cfg) -> None:
         err=True,
     )
     sys.exit(1)
+
+
+def _refuse_if_thin_client_mock() -> None:
+    """Refuse ``coord acceptance mock`` outright when run from a thin client
+    (#2018, #2748 IL-2).
+
+    ``dispatch_acceptance_mock`` (``coord/mock_author.py``) fetches the
+    tracking issue and its milestone's open issues straight off ``gh`` —
+    :func:`coord.github_ops.get_issue` / ``_fetch_milestone_issues`` are
+    plain ``subprocess`` calls, run on whichever machine invokes this
+    command, never routed through the daemon the way the board/config reads
+    already are (:func:`coord.board_service.read_board`,
+    :func:`coord.commands._common._load_config`'s ``fetch_remote_config``
+    branch). The operator's laptop — the thin client from which the
+    customer/oracle loop is actually driven (docs/ORACLE_LOOP.md) — is
+    exactly the machine :mod:`coord.client`'s bootstrap contract documents
+    as carrying "no Claude or gh credentials", so a ``gh`` call issued from
+    there is either missing, unauthenticated, or (worse) silently talking
+    to a DIFFERENT GitHub identity than the daemon uses for everything
+    else. Refusing loudly here, before any of that runs, beats a Gate-A
+    dispatch that quietly did nothing (#2018's report: "exit 0, no output,
+    no dispatch") or one that ran with the wrong credentials and nobody
+    noticed.
+
+    Mirrors ``coord.commands.portal._refuse_if_thin_client`` — same
+    detection (``board_service`` configured means this machine is a thin
+    client per ``coord/client.py``'s bootstrap contract), same "name the
+    daemon host, tell them to ssh there" remedy. Unlike ``coord portal
+    link`` (#2751), this does NOT route the whole command through the
+    daemon: that would need a new server endpoint (mirroring
+    ``/acceptance-record``) that is out of scope for closing #2018 — the
+    fix here is "fail loud instead of running wrong or not at all", not new
+    remote-exec plumbing.
+    """
+    from coord.board_service import resolve  # noqa: PLC0415
+
+    svc = resolve()
+    if svc is None:
+        return
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    host = urlparse(svc.url).hostname or svc.url
+    raise click.ClickException(
+        f"coord acceptance mock must run on the daemon host ({host}) — "
+        "dispatching Gate A fetches the tracking issue and its milestone's "
+        "open issues straight off `gh`, which this thin client carries no "
+        "credentials for (board_service is configured in "
+        "~/.coord/client.toml, making this machine a thin client). Run it "
+        "over `ssh` on the daemon host instead. (#2018)"
+    )
 
 
 def _scoped_verdict(
@@ -1190,6 +1250,8 @@ def acceptance_mock_cmd(
     amend_file: Path | None,
     config_path: Path,
 ) -> None:
+    _refuse_if_thin_client_mock()
+
     if amend_text is not None and amend_file is not None:
         click.echo("error: --amend and --amend-file are mutually exclusive", err=True)
         sys.exit(2)
