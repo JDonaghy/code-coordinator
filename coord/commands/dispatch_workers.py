@@ -4320,9 +4320,11 @@ def _dispatch_interactive_work(
         # later `coord reattach` can push it back (record_dispatched writes
         # from the Proposal, which carries no branch).
         try:
+            from coord import sql as _sql_wb  # noqa: PLC0415
             from coord.state import get_connection as _gc_wb  # noqa: PLC0415
             _conn_wb = _gc_wb()
-            _conn_wb.execute(
+            _sql_wb.execute(
+                _conn_wb,
                 "UPDATE assignments SET branch=? WHERE assignment_id=?",
                 (_remote_branch, assignment_id),
             )

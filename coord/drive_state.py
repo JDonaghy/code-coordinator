@@ -819,12 +819,14 @@ def _local_merge_queue_rows() -> list[dict]:
     :func:`_local_issue_rows`'s own table — one bad table must not blank the
     other's top-up.
     """
+    from coord import sql
     from coord.db import get_connection  # noqa: PLC0415
 
     try:
-        rows = get_connection().execute(
+        rows = sql.execute(
+            get_connection(),
             "SELECT repo_name, issue_number, state, error, assignment_id, "
-            "pr_url FROM merge_queue"
+            "pr_url FROM merge_queue",
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []
@@ -855,12 +857,14 @@ def _local_issue_rows() -> list[dict]:
     daemon host back on the assignment-only signals rather than aborting the
     whole board read over one bad table.
     """
+    from coord import sql
     from coord.db import get_connection  # noqa: PLC0415
 
     try:
-        rows = get_connection().execute(
+        rows = sql.execute(
+            get_connection(),
             "SELECT repo_name, number, state, milestone_number, milestone_title, "
-            "labels, body FROM issues"
+            "labels, body FROM issues",
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []

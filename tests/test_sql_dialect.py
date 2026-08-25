@@ -15,7 +15,10 @@ when the optional dependency genuinely isn't there.
 
 from __future__ import annotations
 
+import ast
+import re
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -484,3 +487,282 @@ def test_driver_error_postgres_without_psycopg_raises_import_error():
 def test_driver_error_unknown_dialect_raises():
     with pytest.raises(sql.UnsupportedDialectError):
         sql.driver_error(_FakeUnknownConnection())
+
+
+# ── the ratchet: no raw `?` reaches a driver outside the seam (#2768, #1948) ─
+#
+# #1948's first acceptance bullet: "No raw `?` placeholder reaches a driver:
+# every execute() goes through the dialect seam, enforced by a test that
+# greps the tree." Nothing implemented that until now — the 34 tests above
+# all exercise coord/sql.py in isolation; none of them look at the rest of
+# coord/**. This is that test, sequenced last (#2768) because it can only be
+# green once every migration slice (#2721 -> #2766 -> #2767) has landed.
+#
+# AST over regex, per the issue: a `Call` node whose `func` is an
+# `Attribute` named execute/executemany/executescript is unambiguous and
+# can't be confused with the word "execute" inside a comment/docstring (this
+# very module's own docstring says "``conn.execute()``" in prose — a naive
+# grep would have to dodge that) or a same-named method on something that
+# isn't a DB-API connection.
+#
+# Exactly one exemption, by explicit constant: coord/sql.py — it *is* the
+# seam, so `cur.execute()` inside it is the seam doing its job, not a caller
+# routing around it. coord/db.py needs none: every DDL/DML call site in it
+# already goes through coord.sql (verified below, by the same walk, as part
+# of the assertion rather than assumed) — #2724 genuinely left nothing that
+# can't route through `sql.executescript()`.
+_COORD_DIR = Path(sql.__file__).parent
+_SEAM_RELPATH = "coord/sql.py"
+
+# coord.sql function names that legitimately take a qmark-style SQL string
+# and are the whole point of the seam — an argument to one of these is
+# "through the seam", not a violation.
+_SEAM_FUNCS = {
+    "execute",
+    "executemany",
+    "executescript",
+    "upsert",
+    "insert_ignore",
+    "insert_ignore_select",
+    "insert_returning_id",
+}
+
+# The DB-API 2.0 cursor/connection methods a raw call must never reach
+# outside the seam.
+_DRIVER_METHODS = {"execute", "executemany", "executescript"}
+
+_SQL_LIKE_RE = re.compile(
+    r"^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|PRAGMA|REPLACE|WITH)\b",
+    re.IGNORECASE,
+)
+
+
+def _tree_modules():
+    """Every ``coord/**/*.py`` module, excluding the seam itself."""
+    for path in sorted(_COORD_DIR.rglob("*.py")):
+        rel = str(path.relative_to(_COORD_DIR.parent))
+        if rel == _SEAM_RELPATH:
+            continue
+        yield rel, path
+
+
+def _parse(path: Path):
+    src = path.read_text(encoding="utf-8")
+    return src, ast.parse(src, filename=str(path))
+
+
+def _seam_alias_names(tree: ast.AST) -> set[str]:
+    """Local names bound to the ``coord.sql`` module in this file.
+
+    Covers the plain ``from coord import sql`` used almost everywhere, and
+    the two call sites that alias it to dodge a same-named local — the
+    ``_sql``/``_sql_wb`` lazy imports in ``coord/commands/dispatch.py`` and
+    ``coord/commands/dispatch_workers.py``.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "coord":
+            for alias in node.names:
+                if alias.name == "sql":
+                    names.add(alias.asname or "sql")
+    return names
+
+
+def _is_seam_call(call: ast.Call, seam_names: set[str]) -> bool:
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr in _SEAM_FUNCS
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in seam_names
+    )
+
+
+def test_no_raw_driver_execute_call_outside_the_dialect_seam():
+    """No ``.execute()``/``.executemany()``/``.executescript()`` call
+    anywhere in ``coord/**`` reaches a driver directly — every one must be a
+    call to ``coord.sql``'s wrapper of the same name.
+
+    Deliberately introducing e.g. ``conn.execute("SELECT 1 WHERE x = ?",
+    (1,))`` in any ``coord/`` module makes this red: it's an ``Attribute``
+    call named ``execute`` whose ``func.value`` is not a name bound to
+    ``coord.sql`` in that file.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        src, tree = _parse(path)
+        seam_names = _seam_alias_names(tree)
+        lines = src.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in _DRIVER_METHODS:
+                continue
+            if _is_seam_call(node, seam_names):
+                continue
+            lineno = node.lineno
+            src_line = (
+                lines[lineno - 1].strip() if 0 < lineno <= len(lines) else "<no source line>"
+            )
+            violations.append(f"{rel}:{lineno}: {src_line}")
+    assert not violations, (
+        "raw DB-API execute-family call(s) bypassing the coord.sql dialect "
+        "seam (#2768/#1948) — route these through coord.sql.execute()/"
+        "executemany()/executescript() instead:\n" + "\n".join(violations)
+    )
+
+
+def _reachable_seam_literal_ids(tree: ast.AST) -> set[int]:
+    """``id()`` of every string-literal ``ast.Constant`` node in *tree* that
+    is provably routed through a ``coord.sql`` seam call — either directly
+    (the literal is itself a call argument) or transitively, through the
+    one-hop local-assignment pattern ``coord/db.py`` uses for its schema
+    constant (``_SCHEMA_SQL = "..."``; ``schema_sql =
+    _SCHEMA_SQL.replace(...)``; ``sql.executescript(conn, schema_sql)``).
+
+    This is a small fixed-point over local ``Assign``/``AnnAssign`` nodes,
+    not full interprocedural dataflow — good enough for the shallow,
+    single-file indirection this tree actually uses, and precise (no
+    filename-based allowlisting) rather than a pattern that could paper
+    over a genuinely unrouted literal.
+    """
+    seam_names = _seam_alias_names(tree)
+    seam_call_args = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _is_seam_call(node, seam_names):
+            seam_call_args.extend(node.args)
+            seam_call_args.extend(kw.value for kw in node.keywords)
+
+    protected_ids: set[int] = set()
+    reachable_names: set[str] = set()
+    for arg in seam_call_args:
+        for sub in ast.walk(arg):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                protected_ids.add(id(sub))
+            elif isinstance(sub, ast.Name):
+                reachable_names.add(sub.id)
+
+    assigns = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    for _ in range(len(assigns) + 1):  # fixed point, bounded by #assignments
+        changed = False
+        for a in assigns:
+            value = a.value
+            if value is None:
+                continue
+            targets = a.targets if isinstance(a, ast.Assign) else [a.target]
+            target_names = {t.id for t in targets if isinstance(t, ast.Name)}
+            if not (target_names & reachable_names):
+                continue
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    if id(sub) not in protected_ids:
+                        protected_ids.add(id(sub))
+                        changed = True
+                elif isinstance(sub, ast.Name) and sub.id not in reachable_names:
+                    reachable_names.add(sub.id)
+                    changed = True
+        if not changed:
+            break
+    return protected_ids
+
+
+def _contains_bare_placeholder(sql_text: str) -> bool:
+    """Does *sql_text* contain a ``?`` outside a quoted string literal or a
+    ``--``/``/* */`` SQL comment?
+
+    Extends :func:`coord.sql._qmark_to_pyformat`'s quote-tracking with
+    comment-awareness — needed because coord/db.py's schema DDL has a
+    rhetorical "?" inside a ``--`` comment (``"which cursor?"``) that is not
+    a placeholder and must not trip this check.
+    """
+    in_string: str | None = None
+    in_line_comment = False
+    in_block_comment = False
+    i, n = 0, len(sql_text)
+    while i < n:
+        ch = sql_text[i]
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if sql_text[i : i + 2] == "*/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string is not None:
+            if ch == in_string:
+                if sql_text[i : i + 2] == in_string * 2:
+                    i += 2
+                    continue
+                in_string = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_string = ch
+            i += 1
+            continue
+        if sql_text[i : i + 2] == "--":
+            in_line_comment = True
+            i += 2
+            continue
+        if sql_text[i : i + 2] == "/*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "?":
+            return True
+        i += 1
+    return False
+
+
+def test_no_bare_placeholder_in_sql_literal_outside_the_dialect_seam():
+    """No SQL string literal in ``coord/**`` outside the seam carries a bare
+    ``?`` placeholder — the *symptom* half of the ratchet.
+
+    The call-site test above catches a raw ``conn.execute("... ?", ...)``.
+    This one is the backstop for what it can't see: SQL text built as a
+    module-level (or local) constant and forwarded to a driver call by a
+    helper the AST walk doesn't recognize as ``execute`` (e.g. one that
+    takes a cursor and a string and calls ``cursor.execute(sql, params)``
+    several frames from where the string was written). A literal is exempt
+    only if it is provably an argument — directly, or through the kind of
+    one-hop local assignment coord/db.py's own schema constant uses — to a
+    ``coord.sql`` seam call; anything else that is SQL-shaped and carries a
+    bare ``?`` is exactly the "raw placeholder reaches a driver" failure
+    #1948 names.
+
+    Deliberately introducing e.g. ``_RAW_SQL = "SELECT * FROM t WHERE id =
+    ?"`` in any ``coord/`` module, unrouted to ``coord.sql``, makes this
+    red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        _src, tree = _parse(path)
+        protected_ids = _reachable_seam_literal_ids(tree)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in protected_ids:
+                continue
+            text = node.value
+            if not _SQL_LIKE_RE.match(text):
+                continue
+            if not _contains_bare_placeholder(text):
+                continue
+            lineno = node.lineno
+            snippet = text.strip()
+            for i, line in enumerate(text.split("\n")):
+                if "?" in line:
+                    lineno = node.lineno + i
+                    snippet = line.strip()
+                    break
+            violations.append(f"{rel}:{lineno}: {snippet}")
+    assert not violations, (
+        "bare `?` placeholder in a SQL string literal outside the coord.sql "
+        "dialect seam (#2768/#1948) — route this SQL through "
+        "coord.sql.execute()/executemany()/upsert()/etc. instead of a raw "
+        "driver call:\n" + "\n".join(violations)
+    )
