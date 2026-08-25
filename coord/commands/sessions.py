@@ -1689,6 +1689,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
 @click.option("--interval", default=30, show_default=True, type=int, help="Seconds between polls.")
 @click.option("--timeout", default=1800, show_default=True, type=int, help="Max seconds to wait.")
 def wait(assignment_id: str, config_path: Path, interval: int, timeout: int) -> None:
+    from coord.commands._common import poll_until_terminal
     from coord.state import load_dispatched
 
     cfg = _load_config(config_path)
@@ -1711,54 +1712,35 @@ def wait(assignment_id: str, config_path: Path, interval: int, timeout: int) -> 
         )
         sys.exit(2)
 
-    url = f"http://{machine.host}:{AGENT_PORT}/status"
-    deadline = time.monotonic() + timeout
+    # #2743: the poll loop itself is shared with `coord portal
+    # decompose-chat --wait` (coord/commands/_common.py::poll_until_terminal)
+    # so the two surfaces that answer "did assignment X finish, and how"
+    # can't drift on the answer.
+    outcome = poll_until_terminal(assignment_id, machine, timeout=timeout, interval=interval)
 
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(url, timeout=10)
-            data = resp.json()
-        except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
-            click.echo(f"warning: could not reach agent on {machine.name}: {e}", err=True)
-            time.sleep(interval)
-            continue
+    if outcome.status == "not_found":
+        click.echo(
+            f"Assignment {assignment_id} not found on agent (not active or completed)",
+            err=True,
+        )
+        sys.exit(2)
 
-        # Check completed list
-        for c in data.get("completed", []):
-            if c.get("id") == assignment_id:
-                exit_code = c.get("exit_code", -1)
-                branch = c.get("branch", "unknown")
-                started = c.get("started_at", 0)
-                finished = c.get("finished_at", 0)
-                duration = finished - started if finished and started else 0
-                mins, secs = divmod(int(duration), 60)
+    if outcome.status == "timeout":
+        click.echo(f"Timed out after {timeout}s waiting for {assignment_id}", err=True)
+        sys.exit(3)
 
-                if exit_code == 0:
-                    click.echo(f"Assignment {assignment_id} completed (exit 0, {mins}m {secs}s)")
-                    click.echo(f"  branch: {branch}")
-                    sys.exit(0)
-                else:
-                    click.echo(f"Assignment {assignment_id} failed (exit {exit_code}, {mins}m {secs}s)")
-                    error = c.get("error", "")
-                    if error:
-                        click.echo(f"  error: {error}")
-                    click.echo(f"  branch: {branch}")
-                    sys.exit(1)
-
-        # Check active list — if not there either, it vanished
-        active_ids = [a.get("id") for a in data.get("active", [])]
-        if assignment_id not in active_ids:
-            click.echo(
-                f"Assignment {assignment_id} not found on agent (not active or completed)",
-                err=True,
-            )
-            sys.exit(2)
-
-        time.sleep(interval)
-
-    # Timeout
-    click.echo(f"Timed out after {timeout}s waiting for {assignment_id}", err=True)
-    sys.exit(3)
+    mins, secs = outcome.duration_mins_secs
+    branch = outcome.branch or "unknown"
+    if outcome.exit_code == 0:
+        click.echo(f"Assignment {assignment_id} completed (exit 0, {mins}m {secs}s)")
+        click.echo(f"  branch: {branch}")
+        sys.exit(0)
+    else:
+        click.echo(f"Assignment {assignment_id} failed (exit {outcome.exit_code}, {mins}m {secs}s)")
+        if outcome.error:
+            click.echo(f"  error: {outcome.error}")
+        click.echo(f"  branch: {branch}")
+        sys.exit(1)
 
 
 def _tail_log(log_path: Path, interval: float = 1.0):

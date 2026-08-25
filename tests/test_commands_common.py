@@ -226,3 +226,130 @@ class TestNoteWithheldSnapshotReadsThroughTheSeam:
 
         err = capsys.readouterr().err
         assert "worker-1" in err
+
+
+class TestPollUntilTerminal:
+    """#2743 fix iteration 1: `coord wait` and `coord portal decompose-chat
+    --wait` used to run two independent poll loops that had already drifted
+    on whether a FAILED completion is reported as an error. They now share
+    :func:`coord.commands._common.poll_until_terminal` — this pins its
+    contract directly, including the non-blocking review finding that a
+    PENDING assignment must not be misreported as terminal even though
+    `AgentServer.list_assignments()` buckets it into the "completed" list
+    for anything that isn't RUNNING.
+    """
+
+    def _machine(self) -> Machine:
+        return Machine(name="dellserver", host="dellserver", repos=["coord"])
+
+    def test_reports_a_successful_completion(self, monkeypatch):
+        from unittest.mock import patch
+
+        from coord.commands._common import poll_until_terminal
+
+        payload = {
+            "completed": [
+                {
+                    "id": "asg-1",
+                    "status": "done",
+                    "exit_code": 0,
+                    "started_at": 100,
+                    "finished_at": 142,
+                    "branch": "issue-1-foo",
+                }
+            ],
+            "active": [],
+        }
+
+        class _Resp:
+            def json(self):
+                return payload
+
+        with patch("httpx.get", return_value=_Resp()):
+            outcome = poll_until_terminal(
+                "asg-1", self._machine(), timeout=30, interval=1
+            )
+
+        assert outcome.status == "completed"
+        assert outcome.exit_code == 0
+        assert outcome.branch == "issue-1-foo"
+        assert outcome.duration_mins_secs == (0, 42)
+
+    def test_a_pending_entry_in_the_completed_list_is_not_terminal(self):
+        """`list_assignments()` buckets anything that isn't RUNNING —
+        including PENDING — into "completed" (`coord/agent.py`). Before this
+        guard, the first poll of a not-yet-started assignment would have
+        been misread as a terminal completion with `exit_code=None`."""
+        from unittest.mock import patch
+
+        from coord.commands._common import poll_until_terminal
+
+        pending_then_done = [
+            {
+                "completed": [
+                    {"id": "asg-1", "status": "pending", "exit_code": None}
+                ],
+                "active": [],
+            },
+            {
+                "completed": [
+                    {
+                        "id": "asg-1",
+                        "status": "done",
+                        "exit_code": 0,
+                        "started_at": 0,
+                        "finished_at": 5,
+                        "branch": "issue-1-foo",
+                    }
+                ],
+                "active": [],
+            },
+        ]
+
+        class _Resp:
+            def __init__(self, data):
+                self._data = data
+
+            def json(self):
+                return self._data
+
+        responses = iter(pending_then_done)
+
+        with (
+            patch("httpx.get", side_effect=lambda *a, **k: _Resp(next(responses))),
+            patch("time.sleep"),
+        ):
+            outcome = poll_until_terminal(
+                "asg-1", self._machine(), timeout=30, interval=1
+            )
+
+        assert outcome.status == "completed"
+        assert outcome.exit_code == 0
+
+    def test_reports_not_found_when_absent_from_both_lists(self):
+        from unittest.mock import patch
+
+        from coord.commands._common import poll_until_terminal
+
+        class _Resp:
+            def json(self):
+                return {"completed": [], "active": []}
+
+        with patch("httpx.get", return_value=_Resp()):
+            outcome = poll_until_terminal(
+                "ghost", self._machine(), timeout=30, interval=1
+            )
+
+        assert outcome.status == "not_found"
+
+    def test_reports_timeout_when_the_deadline_passes(self):
+        from unittest.mock import patch
+
+        from coord.commands._common import poll_until_terminal
+
+        with patch("time.monotonic", side_effect=[0, 100]):
+            outcome = poll_until_terminal(
+                "asg-1", self._machine(), timeout=5, interval=1
+            )
+
+        assert outcome.status == "timeout"

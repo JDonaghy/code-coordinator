@@ -466,21 +466,25 @@ def _wait_and_print_decomposition_summary(
     """Block until *assignment_id* finishes, then print its completion line
     and its full closing assistant turn (#2743).
 
-    Polls the dispatch machine's own agent ``/status`` — the same mechanism
-    `coord wait` uses (`coord/commands/sessions.py`) — since a
-    `decomposition-chat` session is `issue_number=0` and so has no GitHub
-    thread this could otherwise watch for a completion comment on. Once the
-    agent reports the assignment done, the log is fetched (over the same
-    HTTP path `coord log` uses, so this works whether the session landed on
-    this machine or a remote one) and its last assistant turn — the
-    session's own prose report of what it filed/queued/linked, per
+    Polls the dispatch machine's own agent ``/status`` via the same shared
+    helper `coord wait` uses — :func:`coord.commands._common.poll_until_terminal`
+    (factored out in #2743's fix round so the two "did this assignment
+    finish, and how" surfaces can't independently drift on the answer) —
+    since a `decomposition-chat` session is `issue_number=0` and so has no
+    GitHub thread this could otherwise watch for a completion comment on.
+    Once the agent reports the assignment done, the log is fetched (over the
+    same HTTP path `coord log` uses, so this works whether the session
+    landed on this machine or a remote one) and its last assistant turn —
+    the session's own prose report of what it filed/queued/linked, per
     `DECOMPOSITION_CHAT_SYSTEM_PROMPT` — is printed in full.
+
+    A FAILED session (non-zero exit code) always raises ``SystemExit(1)``
+    once the summary (or a best-effort note that the summary couldn't be
+    fetched) has been printed — a script doing
+    ``coord portal decompose-chat SUB --wait && next_step`` must see the
+    failure in its own exit status, not just in printed text.
     """
-    import time as _time
-
-    import httpx
-
-    from coord.commands._common import AGENT_PORT
+    from coord.commands._common import poll_until_terminal
 
     machine = next((m for m in cfg.machines if m.name == machine_name), None)
     if machine is None:
@@ -491,72 +495,57 @@ def _wait_and_print_decomposition_summary(
         )
         raise SystemExit(1)
 
-    url = f"http://{machine.host}:{AGENT_PORT}/status"
-    deadline = _time.monotonic() + timeout
-    completed_entry: dict | None = None
-
     click.echo(f"waiting for {assignment_id} on {machine.name}...", err=True)
-    while _time.monotonic() < deadline:
-        try:
-            resp = httpx.get(url, timeout=10)
-            data = resp.json()
-        except (httpx.HTTPError, httpx.TimeoutException, OSError) as exc:
-            click.echo(f"warning: could not reach agent on {machine.name}: {exc}", err=True)
-            _time.sleep(interval)
-            continue
+    outcome = poll_until_terminal(assignment_id, machine, timeout=timeout, interval=interval)
 
-        completed_entry = next(
-            (c for c in data.get("completed", []) if c.get("id") == assignment_id),
-            None,
+    if outcome.status == "not_found":
+        click.secho(
+            f"error: assignment {assignment_id} not found on {machine.name} "
+            "(not active or completed)",
+            fg="red",
         )
-        if completed_entry is not None:
-            break
+        raise SystemExit(2)
 
-        active_ids = [a.get("id") for a in data.get("active", [])]
-        if assignment_id not in active_ids:
-            click.secho(
-                f"error: assignment {assignment_id} not found on {machine.name} "
-                "(not active or completed)",
-                fg="red",
-            )
-            raise SystemExit(2)
-
-        _time.sleep(interval)
-
-    if completed_entry is None:
+    if outcome.status == "timeout":
         click.secho(f"timed out after {timeout}s waiting for {assignment_id}", fg="red")
         raise SystemExit(3)
 
-    exit_code = completed_entry.get("exit_code", -1)
-    started = completed_entry.get("started_at", 0)
-    finished = completed_entry.get("finished_at", 0)
-    duration = finished - started if finished and started else 0
-    mins, secs = divmod(int(duration), 60)
+    exit_code = outcome.exit_code if outcome.exit_code is not None else -1
+    mins, secs = outcome.duration_mins_secs
     status_word = "completed" if exit_code == 0 else f"FAILED (exit {exit_code})"
     click.echo(f"\nAssignment {assignment_id} {status_word} in {mins}m {secs}s")
-    branch = completed_entry.get("branch")
-    if branch:
-        click.echo(f"  branch: {branch}")
+    if outcome.branch:
+        click.echo(f"  branch: {outcome.branch}")
 
     from coord.network import fetch_log
     from coord.worker_events import latest_assistant_turn_text_from_text
 
     try:
         status_code, body = fetch_log(machine, assignment_id, since=0)
-    except Exception as exc:  # noqa: BLE001 — best-effort; exit status above already reported
+    except Exception as exc:  # noqa: BLE001 — best-effort; failure exit raised below regardless
         click.echo(f"(could not fetch log to recover the closing summary: {exc})", err=True)
+        if exit_code != 0:
+            raise SystemExit(1) from exc
         return
     if status_code != 200:
         click.echo(f"(could not fetch log: HTTP {status_code})", err=True)
+        if exit_code != 0:
+            raise SystemExit(1)
         return
 
     text = body.decode("utf-8", errors="replace")
     summary = latest_assistant_turn_text_from_text(text)
     if not summary:
         click.echo("(no closing assistant turn found in the log)", err=True)
-        return
-    click.echo("\n--- closing summary ---")
-    click.echo(summary)
+    else:
+        click.echo("\n--- closing summary ---")
+        click.echo(summary)
+
+    # #2743: propagate a FAILED session's exit code to this CLI invocation's
+    # own exit status — printing "FAILED" above is not enough for a caller
+    # scripting `coord portal decompose-chat SUB --wait && next_step`.
+    if exit_code != 0:
+        raise SystemExit(1)
 
 
 # ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────

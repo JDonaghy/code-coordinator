@@ -508,6 +508,88 @@ def test_decompose_chat_wait_prints_completion_and_closing_summary(config_path):
     assert "…" not in result.output
 
 
+def test_decompose_chat_wait_exits_nonzero_on_failed_session(config_path):
+    # #2743 fix iteration 1: a FAILED session must fail the CLI's own exit
+    # status, not just print "FAILED" — a script doing
+    # `coord portal decompose-chat SUB --wait && next_step` has to be able
+    # to see the failure without parsing stdout.
+    status_payload = {
+        "completed": [
+            {
+                "id": "asg-789",
+                "exit_code": 1,
+                "started_at": 100,
+                "finished_at": 130,
+                "branch": "issue-0-decomposition-asg-789",
+                "error": "system prompt: coord portal link failed",
+            }
+        ],
+        "active": [],
+    }
+
+    class _Resp:
+        def json(self):
+            return status_payload
+
+    with (
+        patch(
+            "coord.decomposition_chat.dispatch_decomposition_chat",
+            return_value=("asg-789", "dellserver"),
+        ),
+        patch("httpx.get", return_value=_Resp()),
+        patch(
+            "coord.network.fetch_log",
+            return_value=(200, _decompose_chat_ndjson("could not link, aborting")),
+        ),
+    ):
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c", "--wait"
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "FAILED (exit 1)" in result.output
+    # The closing summary is still printed — failure isn't a reason to
+    # withhold the one thing that explains *why*.
+    assert "could not link, aborting" in result.output
+
+
+def test_decompose_chat_wait_exits_nonzero_on_failed_session_even_if_log_fetch_fails(config_path):
+    # Same as above, but the log fetch itself also fails — the exit status
+    # must still reflect the FAILED session rather than silently returning 0
+    # because the best-effort log-fetch fallback swallowed the exception.
+    status_payload = {
+        "completed": [
+            {
+                "id": "asg-789",
+                "exit_code": 1,
+                "started_at": 100,
+                "finished_at": 130,
+                "branch": "issue-0-decomposition-asg-789",
+            }
+        ],
+        "active": [],
+    }
+
+    class _Resp:
+        def json(self):
+            return status_payload
+
+    with (
+        patch(
+            "coord.decomposition_chat.dispatch_decomposition_chat",
+            return_value=("asg-789", "dellserver"),
+        ),
+        patch("httpx.get", return_value=_Resp()),
+        patch("coord.network.fetch_log", side_effect=OSError("connection refused")),
+    ):
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c", "--wait"
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "FAILED (exit 1)" in result.output
+
+
 def test_decompose_chat_wait_times_out(config_path):
     with (
         patch(
