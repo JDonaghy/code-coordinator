@@ -29,6 +29,7 @@ import os
 import sqlite3
 import time
 
+from coord import sql
 from coord.dao import (
     TERMINAL_STATUSES,
     _KEEP_INDEX_COLUMNS,
@@ -72,7 +73,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
     """Return ``[(name, type), ...]`` for *table* (empty if it doesn't exist)."""
     return [
         (r[1], r[2] or "TEXT")
-        for r in conn.execute(f"PRAGMA table_info({table})").fetchall()  # noqa: S608
+        for r in sql.execute(conn, f"PRAGMA table_info({table})").fetchall()  # noqa: S608
     ]
 
 
@@ -86,11 +87,11 @@ def _ensure_archive_mirror(conn: sqlite3.Connection, src: str, dst: str) -> list
     dst_existing = {name for name, _ in _columns(conn, dst)}
     if not dst_existing:
         coldefs = ", ".join(f'"{name}" {ctype}' for name, ctype in src_cols)
-        conn.execute(f"CREATE TABLE {dst} ({coldefs})")  # noqa: S608
+        sql.execute(conn, f"CREATE TABLE {dst} ({coldefs})")  # noqa: S608
     else:
         for name, ctype in src_cols:
             if name not in dst_existing:
-                conn.execute(f'ALTER TABLE {dst} ADD COLUMN "{name}" {ctype}')  # noqa: S608
+                sql.execute(conn, f'ALTER TABLE {dst} ADD COLUMN "{name}" {ctype}')  # noqa: S608
     return [name for name, _ in src_cols]
 
 
@@ -107,12 +108,14 @@ def _move_rows(
     for i in range(0, len(ids), _BATCH):
         batch = ids[i : i + _BATCH]
         placeholders = ",".join("?" for _ in batch)
-        conn.execute(
+        sql.execute(
+            conn,
             f"INSERT INTO {dst} ({collist}) SELECT {collist} FROM {src} "  # noqa: S608
             f"WHERE {key_col} IN ({placeholders})",
             batch,
         )
-        conn.execute(
+        sql.execute(
+            conn,
             f"DELETE FROM {src} WHERE {key_col} IN ({placeholders})",  # noqa: S608
             batch,
         )
@@ -142,21 +145,21 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     conn = get_connection()
     index = [
         dict(r)
-        for r in conn.execute(
-            f"SELECT {_KEEP_INDEX_COLUMNS} FROM {_ASSIGNMENTS}"  # noqa: S608
+        for r in sql.execute(
+            conn, f"SELECT {_KEEP_INDEX_COLUMNS} FROM {_ASSIGNMENTS}"  # noqa: S608
         ).fetchall()
     ]
     mq_ids = {
         r["assignment_id"]
-        for r in conn.execute(
-            f"SELECT assignment_id FROM merge_queue"  # noqa: S608
+        for r in sql.execute(
+            conn, f"SELECT assignment_id FROM merge_queue"  # noqa: S608
         ).fetchall()
         if r["assignment_id"]
     }
     open_keys = {
         (r["repo_name"], r["number"])
-        for r in conn.execute(
-            "SELECT repo_name, number FROM issues WHERE LOWER(state) != 'closed'"
+        for r in sql.execute(
+            conn, "SELECT repo_name, number FROM issues WHERE LOWER(state) != 'closed'"
         ).fetchall()
     }
     protected = compute_board_keep_ids(index, mq_ids, open_keys, cutoff)
@@ -174,8 +177,8 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     # old notifications not referencing a still-protected assignment.
     notif_ids = [
         r["assignment_id"]
-        for r in conn.execute(
-            f"SELECT assignment_id, posted_at FROM {_NOTIFICATIONS}"  # noqa: S608
+        for r in sql.execute(
+            conn, f"SELECT assignment_id, posted_at FROM {_NOTIFICATIONS}"  # noqa: S608
         ).fetchall()
         if r["assignment_id"]
         and (
