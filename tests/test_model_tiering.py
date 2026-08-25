@@ -3,6 +3,7 @@ escalate on failure."""
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,22 @@ from coord.cli import main
 from coord.config import Config, ConfigError, ModelsConfig, load
 from coord.dispatch import dispatch
 from coord.models import Assignment, Machine, Proposal, Repo
+
+
+def _fake_repo_path(*parts: str) -> str:
+    """Portable stand-in for a repo's local checkout path.
+
+    Every test in this file that needs a `repo_path`/`repo_paths` value only
+    carries it through as an opaque config string (mocked `dispatch()`/
+    `httpx.post()` calls, never a real filesystem walk) — so it never needs
+    to exist on disk. It still must be a value the config loader and
+    `pathlib` accept on every platform, which a hardcoded POSIX literal like
+    ``/tmp/api`` is not (`Path("/tmp/api").is_absolute()` is False on
+    Windows — no drive letter — #2731). `tempfile.gettempdir()` is the
+    portable equivalent of `/tmp` on POSIX and `C:\\Users\\...\\Temp` on
+    Windows.
+    """
+    return str(Path(tempfile.gettempdir()).joinpath(*parts))
 
 
 # ── ModelsConfig defaults and parsing ──────────────────────────────────────
@@ -160,7 +177,7 @@ class TestNextModel:
 def _spec(**overrides) -> AssignmentSpec:
     base = dict(
         repo_name="api",
-        repo_path="/tmp/repo",
+        repo_path=_fake_repo_path("repo"),
         issue_number=1,
         issue_title="t",
         briefing="do the thing",
@@ -222,7 +239,7 @@ def _make_cfg(
                 name="laptop",
                 host="laptop.tailnet",
                 repos=["api"],
-                repo_paths={"api": "/home/user/src/api"},
+                repo_paths={"api": _fake_repo_path("src", "api")},
             ),
         ],
         models=ModelsConfig(
@@ -344,27 +361,35 @@ class TestDispatchModel:
 # ── coord assign --model passes through ────────────────────────────────────
 
 
-CONFIG_YAML = """\
-repos:
-  - name: api
-    github: acme/api
-    default_branch: main
-machines:
-  - name: laptop
-    host: laptop.tailnet
-    repos: [api]
-    repo_paths:
-      api: /tmp/api
-models:
-  default: sonnet
-  escalation: [haiku, sonnet, opus]
-"""
+def _config_yaml(api_repo_path: str) -> str:
+    """coordinator.yml body for the CLI-assign tests below.
+
+    `repo_paths.api` is interpolated rather than a hardcoded POSIX literal
+    (#2731) — callers pass a `tmp_path`-derived path, which stays a valid
+    YAML plain scalar and a valid `pathlib` path on every platform (a
+    forward-slash `Path.as_posix()` form, which Windows accepts too).
+    """
+    return (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    default_branch: main\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        f"      api: {api_repo_path}\n"
+        "models:\n"
+        "  default: sonnet\n"
+        "  escalation: [haiku, sonnet, opus]\n"
+    )
 
 
 @pytest.fixture
 def cli_config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
-    p.write_text(CONFIG_YAML)
+    p.write_text(_config_yaml((tmp_path / "api").as_posix()))
     return p
 
 
@@ -462,31 +487,33 @@ class TestCliAssignModel:
         assert records[0]["model"] == "haiku"
 
 
-CONFIG_YAML_WITH_LABELS = """\
-repos:
-  - name: api
-    github: acme/api
-    default_branch: main
-machines:
-  - name: laptop
-    host: laptop.tailnet
-    repos: [api]
-    repo_paths:
-      api: /tmp/api
-models:
-  default: sonnet
-  escalation: [haiku, sonnet, opus]
-  labels:
-    enhancement: sonnet
-    tier:small: haiku
-    tier:large: opus
-"""
+def _config_yaml_with_labels(api_repo_path: str) -> str:
+    """As :func:`_config_yaml`, plus a `models.labels` block (#2731)."""
+    return (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    default_branch: main\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        f"      api: {api_repo_path}\n"
+        "models:\n"
+        "  default: sonnet\n"
+        "  escalation: [haiku, sonnet, opus]\n"
+        "  labels:\n"
+        "    enhancement: sonnet\n"
+        "    tier:small: haiku\n"
+        "    tier:large: opus\n"
+    )
 
 
 @pytest.fixture
 def cli_config_file_with_labels(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
-    p.write_text(CONFIG_YAML_WITH_LABELS)
+    p.write_text(_config_yaml_with_labels((tmp_path / "api").as_posix()))
     return p
 
 
@@ -1177,13 +1204,13 @@ class TestReassignModel:
                     name="laptop",
                     host="laptop.tailnet",
                     repos=["api"],
-                    repo_paths={"api": "/tmp/api"},
+                    repo_paths={"api": _fake_repo_path("api")},
                 ),
                 Machine(
                     name="server",
                     host="server.tailnet",
                     repos=["api"],
-                    repo_paths={"api": "/tmp/api"},
+                    repo_paths={"api": _fake_repo_path("api")},
                 ),
             ],
             models=ModelsConfig(default="sonnet"),
@@ -1222,13 +1249,13 @@ class TestReassignModel:
                     name="laptop",
                     host="laptop.tailnet",
                     repos=["api"],
-                    repo_paths={"api": "/tmp/api"},
+                    repo_paths={"api": _fake_repo_path("api")},
                 ),
                 Machine(
                     name="server",
                     host="server.tailnet",
                     repos=["api"],
-                    repo_paths={"api": "/tmp/api"},
+                    repo_paths={"api": _fake_repo_path("api")},
                 ),
             ],
             models=ModelsConfig(default="sonnet"),
@@ -1263,13 +1290,13 @@ def _reassign_cfg() -> Config:
                 name="laptop",
                 host="laptop.tailnet",
                 repos=["api"],
-                repo_paths={"api": "/tmp/api"},
+                repo_paths={"api": _fake_repo_path("api")},
             ),
             Machine(
                 name="server",
                 host="server.tailnet",
                 repos=["api"],
-                repo_paths={"api": "/tmp/api"},
+                repo_paths={"api": _fake_repo_path("api")},
             ),
         ],
         models=ModelsConfig(default="sonnet"),
