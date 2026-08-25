@@ -2788,10 +2788,25 @@ def test_serve_issue_create_writes_backend_and_cache(
 class _AlwaysLockedConn:
     """Wraps a real connection, making every ``execute()`` raise
     `database is locked` — simulates sustained contention (a concurrent
-    writer that never lets go within the retry budget)."""
+    writer that never lets go within the retry budget).
+
+    #2726: `_create_issue_local`'s cache-mirror write now goes through
+    `coord.sql.execute()`, which calls `conn.cursor()` then
+    `cursor.execute()` rather than the sqlite3 connection-level `.execute()`
+    shortcut, so `cursor()` must be implemented too. `__module__` is pinned
+    to `"sqlite3"` so `coord.sql.detect_dialect` (keyed off
+    `type(conn).__module__`) recognizes this fake as SQLite instead of
+    raising `UnsupportedDialectError` before the intended lock error ever
+    fires.
+    """
+
+    __module__ = "sqlite3"
 
     def __init__(self, real_conn) -> None:
         self._real = real_conn
+
+    def cursor(self):
+        return self
 
     def execute(self, *args, **kwargs):
         raise sqlite3.OperationalError("database is locked")

@@ -48,6 +48,7 @@ from coord.models import (
     test_mode_from_labels,
 )
 from coord.platform_paths import default_coord_dir
+from coord import sql
 
 # Re-exported for backward compatibility (these moved to coord._board_mapping in
 # #584 so the daemon/client can share the one mapping):
@@ -313,7 +314,7 @@ def write_session_start() -> None:
     """Record session start with clean_shutdown=False."""
     conn = get_connection()
     started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    conn.execute(
+    sql.execute(conn,
         """INSERT INTO sessions (started_at, clean_shutdown)
            VALUES (?, 0)""",
         (started_at,),
@@ -331,11 +332,11 @@ def write_session_end(
     conn = get_connection()
     ended_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     # Find the latest session row; update it or insert if none
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT id, started_at FROM sessions ORDER BY id DESC LIMIT 1"
     ).fetchone()
     if row:
-        conn.execute(
+        sql.execute(conn,
             """UPDATE sessions SET
                ended_at = ?, clean_shutdown = 1,
                completed_this_session = ?, issues_closed = ?,
@@ -350,7 +351,7 @@ def write_session_end(
             ),
         )
     else:
-        conn.execute(
+        sql.execute(conn,
             """INSERT INTO sessions
                (ended_at, clean_shutdown, completed_this_session,
                 issues_closed, total_cost_usd)
@@ -364,7 +365,7 @@ def write_session_end(
 def load_session() -> dict | None:
     """Load the latest session record.  Returns None if no session exists."""
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT * FROM sessions ORDER BY id DESC LIMIT 1"
     ).fetchone()
     if row is None:
@@ -391,9 +392,9 @@ def save_proposals(proposals: list[Proposal]) -> Path:
     """Persist the current proposal list (replaces previous list)."""
     conn = get_connection()
     with conn:
-        conn.execute("DELETE FROM proposals")
+        sql.execute(conn, "DELETE FROM proposals")
         for p in proposals:
-            conn.execute(
+            sql.execute(conn,
                 """INSERT INTO proposals
                    (id, machine_name, repo_name, issue_number, issue_title,
                     rationale, files_likely, briefing, model, type, required_gates)
@@ -412,7 +413,7 @@ def save_proposals(proposals: list[Proposal]) -> Path:
 def load_proposals() -> list[Proposal]:
     """Return all pending proposals."""
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM proposals ORDER BY id").fetchall()
+    rows = sql.execute(conn, "SELECT * FROM proposals ORDER BY id").fetchall()
     return [
         Proposal(
             id=row["id"],
@@ -434,7 +435,7 @@ def load_proposals() -> list[Proposal]:
 def clear_proposals() -> None:
     """Delete all pending proposals."""
     conn = get_connection()
-    conn.execute("DELETE FROM proposals")
+    sql.execute(conn, "DELETE FROM proposals")
     conn.commit()
 
 
@@ -444,17 +445,17 @@ def save_split_proposals(splits: list[SplitProposal]) -> Path:
     """Persist the current split-proposal list (replaces previous list)."""
     conn = get_connection()
     with conn:
-        conn.execute("DELETE FROM split_chunks")
-        conn.execute("DELETE FROM split_proposals")
+        sql.execute(conn, "DELETE FROM split_chunks")
+        sql.execute(conn, "DELETE FROM split_proposals")
         for s in splits:
-            conn.execute(
+            sql.execute(conn,
                 """INSERT INTO split_proposals
                    (id, repo_name, issue_number, issue_title, rationale)
                    VALUES (?, ?, ?, ?, ?)""",
                 (s.id, s.repo_name, s.issue_number, s.issue_title, s.rationale),
             )
             for chunk in s.chunks:
-                conn.execute(
+                sql.execute(conn,
                     """INSERT INTO split_chunks
                        (split_proposal_id, title, scope, files_likely)
                        VALUES (?, ?, ?, ?)""",
@@ -466,10 +467,10 @@ def save_split_proposals(splits: list[SplitProposal]) -> Path:
 def load_split_proposals() -> list[SplitProposal]:
     """Return all pending split proposals."""
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM split_proposals ORDER BY id").fetchall()
+    rows = sql.execute(conn, "SELECT * FROM split_proposals ORDER BY id").fetchall()
     result = []
     for row in rows:
-        chunks = conn.execute(
+        chunks = sql.execute(conn,
             "SELECT * FROM split_chunks WHERE split_proposal_id = ? ORDER BY id",
             (row["id"],),
         ).fetchall()
@@ -497,8 +498,8 @@ def clear_split_proposals() -> None:
     """Delete all split proposals and their chunks."""
     conn = get_connection()
     with conn:
-        conn.execute("DELETE FROM split_chunks")
-        conn.execute("DELETE FROM split_proposals")
+        sql.execute(conn, "DELETE FROM split_chunks")
+        sql.execute(conn, "DELETE FROM split_proposals")
 
 
 # ── Dispatched-assignment ledger ──────────────────────────────────────────────
@@ -580,7 +581,7 @@ def _load_dispatched_local() -> list[dict]:
     fallback.
     """
     conn = get_connection()
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT * FROM assignments WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at"
     ).fetchall()
     return [_row_to_dispatched_dict(row) for row in rows]
@@ -906,7 +907,7 @@ def _record_dispatched_local(
     )
 
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
@@ -1032,7 +1033,7 @@ def _record_dispatched_assignment_local(
     # as-is: `assignment_id` is the primary key and the `ON CONFLICT ...
     # DO UPDATE` makes a re-attempted write idempotent.
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
@@ -1206,7 +1207,7 @@ def _record_acceptance_verdict_local(
     """UPDATE the assignment's acceptance_state/acceptance_reason/acceptance_sha
     (+ #932's acceptance_total/acceptance_passed counts)."""
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET acceptance_state=?, acceptance_reason=?, "
         "acceptance_sha=?, acceptance_total=?, acceptance_passed=? WHERE assignment_id=?",
         (
@@ -1220,7 +1221,7 @@ def _record_acceptance_verdict_local(
     )
     conn.commit()
 
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -1361,7 +1362,7 @@ def _record_test_verdict_local(
         # choice `coord test --skipped` makes.
 
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
         "WHERE assignment_id=?",
         (test_state, test_reason, test_toolchain, assignment_id),
@@ -1369,14 +1370,14 @@ def _record_test_verdict_local(
     # Mirror to legacy smoke_test only for pass/fail, matching coord test /
     # the TUI's record_test_verdict_conn.
     if smoke_test is not None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "
             "WHERE assignment_id=?",
             (smoke_test, smoke_test_reason, assignment_id),
         )
     conn.commit()
 
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name, branch FROM assignments "
         "WHERE assignment_id=?",
         (assignment_id,),
@@ -1481,13 +1482,13 @@ def _record_uat_verdict_local(
     issue sees WHY without re-fetching the PR.
     """
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET uat_state=?, uat_reason=? WHERE assignment_id=?",
         (uat_state, uat_reason, assignment_id),
     )
     conn.commit()
 
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments "
         "WHERE assignment_id=?",
         (assignment_id,),
@@ -1601,7 +1602,7 @@ def _record_review_reaffirm_local(
     Defense in depth on a feature whose entire value is audit integrity.
     """
     conn = get_connection()
-    prior = conn.execute(
+    prior = sql.execute(conn,
         "SELECT review_head_sha, review_patch_id, repo_name, issue_number, "
         "machine_name, type FROM assignments WHERE assignment_id=?",
         (review_assignment_id,),
@@ -1614,7 +1615,7 @@ def _record_review_reaffirm_local(
             f"{prior['type']!r}, not 'review' — refusing to reaffirm a "
             f"non-review assignment"
         )
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_head_sha=?, review_patch_id=? "
         "WHERE assignment_id=?",
         (new_head_sha, new_patch_id, review_assignment_id),
@@ -1711,7 +1712,7 @@ def _stamp_test_staleness_anchor(
         test_head_sha = test_base_sha = test_patch_id = None
 
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET test_head_sha=?, test_patch_id=?, test_base_sha=? "
         "WHERE assignment_id=?",
         (test_head_sha, test_patch_id, test_base_sha, assignment_id),
@@ -1746,7 +1747,7 @@ def record_test_staleness_anchor(
     the two can't disagree about which columns constitute "the anchor".
     """
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET test_head_sha=?, test_patch_id=?, test_base_sha=? "
         "WHERE assignment_id=?",
         (test_head_sha, test_patch_id, test_base_sha, assignment_id),
@@ -1759,7 +1760,7 @@ def record_test_staleness_anchor(
 def load_notified() -> dict[str, dict]:
     """Return {assignment_id: {event, posted_at, branch?}} for all notified assignments."""
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM notifications").fetchall()
+    rows = sql.execute(conn, "SELECT * FROM notifications").fetchall()
     result: dict[str, dict] = {}
     for row in rows:
         entry: dict = {
@@ -1857,20 +1858,29 @@ def _mark_notified_local(
 
     conn = get_connection()
     now = time.time()
-    conn.execute(
-        """INSERT OR REPLACE INTO notifications (assignment_id, event, branch, posted_at)
-           VALUES (?, ?, ?, ?)""",
+    # #2726: was `INSERT OR REPLACE`. Every column of `notifications` is
+    # `(assignment_id PRIMARY KEY, event, branch, posted_at)` and every one
+    # of them is supplied here, so DELETE+INSERT's "unmentioned columns reset
+    # to defaults" hazard cannot fire — there is no unmentioned column and no
+    # other table has an FK onto `notifications` for an ON DELETE cascade to
+    # touch. Same reasoning as #2721's identical rewrite in
+    # coord/issue_store.py._record_notification.
+    sql.upsert(
+        conn,
+        "notifications",
+        ["assignment_id", "event", "branch", "posted_at"],
         (assignment_id, event, branch, now),
+        conflict_columns=["assignment_id"],
     )
     # Keep assignments table in sync so build_board() is always accurate.
     if event in (EVENT_COMPLETION, EVENT_PLAN):
         if branch is not None:
-            conn.execute(
+            sql.execute(conn,
                 "UPDATE assignments SET status=?, finished_at=?, branch=? WHERE assignment_id=?",
                 ("done", now, branch, assignment_id),
             )
         else:
-            conn.execute(
+            sql.execute(conn,
                 "UPDATE assignments SET status=?, finished_at=? WHERE assignment_id=?",
                 ("done", now, assignment_id),
             )
@@ -1883,7 +1893,7 @@ def _mark_notified_local(
         # `failed`. No evidence of an actual failure (empty exit_code, no
         # failure_reason) ever backed that write — it was a straight
         # mislabel, not a real terminal failure.
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET status='advisory', finished_at=? WHERE assignment_id=?",
             (now, assignment_id),
         )
@@ -1894,7 +1904,7 @@ def _mark_notified_local(
         # falls into the bare `else` below, unconditionally overwriting the
         # just-posted classification back to `status='failed'` — reproducing
         # #2234's own headline defect one layer further down the stack.
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET status='refused_policy', finished_at=? WHERE assignment_id=?",
             (now, assignment_id),
         )
@@ -1918,7 +1928,7 @@ def _mark_notified_local(
             fields.append("exit_code=?")
             params.append(exit_code)
         params.append(assignment_id)
-        conn.execute(
+        sql.execute(conn,
             f"UPDATE assignments SET {', '.join(fields)} WHERE assignment_id=?",
             tuple(params),
         )
@@ -1944,7 +1954,7 @@ def _mark_notified_local(
         if real_assignment_id.endswith(_suffix):
             real_assignment_id = real_assignment_id[: -len(_suffix)]
             break
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (real_assignment_id,),
     ).fetchone()
@@ -1999,7 +2009,7 @@ def load_liveness_audit_state(assignment_id: str) -> AuditState:
     from coord.liveness_auditor import AuditState  # noqa: PLC0415 — avoid import cycle
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT consecutive_blocked, last_audit_at, last_verdict, raised "
         "FROM liveness_audits WHERE assignment_id=?",
         (assignment_id,),
@@ -2018,7 +2028,7 @@ def save_liveness_audit_state(assignment_id: str, state: AuditState) -> None:
     """Upsert the #2048 audit-tracking state for *assignment_id*."""
     conn = get_connection()
     with conn:
-        conn.execute(
+        sql.execute(conn,
             """INSERT INTO liveness_audits
                    (assignment_id, consecutive_blocked, last_audit_at, last_verdict, raised)
                VALUES (?, ?, ?, ?, ?)
@@ -2151,14 +2161,14 @@ def _update_assignment_review_findings_local(
     # UPDATE actually succeeded but the readback that follows it looked
     # mismatched — doesn't emit a second audit row for what is, from the
     # assignments table's perspective, a single transition.
-    prior = conn.execute(
+    prior = sql.execute(conn,
         "SELECT review_verdict, review_findings FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
     prior_findings = prior["review_findings"] if prior is not None else None
     same_verdict = prior is not None and prior["review_verdict"] == verdict
     already_recorded = same_verdict and prior_findings == payload
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -2195,7 +2205,7 @@ def _update_assignment_review_findings_local(
                 },
             )
         return False
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_findings=?, review_verdict=? "
         "WHERE assignment_id=?",
         (payload, verdict, assignment_id),
@@ -2255,7 +2265,7 @@ def delete_assignments_for_issue(
     if review_of_assignment_id is not None:
         extra_sql = " AND (type != 'review' OR review_of_assignment_id = ?)"
         params.append(review_of_assignment_id)
-    cur = conn.execute(
+    cur = sql.execute(conn,
         f"DELETE FROM assignments WHERE repo_name=? AND issue_number=? "  # noqa: S608 — placeholders are literal '?'
         f"AND type IN ({placeholders})" + extra_sql,
         params,
@@ -2294,7 +2304,7 @@ def reset_work_review_state(
     """
     conn = get_connection()
     if assignment_id is not None:
-        cur = conn.execute(
+        cur = sql.execute(conn,
             "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
             "review_posted_at=NULL "
             "WHERE repo_name=? AND issue_number=? AND ("
@@ -2304,7 +2314,7 @@ def reset_work_review_state(
             (repo_name, issue_number, assignment_id),
         )
     else:
-        cur = conn.execute(
+        cur = sql.execute(conn,
             "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
             "review_posted_at=NULL "
             "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
@@ -2318,7 +2328,7 @@ def reset_work_test_state(repo_name: str, issue_number: int) -> int:
     """Clear the work/plan rows' Test-gate verdict (``test_state`` /
     ``test_reason``) so the issue is re-testable.  Returns rows updated."""
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "UPDATE assignments SET test_state=NULL, test_reason=NULL "
         "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
         (repo_name, issue_number),
@@ -2334,7 +2344,7 @@ def clear_issue_context_by_source(
     issue — the targeted peer of :func:`clear_issue_context`.  Returns rows
     deleted."""
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "DELETE FROM issue_context WHERE repo_name=? AND issue_number=? AND source=?",
         (repo_name, issue_number, source),
     )
@@ -2440,7 +2450,7 @@ def load_assignment_test_reason(assignment_id: str) -> str | None:
             return None
     try:
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(conn,
             "SELECT test_reason FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -2480,7 +2490,7 @@ def load_assignment_test_state(assignment_id: str) -> str | None:
             return None
     try:
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(conn,
             "SELECT test_state FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -2527,7 +2537,7 @@ def load_assignment_review_verdict(assignment_id: str) -> tuple[str | None, str 
             return (None, None)
     try:
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(conn,
             "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -2546,7 +2556,7 @@ def _load_assignment_review_findings_local(
     """Local-DB read for :func:`load_assignment_review_findings` — used on the
     daemon host (local DB is canonical) or as the offline fallback."""
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT review_findings FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -2590,7 +2600,7 @@ def _update_assignment_smoke_tests_local(
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET smoke_tests=? WHERE assignment_id=?",
         (json.dumps(smoke_tests), assignment_id),
     )
@@ -2628,7 +2638,7 @@ def _update_assignment_completion_summary_local(
     if not assignment_id or not summary:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET completion_summary=? WHERE assignment_id=?",
         (summary, assignment_id),
     )
@@ -2684,7 +2694,7 @@ def _update_assignment_claude_session_id_local(
     Called directly by the daemon endpoint so it never re-routes back over HTTP.
     """
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET claude_session_id=? WHERE assignment_id=? "
         "AND claude_session_id IS NULL",
         (claude_session_id, assignment_id),
@@ -2723,7 +2733,7 @@ def _update_assignment_cost_local(assignment_id: str, cost_usd: float) -> None:
     # understating per-assignment spend rather than losing the write to a
     # collision that a short retry would have ridden out.
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET cost_usd=? WHERE assignment_id=? "
             "AND (cost_usd IS NULL OR cost_usd < ?)",
             (cost_usd, assignment_id, cost_usd),
@@ -2747,14 +2757,14 @@ def update_assignment_branch(assignment_id: str, branch: str) -> None:
     if not assignment_id or not branch:
         return
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "UPDATE assignments SET branch=? WHERE assignment_id=? "
         "AND (branch IS NULL OR branch = '')",
         (branch, assignment_id),
     )
     conn.commit()
     if cur.rowcount > 0:
-        row = conn.execute(
+        row = sql.execute(conn,
             "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -2786,14 +2796,14 @@ def mark_assignment_merged(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='done'",
         (assignment_id,),
     )
     conn.commit()
     if cur.rowcount > 0:
-        row = conn.execute(
+        row = sql.execute(conn,
             "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -2832,7 +2842,7 @@ def mark_work_review_settled(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
         "AND type='work' AND review_state='pending'",
         (assignment_id,),
@@ -2868,7 +2878,7 @@ def record_work_review_verdict(assignment_id: str, verdict: str) -> None:
         return
     conn = get_connection()
     placeholders = ",".join("?" for _ in WORK_LIKE_TYPES)
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_state='done', review_verdict=? "
         f"WHERE assignment_id=? AND type IN ({placeholders})",
         (verdict, assignment_id, *WORK_LIKE_TYPES),
@@ -2906,7 +2916,7 @@ def reset_wedged_test_author_review(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_state='pending' WHERE assignment_id=? "
         "AND type IN ('test-author','mock-author') "
         "AND review_state='done' AND review_verdict IS NULL",
@@ -2930,7 +2940,7 @@ def mark_sibling_review_done(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
         "AND type IN ('review','smoke','conflict-fix') "
         "AND status='done' AND review_state='pending'",
@@ -2954,7 +2964,7 @@ def mark_advisory_settled(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='advisory'",
         (assignment_id,),
@@ -2978,7 +2988,7 @@ def mark_refused_policy_settled(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='refused_policy'",
         (assignment_id,),
@@ -3048,7 +3058,7 @@ def _update_assignment_tokens_local(
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET "
             "input_tokens=?, output_tokens=?, "
             "cache_creation_tokens=?, cache_read_tokens=? "
@@ -3113,7 +3123,7 @@ def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -
         return
     conn = get_connection()
     try:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET stop_reason=? WHERE assignment_id=? "
             "AND stop_reason IS NULL",
             (stop_reason, assignment_id),
@@ -3150,7 +3160,7 @@ def _mark_assignment_interactive_local(assignment_id: str) -> None:
         return
     conn = get_connection()
     try:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET is_interactive=1 WHERE assignment_id=?",
             (assignment_id,),
         )
@@ -3184,7 +3194,7 @@ def set_test_plan(
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "UPDATE assignments SET test_plan=?, test_plan_branch_head=? "
         "WHERE assignment_id=?",
         (json.dumps(plan), branch_head, assignment_id),
@@ -3237,7 +3247,7 @@ def _get_test_plan_local(assignment_id: str) -> dict | None:
     Called directly by the daemon endpoint so it never re-routes back over HTTP.
     """
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT test_plan FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -3308,7 +3318,7 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
     conn = get_connection()
     now = time.time()
     try:
-        cur = conn.execute(
+        cur = sql.execute(conn,
             "UPDATE assignments SET failure_reason=?, status='failed', finished_at=? "
             "WHERE assignment_id=?",
             (reason[:512], now, assignment_id),  # cap at 512 chars — one-liner
@@ -3322,7 +3332,7 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
     # didn't happen, matching the rowcount-guard pattern used elsewhere.
     if cur.rowcount == 0:
         return
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -3381,7 +3391,7 @@ def _mark_review_posted_local(assignment_id: str) -> None:
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE assignments SET review_posted_at=? WHERE assignment_id=?",
             (time.time(), assignment_id),
         )
@@ -3399,7 +3409,7 @@ def _mark_review_posted_local(assignment_id: str) -> None:
             assignment_id, exc,
         )
         return
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -3489,14 +3499,14 @@ def _load_done_reviews_needing_post_local(repo_name: str | None = None) -> list[
     """
     conn = get_connection()
     if repo_name:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             "SELECT * FROM assignments "
             "WHERE type='review' AND status='done' AND review_posted_at IS NULL "
             "AND repo_name=? ORDER BY finished_at",
             (repo_name,),
         ).fetchall()
     else:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             "SELECT * FROM assignments "
             "WHERE type='review' AND status='done' AND review_posted_at IS NULL "
             "ORDER BY finished_at",
@@ -3566,13 +3576,13 @@ def _load_review_assignments_missing_cost_local(repo_name: str | None = None) ->
         "AND (cost_usd IS NULL OR cost_usd = 0)"
     )
     if repo_name:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             f"SELECT * FROM assignments WHERE {where} AND repo_name=? "
             "ORDER BY finished_at",
             (repo_name,),
         ).fetchall()
     else:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             f"SELECT * FROM assignments WHERE {where} ORDER BY finished_at",
         ).fetchall()
     return [_row_to_dispatched_dict(row) for row in rows]
@@ -3595,9 +3605,16 @@ def save_plan(assignment_id: str, plan_dict: dict) -> None:
     """
     _thin_client_local_board_guard("save_plan")
     conn = get_connection()
-    conn.execute(
-        "INSERT OR REPLACE INTO plans (assignment_id, plan_data) VALUES (?, ?)",
+    # #2726: was `INSERT OR REPLACE`. `plans` is (assignment_id PRIMARY KEY,
+    # plan_data) and both columns are supplied on every write, so
+    # DELETE+INSERT's "unmentioned columns reset to defaults" hazard cannot
+    # fire, and nothing holds an FK onto `plans`.
+    sql.upsert(
+        conn,
+        "plans",
+        ["assignment_id", "plan_data"],
         (assignment_id, json.dumps(plan_dict)),
+        conflict_columns=["assignment_id"],
     )
     conn.commit()
 
@@ -3605,7 +3622,7 @@ def save_plan(assignment_id: str, plan_dict: dict) -> None:
 def load_plans() -> dict[str, dict]:
     """Return all saved plans as ``{assignment_id: plan_dict}``."""
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM plans").fetchall()
+    rows = sql.execute(conn, "SELECT * FROM plans").fetchall()
     result: dict[str, dict] = {}
     for row in rows:
         try:
@@ -3652,7 +3669,7 @@ def save_board(board: Board, *, config=None) -> Path:
     conn = get_connection()
     with conn:
         existing_ids = {
-            row[0] for row in conn.execute("SELECT assignment_id FROM assignments")
+            row[0] for row in sql.execute(conn, "SELECT assignment_id FROM assignments")
         }
         for a in board.active + board.completed:
             if not a.assignment_id:
@@ -3669,19 +3686,33 @@ def save_board(board: Board, *, config=None) -> Path:
                     machine_name=a.machine_name,
                     config=config,
                 )
-            conn.execute(_UPSERT_SQL, _assignment_upsert_params(a))
+            sql.execute(conn, _UPSERT_SQL, _assignment_upsert_params(a))
         # NOTE: we intentionally never DELETE here.  The assignments table is
         # append-only ground truth.  A partial board snapshot (e.g. from
         # coord status loading only recent assignments) must not wipe rows that
         # simply weren't included in the snapshot.  Explicit archival/pruning
         # should be a separate operation if ever needed.
-        # Save round_number and mark that the board has been initialised
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', ?)",
-            (str(board.round_number),),
+        # Save round_number and mark that the board has been initialised.
+        # #2726: both of these were `INSERT OR REPLACE`. `board_meta` is a
+        # plain (key PRIMARY KEY, value) table and both columns are supplied
+        # on every write below, so DELETE+INSERT's "unmentioned columns reset
+        # to defaults" hazard cannot fire, and nothing holds an FK onto
+        # `board_meta` — same reasoning applies to every other board_meta
+        # rewrite in this file (milestone_drains, milestone_gates,
+        # gate_a_approvals, portal_links below).
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("round_number", str(board.round_number)),
+            conflict_columns=["key"],
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("board_initialized", "1"),
+            conflict_columns=["key"],
         )
     return BOARD_FILE  # Legacy return value
 
@@ -3694,7 +3725,7 @@ def load_board() -> Board | None:
     """
     _thin_client_local_board_guard("load_board")
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'board_initialized'"
     ).fetchone()
     if row is None:
@@ -3712,14 +3743,14 @@ def _query_board(conn: sqlite3.Connection) -> Board:
     # tolerant decoder every other JSON column in this module already uses
     # (_board_mapping.json_loads): a bad row degrades to "no plan" for that
     # one assignment instead of taking down every assignment's board data.
-    plan_rows = conn.execute("SELECT assignment_id, plan_data FROM plans").fetchall()
+    plan_rows = sql.execute(conn, "SELECT assignment_id, plan_data FROM plans").fetchall()
     plans_by_id: dict[str, dict] = {
         r["assignment_id"]: _json_loads(r["plan_data"]) for r in plan_rows
     }
     plans_by_id = {k: v for k, v in plans_by_id.items() if v is not None}
 
-    rows = conn.execute("SELECT * FROM assignments").fetchall()
-    round_number_row = conn.execute(
+    rows = sql.execute(conn, "SELECT * FROM assignments").fetchall()
+    round_number_row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'round_number'"
     ).fetchone()
     round_number = int(round_number_row["value"]) if round_number_row else 0
@@ -3772,10 +3803,12 @@ def _register_milestone_drain_local(*, repo_name: str, tracking_issue: int) -> N
             (d.get("repo_name"), d.get("tracking_issue")) == key for d in drains
         ):
             drains.append({"repo_name": repo_name, "tracking_issue": tracking_issue})
-            conn.execute(
-                "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-                "('milestone_drains', ?)",
-                (json.dumps(drains),),
+            sql.upsert(
+                conn,
+                "board_meta",
+                ["key", "value"],
+                ("milestone_drains", json.dumps(drains)),
+                conflict_columns=["key"],
             )
 
 
@@ -3790,7 +3823,7 @@ def list_milestone_drains() -> list[dict]:
 
 
 def _load_milestone_drains_raw(conn: sqlite3.Connection) -> list[dict]:
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'milestone_drains'"
     ).fetchone()
     if row is None:
@@ -3817,10 +3850,12 @@ def deregister_milestone_drain(*, repo_name: str, tracking_issue: int) -> None:
             d for d in drains
             if (d.get("repo_name"), d.get("tracking_issue")) != key
         ]
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('milestone_drains', ?)",
-            (json.dumps(remaining),),
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("milestone_drains", json.dumps(remaining)),
+            conflict_columns=["key"],
         )
 
 
@@ -3873,10 +3908,12 @@ def _save_milestone_gate_local(record: dict) -> None:
             if (g.get("repo_name"), _as_int(g.get("tracking_issue"))) != key
         ]
         remaining.append(record)
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('milestone_gates', ?)",
-            (json.dumps(remaining),),
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("milestone_gates", json.dumps(remaining)),
+            conflict_columns=["key"],
         )
 
 
@@ -3942,7 +3979,7 @@ def _as_int(value: object) -> int | None:
 
 
 def _load_milestone_gates_raw(conn: sqlite3.Connection) -> list[dict]:
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'milestone_gates'"
     ).fetchone()
     if row is None:
@@ -4002,10 +4039,12 @@ def _save_gate_a_approval_local(record: dict) -> None:
             if (a.get("repo_name"), _as_int(a.get("milestone_number"))) != key
         ]
         remaining.append(record)
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('gate_a_approvals', ?)",
-            (json.dumps(remaining),),
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("gate_a_approvals", json.dumps(remaining)),
+            conflict_columns=["key"],
         )
 
 
@@ -4049,7 +4088,7 @@ def _get_gate_a_approval_local(
 
 
 def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'gate_a_approvals'"
     ).fetchone()
     if row is None:
@@ -4147,10 +4186,12 @@ def _save_portal_link_local(record: dict) -> None:
         key = _link_target_key(record)
         remaining = [link for link in links if _link_target_key(link) != key]
         remaining.append(record)
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('portal_links', ?)",
-            (json.dumps(remaining),),
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("portal_links", json.dumps(remaining)),
+            conflict_columns=["key"],
         )
 
 
@@ -4188,7 +4229,7 @@ def get_portal_link(
 
 
 def _load_portal_links_raw(conn: sqlite3.Connection) -> list[dict]:
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT value FROM board_meta WHERE key = 'portal_links'"
     ).fetchone()
     if row is None:
@@ -4217,10 +4258,12 @@ def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
             g for g in gates
             if (g.get("repo_name"), _as_int(g.get("tracking_issue"))) != key
         ]
-        conn.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-            "('milestone_gates', ?)",
-            (json.dumps(remaining),),
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("milestone_gates", json.dumps(remaining)),
+            conflict_columns=["key"],
         )
 
 
@@ -4256,7 +4299,7 @@ def save_machine_health(
     """
     conn = get_connection()
     with conn:
-        conn.execute(
+        sql.execute(conn,
             """
             INSERT INTO machine_health
                 (machine_name, state, reason, latency_ms, health_json, received_at)
@@ -4289,7 +4332,7 @@ def load_machine_health() -> dict[str, dict]:
     never as healthy (#1485's whole failure mode).
     """
     conn = get_connection()
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT machine_name, state, reason, latency_ms, health_json, received_at "
         "FROM machine_health"
     ).fetchall()
@@ -4312,11 +4355,11 @@ def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
     the storage-neutral core (``coord._board_mapping.infer_review_state``) so the
     daemon/client path applies the identical logic (#584).
     """
-    review_rows = conn.execute(
+    review_rows = sql.execute(conn,
         "SELECT assignment_id, review_of_assignment_id, status FROM assignments "
         "WHERE type = 'review' AND review_of_assignment_id IS NOT NULL"
     ).fetchall()
-    notified_rows = conn.execute("SELECT assignment_id FROM notifications").fetchall()
+    notified_rows = sql.execute(conn, "SELECT assignment_id FROM notifications").fetchall()
     notified_ids = {r["assignment_id"] for r in notified_rows}
     _infer_review_state_core(board, review_rows, notified_ids)
 
@@ -4351,7 +4394,7 @@ def _update_issue_labels_local(
     an error here).  Does not touch ``state`` or ``synced_at`` — only ``labels``.
     """
     conn = get_connection()
-    cursor = conn.execute(
+    cursor = sql.execute(conn,
         "UPDATE issues SET labels = ? WHERE repo_name = ? AND number = ?",
         (json.dumps(sorted(set(labels))), repo_name, issue_number),
     )
@@ -4369,7 +4412,7 @@ def get_cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | No
     since ``apply_issue_labels`` only returns the post-change label set.
     """
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",
         (repo_name, issue_number),
     ).fetchone()
@@ -4533,7 +4576,7 @@ def _create_issue_local(
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             """
             INSERT INTO issues
                 (repo_name, number, title, body, state, labels, synced_at,
@@ -4622,7 +4665,7 @@ def _get_issue_test_mode_local(repo_name: str, issue_number: int) -> str | None:
     Called directly by the daemon endpoint so it never re-routes back over HTTP.
     """
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",
         (repo_name, issue_number),
     ).fetchone()
@@ -4791,7 +4834,7 @@ def _edit_issue_content_local(
     params.extend([repo_name, issue_number])
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             f"UPDATE issues SET {', '.join(sets)} WHERE repo_name = ? AND number = ?",
             tuple(params),
         )
@@ -4881,7 +4924,7 @@ def _assign_issue_milestone_local(
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE issues SET milestone_number = ?, milestone_title = ?"
             " WHERE repo_name = ? AND number = ?",
             (milestone_number, milestone_title, repo_name, issue_number),
@@ -4955,7 +4998,7 @@ def _unassign_issue_milestone_local(
     conn = get_connection()
 
     def _write() -> None:
-        conn.execute(
+        sql.execute(conn,
             "UPDATE issues SET milestone_number = NULL, milestone_title = NULL"
             " WHERE repo_name = ? AND number = ?",
             (repo_name, issue_number),
@@ -5214,12 +5257,12 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
     # Mark all current open issues for this repo as closed (stamping
     # synced_at = now for exactly the rows flipping state right now); the
     # upsert below will reopen those still present in the fetched list.
-    conn.execute(
+    sql.execute(conn,
         "UPDATE issues SET state = 'closed', synced_at = ? WHERE repo_name = ? AND state = 'open'",
         (now, repo_name),
     )
     # Prune closed issues synced more than 7 days ago to keep the DB lean.
-    conn.execute(
+    sql.execute(conn,
         "DELETE FROM issues WHERE repo_name = ? AND state = 'closed' AND synced_at < ?",
         (repo_name, now - 7 * 86400),
     )
@@ -5231,7 +5274,7 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
         milestone = issue.get("milestone") or {}
         milestone_number = milestone.get("number") if milestone else None
         milestone_title = milestone.get("title") if milestone else None
-        conn.execute(
+        sql.execute(conn,
             """
             INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at,
                                 milestone_number, milestone_title)
@@ -5260,7 +5303,7 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
     # of this repo no longer open (closed, or already pruned from `issues`).
     # Keyed off the open set (not state='closed') so it's robust regardless of
     # the 7-day prune above.  Forgotten on close.
-    conn.execute(
+    sql.execute(conn,
         "DELETE FROM issue_context WHERE repo_name = ? AND issue_number NOT IN "
         "(SELECT number FROM issues WHERE repo_name = ? AND state = 'open')",
         (repo_name, repo_name),
@@ -5360,7 +5403,7 @@ def _record_issue_comment_capture_local(
         # regardless of which wrote it first. COALESCE keeps a real author
         # captured-at-write time even if a later call (e.g. a race with the
         # backfill sync) supplies None.
-        conn.execute(
+        sql.execute(conn,
             """
             INSERT INTO issue_comments (
                 gh_comment_id, repo_name, issue_number, author, created_at,
@@ -5386,7 +5429,7 @@ def _record_issue_comment_capture_local(
         # gh didn't hand back a parseable comment id (should be rare — see
         # github_ops.parse_comment_id) — durability still wins over dedup
         # here; the row just can't be upserted against by a later sync.
-        conn.execute(
+        sql.execute(conn,
             """
             INSERT INTO issue_comments (
                 gh_comment_id, repo_name, issue_number, author, created_at,
@@ -5461,7 +5504,7 @@ def list_issue_comments(repo_name: str, issue_number: int) -> list[dict]:
     daemon (read-only, mirrors ``_list_issue_context_local``'s directness);
     a thin client reads the daemon's copy via the HTTP endpoint directly."""
     conn = get_connection()
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT id, gh_comment_id, repo_name, issue_number, author, created_at, "
         "updated_at, body, coord_event, coord_assignment_id, machine, verdict "
         "FROM issue_comments WHERE repo_name = ? AND issue_number = ? "
@@ -5501,7 +5544,7 @@ def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
     numbers: set[int] = set()
     for table in ("assignments", "assignments_archive"):
         try:
-            rows = conn.execute(
+            rows = sql.execute(conn,
                 f"SELECT DISTINCT issue_number FROM {table} WHERE repo_name = ?",  # noqa: S608
                 (repo_name,),
             ).fetchall()
@@ -5567,14 +5610,16 @@ def _add_issue_context_entry_local(
     source: str | None = None,
 ) -> int:
     conn = get_connection()
-    cur = conn.execute(
+    new_id = sql.insert_returning_id(
+        conn,
         "INSERT INTO issue_context "
         "(repo_name, issue_number, pinned, source, body, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (repo_name, issue_number, 1 if pinned else 0, source, body.strip(), time.time()),
+        pk_column="id",
     )
     conn.commit()
-    return int(cur.lastrowid or 0)
+    return int(new_id or 0)
 
 
 def set_issue_context_pin(
@@ -5603,7 +5648,7 @@ def _set_issue_context_pin_local(
     repo_name: str, issue_number: int, entry_id: int, pinned: bool
 ) -> bool:
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "UPDATE issue_context SET pinned = ? "
         "WHERE id = ? AND repo_name = ? AND issue_number = ?",
         (1 if pinned else 0, entry_id, repo_name, issue_number),
@@ -5632,7 +5677,7 @@ def clear_issue_context(repo_name: str, issue_number: int) -> int:
 
 def _clear_issue_context_local(repo_name: str, issue_number: int) -> int:
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "DELETE FROM issue_context WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     )
@@ -5666,7 +5711,7 @@ def _replace_issue_context_local(
     repo_name: str, issue_number: int, entries: list[dict]
 ) -> None:
     conn = get_connection()
-    conn.execute(
+    sql.execute(conn,
         "DELETE FROM issue_context WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     )
@@ -5675,7 +5720,7 @@ def _replace_issue_context_local(
         body = (e.get("body") or "").strip()
         if not body:
             continue
-        conn.execute(
+        sql.execute(conn,
             "INSERT INTO issue_context "
             "(repo_name, issue_number, pinned, source, body, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -5765,7 +5810,7 @@ def _record_drive_escalation_local(
 ) -> int:
     conn = get_connection()
     now = time.time()
-    conn.execute(
+    sql.execute(conn,
         "INSERT INTO drive_escalations "
         "(repo_name, issue_number, stage, assignment_id, reason, "
         " gate_readings, proposed_command, created_at) "
@@ -5780,7 +5825,7 @@ def _record_drive_escalation_local(
         ),
     )
     conn.commit()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT id FROM drive_escalations WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     ).fetchone()
@@ -5810,7 +5855,7 @@ def dismiss_drive_escalation(repo_name: str, issue_number: int) -> bool:
 
 def _dismiss_drive_escalation_local(repo_name: str, issue_number: int) -> bool:
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "DELETE FROM drive_escalations WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     )
@@ -5834,7 +5879,7 @@ def get_drive_escalation(repo_name: str, issue_number: int) -> dict | None:
 
 def _get_drive_escalation_local(repo_name: str, issue_number: int) -> dict | None:
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
         "gate_readings, proposed_command, created_at FROM drive_escalations "
         "WHERE repo_name = ? AND issue_number = ?",
@@ -5860,14 +5905,14 @@ def list_drive_escalations(repo_name: str | None = None) -> list[dict]:
 def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
     conn = get_connection()
     if repo_name:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
             "gate_readings, proposed_command, created_at FROM drive_escalations "
             "WHERE repo_name = ? ORDER BY id",
             (repo_name,),
         ).fetchall()
     else:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
             "gate_readings, proposed_command, created_at FROM drive_escalations "
             "ORDER BY id"
@@ -5954,11 +5999,11 @@ def _renumber_drive_queue(conn) -> None:
     Caller commits. Ties on ``position`` fall back to ``id`` so the result is
     deterministic even if a row was written out-of-band.
     """
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT id FROM drive_queue ORDER BY position, id"
     ).fetchall()
     for index, row in enumerate(rows):
-        conn.execute(
+        sql.execute(conn,
             "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row["id"])
         )
 
@@ -6092,7 +6137,7 @@ def _enqueue_drive_queue_local(
     if max_fix_rounds is not None and int(max_fix_rounds) < 1:
         max_fix_rounds = None
     no_acceptance_int = 1 if no_acceptance else 0
-    existing = conn.execute(
+    existing = sql.execute(conn,
         "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     ).fetchone()
@@ -6106,7 +6151,7 @@ def _enqueue_drive_queue_local(
         # declaration being withdrawn. `max_fix_rounds` (#2604) is fully
         # replaced too, same as `machine`/`after` — see the public
         # `enqueue_drive_queue`'s docstring.
-        conn.execute(
+        sql.execute(conn,
             "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
             "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
             "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
@@ -6126,11 +6171,12 @@ def _enqueue_drive_queue_local(
         conn.commit()
         entry_id = int(existing["id"])
     else:
-        tail = conn.execute(
+        tail = sql.execute(conn,
             "SELECT MAX(position) AS m FROM drive_queue"
         ).fetchone()
         next_pos = 0 if tail is None or tail["m"] is None else int(tail["m"]) + 1
-        cur = conn.execute(
+        new_id = sql.insert_returning_id(
+            conn,
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
             " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
@@ -6151,9 +6197,10 @@ def _enqueue_drive_queue_local(
                 max_fix_rounds,
                 no_acceptance_int,
             ),
+            pk_column="id",
         )
         conn.commit()
-        entry_id = int(cur.lastrowid)
+        entry_id = int(new_id)
     if position is not None:
         _move_drive_queue_entry_local(repo_name, issue_number, position)
     return entry_id
@@ -6182,7 +6229,7 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
 
 def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
     conn = get_connection()
-    cur = conn.execute(
+    cur = sql.execute(conn,
         "DELETE FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
     )
@@ -6247,7 +6294,7 @@ def _update_drive_queue_entry_local(
         fields = {**fields, "reason_at": time.time()}
     conn = get_connection()
     assignments = ", ".join(f"{name} = ?" for name in fields)
-    cur = conn.execute(
+    cur = sql.execute(conn,
         f"UPDATE drive_queue SET {assignments} "  # noqa: S608 — names whitelisted above
         "WHERE repo_name = ? AND issue_number = ?",
         (*fields.values(), repo_name, issue_number),
@@ -6288,7 +6335,7 @@ def _move_drive_queue_entry_local(
     repo_name: str, issue_number: int, to_position: int
 ) -> bool:
     conn = get_connection()
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT id, repo_name, issue_number FROM drive_queue ORDER BY position, id"
     ).fetchall()
     order = [int(r["id"]) for r in rows]
@@ -6306,7 +6353,7 @@ def _move_drive_queue_entry_local(
     dest = max(0, min(int(to_position), len(order)))
     order.insert(dest, target)
     for index, row_id in enumerate(order):
-        conn.execute(
+        sql.execute(conn,
             "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row_id)
         )
     conn.commit()
@@ -6329,7 +6376,7 @@ def get_drive_queue_entry(repo_name: str, issue_number: int) -> dict | None:
 
 def _get_drive_queue_entry_local(repo_name: str, issue_number: int) -> dict | None:
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(conn,
         f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
         "WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
@@ -6354,13 +6401,13 @@ def list_drive_queue(repo_name: str | None = None) -> list[dict]:
 def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
     conn = get_connection()
     if repo_name:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
             "WHERE repo_name = ? ORDER BY position, id",
             (repo_name,),
         ).fetchall()
     else:
-        rows = conn.execute(
+        rows = sql.execute(conn,
             f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
             "ORDER BY position, id"
         ).fetchall()
@@ -6447,7 +6494,7 @@ def run_report(report_id: str, params: dict[str, str] | None = None) -> dict:
 
 def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
     conn = get_connection()
-    rows = conn.execute(
+    rows = sql.execute(conn,
         "SELECT id, pinned, source, body, created_at FROM issue_context "
         "WHERE repo_name = ? AND issue_number = ? ORDER BY created_at",
         (repo_name, issue_number),
@@ -6571,14 +6618,14 @@ def purge_done_assignments(older_than_days: float = 7.0) -> int:
     """
     cutoff = time.time() - older_than_days * 86_400
     conn = get_connection()
-    deleted_assignments = conn.execute(
+    deleted_assignments = sql.execute(conn,
         "DELETE FROM assignments "
         "WHERE status IN ('done', 'failed') "
         "AND finished_at IS NOT NULL "
         "AND finished_at < ?",
         (cutoff,),
     ).rowcount
-    deleted_issues = conn.execute(
+    deleted_issues = sql.execute(conn,
         "DELETE FROM issues "
         "WHERE state = 'closed' "
         "AND synced_at IS NOT NULL "
@@ -6587,7 +6634,7 @@ def purge_done_assignments(older_than_days: float = 7.0) -> int:
     ).rowcount
     # #603: backstop — drop context for any issue no longer open (closed or
     # already purged above), in case drop-on-close was missed.
-    conn.execute(
+    sql.execute(conn,
         "DELETE FROM issue_context WHERE (repo_name, issue_number) NOT IN "
         "(SELECT repo_name, number FROM issues WHERE state = 'open')"
     )

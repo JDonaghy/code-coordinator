@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import warnings
@@ -415,12 +416,27 @@ class TestRecordDispatchedAssignmentLockContention:
         """Wraps a real (in-memory) connection, raising `database is
         locked` on the first *fail_times* `execute()` calls before
         delegating to the real one — simulates a concurrent writer holding
-        the DB for a few moments."""
+        the DB for a few moments.
+
+        #2726: `_record_dispatched_assignment_local`'s INSERT now goes
+        through `coord.sql.execute()`, which calls `conn.cursor()` then
+        `cursor.execute()` rather than the sqlite3 connection-level
+        `.execute()` shortcut — so `cursor()` must be implemented too, not
+        just `execute()`. `__module__` is pinned to `"sqlite3"` so
+        `coord.sql.detect_dialect` (keyed off `type(conn).__module__`)
+        recognizes this fake as SQLite instead of raising
+        `UnsupportedDialectError`.
+        """
+
+        __module__ = "sqlite3"
 
         def __init__(self, real_conn, fail_times: int) -> None:
             self._real = real_conn
             self._fail_times = fail_times
             self.calls = 0
+
+        def cursor(self):
+            return self
 
         def execute(self, *args, **kwargs):
             self.calls += 1
@@ -2596,7 +2612,18 @@ class _FlakyConnProxy:
     writer without needing a genuine second OS-level connection against the
     in-memory ``coord_db`` fixture (which, being ``:memory:``, has no
     cross-connection contention to hold in the first place).
+
+    #2726: the writers below now go through ``coord.sql.execute()``, which
+    calls ``conn.cursor()`` then ``cursor.execute()`` rather than the
+    sqlite3 connection-level ``.execute()`` shortcut — so ``cursor()`` must
+    be implemented too, routed through a proxy cursor (below) that keeps
+    the same counting/raising behavior. ``__module__`` is pinned to
+    ``"sqlite3"`` so ``coord.sql.detect_dialect`` (keyed off
+    ``type(conn).__module__``) recognizes this fake as SQLite instead of
+    raising ``UnsupportedDialectError``.
     """
+
+    __module__ = "sqlite3"
 
     def __init__(self, real_conn, fail_times: int) -> None:
         self._real = real_conn
@@ -2609,8 +2636,29 @@ class _FlakyConnProxy:
             raise sqlite3.OperationalError("database is locked")
         return self._real.execute(*args, **kwargs)
 
+    def cursor(self):
+        return _FlakyCursorProxy(self)
+
     def __getattr__(self, name):
         return getattr(self._real, name)
+
+
+class _FlakyCursorProxy:
+    """The cursor ``coord.sql.execute()``'s ``conn.cursor()`` call receives
+    from :class:`_FlakyConnProxy` (#2726) — routes ``.execute()`` back
+    through the proxy's own counting/raising logic instead of a real,
+    unproxied cursor obtained straight from the underlying connection."""
+
+    def __init__(self, proxy: "_FlakyConnProxy") -> None:
+        self._proxy = proxy
+        self._real_cursor = None
+
+    def execute(self, *args, **kwargs):
+        self._real_cursor = self._proxy.execute(*args, **kwargs)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._real_cursor, name)
 
 
 def _dispatch_for_cost(coord_db, assignment_id: str = "aid-cost") -> None:
@@ -2728,7 +2776,19 @@ class _BrokenConn:
     """A connection whose every ``execute()`` raises a non-contention
     `OperationalError` — simulates a real bug (schema drift, a typo in
     hand-written SQL) rather than transient lock contention, so it must
-    surface immediately instead of being retried or swallowed."""
+    surface immediately instead of being retried or swallowed.
+
+    #2726: ``cursor()`` returns ``self`` so ``coord.sql.execute()``'s
+    ``conn.cursor().execute()`` call still reaches this same raise;
+    ``__module__`` is pinned to ``"sqlite3"`` so ``coord.sql.detect_dialect``
+    recognizes this fake as SQLite instead of raising
+    ``UnsupportedDialectError`` before the intended error ever fires.
+    """
+
+    __module__ = "sqlite3"
+
+    def cursor(self):
+        return self
 
     def execute(self, *args, **kwargs):
         raise sqlite3.OperationalError("no such column: bogus")
@@ -3010,3 +3070,139 @@ class TestMarkReviewPostedLocalLockContention:
         with caplog.at_level("ERROR", logger="coord.state"):
             _mark_review_posted_local("aid-does-not-exist")  # must not raise
         assert any("2689" in rec.message for rec in caplog.records)
+
+
+# ── #2726: the 10 `INSERT OR REPLACE` sites rewritten to `coord.sql.upsert()`
+# (`ON CONFLICT ... DO UPDATE`) ──────────────────────────────────────────────
+#
+# Every affected table enforces its own PK (`notifications.assignment_id`,
+# `plans.assignment_id`, `board_meta.key`), so a plain `INSERT` would already
+# raise `IntegrityError` on a second write for the same key — that alone
+# doesn't prove the seam rewrite preserved "second write replaces the first
+# row in place" semantics (a bug here could just as easily raise
+# `IntegrityError` on the second write, or a stray plain `INSERT` could crash
+# instead of updating). These pin it directly: write twice with different
+# payloads, assert exactly one row survives holding the *second* payload.
+
+
+class TestUpsertSeamReplacesNotDuplicates:
+    def test_mark_notified_second_call_replaces_not_duplicates(
+        self, coord_db
+    ) -> None:
+        from coord.state import mark_notified
+
+        mark_notified("aid-upsert", "plan")
+        mark_notified("aid-upsert", "completion", branch="issue-1-fix")
+
+        rows = coord_db.execute(
+            "SELECT event, branch FROM notifications WHERE assignment_id=?",
+            ("aid-upsert",),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["event"] == "completion"
+        assert rows[0]["branch"] == "issue-1-fix"
+
+    def test_save_plan_second_call_replaces_not_duplicates(self, coord_db) -> None:
+        from coord.state import save_plan
+
+        save_plan("aid-plan", {"steps": ["a"]})
+        save_plan("aid-plan", {"steps": ["a", "b"]})
+
+        rows = coord_db.execute(
+            "SELECT plan_data FROM plans WHERE assignment_id=?", ("aid-plan",),
+        ).fetchall()
+        assert len(rows) == 1
+        assert json.loads(rows[0]["plan_data"]) == {"steps": ["a", "b"]}
+
+    def test_save_board_round_number_and_initialized_replace_not_duplicate(
+        self, coord_db
+    ) -> None:
+        from coord.models import Board
+        from coord.state import save_board
+
+        save_board(Board(active=[], completed=[], round_number=1))
+        save_board(Board(active=[], completed=[], round_number=2))
+
+        rows = coord_db.execute(
+            "SELECT key, value FROM board_meta WHERE key IN "
+            "('round_number', 'board_initialized')"
+        ).fetchall()
+        by_key = {r["key"]: r["value"] for r in rows}
+        assert by_key == {"round_number": "2", "board_initialized": "1"}
+
+    def test_milestone_drain_register_is_idempotent_one_board_meta_row(
+        self, coord_db
+    ) -> None:
+        from coord.state import list_milestone_drains, register_milestone_drain
+
+        register_milestone_drain(repo_name="api", tracking_issue=1)
+        register_milestone_drain(repo_name="api", tracking_issue=1)  # no-op re-register
+        register_milestone_drain(repo_name="api", tracking_issue=2)
+
+        rows = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key='milestone_drains'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert list_milestone_drains() == [
+            {"repo_name": "api", "tracking_issue": 1},
+            {"repo_name": "api", "tracking_issue": 2},
+        ]
+
+    def test_milestone_gate_save_and_delete_replace_one_board_meta_row(
+        self, coord_db
+    ) -> None:
+        from coord.state import (
+            delete_milestone_gate,
+            list_milestone_gates,
+            save_milestone_gate,
+        )
+
+        save_milestone_gate({"repo_name": "api", "tracking_issue": 1, "gate": "A"})
+        save_milestone_gate({"repo_name": "api", "tracking_issue": 1, "gate": "B"})
+
+        rows = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key='milestone_gates'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert list_milestone_gates() == [
+            {"repo_name": "api", "tracking_issue": 1, "gate": "B"}
+        ]
+
+        delete_milestone_gate(repo_name="api", tracking_issue=1)
+        rows = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key='milestone_gates'"
+        ).fetchall()
+        assert len(rows) == 1, "delete rewrites the same row rather than removing it"
+        assert list_milestone_gates() == []
+
+    def test_gate_a_approval_save_replaces_one_board_meta_row(self, coord_db) -> None:
+        from coord.state import list_gate_a_approvals, save_gate_a_approval
+
+        save_gate_a_approval(
+            {"repo_name": "api", "milestone_number": 1, "verdict": "approve"}
+        )
+        save_gate_a_approval(
+            {"repo_name": "api", "milestone_number": 1, "verdict": "reject"}
+        )
+
+        rows = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key='gate_a_approvals'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert [a["verdict"] for a in list_gate_a_approvals()] == ["reject"]
+
+    def test_portal_link_save_replaces_one_board_meta_row(self, coord_db) -> None:
+        from coord.state import list_portal_links, save_portal_link
+
+        save_portal_link(
+            {"repo_name": "api", "milestone_number": 1, "submission_id": "s1"}
+        )
+        save_portal_link(
+            {"repo_name": "api", "milestone_number": 1, "submission_id": "s2"}
+        )
+
+        rows = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key='portal_links'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert [link["submission_id"] for link in list_portal_links()] == ["s2"]
