@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from unittest.mock import patch
 
@@ -411,6 +412,120 @@ def test_decompose_chat_reports_a_dispatch_failure_cleanly(config_path):
         )
     assert result.exit_code != 0
     assert "no single machine claims every repo" in result.output
+
+
+# ── #2743: --wait blocks and prints the closing summary ────────────────────
+#
+# A CLI-dispatched decomposition-chat is issue_number=0 — no GitHub thread to
+# post a completion comment to, and the assignment drops off `coord status`
+# once it goes done. `--wait` polls the dispatch machine's own agent for
+# completion, then fetches the log and prints the session's own closing
+# report in full (previously only recoverable by hand-parsing `coord log
+# --raw`'s NDJSON).
+
+
+def _decompose_chat_ndjson(closing_text: str) -> bytes:
+    """A minimal stream-json transcript ending in the closing assistant turn
+    plus a terminal `result` event, mirroring a real decomposition-chat
+    log."""
+    lines = [
+        json.dumps(
+            {"type": "system", "subtype": "init", "session_id": "s1", "model": "claude-x"}
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "filing issues..."}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": closing_text}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "result",
+                "total_cost_usd": 0.5,
+                "stop_reason": "end_turn",
+                "num_turns": 2,
+                "duration_ms": 1000,
+            }
+        ),
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def test_decompose_chat_wait_prints_completion_and_closing_summary(config_path):
+    # #2743's motivating incident: the closing turn flagged a customer
+    # round-trip need — the single most operationally important line the
+    # session produced, and well over the old 100-char truncation.
+    closing_text = (
+        "Filed issue #501 and #502 under milestone ms-9, queued both via "
+        "drive-queue, and recorded coord portal link — two of the six "
+        "requested items reference a feature with zero references in the "
+        "repo and need a customer round-trip before I can file them."
+    )
+    assert len(closing_text) > 100
+    status_payload = {
+        "completed": [
+            {
+                "id": "asg-789",
+                "exit_code": 0,
+                "started_at": 100,
+                "finished_at": 142,
+                "branch": "issue-0-decomposition-asg-789",
+            }
+        ],
+        "active": [],
+    }
+
+    class _Resp:
+        def json(self):
+            return status_payload
+
+    with (
+        patch(
+            "coord.decomposition_chat.dispatch_decomposition_chat",
+            return_value=("asg-789", "dellserver"),
+        ),
+        patch("httpx.get", return_value=_Resp()),
+        patch(
+            "coord.network.fetch_log",
+            return_value=(200, _decompose_chat_ndjson(closing_text)),
+        ),
+    ):
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c", "--wait"
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "asg-789" in result.output
+    assert "completed in 0m 42s" in result.output
+    assert "closing summary" in result.output
+    assert closing_text in result.output
+    assert "…" not in result.output
+
+
+def test_decompose_chat_wait_times_out(config_path):
+    with (
+        patch(
+            "coord.decomposition_chat.dispatch_decomposition_chat",
+            return_value=("asg-789", "dellserver"),
+        ),
+        # Deterministic timeout: the deadline check sees time already past
+        # the deadline on its very first read, so the poll loop body never
+        # runs (and httpx.get is never called) — no real sleeping needed.
+        patch("time.monotonic", side_effect=[0, 100]),
+    ):
+        result = run(
+            "portal", "decompose-chat", "--config", config_path, "sub_2f6a1c",
+            "--wait", "--timeout", "5",
+        )
+
+    assert result.exit_code == 3
+    assert "timed out" in result.output
 
 
 # ── #1982: the sync loop's operator surface ─────────────────────────────────

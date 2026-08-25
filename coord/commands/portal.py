@@ -383,7 +383,33 @@ def portal_link(
     default=None,
     help="Force a specific machine (must claim every repo the submission maps to).",
 )
-def portal_decompose_chat(config_path, submission_id: str, machine_override: str | None) -> None:
+@click.option(
+    "--wait",
+    "wait_for_completion",
+    is_flag=True,
+    help=(
+        "Block until the session finishes and print its closing summary "
+        "(#2743) — the CLI dispatch path otherwise has no completion "
+        "surface: issue_number=0 means there is no GitHub thread to post "
+        "to, and the assignment drops off `coord status` once it goes done."
+    ),
+)
+@click.option(
+    "--timeout", default=1800, show_default=True, type=int,
+    help="With --wait: max seconds to wait for completion.",
+)
+@click.option(
+    "--interval", default=15, show_default=True, type=int,
+    help="With --wait: seconds between polls.",
+)
+def portal_decompose_chat(
+    config_path,
+    submission_id: str,
+    machine_override: str | None,
+    wait_for_completion: bool,
+    timeout: int,
+    interval: int,
+) -> None:
     """Dispatch a ``type="decomposition-chat"`` session for SUBMISSION_ID (#2533).
 
     The TUI's "Pull into decomposition session" action (ms-67 contract §4a/
@@ -404,6 +430,14 @@ def portal_decompose_chat(config_path, submission_id: str, machine_override: str
     (like every other portal-bridge reader) resolves state out of this
     machine's own ``~/.coord/coord.db`` — a daemon-host command, same as
     ``link``/``publish-mocks`` above.
+
+    **--wait** (#2743): the TUI's equivalent action binds a live chat
+    overlay to the dispatch and so shows the session's summary as it
+    happens; the bare CLI dispatch has no such surface — the run's actual
+    closing report (what it filed, what it deliberately didn't, whether
+    `coord portal link` succeeded) was previously only recoverable by
+    hand-parsing `coord log --raw`'s NDJSON. Pass --wait to block here and
+    have this command print it for you once the session ends.
     """
     _refuse_if_thin_client("decompose-chat")
 
@@ -411,14 +445,118 @@ def portal_decompose_chat(config_path, submission_id: str, machine_override: str
 
     cfg = _load_config(config_path)
     try:
-        assignment_id, machine = dispatch_decomposition_chat(
+        assignment_id, machine_name = dispatch_decomposition_chat(
             submission_id, cfg, machine_override=machine_override
         )
     except RuntimeError as exc:
         click.secho(f"error: {exc}", fg="red")
         raise SystemExit(1) from exc
     click.echo(assignment_id)
-    click.echo(f"# dispatched to {machine}", err=True)
+    click.echo(f"# dispatched to {machine_name}", err=True)
+
+    if wait_for_completion:
+        _wait_and_print_decomposition_summary(
+            assignment_id, machine_name, cfg, timeout=timeout, interval=interval
+        )
+
+
+def _wait_and_print_decomposition_summary(
+    assignment_id: str, machine_name: str, cfg, *, timeout: int, interval: int
+) -> None:
+    """Block until *assignment_id* finishes, then print its completion line
+    and its full closing assistant turn (#2743).
+
+    Polls the dispatch machine's own agent ``/status`` — the same mechanism
+    `coord wait` uses (`coord/commands/sessions.py`) — since a
+    `decomposition-chat` session is `issue_number=0` and so has no GitHub
+    thread this could otherwise watch for a completion comment on. Once the
+    agent reports the assignment done, the log is fetched (over the same
+    HTTP path `coord log` uses, so this works whether the session landed on
+    this machine or a remote one) and its last assistant turn — the
+    session's own prose report of what it filed/queued/linked, per
+    `DECOMPOSITION_CHAT_SYSTEM_PROMPT` — is printed in full.
+    """
+    import time as _time
+
+    import httpx
+
+    from coord.commands._common import AGENT_PORT
+
+    machine = next((m for m in cfg.machines if m.name == machine_name), None)
+    if machine is None:
+        click.secho(
+            f"error: machine {machine_name!r} (from dispatch) not in coordinator.yml "
+            "— cannot poll for completion",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    url = f"http://{machine.host}:{AGENT_PORT}/status"
+    deadline = _time.monotonic() + timeout
+    completed_entry: dict | None = None
+
+    click.echo(f"waiting for {assignment_id} on {machine.name}...", err=True)
+    while _time.monotonic() < deadline:
+        try:
+            resp = httpx.get(url, timeout=10)
+            data = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException, OSError) as exc:
+            click.echo(f"warning: could not reach agent on {machine.name}: {exc}", err=True)
+            _time.sleep(interval)
+            continue
+
+        completed_entry = next(
+            (c for c in data.get("completed", []) if c.get("id") == assignment_id),
+            None,
+        )
+        if completed_entry is not None:
+            break
+
+        active_ids = [a.get("id") for a in data.get("active", [])]
+        if assignment_id not in active_ids:
+            click.secho(
+                f"error: assignment {assignment_id} not found on {machine.name} "
+                "(not active or completed)",
+                fg="red",
+            )
+            raise SystemExit(2)
+
+        _time.sleep(interval)
+
+    if completed_entry is None:
+        click.secho(f"timed out after {timeout}s waiting for {assignment_id}", fg="red")
+        raise SystemExit(3)
+
+    exit_code = completed_entry.get("exit_code", -1)
+    started = completed_entry.get("started_at", 0)
+    finished = completed_entry.get("finished_at", 0)
+    duration = finished - started if finished and started else 0
+    mins, secs = divmod(int(duration), 60)
+    status_word = "completed" if exit_code == 0 else f"FAILED (exit {exit_code})"
+    click.echo(f"\nAssignment {assignment_id} {status_word} in {mins}m {secs}s")
+    branch = completed_entry.get("branch")
+    if branch:
+        click.echo(f"  branch: {branch}")
+
+    from coord.network import fetch_log
+    from coord.worker_events import latest_assistant_turn_text_from_text
+
+    try:
+        status_code, body = fetch_log(machine, assignment_id, since=0)
+    except Exception as exc:  # noqa: BLE001 — best-effort; exit status above already reported
+        click.echo(f"(could not fetch log to recover the closing summary: {exc})", err=True)
+        return
+    if status_code != 200:
+        click.echo(f"(could not fetch log: HTTP {status_code})", err=True)
+        return
+
+    text = body.decode("utf-8", errors="replace")
+    summary = latest_assistant_turn_text_from_text(text)
+    if not summary:
+        click.echo("(no closing assistant turn found in the log)", err=True)
+        return
+    click.echo("\n--- closing summary ---")
+    click.echo(summary)
 
 
 # ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────
