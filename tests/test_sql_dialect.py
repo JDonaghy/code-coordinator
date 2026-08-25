@@ -410,3 +410,77 @@ def test_insert_returning_id_strips_trailing_semicolon_before_appending_returnin
     sql.insert_returning_id(conn, "INSERT INTO t (a) VALUES (?);", ("x",))
     [(sent_sql, _)] = conn.cur.executed
     assert sent_sql == "INSERT INTO t (a) VALUES (%s) RETURNING id"
+
+
+# ── apply_connection_setup(read_only=...) (#2766) ────────────────────────────
+
+
+def test_apply_connection_setup_default_sets_writer_pragmas(tmp_path):
+    # WAL mode is a no-op on `:memory:` databases (SQLite silently keeps
+    # "memory"), so this needs a real on-disk connection to observe it.
+    conn = sqlite3.connect(str(tmp_path / "writer.db"))
+    try:
+        sql.apply_connection_setup(conn)
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        # query_only must NOT be set on a writer connection.
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_apply_connection_setup_read_only_sets_query_only_not_wal(memdb):
+    sql.apply_connection_setup(memdb, read_only=True)
+    assert memdb.execute("PRAGMA query_only").fetchone()[0] == 1
+    assert memdb.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    # journal_mode is left alone -- a read-only connection can't set it.
+    assert memdb.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal"
+
+
+def test_apply_connection_setup_read_only_survives_a_true_mode_ro_connection(tmp_path):
+    """The scenario #2766 actually cares about: SQLite's ``mode=ro`` URI
+    connection (what ``coord/dao.py``'s ``SqliteStore`` opens) rejects a
+    ``PRAGMA journal_mode=WAL`` with "attempt to write a readonly database"
+    -- ``read_only=True`` must avoid tripping that."""
+    db_path = tmp_path / "ro.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    writer.commit()
+    writer.close()
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        sql.apply_connection_setup(conn, read_only=True)  # must not raise
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_apply_connection_setup_postgres_read_only_is_still_a_noop():
+    conn = _FakePostgresConnection()
+    sql.apply_connection_setup(conn, read_only=True)  # must not raise
+    assert conn.cur.executed == []
+
+
+# ── driver_error (#2766) ─────────────────────────────────────────────────────
+
+
+def test_driver_error_sqlite_is_sqlite_error(memdb):
+    assert sql.driver_error(memdb) is sqlite3.Error
+
+
+def test_driver_error_catches_a_real_sqlite_operational_error(memdb):
+    with pytest.raises(sql.driver_error(memdb)):
+        memdb.execute("SELECT * FROM no_such_table")
+
+
+def test_driver_error_postgres_without_psycopg_raises_import_error():
+    conn = _FakePostgresConnection()
+    with pytest.raises(ImportError):
+        sql.driver_error(conn)
+
+
+def test_driver_error_unknown_dialect_raises():
+    with pytest.raises(sql.UnsupportedDialectError):
+        sql.driver_error(_FakeUnknownConnection())
