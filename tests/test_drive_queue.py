@@ -3190,6 +3190,82 @@ def test_a_blocked_entry_resumes_once_its_prereqs_queue_row_reads_done_even_befo
     assert plan.launch is not None and plan.launch.issue == 1654
 
 
+# ── #2756: partial satisfaction — resume to `waiting`, not stay `blocked` ──
+#
+# `_resolve_prereqs` walks `entry.after` in order and returns the FIRST
+# unsatisfiable verdict it finds, so a `blocked` entry's frozen `last_reason`
+# may name only ONE of several pre-reqs. Before this fix, `_reconcile_blocked_
+# after` only resumed once EVERY named pre-req had landed (`dependency_reason`
+# empty) — so an entry stayed `blocked`, wearing its now-false "will never
+# satisfy" reason about a pre-req that had already cleared, for as long as ANY
+# *other* pre-req remained merely in flight. claude-coordinator#2741
+# (2026-08-24) is the live incident: nine `after=` entries from an overly
+# broad `tests/` declaration, one of which (#2731) merged while five others
+# were still queued/running — the row stayed red with a false claim about
+# #2731 specifically until the slowest sibling finally landed.
+
+
+def test_a_blocked_entry_resumes_to_waiting_when_its_unsatisfiable_prereq_clears_but_a_sibling_prereq_is_still_in_flight():
+    """The #2741 shape, minimised: two named pre-reqs, one dead (the one the
+    frozen `last_reason` names) and one merely queued. Once the dead one
+    lands, the re-derived verdict is no longer unsatisfiable — even though
+    the second pre-req is still outstanding — so the entry must resume to
+    `waiting` (an accurate, live "waiting on ..." reason takes over on the
+    next real tick) rather than stay `blocked` asserting an impossibility
+    about a pre-req that already merged."""
+    dep_done = entry_key(REPO, 1650)
+    dep_waiting = entry_key(REPO, 1651)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(1651, position=1, state=STATE_WAITING),
+        entry(
+            1654,
+            position=2,
+            after=(dep_done, dep_waiting),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_done} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=3)
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1654))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    # It does NOT launch this same tick — `dep_waiting` has not landed — but
+    # critically it is no longer pinned `blocked`; it falls into step 4's
+    # ordinary deferral, exactly like any other `waiting` entry with an
+    # outstanding pre-req.
+    assert plan.launch is None or plan.launch.issue != 1654
+
+
+def test_a_blocked_entry_stays_blocked_when_a_different_named_prereq_is_independently_unsatisfiable():
+    """Guard against over-widening the resume: the FIRST dep clears, but a
+    SECOND named pre-req is independently dead (itself `blocked`/`failed`).
+    The re-derived verdict is STILL unsatisfiable — just for a different
+    dep — so #2756 must not resume this entry; only the merely-in-flight
+    case should."""
+    dep_done = entry_key(REPO, 1650)
+    dep_dead = entry_key(REPO, 1651)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(1651, position=1, state=STATE_FAILED),
+        entry(
+            1654,
+            position=2,
+            after=(dep_done, dep_dead),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=f"pre-req {dep_done} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=3)
+    assert all(r.key != entry_key(REPO, 1654) for r in plan.reconciles)
+    assert plan.launch is None
+
+
 # ── #2404 review: a CHAINED (two-hop) after= block, not just single-hop ────
 #
 # The live incident this issue is about (claude-coordinator#2284-#2288) was
@@ -3258,14 +3334,26 @@ def test_a_two_hop_after_chain_resumes_in_one_tick_once_both_hops_have_landed():
     assert plan.launch is not None and plan.launch.issue == 1658
 
 
-def test_a_two_hop_after_chain_leaf_is_not_resumed_until_its_own_pre_req_lands():
-    """Guard against the false-resume a naive "propagate through `states`"
-    chain fix would introduce: once the root lands, the middle correctly
-    resumes to `waiting` THIS tick (single-hop #2362 behaviour) — but the
-    leaf's own named pre-req is the MIDDLE, which has only been re-queued,
-    not merged. The leaf must stay `blocked` until the middle itself
-    actually lands, even though `states[middle]` already reads `waiting` by
-    the time the leaf is walked in this same tick."""
+def test_a_two_hop_after_chain_leaf_cascades_to_waiting_but_does_not_launch_until_its_own_prereq_lands():
+    """Once the root lands, the middle resumes to `waiting` THIS tick
+    (single-hop #2362 behaviour) — and, because the root is fully landed,
+    the middle also happens to be immediately launchable and takes this
+    tick's `plan.launch`. The leaf's own named pre-req is the MIDDLE, which
+    has only been re-queued, not merged — so the leaf must NOT be treated
+    as satisfied/launchable, even though `states[middle]` already reads
+    `waiting` by the time the leaf is walked in this same tick.
+
+    #2756: the middle is no longer `blocked`/`failed` either, though — so
+    the leaf's frozen "it will never satisfy" claim about the middle is now
+    equally false, one hop up the chain from the issue's original repro.
+    The same partial-satisfaction resume that clears the middle must
+    cascade to the leaf too: it comes back `waiting`, with a live
+    "waiting on middle" reason, rather than staying pinned `blocked` with a
+    stale, now-false reason of its own. Resuming to `waiting` is NOT the
+    same as declaring it launchable — :func:`_resolve_prereqs` still gates
+    the leaf's actual launch on the middle reaching real `facts.landed`,
+    which is the guard against a naive "propagate through `states`" chain
+    fix this test originally pinned."""
     root = entry_key(REPO, 1650)
     middle = entry_key(REPO, 1654)
     entries = [
@@ -3294,10 +3382,18 @@ def test_a_two_hop_after_chain_leaf_is_not_resumed_until_its_own_pre_req_lands()
     middle_reconcile = next(r for r in plan.reconciles if r.key == middle)
     assert middle_reconcile.outcome == "resumed"
     assert middle_reconcile.updates["state"] == STATE_WAITING
+    # The middle's OWN pre-req (root) is fully landed, so it is immediately
+    # launchable and claims this tick's single launch slot.
+    assert plan.launch is not None and plan.launch.issue == 1654
 
-    # The leaf gets NO reconcile at all this tick — it stays blocked, with
-    # its existing (still-true) "it will never satisfy" reason untouched.
-    assert all(r.key != entry_key(REPO, 1658) for r in plan.reconciles)
+    # The leaf ALSO resumes to `waiting` this same tick — no longer pinned
+    # `blocked` with a false "will never satisfy" claim about the middle —
+    # but it is not the one that launches: its own pre-req (the middle) has
+    # not itself reached `facts.landed` yet.
+    leaf_reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1658))
+    assert leaf_reconcile.outcome == "resumed"
+    assert leaf_reconcile.updates["state"] == STATE_WAITING
+    assert plan.launch.issue != 1658
 
 
 def test_is_unsatisfiable_prereq_reason_recognises_only_the_exact_verdict_shapes():

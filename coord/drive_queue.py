@@ -1933,10 +1933,20 @@ class BlockedAfterDiagnosis:
     now-landed pre-req dropped. ``dependency_reason`` is the CURRENT
     ``_resolve_prereqs`` verdict against that same graph — ``''`` when the
     graph is not (or no longer) why the entry is stuck.
+
+    ``unsatisfiable`` (#2756) carries ``_Verdict.unsatisfiable`` through
+    instead of collapsing it: ``dependency_reason`` alone cannot tell "a
+    named pre-req is itself dead, or a cycle exists — this will never
+    clear on its own" apart from "merely waiting on a pre-req that is
+    still in flight — an ordinary, plausibly-temporary deferral". Both
+    produce a non-empty ``dependency_reason``; only the former should keep
+    a row `blocked`. ``False`` whenever ``dependency_reason`` is empty
+    (nothing to be unsatisfiable about).
     """
 
     unsatisfied: tuple[str, ...] = ()
     dependency_reason: str = ""
+    unsatisfiable: bool = False
 
 
 def diagnose_blocked_after(
@@ -1977,6 +1987,13 @@ def diagnose_blocked_after(
       declared none), so whatever originally blocked this row — a red build,
       an exhausted retry budget, a refused pre-dispatch guard — was NOT its
       ``after=`` list, and the row's own ``last_reason`` is the real story.
+      A non-empty ``dependency_reason`` splits further via ``unsatisfiable``
+      (#2756): a dep that is itself dead (`blocked`/`failed`), unknown to
+      the board, or part of a cycle keeps the graph a genuine, permanent
+      cause; a dep that is merely still queued/open/in-flight is an
+      ordinary deferral that happens to be phrased the same way a terminal
+      row's caption is — see :func:`_reconcile_blocked_after`, which acts
+      on this distinction.
 
     *live_prereq_terminal* (#2602) is the same live-recheck mapping
     :func:`_resolve_prereqs` takes — a dep it confirms landed drops out of
@@ -1998,7 +2015,9 @@ def diagnose_blocked_after(
         live_prereq_terminal=live_prereq_terminal,
     )
     return BlockedAfterDiagnosis(
-        unsatisfied, "" if verdict.satisfied else verdict.reason
+        unsatisfied,
+        "" if verdict.satisfied else verdict.reason,
+        unsatisfiable=verdict.unsatisfiable,
     )
 
 
@@ -2058,7 +2077,12 @@ def _reconcile_blocked_after(
     live_prereq_terminal: Mapping[str, bool] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
-    `after=` pre-req, once every named pre-req has since landed.
+    `after=` pre-req, once every named pre-req has since landed. #2756:
+    ALSO resume it the moment the specific unsatisfiable condition clears
+    even while OTHER named pre-reqs remain merely in flight — the entry
+    returns to `waiting`, where step 4's ordinary deferral machinery takes
+    over and produces a live, accurate reason instead of the frozen,
+    now-false one this row was blocked with.
 
     `_resolve_prereqs` (called from step 4's launch walk) blocks a `waiting`
     entry the instant one of its pre-reqs is itself `blocked`/`failed`, OR
@@ -2088,12 +2112,20 @@ def _reconcile_blocked_after(
     * re-deriving the verdict fresh against the CURRENT board — via
       :func:`diagnose_blocked_after`, the SAME function #2183's `coord
       drive-queue list`/`status` rendering already uses, so this can never
-      disagree with what an operator is shown — comes back satisfied (every
-      named pre-req now reads `facts.landed`, OR *live_prereq_terminal*
-      confirms it live, OR the dep's own queue row already reads
-      `STATE_DONE`, #2715). Anything else (still unsatisfied, or unsatisfiable
-      for a fresh reason, including a DIFFERENT pre-req going bad in the
-      meantime) leaves the entry blocked.
+      disagree with what an operator is shown — is NOT unsatisfiable
+      (:attr:`BlockedAfterDiagnosis.unsatisfiable`). That covers two cases,
+      both a legitimate resume back to `waiting`: every named pre-req now
+      reads `facts.landed` (OR *live_prereq_terminal* confirms it live, OR
+      the dep's own queue row already reads `STATE_DONE`, #2715) — the
+      original #2362 case — AND #2756's partial case, where the SPECIFIC
+      dep that made the verdict unsatisfiable has cleared while other named
+      pre-reqs are still merely queued/open/in-flight. A verdict that is
+      STILL unsatisfiable — a (possibly different) dep still `blocked`/
+      `failed`, still unknown to the board, or a genuine dependency cycle
+      (:data:`_UNSATISFIABLE_PREREQ_MARKER` never matches a cycle verdict,
+      and `_resolve_prereqs` marks cycles unsatisfiable too, so this check
+      naturally declines to resume one — no re-check can ever undo a cycle)
+      — leaves the entry blocked.
 
     *live_prereq_terminal* (#2602) is threaded straight through to
     :func:`diagnose_blocked_after` / :func:`_resolve_prereqs` — see their
@@ -2125,13 +2157,26 @@ def _reconcile_blocked_after(
     diagnosis = diagnose_blocked_after(
         entry, board, states, cycle_keys, live_prereq_terminal
     )
-    if diagnosis.dependency_reason:
+    if diagnosis.unsatisfiable:
         return None
-    reason = (
-        f"{entry.key}'s pre-req(s) ({', '.join(entry.after)}) now show "
-        "facts.landed — resuming from blocked without an operator "
-        "remove+add, attempt budget reset (#2362)"
-    )
+    if diagnosis.dependency_reason:
+        # #2756: the verdict is no longer unsatisfiable, but not every
+        # named pre-req has landed either — the specific dep that made
+        # this row unsatisfiable has cleared while others are merely still
+        # in flight. Resume to `waiting` with a live reason describing what
+        # it is actually waiting on now, rather than the frozen "will never
+        # satisfy" claim this row was blocked with.
+        reason = (
+            f"{entry.key}'s unsatisfiable pre-req condition cleared — "
+            f"resuming from blocked to waiting on: {diagnosis.dependency_reason} "
+            "(#2756)"
+        )
+    else:
+        reason = (
+            f"{entry.key}'s pre-req(s) ({', '.join(entry.after)}) now show "
+            "facts.landed — resuming from blocked without an operator "
+            "remove+add, attempt budget reset (#2362)"
+        )
     return Reconcile(
         entry.key,
         "resumed",
