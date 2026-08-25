@@ -603,6 +603,64 @@ class TestRender:
         # should be summarised as either text or tool_use=Bash.
         assert any("result" in l for l in lines)
 
+    # ── #2743: the terminating assistant turn renders in full ──────────────
+
+    def test_assistant_text_truncated_by_default(self) -> None:
+        long_text = "issue filed and queued, no further action needed here. " * 3
+        assert len(long_text) > 100
+        e = parse_event(json.dumps(_assistant_text_event(long_text)))
+        out = render_event(e)
+        assert "…" in out
+        assert long_text.strip() not in out
+
+    def test_assistant_text_rendered_in_full_when_final(self) -> None:
+        """A session's closing summary — e.g. a decomposition-chat's report
+        of what it filed/queued/linked, or a flag that it needs a customer
+        round-trip — must not be clipped to the mid-run 100-char limit."""
+        long_text = (
+            "Filed issue #501 and #502, queued both, recorded the portal "
+            "link. Two of six requested items reference a feature with zero "
+            "references in the repo and need a customer round-trip."
+        )
+        assert len(long_text) > 100
+        e = parse_event(json.dumps(_assistant_text_event(long_text)))
+        out = render_event(e, final=True)
+        assert "…" not in out
+        assert long_text.strip() in out
+
+    def test_render_log_marks_only_the_last_assistant_turn_final(
+        self, tmp_path: Path
+    ) -> None:
+        turn1_text = "reading the submission and mapping repos now, one moment " * 2
+        turn2_text = (
+            "closing summary: filed 2 issues under ms-9, queued both via "
+            "drive-queue, and recorded coord portal link successfully."
+        )
+        assert len(turn1_text) > 100
+        assert len(turn2_text) > 100
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _assistant_text_event(turn1_text),
+                    _assistant_text_event(turn2_text),
+                    _result_event(
+                        total_cost_usd=0.1, stop_reason="end_turn", num_turns=2, duration_ms=1000
+                    ),
+                ]
+            )
+        )
+        lines = list(render_log(p))
+        turn1_line = next(l for l in lines if "Turn 1" in l)
+        turn2_line = next(l for l in lines if "Turn 2" in l)
+        # Mid-run turn stays clipped...
+        assert "…" in turn1_line
+        assert turn1_text.strip() not in turn1_line
+        # ...but the closing turn renders whole.
+        assert "…" not in turn2_line
+        assert turn2_text.strip() in turn2_line
+
 
 # ── opencode rendering (#2315) ───────────────────────────────────────────
 #

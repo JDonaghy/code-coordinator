@@ -159,8 +159,17 @@ def _resolve_log_machine_via_daemon(assignment_id: str, config_path: Path):
     return next((m for m in cfg.machines if m.name == machine_name), None)
 
 
-def _emit_log_text(text: str, *, raw: bool) -> None:
+def _emit_log_text(text: str, *, raw: bool, mark_final_turn: bool = False) -> None:
     """Print *text* either as-is (raw mode or plain-text log) or rendered.
+
+    #2743: *mark_final_turn* tells the renderer that *text* is a complete,
+    one-shot read of the log (the non-follow ``coord log <id>`` path) rather
+    than an incremental ``--follow`` slice — in that case the LAST assistant
+    turn found in *text* is the run's actual closing turn, and gets rendered
+    in full instead of truncated to 100 chars. A ``--follow`` poll only ever
+    sees a fragment of the log, so "last assistant event in this chunk" is
+    not reliably the run's real last turn there — leave it False and every
+    chunk renders exactly as before.
 
     #1710 inventory: kept as a direct ``coord.worker_events`` import rather
     than routed through ``provider.parse_log()``. This — and the three other
@@ -205,8 +214,23 @@ def _emit_log_text(text: str, *, raw: bool) -> None:
         click.echo(text, nl=False)
         return
 
+    # #2743: find the last assistant turn in *text* so it can be rendered in
+    # full below — but only when this read is known to cover the whole log
+    # (see the docstring's `mark_final_turn` note). A second, cheap pass
+    # over the same lines; logs are small enough that this is not worth
+    # complicating the single-pass loop below for.
+    last_assistant_idx = None
+    if mark_final_turn:
+        for idx, raw_line in enumerate(text.splitlines()):
+            stripped = raw_line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            event = parse_event(raw_line)
+            if event is not None and event.type == "assistant":
+                last_assistant_idx = idx
+
     turn_counter = [0]
-    for raw_line in text.splitlines():
+    for idx, raw_line in enumerate(text.splitlines()):
         stripped = raw_line.lstrip()
         if not stripped:
             continue
@@ -220,7 +244,9 @@ def _emit_log_text(text: str, *, raw: bool) -> None:
             # Couldn't parse — show verbatim so nothing is silently dropped.
             click.echo(raw_line)
             continue
-        rendered = render_event(event, turn_counter=turn_counter)
+        rendered = render_event(
+            event, turn_counter=turn_counter, final=(idx == last_assistant_idx)
+        )
         if rendered is not None:
             click.echo(rendered)
 
@@ -277,7 +303,9 @@ def _log_local(assignment_id: str, follow: bool, *, raw: bool = False) -> None:
                 if rendered is not None:
                     click.echo(rendered)
     else:
-        _emit_log_text(log_path.read_text(), raw=raw)
+        # A one-shot, non-follow read sees the whole log at once — mark the
+        # closing turn so it renders in full (#2743).
+        _emit_log_text(log_path.read_text(), raw=raw, mark_final_turn=True)
 
 
 def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False) -> None:
@@ -298,7 +326,13 @@ def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False)
             err=True,
         )
         sys.exit(1)
-    _emit_log_text(body.decode("utf-8", errors="replace"), raw=raw)
+    # When not following, this first fetch already is the whole (and only)
+    # log read, so the closing turn can be marked final (#2743). When
+    # following, this is merely "whatever's landed so far" — the run may
+    # still be going, so leave it unmarked like every later poll below.
+    _emit_log_text(
+        body.decode("utf-8", errors="replace"), raw=raw, mark_final_turn=not follow
+    )
     since = len(body)
 
     if not follow:

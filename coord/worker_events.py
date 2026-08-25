@@ -1007,9 +1007,12 @@ def parse_log(log_path: str | Path, tail_bytes: int = 65536) -> WorkerSummary:
 # ── Human-readable rendering ────────────────────────────────────────────────
 
 
-def _truncate(text: str, n: int = 80) -> str:
+def _truncate(text: str, n: int | None = 80) -> str:
+    """Collapse *text* to one line, cutting it to *n* chars — or, with
+    ``n=None``, keeping it in full (#2743: the closing turn of a session
+    deserves the whole thing, not the 100-char mid-run clip)."""
     text = text.replace("\n", " ").strip()
-    if len(text) <= n:
+    if n is None or len(text) <= n:
         return text
     return text[: n - 1] + "…"
 
@@ -1027,8 +1030,24 @@ def _format_duration(ms: int | None) -> str:
     return f"{hours}h {minutes}m"
 
 
-def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -> str | None:
-    """Render an event as a single human-readable line. Returns None to skip."""
+def render_event(
+    event: WorkerEvent,
+    *,
+    turn_counter: list[int] | None = None,
+    final: bool = False,
+) -> str | None:
+    """Render an event as a single human-readable line. Returns None to skip.
+
+    *final* marks this assistant turn as the run's terminating one (#2743) —
+    the 100-char mid-run truncation is right for progress lines but wrong
+    for a session's closing summary, which is often the single most
+    important thing it produced (e.g. a decomposition-chat's final report of
+    what it filed/queued/linked, or a flag that it needs a customer
+    round-trip). Callers that know the whole log (``render_log`` below, or a
+    one-shot non-follow ``coord log`` read) can identify that turn and pass
+    this through; callers only ever seeing an incremental slice (``coord log
+    --follow``) leave it False rather than guess.
+    """
     raw = event.raw
 
     if event.type == "system" and event.subtype == "init":
@@ -1046,7 +1065,8 @@ def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -
         # If this assistant turn is purely a tool call, the text block may
         # be empty — render a placeholder so the timeline still ticks.
         if text:
-            return f"[assistant] Turn {n}: {_truncate(text, 100)!r}"
+            shown = _truncate(text, None if final else 100)
+            return f"[assistant] Turn {n}: {shown!r}"
         # Try to summarise the tool calls.
         message = raw.get("message") or {}
         tool_names = [
@@ -1140,10 +1160,23 @@ def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -
 
 
 def render_log(log_path: str | Path) -> Iterable[str]:
-    """Yield rendered lines for every event in *log_path*."""
+    """Yield rendered lines for every event in *log_path*.
+
+    Unlike per-line streaming callers, this walks the whole file up front,
+    so it knows which assistant turn (if any) is the last one — that turn is
+    rendered in full rather than truncated to 100 chars (#2743).
+    """
+    events = list(iter_events(log_path))
+    last_assistant_idx = None
+    for idx, event in enumerate(events):
+        if event.type == "assistant":
+            last_assistant_idx = idx
+
     turn_counter = [0]
-    for event in iter_events(log_path):
-        line = render_event(event, turn_counter=turn_counter)
+    for idx, event in enumerate(events):
+        line = render_event(
+            event, turn_counter=turn_counter, final=(idx == last_assistant_idx)
+        )
         if line is not None:
             yield line
 
