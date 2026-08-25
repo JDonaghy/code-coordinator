@@ -393,6 +393,38 @@ def portal_link(
     help="Force a specific machine (must claim every repo the submission maps to).",
 )
 @click.option(
+    "--discuss/--no-discuss",
+    "discuss_flag",
+    default=None,
+    help=(
+        "#2750 (IL-4): force the ask/propose/decompose intake loop on/off "
+        "instead of auto-selecting it. Auto-selection turns it on when "
+        "done_definition/audience is missing/blank/'Not captured at first "
+        "contact', or a mapped repo has no commits/no CLAUDE.md yet — "
+        "otherwise it files straight through, exactly as before #2750. "
+        "Omit to auto-select; the picked mode and why is always the first "
+        "line of the session's briefing."
+    ),
+)
+@click.option(
+    "--interactive",
+    "interactive_flag",
+    is_flag=True,
+    default=False,
+    help=(
+        "#2750 (IL-4): HUMAN-ATTENDED launcher — a genuine tmux-attached "
+        "`claude` locally for the scoping conversation itself, instead of a "
+        "headless dispatch. Local-only for now (Track B / #486 is remote): "
+        "refuses when this machine does not claim every repo SUBMISSION_ID "
+        "maps to. On a thin client (this machine has `board_service` "
+        "configured), `coord portal decision`/`ledger`/`link` route through "
+        "the daemon (#2751) but `enqueue-question`/`enqueue-status` do not "
+        "yet — an Ask-shaped iteration will refuse loudly mid-conversation "
+        "on those; ssh to the daemon host instead for that case. Mutually "
+        "exclusive with --wait/--machine/--timeout/--interval."
+    ),
+)
+@click.option(
     "--wait",
     "wait_for_completion",
     is_flag=True,
@@ -415,6 +447,8 @@ def portal_decompose_chat(
     config_path,
     submission_id: str,
     machine_override: str | None,
+    discuss_flag: bool | None,
+    interactive_flag: bool,
     wait_for_completion: bool,
     timeout: int,
     interval: int,
@@ -428,17 +462,20 @@ def portal_decompose_chat(
     board poll.
 
     Briefs the session with SUBMISSION_ID's outcome / audience / done-
-    definition / constraints, its mapped repo(s), and `coordinator.yml`
-    topology context for those repo(s) (:mod:`coord.decomposition_chat`).
-    The session's own job — deciding whether the work is oracle-loop-shaped,
-    filing issue(s) via `coord issue create`, queueing them via `coord
-    drive-queue add`, and recording `coord portal link` — is described in its
-    system prompt (`coord.agent.DECOMPOSITION_CHAT_SYSTEM_PROMPT`), not here.
+    definition / constraints, its mapped repo(s), `coordinator.yml` topology
+    context for those repo(s), and its full running-context ledger so far
+    (:mod:`coord.decomposition_chat`) — one ITERATION of #2750's intake
+    session, ending in ask / propose / decompose (``--discuss``) or filing
+    straight through (``--no-discuss``; auto-selected when neither is
+    given). The session's own job in each mode is described in its system
+    prompt (`coord.agent.DECOMPOSITION_CHAT_SYSTEM_PROMPT`), not here.
 
-    Reads through :func:`coord.approved_work.approved_submissions`, which
-    (like every other portal-bridge reader) resolves state out of this
-    machine's own ``~/.coord/coord.db`` — a daemon-host command, same as
-    ``link``/``publish-mocks`` above.
+    Reads through :func:`coord.decomposition_chat.resolve_approved_submission`,
+    which (like every other portal-bridge reader) resolves state out of this
+    machine's own ``~/.coord/coord.db`` when it IS the daemon host, and
+    routes through the daemon otherwise (only reachable via --interactive
+    below — the headless path refuses on a thin client, same as
+    ``link``/``publish-mocks`` above).
 
     **--wait** (#2743): the TUI's equivalent action binds a live chat
     overlay to the dispatch and so shows the session's summary as it
@@ -447,7 +484,23 @@ def portal_decompose_chat(
     `coord portal link` succeeded) was previously only recoverable by
     hand-parsing `coord log --raw`'s NDJSON. Pass --wait to block here and
     have this command print it for you once the session ends.
+
+    **--interactive** (#2750): launches a human-attended tmux session on
+    THIS machine instead — see that option's help for the local-only
+    constraint and the thin-client caveat.
     """
+    if interactive_flag:
+        if wait_for_completion or machine_override:
+            click.echo(
+                "error: --interactive is mutually exclusive with "
+                "--wait/--machine/--timeout/--interval",
+                err=True,
+            )
+            raise SystemExit(2)
+        cfg = _load_config(config_path)
+        _run_decompose_chat_interactive(cfg, submission_id, discuss=discuss_flag)
+        return
+
     _refuse_if_thin_client("decompose-chat")
 
     from coord.decomposition_chat import dispatch_decomposition_chat
@@ -455,7 +508,7 @@ def portal_decompose_chat(
     cfg = _load_config(config_path)
     try:
         assignment_id, machine_name = dispatch_decomposition_chat(
-            submission_id, cfg, machine_override=machine_override
+            submission_id, cfg, machine_override=machine_override, discuss=discuss_flag
         )
     except RuntimeError as exc:
         click.secho(f"error: {exc}", fg="red")
@@ -467,6 +520,240 @@ def portal_decompose_chat(
         _wait_and_print_decomposition_summary(
             assignment_id, machine_name, cfg, timeout=timeout, interval=interval
         )
+
+
+def _run_decompose_chat_interactive(
+    cfg, submission_id: str, *, discuss: bool | None
+) -> None:
+    """#2750 (IL-4): human-attended, tmux-attached intake session for
+    SUBMISSION_ID — the ``--interactive`` counterpart to the headless
+    dispatch above.
+
+    Mirrors `_dispatch_milestone_chat_of`'s shape
+    (`coord/commands/dispatch_workers.py`: a genuine tmux-attached `claude`,
+    no worktree, live checkout, briefing pre-seeded via a temp file + a
+    short pointer prompt) but lives here rather than as a
+    `coord assign --interactive` flavour, since ``coord portal
+    decompose-chat`` is #2750's own stated per-dispatch surface ("takes only
+    --machine, so there is no per-dispatch way to ask for anything else").
+
+    **Local-only** (#2750's own stated limit — Track B / #486 is remote):
+    resolved via :func:`coord.test_orchestrator.local_machine`, and refuses
+    outright, rather than failing obscurely mid-conversation, when this
+    machine claims none — or not all — of SUBMISSION_ID's mapped repos.
+    """
+    import sys as _sys  # noqa: PLC0415
+    import tempfile as _tempfile  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from coord.agent import (  # noqa: PLC0415
+        AssignmentSpec as _AssignmentSpecDc,
+        DECOMPOSITION_CHAT_DENY_COMMANDS,
+        DECOMPOSITION_CHAT_SYSTEM_PROMPT,
+        build_deny_prompt,
+    )
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        build_decomposition_chat_briefing,
+        fetch_running_context,
+        render_running_context_section,
+        repo_topology_context,
+        resolve_approved_submission,
+        select_discuss_mode,
+    )
+    from coord.interactive import (  # noqa: PLC0415
+        finalize_interactive_exit,
+        launch_human_attended_interactive,
+        tmux_available as _tmux_avail,
+        tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
+    )
+    from coord.models import Assignment as _AssignmentDc  # noqa: PLC0415
+    from coord.providers.claude_pty import ClaudePtyProvider as _ClaudePtyProvider  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment as _record_dc  # noqa: PLC0415
+    from coord.test_orchestrator import local_machine as _local_machine  # noqa: PLC0415
+
+    submission = resolve_approved_submission(cfg, submission_id)
+    if submission is None:
+        click.secho(
+            f"error: submission {submission_id!r} is not a currently-approved "
+            "portal submission — nothing to decompose",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    repos: list[str] = submission.get("repos") or []
+    if not repos:
+        click.secho(
+            f"error: submission {submission_id!r} has no mapped repo (portal."
+            "project_repos in coordinator.yml) — map its project first",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    machine = _local_machine(cfg)
+    if machine is None:
+        click.echo(
+            "error: --interactive is local-only for now (Track B / #486 is "
+            "remote); this machine is not a configured machine in "
+            "coordinator.yml at all.",
+            err=True,
+        )
+        raise SystemExit(2)
+    missing = [r for r in repos if not machine.can_work_on(r)]
+    if missing:
+        click.echo(
+            f"error: --interactive is local-only for now (Track B / #486 is "
+            f"remote); this machine ({machine.name}) does not claim repo(s) "
+            f"{', '.join(missing)} that submission {submission_id!r} maps to "
+            f"({', '.join(repos)}). Run this on a machine that claims all of "
+            "them, or dispatch headlessly instead.",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    from coord import board_service as _board_service  # noqa: PLC0415
+
+    if _board_service.resolve() is not None:
+        click.secho(
+            "note: this machine is a thin client — `coord portal decision`/"
+            "`ledger`/`link` route through the daemon (#2751), but `coord "
+            "portal enqueue-question`/`enqueue-status` (the Ask move) do "
+            "not yet and will refuse loudly if this iteration needs them. "
+            "ssh to the daemon host for that case (#2750's own stated "
+            "limit).",
+            fg="yellow",
+        )
+
+    topology_context = repo_topology_context(cfg, repos)
+    discuss_mode, discuss_reason = select_discuss_mode(cfg, submission, discuss_override=discuss)
+    running_context = render_running_context_section(fetch_running_context(submission_id))
+    briefing = build_decomposition_chat_briefing(
+        submission=submission,
+        topology_context=topology_context,
+        discuss=discuss_mode,
+        discuss_reason=discuss_reason,
+        running_context_section=running_context,
+    )
+
+    repo_path = str(_Path(machine.repo_path(repos[0]) or str(_Path.cwd())).expanduser())
+    resolved_model = cfg.models.default
+    assignment_id = _uuid.uuid4().hex[:12]
+
+    # Full briefing to a temp file, short pointer prompt pre-filled into the
+    # tmux pane — same rationale as `_dispatch_milestone_chat_of`: a
+    # multi-KB multi-line paste over the embedded-terminal/tmux path is less
+    # reliable than a short one, and this degrades gracefully (the operator
+    # can open the file by hand if the paste misses).
+    brief_path = str(_Path(_tempfile.gettempdir()) / f"coord-intake-{submission_id}.md")
+    _Path(brief_path).write_text(briefing, encoding="utf-8")
+    mode_word = "DISCUSS" if discuss_mode else "FILE"
+    seed_prompt = (
+        f"Intake session for portal submission {submission_id} "
+        f"(MODE: {mode_word} — {discuss_reason}): read the full context at "
+        f"{brief_path} (submission fields, repo topology, and the running-"
+        "context ledger so far) and let's work through it."
+    )
+
+    spec = _AssignmentSpecDc(
+        repo_name=repos[0],
+        repo_path=repo_path,
+        issue_number=0,
+        issue_title=_issue_title_for_display(submission_id),
+        briefing=briefing,
+        model=resolved_model,
+        type="decomposition-chat",
+        provider="claude-pty",
+    )
+    provider = _ClaudePtyProvider()
+    # Explicit system_prompt/allowed_tools rather than relying on
+    # ClaudePtyProvider's own spec.type branching (unlike
+    # `_dispatch_milestone_chat_of`'s precedent) — the PTY provider's
+    # internal branch table has no `"decomposition-chat"` case, so leaving
+    # it implicit would silently fall through to the generic work-shaped
+    # branch (full WORKER_SYSTEM_PROMPT + Edit/Write/Monitor), which is
+    # wrong for a no-worktree chat type. Passing these explicitly keeps
+    # this session byte-identical, on the system prompt, to the headless
+    # dispatch path (`coord.agent.default_worker_command`'s own
+    # `spec.type == "decomposition-chat"` branch).
+    argv = provider.build_command(
+        spec,
+        resolved_model=resolved_model,
+        system_prompt=DECOMPOSITION_CHAT_SYSTEM_PROMPT + build_deny_prompt(
+            DECOMPOSITION_CHAT_DENY_COMMANDS
+        ),
+        allowed_tools="Read,Bash",
+    )
+
+    click.echo(f"{machine.name} (local TTY) → INTAKE SESSION: {submission_id}")
+    click.echo(f"  mode: HUMAN-ATTENDED interactive intake session, MODE: {mode_word} (#2750)")
+    click.echo(f"  why: {discuss_reason}")
+    click.echo(f"  assignment id: {assignment_id}")
+    click.echo(f"  cwd: {repo_path} (live checkout — read-only, no worktree)")
+
+    dc_assignment = _AssignmentDc(
+        machine_name=machine.name,
+        repo_name=repos[0],
+        issue_number=0,
+        issue_title=_issue_title_for_display(submission_id),
+        briefing=briefing,
+        assignment_id=assignment_id,
+        status="running",
+        dispatched_at=_time.time(),
+        type="decomposition-chat",
+        model=resolved_model,
+        provider_name="claude-pty",
+    )
+    repo_cfg = cfg.repo(repos[0])
+    _record_dc(
+        assignment=dc_assignment,
+        repo_github=repo_cfg.github if repo_cfg is not None else repos[0],
+    )
+    import os as _os  # noqa: PLC0415
+
+    _os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    started_at = _time.time()
+    exit_code = launch_human_attended_interactive(
+        argv, seed_prompt, assignment_id=assignment_id, cwd=repo_path,
+    )
+    if exit_code != 0:
+        click.echo(f"  claude exited with status {exit_code}", err=True)
+
+    sname = _tmux_name(assignment_id) if _tmux_avail() else None
+    if sname and _tmux_alive(sname):
+        click.echo(
+            f"  session still running in tmux: {sname}\n"
+            f"  reattach with:  coord reattach {assignment_id}"
+        )
+        _sys.exit(0)
+
+    default_branch = repo_cfg.default_branch if repo_cfg is not None else "main"
+    try:
+        finalize_interactive_exit(
+            assignment_id=assignment_id,
+            repo_name=repos[0],
+            repo_github=repo_cfg.github if repo_cfg is not None else repos[0],
+            issue_number=0,
+            machine_name=machine.name,
+            worktree_path=None,
+            base_branch=default_branch or "main",
+            exit_code=exit_code,
+            started_at=started_at,
+            log_path=None,
+            repo_path=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort backstop
+        click.echo(f"  warning: backstop failed to record intake-session exit: {exc}", err=True)
+
+
+def _issue_title_for_display(submission_id: str) -> str:
+    """Same sentinel `dispatch_decomposition_chat` writes onto the
+    assignment (`coord.decomposition_chat._issue_title`, private) — kept as
+    a tiny local mirror rather than importing a name with a leading
+    underscore across the module boundary."""
+    return f"decomposition: {submission_id}"
 
 
 def _wait_and_print_decomposition_summary(
