@@ -882,18 +882,21 @@ def _lookup_titles(
         return {}
     out: dict[tuple[str, int], str] = {}
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
         for repo, number in keys:
-            row = conn.execute(
+            row = sql.execute(
+                conn,
                 "SELECT title FROM issues WHERE repo_name = ? AND number = ?",
                 (repo, number),
             ).fetchone()
             if row is not None and row["title"]:
                 out[(repo, number)] = row["title"]
                 continue
-            row = conn.execute(
+            row = sql.execute(
+                conn,
                 "SELECT issue_title FROM assignments WHERE repo_name = ? "
                 "AND issue_number = ? AND issue_title IS NOT NULL "
                 "ORDER BY rowid DESC LIMIT 1",
@@ -2933,13 +2936,14 @@ def _default_completed_source() -> tuple[list[dict], list[dict], list[dict]]:
     that host's daemon answer it over ``GET /report/completed``.
     """
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
         issues = [
             dict(r)
-            for r in conn.execute(
-                "SELECT repo_name, number, title, state FROM issues"
+            for r in sql.execute(
+                conn, "SELECT repo_name, number, title, state FROM issues"
             ).fetchall()
         ]
         # #2472 widens this one SELECT rather than adding a second source
@@ -2953,17 +2957,18 @@ def _default_completed_source() -> tuple[list[dict], list[dict], list[dict]]:
         # report does not emit.
         assignments = [
             dict(r)
-            for r in conn.execute(
+            for r in sql.execute(
+                conn,
                 "SELECT repo_name, issue_number, for_issue_number, "
                 "dispatched_at, finished_at, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, cost_usd, model "
-                "FROM assignments"
+                "FROM assignments",
             ).fetchall()
         ]
         merge_queue = [
             dict(r)
-            for r in conn.execute(
-                "SELECT repo_name, issue_number, state, last_attempt FROM merge_queue"
+            for r in sql.execute(
+                conn, "SELECT repo_name, issue_number, state, last_attempt FROM merge_queue"
             ).fetchall()
         ]
     except Exception:  # noqa: BLE001 — an unreadable board is an empty report

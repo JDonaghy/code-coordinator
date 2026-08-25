@@ -48,10 +48,12 @@ def _get_assignment_branch_head(
     as "HEAD unknown — skip staleness tracking".
     """
     import subprocess  # noqa: PLC0415 — lazy import keeps startup fast
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT repo_name, branch FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
@@ -91,6 +93,7 @@ def _maybe_reconcile_branch(
     already had, or the reconciled ref is missing on origin.  The caller
     falls back to the original error in those cases.
     """
+    from coord import sql
     from coord.db import get_connection
 
     # Need a PR number to look up the head ref.  Pull it from the
@@ -99,7 +102,8 @@ def _maybe_reconcile_branch(
     if not aid:
         return None
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT pr_number, repo_github FROM merge_queue "
         "WHERE assignment_id=?",
         (aid,),
@@ -140,11 +144,13 @@ def _maybe_reconcile_branch(
 
     # Persist the reconciled branch on both tables so future runs of
     # coord test / coord merge / TUI etc. all see the right value.
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE assignments SET branch=? WHERE assignment_id=?",
         (real_branch, aid),
     )
-    conn.execute(
+    sql.execute(
+        conn,
         "UPDATE merge_queue SET branch=? WHERE assignment_id=?",
         (real_branch, aid),
     )
@@ -753,9 +759,11 @@ def uat(assignment_id: str, config_path: Path, verdict: str | None, note: str) -
     else:
         pr_number = None
         try:
+            from coord import sql  # noqa: PLC0415
             from coord.db import get_connection  # noqa: PLC0415
 
-            row = get_connection().execute(
+            row = sql.execute(
+                get_connection(),
                 "SELECT pr_number FROM merge_queue WHERE assignment_id=?",
                 (assignment_id,),
             ).fetchone()

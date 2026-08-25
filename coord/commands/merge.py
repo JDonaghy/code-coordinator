@@ -1106,12 +1106,11 @@ def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     when #278/#280 landed but the local cache stopped at #271).
     """
     try:
+        from coord import sql
         from coord.db import get_connection
 
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT repo_name, number, state FROM issues"
-        ).fetchall()
+        rows = sql.execute(conn, "SELECT repo_name, number, state FROM issues").fetchall()
     except Exception:  # noqa: BLE001 — caller treats empty as "unknown"
         return {}, {}
 

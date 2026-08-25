@@ -2594,11 +2594,13 @@ def _persist_review_verdict(assignment_id: str, verdict: str) -> None:
     if verdict not in ("approve", "request-changes"):
         return
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
         conn = get_connection()
         with conn:
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE assignments SET review_verdict = ? WHERE assignment_id = ?",
                 (verdict, assignment_id),
             )

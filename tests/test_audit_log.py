@@ -156,12 +156,28 @@ class _FlakyConn:
     ``execute()`` calls raise ``database is locked`` before delegating to
     the real connection — simulates a momentary collision with a
     concurrent writer.  ``fail_times=None`` never delegates (sustained
-    contention that outlasts the whole retry budget)."""
+    contention that outlasts the whole retry budget).
+
+    #2767: ``record_audit``'s write now goes through ``coord.sql.execute()``,
+    which calls ``conn.cursor()`` then ``cursor.execute()`` rather than the
+    sqlite3 connection-level ``.execute()`` shortcut — so ``cursor()`` must
+    be implemented too, not just ``execute()``. ``__module__`` is pinned to
+    ``"sqlite3"`` so ``coord.sql.detect_dialect`` (keyed off
+    ``type(conn).__module__``) recognizes this fake as SQLite instead of
+    raising ``UnsupportedDialectError`` before the intended lock error ever
+    fires — mirrors ``tests/test_state.py``'s ``_FlakyConn`` (#2726) and
+    ``tests/test_serve.py``'s ``_AlwaysLockedConn`` (#2726).
+    """
+
+    __module__ = "sqlite3"
 
     def __init__(self, real_conn, fail_times: int | None) -> None:
         self._real = real_conn
         self._fail_times = fail_times
         self.calls = 0
+
+    def cursor(self):
+        return self
 
     def execute(self, *args, **kwargs):
         self.calls += 1
@@ -177,10 +193,20 @@ class _TrimLockedConn:
     """Wraps a real connection so every ``INSERT`` succeeds normally but
     every ``DELETE`` (the opportunistic ``audit.max_rows`` trim) hits
     sustained lock contention — isolates a trim-only failure from the
-    INSERT that already committed successfully above it."""
+    INSERT that already committed successfully above it.
+
+    #2767: see ``_FlakyConn`` above — ``cursor()``/``__module__`` are needed
+    for the same reason now that both the insert and the trim route through
+    ``coord.sql.execute()``.
+    """
+
+    __module__ = "sqlite3"
 
     def __init__(self, real_conn) -> None:
         self._real = real_conn
+
+    def cursor(self):
+        return self
 
     def execute(self, sql, *args, **kwargs):
         if sql.strip().upper().startswith("DELETE"):

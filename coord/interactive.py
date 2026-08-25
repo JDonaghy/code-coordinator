@@ -2154,10 +2154,12 @@ def _assignment_status(assignment_id: str) -> str | None:
         except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
             pass
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.state import get_connection  # noqa: PLC0415
 
         conn = get_connection()
-        row = conn.execute(
+        row = sql.execute(
+            conn,
             "SELECT status FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -4359,6 +4361,7 @@ def reap_stale_interactive_sessions(
     if not tmux_available():
         return []
 
+    from coord import sql  # noqa: PLC0415
     from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
 
     if worktrees_dir is None:
@@ -4478,7 +4481,8 @@ def reap_stale_interactive_sessions(
         # 2. Mark ``terminal_status`` in the DB if the row is still live.
         try:
             conn = get_connection()
-            conn.execute(
+            sql.execute(
+                conn,
                 "UPDATE assignments SET status=?, finished_at=? "
                 "WHERE assignment_id=? AND status IN ('running', 'pending')",
                 (terminal_status, now, a.assignment_id),
@@ -4563,9 +4567,11 @@ def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) 
     update that follows always frees the machine slot regardless.
     """
     try:
+        from coord import sql  # noqa: PLC0415
         from coord.state import get_connection  # noqa: PLC0415
         conn = get_connection()
-        conn.execute(
+        sql.execute(
+            conn,
             "UPDATE assignments SET status=?, finished_at=? "
             "WHERE assignment_id=? AND status IN ('running', 'pending')",
             (status, finished_at, assignment_id),

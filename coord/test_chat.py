@@ -246,10 +246,12 @@ def dispatch_test_chat(
         )
 
     # Look up the work assignment from the DB.
+    from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     conn = get_connection()
-    row = conn.execute(
+    row = sql.execute(
+        conn,
         "SELECT issue_number, issue_title, branch, smoke_tests "
         "FROM assignments WHERE assignment_id=?",
         (work_assignment_id,),

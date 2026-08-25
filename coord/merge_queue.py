@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, NamedTuple, Protocol
 
+from coord import sql
 from coord.audit import record_audit
 # #2704: recognized (not required) — only `coord.github_ops.get_branch_sha`'s
 # opt-in `raise_on_transient=True` path raises this. A `gh_ops` stand-in that
@@ -3337,9 +3338,7 @@ def live_gate_entry(
 def load_queue() -> list[QueuedMerge]:
     """Load all merge queue entries from the database."""
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM merge_queue ORDER BY id"
-    ).fetchall()
+    rows = sql.execute(conn, "SELECT * FROM merge_queue ORDER BY id").fetchall()
     return [
         QueuedMerge(
             assignment_id=row["assignment_id"],
@@ -3390,9 +3389,10 @@ def save_queue(items: list[QueuedMerge]) -> None:
     """Replace the entire merge queue in the database."""
     conn = get_connection()
     with conn:
-        conn.execute("DELETE FROM merge_queue")
+        sql.execute(conn, "DELETE FROM merge_queue")
         for item in items:
-            conn.execute(
+            sql.execute(
+                conn,
                 """INSERT INTO merge_queue (
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
@@ -4595,8 +4595,8 @@ def _load_milestones_for_queue(
         return {}
     try:
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT repo_name, number, milestone_title FROM issues"
+        rows = sql.execute(
+            conn, "SELECT repo_name, number, milestone_title FROM issues"
         ).fetchall()
         return {
             (r["repo_name"], r["number"]): r["milestone_title"]
@@ -7087,8 +7087,8 @@ def drop_entry(assignment_id: str) -> bool:
     if entry is None:
         return False
     with conn:
-        cursor = conn.execute(
-            "DELETE FROM merge_queue WHERE assignment_id = ?", (entry.assignment_id,)
+        cursor = sql.execute(
+            conn, "DELETE FROM merge_queue WHERE assignment_id = ?", (entry.assignment_id,)
         )
     return cursor.rowcount > 0
 
