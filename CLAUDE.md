@@ -223,10 +223,9 @@ versus keep in the coordinator session) are in
   bypassed by the one class of session most likely to reach for `gh` out of habit. Reads are
   covered too — `coord issue list` and `coord issue view` shipped in #2484, so a plain issue
   listing/search or an issue-plus-comments lookup has no excuse to reach for `gh`. Where no
-  `coord` subcommand covers what's needed — still a real gap in places as of 2026-08 (e.g. #2643:
-  `coord issue` can create/edit/label/close but cannot post a plain comment on an issue that stays
-  open) — falling back to `gh` for that one call is fine, but say so and treat it as a gap to flag
-  or file, not a silent workaround.
+  `coord` subcommand covers what's needed — the seam is wide but not total, so check
+  `coord <group> --help` before concluding either way — falling back to `gh` for that one call is
+  fine, but say so and treat it as a gap to flag or file, not a silent workaround.
 
 ## Testing — black-box coverage is the acceptance bar
 
