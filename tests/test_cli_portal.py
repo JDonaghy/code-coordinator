@@ -954,8 +954,6 @@ def thin_client(monkeypatch):
         ("portal", "sync"),
         ("portal", "outbox"),
         ("portal", "events"),
-        ("portal", "link", "coord", "3"),
-        ("portal", "link", "coord", "3", "sub_1"),
         ("portal", "enqueue-status", "sub_1", "shipped"),
         ("portal", "enqueue-design-round", "sub_1", "{}"),
         ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
@@ -997,3 +995,80 @@ def test_status_heartbeat_and_push_do_not_call_the_thin_client_guard(thin_client
         portal_mod._refuse_if_thin_client = real_guard
     assert result.exit_code != 0  # fails for an unrelated reason (bad --config)
     assert calls == []
+
+
+# ── #2751: `link` routes through the daemon instead of refusing ────────────
+
+
+def test_link_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    """Unlike sync/outbox/events/enqueue-*/requeue/publish-mocks, `link` now
+    routes its read/write through `/portal-link` instead of refusing — it
+    must never call `_refuse_if_thin_client` at all."""
+    import coord.commands.portal as portal_mod
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+    try:
+        # Fails for an unrelated reason (COORD_SERVICE_URL points nowhere
+        # reachable) — the point is only that the guard itself is never hit.
+        result = run("portal", "link", "coord", "3", "--config", "/does/not/exist.yml")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0
+    assert calls == []
+
+
+def test_link_write_and_read_route_through_the_daemon_on_a_thin_client(
+    config_path, monkeypatch
+):
+    """End-to-end: a `coord portal link` write, then read, both succeed from
+    a simulated thin client — the ms-67 gap this issue fixes (a
+    `type="decomposition-chat"` session dispatched to precision/elitebook
+    could file issues but could not record the mandatory portal link)."""
+    from coord import client as cc
+
+    monkeypatch.setattr(
+        cc,
+        "resolve_board_service",
+        lambda *a, **k: cc.ServiceConfig("http://dellserver:7435"),
+    )
+    monkeypatch.setattr(cc, "fetch_remote_config", lambda svc, **k: config_path)
+
+    store: dict = {}
+
+    def _fake_post_record(svc, path, payload, **kw):
+        assert path == "/portal-link"
+        store["link"] = payload["record"]
+        return {"ok": True}
+
+    def _fake_get(url, *, params, headers, timeout):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                link = store.get("link")
+                matches = link is not None and all(
+                    link.get(k) == v for k, v in params.items()
+                )
+                return {"link": link if matches else None}
+
+        return _Resp()
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+    monkeypatch.setattr(cc.httpx, "get", _fake_get)
+
+    write = run("portal", "link", "coord", "3", "sub_abc123")
+    assert write.exit_code == 0, write.output
+    assert "linked" in write.output
+    assert "sub_abc123" in write.output
+
+    read = run("portal", "link", "coord", "3")
+    assert read.exit_code == 0, read.output
+    assert "submission_id=sub_abc123" in read.output

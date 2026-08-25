@@ -2469,6 +2469,81 @@ def _openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-link": {
+            "get": {
+                "summary": (
+                    "#2751: read one milestone's (or one issue's) portal "
+                    "submission_id link so a `type=\"decomposition-chat\"` "
+                    "session dispatched to a thin client can run "
+                    "`coord portal link` regardless of which machine it "
+                    "landed on."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "milestone_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {
+                        "description": (
+                            "Missing repo_name, or not exactly one of "
+                            "milestone_number/issue_number"
+                        )
+                    },
+                },
+            },
+            "post": {
+                "summary": (
+                    "Record (or overwrite) a milestone's/issue's portal "
+                    "submission_id link (#2507/#2665/#2751) — "
+                    "`coord portal link`"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "record": {
+                                        "type": "object",
+                                        "description": (
+                                            "A serialized coord.portal_store."
+                                            "PortalLink: repo_name, exactly "
+                                            "one of milestone_number/"
+                                            "issue_number, submission_id, "
+                                            "linked_at, actor, schema. Keyed "
+                                            "on (repo_name, milestone_number) "
+                                            "or (repo_name, issue_number) — "
+                                            "an existing link for that pair "
+                                            "is replaced wholesale."
+                                        ),
+                                    },
+                                },
+                                "required": ["record"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad portal-link"},
+                },
+            },
+        },
         "/dispatched": {
             "post": {
                 "summary": "Record a thin client's review/fix/rework/merge dispatch (#590 Phase 2)",
@@ -5129,6 +5204,72 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def get_portal_link(request: Request) -> Response:
+        # #2751: read one milestone's (or, with issue_number, one issue's)
+        # portal submission_id link so a `type="decomposition-chat"` session
+        # dispatched to a thin client can run `coord portal link` (its own
+        # mandatory step) regardless of which machine it landed on. Same
+        # shape as get_gate_a_approval above, keyed on (repo_name,
+        # milestone_number) OR (repo_name, issue_number) — exactly one.
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_ms = request.query_params.get("milestone_number")
+        raw_issue = request.query_params.get("issue_number")
+        if not repo_name or (raw_ms is None) == (raw_issue is None):
+            return JSONResponse(
+                {
+                    "error": "repo_name and exactly one of milestone_number/"
+                    "issue_number are required"
+                },
+                status_code=400,
+            )
+        try:
+            milestone_number = int(raw_ms) if raw_ms is not None else None
+            issue_number = int(raw_issue) if raw_issue is not None else None
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "milestone_number/issue_number must be an int"},
+                status_code=400,
+            )
+        try:
+            record = state._get_portal_link_local(
+                repo_name=repo_name,
+                milestone_number=milestone_number,
+                issue_number=issue_number,
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-link read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"link": record})
+
+    async def post_portal_link(request: Request) -> Response:
+        # #2751: upsert a milestone's/issue's portal submission_id link on
+        # the shared DB for a thin client's `coord portal link`. Mirrors
+        # post_gate_a_approval above — same seam, same error posture.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        record = body.get("record")
+        if not isinstance(record, dict):
+            return JSONResponse(
+                {"error": "portal-link needs a 'record' object"}, status_code=400
+            )
+        try:
+            state._save_portal_link_local(record)
+        except (TypeError, KeyError, ValueError) as e:
+            return JSONResponse({"error": f"bad portal-link: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-link write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_dispatched(request: Request) -> Response:
         # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
         from coord import state  # noqa: PLC0415
@@ -7728,6 +7869,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-gate", post_milestone_gate, methods=["POST"]),
         Route("/gate-a-approval", get_gate_a_approval, methods=["GET"]),
         Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
+        Route("/portal-link", get_portal_link, methods=["GET"]),
+        Route("/portal-link", post_portal_link, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/uat-verdict", post_uat_verdict, methods=["POST"]),

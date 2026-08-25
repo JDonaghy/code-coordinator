@@ -4081,16 +4081,19 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
 # ``issue_number`` and decodes exactly as before (see
 # :meth:`coord.portal_store.PortalLink.from_dict`).
 #
-# Unlike ``gate_a_approvals``, this is deliberately LOCAL ONLY — no
-# ``_route_write``/``_board_service`` daemon routing. The rest of the portal
-# bridge's durable state (:mod:`coord.portal_store`'s four ``portal_*``
-# tables) has no daemon proxy either: every state-touching ``coord portal``
-# command is a daemon-host command, run over ``ssh``, and refuses outright on
-# a thin client (``coord.commands.portal._refuse_if_thin_client``, #2336).
-# This mapping follows that already-established rule — read/write via
-# ``coord portal link`` on the daemon host — rather than inventing a second
-# I/O story for one record type. Giving the whole bridge real cross-machine
-# routing is Option A in #2336, left for a follow-up.
+# #2751: routes to the daemon (``/portal-link``) exactly like
+# ``gate_a_approvals`` above, via ``save_portal_link``/``get_portal_link``
+# below. This mapping used to be deliberately LOCAL ONLY — every
+# state-touching ``coord portal`` command was a daemon-host command that
+# refused outright on a thin client
+# (``coord.commands.portal._refuse_if_thin_client``, #2336) — but a
+# `type="decomposition-chat"` session can be dispatched to ANY machine that
+# claims the submission's mapped repo(s), not just the daemon host, and its
+# system prompt treats ``coord portal link`` as a mandatory, non-optional
+# step (#2751). This is that follow-up for the one write an agent actually
+# needs; the rest of the bridge's durable state
+# (:mod:`coord.portal_store`'s four other ``portal_*`` tables) is unaffected
+# and still refuses via ``_refuse_if_thin_client``.
 #
 # The domain shape (``PortalLink``, tolerant ``from_dict``) lives in
 # :mod:`coord.portal_store`, which calls the functions below the same way
@@ -4100,7 +4103,7 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
 
 def save_portal_link(record: dict) -> None:
     """Upsert one milestone's (or, since #2665, one issue's) portal
-    ``submission_id`` link.
+    ``submission_id`` link — routes to the daemon when set (#2751).
 
     Keyed on ``(repo_name, milestone_number)`` or ``(repo_name,
     issue_number)`` — whichever the record carries; an existing link for
@@ -4108,6 +4111,10 @@ def save_portal_link(record: dict) -> None:
     matching :func:`save_gate_a_approval`'s semantics for the same reason
     (exactly one live link per milestone/issue).
     """
+    svc = _board_service()
+    resp = _route_write(svc, "/portal-link", {"record": record})
+    if resp is not None:
+        return
     _save_portal_link_local(record)
 
 
@@ -4168,14 +4175,36 @@ def get_portal_link(
     recorded one (#2665). Pass exactly one of ``milestone_number`` /
     ``issue_number``.
 
-    Local-DB only, like :func:`list_portal_links` — see the section docstring
-    above for why this does not route to the daemon like
-    :func:`get_gate_a_approval` does.
+    Routes to the daemon when ``board_service`` is set (#2751), mirroring
+    :func:`get_gate_a_approval`. A routing failure is swallowed to ``None``
+    (see :func:`coord.client.fetch_portal_link`) — "couldn't ask" collapsing
+    to "not linked" matches what the CLI already reports for a genuinely
+    unlinked target, so a daemon hiccup degrades to the same message rather
+    than a traceback.
     """
     if (milestone_number is None) == (issue_number is None):
         raise ValueError(
             "get_portal_link needs exactly one of milestone_number or issue_number"
         )
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_portal_link  # noqa: PLC0415
+
+        return fetch_portal_link(
+            svc,
+            repo_name,
+            milestone_number=milestone_number,
+            issue_number=issue_number,
+        )
+    return _get_portal_link_local(
+        repo_name=repo_name, milestone_number=milestone_number, issue_number=issue_number
+    )
+
+
+def _get_portal_link_local(
+    *, repo_name: str, milestone_number: int | None, issue_number: int | None
+) -> dict | None:
+    """Local-DB-only lookup — the daemon's own reader, never routed."""
     for link in list_portal_links():
         if link.get("repo_name") != repo_name:
             continue
