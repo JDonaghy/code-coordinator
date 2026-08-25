@@ -21,11 +21,14 @@ from __future__ import annotations
 import json
 import socket
 import sys
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+import httpx
 
 from coord import sql
 from coord.config import (
@@ -432,5 +435,116 @@ def _apply_label_change(
     if not changed and no_op_message is not None:
         click.echo(no_op_message)
         return
+
+
+@dataclass
+class PollOutcome:
+    """Result of polling an agent's ``/status`` for one assignment until it
+    reaches a terminal state (#2743).
+
+    Shared by ``coord wait`` (``coord/commands/sessions.py::wait``) and
+    ``coord portal decompose-chat --wait``
+    (``coord/commands/portal.py::_wait_and_print_decomposition_summary``) —
+    both answer the same question ("has assignment X finished, and how did
+    it end") and, per this repo's "one question, one answer" rule (epic
+    #2096), must call the same function instead of maintaining two poll
+    loops that can silently drift on what counts as a failure.
+
+    ``status`` is one of:
+
+    * ``"completed"`` — the assignment reached a terminal state; see
+      ``exit_code``/``branch``/``error`` for how it ended (``exit_code`` is
+      ``0`` for success, non-zero for a failed run).
+    * ``"not_found"`` — the assignment isn't in the agent's active *or*
+      completed lists (it vanished, or the id was wrong).
+    * ``"timeout"`` — *timeout* elapsed with the assignment never reaching a
+      terminal state.
+    """
+
+    status: str
+    exit_code: int | None = None
+    branch: str | None = None
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    error: str | None = None
+
+    @property
+    def duration_mins_secs(self) -> tuple[int, int]:
+        """``(minutes, seconds)`` between ``started_at`` and ``finished_at``."""
+        duration = self.finished_at - self.started_at if self.finished_at and self.started_at else 0
+        return divmod(int(duration), 60)
+
+
+def poll_until_terminal(
+    assignment_id: str,
+    machine,
+    *,
+    timeout: int,
+    interval: int,
+) -> "PollOutcome":
+    """Poll *machine*'s agent ``/status`` until *assignment_id* reaches a
+    terminal state, or *timeout* seconds elapse (#2743).
+
+    Never raises and never exits the process — callers decide how
+    ``"not_found"``/``"timeout"``/a non-zero ``exit_code`` map to their own
+    exit code and messaging (``coord wait`` and ``coord portal
+    decompose-chat --wait`` disagree on exactly that mapping today, which is
+    the point of factoring the polling itself out from underneath them).
+
+    A transient network error talking to the agent is logged and treated as
+    "keep polling", not a terminal outcome — matching both prior independent
+    implementations.
+    """
+    url = f"http://{machine.host}:{AGENT_PORT}/status"
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(url, timeout=10)
+            data = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException, OSError) as exc:
+            click.echo(f"warning: could not reach agent on {machine.name}: {exc}", err=True)
+            time.sleep(interval)
+            continue
+
+        completed_entry = next(
+            (
+                c
+                for c in data.get("completed", [])
+                if c.get("id") == assignment_id
+                # #2743: list_assignments() buckets anything that isn't
+                # RUNNING — including PENDING — into "completed". Guard
+                # against misreporting a not-yet-started assignment as
+                # terminal (not reachable today via the default spawn path,
+                # which sets RUNNING synchronously before /status can be
+                # polled, but cheap to harden against a future provider
+                # path that doesn't).
+                and c.get("status") != "pending"
+            ),
+            None,
+        )
+        if completed_entry is not None:
+            return PollOutcome(
+                status="completed",
+                exit_code=completed_entry.get("exit_code", -1),
+                branch=completed_entry.get("branch"),
+                started_at=completed_entry.get("started_at", 0),
+                finished_at=completed_entry.get("finished_at", 0),
+                error=completed_entry.get("error"),
+            )
+
+        active_ids = [a.get("id") for a in data.get("active", [])]
+        # A PENDING entry was excluded from `completed_entry` above (it isn't
+        # terminal yet) but it's still a real, known assignment — don't let
+        # its absence from `active` alone read as "vanished".
+        pending_ids = [
+            c.get("id") for c in data.get("completed", []) if c.get("status") == "pending"
+        ]
+        if assignment_id not in active_ids and assignment_id not in pending_ids:
+            return PollOutcome(status="not_found")
+
+        time.sleep(interval)
+
+    return PollOutcome(status="timeout")
 
     click.echo(success_message)
