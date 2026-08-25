@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from coord import __version__ as _coord_version
 from coord import sql
 from coord.platform_paths import default_coord_dir
 
@@ -29,18 +31,34 @@ _conn: sqlite3.Connection | None = None
 
 
 class ProductionDatabaseGuardError(RuntimeError):
-    """Raised when code running under pytest tries to open the live
-    ``~/.coord/coord.db`` (#1960).
+    """Raised when unreleased or test code tries to write to the live
+    ``~/.coord/coord.db`` (#1960, #2752).
 
-    The autouse ``coord_db`` fixture in ``tests/conftest.py`` overrides the
-    module-level singleton with an isolated ``:memory:`` connection before
-    every test body runs, so ``get_connection()`` normally never reaches
-    ``_open()`` at all during a test. This guard exists for the paths that
-    fixture can't reach: code that calls ``_open(DB_PATH)`` directly, a
-    subprocess the test spawned that re-imports ``coord.db`` fresh (pytest's
-    ``PYTEST_CURRENT_TEST`` env var is inherited by child processes by
-    default), or a test that closes the override and lets the singleton fall
-    back to the real path.
+    Two independent triggers share this class because they share a root
+    cause -- code that isn't the released binary reaching the one live
+    database -- and a caller catching one should catch the other the same
+    way:
+
+    1. **Under pytest** (#1960). The autouse ``coord_db`` fixture in
+       ``tests/conftest.py`` overrides the module-level singleton with an
+       isolated ``:memory:`` connection before every test body runs, so
+       ``get_connection()`` normally never reaches ``_open()`` at all during
+       a test. This guard exists for the paths that fixture can't reach:
+       code that calls ``_open(DB_PATH)`` directly, a subprocess the test
+       spawned that re-imports ``coord.db`` fresh (pytest's
+       ``PYTEST_CURRENT_TEST`` env var is inherited by child processes by
+       default), or a test that closes the override and lets the singleton
+       fall back to the real path.
+
+    2. **From a non-release build, for schema writes only** (#2752).
+       ``COORD_DIR`` defaults to ``~/.coord/`` regardless of cwd, so a
+       worktree checkout, an editable install, or any process running code
+       that was never tagged/released can still reach the live database with
+       no pytest involved. Reads are unaffected -- an already-caught-up
+       database opens exactly as before -- but stamping ``schema_version``
+       forward from unreleased code permanently skips any migration the
+       *released* code later adds under that same version number (the
+       mechanism behind #2675/#2709). See :func:`_is_release_build`.
     """
 
 
@@ -80,11 +98,52 @@ def _open(path: Path) -> sqlite3.Connection:
     # write at all. See _read_schema_version's docstring for why this read
     # is correct against both the pre-#2598 and post-#2598 table shapes.
     if _read_schema_version(conn) < _DB_SCHEMA_VERSION:
+        # #2752: this is the schema *write* path (_ensure_schema and, inside
+        # it, _set_schema_version) — the only place a process permanently
+        # stamps how caught-up ~/.coord/coord.db is. A non-release build
+        # reaching here would advance schema_version to whatever
+        # _DB_SCHEMA_VERSION *that branch* declares, and every later open by
+        # the actually-released code (same or lower version number) reads
+        # `_read_schema_version(conn) < _DB_SCHEMA_VERSION` as False and
+        # skips this block forever -- permanently missing any migration the
+        # release adds under that version number. Reads are unaffected: an
+        # already-caught-up database never reaches this branch at all.
+        if path == DB_PATH and not _is_release_build(_coord_version):
+            raise ProductionDatabaseGuardError(
+                "Refusing to write schema changes to the production "
+                f"coordinator database at {path} from a non-release build "
+                f"(coord.__version__={_coord_version!r} is not a clean "
+                "X.Y.Z release tag). Stamping schema_version forward from "
+                "unreleased code -- a worktree, an editable install, a "
+                "branch that bumped _DB_SCHEMA_VERSION -- permanently skips "
+                "any migration the released code later adds under that same "
+                "version number; see #2752 (and the incidents it names, "
+                "#2675/#2709). Fix: point COORD_DIR at a scratch directory "
+                "(e.g. `COORD_DIR=/tmp/coord-dev coord ...`) instead of "
+                "touching the live ~/.coord/coord.db from unreleased code."
+            )
         _ensure_schema(conn)
         _maybe_migrate_json(conn)
         _migrate_gate_order(conn)
         _backfill_orphaned_review_verdicts(conn)
     return conn
+
+
+# #2752: a clean, tagged release is always exactly "X.Y.Z" -- setuptools_scm
+# only emits anything else (a ".devN+g<sha>" local/dev suffix, a bare
+# "0+unknown" when no distribution resolves at all, or git-describe's
+# hyphenated "X.Y.Z-N-g<sha>[-dirty]" fallback from coord/__init__.py's
+# _live_scm_version) when HEAD is not exactly at a release tag -- a
+# worktree, an editable checkout, or a build with no install at all. See
+# coord/__init__.py's _resolve_version for how __version__ is computed.
+_RELEASE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def _is_release_build(version: str) -> bool:
+    """True when *version* is shaped like a clean ``X.Y.Z`` release tag,
+    with no dev/local-version suffix (#2752). See :data:`_RELEASE_VERSION_RE`
+    for why any other shape means "not built from a release tag"."""
+    return _RELEASE_VERSION_RE.fullmatch(version) is not None
 
 
 def override_connection(conn: sqlite3.Connection) -> None:

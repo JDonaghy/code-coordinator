@@ -2011,3 +2011,134 @@ class TestMigrateAddColumnsVersionGuard:
             "migration shipped without one) and update the pinned tuple "
             "above to match, in the same commit."
         )
+
+
+# ── #2752: non-release builds must not stamp the production DB's schema ─────
+#
+# #1960's guard only fires under pytest, so it can't prove anything about
+# _open()'s *other* trigger (a non-release build). These tests bypass the
+# pytest trigger deliberately (monkeypatch.delenv) so the version-shape guard
+# is exercised on its own, then restore DB_PATH via monkeypatch teardown.
+
+class TestIsReleaseBuild:
+    """Unit tests for the version-shape test itself -- no I/O."""
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "0.5.244",
+            "1.0.0",
+            "0.0.1",
+        ],
+    )
+    def test_clean_tag_is_a_release_build(self, version: str) -> None:
+        assert db_mod._is_release_build(version) is True
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "0.5.244.dev11+g98076d93e",  # setuptools_scm dev/local suffix
+            "0+unknown",  # #2010 sentinel: no distribution installed at all
+            "0.5.244-11-g98076d93e-dirty",  # git-describe fallback
+            "0.5.244-11-g98076d93e",  # git-describe fallback, not dirty
+            "0.0.0.dev0",  # setuptools_scm.get_version's own fallback_version
+        ],
+    )
+    def test_non_release_shapes_are_not_a_release_build(self, version: str) -> None:
+        assert db_mod._is_release_build(version) is False
+
+
+class TestProductionDatabaseGuardBlocksNonReleaseSchemaWrites:
+    def _bypass_pytest_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unset PYTEST_CURRENT_TEST so _open()'s #1960 pytest guard doesn't
+        fire first and mask the #2752 guard under test here."""
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    def test_dev_build_refuses_to_stamp_a_fresh_production_db(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A brand-new (unstamped) DB_PATH is exactly the schema-write path
+        -- _read_schema_version reads 0, which is < _DB_SCHEMA_VERSION -- so
+        a non-release build must refuse rather than stamp it forward."""
+        self._bypass_pytest_trigger(monkeypatch)
+        db_path = tmp_path / "coord.db"
+        monkeypatch.setattr(db_mod, "DB_PATH", db_path)
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.244.dev11+g98076d93e")
+
+        with pytest.raises(db_mod.ProductionDatabaseGuardError) as excinfo:
+            db_mod._open(db_path)
+
+        message = str(excinfo.value)
+        assert str(db_path) in message
+        assert "2752" in message
+
+    def test_dev_build_refuses_to_advance_a_stale_schema_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A database already stamped at an OLDER version (the #2675/#2709
+        shape: released code bumped _DB_SCHEMA_VERSION since this file was
+        last opened) must also refuse under a non-release build -- not just
+        a from-scratch database."""
+        self._bypass_pytest_trigger(monkeypatch)
+        db_path = tmp_path / "coord.db"
+        monkeypatch.setattr(db_mod, "DB_PATH", db_path)
+
+        # First, a release build opens it and stamps the current version.
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.244")
+        conn = db_mod._open(db_path)
+        conn.close()
+
+        # Simulate a released migration landing later under a higher
+        # version number by bumping the module's notion of "current".
+        monkeypatch.setattr(db_mod, "_DB_SCHEMA_VERSION", db_mod._DB_SCHEMA_VERSION + 1)
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.245.dev3+gdeadbeef")
+
+        with pytest.raises(db_mod.ProductionDatabaseGuardError):
+            db_mod._open(db_path)
+
+    def test_release_build_is_unaffected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sanity check: the guard is scoped to non-release builds -- a
+        release build must keep stamping a fresh DB exactly as before."""
+        self._bypass_pytest_trigger(monkeypatch)
+        db_path = tmp_path / "coord.db"
+        monkeypatch.setattr(db_mod, "DB_PATH", db_path)
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.244")
+
+        conn = db_mod._open(db_path)
+        try:
+            conn.execute("SELECT 1 FROM machines")
+        finally:
+            conn.close()
+
+    def test_dev_build_does_not_block_reads_of_an_already_current_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard is scoped to schema *writes* -- once a database is
+        already caught up to _DB_SCHEMA_VERSION, a non-release build can
+        still open (read) it, matching #2752's "reads stay unaffected"."""
+        self._bypass_pytest_trigger(monkeypatch)
+        db_path = tmp_path / "coord.db"
+        monkeypatch.setattr(db_mod, "DB_PATH", db_path)
+
+        # A release build brings it up to the current version first.
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.244")
+        conn = db_mod._open(db_path)
+        conn.close()
+
+        # A non-release build re-opening the now-current database must not
+        # raise -- there is no schema write left to guard against.
+        monkeypatch.setattr(db_mod, "_coord_version", "0.5.244.dev11+g98076d93e")
+        conn = db_mod._open(db_path)
+        try:
+            conn.execute("SELECT 1 FROM machines")
+        finally:
+            conn.close()
+
+    def test_dev_build_still_blocked_under_pytest_via_the_1960_guard(self) -> None:
+        """Without bypassing PYTEST_CURRENT_TEST, opening the real DB_PATH
+        still raises via the pre-existing #1960 guard -- this fix adds a
+        second trigger, it does not weaken the first."""
+        with pytest.raises(db_mod.ProductionDatabaseGuardError):
+            db_mod._open(db_mod.DB_PATH)
