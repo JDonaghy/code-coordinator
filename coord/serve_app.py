@@ -2544,6 +2544,69 @@ def _openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-decision": {
+            "post": {
+                "summary": (
+                    "#2749 (IL-3): the running-context ledger's agent-writable "
+                    "Decisions layer — propose/confirm/reject/supersede a "
+                    "decision for a portal submission, executed HERE on the "
+                    "daemon (same reason /portal-link is #2751's exception) — "
+                    "`coord portal decision ...`"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["propose", "confirm", "reject", "supersede"],
+                                    },
+                                    "submission_id": {"type": "string"},
+                                    "text": {"type": "string", "description": "propose only"},
+                                    "seq": {
+                                        "type": "integer",
+                                        "description": "confirm/reject/supersede only",
+                                    },
+                                    "reason": {"type": "string", "description": "reject only"},
+                                    "by_seq": {
+                                        "type": "integer",
+                                        "description": "supersede only",
+                                    },
+                                    "actor": {"type": "string"},
+                                },
+                                "required": ["action", "submission_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK — {'entry': <serialized DecisionEntry>}"},
+                    "400": {"description": "Bad portal-decision, or unknown action"},
+                },
+            },
+        },
+        "/portal-ledger": {
+            "get": {
+                "summary": (
+                    "#2749 (IL-3): render one submission's running-context "
+                    "briefing (Q&A pairs, current decisions, archived "
+                    "decisions, narrative) — `coord portal ledger`"
+                ),
+                "parameters": [
+                    {
+                        "name": "submission_id", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK — {'payload': <render_ledger_payload() dict>}"},
+                    "400": {"description": "Missing submission_id"},
+                },
+            },
+        },
         "/dispatched": {
             "post": {
                 "summary": "Record a thin client's review/fix/rework/merge dispatch (#590 Phase 2)",
@@ -5270,6 +5333,112 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_portal_decision(request: Request) -> Response:
+        # #2749 (IL-3): the running-context ledger's one agent-writable
+        # layer. A `type="work"`/decomposition-chat session recording its
+        # own decision can land on any machine that claims the
+        # submission's mapped repo(s) — same reason `/portal-link` (#2751)
+        # exists — so this executes the actual `portal_decisions` SQL
+        # write HERE, on the daemon, and hands back the resulting record.
+        from coord import portal_store  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        submission_id = body.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return JSONResponse(
+                {"error": "portal-decision needs a 'submission_id'"}, status_code=400
+            )
+        actor = body.get("actor") or ""
+        try:
+            if action == "propose":
+                entry = portal_store._propose_decision_local(
+                    submission_id, body.get("text") or "", actor=actor
+                )
+            elif action in ("confirm", "reject", "supersede"):
+                seq = body.get("seq")
+                if not isinstance(seq, int):
+                    return JSONResponse(
+                        {"error": "portal-decision needs an integer 'seq'"},
+                        status_code=400,
+                    )
+                if action == "confirm":
+                    entry = portal_store._transition_decision_local(
+                        submission_id, seq,
+                        state=portal_store.DECISION_CONFIRMED, actor=actor,
+                    )
+                elif action == "reject":
+                    entry = portal_store._transition_decision_local(
+                        submission_id, seq,
+                        state=portal_store.DECISION_REJECTED,
+                        reason=body.get("reason") or "", actor=actor,
+                    )
+                else:  # supersede
+                    by_seq = body.get("by_seq")
+                    if not isinstance(by_seq, int):
+                        return JSONResponse(
+                            {"error": "portal-decision supersede needs an integer 'by_seq'"},
+                            status_code=400,
+                        )
+                    entry = portal_store._transition_decision_local(
+                        submission_id, seq,
+                        state=portal_store.DECISION_SUPERSEDED,
+                        superseded_by_seq=by_seq, actor=actor,
+                    )
+            else:
+                return JSONResponse(
+                    {"error": f"unknown portal-decision action {action!r}"},
+                    status_code=400,
+                )
+        except ValueError as e:
+            return JSONResponse({"error": f"bad portal-decision: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-decision write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "entry": {
+                    "id": entry.id,
+                    "submission_id": entry.submission_id,
+                    "seq": entry.seq,
+                    "text": entry.text,
+                    "state": entry.state,
+                    "reason": entry.reason,
+                    "superseded_by_seq": entry.superseded_by_seq,
+                    "actor": entry.actor,
+                    "recorded_at": entry.recorded_at,
+                    "updated_at": entry.updated_at,
+                }
+            }
+        )
+
+    async def get_portal_ledger(request: Request) -> Response:
+        # #2749 (IL-3): render one submission's running-context briefing on
+        # the daemon and hand back the same JSON shape
+        # `coord.portal_store.render_ledger_payload` produces locally — a
+        # `type="work"`/decomposition-chat session on ANY machine can be
+        # briefed from this, not just the daemon host (the issue's "Done
+        # when" bar), same reasoning as `/portal-link` (#2751).
+        from coord import portal_store  # noqa: PLC0415
+
+        submission_id = request.query_params.get("submission_id")
+        if not submission_id:
+            return JSONResponse(
+                {"error": "submission_id is required"}, status_code=400
+            )
+        try:
+            payload = portal_store.render_ledger_payload(submission_id)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-ledger read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"payload": payload})
+
     async def post_dispatched(request: Request) -> Response:
         # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
         from coord import state  # noqa: PLC0415
@@ -7871,6 +8040,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
         Route("/portal-link", get_portal_link, methods=["GET"]),
         Route("/portal-link", post_portal_link, methods=["POST"]),
+        Route("/portal-decision", post_portal_decision, methods=["POST"]),
+        Route("/portal-ledger", get_portal_ledger, methods=["GET"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/uat-verdict", post_uat_verdict, methods=["POST"]),

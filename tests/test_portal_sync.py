@@ -1796,3 +1796,235 @@ class TestSyncTickStatusFold:
         result = sync_tick(client=client)
         assert result.status_queued == 0
         assert result.heartbeat_ok is True
+
+
+# ── consuming question answers (#2749, IL-3) ─────────────────────────────────
+#
+# The gap the issue describes directly: `question.answered` is pulled and
+# stored (`portal_events`) but nothing ever reads it — a client answers into
+# a void. These tests are the "Done when" bar: a pushed question, answered,
+# shows up paired in the ledger, the event is stamped `handled_at`, and the
+# submission's status moves off `needs-input`.
+
+
+def _question_answered_page(
+    *, revision: int = 1, answer: str = "Yes, offline-first.", answered_by: str = "jane",
+    event_id: str = "e1",
+) -> dict:
+    return {
+        "events": [
+            {
+                "id": event_id,
+                "submission_id": SUB,
+                "type": "question.answered",
+                "data": {"revision": revision, "answer": answer, "answered_by": answered_by},
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+
+
+def _push_and_apply_question(question: str = "Offline-first, yes or no?"):
+    """Enqueue a question and simulate the portal confirming it — the same
+    path `mark_applied`'s `kind == "question"` branch runs for real once
+    `_push` gets a 200 back, which is what writes the `question_pushed`
+    ledger entry `_consume_questions` later pairs an answer against."""
+    row = enqueue_question(SUB, question)
+    portal_store.mark_applied(row)
+    return row
+
+
+class TestQuestionAnswerFields:
+    def test_recognizes_dotted_kind_with_nested_data(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="question.answered",
+            occurred_at="", payload={"data": {"revision": 1, "answer": "Yes."}},
+            received_at=1.0,
+        )
+        fields = portal_sync._question_answer_fields(event)
+        assert fields == {
+            "answer": "Yes.", "question_revision": 1, "answered_by": "customer",
+        }
+
+    def test_recognizes_underscore_kind_and_top_level_fields(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="question_answered",
+            occurred_at="",
+            payload={"answer_text": "No thanks.", "revision": "2", "actor": "jane"},
+            received_at=1.0,
+        )
+        fields = portal_sync._question_answer_fields(event)
+        assert fields == {
+            "answer": "No thanks.", "question_revision": 2, "answered_by": "jane",
+        }
+
+    def test_non_matching_kind_is_none(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="signoff.approved",
+            occurred_at="", payload={}, received_at=1.0,
+        )
+        assert portal_sync._question_answer_fields(event) is None
+
+    def test_matching_kind_with_no_answer_text_is_none(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="question.answered",
+            occurred_at="", payload={"revision": 1}, received_at=1.0,
+        )
+        assert portal_sync._question_answer_fields(event) is None
+
+
+class TestConsumeQuestions:
+    def test_answer_is_ledgered_paired_with_its_question_and_event_marked_handled(
+        self,
+    ) -> None:
+        row = _push_and_apply_question()
+        client = FakeClient(pages=[_question_answered_page(revision=row.revision)])
+        result = sync_tick(client=client)
+
+        assert result.questions_consumed == 1
+        [q_entry, a_entry] = portal_store.ledger_for_submission(SUB)
+        assert q_entry.kind == portal_store.LEDGER_KIND_QUESTION_PUSHED
+        assert a_entry.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+        assert a_entry.question_revision == q_entry.question_revision == row.revision
+        assert a_entry.text == "Yes, offline-first."
+        assert a_entry.actor == "jane"
+        assert portal_store.unhandled_events() == []
+
+    def test_with_no_config_the_ledger_append_still_happens(self) -> None:
+        """Unlike `_consume_verdicts`, ledgering needs no repo/dispatch
+        context — only the courtesy status nudge does
+        (`_record_question_answer` degrades that alone to a no-op) — so
+        calling `_consume_questions` directly with `config=None` (the
+        documented `sync_tick(client=...)` bypass path) must still ledger
+        the answer and mark the event handled."""
+        row = _push_and_apply_question()
+        answer_event = _question_answered_page(revision=row.revision)["events"][0]
+        portal_store.record_events([answer_event])
+
+        consumed, errors = portal_sync._consume_questions(None)
+
+        assert consumed == 1
+        assert errors == []
+        assert any(
+            e.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+            for e in portal_store.ledger_for_submission(SUB)
+        )
+        assert portal_store.unhandled_events() == []
+
+    def test_an_answer_with_no_matching_pushed_question_is_still_ledgered(self) -> None:
+        """No `_push_and_apply_question` here — the revision in the answer
+        matches nothing in the outbox. The answer must still be recorded
+        (never dropped); it is just imperfectly paired."""
+        client = FakeClient(pages=[_question_answered_page(revision=999)])
+        result = sync_tick(client=client)
+
+        assert result.questions_consumed == 1
+        [entry] = portal_store.ledger_for_submission(SUB)
+        assert entry.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+        assert entry.question_revision == 999
+
+    def test_a_second_tick_does_not_re_ledger_the_same_event(self) -> None:
+        row = _push_and_apply_question()
+        client = FakeClient(pages=[_question_answered_page(revision=row.revision)])
+        first = sync_tick(client=client)
+        second = sync_tick(client=FakeClient())  # nothing new to pull
+
+        assert first.questions_consumed == 1
+        assert second.questions_consumed == 0
+        assert len(portal_store.ledger_for_submission(SUB)) == 2  # push + answer, not 3
+
+    def test_a_ledger_write_failure_freezes_the_watermark_for_retry(
+        self, monkeypatch
+    ) -> None:
+        """Unlike "no link on file" / "no matching queued question" (both
+        best-effort, never raise), a genuine `append_ledger_entry` failure
+        (a locked DB, say) is transient and deserves a retry — the watermark
+        must NOT advance past it, mirroring `_consume_verdicts`'s freeze."""
+        row = _push_and_apply_question()
+
+        real_append = portal_store.append_ledger_entry
+
+        def _boom(submission_id, kind, **kw):
+            if kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED:
+                raise RuntimeError("database is locked")
+            return real_append(submission_id, kind, **kw)
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", _boom)
+
+        client = FakeClient(pages=[_question_answered_page(revision=row.revision)])
+        result = sync_tick(client=client)
+
+        assert result.questions_consumed == 0
+        assert any("database is locked" in e for e in result.errors)
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+        # Retry once the DB is healthy again: the watermark was frozen, so
+        # the SAME event is reachable next tick rather than skipped.
+        monkeypatch.setattr(portal_store, "append_ledger_entry", real_append)
+        retry = sync_tick(client=FakeClient())
+        assert retry.questions_consumed == 1
+        assert portal_store.unhandled_events() == []
+
+    def test_answering_nudges_the_submission_off_needs_input(self, monkeypatch) -> None:
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        row = _push_and_apply_question()
+        needs_input_row = enqueue_status(SUB, "needs-input")
+        portal_store.mark_applied(needs_input_row)
+        assert portal_store.get_submission(SUB).last_status == "needs-input"
+
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "OPEN")],
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        client = FakeClient(pages=[_question_answered_page(revision=row.revision)])
+
+        result = sync_tick(config=config, client=client)
+
+        assert result.questions_consumed == 1
+        # The status fold queued (and, since this client never errors,
+        # drained) a folded status different from `needs-input` — the
+        # submission's CONFIRMED status is no longer `needs-input`.
+        assert portal_store.get_submission(SUB).last_status != "needs-input"
+
+    def test_no_link_on_file_does_not_block_the_ledger_append(self, monkeypatch) -> None:
+        """No `coord portal link` recorded — the courtesy status nudge has
+        nowhere to resolve to, but that must not stop the answer itself
+        from being ledgered and the event from being marked handled."""
+        row = _push_and_apply_question()
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        client = FakeClient(pages=[_question_answered_page(revision=row.revision)])
+
+        result = sync_tick(config=config, client=client)
+
+        assert result.questions_consumed == 1
+        assert portal_store.unhandled_events() == []
+
+    def test_a_large_non_actionable_backlog_does_not_starve_a_later_answer(self) -> None:
+        """Same #2509-style regression this issue explicitly calls out
+        (`portal_sync.py:1092`'s comment) reproduced for THIS consumer: 150
+        non-actionable events ahead of one real `question.answered` event
+        must not make it unreachable."""
+        row = _push_and_apply_question()
+        noise = [
+            {"id": f"noise-{i}", "submission_id": SUB, "type": "created"} for i in range(150)
+        ]
+        portal_store.record_events(noise)
+        answer_event = _question_answered_page(revision=row.revision)["events"][0]
+        portal_store.record_events([answer_event])
+
+        for _ in range(5):
+            consumed, _errors = portal_sync._consume_questions(
+                None, limit=50, pages=1
+            )
+            if consumed:
+                break
+
+        assert consumed == 1
+        assert any(
+            entry.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+            and entry.question_revision == row.revision
+            for entry in portal_store.ledger_for_submission(SUB)
+        )

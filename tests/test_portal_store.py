@@ -645,6 +645,126 @@ def test_daemon_portal_link_endpoints(tmp_path) -> None:
     )
 
 
+def test_daemon_portal_decision_endpoint(tmp_path) -> None:
+    """#2749 (IL-3): POST `/portal-decision` — the Decisions layer's one
+    agent-writable seam, mirroring `test_daemon_portal_link_endpoints`
+    above (#2751) — an agent session proposing/confirming/rejecting a
+    decision can land on any machine, not just the daemon host."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import decisions_for_submission
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-decision.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_submission = cli.post("/portal-decision", json={"action": "propose"})
+        proposed = cli.post(
+            "/portal-decision",
+            json={
+                "action": "propose",
+                "submission_id": "sub_1",
+                "text": "Ship offline-first v1",
+                "actor": "agent-1",
+            },
+        )
+        unknown_action = cli.post(
+            "/portal-decision",
+            json={"action": "nope", "submission_id": "sub_1"},
+        )
+        seq = proposed.json()["entry"]["seq"]
+        confirmed = cli.post(
+            "/portal-decision",
+            json={
+                "action": "confirm",
+                "submission_id": "sub_1",
+                "seq": seq,
+                "actor": "operator",
+            },
+        )
+        rejected_no_reason = cli.post(
+            "/portal-decision",
+            json={"action": "reject", "submission_id": "sub_1", "seq": seq, "reason": ""},
+        )
+
+    assert missing_submission.status_code == 400
+    assert proposed.status_code == 200
+    assert proposed.json()["entry"]["state"] == "proposed"
+    assert proposed.json()["entry"]["text"] == "Ship offline-first v1"
+    assert unknown_action.status_code == 400
+    assert confirmed.status_code == 200
+    assert confirmed.json()["entry"]["state"] == "confirmed"
+    assert rejected_no_reason.status_code == 400
+
+    [stored] = decisions_for_submission("sub_1")
+    assert stored.state == "confirmed"
+    assert stored.text == "Ship offline-first v1"
+
+
+def test_daemon_portal_ledger_endpoint(tmp_path) -> None:
+    """#2749 (IL-3): GET `/portal-ledger` — the read half of the "any
+    machine can be briefed" requirement, mirroring the two endpoint tests
+    above."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db, portal_store
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-ledger.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "Offline-first?"})
+    portal_store.mark_applied(row)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_param = cli.get("/portal-ledger")
+        found = cli.get("/portal-ledger", params={"submission_id": "sub_1"})
+        empty = cli.get("/portal-ledger", params={"submission_id": "sub_nope"})
+
+    assert missing_param.status_code == 400
+    assert found.status_code == 200
+    payload = found.json()["payload"]
+    assert payload["submission_id"] == "sub_1"
+    [qa] = payload["qa"]
+    assert qa["question"] == "Offline-first?"
+    assert qa["answers"] == []
+    assert empty.json()["payload"]["qa"] == []
+
+
 class TestEventsAfterVerdictWatermarkPagination:
     """#2723 (Phase C slice 5/7 of #1948): the seam migration replaced the
     `(received_at, rowid)` tiebreak `events_after_verdict_watermark` pages on
@@ -816,3 +936,249 @@ class TestEnqueueSeamMigration:
         first = enqueue("sub_1", "status", {"status": "a"})
         second = enqueue("sub_1", "status", {"status": "b"})
         assert second.id > first.id
+
+
+# ── #2749 (IL-3): the running-context ledger ─────────────────────────────────
+
+
+class TestLedger:
+    def test_append_and_read_back(self, coord_db) -> None:
+        from coord.portal_store import (
+            LEDGER_KIND_QUESTION_ANSWERED,
+            append_ledger_entry,
+            ledger_for_submission,
+        )
+
+        entry = append_ledger_entry(
+            "sub_1",
+            LEDGER_KIND_QUESTION_ANSWERED,
+            question_revision=1,
+            text="Yes, offline-first.",
+            actor="jane",
+            source_event_id="e1",
+            payload={"raw": True},
+        )
+        assert entry.seq == 1
+        [stored] = ledger_for_submission("sub_1")
+        assert stored == entry
+        assert stored.text == "Yes, offline-first."
+        assert stored.payload == {"raw": True}
+
+    def test_seq_is_monotonic_per_submission(self, coord_db) -> None:
+        from coord.portal_store import append_ledger_entry, ledger_for_submission
+
+        append_ledger_entry("sub_1", "question_pushed", text="Q1")
+        append_ledger_entry("sub_1", "question_pushed", text="Q2")
+        append_ledger_entry("sub_2", "question_pushed", text="other submission")
+
+        seqs = [e.seq for e in ledger_for_submission("sub_1")]
+        assert seqs == [1, 2]
+        assert [e.seq for e in ledger_for_submission("sub_2")] == [1]
+
+    def test_repeat_append_with_same_source_event_id_is_a_no_op(self, coord_db) -> None:
+        """#2749: idempotency for a consumer retrying after a crash between
+        the ledger append and `mark_event_handled` — a second append for the
+        same (submission_id, kind, source_event_id) must return the
+        ALREADY-stored row, not duplicate it."""
+        from coord.portal_store import append_ledger_entry, ledger_for_submission
+
+        first = append_ledger_entry(
+            "sub_1", "question_answered", text="Yes.", source_event_id="e1"
+        )
+        second = append_ledger_entry(
+            "sub_1", "question_answered", text="Yes.", source_event_id="e1"
+        )
+        assert first == second
+        assert len(ledger_for_submission("sub_1")) == 1
+
+    def test_no_source_event_id_never_dedupes(self, coord_db) -> None:
+        """Rows with no `source_event_id` (e.g. `question_pushed`, derived
+        from an outbox transition, not a pulled event) coexist freely — SQL's
+        NULL != NULL means the `UNIQUE(submission_id, kind, source_event_id)`
+        constraint never fires for them."""
+        from coord.portal_store import append_ledger_entry, ledger_for_submission
+
+        append_ledger_entry("sub_1", "question_pushed", text="Q1")
+        append_ledger_entry("sub_1", "question_pushed", text="Q2")
+        assert len(ledger_for_submission("sub_1")) == 2
+
+    def test_mark_applied_on_a_question_row_ledgers_it(self, coord_db) -> None:
+        """The ledger's own record of "a question as it was ACTUALLY
+        pushed" — written from `mark_applied`'s `kind == "question"` branch,
+        not at enqueue time (see that function's #2749 comment)."""
+        from coord.portal_store import (
+            LEDGER_KIND_QUESTION_PUSHED,
+            enqueue,
+            ledger_for_submission,
+            mark_applied,
+        )
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        assert ledger_for_submission("sub_1") == []  # not yet — only enqueued
+
+        mark_applied(row)
+        [entry] = ledger_for_submission("sub_1")
+        assert entry.kind == LEDGER_KIND_QUESTION_PUSHED
+        assert entry.question_revision == row.revision
+        assert entry.text == "Offline-first?"
+
+
+# ── #2749 (IL-3): decisions ──────────────────────────────────────────────────
+
+
+class TestDecisions:
+    def test_propose_then_confirm(self, coord_db) -> None:
+        from coord.portal_store import (
+            DECISION_CONFIRMED,
+            confirm_decision,
+            propose_decision,
+        )
+
+        proposed = propose_decision("sub_1", "Ship offline-first v1", actor="agent-1")
+        assert proposed.state == "proposed"
+        assert proposed.is_current
+
+        confirmed = confirm_decision("sub_1", proposed.seq, actor="operator")
+        assert confirmed.state == DECISION_CONFIRMED
+        assert confirmed.text == "Ship offline-first v1"  # text never rewritten
+        assert confirmed.is_current
+
+    def test_reject_requires_a_reason(self, coord_db) -> None:
+        from coord.portal_store import propose_decision, reject_decision
+
+        proposed = propose_decision("sub_1", "Native app")
+        with pytest.raises(ValueError, match="reason"):
+            reject_decision("sub_1", proposed.seq, "")
+        with pytest.raises(ValueError, match="reason"):
+            reject_decision("sub_1", proposed.seq, "   ")
+
+        rejected = reject_decision("sub_1", proposed.seq, "customer wants web-only")
+        assert rejected.state == "rejected"
+        assert rejected.reason == "customer wants web-only"
+        assert not rejected.is_current
+
+    def test_supersede_keeps_the_old_row_and_points_at_the_new_one(self, coord_db) -> None:
+        from coord.portal_store import propose_decision, supersede_decision
+
+        first = propose_decision("sub_1", "Use Postgres")
+        second = propose_decision("sub_1", "Use SQLite")
+        superseded = supersede_decision("sub_1", first.seq, by_seq=second.seq)
+
+        assert superseded.state == "superseded"
+        assert superseded.superseded_by_seq == second.seq
+        assert superseded.text == "Use Postgres"  # never rewritten
+        assert not superseded.is_current
+
+    def test_transitioning_an_unknown_seq_raises(self, coord_db) -> None:
+        from coord.portal_store import confirm_decision
+
+        with pytest.raises(ValueError, match="no decision"):
+            confirm_decision("sub_1", 999)
+
+    def test_decisions_for_submission_is_seq_ordered_and_scoped(self, coord_db) -> None:
+        from coord.portal_store import decisions_for_submission, propose_decision
+
+        propose_decision("sub_1", "first")
+        propose_decision("sub_1", "second")
+        propose_decision("sub_2", "unrelated")
+
+        texts = [d.text for d in decisions_for_submission("sub_1")]
+        assert texts == ["first", "second"]
+
+    def test_propose_routes_to_the_daemon_when_board_service_is_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2749: the one write path in this module that IS daemon-routed —
+        an agent session can land on any machine, not just the daemon host,
+        same reason `coord portal link` routes (#2751)."""
+        import coord.client as cc
+        from coord.portal_store import propose_decision
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+
+        def fake_post_record(svc, path, payload, **kw):
+            calls.append((path, payload))
+            return {
+                "entry": {
+                    "id": 1, "submission_id": payload["submission_id"], "seq": 1,
+                    "text": payload["text"], "state": "proposed", "reason": "",
+                    "superseded_by_seq": None, "actor": payload.get("actor", ""),
+                    "recorded_at": 100.0, "updated_at": 100.0,
+                }
+            }
+
+        monkeypatch.setattr(cc, "post_record", fake_post_record)
+
+        result = propose_decision("sub_1", "Routed decision", actor="agent-x")
+        assert calls == [
+            (
+                "/portal-decision",
+                {
+                    "action": "propose",
+                    "submission_id": "sub_1",
+                    "text": "Routed decision",
+                    "actor": "agent-x",
+                },
+            )
+        ]
+        assert result.text == "Routed decision"
+        assert result.actor == "agent-x"
+
+
+# ── #2749 (IL-3): narrative ───────────────────────────────────────────────────
+
+
+class TestNarrative:
+    def test_set_then_get(self, coord_db) -> None:
+        from coord.portal_store import get_narrative, set_narrative
+
+        set_narrative("sub_1", "The customer wants an offline-first mobile app.", actor="agent-1")
+        entry = get_narrative("sub_1")
+        assert entry.text == "The customer wants an offline-first mobile app."
+        assert entry.actor == "agent-1"
+
+    def test_missing_narrative_is_none(self, coord_db) -> None:
+        from coord.portal_store import get_narrative
+
+        assert get_narrative("nope") is None
+
+    def test_set_overwrites_wholesale_not_appends(self, coord_db) -> None:
+        from coord.portal_store import get_narrative, set_narrative
+
+        set_narrative("sub_1", "first draft")
+        set_narrative("sub_1", "second draft, replacing the first")
+        entry = get_narrative("sub_1")
+        assert entry.text == "second draft, replacing the first"
+
+
+# ── #2749 (IL-3): the question consumer's private watermark ─────────────────
+
+
+class TestQuestionWatermark:
+    def test_default_is_zero_sentinel(self, coord_db) -> None:
+        from coord.portal_store import get_question_watermark
+
+        assert get_question_watermark() == (0.0, "")
+
+    def test_set_then_get_round_trips(self, coord_db) -> None:
+        from coord.portal_store import get_question_watermark, set_question_watermark
+
+        set_question_watermark(200.0, "evt-42")
+        assert get_question_watermark() == (200.0, "evt-42")
+
+    def test_independent_of_the_verdict_watermark(self, coord_db) -> None:
+        from coord.portal_store import (
+            get_question_watermark,
+            get_verdict_watermark,
+            set_question_watermark,
+            set_verdict_watermark,
+        )
+
+        set_verdict_watermark(50.0, "verdict-evt")
+        set_question_watermark(75.0, "question-evt")
+        assert get_verdict_watermark() == (50.0, "verdict-evt")
+        assert get_question_watermark() == (75.0, "question-evt")

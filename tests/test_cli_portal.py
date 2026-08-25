@@ -86,7 +86,7 @@ def run(*args):
 def test_portal_group_is_registered():
     result = run("portal", "--help")
     assert result.exit_code == 0
-    for sub in ("status", "heartbeat", "push", "link"):
+    for sub in ("status", "heartbeat", "push", "link", "ledger", "decision"):
         assert sub in result.output
 
 
@@ -719,6 +719,102 @@ def test_outbox_is_empty_by_default():
     assert "outbox: empty" in result.output
 
 
+# ── #2749 (IL-3): the running-context ledger ────────────────────────────────
+
+
+def test_ledger_reports_nothing_by_default():
+    result = run("portal", "ledger", "sub_1")
+    assert result.exit_code == 0
+    assert "(none)" in result.output
+
+
+def test_ledger_renders_paired_qa_and_decisions():
+    from coord import portal_store
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "Offline-first?"})
+    portal_store.mark_applied(row)
+    portal_store.append_ledger_entry(
+        "sub_1",
+        portal_store.LEDGER_KIND_QUESTION_ANSWERED,
+        question_revision=row.revision,
+        text="Yes.",
+        actor="jane",
+        source_event_id="e1",
+    )
+    portal_store.propose_decision("sub_1", "Ship offline-first v1", actor="agent-1")
+    rejected = portal_store.propose_decision("sub_1", "Native app", actor="agent-1")
+    portal_store.reject_decision("sub_1", rejected.seq, "customer wants web-only")
+
+    result = run("portal", "ledger", "sub_1")
+    assert result.exit_code == 0
+    assert "Offline-first?" in result.output
+    assert "Yes." in result.output
+    assert "(by jane)" in result.output
+    assert "Ship offline-first v1" in result.output
+    assert "REJECTED: customer wants web-only" in result.output
+
+
+def test_ledger_json_shape():
+    from coord import portal_store
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "Offline-first?"})
+    portal_store.mark_applied(row)
+
+    result = run("portal", "ledger", "sub_1", "--json")
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["submission_id"] == "sub_1"
+    [qa] = payload["qa"]
+    assert qa["question"] == "Offline-first?"
+    assert qa["answers"] == []
+
+
+def test_ledger_shows_an_unanswered_question_as_open():
+    from coord import portal_store
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "SQLite or Postgres?"})
+    portal_store.mark_applied(row)
+
+    result = run("portal", "ledger", "sub_1")
+    assert result.exit_code == 0
+    assert "unanswered" in result.output
+
+
+# ── #2749 (IL-3): decision propose/confirm/reject/supersede ────────────────
+
+
+def test_decision_propose_confirm_reject_supersede_round_trip():
+    proposed = run("portal", "decision", "propose", "sub_1", "Use SQLite")
+    assert proposed.exit_code == 0
+    assert "proposed: sub_1 #1" in proposed.output
+
+    confirmed = run("portal", "decision", "confirm", "sub_1", "1")
+    assert confirmed.exit_code == 0
+    assert "confirmed: sub_1 #1" in confirmed.output
+
+    proposed2 = run("portal", "decision", "propose", "sub_1", "Use Postgres instead")
+    assert proposed2.exit_code == 0
+
+    superseded = run("portal", "decision", "supersede", "sub_1", "1", "2")
+    assert superseded.exit_code == 0
+    assert "superseded: sub_1 #1 -> #2" in superseded.output
+
+    rejected_no_reason = run("portal", "decision", "reject", "sub_1", "2", "")
+    assert rejected_no_reason.exit_code != 0
+    assert "reason" in rejected_no_reason.output
+
+    rejected = run("portal", "decision", "reject", "sub_1", "2", "overkill for v1")
+    assert rejected.exit_code == 0
+    assert "rejected: sub_1 #2" in rejected.output
+    assert "overkill for v1" in rejected.output
+
+
+def test_decision_confirm_unknown_seq_reports_cleanly():
+    result = run("portal", "decision", "confirm", "sub_1", "999")
+    assert result.exit_code != 0
+    assert "no decision" in result.output
+
+
 def test_events_reports_nothing_by_default():
     result = run("portal", "events")
     assert result.exit_code == 0
@@ -1269,3 +1365,134 @@ def test_link_write_and_read_route_through_the_daemon_on_a_thin_client(
     read = run("portal", "link", "coord", "3")
     assert read.exit_code == 0, read.output
     assert "submission_id=sub_abc123" in read.output
+
+
+# ── #2749 (IL-3): `decision` routes through the daemon instead of refusing ──
+
+
+def test_decision_propose_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    """Same #2751 exception as `link` above: an agent session's decision can
+    land on any machine, so `decision propose` must never call
+    `_refuse_if_thin_client` at all."""
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+
+    def _boom_post_record(svc, path, payload, **kw):
+        raise RuntimeError("simulated unreachable daemon")
+
+    monkeypatch.setattr(cc, "post_record", _boom_post_record)
+    try:
+        # Fails for an unrelated reason (the daemon POST above is stubbed to
+        # raise) — the point is only that the guard itself is never hit.
+        result = run("portal", "decision", "propose", "sub_1", "Use SQLite")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0
+    assert calls == []
+
+
+def test_ledger_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    """`ledger` is explicitly NOT thin-client-refused (#2749's "any machine"
+    requirement) — it routes a GET to `/portal-ledger` instead."""
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+
+    def _boom_get(url, *, params, headers, timeout):
+        raise RuntimeError("simulated unreachable daemon")
+
+    monkeypatch.setattr(cc.httpx, "get", _boom_get)
+    try:
+        result = run("portal", "ledger", "sub_1")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0
+    assert calls == []
+
+
+def test_ledger_routes_through_the_daemon_on_a_thin_client(thin_client, monkeypatch):
+    """End-to-end: `coord portal ledger` from a simulated thin client reads
+    `/portal-ledger` and renders the exact payload the daemon returns."""
+    from coord import client as cc
+
+    payload = {
+        "submission_id": "sub_1",
+        "qa": [{"question_revision": 1, "question": "Offline-first?", "answers": []}],
+        "unpaired_answers": [],
+        "decisions": [],
+        "archived_decisions": [],
+        "narrative": "",
+    }
+
+    def _fake_get(url, *, params, headers, timeout):
+        assert url.endswith("/portal-ledger")
+        assert params == {"submission_id": "sub_1"}
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"payload": payload}
+
+        return _Resp()
+
+    monkeypatch.setattr(cc.httpx, "get", _fake_get)
+
+    result = run("portal", "ledger", "sub_1")
+    assert result.exit_code == 0, result.output
+    assert "Offline-first?" in result.output
+    assert "(unanswered — needs-input)" in result.output
+
+    as_json = run("portal", "ledger", "sub_1", "--json")
+    assert as_json.exit_code == 0
+    assert json.loads(as_json.output) == payload
+
+
+def test_decision_propose_routes_through_the_daemon_on_a_thin_client(
+    thin_client, monkeypatch
+):
+    """End-to-end: `coord portal decision propose` from a simulated thin
+    client reaches `/portal-decision` instead of writing a local (wrong)
+    DB — the same shape as `test_link_write_and_read_route_through_the_daemon
+    _on_a_thin_client` above."""
+    from coord import client as cc
+
+    calls = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        calls.append((path, payload))
+        assert path == "/portal-decision"
+        return {
+            "entry": {
+                "id": 1, "submission_id": payload["submission_id"], "seq": 1,
+                "text": payload["text"], "state": "proposed", "reason": "",
+                "superseded_by_seq": None, "actor": payload.get("actor", ""),
+                "recorded_at": 100.0, "updated_at": 100.0,
+            }
+        }
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    result = run("portal", "decision", "propose", "sub_1", "Use SQLite")
+    assert result.exit_code == 0, result.output
+    assert "proposed: sub_1 #1" in result.output
+    assert len(calls) == 1
+    assert calls[0][1]["action"] == "propose"

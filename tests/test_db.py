@@ -1983,7 +1983,7 @@ class TestUatStateAndReasonColumns:
 # structural version: change either number in coord/db.py without updating
 # this pinned tuple to match, and it fails red -- see the test body for the
 # exact assertion.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (4, 71)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (5, 73)
 
 
 class TestMigrateAddColumnsVersionGuard:

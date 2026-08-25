@@ -203,7 +203,7 @@ def retry_on_locked(
 # next to this version number — append an entry without updating both and
 # that test fails red. If you touched `_migrate_add_columns`, bump this
 # AND update the pinned count in that test, in the same commit.
-_DB_SCHEMA_VERSION = 4
+_DB_SCHEMA_VERSION = 5
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -847,7 +847,99 @@ _SCHEMA_SQL = """
             last_heartbeat_at     REAL,
             last_error            TEXT NOT NULL DEFAULT '',
             verdict_watermark_at    REAL,
-            verdict_watermark_rowid TEXT
+            verdict_watermark_rowid TEXT,
+            question_watermark_at    REAL,
+            question_watermark_rowid TEXT
+        );
+
+        -- #2749 (IL-3, epic #2746): the running-context ledger — the record
+        -- half of the four-layer store issue #2749's design section
+        -- describes ("Ledger / Decisions / Narrative / Briefing"; not yet
+        -- folded into `docs/CUSTOMER_PORTAL.md`). Three tables, one per
+        -- durable layer (the fourth, Briefing, is
+        -- rendered on demand from the other three — `coord portal ledger`
+        -- — and owns no storage of its own).
+        --
+        -- `portal_ledger`: append-only, immutable, VERBATIM — everything
+        -- coord observes without asking an agent: a question exactly as it
+        -- was actually pushed, an answer exactly as it was actually
+        -- received. Never edited after insert; a correction is a new row,
+        -- not an UPDATE. `kind` is open-ended (only `question_pushed` /
+        -- `question_answered` are written as of this migration —
+        -- `coord.portal_store.mark_applied`'s `kind == "question"` branch
+        -- and `coord.portal_sync._consume_questions` respectively) so a
+        -- later consumer (a dispatch record, a verdict) can extend it
+        -- without a schema change. `seq` is a dense per-submission sequence
+        -- (mirrors `portal_outbox.seq`) so a ledger read is stably ordered
+        -- without depending on `id`/`rowid`, which #2723 established is not
+        -- portable. `question_revision` pairs an answer back to the
+        -- `portal_outbox` row (by its `revision`) that asked it — NULL for
+        -- a kind that isn't part of a Q&A pair. `source_event_id` is the
+        -- originating `portal_events.event_id` for a row derived from a
+        -- pulled event (`question_answered`) — NULL (not '') for a row
+        -- that isn't, e.g. `question_pushed`, so `UNIQUE(submission_id,
+        -- kind, source_event_id)` only actually dedupes the rows that need
+        -- it: SQL's NULL != NULL means any number of NULL-source rows for
+        -- the same submission/kind coexist freely, while a genuine replay
+        -- of the same pulled event (a crash between this insert and
+        -- `mark_event_handled`, #2749) is a harmless no-op via
+        -- `INSERT OR IGNORE` against that same constraint. `payload_json`
+        -- keeps the full observed record for anything the typed columns
+        -- above don't capture.
+        CREATE TABLE IF NOT EXISTS portal_ledger (
+            id                __AUTOPK_DDL__,
+            submission_id     TEXT    NOT NULL,
+            seq               INTEGER NOT NULL,
+            kind              TEXT    NOT NULL,
+            question_revision INTEGER,
+            text              TEXT    NOT NULL DEFAULT '',
+            actor             TEXT    NOT NULL DEFAULT '',
+            source_event_id   TEXT,
+            payload_json      TEXT    NOT NULL DEFAULT '{}',
+            recorded_at       REAL    NOT NULL,
+            UNIQUE(submission_id, seq),
+            UNIQUE(submission_id, kind, source_event_id)
+        );
+
+        -- `portal_decisions`: append-only ROWS with a mutable `state` —
+        -- unlike the ledger above, a decision's `state` legitimately
+        -- transitions in place (`proposed` -> `confirmed`, or ->
+        -- `superseded` / `rejected`) via UPDATE; what never happens is a
+        -- row being deleted or its `text` rewritten, so the history of
+        -- what was ever proposed is never lost even once superseded or
+        -- rejected. `reason` is required (enforced in
+        -- `coord.portal_store`, not here) when `state = 'rejected'` — a
+        -- rejection with no reason is exactly the "re-litigated in a later
+        -- iteration" failure mode #2749 exists to close.
+        -- `superseded_by_seq` names the replacement decision's own `seq`
+        -- once this row is superseded; NULL otherwise. `actor` is who
+        -- proposed/transitioned it (an agent session id, or an operator's
+        -- username for a hand-run `coord portal decision`).
+        CREATE TABLE IF NOT EXISTS portal_decisions (
+            id                 __AUTOPK_DDL__,
+            submission_id      TEXT    NOT NULL,
+            seq                INTEGER NOT NULL,
+            text               TEXT    NOT NULL,
+            state              TEXT    NOT NULL DEFAULT 'proposed',
+            reason             TEXT    NOT NULL DEFAULT '',
+            superseded_by_seq  INTEGER,
+            actor              TEXT    NOT NULL DEFAULT '',
+            recorded_at        REAL    NOT NULL,
+            updated_at         REAL    NOT NULL,
+            UNIQUE(submission_id, seq)
+        );
+
+        -- `portal_narrative`: the regenerable, disposable layer — one row
+        -- per submission, always OVERWRITTEN wholesale, never appended to
+        -- and never read back as an input to its own next generation (that
+        -- is the property that makes a wrong narrative merely regenerable
+        -- rather than, like a bad ledger row, unrecoverable). No history is
+        -- kept on purpose.
+        CREATE TABLE IF NOT EXISTS portal_narrative (
+            submission_id TEXT    PRIMARY KEY,
+            text          TEXT    NOT NULL DEFAULT '',
+            actor         TEXT    NOT NULL DEFAULT '',
+            recorded_at   REAL    NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
@@ -869,6 +961,13 @@ _SCHEMA_SQL = """
             ON portal_outbox(state, submission_id, seq);
         CREATE INDEX IF NOT EXISTS idx_portal_events_submission
             ON portal_events(submission_id);
+        -- #2749: `coord portal ledger`'s hot read is "every row for one
+        -- submission, in seq order" — see coord.portal_store.ledger_for_submission
+        -- / decisions_for_submission.
+        CREATE INDEX IF NOT EXISTS idx_portal_ledger_submission
+            ON portal_ledger(submission_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_portal_decisions_submission
+            ON portal_decisions(submission_id, seq);
 """
 
 
@@ -1254,6 +1353,20 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # NULL `uat_preview` regardless of this column).
     "ALTER TABLE assignments ADD COLUMN uat_state TEXT",
     "ALTER TABLE assignments ADD COLUMN uat_reason TEXT",
+    # #2749 (IL-3): the `question.answered` consumer's own read position
+    # into `portal_events` — same reason and same shape as
+    # `verdict_watermark_at`/`verdict_watermark_rowid` above (a private
+    # watermark independent of `handled_at`, so the never-marked backlog
+    # every OTHER event kind leaves behind cannot starve this consumer of
+    # events newer than it — see `coord.portal_sync._consume_questions`).
+    # NULL (read as `(0.0, "")`, before every real event) for every
+    # database predating this migration, which replays the full existing
+    # inbox exactly once on upgrade — safe, for the same reason replaying
+    # it is safe for the verdict consumer: `append_ledger_entry`'s
+    # `(submission_id, kind, source_event_id)` dedupe makes a re-observed
+    # `question_answered` event a no-op rather than a duplicate ledger row.
+    "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_at REAL",
+    "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_rowid TEXT",
 ]
 
 
