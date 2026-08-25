@@ -840,10 +840,16 @@ def busy_host_for_entry(
     assignment has closed out and the next has not landed yet — had no host
     this function could name, and an unattributable signal blocks every host
     (:attr:`Quiescence.fleet_wide_busy`). That was priced as a bounded cost:
-    some rolls defer. #2240 measured the real cost. The cordon a deferral
-    leaves standing is what stops the next leg (a review) from ever being
-    dispatched, so the "between legs" window — normally seconds — becomes
-    permanent, and the whole fleet sits idle behind it.
+    some rolls defer. #2240 measured the real cost — not, as first written
+    here, that a standing cordon stops the next leg from being dispatched
+    (a cordon is follow-on-blind; a review for in-flight work routes onto a
+    cordoned host fine, #2240 fix 2, corrected by #2741 after that claim was
+    found live in an operator-facing message it never should have reached).
+    The real cost is narrower and just as bad in practice: an unattributable
+    "between legs" row reads as fleet-wide busy for as long as the next leg
+    takes to be picked up and dispatched, so every propagate tick in that
+    window defers, and a deferral leaves the cordon standing rather than
+    lifting it — a normally-seconds-long window can span several ticks.
 
     So the between-legs case now falls back to the host that ran the entry's
     **last** assignment (*last_assignment_hosts*, any status). That is the

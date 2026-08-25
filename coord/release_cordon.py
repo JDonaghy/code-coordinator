@@ -124,12 +124,51 @@ the cooldown are both read back out of the propagation journal
 the very roll it gates — the same reason ``expires_at`` is stored rather
 than held in memory.
 
-The reasoning is deliberately blunt: **a cordon that has failed to produce
-quiescence twice running is not draining anything; it is blocking the work
-whose completion it is waiting for.** Trading two cordoned ticks for one
-uncordoned window costs at worst one deferred release cycle. Not trading
-costs the entire fleet, indefinitely, until a human runs
+The reasoning, as first written here, was deliberately blunt: "a cordon that
+has failed to produce quiescence twice running is not draining anything; it
+is blocking the work whose completion it is waiting for." Trading two
+cordoned ticks for one uncordoned window costs at worst one deferred release
+cycle. Not trading costs the entire fleet, indefinitely, until a human runs
 ``coord release cordon --clear --all``.
+
+#2741: THAT REASONING'S OWN PREMISE WAS FALSE, AND NOBODY CHECKED
+--------------------------------------------------------------------
+"It is blocking the work whose completion it is waiting for" was itself an
+assumption, and Fix 2 above had already made it false by construction: a
+cordon is follow-on-blind (:func:`coord.machine_pause.follow_on_paused_set`)
+— a review, fix, or smoke leg for work already in flight dispatches onto a
+cordoned host exactly as if it were not cordoned. Nothing here was ever
+gating leg dispatch; only :func:`coord.drive_queue.plan_tick`'s NEW-launch
+path reads the cordon at all.
+
+Live audit trail, 2026-08-24 (the v0.5.244 roll): two review dispatches
+landed on the two cordoned hosts, 8 and 17 minutes before the deadlock
+release fired — while :class:`DeadlockRelease`'s own message told the
+operator the opposite. The consequence was not cosmetic: the drain was
+converging normally (both drives were advancing through their pipelines,
+and the fleet reached genuine quiescence within the release-cooldown window
+that followed), and the release cut it short anyway, on a diagnosis that did
+not match the log. #2490's cooldown then suppressed re-cordoning for 30
+minutes on top of that, with no automatic path back to rolling.
+
+Two consecutive deferrals is not, on its own, evidence of anything —
+`propagate`'s tick interval is shorter than a normal review/fix/smoke leg
+takes to run, so a *healthy*, converging drain reliably produces at least one
+or two deferred ticks while it finishes. The distinguishing signal is
+**whether the fleet's own busy signal changed between those ticks**
+(:func:`deferral_pressure`'s ``progressed``, from comparing each deferred
+run's journalled :class:`~coord.release_propagate.Quiescence` snapshot
+against the others in the same streak): a different assignment, a different
+queue key, a different host — anything — means legs are completing and new
+ones are being dispatched, i.e. the drain is doing exactly what it is
+supposed to. Only a streak whose busy signal is *identical* on every single
+tick is the condition the blunt reasoning above actually describes, and
+:func:`plan_cordons` now requires that in addition to the tick count before
+it releases anything. Data too sparse or too old to carry a ``quiescence``
+snapshot degrades to the pre-#2741 behaviour (releases on count alone) —
+never the reverse, which would fail toward holding the fleet cordoned longer
+on missing data, the same wrong direction #2101's read-side failures already
+refuse everywhere else in this module.
 
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
@@ -579,6 +618,17 @@ class DeferralPressure:
     #: count. Defaults to `DEFAULT_MAX_DEFERRALS` for a record written before
     #: this field existed, or when there is no matched run at all.
     max_deferrals: int = DEFAULT_MAX_DEFERRALS
+    #: #2741: did the fleet's own busy signal (each deferred run's journalled
+    #: ``quiescence`` snapshot) actually CHANGE somewhere across this streak?
+    #: True only when at least two runs in the streak carried a readable
+    #: snapshot and those snapshots were not all identical — positive
+    #: evidence that legs are completing and new ones are being dispatched,
+    #: i.e. the drain is converging rather than stuck. Defaults to ``False``
+    #: (no evidence of progress, same as the pre-#2741 read) for a record too
+    #: old or too sparse to carry the snapshot at all — "unreadable degrades
+    #: toward the existing behaviour, never toward a stronger claim" is the
+    #: same rule the rest of this module follows on a read failure.
+    progressed: bool = False
 
     def cooling_for(self, now: float, cooldown: float) -> float:
         """Seconds of cooldown left at *now*; 0 when cordoning may resume."""
@@ -592,6 +642,7 @@ class DeferralPressure:
             "last_release_at": self.last_release_at,
             "max_deferrals": self.max_deferrals,
             "target_version": self.target_version,
+            "progressed": self.progressed,
         }
 
 
@@ -617,13 +668,17 @@ class DeadlockRelease:
         who = ", ".join(self.hosts) if self.hosts else "no host (already clear)"
         minutes = self.cooldown_seconds / 60.0
         return (
-            f"CORDON RELEASED (#2240): {self.consecutive_deferrals} consecutive "
-            f"propagate runs deferred {version} while holding a cordon, so the "
-            f"cordon is not draining anything — it is blocking the work whose "
-            f"completion it is waiting for (a review cannot be dispatched onto "
-            f"a cordoned host). Uncordoning {who} and not cordoning again for "
-            f"{minutes:.0f}m, so the fleet can finish that work; the roll will "
-            f"be retried after that."
+            f"CORDON RELEASED (#2240/#2741): {self.consecutive_deferrals} "
+            f"consecutive propagate runs deferred {version} while holding a "
+            f"cordon, and the fleet's busy signal held IDENTICAL across every "
+            f"one of them — no leg completed, no new leg dispatched. That is a "
+            f"genuine stall, not a cordon blocking dispatch (a review for "
+            f"in-flight work already routes onto a cordoned host regardless — "
+            f"only NEW drive launches are gated) and not a converging drain "
+            f"that just hasn't hit a quiescent tick yet. Uncordoning {who} and "
+            f"not cordoning again for {minutes:.0f}m, so whatever is actually "
+            f"wedged has a window to be noticed and fixed; the roll will be "
+            f"retried after that."
         )
 
     def to_dict(self) -> dict:
@@ -635,6 +690,43 @@ class DeadlockRelease:
             "target_version": self.target_version,
             "message": self.message,
         }
+
+
+def _busy_signature(record: Mapping[str, Any]) -> frozenset[tuple[str, str, str | None]] | None:
+    """A comparable snapshot of one journal record's busy signal (#2741).
+
+    *record* is one whole propagation-journal entry — the ``quiescence`` key
+    is :meth:`coord.release_propagate.Quiescence.to_dict`, written by the
+    shell on every run regardless of outcome. Reduced to
+    ``{(kind, subject, host), ...}`` — ``detail`` is deliberately left out:
+    it is free-form prose (e.g. "between legs — attributed to its last known
+    host"), and two runs describing the SAME still-running item in slightly
+    different words must not read as "different work", which is the false
+    positive the opposite mistake (comparing full dicts) would make.
+
+    ``None`` — not an empty set — when the snapshot cannot be read at all
+    (missing, malformed, or a ``busy`` list that is not a list): an empty
+    fleet really did have a quiescent moment recorded, which is itself
+    meaningful (arguably a converging drain), and must not be confused with
+    "we have no idea what this run saw".
+    """
+    quiescence = record.get("quiescence")
+    if not isinstance(quiescence, Mapping):
+        return None
+    busy = quiescence.get("busy")
+    if not isinstance(busy, list):
+        return None
+    out: set[tuple[str, str, str | None]] = set()
+    for item in busy:
+        if not isinstance(item, Mapping):
+            continue
+        host = item.get("host")
+        out.add((
+            str(item.get("kind") or ""),
+            str(item.get("subject") or ""),
+            str(host) if host else None,
+        ))
+    return frozenset(out)
 
 
 def deferral_pressure(
@@ -654,11 +746,12 @@ def deferral_pressure(
     * the last deadlock release — everything before it has already been paid
       for, so the count restarts from there and the cooldown takes over.
 
-    A deferral that cordoned NOTHING does not increment: the deadlock is
-    specifically "the cordon is blocking the work it is waiting for", and a
-    run that held no cordon cannot be blocking anything. It does not break
-    the walk either — a transient cordon-store write error in the middle of a
-    standoff must not silently reset the counter.
+    A deferral that cordoned NOTHING does not increment: the count is
+    specifically about a STANDING cordon that is producing no observable
+    change (see ``progressed`` below), and a run that held no cordon at all
+    has nothing standing to be stalled. It does not break the walk either —
+    a transient cordon-store write error in the middle of a standoff must not
+    silently reset the counter.
 
     #2240 review: also reads back the ``--cordon-max-deferrals`` value the
     *newest* matched run actually used (from that run's own journal record,
@@ -667,11 +760,21 @@ def deferral_pressure(
     :data:`DEFAULT_MAX_DEFERRALS` — an operator running propagate with a
     non-default ``--cordon-max-deferrals`` was otherwise shown "NOT DRAINING"
     at the wrong count.
+
+    #2741: also compares each cordoned deferral's journalled busy signal
+    (:func:`_busy_signature`) against the others in the streak and sets
+    :attr:`DeferralPressure.progressed` when they are not all identical — a
+    deferral count alone cannot distinguish a genuine deadlock from a drain
+    that is converging normally (legs completing, new ones dispatching) but
+    has simply not yet hit a fully-quiescent tick. See the module docstring's
+    "#2741" section for the incident that showed the count-alone read firing
+    while two reviews were actively dispatching onto the cordoned hosts.
     """
     want = normalize_version(target_version)
     consecutive = 0
     last_release_at = 0.0
     max_deferrals: int | None = None
+    signatures: list[frozenset[tuple[str, str, str | None]]] = []
     for raw in reversed(list(records)):
         if not isinstance(raw, Mapping):
             break
@@ -702,6 +805,14 @@ def deferral_pressure(
             break
         if cordons.get("cordoned"):
             consecutive += 1
+            signature = _busy_signature(raw)
+            if signature is not None:
+                signatures.append(signature)
+    # Positive evidence only: at least two readable snapshots in the streak,
+    # and they were not all the same. Fewer than two, or none readable at
+    # all, leaves `progressed` at its safe default (False) — see the field's
+    # own docstring for why that direction, not the reverse, is safe.
+    progressed = len(signatures) >= 2 and len(set(signatures)) > 1
     return DeferralPressure(
         consecutive=consecutive,
         last_release_at=last_release_at,
@@ -709,6 +820,7 @@ def deferral_pressure(
         max_deferrals=(
             DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
         ),
+        progressed=progressed,
     )
 
 
@@ -966,8 +1078,15 @@ def plan_cordons(
     * an unexpired **cooldown** from a previous release suppresses all new
       cordons — without it the next run re-cordons (the hosts really are
       still behind) and the deadlock re-arms 20 minutes later;
-    * ``consecutive >= max_deferrals`` **releases** every live cordon
-      (:class:`DeadlockRelease`) and starts that cooldown.
+    * ``consecutive >= max_deferrals`` AND NOT ``progressed`` **releases**
+      every live cordon (:class:`DeadlockRelease`) and starts that cooldown.
+      #2741: the count alone used to be sufficient, and that fired the
+      release while two reviews were actively dispatching onto the cordoned
+      hosts — a converging drain, not a deadlock. ``progressed`` (see
+      :func:`deferral_pressure`) is positive evidence the fleet's busy signal
+      changed somewhere in the streak; a streak that never released still
+      must also show that signal was IDENTICAL on every tick before this
+      concludes nothing is moving.
 
     Proven-current hosts are uncordoned in every one of these branches: that
     is never the wrong move, and skipping it during a cooldown would leave a
@@ -1050,7 +1169,11 @@ def plan_cordons(
             blocked_behind=blocked_behind,
             stuck_in_cooldown=stuck,
         )
-    if max_deferrals > 0 and pressure.consecutive >= max_deferrals:
+    if (
+        max_deferrals > 0
+        and pressure.consecutive >= max_deferrals
+        and not pressure.progressed
+    ):
         return CordonPlan(
             uncordon=to_uncordon,
             expired=expired,
