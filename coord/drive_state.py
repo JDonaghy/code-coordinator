@@ -783,6 +783,54 @@ def scratch_dir() -> Path:
     return base
 
 
+def _local_merge_queue_rows() -> list[dict]:
+    """``merge_queue`` rows straight from the local DB (daemon-host path only).
+
+    #2740: same #2040 gap, one table over — and the more serious half of it.
+    :meth:`BoardFetcher._fetch_local`'s standalone payload used to carry no
+    ``merge_queue`` key at all (nor ``merge_plan``, which is computed, not
+    stored), so :func:`_merge_entry` always fell through both its `plan_entry`
+    and `raw_entry` lookups to ``None`` on the daemon host — regardless of
+    what the real merge-queue row said. That is a strictly worse failure than
+    the #1892/#2252/#2712 shadowing bugs it was mistaken for: those all have a
+    populated `raw_entry` to recover a reason FROM; this had no entry at all,
+    so `_decide_merge` saw `merge_status == "" `/`merge_reason == ""` and fell
+    into the bounded empty-status retry — burning the whole
+    `--max-merge-attempts` budget on a block (e.g. a stale smoke verdict) its
+    OWN `coord merge --only` attempt was reporting in full, the whole time.
+
+    Mirrors :func:`coord.commands.drive_queue._local_merge_queue_rows` (#1891,
+    the identical top-up for the drive-QUEUE tick's own board view) — but that
+    one selects only ``repo_name, issue_number, error``, enough for
+    ``build_board_view``'s narrower ``merge_ci_pending`` fact. This driver's
+    :func:`_merge_entry` also needs ``state`` (the retry/escalate switch in
+    ``coord.drive._decide_merge``), ``assignment_id`` (the fix-chain-aware
+    ``coord merge --only <aid>`` target), and ``pr_url`` (the escalation
+    record's proposed ``gh pr merge`` command) — see its raw-fallback branch.
+
+    ``merge_plan`` is deliberately NOT backfilled here, matching #1891's
+    reasoning: it needs a live ``config``/``ci_store`` to compute (a real `gh
+    api` round trip this read-only local fetch must never make), and
+    :func:`_merge_entry` already falls back to this raw table's columns
+    whenever the plan section is absent — exactly the fallback this top-up
+    feeds.
+
+    Fail-soft: an unreadable/absent table degrades to ``[]``, independently of
+    :func:`_local_issue_rows`'s own table — one bad table must not blank the
+    other's top-up.
+    """
+    from coord.db import get_connection  # noqa: PLC0415
+
+    try:
+        rows = get_connection().execute(
+            "SELECT repo_name, issue_number, state, error, assignment_id, "
+            "pr_url FROM merge_queue"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return []
+    return [dict(r) for r in rows]
+
+
 def _local_issue_rows() -> list[dict]:
     """``issues`` rows straight from the local DB (daemon-host path only).
 
@@ -871,7 +919,7 @@ class BoardFetcher:
     def _fetch_local() -> dict:
         """Standalone (daemon host, no ``board_service`` configured): the old
         ``{assignments, round_number}`` write-serialization, topped up with
-        the two keys :func:`project`'s #1453 oracle-loop resolution needs.
+        the keys :func:`project` needs that it never carried.
 
         #2040: this used to be JUST ``serialize_board(read_board())`` —
         ``coord.client.serialize_board`` is the ``POST /board`` UPSERT
@@ -882,6 +930,19 @@ class BoardFetcher:
         defeating the #1453 oracle gate (every oracle-opted-in issue read as
         a plain "normal drive" and dead-ended on the #1138 refusal #1453
         exists to prevent).
+
+        #2740: the identical gap applied to ``merge_queue`` (and, by
+        extension, ``merge_plan``) — never topped up here, so on the daemon
+        host :func:`_merge_entry` always saw ``payload.get("merge_queue")``
+        as ``None`` and returned ``None`` outright, no matter how populated
+        the real queue row was. Unlike the #1892/#2252/#2712 raw-row
+        recoveries (which all assume a *populated* raw entry to recover a
+        sharper reason FROM), this left `_decide_merge` with NOTHING —
+        `merge_status`/`merge_reason` both empty — so it fell into the
+        bounded empty-status retry and burned the whole
+        `--max-merge-attempts` budget on a block (e.g. a stale smoke verdict)
+        its own `coord merge --only` attempt was reporting in full the entire
+        time. See :func:`_local_merge_queue_rows`.
 
         Deliberately NOT ``coord.dao.SqliteStore`` (what ``coord.serve_app``'s
         ``/board`` handler uses): that class opens its OWN ``sqlite3``
@@ -895,13 +956,13 @@ class BoardFetcher:
         ``coord drive``/``drive-queue tick`` run IN-PROCESS with the rest of
         the CLI on the daemon host (unlike ``coord serve``, a separate
         process), so this has to go through the same connection every other
-        in-process reader does — :func:`_local_issue_rows` below queries it
-        directly, mirroring ``coord.commands.drive_queue._local_issue_rows``'s
-        established fail-soft top-up pattern for the same standalone-payload
-        gap, one table over.
+        in-process reader does — :func:`_local_issue_rows` and
+        :func:`_local_merge_queue_rows` below query it directly, mirroring
+        ``coord.commands.drive_queue``'s own established fail-soft top-up
+        pattern for the same standalone-payload gap.
 
         ``milestone_work_orders`` — the other key :func:`project` needs, and
-        the one no raw table backs — is derived from those same rows by
+        the one no raw table backs — is derived from the issue rows by
         :func:`coord.milestone_order.milestone_work_order_membership`; see
         its docstring for why a membership-only projection (no readiness) is
         the right scope for this call site.
@@ -915,6 +976,7 @@ class BoardFetcher:
         payload["milestone_work_orders"] = milestone_work_order_membership(
             payload["issues"]
         )
+        payload["merge_queue"] = _local_merge_queue_rows()
         return payload
 
     def _cache_path(self, url: str) -> Path:

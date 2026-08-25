@@ -1253,14 +1253,14 @@ def test_fetch_tops_up_issues_and_milestone_work_orders_when_standalone(
 
 def test_fetch_local_issue_rows_fail_soft_on_an_unreadable_table(monkeypatch, tmp_path):
     """Mirrors ``coord.commands.drive_queue._local_issue_rows``'s fail-soft
-    posture: an unreadable ``issues`` table degrades the board read to `[]`
-    (and therefore no ``milestone_work_orders``) rather than aborting the
-    whole ``coord drive`` poll.
+    posture: an unreadable ``issues``/``merge_queue`` table degrades the
+    board read to `[]` (and therefore no ``milestone_work_orders``) rather
+    than aborting the whole ``coord drive`` poll.
     """
 
     class _BrokenConn:
         def execute(self, *a, **k):
-            raise sqlite3.OperationalError("no such table: issues")
+            raise sqlite3.OperationalError("no such table")
 
     monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
     monkeypatch.setattr("coord.board_service.read_board", lambda: "BOARD")
@@ -1270,6 +1270,62 @@ def test_fetch_local_issue_rows_fail_soft_on_an_unreadable_table(monkeypatch, tm
     payload = BoardFetcher(cache_dir=tmp_path).fetch()
     assert payload["issues"] == []
     assert payload["milestone_work_orders"] == []
+    assert payload["merge_queue"] == []
+
+
+def test_fetch_tops_up_merge_queue_when_standalone(monkeypatch, tmp_path, coord_db):
+    """#2740: the daemon-host path used to carry no ``merge_queue`` key at
+    all (nor ``merge_plan``, which is computed live and never backfilled
+    here), so :func:`_merge_entry` fell through both its `plan_entry` and
+    `raw_entry` lookups to ``None`` — no matter what the real queue row said
+    — and `_decide_merge` saw a bare `merge_status == ""`/`merge_reason ==
+    ""`. That is the shape reported in #2740: a drive burns its whole
+    `--max-merge-attempts` budget on a stale smoke verdict its own `coord
+    merge --only` attempt printed in full, because the projection this
+    driver actually polls never carried the queue row at all.
+
+    Drives ``fetch()`` against the REAL ``merge_queue`` schema (the autouse
+    ``coord_db`` fixture's ``:memory:`` DB), then round-trips the resulting
+    payload through :func:`project` exactly like #2040's issues/milestone
+    top-up test — the projection seam #2712's tests never exercised (they
+    built ``IssueState`` directly, bypassing this entirely).
+    """
+    monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr("coord.board_service.read_board", lambda: "BOARD")
+    monkeypatch.setattr("coord.client.serialize_board", lambda b: {"from": b})
+
+    stale_reason = (
+        "smoke test verdict is stale: recorded against base 22865dc, "
+        "base is now 4e5138a — re-verify against the current base, then "
+        "`coord test a806489a3ffa --passed`"
+    )
+    coord_db.execute(
+        "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+        "branch, target_branch, issue_number, issue_title, state, pr_number, "
+        "pr_url, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "a806489a3ffa", REPO, REPO, "issue-2725-w5", "main", 2725,
+            "fake-worker-spawn-fixtures-are-posix", "pending", 2735,
+            "https://github.com/x/y/pull/2735", stale_reason,
+        ),
+    )
+    coord_db.commit()
+
+    payload = BoardFetcher(cache_dir=tmp_path).fetch()
+    assert [q["issue_number"] for q in payload["merge_queue"]] == [2725]
+    assert payload["merge_queue"][0]["error"] == stale_reason
+
+    # And the whole thing round-trips through `project()`: this is the
+    # #2740 regression — a raw-only `merge_queue` row (no `merge_plan`
+    # section, exactly the standalone-payload shape) must still resolve to a
+    # non-empty, classified `merge_reason`/`merge_status`, never `""`/`""`.
+    payload["assignments"] = [
+        row(assignment_id="a806489a3ffa", issue_number=2725)
+    ]
+    state = project(payload, REPO, 2725, make_config())
+    assert state.merge_status == "PENDING"
+    assert state.merge_reason == stale_reason
+    assert state.merge_aid == "a806489a3ffa"
 
 
 # ── #2024: the per-issue Test-stage policy the driver has to be able to see ──
