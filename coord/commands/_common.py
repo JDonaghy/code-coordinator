@@ -436,6 +436,8 @@ def _apply_label_change(
         click.echo(no_op_message)
         return
 
+    click.echo(success_message)
+
 
 @dataclass
 class PollOutcome:
@@ -546,5 +548,3 @@ def poll_until_terminal(
         time.sleep(interval)
 
     return PollOutcome(status="timeout")
-
-    click.echo(success_message)
