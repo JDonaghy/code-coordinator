@@ -36,6 +36,15 @@ over HTTP.
 Auth: optional shared bearer token (defence-in-depth on top of Tailscale ACLs).
 When no token is configured the endpoints are open (matching the agent/dashboard
 servers, which have no auth). Per-user auth is #282 / team-mode territory.
+
+Schema negotiation (#1943): every route accepts an optional ``X-Coord-Schema``
+integer request header. Absent, or ``1``, means today's shape -- byte-identical
+to the pre-#1943 response, forever, for every pinned client that never sends
+the header. A value outside ``[coord.dao.MIN_SCHEMA_VERSION,
+coord.dao.SCHEMA_VERSION]`` (or non-integer) is refused with a 4xx naming the
+supported range, never silently downgraded. ``/healthz`` advertises that range
+as ``schema_min``/``schema_max``. No v2 response body exists yet -- see
+``docs/STORE_SERVICE.md`` Phase B for what comes after this mechanism.
 """
 
 from __future__ import annotations
@@ -63,7 +72,7 @@ from starlette.routing import Route
 from coord import __version__, board_schema
 from coord.config import Config
 from coord.config_reload import reload_config_if_stale
-from coord.dao import SCHEMA_VERSION, CoordStore
+from coord.dao import MIN_SCHEMA_VERSION, SCHEMA_VERSION, CoordStore
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 
 # Default port for the coordination daemon (agent=7433, dashboard=7434).
@@ -280,6 +289,59 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path != "/healthz":
             if request.headers.get("authorization", "") != self._expected:
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+class _SchemaNegotiationMiddleware(BaseHTTPMiddleware):
+    """Parse ``X-Coord-Schema`` on every route and refuse anything unsupported (#1943).
+
+    This is the negotiation *mechanism* only -- no v2 response body exists
+    yet, so every in-range request still gets today's (v1) shape. The point
+    is to make that explicit and safe to build on:
+
+    * No header, or ``X-Coord-Schema: 1`` -- both mean "today's shape" and
+      are byte-identical to the pre-#1943 response. This is the path every
+      existing client (pinned agents included) takes forever, by construction.
+    * A non-integer value, or an integer outside
+      ``[MIN_SCHEMA_VERSION, SCHEMA_VERSION]`` -- a clear 4xx naming the
+      supported range. Never a silent downgrade to v1: that would look like
+      success while quietly shipping the wrong shape.
+    * An in-range integer is stamped onto ``request.state.schema_version``
+      for handlers to branch on once a v2 body exists (none do yet).
+    """
+
+    async def dispatch(self, request: Request, call_next):  # noqa: ANN001, ANN201
+        raw = request.headers.get("x-coord-schema")
+        if raw is None:
+            request.state.schema_version = MIN_SCHEMA_VERSION
+            return await call_next(request)
+        try:
+            version = int(raw)
+        except ValueError:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"X-Coord-Schema must be an integer, got {raw!r} "
+                        f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
+                    ),
+                    "schema_min": MIN_SCHEMA_VERSION,
+                    "schema_max": SCHEMA_VERSION,
+                },
+                status_code=400,
+            )
+        if version < MIN_SCHEMA_VERSION or version > SCHEMA_VERSION:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"unsupported X-Coord-Schema: {version} "
+                        f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
+                    ),
+                    "schema_min": MIN_SCHEMA_VERSION,
+                    "schema_max": SCHEMA_VERSION,
+                },
+                status_code=400,
+            )
+        request.state.schema_version = version
         return await call_next(request)
 
 
@@ -4294,7 +4356,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             _bust_board_cache()
 
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
-        return JSONResponse({"status": "ok", "schema_version": SCHEMA_VERSION})
+        # #1943: advertise the supported X-Coord-Schema range so a client can
+        # detect a too-old daemon before negotiating. schema_version stays
+        # for back-compat (pre-#1943 callers read it as "the" version) and
+        # is always equal to schema_max.
+        return JSONResponse(
+            {
+                "status": "ok",
+                "schema_version": SCHEMA_VERSION,
+                "schema_min": MIN_SCHEMA_VERSION,
+                "schema_max": SCHEMA_VERSION,
+            }
+        )
 
     async def board(request: Request) -> Response:
         # #1081: pick up a hand-edited coordinator.yml before computing the
@@ -8105,7 +8178,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # large payload can't overrun the TUI's fetch timeout on a slow link.  Gzip is
     # outermost so it compresses every response (incl. auth rejections); ureq on
     # the client decodes Content-Encoding: gzip transparently.
-    middleware = [Middleware(GZipMiddleware, minimum_size=1024)]
+    middleware = [
+        Middleware(GZipMiddleware, minimum_size=1024),
+        # #1943: negotiate X-Coord-Schema on every route. Starlette wraps
+        # user_middleware outer-to-inner in list order, so this runs right
+        # after gzip and *before* bearer auth (appended below) -- a bad
+        # X-Coord-Schema gets its 4xx without needing auth to pass first.
+        Middleware(_SchemaNegotiationMiddleware),
+    ]
     if token:
         middleware.append(Middleware(_BearerAuthMiddleware, token=token))
     return Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)

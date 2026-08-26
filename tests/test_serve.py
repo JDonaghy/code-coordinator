@@ -117,6 +117,67 @@ def test_serve_bearer_auth(file_db: Path, valid_config_path: Path):
         assert ok.status_code == 200
 
 
+# ── Schema negotiation (#1943) ─────────────────────────────────────────────────
+
+def test_schema_absent_is_byte_identical_to_explicit_v1(file_db: Path, valid_config_path: Path):
+    """No ``X-Coord-Schema`` header, and an explicit ``1``, must produce the
+    exact same bytes -- the golden-fixture requirement from #1943's acceptance
+    bar, not eyeballing.  Checked against both /board (JSON) and /healthz."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        no_header = cli.get("/board")
+        explicit_v1 = cli.get("/board", headers={"X-Coord-Schema": "1"})
+        assert no_header.status_code == explicit_v1.status_code == 200
+        assert no_header.content == explicit_v1.content
+
+        h_no_header = cli.get("/healthz")
+        h_explicit_v1 = cli.get("/healthz", headers={"X-Coord-Schema": "1"})
+        assert h_no_header.status_code == h_explicit_v1.status_code == 200
+        assert h_no_header.content == h_explicit_v1.content
+
+
+def test_schema_too_high_is_refused_naming_the_range(file_db: Path, valid_config_path: Path):
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board", headers={"X-Coord-Schema": "99"})
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "1" in body["error"]  # names the supported range
+        assert body["schema_min"] == 1
+        assert body["schema_max"] == 1
+
+
+def test_schema_non_integer_is_refused(file_db: Path, valid_config_path: Path):
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board", headers={"X-Coord-Schema": "banana"})
+        assert resp.status_code == 400
+        assert "integer" in resp.json()["error"]
+
+
+def test_healthz_advertises_schema_range(file_db: Path, valid_config_path: Path):
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        body = cli.get("/healthz").json()
+        assert body["schema_min"] == 1
+        assert body["schema_max"] == 1
+        assert body["schema_version"] == 1  # back-compat: == schema_max
+
+
+def test_schema_negotiation_runs_before_bearer_auth(file_db: Path, valid_config_path: Path):
+    """An unsupported schema is refused even without valid auth -- the 4xx
+    doesn't depend on the request clearing the bearer-auth layer first."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg, token="s3cret")
+    with TestClient(app) as cli:
+        resp = cli.get("/board", headers={"X-Coord-Schema": "99"})
+        assert resp.status_code == 400
+
+
 # ── Pause (#1563) ─────────────────────────────────────────────────────────────
 #
 # `coord pause` on a thin client used to write only to the operator's own
