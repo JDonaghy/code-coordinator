@@ -20,8 +20,11 @@ Deliberately out of scope (left to ``coord merge``'s own machinery):
 - The merge queue's CI/review/smoke gates — those are keyed on assignment ids
   and board rows, which a hand-authored branch by definition has neither of.
   ``coord pr merge`` instead runs its own, narrower CI-checks read (via
-  ``coord.ci_store``) so it is not a silent bypass, but it never touches
-  ``coord.merge_queue``.
+  ``coord.ci_store``, reusing ``coord.merge_queue``'s "does this repo expect
+  checks?"/#1877-conflict predicates rather than re-deriving them) so it is
+  not a silent bypass, but it never touches the queue's gate *machinery*
+  (``plan()``/``process()``). It does read ``coord.merge_queue.load_queue()``
+  (or the daemon's ``/board`` equivalent) for the queue-conflict check below.
 - Bringing coordinator-authored branches into the board/queue at all — they
   are deliberately outside it; this only gives them a seam-native route.
 """
@@ -176,11 +179,21 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
     rather than the merge queue's board-keyed gate machinery — #2790's
     design explicitly does not re-implement that here. Mirrors #1904's
     reading: a PR with zero reported checks is only "clear" when the repo's
-    CI backend itself confirms it never expected any (``expects_checks`` ==
-    False) — an empty list from a repo that does run CI reads as "checks
-    absent", not as a free pass.
+    CI backend itself confirms it never expected any — an empty list from a
+    repo that does run CI reads as "checks absent", not as a free pass.
+
+    #2790-review (non-blocking): reuses ``coord.merge_queue._ci_expects_checks``
+    for that "did this repo expect checks?" read — rather than calling
+    ``ci_store.expects_checks`` directly — and carries over the #1877
+    carve-out it guards: an empty check list is ALSO what GitHub reports for
+    a PR that conflicts with its base (no ``pull_request``-triggered workflow
+    can ever run for it), which is a different fact from "CI never ran on a
+    mergeable PR" and needs the opposite response — don't block here, let a
+    live merge attempt itself surface the real conflict.
     """
+    from coord import github_ops  # noqa: PLC0415
     from coord.ci_store import build_ci_store, failed_checks, in_flight_checks  # noqa: PLC0415
+    from coord.merge_queue import _ci_expects_checks  # noqa: PLC0415
 
     ci_store = build_ci_store(
         cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env,
@@ -190,9 +203,16 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
 
     checks = ci_store.list_checks_for_pr(repo_slug, number)
     if not checks:
-        if ci_store.expects_checks(repo_slug, number):
-            return f"{repo_slug}#{number} has no reported checks (checks absent)"
-        return None
+        if not _ci_expects_checks(ci_store, repo_slug, number):
+            return None
+        # #1877: an empty check list this repo otherwise expects checks for
+        # can still mean "PR conflicts with its base", not "CI never ran" —
+        # `check_pr_mergeable` fails closed to `None` (inconclusive) on any
+        # `gh` error, which this treats the same as "not confirmed
+        # conflicting" and falls through to the block below.
+        if github_ops.check_pr_mergeable(repo_slug, number) is False:
+            return None
+        return f"{repo_slug}#{number} has no reported checks (checks absent)"
 
     failed = failed_checks(checks)
     if failed:
@@ -205,6 +225,67 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
         return f"{repo_slug}#{number} has checks still running: {names}"
 
     return None
+
+
+def _active_merge_queue_entries() -> list[dict]:
+    """Merge-queue rows still capable of colliding with a ``coord pr merge``
+    target — read through the daemon's ``/board`` when a board service is
+    configured, never a bare local ``load_queue()`` (#2790-review).
+
+    The merge queue lives in the canonical, host-local DB. ``coord merge``
+    reroutes its *entire* execution to the daemon for exactly this reason
+    (``coord/commands/merge.py``'s ``COORD_MERGE_ON_DAEMON`` preamble,
+    ``board_service.daemon_reroute_target``) — on a thin client, a bare
+    ``coord.merge_queue.load_queue()`` would silently see an empty/stale
+    local sqlite DB instead of the fleet's real queue, so this "does the
+    branch already have an entry?" check would always pass and race a live
+    entry instead of refusing (the exact failure the issue's Design section
+    calls out). ``pr merge`` can't reuse ``daemon_reroute_target`` itself —
+    that reroutes the *whole command*, and this check is only the first of
+    several steps (CI-checks read, then the actual merge) — so this reuses
+    just the read half: ``board_service.resolve()`` + a ``/board`` GET,
+    mirroring how ``merge --plan`` reads the daemon's board rather than
+    calling ``/merge`` for a read-only path.
+
+    Filters out ``MERGED``/``SKIPPED`` rows: per
+    ``coord.merge_queue.prune_stale_queue_entries``, a ``MERGED`` row is kept
+    forever as history, never pruned — matching one by PR number/branch must
+    not refuse a merge that already happened, pointing at a long-dead
+    ``coord merge --only <id>`` (#2790-review, non-blocking).
+    """
+    from coord import board_service  # noqa: PLC0415
+    from coord.merge_queue import MERGED, SKIPPED  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    if svc is not None:
+        from coord.client import fetch_board_payload  # noqa: PLC0415
+
+        raw = fetch_board_payload(svc).get("merge_queue") or []
+        entries = [
+            {
+                "assignment_id": e.get("assignment_id"),
+                "repo_github": e.get("repo_github"),
+                "branch": e.get("branch"),
+                "pr_number": e.get("pr_number"),
+                "state": e.get("state"),
+            }
+            for e in raw
+        ]
+    else:
+        from coord.merge_queue import load_queue  # noqa: PLC0415
+
+        entries = [
+            {
+                "assignment_id": e.assignment_id,
+                "repo_github": e.repo_github,
+                "branch": e.branch,
+                "pr_number": e.pr_number,
+                "state": e.state,
+            }
+            for e in load_queue()
+        ]
+
+    return [e for e in entries if e["state"] not in (MERGED, SKIPPED)]
 
 
 @pr_group.command(
@@ -246,7 +327,6 @@ def pr_merge(
     slug = repo_entry.github
 
     from coord import github_ops  # noqa: PLC0415
-    from coord.merge_queue import load_queue  # noqa: PLC0415
 
     # #2790: stay out of the merge queue's way — a branch it already knows
     # about is its job to merge (`coord merge --only <id>`), not this
@@ -256,17 +336,17 @@ def pr_merge(
     head_ref = github_ops.get_pr_head_ref(slug, number)
     conflicting_entry = next(
         (
-            entry for entry in load_queue()
-            if entry.repo_github == slug
-            and (entry.pr_number == number or (head_ref and entry.branch == head_ref))
+            entry for entry in _active_merge_queue_entries()
+            if entry["repo_github"] == slug
+            and (entry["pr_number"] == number or (head_ref and entry["branch"] == head_ref))
         ),
         None,
     )
     if conflicting_entry is not None:
         click.echo(
             f"error: {slug}#{number} has a merge-queue entry "
-            f"({conflicting_entry.assignment_id}); use `coord merge --only "
-            f"{conflicting_entry.assignment_id}` instead",
+            f"({conflicting_entry['assignment_id']}); use `coord merge --only "
+            f"{conflicting_entry['assignment_id']}` instead",
             err=True,
         )
         sys.exit(1)
