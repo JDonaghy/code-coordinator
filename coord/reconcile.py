@@ -2452,15 +2452,25 @@ def _try_semantic_escalation(
     the plumbing isn't available, this entry already had its one escalation,
     or dispatch failed — in every ``None`` case the caller falls through to
     today's HUMAN_REQUIRED behaviour.
+
+    The "is the feature off" question is delegated to
+    :func:`coord.conflict_fix.semantic_escalation_disabled` rather than
+    re-derived here, so this function and the HUMAN_REQUIRED message built
+    in :func:`on_conflict_fix_done` can never disagree about *why* no
+    escalation was attempted (#2566 review).
     """
     if board is None or config is None:
         return None
-    pipeline = getattr(config, "pipeline", None)
-    if pipeline is None or not getattr(pipeline, "escalate_semantic_conflicts", False):
+
+    from coord.conflict_fix import (  # noqa: PLC0415
+        dispatch_conflict_fix,
+        semantic_escalation_disabled,
+    )
+
+    if semantic_escalation_disabled(config):
         return None
 
-    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
-
+    pipeline = getattr(config, "pipeline", None)
     model = getattr(pipeline, "semantic_conflict_model", None) or "fable"
     try:
         return dispatch_conflict_fix(
