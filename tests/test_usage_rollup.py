@@ -61,6 +61,7 @@ def _leg(
     dispatched_at: float,
     finished_at: float | None,
     cache_creation_tokens: int = 0,
+    num_turns: int = 0,
 ) -> dict:
     return {
         "issue_number": issue_number,
@@ -75,6 +76,7 @@ def _leg(
         "output_tokens": output_tokens,
         "cache_read_tokens": cache_read_tokens,
         "cache_creation_tokens": cache_creation_tokens,
+        "num_turns": num_turns,
         "dispatched_at": dispatched_at,
         "finished_at": finished_at,
     }
@@ -84,32 +86,32 @@ def _leg(
 L1 = _leg(
     issue_number=501, repo_name="alpha", type="work", model="sonnet", is_interactive=False,
     cost_usd=0.50, input_tokens=10_000, output_tokens=100_000, cache_read_tokens=1_000_000,
-    dispatched_at=_t(9, 0), finished_at=_t(9, 10),  # 600s
+    dispatched_at=_t(9, 0), finished_at=_t(9, 10), num_turns=40,  # 600s
 )
 L2 = _leg(
     issue_number=501, repo_name="alpha", type="review", model="sonnet", is_interactive=True,
     cost_usd=None, input_tokens=2_000, output_tokens=50_000, cache_read_tokens=500_000,
-    dispatched_at=_t(9, 20), finished_at=_t(9, 25),  # 300s
+    dispatched_at=_t(9, 20), finished_at=_t(9, 25), num_turns=10,  # 300s
 )
 L3 = _leg(
     issue_number=502, repo_name="beta", type="work", model="opus", is_interactive=False,
     cost_usd=2.00, input_tokens=20_000, output_tokens=200_000, cache_read_tokens=2_000_000,
-    dispatched_at=_t(10, 0), finished_at=_t(10, 20),  # 1200s
+    dispatched_at=_t(10, 0), finished_at=_t(10, 20), num_turns=80,  # 1200s
 )
 L4 = _leg(
     issue_number=502, repo_name="beta", type="smoke", model="sonnet", is_interactive=True,
     cost_usd=None, input_tokens=4_000, output_tokens=80_000, cache_read_tokens=800_000,
-    dispatched_at=_t(10, 30), finished_at=_t(10, 30) + 400,  # 400s = 6m40s
+    dispatched_at=_t(10, 30), finished_at=_t(10, 30) + 400, num_turns=15,  # 400s = 6m40s
 )
 L5 = _leg(
     issue_number=502, repo_name="beta", type="chat", model="(unknown)", is_interactive=True,
     cost_usd=None, input_tokens=1_000, output_tokens=30_000, cache_read_tokens=300_000,
-    dispatched_at=_t(11, 0), finished_at=_t(11, 0) + 200,
+    dispatched_at=_t(11, 0), finished_at=_t(11, 0) + 200, num_turns=5,
 )
 L6 = _leg(
     issue_number=502, repo_name="beta", type="work", model="sonnet", is_interactive=False,
     cost_usd=None, input_tokens=0, output_tokens=0, cache_read_tokens=0,
-    dispatched_at=_t(12, 0), finished_at=None,  # running
+    dispatched_at=_t(12, 0), finished_at=None,  # running; num_turns left at 0
 )
 
 ALL_LEGS = [L1, L2, L3, L4, L5, L6]
@@ -143,6 +145,8 @@ def test_rollup_by_issue_matches_contract_mock1() -> None:
     assert beta.open_legs == 1
     assert beta.unknown_model_legs == 1
     assert beta.has_unknown_model is True
+    # #2786: L3(80) + L4(15) + L5(5) + L6(0, running/never reported) = 100.
+    assert beta.turns == 100
 
     alpha = result.groups[IssueKey("alpha", 501)]
     assert alpha.legs == 2
@@ -154,6 +158,8 @@ def test_rollup_by_issue_matches_contract_mock1() -> None:
     assert alpha.duration_secs == pytest.approx(900.0)
     assert alpha.open_legs == 0
     assert alpha.unknown_model_legs == 0
+    # #2786: L1(40) + L2(10) = 50.
+    assert alpha.turns == 50
 
     total = result.total
     assert total.legs == 6
@@ -164,6 +170,8 @@ def test_rollup_by_issue_matches_contract_mock1() -> None:
     assert total.tokens.cache_read == 4_600_000
     assert total.duration_secs == pytest.approx(2700.0)
     assert total.open_legs == 1
+    # #2786: 100 (beta) + 50 (alpha) = 150.
+    assert total.turns == 150
 
 
 def test_rollup_by_repo_matches_by_issue_totals_for_this_fixture() -> None:
@@ -174,6 +182,36 @@ def test_rollup_by_repo_matches_by_issue_totals_for_this_fixture() -> None:
     result = rollup(ALL_LEGS, group_by="repo", window=window, pricing=FIXTURE_PRICING)
     assert result.groups["beta"].cost_total == pytest.approx(3.4520)
     assert result.groups["alpha"].cost_total == pytest.approx(1.4060)
+
+
+# ── #2786: num_turns accumulation ────────────────────────────────────────────
+
+
+def test_turns_defaults_to_zero_for_an_empty_group() -> None:
+    """A row predating the `assignments.num_turns` column (or a group with
+    no legs at all) reads as 0, not a missing attribute."""
+    assert GroupRollup(key=None).turns == 0
+
+
+def test_turns_accumulates_and_degrades_gracefully_when_the_key_is_absent() -> None:
+    """A row that never carries `num_turns` at all (e.g. hand-built board
+    payload from before #2786) contributes 0 rather than raising."""
+    window = window_today(now=NOW)
+    with_turns = _leg(
+        issue_number=1, repo_name="r", type="work", model="sonnet", is_interactive=False,
+        cost_usd=0.10, input_tokens=100, output_tokens=100, cache_read_tokens=1_000,
+        dispatched_at=_t(9, 0), finished_at=_t(9, 5), num_turns=7,
+    )
+    no_turns_key = _leg(
+        issue_number=1, repo_name="r", type="work", model="sonnet", is_interactive=False,
+        cost_usd=0.10, input_tokens=100, output_tokens=100, cache_read_tokens=1_000,
+        dispatched_at=_t(9, 10), finished_at=_t(9, 15), num_turns=3,
+    )
+    del no_turns_key["num_turns"]
+
+    result = rollup([with_turns, no_turns_key], group_by="repo", window=window, pricing=FIXTURE_PRICING)
+    assert result.groups["r"].turns == 7
+    assert result.groups["r"].legs == 2
 
 
 def test_rollup_by_stage_matches_contract_mock4() -> None:

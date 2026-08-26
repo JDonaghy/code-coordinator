@@ -1017,6 +1017,7 @@ pub fn make_assignment_typed(
         verdict_source: None,
         verdict_source_reason: None,
         stop_reason: None,
+        num_turns: None,
     }
 }
 

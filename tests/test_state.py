@@ -2767,6 +2767,86 @@ class TestUpdateAssignmentTokensRetriesLockContention:
         )
 
 
+class TestUpdateAssignmentTokensPersistsNumTurns:
+    """#2786: `num_turns` rides the same write as the four token columns —
+    parsed off the same final `result` event (`WorkerSummary.num_turns`,
+    coord/worker_events.py) but previously never reached the DB at all."""
+
+    def test_local_write_persists_num_turns(self, coord_db) -> None:
+        from coord.state import _update_assignment_tokens_local
+
+        _dispatch_for_cost(coord_db, "aid-turns-1")
+        _update_assignment_tokens_local(
+            "aid-turns-1", input_tokens=10_000, output_tokens=5_000,
+            cache_creation_tokens=100_000, cache_read_tokens=11_300_000,
+            num_turns=87,
+        )
+        row = coord_db.execute(
+            "SELECT num_turns, cache_read_tokens FROM assignments WHERE assignment_id=?",
+            ("aid-turns-1",),
+        ).fetchone()
+        assert row["num_turns"] == 87
+        assert row["cache_read_tokens"] == 11_300_000
+
+    def test_public_wrapper_persists_num_turns(self, coord_db) -> None:
+        """`update_assignment_tokens` (the notify.py/reconcile.py-facing
+        wrapper) threads `num_turns` through to the same local write when no
+        board service is configured."""
+        from coord.state import update_assignment_tokens
+
+        _dispatch_for_cost(coord_db, "aid-turns-2")
+        update_assignment_tokens(
+            "aid-turns-2", input_tokens=1, output_tokens=1,
+            cache_creation_tokens=1, cache_read_tokens=1, num_turns=42,
+        )
+        row = coord_db.execute(
+            "SELECT num_turns FROM assignments WHERE assignment_id=?",
+            ("aid-turns-2",),
+        ).fetchone()
+        assert row["num_turns"] == 42
+
+    def test_a_row_predating_the_column_reads_zero_not_null(self, coord_db) -> None:
+        """No backfill for historical rows (explicitly out of scope) — a
+        never-written row must read as 0, the same convention the four
+        token columns already use, not NULL."""
+        _dispatch_for_cost(coord_db, "aid-turns-3")
+        row = coord_db.execute(
+            "SELECT num_turns FROM assignments WHERE assignment_id=?",
+            ("aid-turns-3",),
+        ).fetchone()
+        assert row["num_turns"] == 0
+
+    def test_all_zero_call_is_a_no_op(self, coord_db) -> None:
+        """The existing guard (interactive/Max sessions produce no per-token
+        data and must not overwrite 0 with 0) still applies when every
+        argument, including `num_turns`, is 0 — no write is attempted at
+        all, not even one that sets num_turns to the same 0 it already is."""
+        from coord.state import _update_assignment_tokens_local
+
+        _dispatch_for_cost(coord_db, "aid-turns-4")
+        _update_assignment_tokens_local("aid-turns-4", num_turns=0)
+        row = coord_db.execute(
+            "SELECT num_turns FROM assignments WHERE assignment_id=?",
+            ("aid-turns-4",),
+        ).fetchone()
+        assert row["num_turns"] == 0
+
+    def test_num_turns_alone_is_enough_to_pass_the_guard(self, coord_db) -> None:
+        """A non-zero `num_turns` with all four token counts at 0 still
+        passes the "is there anything real to write" guard — the guard's
+        job is to reject an all-zero, no-signal call, not to require tokens
+        specifically."""
+        from coord.state import _update_assignment_tokens_local
+
+        _dispatch_for_cost(coord_db, "aid-turns-5")
+        _update_assignment_tokens_local("aid-turns-5", num_turns=3)
+        row = coord_db.execute(
+            "SELECT num_turns FROM assignments WHERE assignment_id=?",
+            ("aid-turns-5",),
+        ).fetchone()
+        assert row["num_turns"] == 3
+
+
 # ── #2689: issue-tracker seam writes ride out transient lock contention,
 # and never fail the call once the (irreversible) upstream GitHub write has
 # already landed ─────────────────────────────────────────────────────────

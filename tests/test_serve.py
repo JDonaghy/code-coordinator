@@ -2436,6 +2436,31 @@ def test_update_assignment_tokens_unset_writes_local(coord_db, monkeypatch):
     assert row["input_tokens"] == 200 and row["output_tokens"] == 75
 
 
+def test_update_assignment_tokens_routes_num_turns_when_service_set(coord_db, monkeypatch):
+    """#2786: `num_turns` rides the same /assignment-usage POST as the four
+    token counts when a board service is configured."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="tu03")
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.update_assignment_tokens("tu03", input_tokens=100, output_tokens=50, num_turns=12)
+    assert captured["path"] == "/assignment-usage"
+    assert captured["payload"]["num_turns"] == 12
+    # Routed → local row untouched.
+    row = coord_db.execute(
+        "SELECT num_turns FROM assignments WHERE assignment_id='tu03'"
+    ).fetchone()
+    assert row["num_turns"] is None or row["num_turns"] == 0
+
+
 def test_mark_assignment_interactive_routes_when_service_set(coord_db, monkeypatch):
     """mark_assignment_interactive() POSTs to /assignment-usage when board_service is set."""
     from coord import client as cc
@@ -2511,6 +2536,30 @@ def test_serve_assignment_usage_records_tokens(file_db, valid_config_path, rw_db
         "SELECT input_tokens, output_tokens FROM assignments WHERE assignment_id='du02'"
     ).fetchone()
     assert row["input_tokens"] == 300 and row["output_tokens"] == 120
+
+
+def test_serve_assignment_usage_records_num_turns(file_db, valid_config_path, rw_db):
+    """#2786: POST /assignment-usage with num_turns writes it to the daemon DB
+    alongside the token fields."""
+    _seed_running_assignment(rw_db, aid="du02b")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={
+                "assignment_id": "du02b",
+                "input_tokens": 300,
+                "output_tokens": 120,
+                "cache_creation_tokens": 20,
+                "cache_read_tokens": 10,
+                "num_turns": 9,
+            },
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    row = rw_db.execute(
+        "SELECT num_turns FROM assignments WHERE assignment_id='du02b'"
+    ).fetchone()
+    assert row["num_turns"] == 9
 
 
 def test_serve_assignment_usage_records_interactive(file_db, valid_config_path, rw_db):

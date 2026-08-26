@@ -285,7 +285,10 @@ def retry_on_locked(
 # next to this version number — append an entry without updating both and
 # that test fails red. If you touched `_migrate_add_columns`, bump this
 # AND update the pinned count in that test, in the same commit.
-_DB_SCHEMA_VERSION = 5
+#
+# #2786: bumped 5 -> 6 for the `assignments.num_turns` column appended to
+# `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 6
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1449,6 +1452,16 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # `question_answered` event a no-op rather than a duplicate ledger row.
     "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_at REAL",
     "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_rowid TEXT",
+    # #2786: worker-reported turn count, parsed off the final stream-json
+    # `result` event into `WorkerSummary.num_turns` (coord/worker_events.py)
+    # alongside the four token columns above, but never persisted until now.
+    # Cache-read cost is context-size × turns-per-leg — without this column
+    # there is no way to tell "long context" from "many turns" apart, which
+    # is exactly what made ~66% of `work`-leg spend unmeasurable. Default 0,
+    # same convention as the token columns: an interactive/Max session or a
+    # row predating this migration reads as 0, not NULL, so `coord usage`
+    # can sum it without a None-check.
+    "ALTER TABLE assignments ADD COLUMN num_turns INTEGER DEFAULT 0",
 ]
 
 

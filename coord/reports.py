@@ -1715,6 +1715,15 @@ USAGE_GROUP_BY_CHOICES = ("issue", "repo")
 
 # Columns depend on `group_by`: a repo-grouped row IS the whole repo, so it
 # carries no issue number and no title (same shape the retired panel used).
+#
+# #2786: `cache_read`/`cache_create`/`turns` were added alongside the
+# existing `tokens_in`/`tokens_out` — never folded into them. `tokens_in`
+# keeps meaning exactly what it always meant (raw uncached input, ~0.001% of
+# `work`-leg spend); redefining it to a sum would silently change every
+# historical number a dashboard already rendered. `cache_read` is the one
+# that actually carries the money (~66% of `work` spend, #2786) and is
+# listed right after the existing token columns so it isn't the column a
+# narrow client truncates first.
 USAGE_ISSUE_COLUMNS = [
     "issue",
     "repo",
@@ -1722,6 +1731,9 @@ USAGE_ISSUE_COLUMNS = [
     "legs",
     "tokens_in",
     "tokens_out",
+    "cache_read",
+    "cache_create",
+    "turns",
     "cost_captured",
     "cost_est",
     "cost_total",
@@ -1732,6 +1744,9 @@ USAGE_REPO_COLUMNS = [
     "legs",
     "tokens_in",
     "tokens_out",
+    "cache_read",
+    "cache_create",
+    "turns",
     "cost_captured",
     "cost_est",
     "cost_total",
@@ -1749,6 +1764,10 @@ _USAGE_COLUMN_META: dict[str, ColumnMeta] = {
     "legs": ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
     "tokens_in": ColumnMeta(id="tokens_in", label="Tok In", kind="int", align="right"),
     "tokens_out": ColumnMeta(id="tokens_out", label="Tok Out", kind="int", align="right"),
+    # #2786: the column that carries the money — see module comment above.
+    "cache_read": ColumnMeta(id="cache_read", label="Cache Rd", kind="int", align="right"),
+    "cache_create": ColumnMeta(id="cache_create", label="Cache Cr", kind="int", align="right"),
+    "turns": ColumnMeta(id="turns", label="Turns", kind="int", align="right", weight=0.6),
     "cost_captured": ColumnMeta(
         id="cost_captured", label="Cost $", kind="money", align="right"
     ),
@@ -1814,22 +1833,35 @@ def _usage_row_title(leg_rows: Sequence[Mapping[str, Any]]) -> str | None:
 
 def _usage_metrics(group: Any) -> dict[str, Any]:
     """The numeric half of a row (or of ``totals``) — identical for both."""
-    return {
+    turns = int(group.turns)
+    cache_read = int(group.tokens.cache_read)
+    cache_create = int(group.tokens.cache_creation)
+    metrics = {
         "legs": int(group.legs),
         "tokens_in": int(group.tokens.input),
         "tokens_out": int(group.tokens.output),
+        # #2786: cache_read is the column that carries the money (~66% of
+        # `work`-leg spend) — see the module comment above USAGE_ISSUE_COLUMNS.
+        "cache_read": cache_read,
+        "cache_create": cache_create,
+        "turns": turns,
         "cost_captured": round(float(group.cost_captured), _USAGE_COST_PLACES),
         "cost_est": round(float(group.cost_est), _USAGE_COST_PLACES),
         "cost_total": round(float(group.cost_total), _USAGE_COST_PLACES),
-        # Beyond `columns` — the contract explicitly allows extra row keys,
-        # and a client that wants the cache split or the open-leg count can
-        # have it without another column in an already-wide table.
-        "tokens_cache_read": int(group.tokens.cache_read),
-        "tokens_cache_creation": int(group.tokens.cache_creation),
         "duration_secs": round(float(group.duration_secs), 3),
         "open_legs": int(group.open_legs),
         "unknown_model_legs": int(group.unknown_model_legs),
     }
+    # #2786: tok/turn — beyond `columns` (the contract explicitly allows
+    # extra row keys), a derived figure that makes "long context" vs "many
+    # turns" directly readable without a client doing its own division. 0
+    # (not a crash / not a bare token total) when there's no turn data to
+    # divide by, e.g. every row predating the `num_turns` column.
+    total_tokens = (
+        metrics["tokens_in"] + metrics["tokens_out"] + cache_read + cache_create
+    )
+    metrics["tok_per_turn"] = round(total_tokens / turns) if turns > 0 else 0
+    return metrics
 
 
 def _usage_stage_breakdown(
@@ -2736,14 +2768,16 @@ _COMPLETED_NO_LEGS: dict[str, Any] = {
     "legs": 0,
     "tokens_in": 0,
     "tokens_out": 0,
+    "cache_read": 0,
+    "cache_create": 0,
+    "turns": 0,
     "cost_captured": 0.0,
     "cost_est": 0.0,
     "cost_total": 0.0,
-    "tokens_cache_read": 0,
-    "tokens_cache_creation": 0,
     "duration_secs": 0.0,
     "open_legs": 0,
     "unknown_model_legs": 0,
+    "tok_per_turn": 0,
 }
 
 

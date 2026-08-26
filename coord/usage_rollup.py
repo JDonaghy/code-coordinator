@@ -16,7 +16,8 @@ Row fields consumed (all optional except where noted; missing/None fields
 degrade gracefully rather than raising): ``issue_number``, ``issue_title``,
 ``repo_name``, ``type``, ``model``, ``is_interactive``, ``status``,
 ``cost_usd``, ``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
-``cache_creation_tokens``, ``dispatched_at``, ``finished_at``.
+``cache_creation_tokens``, ``num_turns`` (#2786), ``dispatched_at``,
+``finished_at``.
 
 Grouping dimensions (``group_by=``): ``"issue"`` (keyed by repo+issue number
 in the internal :func:`rollup` path — see :func:`_agg_key` for how the
@@ -380,6 +381,11 @@ class GroupRollup:
     duration_secs: float = 0.0
     open_legs: int = 0
     unknown_model_legs: int = 0
+    # #2786: sum of `num_turns` across every leg in the group — the other
+    # half of "context size vs turn count" (cache-read tokens are the
+    # numerator, turns is the denominator). 0 for rows predating the
+    # `assignments.num_turns` column, same convention as the token totals.
+    turns: int = 0
     # Retained per-leg rows for drill-down (e.g. CLI-1's `coord usage --issue N`
     # per-stage breakdown). Rows appear in the order they were accumulated.
     leg_rows: list[dict] = field(default_factory=list)
@@ -415,6 +421,7 @@ def _accumulate(group: GroupRollup, row: dict, pricing: PricingConfig) -> None:
     group.tokens.output += _to_int(row.get("output_tokens"))
     group.tokens.cache_read += _to_int(row.get("cache_read_tokens"))
     group.tokens.cache_creation += _to_int(row.get("cache_creation_tokens"))
+    group.turns += _to_int(row.get("num_turns"))
     group.duration_secs += duration
     if is_open:
         group.open_legs += 1
