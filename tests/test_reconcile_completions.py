@@ -483,18 +483,21 @@ def test_plan_capture_invoked_for_plan_type(monkeypatch) -> None:
 
 
 def test_token_counts_captured_from_entry(monkeypatch) -> None:
-    """#667: when the /status completed entry carries token counts the
-    reconcile path persists them via update_assignment_tokens."""
+    """#667/#2786: when the /status completed entry carries token counts (and
+    the turn count) the reconcile path persists them via
+    update_assignment_tokens."""
     captured_tokens: list[dict] = []
 
     def fake_update_tokens(assignment_id, *, input_tokens, output_tokens,
-                           cache_creation_tokens, cache_read_tokens) -> None:
+                           cache_creation_tokens, cache_read_tokens,
+                           num_turns=0) -> None:
         captured_tokens.append({
             "assignment_id": assignment_id,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_tokens": cache_creation_tokens,
             "cache_read_tokens": cache_read_tokens,
+            "num_turns": num_turns,
         })
 
     monkeypatch.setattr("coord.state.update_assignment_tokens", fake_update_tokens)
@@ -506,6 +509,7 @@ def test_token_counts_captured_from_entry(monkeypatch) -> None:
         "output_tokens": 300,
         "cache_creation_tokens": 50,
         "cache_read_tokens": 200,
+        "num_turns": 17,
     }
     reconcile_completed_assignments(
         _config(), board=_board(_running("w1", atype="work")),
@@ -520,6 +524,41 @@ def test_token_counts_captured_from_entry(monkeypatch) -> None:
     assert t["output_tokens"] == 300
     assert t["cache_creation_tokens"] == 50
     assert t["cache_read_tokens"] == 200
+    assert t["num_turns"] == 17
+
+
+def test_num_turns_absent_from_entry_defaults_to_zero(monkeypatch) -> None:
+    """#2786: an older agent that reports token counts but no ``num_turns``
+    still gets its tokens persisted — the turn count just lands as 0 rather
+    than blowing up the (best-effort, exception-swallowing) capture path."""
+    captured_tokens: list[dict] = []
+
+    def fake_update_tokens(assignment_id, *, input_tokens, output_tokens,
+                           cache_creation_tokens, cache_read_tokens,
+                           num_turns=-1) -> None:
+        captured_tokens.append({
+            "assignment_id": assignment_id,
+            "input_tokens": input_tokens,
+            "num_turns": num_turns,
+        })
+
+    monkeypatch.setattr("coord.state.update_assignment_tokens", fake_update_tokens)
+
+    entry = {  # no "num_turns" key — pre-#2786 agent payload
+        "id": "w1",
+        "status": "done",
+        "input_tokens": 1500,
+        "output_tokens": 300,
+    }
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [entry]},
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+
+    assert len(captured_tokens) == 1
+    assert captured_tokens[0]["input_tokens"] == 1500
+    assert captured_tokens[0]["num_turns"] == 0
 
 
 def test_token_capture_zero_skipped(monkeypatch) -> None:
