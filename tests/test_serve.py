@@ -144,9 +144,41 @@ def test_schema_too_high_is_refused_naming_the_range(file_db: Path, valid_config
         resp = cli.get("/board", headers={"X-Coord-Schema": "99"})
         assert resp.status_code == 400
         body = resp.json()
-        assert "1" in body["error"]  # names the supported range
+        # Exact substring, not just "contains a 1" -- that would also pass
+        # for a message that named the wrong value or the wrong range.
+        assert "unsupported X-Coord-Schema: 99 (supported: 1-1)" in body["error"]
         assert body["schema_min"] == 1
         assert body["schema_max"] == 1
+
+
+def test_schema_below_range_is_refused(file_db: Path, valid_config_path: Path):
+    """A value below ``MIN_SCHEMA_VERSION`` (e.g. ``0``) is refused the same
+    way as one above ``SCHEMA_VERSION`` -- both ends of the range check."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board", headers={"X-Coord-Schema": "0"})
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "unsupported X-Coord-Schema: 0 (supported: 1-1)" in body["error"]
+        assert body["schema_min"] == 1
+        assert body["schema_max"] == 1
+
+
+def test_schema_too_high_is_refused_on_mutating_route(file_db: Path, valid_config_path: Path):
+    """The middleware applies identically regardless of HTTP method -- an
+    unsupported schema on a mutating (non-GET) route is refused the same way
+    as on a GET, before the route handler (and any DB write) runs."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/pause",
+            headers={"X-Coord-Schema": "99"},
+            json={"machine": "does-not-matter"},
+        )
+        assert resp.status_code == 400
+        assert "unsupported X-Coord-Schema: 99 (supported: 1-1)" in resp.json()["error"]
 
 
 def test_schema_non_integer_is_refused(file_db: Path, valid_config_path: Path):
@@ -156,6 +188,33 @@ def test_schema_non_integer_is_refused(file_db: Path, valid_config_path: Path):
         resp = cli.get("/board", headers={"X-Coord-Schema": "banana"})
         assert resp.status_code == 400
         assert "integer" in resp.json()["error"]
+
+
+def test_schema_absent_and_explicit_v1_take_the_same_refusal_path(
+    file_db: Path, valid_config_path: Path
+):
+    """Regression guard for the split-brain the absent-header branch used to
+    have: absent used to be special-cased straight to ``MIN_SCHEMA_VERSION``
+    instead of running through the shared int()+range-check path an explicit
+    header takes. Simulate a retired v1 by monkeypatching
+    ``MIN_SCHEMA_VERSION`` above ``SCHEMA_VERSION`` and confirm an absent
+    header is refused exactly like an explicit ``X-Coord-Schema: 1`` would
+    be -- not silently accepted because it skipped the check.
+    """
+    import coord.serve_app as serve_app_module
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    original_min = serve_app_module.MIN_SCHEMA_VERSION
+    try:
+        serve_app_module.MIN_SCHEMA_VERSION = 2  # simulate v1 retired
+        with TestClient(app) as cli:
+            no_header = cli.get("/board")
+            explicit_v1 = cli.get("/board", headers={"X-Coord-Schema": "1"})
+        assert no_header.status_code == explicit_v1.status_code == 400
+        assert no_header.json() == explicit_v1.json()
+    finally:
+        serve_app_module.MIN_SCHEMA_VERSION = original_min
 
 
 def test_healthz_advertises_schema_range(file_db: Path, valid_config_path: Path):
