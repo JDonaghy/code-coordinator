@@ -175,6 +175,17 @@ def test_merge_stage_human_required_is_failed():
     assert sp.merge_stage_status_for([], entry, is_closed=False) == sp.FAILED
 
 
+def test_merge_stage_conflict_is_failed():
+    """#919 review: a real GitHub merge conflict is a genuine
+    resting/terminal merge_queue state (coord/merge_queue.py). Before this
+    fix `conflict` fell through to the CI-check / pending fallback below —
+    and a conflicting PR reliably reports zero CI checks (merge_queue.py
+    #1877), so the Merge stage box rendered Pending with a lit one-click
+    [Go] for an item that could never actually merge."""
+    entry = _entry(state="conflict")
+    assert sp.merge_stage_status_for([], entry, is_closed=False) == sp.FAILED
+
+
 def test_merge_stage_pruned_entry_falls_back_to_merged_work_assignment():
     """#775: the queue row can be pruned after the work assignment flips to
     status='merged' — that's still sufficient evidence Merge is Done."""

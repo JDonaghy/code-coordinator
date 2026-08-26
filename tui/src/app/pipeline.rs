@@ -6671,7 +6671,16 @@ impl CoordApp {
             Some("open") | Some("queued") => StageStatus::Active,
             // #241: HUMAN_REQUIRED (failed conflict-fix) — the merge needs a
             // human, so Failed.  `failed` (legacy / direct) is also Failed.
-            Some("failed") | Some("human_required") => StageStatus::Failed,
+            // #919 review: `conflict` is a genuine resting/terminal state
+            // (coord/merge_queue.py) reached whenever GitHub reports a real
+            // merge conflict and no conflict-fix worker is currently
+            // resolving it — without this arm it fell through to `_` below,
+            // where `ci_failed_for_entry` is reliably false for a
+            // conflicting PR (GitHub reports zero CI checks for one, per
+            // merge_queue.py's #1877 comment), so the Merge stage box rendered
+            // Pending with a lit one-click [Go] — exactly the false green
+            // #919 exists to close.
+            Some("failed") | Some("human_required") | Some("conflict") => StageStatus::Failed,
             _ => {
                 // A pending (not yet merged/active) entry whose PR has failing
                 // CI checks goes Failed so the Merge box is red at a glance —
@@ -9330,14 +9339,19 @@ impl CoordApp {
                 issue: issue.number,
             };
         }
-        // #919: an entry already parked `conflict`/`human_required` from a
-        // previous merge attempt must never read as Ready again just
-        // because the review verdict looks approved and no CI failure has
-        // been polled yet — neither of those checks is what discovered the
-        // conflict in the first place. `entry.error` carries the gate's own
-        // message (real GitHub conflict output, or the human-required
-        // reason), so surface that directly rather than a generic "blocked".
-        if matches!(entry.state.as_str(), "conflict" | "human_required") {
+        // #919: an entry already parked `conflict`/`human_required`/
+        // `skipped` from a previous merge attempt must never read as Ready
+        // again just because the review verdict looks approved and no CI
+        // failure has been polled yet — neither of those checks is what
+        // discovered the problem in the first place. `entry.error` carries
+        // the gate's own message (real GitHub conflict output, or the
+        // human-required/skipped reason), so surface that directly rather
+        // than a generic "blocked". `skipped` is included alongside
+        // conflict/human_required because the server maps all three to
+        // PLAN_NEEDS_ATTENTION (`coord/merge_queue.py::_state_to_plan_status`)
+        // and treats `skipped` as terminal alongside `merged`
+        // (`_RESOLVE_TERMINAL_STATES`) — it will not silently self-resolve.
+        if matches!(entry.state.as_str(), "conflict" | "human_required" | "skipped") {
             return PipelineMergeState::BlockedOnConflict {
                 issue: issue.number,
                 reason: entry
@@ -9357,7 +9371,11 @@ impl CoordApp {
         if let Some(plan_entry) =
             self.merge_plan_entry_for_issue(&issue.repo_slug, issue.number)
         {
-            if plan_entry.status == "BLOCKED" {
+            // #919 review: NEEDS_ATTENTION (conflict/human_required/skipped,
+            // per `_state_to_plan_status`) is just as much "not ready" as
+            // BLOCKED — checking only BLOCKED let a NEEDS_ATTENTION plan
+            // entry fall through to the checks below and read Ready.
+            if matches!(plan_entry.status.as_str(), "BLOCKED" | "NEEDS_ATTENTION") {
                 return PipelineMergeState::BlockedOnConflict {
                     issue: issue.number,
                     reason: plan_entry
