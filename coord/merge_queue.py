@@ -41,7 +41,7 @@ from coord.ci_store import (
     summarize,
     summarize_counts,
 )
-from coord.db import get_connection
+from coord.db import get_connection, retry_on_locked
 from coord.forge_availability import MERGE_GATE_REFUSAL_KINDS, record_merge_gate_refusal
 from coord.models import (
     CLOSES_ISSUE_TYPES,
@@ -3566,30 +3566,38 @@ def load_queue() -> list[QueuedMerge]:
 def save_queue(items: list[QueuedMerge]) -> None:
     """Replace the entire merge queue in the database."""
     conn = get_connection()
-    with conn:
-        sql.execute(conn, "DELETE FROM merge_queue")
-        for item in items:
-            sql.execute(
-                conn,
-                """INSERT INTO merge_queue (
-                    assignment_id, repo_name, repo_github, branch,
-                    target_branch, issue_number, issue_title, state,
-                    pr_number, pr_url, size, last_attempt, error, enqueued_at,
-                    assignment_type, required_gates, ci_infra_reruns,
-                    ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
-                    ci_unreadable_reruns, ci_fix_dispatches
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    item.assignment_id, item.repo_name, item.repo_github,
-                    item.branch, item.target_branch, item.issue_number,
-                    item.issue_title, item.state, item.pr_number, item.pr_url,
-                    item.size, item.last_attempt, item.error, item.enqueued_at,
-                    item.assignment_type, json.dumps(list(item.required_gates or [])),
-                    item.ci_infra_reruns, item.ci_stale_reruns,
-                    item.ci_flaky_reruns, item.ci_flaky_pending,
-                    item.ci_unreadable_reruns, item.ci_fix_dispatches,
-                ),
-            )
+
+    def _write() -> None:
+        with conn:
+            sql.execute(conn, "DELETE FROM merge_queue")
+            for item in items:
+                sql.execute(
+                    conn,
+                    """INSERT INTO merge_queue (
+                        assignment_id, repo_name, repo_github, branch,
+                        target_branch, issue_number, issue_title, state,
+                        pr_number, pr_url, size, last_attempt, error, enqueued_at,
+                        assignment_type, required_gates, ci_infra_reruns,
+                        ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
+                        ci_unreadable_reruns, ci_fix_dispatches
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        item.assignment_id, item.repo_name, item.repo_github,
+                        item.branch, item.target_branch, item.issue_number,
+                        item.issue_title, item.state, item.pr_number, item.pr_url,
+                        item.size, item.last_attempt, item.error, item.enqueued_at,
+                        item.assignment_type, json.dumps(list(item.required_gates or [])),
+                        item.ci_infra_reruns, item.ci_stale_reruns,
+                        item.ci_flaky_reruns, item.ci_flaky_pending,
+                        item.ci_unreadable_reruns, item.ci_fix_dispatches,
+                    ),
+                )
+
+    # #2802: ride out transient `database is locked` contention the same way
+    # every other write in the module does — a bare write here left a
+    # review-dispatch drain aborting mid-flight on lock contention with no
+    # retry, stranding downstream queue rows behind it.
+    retry_on_locked(_write)
 
 
 # ── Enqueue ──────────────────────────────────────────────────────────────

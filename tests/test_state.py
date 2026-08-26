@@ -503,6 +503,115 @@ class TestRecordDispatchedAssignmentLockContention:
             )
 
 
+class TestRecordTestVerdictLockContention:
+    """#2802: `_record_test_verdict_local`'s UPDATE(s) must ride out
+    transient `database is locked` collisions the same way every
+    neighbouring write in this module does (#2597/#2538) — the bug report
+    was an assignment stranded at `test_state='running'` forever because
+    the verdict write lost a lock race and raised straight through the
+    caller with nothing left to retry it, since the caller has already run
+    the test and has no reason to call back in.
+    """
+
+    class _FlakyConn:
+        """Like `TestRecordDispatchedAssignmentLockContention._FlakyConn`,
+        but also delegates `fetchone`/`fetchall`/etc. to the most recent
+        real cursor: `_record_test_verdict_local` issues a `SELECT` right
+        after its writes (to resolve the staleness anchor / audit-log
+        fields), and `coord.sql.execute` returns the object `.cursor()`
+        produced — this fake, standing in for the connection — as if it
+        were that cursor, so it must forward the fetch methods too."""
+
+        __module__ = "sqlite3"
+
+        def __init__(self, real_conn, fail_times: int) -> None:
+            self._real = real_conn
+            self._fail_times = fail_times
+            self.calls = 0
+            self._last_cursor = None
+
+        def cursor(self):
+            return self
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls <= self._fail_times:
+                import sqlite3
+
+                raise sqlite3.OperationalError("database is locked")
+            self._last_cursor = self._real.execute(*args, **kwargs)
+            return self._last_cursor
+
+        def commit(self):
+            return self._real.commit()
+
+        def __getattr__(self, name):
+            if self._last_cursor is not None:
+                return getattr(self._last_cursor, name)
+            raise AttributeError(name)
+
+    @staticmethod
+    def _seed_assignment(coord_db, *, assignment_id="aid-lock") -> None:
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, test_state) VALUES (?, 'm1', 'api', 1, 't', 'running')",
+            (assignment_id,),
+        )
+        coord_db.commit()
+
+    def test_retries_through_transient_lock_then_persists(
+        self, coord_db, monkeypatch
+    ) -> None:
+        self._seed_assignment(coord_db)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        record_test_verdict(assignment_id="aid-lock", test_state="passed")
+
+        # Two collisions absorbed before the write lands — `_write` issues
+        # more than one statement (test_state + the smoke_test mirror), so
+        # this checks "retried at all" rather than pinning an exact count
+        # that would drift with unrelated statements added to the writer.
+        assert flaky.calls >= 3
+        row = coord_db.execute(
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id=?",
+            ("aid-lock",),
+        ).fetchone()
+        assert row is not None
+        assert row["test_state"] == "passed", (
+            "a verdict must land once the lock clears — never stranded at "
+            "'running' by a lock collision"
+        )
+        assert row["smoke_test"] == "pass"
+
+    def test_raises_once_the_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A lock that never clears must still surface to the caller
+        (`notify.py`'s drain, which already knows how to log and move on)
+        rather than being silently swallowed here — swallowing it would
+        make the row look successfully updated when it wasn't."""
+        self._seed_assignment(coord_db, assignment_id="aid-lock-b")
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            record_test_verdict(assignment_id="aid-lock-b", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            ("aid-lock-b",),
+        ).fetchone()
+        assert row is not None
+        assert row["test_state"] == "running", (
+            "the exhausted-retry row must be left exactly where the existing "
+            "stuck-test_state='running' self-heal (coord/diagnose.py, "
+            "coord/merge_queue.py's staleness window) already knows to find it"
+        )
+
+
 class TestRecordDispatchedAssignmentBranch:
     """#557: record_dispatched_assignment must persist the branch column so
     coord reattach can find it for the remote push-back finalize."""

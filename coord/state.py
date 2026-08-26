@@ -1387,20 +1387,30 @@ def _record_test_verdict_local(
         # choice `coord test --skipped` makes.
 
     conn = get_connection()
-    sql.execute(conn,
-        "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
-        "WHERE assignment_id=?",
-        (test_state, test_reason, test_toolchain, assignment_id),
-    )
-    # Mirror to legacy smoke_test only for pass/fail, matching coord test /
-    # the TUI's record_test_verdict_conn.
-    if smoke_test is not None:
+
+    def _write() -> None:
         sql.execute(conn,
-            "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "
+            "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
             "WHERE assignment_id=?",
-            (smoke_test, smoke_test_reason, assignment_id),
+            (test_state, test_reason, test_toolchain, assignment_id),
         )
-    conn.commit()
+        # Mirror to legacy smoke_test only for pass/fail, matching coord test /
+        # the TUI's record_test_verdict_conn.
+        if smoke_test is not None:
+            sql.execute(conn,
+                "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "
+                "WHERE assignment_id=?",
+                (smoke_test, smoke_test_reason, assignment_id),
+            )
+        conn.commit()
+
+    # #2802: ride out transient `database is locked` contention the same way
+    # every neighbouring write in this module does (#2597) — a bare
+    # `sql.execute` here left the assignment pinned at `test_state='running'`
+    # with no self-heal when the write lost a lock race, since nothing else
+    # ever re-attempts a Test verdict once the caller has already run the
+    # test and computed the result.
+    retry_on_locked(_write)
 
     row = sql.execute(conn,
         "SELECT repo_name, issue_number, machine_name, branch FROM assignments "
