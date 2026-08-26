@@ -310,8 +310,11 @@ goes in flight after an entry was queued does not retroactively reorder it — #
 post-merge sibling sweep is the exact, zero-prediction backstop for those.
 
 **`file_groups` and `exclusive_files` do not exist.** Earlier revisions of this note offered
-them as optional power-user config; no such keys are read anywhere in `coord/`, and none
-appear in any `coordinator.yml`. Treat any reference to them as stale.
+them as optional power-user config; no such keys are read anywhere in `coord/`. That does
+not mean no `coordinator.yml` carries them — one or both can sit in a live config (a stray
+key validates clean; see `_parse_repos`'s unknown-key warning, #2783) as a comment
+describing a mechanism the coordinator does not implement. Treat any reference to them,
+wherever found, as stale.
 
 The exact, zero-prediction signal that *is* available is GitHub's own `mergeable` field
 (`GhOps.check_pr_mergeable`). #2246 put it on the post-merge sweep, where it catches the

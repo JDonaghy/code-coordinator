@@ -43,6 +43,13 @@ def config_cmd(config_path: Path) -> None:
         click.echo(f"  - {m.name} @ {m.host}")
         click.echo(f"    capabilities: {caps}")
         click.echo(f"    repos: {repos}")
+    # #2783 — non-fatal parse-time warnings (e.g. an unrecognised repos[]
+    # key). Advisory only: the config above loaded and is fully usable.
+    if cfg.warnings:
+        click.echo("")
+        click.echo("Warnings:")
+        for w in cfg.warnings:
+            click.echo(f"  ! {w}")
 
 
 def _ensure_coord_permissions(cwd: Path) -> None:

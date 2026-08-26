@@ -301,6 +301,60 @@ def test_self_dependency(tmp_path: Path) -> None:
         load(p)
 
 
+def test_repo_unknown_key_warns_but_does_not_raise(tmp_path: Path) -> None:
+    """#2783: an unrecognised repos[] key (e.g. the dead `exclusive_files`)
+    must not fail config loading — it is unread, not invalid."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    bogus_key: [x]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)  # must not raise ConfigError
+    assert len(cfg.warnings) == 1
+    assert "api" in cfg.warnings[0]
+    assert "bogus_key" in cfg.warnings[0]
+
+
+def test_repo_known_keys_produce_no_warnings(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    depends_on: []\n"
+        "    default_branch: main\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.warnings == []
+
+
+def test_config_cmd_surfaces_unknown_repo_key(tmp_path: Path) -> None:
+    """Black-box: `coord config` names the unrecognised key without extra flags."""
+    from click.testing import CliRunner  # noqa: PLC0415
+
+    from coord.cli import main  # noqa: PLC0415
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    bogus_key: [x]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    result = CliRunner().invoke(main, ["config", "--config", str(p)])
+    assert result.exit_code == 0
+    assert "bogus_key" in result.output
+    assert "api" in result.output
+
+
 _EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "coordinator.yml"
 
 
