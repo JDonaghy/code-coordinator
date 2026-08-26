@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 import warnings
 from dataclasses import asdict, replace
@@ -56,17 +57,41 @@ from coord import sql
 __all__ = ["_json_loads", "_decode_smoke_tests", "_row_to_assignment"]
 
 # ── Directory for logs and other non-DB state ─────────────────────────────────
-COORD_DIR = default_coord_dir()
+# COORD_DIR and the legacy file-path constants below are resolved lazily via
+# __getattr__ (#2781) rather than bound here at import time -- see the
+# function's docstring.
 
 # Legacy file-path constants — kept so that existing monkeypatch.setattr calls
 # don't blow up with AttributeError.  None of the functions read/write these.
-PROPOSALS_FILE = COORD_DIR / "pending_proposals.json"
-SPLITS_FILE = COORD_DIR / "pending_splits.json"
-DISPATCHED_FILE = COORD_DIR / "dispatched.json"
-NOTIFIED_FILE = COORD_DIR / "notified.json"
-BOARD_FILE = COORD_DIR / "board.json"
-SESSION_FILE = COORD_DIR / "session.json"
-PLANS_FILE = COORD_DIR / "plans.json"
+_LEGACY_FILE_NAMES = {
+    "PROPOSALS_FILE": "pending_proposals.json",
+    "SPLITS_FILE": "pending_splits.json",
+    "DISPATCHED_FILE": "dispatched.json",
+    "NOTIFIED_FILE": "notified.json",
+    "BOARD_FILE": "board.json",
+    "SESSION_FILE": "session.json",
+    "PLANS_FILE": "plans.json",
+}
+
+
+def __getattr__(name: str) -> Path:
+    """PEP 562 lazy fallback for ``COORD_DIR`` and the legacy file-path
+    constants above (#2781).
+
+    Pre-#2781 these were bound eagerly at import time, so ``$COORD_DIR`` set
+    *after* this module was first imported -- e.g. by a pytest fixture --
+    never reached them, unlike :func:`default_coord_dir` itself which is
+    "computed fresh on every call" by design. This only engages when the
+    name hasn't been bound directly in this module's namespace, so
+    ``monkeypatch.setattr(coord.state, "COORD_DIR", ...)`` (used throughout
+    the test suite) still takes priority exactly as before: Python calls
+    ``__getattr__`` only when normal attribute lookup fails.
+    """
+    if name == "COORD_DIR":
+        return default_coord_dir()
+    if name in _LEGACY_FILE_NAMES:
+        return sys.modules[__name__].COORD_DIR / _LEGACY_FILE_NAMES[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -407,7 +432,7 @@ def save_proposals(proposals: list[Proposal]) -> Path:
                     json.dumps(list(p.required_gates)),
                 ),
             )
-    return PROPOSALS_FILE  # Return legacy path for callers that check it
+    return sys.modules[__name__].PROPOSALS_FILE  # Return legacy path for callers that check it
 
 
 def load_proposals() -> list[Proposal]:
@@ -461,7 +486,7 @@ def save_split_proposals(splits: list[SplitProposal]) -> Path:
                        VALUES (?, ?, ?, ?)""",
                     (s.id, chunk.title, chunk.scope, json.dumps(list(chunk.files_likely))),
                 )
-    return SPLITS_FILE
+    return sys.modules[__name__].SPLITS_FILE
 
 
 def load_split_proposals() -> list[SplitProposal]:
@@ -3714,7 +3739,7 @@ def save_board(board: Board, *, config=None) -> Path:
             ("board_initialized", "1"),
             conflict_columns=["key"],
         )
-    return BOARD_FILE  # Legacy return value
+    return sys.modules[__name__].BOARD_FILE  # Legacy return value
 
 
 def load_board() -> Board | None:

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -24,10 +25,31 @@ from coord import __version__ as _coord_version
 from coord import sql
 from coord.platform_paths import default_coord_dir
 
-COORD_DIR = default_coord_dir()
-DB_PATH = COORD_DIR / "coord.db"
-
 _conn: sqlite3.Connection | None = None
+
+
+def __getattr__(name: str) -> Path:
+    """PEP 562 lazy fallback for ``COORD_DIR``/``DB_PATH`` (#2781).
+
+    Pre-#2781 these were bound eagerly at import time, so ``$COORD_DIR`` set
+    *after* this module was first imported -- e.g. by a pytest fixture --
+    never reached them, unlike :func:`default_coord_dir` itself which is
+    "computed fresh on every call" by design (see its docstring). Not binding
+    them eagerly here means any access -- ``coord.db.COORD_DIR``, or the
+    internal ``sys.modules[__name__].COORD_DIR`` lookups below -- re-resolves
+    against the current environment.
+
+    This only engages when the name hasn't been bound directly in this
+    module's namespace, so ``monkeypatch.setattr(coord.db, "DB_PATH", ...)``
+    (used throughout tests/test_db.py) still takes priority exactly as
+    before: Python calls ``__getattr__`` only when normal attribute lookup
+    fails.
+    """
+    if name == "COORD_DIR":
+        return default_coord_dir()
+    if name == "DB_PATH":
+        return sys.modules[__name__].COORD_DIR / "coord.db"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ProductionDatabaseGuardError(RuntimeError):
@@ -66,12 +88,13 @@ def get_connection() -> sqlite3.Connection:
     """Return the module-level singleton connection, opening it on first call."""
     global _conn
     if _conn is None:
-        _conn = _open(DB_PATH)
+        _conn = _open(sys.modules[__name__].DB_PATH)
     return _conn
 
 
 def _open(path: Path) -> sqlite3.Connection:
-    if path == DB_PATH and os.environ.get("PYTEST_CURRENT_TEST"):
+    db_path = sys.modules[__name__].DB_PATH
+    if path == db_path and os.environ.get("PYTEST_CURRENT_TEST"):
         raise ProductionDatabaseGuardError(
             f"Refusing to open the production coordinator database at "
             f"{path} while running under pytest "
@@ -108,7 +131,7 @@ def _open(path: Path) -> sqlite3.Connection:
         # skips this block forever -- permanently missing any migration the
         # release adds under that version number. Reads are unaffected: an
         # already-caught-up database never reaches this branch at all.
-        if path == DB_PATH and not _is_release_build(_coord_version):
+        if path == db_path and not _is_release_build(_coord_version):
             raise ProductionDatabaseGuardError(
                 "Refusing to write schema changes to the production "
                 f"coordinator database at {path} from a non-release build "
@@ -1458,7 +1481,8 @@ def _maybe_migrate_json(conn: sqlite3.Connection) -> None:
     )
     if cursor.fetchone() is not None:
         return
-    dispatched_json = COORD_DIR / "dispatched.json"
+    coord_dir = sys.modules[__name__].COORD_DIR
+    dispatched_json = coord_dir / "dispatched.json"
     if not dispatched_json.exists():
         return
     cursor = sql.execute(conn, "SELECT COUNT(*) FROM assignments")
@@ -1467,7 +1491,6 @@ def _maybe_migrate_json(conn: sqlite3.Connection) -> None:
     try:
         _migrate_json(conn)
     except Exception as exc:  # noqa: BLE001 — migration is best-effort
-        import sys
         print(f"coord: warning: JSON→SQLite migration failed: {exc}", file=sys.stderr)
 
 
@@ -1475,14 +1498,15 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
     """One-shot migration from JSON files to SQLite.  Renames JSON files to .bak."""
     import time as _time
 
-    dispatched_json = COORD_DIR / "dispatched.json"
-    notified_json = COORD_DIR / "notified.json"
-    board_json = COORD_DIR / "board.json"
-    proposals_json = COORD_DIR / "pending_proposals.json"
-    splits_json = COORD_DIR / "pending_splits.json"
-    plans_json = COORD_DIR / "plans.json"
-    session_json = COORD_DIR / "session.json"
-    merge_queue_json = COORD_DIR / "merge_queue.json"
+    coord_dir = sys.modules[__name__].COORD_DIR
+    dispatched_json = coord_dir / "dispatched.json"
+    notified_json = coord_dir / "notified.json"
+    board_json = coord_dir / "board.json"
+    proposals_json = coord_dir / "pending_proposals.json"
+    splits_json = coord_dir / "pending_splits.json"
+    plans_json = coord_dir / "plans.json"
+    session_json = coord_dir / "session.json"
+    merge_queue_json = coord_dir / "merge_queue.json"
 
     with conn:  # single transaction
         # 1. dispatched.json → assignments (initial insert, status='running')

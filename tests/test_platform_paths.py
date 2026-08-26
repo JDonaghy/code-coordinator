@@ -209,3 +209,54 @@ def test_state_root_modules_derive_from_default_coord_dir() -> None:
     assert coord.state.COORD_DIR == expected
     assert coord.agent.DEFAULT_STATE_DIR == expected
     assert coord.config.USER_CONFIG_PATH == expected / "coordinator.yml"
+
+
+# ── #2781: the four constants must reach a post-import $COORD_DIR ──────────
+#
+# W12 (#2776) added the $COORD_DIR override checked before the sys.platform
+# branch, but coord.db.COORD_DIR / coord.state.COORD_DIR /
+# coord.config.USER_CONFIG_PATH / coord.agent.DEFAULT_STATE_DIR each froze
+# `default_coord_dir()`'s result into a module-level constant at their own
+# *import* time -- which, by the time any test runs, is always well before a
+# per-test fixture sets $COORD_DIR. These modules are already imported by
+# the time this test body executes (pytest's collection imports them, same
+# as production code importing coord.* once at process start), so setting
+# the env var here and re-reading the constants is exactly the residue this
+# issue closes: nothing before #2781 could make this pass.
+
+
+def test_coord_dir_set_after_import_redirects_all_four_constants(
+    monkeypatch, tmp_path
+) -> None:
+    import coord.agent
+    import coord.config
+    import coord.db
+    import coord.state
+
+    override = tmp_path / "post-import-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+
+    assert coord.db.COORD_DIR == override
+    assert coord.db.DB_PATH == override / "coord.db"
+    assert coord.state.COORD_DIR == override
+    assert coord.agent.DEFAULT_STATE_DIR == override
+    assert coord.config.USER_CONFIG_PATH == override / "coordinator.yml"
+
+
+def test_coord_dir_set_after_import_redirects_agent_server_default_state_dir(
+    monkeypatch, tmp_path
+) -> None:
+    """``AgentServer()`` (no explicit ``state_dir=``) is the real production
+    call site (``coord agent`` startup, coord/commands/agent_ops.py) that
+    relied on the frozen ``DEFAULT_STATE_DIR`` default-argument value --
+    default-argument values are evaluated once, at `def` time, so merely
+    making the module attribute lazy doesn't fix this call site on its own;
+    it needed the sentinel-default rework too."""
+    from coord.agent import AgentServer
+
+    override = tmp_path / "agent-server-override"
+    monkeypatch.setenv("COORD_DIR", str(override))
+
+    server = AgentServer(machine_name="laptop")
+
+    assert server.state_dir == override

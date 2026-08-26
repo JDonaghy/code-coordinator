@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import sys
 from dataclasses import dataclass, field, fields
 from datetime import time
 from pathlib import Path
@@ -28,7 +29,26 @@ DEFAULT_CONFIG_PATH = Path("coordinator.yml")
 # Canonical config home — works on a machine that has no repo checkout, mirroring
 # where ``~/.coord/coord.db`` and ``~/.coord/client.toml`` already live.  This is
 # the recommended location; ``./coordinator.yml`` stays a development fallback.
-USER_CONFIG_PATH = default_coord_dir() / "coordinator.yml"
+#
+# USER_CONFIG_PATH is resolved lazily via __getattr__ below (#2781), not bound
+# here at import time -- see that function's docstring.
+
+
+def __getattr__(name: str) -> Path:
+    """PEP 562 lazy fallback for ``USER_CONFIG_PATH`` (#2781).
+
+    Pre-#2781 this was bound eagerly at import time, so ``$COORD_DIR`` set
+    *after* this module was first imported -- e.g. by a pytest fixture --
+    never reached it, unlike :func:`default_coord_dir` itself which is
+    "computed fresh on every call" by design. This only engages when the
+    name hasn't been bound directly in this module's namespace, so
+    ``monkeypatch.setattr(coord.config, "USER_CONFIG_PATH", ...)`` (used
+    throughout the test suite) still takes priority exactly as before:
+    Python calls ``__getattr__`` only when normal attribute lookup fails.
+    """
+    if name == "USER_CONFIG_PATH":
+        return default_coord_dir() / "coordinator.yml"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def resolve_config_path() -> Path:
@@ -46,10 +66,11 @@ def resolve_config_path() -> Path:
     env = os.environ.get("COORD_CONFIG")
     if env:
         return Path(env).expanduser()
-    for candidate in (USER_CONFIG_PATH, DEFAULT_CONFIG_PATH):
+    user_config_path = sys.modules[__name__].USER_CONFIG_PATH
+    for candidate in (user_config_path, DEFAULT_CONFIG_PATH):
         if candidate.exists():
             return candidate
-    return USER_CONFIG_PATH
+    return user_config_path
 
 
 def is_canonical_config_path(path: Path) -> bool:
@@ -2069,7 +2090,7 @@ def load(path: str | Path | None = None) -> Config:
     p = Path(path).expanduser() if path is not None else resolve_config_path()
     if not p.exists():
         raise ConfigError(
-            f"Config file not found: {p}. Create it at {USER_CONFIG_PATH} "
+            f"Config file not found: {p}. Create it at {sys.modules[__name__].USER_CONFIG_PATH} "
             f"(recommended — works without a repo checkout), pass --config <path>, "
             f"or set $COORD_CONFIG."
         )
