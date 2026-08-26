@@ -765,11 +765,13 @@ class TestSemanticEscalationDisabled:
     the tier-2 semantic escalation didn't run, rather than reading as
     though it ran and failed."""
 
-    def test_false_when_config_is_none(self) -> None:
-        """No config to attribute the gap to — stay silent rather than
-        guess (the generic message is still accurate)."""
+    def test_true_when_config_is_none(self) -> None:
+        """No config means no pipeline to check — treat escalation as
+        unavailable, matching `_try_semantic_escalation`'s own treatment
+        of a missing config/pipeline as "cannot escalate" (#2566 review:
+        the two fallbacks must agree)."""
         from coord.conflict_fix import semantic_escalation_disabled
-        assert semantic_escalation_disabled(None) is False
+        assert semantic_escalation_disabled(None) is True
 
     def test_true_on_default_config(self, two_machine_config: Config) -> None:
         """`escalate_semantic_conflicts` defaults False (#1291 ships dark)."""

@@ -639,14 +639,23 @@ def semantic_escalation_disabled(config: Config | None) -> bool:
     HUMAN_REQUIRED message and GitHub comment say *why* no second attempt
     was made, instead of reading as if the tier ran and failed.
 
-    Returns ``False`` (no distinct messaging) whenever *config* or its
-    ``pipeline`` block is unavailable — the generic message is still
-    accurate in that case, it's just not attributable to this specific
-    switch.
+    This is the single source of truth for "is escalation allowed" — both
+    the *whether to attempt it* decision
+    (:func:`coord.reconcile._try_semantic_escalation`) and the *why not*
+    message (:func:`coord.reconcile.on_conflict_fix_done`) call this rather
+    than re-deriving the flag check independently, so the two can never
+    disagree about the reason (#2566 review).
+
+    Returns ``True`` (escalation unavailable) whenever *config* or its
+    ``pipeline`` block is unavailable, matching ``_try_semantic_escalation``'s
+    treatment of a missing config/pipeline as "cannot escalate" — a missing
+    ``Config.pipeline`` is unreachable today (it always defaults via
+    ``field(default_factory=PipelineConfig)``), so this only matters for
+    defensive callers passing ``None`` directly.
     """
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None:
-        return False
+        return True
     return not getattr(pipeline, "escalate_semantic_conflicts", False)
 
 
