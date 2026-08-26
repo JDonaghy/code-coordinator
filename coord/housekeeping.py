@@ -70,11 +70,13 @@ def _archive_cutoff(now: float | None = None) -> float | None:
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
-    """Return ``[(name, type), ...]`` for *table* (empty if it doesn't exist)."""
-    return [
-        (r[1], r[2] or "TEXT")
-        for r in sql.execute(conn, f"PRAGMA table_info({table})").fetchall()  # noqa: S608
-    ]
+    """Return ``[(name, type), ...]`` for *table* (empty if it doesn't exist).
+
+    Delegates to :func:`coord.sql.table_columns` (#2782) -- SQLite's
+    ``PRAGMA table_info`` has no Postgres equivalent, so the dialect split
+    lives in the seam, not here.
+    """
+    return sql.table_columns(conn, table)
 
 
 def _ensure_archive_mirror(conn: sqlite3.Connection, src: str, dst: str) -> list[str]:

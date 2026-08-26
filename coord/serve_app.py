@@ -751,6 +751,12 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
     in-memory DB (tests) WAL mode is not enabled, so the result is
     ``{"busy": 0, "log": 0, "checkpointed": 0, "skipped": True}``.
 
+    WAL is a SQLite storage concept with no Postgres equivalent at all (#2782)
+    -- unlike the rest of this seam, there is nothing to translate, so on a
+    non-SQLite connection this reports ``skipped=True`` with an explicit
+    ``reason`` up front, before ever building a ``PRAGMA`` string, rather than
+    letting a Postgres connection discover it as a runtime error.
+
     Extracted as a module-level function so tests can call it directly
     without wiring up the async ``_tick_loop`` infrastructure (mirrors
     ``_reconcile_merges_tick`` / ``_sync_issues_tick``).
@@ -763,10 +769,21 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
     log = logging.getLogger("coord.serve")
     conn = get_connection()
 
+    dialect = sql.detect_dialect(conn)
+    if dialect != sql.DIALECT_SQLITE:
+        log.debug("wal-checkpoint: dialect=%r -- not applicable, skipping", dialect)
+        return {
+            "busy": 0,
+            "log": 0,
+            "checkpointed": 0,
+            "skipped": True,
+            "reason": f"not applicable (dialect={dialect})",
+        }
+
     # WAL mode is not available on :memory: databases (used in tests).
     # Detect by querying the current journal mode and skip gracefully.
     try:
-        journal_mode = sql.execute(conn, "PRAGMA journal_mode").fetchone()[0]
+        journal_mode = sql.sqlite_journal_mode(conn)
     except Exception:  # noqa: BLE001
         journal_mode = "unknown"
 
@@ -778,8 +795,7 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
         return {"busy": 0, "log": 0, "checkpointed": 0, "skipped": True}
 
     try:
-        row = sql.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        busy, log_pages, checkpointed = (row[0], row[1], row[2]) if row else (0, 0, 0)
+        busy, log_pages, checkpointed = sql.sqlite_wal_checkpoint_truncate(conn)
     except Exception:  # noqa: BLE001 — a missed checkpoint is not fatal
         log.warning("wal-checkpoint tick failed", exc_info=True)
         return {"busy": -1, "log": 0, "checkpointed": 0, "error": True}
