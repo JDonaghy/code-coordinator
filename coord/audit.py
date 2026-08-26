@@ -26,7 +26,6 @@ import atexit
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
 from typing import Any
@@ -181,7 +180,7 @@ def _record_audit_unsafe(
     # keep a trim-only failure from ever touching that counter.
     try:
         retry_on_locked(lambda: _maybe_trim(conn))
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.debug(

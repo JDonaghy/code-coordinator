@@ -3114,7 +3114,7 @@ def _update_assignment_tokens_local(
         # genuinely missing column on a pre-migration DB or test fixture —
         # and now also covers a lock that outlasts the retry budget.
         retry_on_locked(_write)
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
         pass
 
 
@@ -3163,7 +3163,7 @@ def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -
             (stop_reason, assignment_id),
         )
         conn.commit()
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
         # Column may not exist yet (pre-migration DB or test fixtures).
         pass
 
@@ -3199,7 +3199,7 @@ def _mark_assignment_interactive_local(assignment_id: str) -> None:
             (assignment_id,),
         )
         conn.commit()
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
         # Column may not exist on a pre-migration DB.
         pass
 
@@ -3358,7 +3358,7 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
             (reason[:512], now, assignment_id),  # cap at 512 chars — one-liner
         )
         conn.commit()
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
         # Column may not exist on a pre-migration DB — best-effort.
         return
     # #1036 fix review finding 2: no matching row (bad/stale assignment_id)
@@ -3433,7 +3433,7 @@ def _mark_review_posted_local(assignment_id: str) -> None:
 
     try:
         retry_on_locked(_write)
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -4556,7 +4556,7 @@ def _apply_issue_labels_local(
         retry_on_locked(
             lambda: _update_issue_labels_local(repo_name, issue_number, new_labels)
         )
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -4665,7 +4665,7 @@ def _create_issue_local(
 
     try:
         retry_on_locked(_write)
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -4905,7 +4905,7 @@ def _edit_issue_content_local(
 
     try:
         retry_on_locked(_write)
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -4996,7 +4996,7 @@ def _assign_issue_milestone_local(
 
     try:
         retry_on_locked(_write)
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -5070,7 +5070,7 @@ def _unassign_issue_milestone_local(
 
     try:
         retry_on_locked(_write)
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             raise
         _log.error(
@@ -5611,7 +5611,7 @@ def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
                 f"SELECT DISTINCT issue_number FROM {table} WHERE repo_name = ?",  # noqa: S608
                 (repo_name,),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
             continue  # assignments_archive may not exist yet (housekeeping never ran)
         numbers.update(r[0] for r in rows if r[0] is not None)
     return numbers

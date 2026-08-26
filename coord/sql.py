@@ -455,6 +455,49 @@ def driver_error(conn: Any) -> type[BaseException]:
     raise UnsupportedDialectError(dialect)
 
 
+def driver_errors() -> tuple[type[BaseException], ...]:
+    """The DB-API ``Error`` base class(es) of every *installed* driver
+    (#2784).
+
+    Unlike :func:`driver_error`, this needs no connection -- it exists for
+    the ~18 call sites tree-wide that wrap a ``retry_on_locked(...)`` call
+    (or another write with no connection in scope) in
+    ``except sqlite3.OperationalError:``, hardcoding the one driver those
+    call sites happened to be written against.  That hardcoding is exactly
+    why #2784 found the whole #2597/#2689 degrade-gracefully layer silently
+    inert on Postgres: a psycopg exception is never an instance of
+    ``sqlite3.OperationalError``, so the ``except`` clause never matches,
+    the handler never runs, and a transient lock becomes an uncaught crash
+    instead of a retried write.
+
+    ``sqlite3`` is a stdlib module -- always present, always included.
+    ``psycopg`` is not a declared dependency (see :func:`row_factory_for`),
+    so its absence is the normal case today, not an error: this degrades to
+    ``(sqlite3.Error,)`` rather than raising ``ImportError``, the same
+    "absence is normal" posture :func:`row_factory_for` takes for a
+    *known* dialect with no live connection to detect it from -- except
+    here there is no dialect to detect at all, so degrading silently (not
+    even function-local, deferred-import-style) is correct: a caller doing
+    ``except sql.driver_errors():`` on a SQLite-only install must keep
+    behaving exactly as ``except sqlite3.OperationalError:`` always did.
+
+    Returns a tuple (not a single class) because ``except`` accepts either,
+    and a tuple is what every call site actually needs: catch whichever
+    driver's error the live connection happens to raise, without knowing in
+    advance which driver that is.
+    """
+    import sqlite3
+
+    errors: list[type[BaseException]] = [sqlite3.Error]
+    try:
+        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+    except ImportError:
+        pass
+    else:
+        errors.append(psycopg.Error)
+    return tuple(errors)
+
+
 def insert_ignore_select(conn: Any, table: str, select_sql: str) -> Any:
     """``INSERT OR IGNORE INTO table <select_sql>`` -- the SELECT-sourced
     sibling of :func:`insert_ignore`, for the one call site (coord/db.py's

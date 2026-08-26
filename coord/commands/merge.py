@@ -4,15 +4,15 @@ coord/cli.py (#747)."""
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
 
 import click
 
 
+from coord import sql
 from coord.commands._common import _CONFIG_OPTION, _load_config
-from coord.db import is_lock_contention_error, retry_on_locked
+from coord.db import LockContentionExhaustedError, is_lock_contention_error, retry_on_locked
 from coord.models import (
     WORK_LIKE_TYPES,
     effective_issue_number,
@@ -2140,7 +2140,10 @@ def merge(
     # exact #1353 regression this file already fixed once, resurrected for
     # lock contention specifically). The whole run still fails loudly: once
     # every assignment has had its turn, a non-zero exit is raised below.
-    lock_contention_failures: list[tuple[str, sqlite3.OperationalError]] = []
+    # #2784: BaseException, not sqlite3.OperationalError — the driver error
+    # this collects is whichever one sql.driver_errors() catches below,
+    # which is Postgres-shaped on a psycopg connection.
+    lock_contention_failures: list[tuple[str, BaseException]] = []
     # Per-repo cache of branches that still exist on origin.  Lets us skip
     # re-enqueuing done-work whose branch was already merged-and-deleted — the
     # dominant merge-queue clog source.  A done assignment for a closed issue
@@ -2331,7 +2334,7 @@ def merge(
                         f"{target_branch}) — "
                         f"{mq.describe_merge_gate_failures(gate_failures)}"
                     )
-            except sqlite3.OperationalError as exc:
+            except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
                 if is_lock_contention_error(exc):
                     # #2597: `retry_on_locked` above already gave the write
                     # several backed-off attempts — reaching here means the
@@ -2372,12 +2375,20 @@ def merge(
         # #2597-review: every assignment in the batch has now had its turn
         # — including the ones after the first contended write, and their
         # results (if any) are already printed above. Surface the
-        # contention loudly now: a real `sqlite3.OperationalError`
-        # propagating out of this command (not a swallowed summary line)
-        # so `coord merge` exits non-zero and the failure is impossible to
-        # miss, same as any other genuinely unrecoverable write failure.
+        # contention loudly now — propagating out of this command (not a
+        # swallowed summary line) so `coord merge` exits non-zero and the
+        # failure is impossible to miss, same as any other genuinely
+        # unrecoverable write failure.
+        #
+        # #2784: this used to fabricate a bare `sqlite3.OperationalError(...)`
+        # regardless of which driver actually raised the per-assignment
+        # errors being summarized — a lie about origin on a Postgres
+        # deployment, and a driver-named exception outside coord/sql.py that
+        # the #2768 ratchet now forbids. `LockContentionExhaustedError` is
+        # coord-owned and dialect-agnostic; the actual driver error survives
+        # as `__cause__` below for anyone inspecting the traceback.
         assignment_ids = ", ".join(aid for aid, _exc in lock_contention_failures)
-        raise sqlite3.OperationalError(
+        raise LockContentionExhaustedError(
             "database is locked — auto-enqueue write(s) still locked after "
             f"exhausting retries for assignment(s): {assignment_ids}"
         ) from lock_contention_failures[-1][1]

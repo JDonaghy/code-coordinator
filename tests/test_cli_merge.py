@@ -14,6 +14,7 @@ from click.testing import CliRunner
 from coord import merge_queue as mq
 from coord import state as state_mod
 from coord.cli import main
+from coord.db import LockContentionExhaustedError
 
 
 # #1525: these fixtures never exercise the CI gate (that's covered by
@@ -1926,7 +1927,12 @@ class TestMergeAutoEnqueue:
             result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
 
         assert result.exit_code != 0
-        assert isinstance(result.exception, sqlite3.OperationalError)
+        # #2784: coord-owned, dialect-agnostic — not a bare sqlite3.OperationalError,
+        # which would be a lie about origin once a Postgres deployment exists,
+        # and a driver-named exception outside coord/sql.py the #2768 ratchet
+        # now forbids. The original driver error still chains as __cause__.
+        assert isinstance(result.exception, LockContentionExhaustedError)
+        assert isinstance(result.exception.__cause__, sqlite3.OperationalError)
         # Never silently swallowed into the scan's ordinary summary output.
         assert "skipped" not in result.output
         assert "auto-enqueued" not in result.output
@@ -1979,7 +1985,9 @@ class TestMergeAutoEnqueue:
             result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
 
         assert result.exit_code != 0
-        assert isinstance(result.exception, sqlite3.OperationalError)
+        # #2784: coord-owned, dialect-agnostic — see the sibling test above.
+        assert isinstance(result.exception, LockContentionExhaustedError)
+        assert isinstance(result.exception.__cause__, sqlite3.OperationalError)
         # The contended assignment is named and clearly flagged as a hard
         # failure — not the soft "skipped" line used for other errors.
         assert "LOCK CONTENTION" in result.output
