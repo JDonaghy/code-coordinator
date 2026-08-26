@@ -130,7 +130,10 @@ def notify(config_path: Path) -> None:
     from coord.notify import run as run_notify
 
     cfg = _load_config(config_path)
-    posted, stuck, needs_attention, stalled, liveness, phantom_healed = run_notify(cfg)
+    (
+        posted, stuck, needs_attention, stalled, liveness, phantom_healed,
+        stuck_test_state_healed,
+    ) = run_notify(cfg)
     if (
         not posted
         and not stuck
@@ -138,6 +141,7 @@ def notify(config_path: Path) -> None:
         and not stalled
         and not liveness
         and not phantom_healed
+        and not stuck_test_state_healed
     ):
         click.echo("No new transitions to notify.")
         return
@@ -186,6 +190,18 @@ def notify(config_path: Path) -> None:
             click.echo(
                 f"  [phantom-healed:{h.stage}] {h.machine_name} → {h.repo_name} "
                 f"#{h.issue_number} (assignment {h.assignment_id})"
+            )
+            click.echo(f"    {h.detail}")
+            click.echo(f"    → {h.action}")
+    if stuck_test_state_healed:
+        click.echo(
+            f"Auto-healed {len(stuck_test_state_healed)} stuck test_state "
+            "row(s) (#2803):"
+        )
+        for h in stuck_test_state_healed:
+            click.echo(
+                f"  [stuck-test-state-healed] {h.machine_name} → "
+                f"{h.repo_name} #{h.issue_number} (assignment {h.assignment_id})"
             )
             click.echo(f"    {h.detail}")
             click.echo(f"    → {h.action}")

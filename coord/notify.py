@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
-    from coord.diagnose import PhantomRowHeal
+    from coord.diagnose import PhantomRowHeal, StuckTestStateHeal
     from coord.merge_queue import QueuedMerge
     from coord.models import Assignment, Board
     from coord.progress import SmokeVerdict
@@ -2697,7 +2697,7 @@ def _capture_cost_and_tokens_for_review(
     captured for a review that completes through the direct
     ``detect_transitions`` path — but investigation of #2476 found the
     majority of review completions actually get their GitHub comment posted
-    later, by :func:`post_orphaned_review_findings` (run_drain's step 4,
+    later, by :func:`post_orphaned_review_findings` (run_drain's step 5,
     which runs on every ~60s drain tick, not just as manual cleanup): that
     function does its own independent ``/status`` poll and local-then-remote
     log fallback to recover the VERDICT, but until now never captured
@@ -3928,6 +3928,103 @@ def _sweep_phantom_rows(config: Config) -> list["PhantomRowHeal"]:
     return posted
 
 
+# ── #2803: fleet-wide stuck test_state='running' watchdog ───────────────────
+#
+# See `coord.diagnose.sweep_stuck_test_state_rows`'s docstring for the full
+# rationale. This is the thin `coord notify` glue around it — read the
+# board, run the sweep (which does the actual recovery write per row via
+# `coord.reconcile.propagate_smoke_terminal_failure`), post one comment per
+# row it healed, and audit-log it. No board write-back is needed here — the
+# sweep writes through `coord.state.record_test_verdict` directly, never
+# mutating the in-memory `board` object, mirroring `_sweep_phantom_rows`
+# above exactly.
+
+
+def post_stuck_test_state_healed(heal: "StuckTestStateHeal", config: Config) -> None:
+    """Post the #2803 auto-heal comment for one board row
+    :func:`_sweep_stuck_test_state` just recovered."""
+    from coord.comments import (  # noqa: PLC0415
+        format_stuck_test_state_healed,
+    )
+
+    repo = config.repo(heal.repo_name)
+    repo_github = repo.github if repo is not None else None
+    if not repo_github:
+        return
+    body = format_stuck_test_state_healed(
+        assignment_id=heal.assignment_id,
+        machine_name=heal.machine_name,
+        repo_name=heal.repo_name,
+        issue_number=heal.issue_number,
+        detail=heal.detail,
+        action=heal.action,
+    )
+    github_ops.post_issue_comment(repo_github, heal.issue_number, body)
+
+
+def _sweep_stuck_test_state(config: Config) -> list["StuckTestStateHeal"]:
+    """Scan the board for work rows wedged at ``test_state='running'`` well
+    past their Test-stage child's own terminal resolution (or absence),
+    auto-clear them for a fresh Test-stage dispatch via
+    :func:`coord.reconcile.propagate_smoke_terminal_failure`, and post one
+    comment per row recovered (#2803).
+
+    Gated by ``config.pipeline.auto_heal_stuck_test_state`` (**default
+    ``True``** — see that field's docstring: every action here is gated on
+    the Test-stage child already being TERMINAL or missing entirely, plus a
+    fixed grace window, and recovery never fabricates a pass/fail verdict).
+
+    Best-effort per row, mirroring :func:`_sweep_phantom_rows`'s contract: a
+    comment-posting failure for one row must not stop the sweep from
+    reaching the rest, and does not undo the row's own recovery (already
+    durably written by the time this posts).
+    """
+    if not config.pipeline.auto_heal_stuck_test_state:
+        return []
+
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.diagnose import sweep_stuck_test_state_rows  # noqa: PLC0415
+
+    board = read_board()
+    healed = sweep_stuck_test_state_rows(board, config)
+
+    posted: list["StuckTestStateHeal"] = []
+    for heal in healed:
+        try:
+            post_stuck_test_state_healed(heal, config)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "post_stuck_test_state_healed failed for %s", heal.assignment_id,
+            )
+            continue
+        posted.append(heal)
+
+        try:
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="business",
+                category="pipeline",
+                event_type="stuck_test_state_auto_healed",
+                actor="coordinator",
+                summary=(
+                    f"stuck test_state sweep healed work row "
+                    f"{heal.assignment_id} for {heal.repo_name}#{heal.issue_number}"
+                ),
+                repo=heal.repo_name,
+                issue=heal.issue_number,
+                assignment_id=heal.assignment_id,
+                machine=heal.machine_name,
+                details={"detail": heal.detail, "action": heal.action},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "record_audit failed for stuck test_state heal %s", heal.assignment_id,
+            )
+
+    return posted
+
+
 @dataclass(frozen=True)
 class DrainResult:
     """What one :func:`run_drain` pass actually did.
@@ -3987,6 +4084,9 @@ def run_drain(
     orphaned review findings posted             yes      comment + verdict capture only
     review dispatch                             yes      guarded; see below
     verdict → parent work row (#1663)           yes      no race, no cost; see below
+    stuck test_state='running' watchdog (#2803) yes      bookkeeping: clears a lost-verdict
+                                                         marker so smoke dispatch (above) can
+                                                         redispatch; never fabricates a verdict
     merge enqueue                               n/a      the daemon tick already runs
                                                          ``enqueue_approved_work`` right after
     **work dispatch**                           **no**   stays with a drive or a human
@@ -4007,7 +4107,7 @@ def run_drain(
     auto-loop all read the *work* row, so an approved issue simply stopped:
     2026-08-01's overnight batch reviewed five issues clean and merged none of
     them in 4h02m.  The propagation half is now separately callable
-    (``auto_loop.propagate_review_verdict_for_transition``) and step 5 calls
+    (``auto_loop.propagate_review_verdict_for_transition``) and step 6 calls
     only that; fix dispatch is as unreachable from here as it ever was.
 
     Why review dispatch is in and fix dispatch is out — the asymmetry is the
@@ -4089,7 +4189,7 @@ def _run_drain_locked(config: Config) -> DrainResult:
     # the same board posts nothing.
     posted: list[Transition] = []
     # #1663: (transition, record, entry) for every review that completed in
-    # THIS pass, so step 5 can propagate its verdict onto the parent work row.
+    # THIS pass, so step 6 can propagate its verdict onto the parent work row.
     review_completions: list[tuple[Transition, dict, dict]] = []
     try:
         from coord.comments import EVENT_COMPLETION  # noqa: PLC0415
@@ -4112,14 +4212,25 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: detect_transitions failed")
 
-    # Step 2: dispatch pending Test-stage smoke (#1426).  Runs BEFORE review
+    # Step 2 (#2803): clear any work row wedged at test_state='running' well
+    # past its Test-stage child's own terminal resolution (or absence) — a
+    # lost verdict write, never a fabricated one (see `sweep_stuck_test_
+    # state_rows`'s docstring). Runs BEFORE step 3's smoke dispatch so a row
+    # this clears is picked up and redispatched in THIS SAME pass, not the
+    # next one.
+    try:
+        _sweep_stuck_test_state(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: stuck test_state sweep failed")
+
+    # Step 3: dispatch pending Test-stage smoke (#1426).  Runs BEFORE review
     # dispatch to mirror the pipeline's Work -> Test -> Review order.
     try:
         _dispatch_board_pending_smoke(config)
     except Exception:  # noqa: BLE001
         log.exception("notify drain: smoke dispatch failed")
 
-    # Step 3: dispatch pending reviews.  Carries the #1612 test-precedes-review
+    # Step 4: dispatch pending reviews.  Carries the #1612 test-precedes-review
     # gate, the #1076/#1152 test-gate backfill, the #946 enqueue gate, the
     # 2026-06-08 flood guard (per-pass cap + surge gate) and the #459 active-fix
     # dedupe — this is calling existing machinery from a clock, not new
@@ -4129,7 +4240,7 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: review dispatch failed")
 
-    # Step 4: post findings for done-review assignments that were never
+    # Step 5: post findings for done-review assignments that were never
     # processed (agent reported 'cancelled', a human marked the row done, or
     # notify ran at the wrong time).  Comment + verdict capture only.
     orphaned: list[str] = []
@@ -4138,9 +4249,9 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: post_orphaned_review_findings failed")
 
-    # Step 5 (#1663): propagate each captured verdict onto its parent WORK row.
+    # Step 6 (#1663): propagate each captured verdict onto its parent WORK row.
     #
-    # Steps 1 and 4 both stamp the verdict on the *review* row and stop there.
+    # Steps 1 and 5 both stamp the verdict on the *review* row and stop there.
     # Everything that reads the *work* row — `coord drive`, the TUI's Review
     # stage, `_stalled_pipeline`, any state-derived recovery — therefore saw
     # `review_state='dispatched'` / `review_verdict=NULL` for every verdict the
@@ -4164,7 +4275,7 @@ def _run_drain_locked(config: Config) -> DrainResult:
             seen: set[str] = set()
             # Orphaned rows have no transition tuple (their comment was posted
             # on an earlier pass, or never).  `_load_review_findings` reads the
-            # DB findings cache first — which step 4 just populated — so an
+            # DB findings cache first — which step 5 just populated — so an
             # empty record/entry still resolves the verdict without any I/O.
             pending: list[tuple[str, dict, dict]] = [
                 (t.assignment_id, record, entry)
@@ -4251,18 +4362,21 @@ def run(
     list[StalledDetection],
     list[LivenessStallDetection],
     list["PhantomRowHeal"],
+    list["StuckTestStateHeal"],
 ]:
     """Detect and post all pending transitions, stuck signals, #846
     needs-attention detections, #1441 stalled-pipeline detections, #2048
-    liveness-auditor stalls, and #2536 phantom-row auto-heals.
+    liveness-auditor stalls, #2536 phantom-row auto-heals, and #2803 stuck
+    test_state='running' auto-heals.
 
     Also dispatches any pending reviews found on the saved board so that
     ``coord notify`` acts as a reliable review-dispatch trigger in addition
     to ``coord status --reconcile``.
 
     Returns (posted_transitions, posted_stuck, posted_needs_attention,
-    posted_stalled, posted_liveness, posted_phantom_healed). Each of the
-    liveness and phantom-healed entries was appended rather than inserted,
+    posted_stalled, posted_liveness, posted_phantom_healed,
+    posted_stuck_test_state_healed). Each of the liveness, phantom-healed
+    and stuck-test-state-healed entries was appended rather than inserted,
     following #1441's own precedent: any existing caller unpacking a
     shorter tuple positionally breaks loudly, which is a good thing (it
     means the CLI/board/TUI surfacing was actually wired up, not silently
@@ -4270,7 +4384,9 @@ def run(
     ``config.pipeline.liveness_auditor.enabled`` is ``False`` (the
     default); ``posted_phantom_healed`` is always ``[]`` when
     ``config.pipeline.auto_heal_phantom_rows`` is ``False`` (not the
-    default — see that field's docstring).
+    default — see that field's docstring); ``posted_stuck_test_state_healed``
+    is always ``[]`` when ``config.pipeline.auto_heal_stuck_test_state`` is
+    ``False`` (not the default — see that field's docstring).
     """
     # Refresh the agent-host cache so _try_parse_and_post_review (and any
     # other helper using _agent_host) can resolve hostnames without
@@ -4382,6 +4498,20 @@ def run(
         phantom_healed_posted = _sweep_phantom_rows(config)
     except Exception:  # noqa: BLE001
         log.exception("_sweep_phantom_rows: unexpected error")
+
+    # #2803: fleet-wide stuck test_state='running' watchdog — a work row
+    # whose Test-stage child already reached a terminal status (or was never
+    # created at all) but whose verdict never propagated to the parent, well
+    # past the ordinary write-propagation lag. Runs right after the phantom-
+    # row sweep above (same "long-running row this daemon can act on itself"
+    # concern) and before the smoke dispatch below, so a row this sweep
+    # clears is redispatched in this same pass. Best-effort, non-fatal —
+    # mirrors every other sweep in this function.
+    stuck_test_state_healed_posted: list["StuckTestStateHeal"] = []
+    try:
+        stuck_test_state_healed_posted = _sweep_stuck_test_state(config)
+    except Exception:  # noqa: BLE001
+        log.exception("_sweep_stuck_test_state: unexpected error")
 
     # Dispatch pending Test-stage smoke from the saved board (#1426;
     # best-effort, non-fatal). Runs BEFORE review dispatch to mirror the
@@ -4515,4 +4645,5 @@ def run(
         stalled_posted,
         liveness_posted,
         phantom_healed_posted,
+        stuck_test_state_healed_posted,
     )

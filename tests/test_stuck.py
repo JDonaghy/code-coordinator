@@ -312,7 +312,7 @@ class TestNotifyRunStuck:
         with patch.object(notify_mod, "_agent_status", side_effect=mock_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_gh, \
              patch("coord.github_ops.post_issue_comment") as mock_gh2:
-            posted, stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
+            posted, stuck, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
 
         assert len(posted) == 1
         assert posted[0].assignment_id == "done-1"
@@ -322,7 +322,7 @@ class TestNotifyRunStuck:
     def test_run_no_stuck_no_transitions(
         self, coord_dir: Path, config: Config
     ) -> None:
-        posted, stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
+        posted, stuck, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
         assert posted == []
         assert stuck == []
 
@@ -539,7 +539,7 @@ class TestNotifyCLIStuck:
             )
         ]
 
-        with patch("coord.notify.run", return_value=(posted, stuck, [], [], [], [])), \
+        with patch("coord.notify.run", return_value=(posted, stuck, [], [], [], [], [])), \
              patch("coord.state.build_board") as bb, \
              patch("coord.state.save_board"), \
              patch("coord.hooks.is_round_complete", return_value=False):
@@ -557,7 +557,7 @@ class TestNotifyCLIStuck:
     def test_notify_no_transitions_no_stuck(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        with patch("coord.notify.run", return_value=([], [], [], [], [], [])):
+        with patch("coord.notify.run", return_value=([], [], [], [], [], [], [])):
             result = CliRunner().invoke(
                 main, ["notify", "--config", str(config_file)]
             )
