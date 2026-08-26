@@ -187,6 +187,96 @@ class TestPersistence:
         assert again == {"a": 2, "b": 0}
 
 
+class TestSaveQueueLockContention:
+    """#2802: `save_queue`'s DELETE+re-INSERT rewrite must ride out
+    transient `database is locked` collisions the same way every other
+    write in the codebase does (#2597/#2538) — the bug report's `notify`
+    drain died mid-batch when this write lost a lock race to a concurrent
+    writer, aborting review dispatch for every entry behind it in the same
+    drain."""
+
+    class _FlakyConn:
+        """Wraps a real (in-memory) connection, raising `database is
+        locked` on the first *fail_times* `execute()` calls before
+        delegating to the real one. Also forwards the `with conn:`
+        transaction protocol `save_queue` uses, since sqlite3.Connection's
+        context manager (not just `.execute`/`.commit`) is what actually
+        drives the DELETE+INSERT batch's commit/rollback here, and
+        delegates `fetchone`/`fetchall`/etc. to the most recent real
+        cursor — `coord.sql.execute` returns whatever `.cursor()`
+        produced (this fake, standing in for the connection) as if it
+        were the cursor itself, and `load_queue`'s read after the retried
+        write exercises that same path.
+        """
+
+        __module__ = "sqlite3"
+
+        def __init__(self, real_conn, fail_times: int) -> None:
+            self._real = real_conn
+            self._fail_times = fail_times
+            self.calls = 0
+            self._last_cursor = None
+
+        def cursor(self):
+            return self
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls <= self._fail_times:
+                import sqlite3
+
+                raise sqlite3.OperationalError("database is locked")
+            self._last_cursor = self._real.execute(*args, **kwargs)
+            return self._last_cursor
+
+        def commit(self):
+            return self._real.commit()
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._real.__exit__(exc_type, exc, tb)
+
+        def __getattr__(self, name):
+            if self._last_cursor is not None:
+                return getattr(self._last_cursor, name)
+            raise AttributeError(name)
+
+    def test_retries_through_transient_lock_then_persists(
+        self, coord_db, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.merge_queue.get_connection", lambda: flaky)
+
+        save_queue([_q("a", size=10)])
+
+        assert flaky.calls >= 3  # two collisions, then the write that lands
+        items = load_queue()
+        assert [x.assignment_id for x in items] == ["a"], (
+            "the queue must land durably once the lock clears — never lost "
+            "to a transient lock collision"
+        )
+
+    def test_raises_once_the_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A lock that never clears must still surface to the caller —
+        `coord.notify`'s drain is the layer responsible for logging and
+        moving on, not this one silently swallowing it and leaving the
+        on-disk queue looking unchanged when a save was actually dropped."""
+        import sqlite3
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.merge_queue.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            save_queue([_q("a", size=10)])
+
+
 class TestEnqueue:
     def _assignment(self, *, branch: str | None = "worker/foo") -> Assignment:
         return Assignment(
