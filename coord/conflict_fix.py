@@ -628,6 +628,28 @@ def detect_semantic_conflict(
     return False
 
 
+def semantic_escalation_disabled(config: Config | None) -> bool:
+    """True when a SEMANTIC give-up has nowhere to escalate to (#2566).
+
+    ``pipeline.escalate_semantic_conflicts`` (#1291) defaults to ``False``
+    and ``~/.coord/coordinator.yml`` does not turn it on, so on today's
+    fleet a conflict-fix worker's semantic verdict always lands here: the
+    tier-2 escalation is fully built but switched off. Distinguishing this
+    from an ordinary "conflict-fix could not resolve" failure lets the
+    HUMAN_REQUIRED message and GitHub comment say *why* no second attempt
+    was made, instead of reading as if the tier ran and failed.
+
+    Returns ``False`` (no distinct messaging) whenever *config* or its
+    ``pipeline`` block is unavailable — the generic message is still
+    accurate in that case, it's just not attributable to this specific
+    switch.
+    """
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None:
+        return False
+    return not getattr(pipeline, "escalate_semantic_conflicts", False)
+
+
 def has_prior_semantic_escalation(board: Board, merge_entry_id: str | None) -> bool:
     """True when this merge entry already had its ONE escalated attempt.
 

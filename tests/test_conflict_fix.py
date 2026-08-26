@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coord.config import Config, ReviewsConfig
+from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.conflict_fix import (
     CONFLICT_FIX_SYSTEM_PROMPT,
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
@@ -760,6 +760,36 @@ class TestDispatch:
         )
 
 
+class TestSemanticEscalationDisabled:
+    """#2566: the predicate that lets HUMAN_REQUIRED messaging say *why*
+    the tier-2 semantic escalation didn't run, rather than reading as
+    though it ran and failed."""
+
+    def test_false_when_config_is_none(self) -> None:
+        """No config to attribute the gap to — stay silent rather than
+        guess (the generic message is still accurate)."""
+        from coord.conflict_fix import semantic_escalation_disabled
+        assert semantic_escalation_disabled(None) is False
+
+    def test_true_on_default_config(self, two_machine_config: Config) -> None:
+        """`escalate_semantic_conflicts` defaults False (#1291 ships dark)."""
+        from coord.conflict_fix import semantic_escalation_disabled
+        assert semantic_escalation_disabled(two_machine_config) is True
+
+    def test_false_when_flag_is_on(self, repo: Repo) -> None:
+        from coord.conflict_fix import semantic_escalation_disabled
+        cfg = Config(
+            repos=[repo],
+            machines=[Machine(
+                name="laptop", host="laptop.tail",
+                repos=["api"], repo_paths={"api": "/work/api"},
+            )],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=False),
+            pipeline=PipelineConfig(escalate_semantic_conflicts=True),
+        )
+        assert semantic_escalation_disabled(cfg) is False
+
+
 class TestHasPriorConflictFix:
     """Cover the retry-cap predicate directly so the cli.py guard is exercised."""
 
@@ -1048,6 +1078,50 @@ class TestReconcileHook:
         assert entry.state != PENDING
         assert entry.state == HUMAN_REQUIRED
         assert "Manual rebase required" in (entry.error or "")
+
+    def test_semantic_giveup_with_escalation_disabled_says_so(
+        self, two_machine_config: Config, coord_db, tmp_path,
+    ) -> None:
+        """#2566: `pipeline.escalate_semantic_conflicts` ships dark (off by
+        default) — #1291's tier-2 escalation is fully built but never
+        fires on a stock config. When a conflict-fix worker gives up on a
+        SEMANTIC conflict and there's nowhere to escalate to *because the
+        flag is off*, both the parked entry's error and the GitHub comment
+        must say so explicitly — not read as though escalation ran and
+        failed, which is indistinguishable from every other conflict-fix
+        give-up and sends operators re-deriving this exact gap.
+        """
+        from coord import merge_queue as mq
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue()
+        log = tmp_path / "worker.log"
+        log.write_text(
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            _on_conflict_fix_done(
+                fix, succeeded=False,
+                agent_entry={"log_path": str(log)},
+                board=Board(), config=two_machine_config,
+            )
+
+        entry = mq.load_queue()[0]
+        assert entry.state == HUMAN_REQUIRED
+        assert "pipeline.escalate_semantic_conflicts is disabled" in (
+            entry.error or ""
+        )
+        post.assert_called_once()
+        body = post.call_args[0][2]
+        assert "escalate_semantic_conflicts" in body
+        assert "No tier-2 attempt was made" in body
 
     def test_clean_exit_without_marker_still_resets_to_pending(
         self, two_machine_config: Config, coord_db, tmp_path,
