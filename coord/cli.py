@@ -151,12 +151,16 @@ from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
     fix,
-    pr,
     reject_plan,
     resume_stuck,
     review,
     split,
 )
+# #2790: `coord pr` is now a group (`open`/`merge` — a branch with no board
+# assignment) that still falls through to the legacy bare `coord pr
+# <ASSIGNMENT_ID>` command above (dispatch a PR-opening worker for a
+# completed assignment) — see coord/commands/pr.py's `_PrGroup`.
+from coord.commands.pr import pr_group
 
 
 # #1182: thresholds past which a stale non-editable install escalates from the
@@ -468,7 +472,7 @@ main.add_command(drive_stop)
 main.add_command(drive_queue_group)
 main.add_command(escalate_group)
 main.add_command(decide)
-main.add_command(pr)
+main.add_command(pr_group)
 main.add_command(fix)
 main.add_command(review)
 main.add_command(approve_plan)
