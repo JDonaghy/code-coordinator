@@ -11922,6 +11922,177 @@
     }
 
     #[test]
+    fn pipeline_merge_state_blocked_on_conflict_when_entry_conflicted() {
+        // #919: the false-green bug — a merge_queue entry already parked
+        // `conflict` from a previous failed attempt must never read as
+        // Ready again just because the review verdict looks approved and
+        // no CI failure has been polled. `entry.error` names the real
+        // reason `coord merge` discovered.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "conflict".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: Some("merge conflict in coord/merge_queue.py".to_string()),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+        match app.pipeline_merge_state() {
+            PipelineMergeState::BlockedOnConflict { issue, reason } => {
+                assert_eq!(issue, 42);
+                assert_eq!(reason, "merge conflict in coord/merge_queue.py");
+            }
+            other => panic!("expected BlockedOnConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_blocked_on_conflict_when_plan_blocked() {
+        // #919: the server-computed merge plan (`coord.merge_queue.plan()`)
+        // already verifies review/branch freshness and PR mergeability —
+        // when it reports BLOCKED for this issue's entry, the classifier
+        // must surface that instead of falling through to Ready on the
+        // strength of a bare approved-review verdict.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+        app.data.merge_plan.push(planned_merge_entry_for_test(
+            "w42",
+            "acme/api",
+            "issue-42-work",
+            42,
+            "test verdict stale (recorded against main a1b2c3d, main now e4f5g6h)",
+            false,
+        ));
+        match app.pipeline_merge_state() {
+            PipelineMergeState::BlockedOnConflict { issue, reason } => {
+                assert_eq!(issue, 42);
+                assert!(
+                    reason.contains("stale"),
+                    "expected the plan's stale-verdict reason, got: {reason:?}"
+                );
+            }
+            other => panic!("expected BlockedOnConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_pipeline_merge_blocked_on_conflict_toasts_no_spawn() {
+        // #919: pressing m/clicking Merge on a row the merge queue already
+        // knows is conflicted must never silently spawn `coord merge`
+        // (which would just rediscover the same conflict) — it must toast
+        // the real reason instead.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "conflict".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: Some("merge conflict in coord/merge_queue.py".to_string()),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(acted, "dispatcher should report having handled the action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must surface a toast — silent no-op was the bug we're fixing",
+        );
+        let last = app.toasts.last().expect("toast pushed");
+        let body = last.0.body.to_string();
+        assert!(
+            body.contains("merge conflict"),
+            "toast body should name the real conflict, got: {body:?}",
+        );
+        assert!(
+            !app.command_runner.is_running(),
+            "must not spawn coord merge on a known-conflicted entry",
+        );
+    }
+
+    #[test]
     fn dispatch_pipeline_merge_blocked_on_review_toasts_no_spawn() {
         // The actual bug the user reported: pressing m on a row with
         // request-changes verdict should NOT silently spawn `coord

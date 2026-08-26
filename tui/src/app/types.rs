@@ -983,6 +983,15 @@ pub(crate) enum PipelineMergeState {
     /// CI checks are failed for the PR.  Falls through to the existing
     /// `pending_force_merge` confirm prompt so the user can opt in.
     BlockedOnCi { issue: u64, repo: String },
+    /// #919: a concrete blocker neither the review-verdict check nor the
+    /// locally-polled CI summary above can see — either the merge_queue
+    /// entry itself is already parked `conflict`/`human_required` from a
+    /// previous failed attempt (`entry.error` carries the message), or the
+    /// server-computed merge plan (`coord.merge_queue.plan()`, which
+    /// verifies PR mergeability and branch/review freshness, not just the
+    /// bare board verdict) reports `BLOCKED`. Never a silent no-op: routes
+    /// to a toast naming the real reason instead of a false "Ready".
+    BlockedOnConflict { issue: u64, reason: String },
     /// Safe to dispatch `coord merge --repo <repo>`.
     /// `repo_slug` is the GitHub `owner/name` slug used to key
     /// `pipeline_inflight_merges`; `repo` is the coord-local name passed to

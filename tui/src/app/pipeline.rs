@@ -9330,6 +9330,43 @@ impl CoordApp {
                 issue: issue.number,
             };
         }
+        // #919: an entry already parked `conflict`/`human_required` from a
+        // previous merge attempt must never read as Ready again just
+        // because the review verdict looks approved and no CI failure has
+        // been polled yet — neither of those checks is what discovered the
+        // conflict in the first place. `entry.error` carries the gate's own
+        // message (real GitHub conflict output, or the human-required
+        // reason), so surface that directly rather than a generic "blocked".
+        if matches!(entry.state.as_str(), "conflict" | "human_required") {
+            return PipelineMergeState::BlockedOnConflict {
+                issue: issue.number,
+                reason: entry
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "merge conflict — needs manual resolution".to_string()),
+            };
+        }
+        // #919: prefer the server-computed merge plan when present — it
+        // already verifies PR mergeability and review/branch freshness
+        // (`coord.merge_queue._entry_gate_status`: stale-approval SHA/
+        // patch-id walk, CI failed/pending/stale, the #1877 no-checks-means-
+        // conflict heuristic, …), which is exactly the "board verdict alone
+        // is not enough" gap the checks below can't close on their own.
+        // Absent in local-SQLite mode (no daemon) or against a daemon older
+        // than #776 — the narrower checks below remain the fallback there.
+        if let Some(plan_entry) =
+            self.merge_plan_entry_for_issue(&issue.repo_slug, issue.number)
+        {
+            if plan_entry.status == "BLOCKED" {
+                return PipelineMergeState::BlockedOnConflict {
+                    issue: issue.number,
+                    reason: plan_entry
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "not mergeable".to_string()),
+                };
+            }
+        }
         // Review gate — only meaningful when the pipeline has a Review
         // stage; otherwise downstream `coord merge` won't enforce it.
         // #292 (Defect 1/2): use issue_has_any_approved_review so a fix-work
@@ -9439,6 +9476,18 @@ impl CoordApp {
                 // keybind opens; the user has to type y to bypass.
                 let _ = issue;
                 self.pending_force_merge = Some(repo);
+                true
+            }
+            PipelineMergeState::BlockedOnConflict { issue, reason } => {
+                // #919: never a one-click dispatch — a real conflict or a
+                // gate the merge plan already marked BLOCKED needs a human
+                // to rebase/resolve/re-review, not a retry of the same
+                // merge that already failed (or would fail) this way.
+                self.push_toast(
+                    "Merge blocked",
+                    &format!("#{issue}: {reason}"),
+                    ToastSeverity::Warning,
+                );
                 true
             }
             PipelineMergeState::Ready { issue, repo, repo_slug } => {
