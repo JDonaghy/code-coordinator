@@ -52,6 +52,8 @@ if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.config import Config
     from coord.models import Assignment, Board, Machine
 
+log = logging.getLogger(__name__)
+
 # Stages the doctor understands.  Each maps to the assignment ``type`` that
 # carries its state; ``test`` and ``merge`` are tracked on the *work* row
 # (``test_state`` / ``status='merged'`` + the merge queue) rather than a
@@ -1686,6 +1688,12 @@ def _latest_smoke_child(board: "Board", parent_id: str) -> "Assignment | None":
     work row can carry more than one Test-stage leg over its lifetime
     (#2272's mute-leg retries), and resolving against a stale earlier leg
     would misreport (or, worse, mis-clear) the CURRENT leg's outcome.
+
+    Ties on ``dispatched_at`` (including the ``or 0.0`` fallback for legs
+    with no timestamp at all) break first-max-wins, per Python's ``max()``
+    semantics — harmless in practice (two legs would need the same
+    wall-clock second, or both be missing a timestamp), not a claim that a
+    tie is meaningfully ordered.
     """
     candidates = [
         a for a in (board.active + board.completed)
@@ -1753,8 +1761,13 @@ def sweep_stuck_test_state_rows(
     (not ``save_board``), so this function never mutates *board* and the
     caller does not need to persist it.
 
-    Returns one :class:`StuckTestStateHeal` per row healed (or, when
-    *dry_run*, per row that WOULD be healed).
+    Returns one :class:`StuckTestStateHeal` per row actually healed (or, when
+    *dry_run*, per row that WOULD be healed). A row whose recovery write
+    itself raises (e.g. sustained DB-lock contention, #2802) is deliberately
+    left OUT of the returned list — it was not healed, `test_state` is still
+    ``"running"``, and the caller (`coord.notify._sweep_stuck_test_state`)
+    must not report it as a heal. It is logged and left for the next sweep
+    tick (or a human via ``coord diagnose --stage test``) to retry.
     """
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
 
@@ -1840,12 +1853,26 @@ def sweep_stuck_test_state_rows(
                 failure_reason=failure_reason,
                 environmental=environmental,
             )
-            action = "cleared test_state for a fresh Test-stage dispatch (#2803)"
         except Exception as exc:  # noqa: BLE001 — never sink the sweep
-            action = (
-                f"recovery failed ({exc}) — left for `coord diagnose "
-                "--stage test`"
+            # The recovery WRITE itself raised (e.g. sustained DB-lock
+            # contention — the exact #2802 failure class this watchdog
+            # exists to route around). `test_state` is untouched, so this
+            # row is NOT healed — do not report it as one. Appending a
+            # `StuckTestStateHeal` here would make
+            # `coord.notify._sweep_stuck_test_state` post a misleading
+            # "auto-healed" GitHub comment for a row nothing happened to,
+            # and since the row is still `test_state='running'` it would be
+            # re-found (and re-commented) on every subsequent ~60s drain
+            # tick for as long as the contention lasts — an unbounded loop
+            # of duplicate, mislabeled comments on the same issue. Log and
+            # leave it at `running`: the next tick retries silently, and a
+            # human can still reach it via `coord diagnose --stage test`.
+            log.warning(
+                "sweep_stuck_test_state_rows: recovery write failed for %s "
+                "(%s) — leaving test_state='running' for the next tick",
+                w.assignment_id, exc,
             )
+            continue
 
         healed.append(StuckTestStateHeal(
             assignment_id=w.assignment_id,
@@ -1853,7 +1880,7 @@ def sweep_stuck_test_state_rows(
             repo_name=w.repo_name,
             issue_number=w.issue_number,
             detail=detail,
-            action=action,
+            action="cleared test_state for a fresh Test-stage dispatch (#2803)",
         ))
 
     return healed

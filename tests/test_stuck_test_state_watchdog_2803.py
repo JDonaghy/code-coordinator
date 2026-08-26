@@ -164,6 +164,88 @@ def test_recovers_missing_smoke_child(monkeypatch, config) -> None:
     assert "no Test-stage" in healed[0].detail
 
 
+def test_recovery_write_failure_is_not_reported_as_healed(monkeypatch, config, caplog) -> None:
+    """When the recovery WRITE itself raises (e.g. sustained DB-lock
+    contention, #2802), the row must NOT show up in the returned list.
+    `test_state` is left untouched, and appending a heal here would make
+    `coord.notify._sweep_stuck_test_state` post a misleading "auto-healed"
+    GitHub comment for a row nothing happened to — and repeat it every
+    subsequent drain tick, since the row would still be `test_state='running'`
+    on the very next scan."""
+    now = time.time()
+
+    def _boom(**kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(status="done", finished_at=now - 3600)
+    board = Board(completed=[work, smoke])
+
+    with caplog.at_level("WARNING"):
+        healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed == []
+    assert any("w1" in rec.message for rec in caplog.records)
+
+
+def test_recovery_write_failure_still_lets_other_rows_heal(monkeypatch, config) -> None:
+    """One row's recovery write raising must not sink the whole sweep — the
+    same "never sink the sweep" contract the `except Exception` already
+    documents, now verified across rows."""
+    now = time.time()
+
+    def _flaky(*, parent_assignment_id, **kw):
+        if parent_assignment_id == "w-boom":
+            raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _flaky)
+    boom_work = _work(aid="w-boom", finished_at=now - 3600)
+    boom_smoke = _smoke(aid="s-boom", review_of="w-boom", status="done", finished_at=now - 3600)
+    ok_work = _work(aid="w-ok", finished_at=now - 3600)
+    ok_smoke = _smoke(aid="s-ok", review_of="w-ok", status="done", finished_at=now - 3600)
+    board = Board(completed=[boom_work, boom_smoke, ok_work, ok_smoke])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert [h.assignment_id for h in healed] == ["w-ok"]
+
+
+def test_notify_sweep_does_not_comment_when_recovery_write_fails(monkeypatch, config) -> None:
+    """End-to-end through the `coord notify` wiring: a failing recovery write
+    must not produce a GitHub "auto-healed" comment nor an audit event —
+    only genuine heals do."""
+    from coord import notify
+
+    now = time.time()
+
+    def _boom(**kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(status="done", finished_at=now - 3600)
+    board = Board(completed=[work, smoke])
+    monkeypatch.setattr("coord.board_service.read_board", lambda: board)
+    monkeypatch.setattr("coord.diagnose.time.time", lambda: now)
+
+    posted_bodies: list[tuple] = []
+    monkeypatch.setattr(
+        "coord.notify.github_ops.post_issue_comment",
+        lambda repo_github, issue, body: posted_bodies.append((repo_github, issue, body)),
+    )
+    audit_calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.audit.record_audit", lambda **kw: audit_calls.append(kw)
+    )
+
+    posted = notify._sweep_stuck_test_state(config)
+
+    assert posted == []
+    assert posted_bodies == []
+    assert audit_calls == []
+
+
 def test_leaves_alone_still_running_smoke_child(monkeypatch, config) -> None:
     """A Test-stage child that is still genuinely `running`/`pending` itself
     is NOT this sweep's job — that's `sweep_dead_running_rows`'/
