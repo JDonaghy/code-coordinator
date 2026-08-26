@@ -52,6 +52,17 @@ _ACTIVE_MERGE_STATES = frozenset({"open", "queued"})
 # `_merge_stage_status` below, projecting a lit one-click Merge for an item
 # that cannot actually merge — the false green #919 exists to close.
 _FAILED_MERGE_STATES = frozenset({"failed", "human_required", "conflict"})
+# #919 review (round 2): "skipped" is the third state `_state_to_plan_status`
+# folds into PLAN_NEEDS_ATTENTION, and `_RESOLVE_TERMINAL_STATES` treats it as
+# terminal alongside "merged" — it will not self-resolve, so it is just as
+# much "not ready to merge" as "conflict". It is kept *out* of
+# `_FAILED_MERGE_STATES` on purpose: unlike conflict/human_required, a
+# superseded ("skipped") row routinely survives next to the *successful*
+# attempt for the same issue whose own row the reconcile tick then prunes
+# (#775), so matching it before the merged-work-assignment / closed-issue
+# fallbacks would paint a finished issue red. Checked last instead — see
+# `merge_stage_status_for`.
+_SUPERSEDED_MERGE_STATES = frozenset({"skipped"})
 
 
 @runtime_checkable
@@ -392,7 +403,19 @@ def merge_stage_status_for(
     if any(a.type in CLOSES_ISSUE_TYPES and a.status == "merged" for a in assignments_for_issue):
         return DONE
 
-    return SKIPPED if is_closed else PENDING
+    if is_closed:
+        return SKIPPED
+
+    # #919 review (round 2): a still-open issue whose only queue row is
+    # `skipped` (superseded by a newer attempt that has since vanished) has
+    # nothing in flight and nothing that will self-resolve — reporting
+    # PENDING here lights the one-click [Go] on the Merge box for an item
+    # `pipeline_merge_state()` would already refuse to dispatch. Same false
+    # green as the `conflict` case, one state value over.
+    if merge_entry is not None and merge_entry.state in _SUPERSEDED_MERGE_STATES:
+        return FAILED
+
+    return PENDING
 
 
 def stage_status_for(

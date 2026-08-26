@@ -12083,6 +12083,72 @@
         }
     }
 
+    /// #919 review (round 2): the plan-status check must catch
+    /// NEEDS_ATTENTION as well as BLOCKED. `_state_to_plan_status`
+    /// (`coord/merge_queue.py`) folds conflict/human_required/skipped into
+    /// PLAN_NEEDS_ATTENTION, so an entry the server has already given up on
+    /// arrives with that status — checking only "BLOCKED" let it fall
+    /// through to the review-verdict checks below and read Ready.
+    #[test]
+    fn pipeline_merge_state_blocked_when_plan_needs_attention() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            // A state the raw-`entry.state` guard above does *not* match, so
+            // this test genuinely exercises the plan-status branch.
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+        let mut plan_entry = planned_merge_entry_for_test(
+            "w42",
+            "acme/api",
+            "issue-42-work",
+            42,
+            "merge conflict — needs manual resolution",
+            false,
+        );
+        plan_entry.status = "NEEDS_ATTENTION".to_string();
+        app.data.merge_plan.push(plan_entry);
+        match app.pipeline_merge_state() {
+            PipelineMergeState::BlockedOnConflict { issue, reason } => {
+                assert_eq!(issue, 42);
+                assert!(
+                    reason.contains("conflict"),
+                    "expected the plan's own reason, got: {reason:?}"
+                );
+            }
+            other => panic!("expected BlockedOnConflict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn dispatch_pipeline_merge_blocked_on_conflict_toasts_no_spawn() {
         // #919: pressing m/clicking Merge on a row the merge queue already
@@ -14962,6 +15028,104 @@
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Failed);
+    }
+
+    /// #919 review (round 2): `skipped` is the third merge_queue state the
+    /// server folds into PLAN_NEEDS_ATTENTION (`_state_to_plan_status`) and
+    /// treats as terminal alongside `merged` (`_RESOLVE_TERMINAL_STATES`) —
+    /// a superseded row on a still-open issue never self-resolves. Before
+    /// this fix it fell through to Pending, lighting a one-click [Go] on the
+    /// Merge box for an item `pipeline_merge_state()` already classifies as
+    /// BlockedOnConflict — the two surfaces answering "is this issue's merge
+    /// ready" disagreed (epic #2096, "one question, one answer").
+    #[test]
+    fn merge_stage_status_failed_from_skipped() {
+        let mut app = make_pipeline_app();
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "skipped".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: Some("superseded by a newer merge attempt".to_string()),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Failed);
+        // …and the user-visible consequence: the Merge box must not offer a
+        // lit one-click [Go] for an entry that can never merge. That button
+        // is what #919 exists to take away.
+        let view = app.build_pipeline_widget().unwrap();
+        let merge_box = view
+            .stages
+            .iter()
+            .find(|s| s.label.starts_with("Merge"))
+            .expect("pipeline row has a Merge stage box");
+        assert_ne!(
+            merge_box.action.as_deref(),
+            Some("Go"),
+            "a superseded (skipped) merge_queue row must not light one-click Merge"
+        );
+    }
+
+    /// The flip side of the above: a superseded (`skipped`) row routinely
+    /// survives next to the *successful* attempt for the same issue, whose
+    /// own row the reconcile tick then prunes (#775). The merged work
+    /// assignment must still win — a finished issue must not be painted red
+    /// just because the losing row outlived the winning one.
+    #[test]
+    fn merge_stage_status_skipped_row_does_not_mask_merged_work() {
+        let mut app = make_pipeline_app();
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 1.0, "merged"));
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "skipped".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: Some("superseded by a newer merge attempt".to_string()),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
     }
 
     /// An `open` row in merge_queue marks the Merge stage Active.

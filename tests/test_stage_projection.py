@@ -186,6 +186,34 @@ def test_merge_stage_conflict_is_failed():
     assert sp.merge_stage_status_for([], entry, is_closed=False) == sp.FAILED
 
 
+def test_merge_stage_skipped_is_failed_for_open_issue():
+    """#919 review (round 2): `skipped` is the third state
+    ``_state_to_plan_status`` folds into PLAN_NEEDS_ATTENTION, and
+    ``_RESOLVE_TERMINAL_STATES`` treats it as terminal alongside "merged" —
+    a superseded row on a still-open issue never self-resolves. Reporting
+    PENDING lit the one-click [Go] on the Merge box for an item
+    ``pipeline_merge_state()`` already refuses to dispatch."""
+    entry = _entry(state="skipped")
+    assert sp.merge_stage_status_for([], entry, is_closed=False) == sp.FAILED
+
+
+def test_merge_stage_skipped_row_does_not_mask_merged_work_assignment():
+    """The flip side: a superseded ("skipped") row routinely survives next
+    to the *successful* attempt for the same issue, whose own row the
+    reconcile tick then prunes (#775). The merged work assignment must still
+    win — a finished issue must not be painted red."""
+    a = [_work(status="merged")]
+    entry = _entry(state="skipped")
+    assert sp.merge_stage_status_for(a, entry, is_closed=False) == sp.DONE
+
+
+def test_merge_stage_skipped_row_on_closed_issue_is_skipped():
+    """A closed issue with only a superseded row reads SKIPPED (settled),
+    not FAILED — there is no remedial action left to take."""
+    entry = _entry(state="skipped")
+    assert sp.merge_stage_status_for([], entry, is_closed=True) == sp.SKIPPED
+
+
 def test_merge_stage_pruned_entry_falls_back_to_merged_work_assignment():
     """#775: the queue row can be pruned after the work assignment flips to
     status='merged' — that's still sufficient evidence Merge is Done."""
