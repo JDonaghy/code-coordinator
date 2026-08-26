@@ -63,6 +63,17 @@ EVENT_LIVENESS_STALL = "liveness_stall"
 # Unlike every other EVENT_* above, this one narrates an action ALREADY
 # TAKEN, not only a finding.
 EVENT_PHANTOM_HEALED = "phantom_row_healed"
+# #2803: a work row wedged at `test_state='running'` well past its
+# Test-stage child's own resolution (or well past `dispatch_smoke`'s own
+# marker with no child ever found), auto-cleared by the fleet-wide
+# `coord.diagnose.sweep_stuck_test_state_rows` watchdog. Distinct from
+# EVENT_PHANTOM_HEALED — that sweep keys off the CHILD assignment's own
+# liveness (`status='running'` + a confirmed-dead session); this one keys
+# off a parent/child MISMATCH (the child already reached a terminal status,
+# or was never created, while the parent's verdict marker never cleared) —
+# the two are complementary, not overlapping. Like EVENT_PHANTOM_HEALED,
+# this narrates an action ALREADY TAKEN, not only a finding.
+EVENT_STUCK_TEST_STATE_HEALED = "stuck_test_state_healed"
 
 
 @dataclass
@@ -534,6 +545,56 @@ def format_phantom_row_healed(
         "commits are preserved, the stage is re-dispatchable, and this "
         "repo's drive-queue slot is freed. If this looks wrong, `coord log "
         "<id>` / `coord diagnose <repo> <issue>` can confirm what happened.",
+    ]
+    return "\n".join(lines)
+
+
+def format_stuck_test_state_healed(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    detail: str,
+    action: str,
+) -> str:
+    """Format a "stuck test_state='running' auto-healed" comment (#2803).
+
+    Mirrors :func:`format_phantom_row_healed`'s shape — this one is also
+    posted AFTER the automatic, verdict-preserving recovery already ran
+    (never *before*, and never a guess): *detail* names the actual Test-stage
+    child and its terminal status (or its absence), *action* what was
+    actually cleared. Deliberately narrates the row this closes the loop
+    on — #2273's 240-minute deadline and `coord drive-queue diagnose`'s
+    independent re-derivation both point away from the real cause, which is
+    exactly the gap this comment exists to close.
+    """
+    marker = _marker(
+        EVENT_STUCK_TEST_STATE_HEALED,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+    )
+    lines = [
+        marker,
+        "## 🩺 Stuck Test-stage verdict auto-healed",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        "",
+        detail.strip(),
+        "",
+        f"**Action taken:** {action.strip()}",
+        "",
+        "`test_state='running'` is meant to be transient, cleared by an "
+        "inbound Test verdict. This row sat well past the ordinary "
+        "propagation lag with its Test-stage child already resolved (or "
+        "missing entirely) — a lost verdict write, not a lost worker. "
+        "Nothing was fabricated: this only clears the stuck marker so the "
+        "Test stage re-dispatches fresh (or, for a real Test-stage failure, "
+        "records it exactly as a normal failed run would have). If this "
+        "looks wrong, `coord log <id>` / `coord diagnose <repo> <issue> "
+        "--stage test` can confirm what happened.",
     ]
     return "\n".join(lines)
 

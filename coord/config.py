@@ -1077,6 +1077,27 @@ class PipelineConfig:
     ``false`` to require a human to run ``coord diagnose --reset``
     themselves, as before #2536.
 
+    ``auto_heal_stuck_test_state`` (#2803) controls whether
+    ``coord.notify._sweep_stuck_test_state`` gets to act, on the daemon's
+    own tick (``coord.notify.run_drain``), on a work row wedged at
+    ``test_state="running"`` well past its Test-stage child's own
+    resolution — see ``coord.diagnose.sweep_stuck_test_state_rows``.
+    **Defaults to ``True``**, the same posture as ``auto_heal_phantom_rows``
+    and for the same reason: this closes a real bug (a lost Test-stage
+    verdict write silently blocking the whole pipeline, and every
+    ``after=``-chained drive-queue entry behind it, until a 240-minute drive
+    deadline gives up with a misleading cause — vimcode#555) rather than
+    adding a new capability. Every action it takes is gated on the Test-stage
+    child having already reached a TERMINAL status (or never having existed
+    at all) plus a fixed grace window past that — it never touches a child
+    that is still genuinely running, which stays
+    ``auto_heal_phantom_rows``'/``coord.notify.detect_needs_attention``'s
+    job. It never fabricates a pass/fail verdict either: recovery always
+    goes through ``coord.reconcile.propagate_smoke_terminal_failure``, the
+    same environmental-vs-work classification the manual ``coord diagnose
+    --stage test`` recovery already uses. Set ``false`` to require a human
+    to run that command themselves, as before #2803.
+
     ``max_fix_rounds`` (#2604) is the fleet-wide default for a
     **tick-launched** ``coord drive --tmux --max-fix-rounds`` — set once here
     instead of on every ``coord drive-queue add``. ``None`` (the default)
@@ -1132,6 +1153,8 @@ class PipelineConfig:
     confirm_test_verdict: bool = True
     # #2536 — DEFAULT ON. See the class docstring.
     auto_heal_phantom_rows: bool = True
+    # #2803 — DEFAULT ON. See the class docstring.
+    auto_heal_stuck_test_state: bool = True
     # #2604 — None means "use coord.drive_queue.DEFAULT_TICK_MAX_FIX_ROUNDS".
     # See the class docstring.
     max_fix_rounds: int | None = None
@@ -3029,6 +3052,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, bool):
             raise ConfigError("pipeline.auto_heal_phantom_rows must be a boolean")
         cfg.auto_heal_phantom_rows = value
+
+    if "auto_heal_stuck_test_state" in raw:
+        value = raw["auto_heal_stuck_test_state"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.auto_heal_stuck_test_state must be a boolean")
+        cfg.auto_heal_stuck_test_state = value
 
     if "max_review_iterations" in raw:
         value = raw["max_review_iterations"]

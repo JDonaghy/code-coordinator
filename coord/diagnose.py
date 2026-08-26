@@ -1618,6 +1618,247 @@ def sweep_dead_running_rows(
     return healed
 
 
+# ── #2803: fleet-wide stuck test_state='running' watchdog ───────────────────
+#
+# `test_state='running'` is the marker `dispatch_smoke` stamps on the PARENT
+# work row the instant it dispatches a Test-stage (`type="smoke"`) child
+# (`coord/smoke.py`, #1426) — transient by design, meant to be cleared only
+# by an inbound verdict. `_recover_test` above already resolves the
+# contradiction when the child died `failed`/`cancelled` without ever
+# reporting pass/fail, but only when a HUMAN happens to run `coord diagnose
+# <repo> <issue> --stage test`, and only for that one narrow terminal shape.
+# Nothing ran it on its own, and nothing at all covered a child that reached
+# `status="done"` (the child believes it succeeded, but the write that
+# should have carried its verdict onto the parent never landed — the DB-lock
+# class of loss #2802 hardened the write path against, going forward) or a
+# parent with no Test-stage child at all.
+#
+# Before this, the only thing that ever noticed a row stuck this way was
+# #2273's 240-minute drive-session deadline — by which point the owning
+# drive had burned its whole attempt budget, gone `blocked`, and blocked
+# every `after=`-chained row behind it too (vimcode#555, 2026-08-26: five
+# rows, ~4h). Worse, the deadline's own message ("no assignment was ever
+# created for this run") and `coord drive-queue diagnose`'s independent
+# re-derivation ("gate-blocked") both misdirect — a Test-stage assignment
+# plainly WAS created, and neither name the stuck row at all.
+# :func:`sweep_stuck_test_state_rows` is the automatic, fleet-wide
+# counterpart — a bounded grace window measured from the actual cause, not a
+# fixed 240-minute wait, and a message that names the stuck row and its
+# child's real status.
+
+# How long to wait, after the Test-stage child itself went terminal (or —
+# for the "no child was ever created" case — after the parent work row
+# itself went terminal), before treating a still-`running` parent
+# `test_state` as a lost verdict rather than the ordinary, bounded
+# propagation lag every terminal Test-stage completion has (see
+# `coord.drive._decide_test`'s own comment: "a fresh `done` smoke completion
+# has an expected, bounded propagation lag ... that is NOT this bug").
+# Deliberately smaller than `PHANTOM_HEAL_BUFFER_SECONDS` above: that buffer
+# guards against racing a session that might still be ALIVE; this one only
+# ever looks at a child that has ALREADY reached a terminal status, so the
+# only thing being waited out here is a slow write, never a slow worker.
+STUCK_TEST_STATE_GRACE_SECONDS = 600.0  # 10 minutes
+
+
+@dataclass
+class StuckTestStateHeal:
+    """One work row this sweep found wedged at ``test_state='running'`` well
+    past its Test-stage child's own resolution, and cleared (or, in a dry
+    run, WOULD clear) for a fresh Test-stage dispatch (#2803).
+
+    Mirrors :class:`PhantomRowHeal`'s shape so ``coord notify`` can post one
+    comment per row the same way.
+    """
+
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    detail: str
+    action: str = ""
+
+
+def _latest_smoke_child(board: "Board", parent_id: str) -> "Assignment | None":
+    """The most recently dispatched ``type="smoke"`` row for *parent_id*, or
+    ``None``.
+
+    Picks the newest by ``dispatched_at`` rather than the first match — a
+    work row can carry more than one Test-stage leg over its lifetime
+    (#2272's mute-leg retries), and resolving against a stale earlier leg
+    would misreport (or, worse, mis-clear) the CURRENT leg's outcome.
+    """
+    candidates = [
+        a for a in (board.active + board.completed)
+        if a.type == "smoke" and a.review_of_assignment_id == parent_id
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda a: a.dispatched_at or 0.0)
+
+
+def sweep_stuck_test_state_rows(
+    board: "Board",
+    config: "Config",
+    *,
+    now: float | None = None,
+    dry_run: bool = False,
+) -> list[StuckTestStateHeal]:
+    """The automatic counterpart to a human running ``coord diagnose <repo>
+    <issue> --stage test`` on a work row wedged at ``test_state='running'``
+    (#2803) — see the module-level comment above for the full incident this
+    closes.
+
+    Scans every ``status="done"`` work-like row on *board* whose
+    ``test_state == "running"`` (fleet-wide, not scoped to one issue — like
+    :func:`sweep_dead_running_rows`). For each, classifies via its latest
+    Test-stage (``type="smoke"``) child:
+
+    * **No child found at all** — the ``dispatch_smoke``-stamped marker
+      exists with nothing behind it (a lost row). Always resolved
+      environmentally (never a work failure — there is no worker output to
+      even blame).
+    * **Child reached ``status in ("failed", "cancelled")``** — mirrors
+      ``_recover_test``'s existing classification exactly (environmental vs.
+      work, decided by :func:`coord.failure_class.classify_failure` from the
+      child's own ``failure_reason``), just fleet-wide and automatic instead
+      of issue-scoped and manual.
+    * **Child reached ``status == "done"``** — the child itself believes it
+      succeeded, but the parent's verdict write never landed. Always
+      resolved environmentally: a lost write is a coordinator/infra fault,
+      never a code defect.
+    * **Child still ``running``/``pending`` itself, or nothing to anchor an
+      age from** — left alone. A child that is still genuinely executing
+      (or phantom-dead) is :func:`sweep_dead_running_rows`'s /
+      ``coord.notify.detect_needs_attention``'s job — both key off the
+      CHILD's own liveness/wall-clock, not the parent/child mismatch this
+      sweep targets.
+
+    Every actionable case above is gated on :data:`STUCK_TEST_STATE_GRACE_SECONDS`
+    having elapsed since the anchor (the child's own ``finished_at``,
+    falling back to ``dispatched_at``; the parent's own ``finished_at``/
+    ``dispatched_at`` when there is no child at all) — an ordinary terminal
+    Test-stage completion has an expected, bounded propagation lag before
+    its verdict lands on the parent, and that lag is not this bug.
+
+    Recovery is always :func:`coord.reconcile.propagate_smoke_terminal_failure`
+    — the same, already-reviewed seam ``_recover_test`` and
+    ``_reconcile_no_agent_record`` both use. It never fabricates a pass/fail
+    verdict: an environmental clear resets ``test_state`` back to ``NULL``
+    so ``dispatch_pending_smoke``'s ordinary bookkeeping (already run every
+    daemon tick) re-dispatches a fresh Test stage on its own next pass; a
+    work classification records ``test_state="failed"`` exactly like a
+    normal non-zero-exit smoke completion would have, spending a bounded
+    ``coord fix`` round exactly as it should have if the write had landed on
+    time. Writes go through ``coord.state.record_test_verdict`` directly
+    (not ``save_board``), so this function never mutates *board* and the
+    caller does not need to persist it.
+
+    Returns one :class:`StuckTestStateHeal` per row healed (or, when
+    *dry_run*, per row that WOULD be healed).
+    """
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    if now is None:
+        now = time.time()
+
+    healed: list[StuckTestStateHeal] = []
+    seen_ids: set[str] = set()
+    for w in board.completed:
+        if w.type not in WORK_LIKE_TYPES:
+            continue
+        if w.status != "done" or w.test_state != "running":
+            continue
+        if not w.assignment_id or w.assignment_id in seen_ids:
+            continue
+        seen_ids.add(w.assignment_id)
+
+        smoke = _latest_smoke_child(board, w.assignment_id)
+
+        if smoke is None:
+            anchor = w.finished_at or w.dispatched_at
+            cause = "no Test-stage (smoke) assignment exists for this work row at all"
+            environmental: bool | None = True
+            failure_reason = (
+                "watchdog (#2803): test_state='running' with no Test-stage "
+                "assignment found at all"
+            )
+        elif (smoke.status or "") in ("failed", "cancelled"):
+            anchor = smoke.finished_at or smoke.dispatched_at
+            cause = (
+                f"Test-stage worker {smoke.assignment_id} already finished "
+                f"(status={smoke.status!r}, failure_reason="
+                f"{smoke.failure_reason or 'none recorded'!r}) but its "
+                "verdict was never propagated to the parent"
+            )
+            environmental = None  # classify from failure_reason, like `_recover_test`
+            failure_reason = smoke.failure_reason
+        elif smoke.status == "done":
+            anchor = smoke.finished_at or smoke.dispatched_at
+            cause = (
+                f"Test-stage worker {smoke.assignment_id} finished "
+                "(status='done') but no verdict was ever recorded on the "
+                "parent row"
+            )
+            environmental = True
+            failure_reason = (
+                f"watchdog (#2803): Test-stage worker {smoke.assignment_id} "
+                "finished but the parent verdict write never landed (the "
+                "DB-lock class of loss, #2802) — cleared for a fresh "
+                "Test-stage dispatch"
+            )
+        else:
+            continue  # still running/pending — not this sweep's job
+
+        if anchor is None:
+            continue  # nothing to compute an age from — never guess
+        running_for = now - anchor
+        if running_for <= STUCK_TEST_STATE_GRACE_SECONDS:
+            continue  # ordinary propagation lag — not lost yet
+
+        detail = (
+            f"test_state='running' for {running_for / 60.0:.0f}m — {cause} "
+            f"(past the {STUCK_TEST_STATE_GRACE_SECONDS / 60.0:.0f}m grace "
+            "window)"
+        )
+
+        if dry_run:
+            healed.append(StuckTestStateHeal(
+                assignment_id=w.assignment_id,
+                machine_name=w.machine_name or "unknown",
+                repo_name=w.repo_name,
+                issue_number=w.issue_number,
+                detail=detail,
+                action="(dry-run) would clear test_state for a fresh Test-stage dispatch",
+            ))
+            continue
+
+        from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+
+        try:
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=w.assignment_id,
+                failure_reason=failure_reason,
+                environmental=environmental,
+            )
+            action = "cleared test_state for a fresh Test-stage dispatch (#2803)"
+        except Exception as exc:  # noqa: BLE001 — never sink the sweep
+            action = (
+                f"recovery failed ({exc}) — left for `coord diagnose "
+                "--stage test`"
+            )
+
+        healed.append(StuckTestStateHeal(
+            assignment_id=w.assignment_id,
+            machine_name=w.machine_name or "unknown",
+            repo_name=w.repo_name,
+            issue_number=w.issue_number,
+            detail=detail,
+            action=action,
+        ))
+
+    return healed
+
+
 # ── #618: orphaned worktree detection + pruning ──────────────────────────────
 
 

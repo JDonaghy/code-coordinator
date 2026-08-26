@@ -768,7 +768,7 @@ class TestReachableFromNotify:
         with patch.object(
             notify_mod, "_agent_status", return_value={"completed": [], "active": []}
         ), patch("coord.notify.github_ops.post_issue_comment"):
-            posted, stuck, needs_attention, stalled, _liveness, _phantom = notify_mod.run(config)
+            posted, stuck, needs_attention, stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
 
         assert posted == []
         assert stuck == []
