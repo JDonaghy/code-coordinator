@@ -2397,16 +2397,24 @@ def get_branch_diff_size(repo: str, base: str, branch: str) -> int:
         return 0
 
 
-def merge_pr(repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
+def merge_pr(
+    repo: str, number: int, method: str = "rebase", *, delete_branch: bool = False
+) -> tuple[bool, str]:
     """Merge a PR. Returns (success, message).
 
     Conflict / not-rebaseable cases come back as (False, <gh stderr>). Caller
     decides whether to retry or surface to the user — we never resolve conflicts
     here.
+
+    ``delete_branch`` (#2790) defaults to ``False`` — the merge queue's own
+    callers never pass it, preserving their pre-existing ``--delete-branch=
+    false`` behavior unchanged; ``coord pr merge`` is the one caller that
+    opts in via its own ``--delete-branch`` flag.
     """
     flag = {"rebase": "--rebase", "squash": "--squash", "merge": "--merge"}.get(method, "--rebase")
+    delete_flag = f"--delete-branch={'true' if delete_branch else 'false'}"
     try:
-        out = _gh("pr", "merge", str(number), "--repo", repo, flag, "--delete-branch=false")
+        out = _gh("pr", "merge", str(number), "--repo", repo, flag, delete_flag)
     except RuntimeError as e:
         return False, str(e)
     return True, out
