@@ -34,13 +34,13 @@ Data model:
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 
 import httpx
 
+from coord import sql
 from coord.config import Config
 from coord.db import is_lock_contention_error
 from coord.dispatch import AGENT_PORT
@@ -1241,7 +1241,7 @@ def _dispatch_fix(
             assignment=fix_assignment,
             repo_github=repo.github,
         )
-    except sqlite3.OperationalError as exc:
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         if not is_lock_contention_error(exc):
             # Not the transient contention this guard exists for (#2538) —
             # a schema mismatch or malformed statement is a real bug and

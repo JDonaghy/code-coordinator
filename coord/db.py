@@ -194,9 +194,48 @@ _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_DELAY_S = 0.1
 
 
+# #2784: Postgres SQLSTATEs that are contention-shaped the same way SQLite's
+# SQLITE_BUSY is -- a concurrent transaction is in the way right now, and a
+# short retry is very likely to let it clear.
+#   55P03 lock_not_available   -- NOWAIT/lock-timeout equivalent of SQLITE_BUSY
+#   40001 serialization_failure -- SERIALIZABLE isolation lost a write race
+#   40P01 deadlock_detected     -- Postgres's deadlock detector picked this
+#                                  transaction as the victim to abort
+# 57014 query_canceled (statement_timeout) is deliberately NOT included: it
+# fires when a statement runs too long, which is just as often a genuinely
+# slow/wrong query as it is contention -- retrying a query that will always
+# time out the same way is wrong, unlike the three codes above where the
+# *same* statement retried a moment later commonly just succeeds.
+_POSTGRES_LOCK_CONTENTION_SQLSTATES = frozenset({"55P03", "40001", "40P01"})
+
+
+class LockContentionExhaustedError(RuntimeError):
+    """Raised when sustained DB lock contention outlasts
+    :func:`retry_on_locked`'s whole retry budget and a caller has decided
+    the failure must surface loudly rather than degrade silently (#2784).
+
+    Dialect-agnostic and coord-owned rather than re-raising (or
+    synthesizing) a driver-specific exception: unlike the 18 sites this
+    issue widens to ``except sql.driver_errors():``, ``coord/commands/
+    merge.py``'s auto-enqueue scan doesn't have a real driver error it is
+    forwarding from a live connection in scope — it collects
+    ``(assignment_id, exc)`` pairs across a whole batch and, once the batch
+    finishes, raises once to fail the ``coord merge`` invocation loudly.
+    Before #2784, that final raise fabricated a bare ``sqlite3.
+    OperationalError(...)`` — a lie about the exception's actual driver
+    origin once a Postgres deployment exists, and exactly the kind of
+    driver-named exception outside ``coord/sql.py`` the #2768 ratchet now
+    forbids. This type says what actually happened (retries exhausted, not
+    "SQLite raised an OperationalError") regardless of which dialect is
+    live; the *original* per-assignment driver error is still preserved as
+    ``__cause__`` (``raise ... from lock_contention_failures[-1][1]``) for
+    anyone inspecting the traceback.
+    """
+
+
 def is_lock_contention_error(exc: BaseException) -> bool:
-    """True when *exc* is transient SQLite lock/busy contention rather than
-    a real bug (#2597).
+    """True when *exc* is transient lock/busy contention rather than a real
+    bug (#2597, widened to Postgres by #2784).
 
     Centralizes a check that used to be duplicated — and drifting — between
     this module's own :func:`retry_on_locked` and ``coord.auto_loop``'s
@@ -208,13 +247,27 @@ def is_lock_contention_error(exc: BaseException) -> bool:
     worded message. Checking the code as well as the text means a future
     SQLite/driver wording change can't silently turn this back into a
     "raise instead of retry" bug the way the single-substring version could.
+
+    Dispatches on the exception itself -- no connection, no config flag, per
+    #2719's whole seam posture (see ``coord/sql.py``'s module docstring): a
+    ``psycopg.OperationalError`` carries a ``sqlstate`` attribute (psycopg3)
+    or a ``.pgcode`` (psycopg2/error subclasses) that plays the same role
+    SQLite's ``sqlite_errorcode`` does, so the Postgres arm below checks
+    that instead of a message substring -- Postgres's error text is not a
+    stable API the way its SQLSTATE codes are.
     """
-    if not isinstance(exc, sqlite3.OperationalError):
-        return False
-    message = str(exc).lower()
-    if "database is locked" in message or "database table is locked" in message:
-        return True
-    return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+    if isinstance(exc, sqlite3.OperationalError):
+        message = str(exc).lower()
+        if "database is locked" in message or "database table is locked" in message:
+            return True
+        return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+    # Not sqlite3 -- check for a Postgres driver error without importing
+    # psycopg (it's an optional dependency, see coord/sql.py's
+    # row_factory_for): psycopg3 exposes `.sqlstate`, psycopg2 exposes
+    # `.pgcode` on the same class hierarchy -- either attribute, if present,
+    # is the SQLSTATE 5-char code.
+    sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return sqlstate in _POSTGRES_LOCK_CONTENTION_SQLSTATES
 
 
 def retry_on_locked(
@@ -223,25 +276,31 @@ def retry_on_locked(
     attempts: int = _LOCK_RETRY_ATTEMPTS,
     base_delay: float = _LOCK_RETRY_BASE_DELAY_S,
 ) -> _T:
-    """Run *write* (a zero-arg callable performing one or more SQLite writes),
-    retrying with exponential backoff when SQLite raises lock/busy
-    contention (:func:`is_lock_contention_error`, #2538/#2597).
+    """Run *write* (a zero-arg callable performing one or more database
+    writes), retrying with exponential backoff when the active driver raises
+    lock/busy contention (:func:`is_lock_contention_error`, #2538/#2597,
+    widened to Postgres by #2784).
 
     That error is transient contention — a concurrent writer holding the DB
     at the exact moment this call tries to write, not a real failure — and a
     short wait is very likely to let it clear.  ``PRAGMA busy_timeout``
-    (set on every connection in :func:`_open`) already makes SQLite itself
-    wait before raising, but under sustained contention (several writers in
-    a tight loop) that single wait can still be exhausted; this adds a few
-    more short, backed-off attempts on top rather than failing on the first
-    collision.
+    (set on every SQLite connection in :func:`_open`) already makes SQLite
+    itself wait before raising, but under sustained contention (several
+    writers in a tight loop) that single wait can still be exhausted; this
+    adds a few more short, backed-off attempts on top rather than failing on
+    the first collision.
 
-    Any other ``OperationalError`` (schema drift, a malformed statement, …)
-    is re-raised immediately without retrying — those are not transient, and
-    retrying would only delay surfacing a real bug.  After *attempts*
-    consecutive lock-contention collisions, re-raises the last
-    ``sqlite3.OperationalError`` so the caller can decide how to degrade
-    (see ``coord.state._record_dispatched_assignment_local``, whose caller —
+    Any other driver error (schema drift, a malformed statement, …) is
+    re-raised immediately without retrying — those are not transient, and
+    retrying would only delay surfacing a real bug. Caught via
+    ``sql.driver_errors()`` — every installed driver's ``Error`` base,
+    **not** a hardcoded ``sqlite3.OperationalError`` — so this still retries
+    under Postgres instead of letting a psycopg exception, which is never an
+    instance of ``sqlite3.OperationalError``, sail straight past the
+    ``except`` and crash (#2784). After *attempts* consecutive
+    lock-contention collisions, re-raises the last driver error so the
+    caller can decide how to degrade (see
+    ``coord.state._record_dispatched_assignment_local``, whose caller —
     ``coord.auto_loop._dispatch_fix`` — treats it as a declined dispatch
     rather than letting it crash the whole run).
     """
@@ -249,7 +308,7 @@ def retry_on_locked(
     for attempt in range(1, attempts + 1):
         try:
             return write()
-        except sqlite3.OperationalError as exc:
+        except sql.driver_errors() as exc:
             if not is_lock_contention_error(exc) or attempt >= attempts:
                 raise
             time.sleep(delay)
@@ -313,7 +372,7 @@ def _read_schema_version(conn: sqlite3.Connection) -> int:
     """
     try:
         row = sql.execute(conn, "SELECT MAX(version) FROM schema_version").fetchone()
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
         return 0  # table doesn't exist yet
     if row is None or row[0] is None:
         return 0
@@ -1468,14 +1527,16 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:
     """Add new columns to existing databases via ALTER TABLE.
 
-    Safe to call on databases that already have the columns — the
-    OperationalError raised by SQLite is silently swallowed.
+    Safe to call on databases that already have the columns — the driver
+    error raised for a duplicate column (SQLite's ``OperationalError``;
+    Postgres's equivalent under ``sql.driver_errors()``, #2784) is silently
+    swallowed.
     """
     for ddl in _MIGRATE_ADD_COLUMNS:
         try:
             sql.execute(conn, ddl)
             conn.commit()
-        except sqlite3.OperationalError:
+        except sql.driver_errors():
             pass  # Column already exists
 
 

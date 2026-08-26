@@ -489,6 +489,104 @@ def test_driver_error_unknown_dialect_raises():
         sql.driver_error(_FakeUnknownConnection())
 
 
+# ── driver_errors (#2784) ─────────────────────────────────────────────────────
+#
+# Unlike driver_error(conn), this needs no connection -- it's for the ~18
+# call sites wrapping a retry_on_locked(...) call (or another write with no
+# connection in scope) that used to hardcode `except sqlite3.OperationalError:`,
+# going silently inert under Postgres. psycopg is not installed in this repo
+# (see the module docstring), so degrading to (sqlite3.Error,) rather than
+# raising ImportError is the case actually under test here.
+
+
+def test_driver_errors_degrades_to_sqlite_only_when_psycopg_absent():
+    assert sql.driver_errors() == (sqlite3.Error,)
+
+
+def test_driver_errors_catches_a_real_sqlite_operational_error(memdb):
+    with pytest.raises(sql.driver_errors()):
+        memdb.execute("SELECT * FROM no_such_table")
+
+
+def test_driver_errors_is_a_tuple_suitable_for_except():
+    errors = sql.driver_errors()
+    assert isinstance(errors, tuple)
+    assert sqlite3.Error in errors
+
+
+# ── is_lock_contention_error dialect dispatch (#2784) ───────────────────────
+#
+# coord.db.is_lock_contention_error dispatches on the exception itself, no
+# connection and no config flag -- these synthesize a psycopg-shaped
+# exception (an `.sqlstate` attribute is all that's needed) without psycopg
+# actually being installed, exercising the Postgres arm the same way the
+# fake-connection classes above exercise dialect detection without a real
+# driver.
+
+
+class _FakePsycopgOperationalError(Exception):
+    """Stands in for `psycopg.OperationalError`, which carries `.sqlstate`
+    (psycopg3) -- no real psycopg needed, matching this module's existing
+    approach of faking driver *shape* rather than importing the driver."""
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class _FakePsycopg2OperationalError(Exception):
+    """Stands in for `psycopg2.OperationalError`, which carries `.pgcode`
+    instead of `.sqlstate`."""
+
+    def __init__(self, message: str, pgcode: str) -> None:
+        super().__init__(message)
+        self.pgcode = pgcode
+
+
+@pytest.mark.parametrize(
+    "sqlstate",
+    ["55P03", "40001", "40P01"],
+    ids=["lock_not_available", "serialization_failure", "deadlock_detected"],
+)
+def test_is_lock_contention_error_true_for_each_postgres_sqlstate(sqlstate):
+    from coord.db import is_lock_contention_error
+
+    exc = _FakePsycopgOperationalError("contention", sqlstate=sqlstate)
+    assert is_lock_contention_error(exc) is True
+
+
+def test_is_lock_contention_error_true_for_psycopg2_pgcode():
+    from coord.db import is_lock_contention_error
+
+    exc = _FakePsycopg2OperationalError("contention", pgcode="40P01")
+    assert is_lock_contention_error(exc) is True
+
+
+def test_is_lock_contention_error_false_for_unrelated_postgres_sqlstate():
+    from coord.db import is_lock_contention_error
+
+    # 42601 syntax_error -- a real bug, not contention; must not be retried.
+    exc = _FakePsycopgOperationalError("syntax error", sqlstate="42601")
+    assert is_lock_contention_error(exc) is False
+
+
+def test_is_lock_contention_error_false_for_query_canceled_statement_timeout():
+    from coord.db import is_lock_contention_error
+
+    # 57014 query_canceled: contention-shaped but deliberately excluded (see
+    # coord/db.py's _POSTGRES_LOCK_CONTENTION_SQLSTATES comment) -- a
+    # statement that times out may just be slow/wrong, not lock-blocked, so
+    # this must NOT be treated as retry-safe contention.
+    exc = _FakePsycopgOperationalError("canceled", sqlstate="57014")
+    assert is_lock_contention_error(exc) is False
+
+
+def test_is_lock_contention_error_false_for_unrelated_exception_with_no_sqlstate():
+    from coord.db import is_lock_contention_error
+
+    assert is_lock_contention_error(ValueError("not a DB error at all")) is False
+
+
 # ── the ratchet: no raw `?` reaches a driver outside the seam (#2768, #1948) ─
 #
 # #1948's first acceptance bullet: "No raw `?` placeholder reaches a driver:
@@ -765,4 +863,85 @@ def test_no_bare_placeholder_in_sql_literal_outside_the_dialect_seam():
         "dialect seam (#2768/#1948) — route this SQL through "
         "coord.sql.execute()/executemany()/upsert()/etc. instead of a raw "
         "driver call:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no driver-named exception outside the seam (#2784) ─
+#
+# #2768's two ratchets above cover *statements* — a raw `.execute()` call and
+# a bare `?` placeholder. #2784 found the seam's other half wide open:
+# *exceptions*. 18 call sites across coord/db.py, coord/state.py,
+# coord/audit.py, coord/auto_loop.py and coord/commands/merge.py caught
+# `sqlite3.OperationalError` directly — the #2597/#2689 whole
+# retry/graceful-degradation layer, silently inert on Postgres because a
+# psycopg exception is never an instance of a sqlite3 one. This is that
+# ratchet's third leg: no `except sqlite3.<X>` and no `raise sqlite3.<X>(...)`
+# anywhere in coord/** outside coord/sql.py. Bare `sqlite3.<X>` usage that
+# ISN'T naming an exception type — `sqlite3.connect(...)`, `sqlite3.Connection`
+# type hints, `sqlite3.Row` — is unaffected: those aren't dialect bugs (the
+# connection/type IS sqlite3-specific by construction at today's one call
+# site, coord/db.py's own `_open()`), only a driver-named except/raise is.
+
+
+def _sqlite_attr_refs(node: ast.AST) -> list[ast.Attribute]:
+    """Every ``sqlite3.<X>`` attribute-access node under *node*."""
+    return [
+        sub
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Attribute)
+        and isinstance(sub.value, ast.Name)
+        and sub.value.id == "sqlite3"
+    ]
+
+
+def _sqlite_named_exception_refs(tree: ast.AST) -> list[ast.Attribute]:
+    """``sqlite3.<X>`` references used to name an exception TYPE in an
+    ``except``/``raise`` — not just any ``sqlite3.*`` usage in the module
+    (``sqlite3.connect()``, ``sqlite3.Connection`` type hints, and
+    ``sqlite3.Row`` are all fine and common outside the seam; only naming a
+    sqlite3 exception class in an except/raise is the dialect-specific bug
+    #2784 fixes).
+
+    Covers ``except sqlite3.OperationalError:``, ``except (sqlite3.Error,
+    ValueError):`` (walking into the tuple), and
+    ``raise sqlite3.OperationalError(...)`` / bare ``raise
+    sqlite3.OperationalError``.
+    """
+    refs: list[ast.Attribute] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            refs.extend(_sqlite_attr_refs(node.type))
+        elif isinstance(node, ast.Raise) and node.exc is not None:
+            target = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+            refs.extend(_sqlite_attr_refs(target))
+    return refs
+
+
+def test_no_sqlite_named_exception_outside_the_dialect_seam():
+    """No ``except sqlite3.<X>:`` / ``raise sqlite3.<X>(...)`` anywhere in
+    ``coord/**`` outside ``coord/sql.py`` — every driver-named exception
+    catch/raise must go through ``sql.driver_errors()`` (or a coord-owned
+    exception type) instead (#2784).
+
+    Deliberately introducing e.g. ``except sqlite3.OperationalError:`` in
+    any ``coord/`` module outside the seam makes this red — the same class
+    of regression the #2768 ratchets above catch for raw ``.execute()``
+    calls and bare ``?`` placeholders, extended to exception types.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        src, tree = _parse(path)
+        lines = src.splitlines()
+        for node in _sqlite_named_exception_refs(tree):
+            lineno = node.lineno
+            src_line = (
+                lines[lineno - 1].strip() if 0 < lineno <= len(lines) else "<no source line>"
+            )
+            violations.append(f"{rel}:{lineno}: {src_line}")
+    assert not violations, (
+        "sqlite3-named exception except/raise outside the coord.sql dialect "
+        "seam (#2784/#2768/#1948) — this goes silently inert on Postgres "
+        "(a psycopg exception is never an instance of a sqlite3 one). Widen "
+        "the except to `sql.driver_errors()`, or raise a coord-owned "
+        "exception type, instead:\n" + "\n".join(violations)
     )
