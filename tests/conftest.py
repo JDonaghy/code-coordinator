@@ -769,3 +769,109 @@ def coord_db():
     db.override_connection(conn)
     yield conn
     db.close()
+
+
+# Every module-attribute name that coord.db / coord.state / coord.config /
+# coord.agent resolve lazily via PEP 562 ``__getattr__`` (#2781) -- see
+# ``_no_frozen_coord_dir_constants`` below for why this list has to exist at
+# all.
+_LAZY_COORD_DIR_CONSTANTS = {
+    "coord.db": ("COORD_DIR", "DB_PATH"),
+    "coord.state": (
+        "COORD_DIR",
+        "PROPOSALS_FILE",
+        "SPLITS_FILE",
+        "DISPATCHED_FILE",
+        "NOTIFIED_FILE",
+        "BOARD_FILE",
+        "SESSION_FILE",
+        "PLANS_FILE",
+    ),
+    "coord.config": ("USER_CONFIG_PATH",),
+    "coord.agent": ("DEFAULT_STATE_DIR",),
+}
+
+
+def _scrub_lazy_coord_dir_constants() -> None:
+    import coord.agent as agent_mod  # noqa: PLC0415
+    import coord.config as config_mod  # noqa: PLC0415
+    import coord.db as db_mod  # noqa: PLC0415
+    import coord.state as state_mod  # noqa: PLC0415
+
+    modules = {
+        "coord.db": db_mod,
+        "coord.state": state_mod,
+        "coord.config": config_mod,
+        "coord.agent": agent_mod,
+    }
+    for module_name, names in _LAZY_COORD_DIR_CONSTANTS.items():
+        module = modules[module_name]
+        for name in names:
+            module.__dict__.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_frozen_coord_dir_constants():
+    """Undo ``monkeypatch``/``mock.patch`` freezing the #2781 lazy constants.
+
+    ``coord.db.COORD_DIR``/``DB_PATH``, ``coord.state.COORD_DIR`` (+ its
+    legacy file-path constants), ``coord.config.USER_CONFIG_PATH`` and
+    ``coord.agent.DEFAULT_STATE_DIR`` are all resolved lazily via a
+    module-level ``__getattr__`` (#2781) specifically so that ``$COORD_DIR``
+    set *after* a module is first imported -- e.g. by a pytest fixture --
+    still reaches them, matching :func:`coord.platform_paths.default_coord_dir`
+    itself.
+
+    But both ``pytest``'s ``monkeypatch.setattr`` and ``unittest.mock.patch``
+    save the "original" value by calling ``getattr(module, name, notset)``
+    before patching. Because ``__getattr__`` never raises ``AttributeError``
+    for these known names, that call always succeeds with a freshly computed
+    real ``Path`` -- never the "attribute didn't exist" sentinel both
+    libraries rely on. On teardown they therefore call
+    ``setattr(module, name, <that captured Path>)`` (not ``delattr``), which
+    permanently binds the name into the module's ``__dict__``. From that
+    point on, plain attribute access on that name never reaches
+    ``__getattr__`` again for the rest of the process -- silently reverting
+    to the pre-#2781 "frozen at first monkeypatch" behaviour for every test
+    that runs afterwards, defeating the entire point of #2781 for the rest
+    of the session. ``tests/test_db.py`` (``COORD_DIR``/``DB_PATH``),
+    ``tests/test_config.py`` (``USER_CONFIG_PATH``) and several others all do
+    exactly this, and pytest collects files alphabetically by default, so a
+    full-suite run reliably poisons all four modules long before
+    ``tests/test_platform_paths.py``'s own post-import-redirect tests run.
+
+    Fixing this by migrating every existing ``monkeypatch.setattr``/
+    ``mock.patch`` call site (dozens, across many files with no lighter
+    touch available -- see #2781's review) would be a huge, unrelated blast
+    radius. Scrubbing these specific names back out of each module's
+    ``__dict__`` is far more surgical: it forces ``__getattr__`` to engage
+    again on the very next access, regardless of which earlier test (or
+    which of the two mechanisms) did the poisoning.
+
+    Scrubbing on *setup*, before the test body runs, is what actually makes
+    this reliable -- not scrubbing on teardown. The first version of this
+    fixture only scrubbed in teardown, on the assumption that autouse
+    function-scoped fixtures tear down *after* explicitly requested ones of
+    the same scope (true in isolation -- verified separately). But this repo
+    already has an earlier autouse fixture that itself requests
+    ``monkeypatch`` as a dependency (``_no_dispatch_target_validation``
+    above), and a fixture's dependencies are set up before it runs -- so
+    that earlier fixture pulls the *shared* function-scoped ``monkeypatch``
+    instance's setup forward to before this fixture even runs, which pushes
+    ``monkeypatch``'s own finalizer (the thing that does the re-poisoning
+    ``setattr``) to teardown *after* this fixture's teardown, not before.
+    Relying on intra-test teardown ordering to race a fixture already
+    embedded elsewhere in this same conftest turned out to be exactly the
+    kind of fragile assumption this fixture exists to route around. Scrubbing
+    on setup instead sidesteps the race entirely: pytest always finishes a
+    test's *entire* teardown phase (whatever internal order it happens in,
+    including ``monkeypatch.undo()``) before the next test's setup phase
+    begins, so scrubbing here guarantees a clean slate for every test
+    regardless of what the previous test's fixtures did or in what order.
+    Teardown here too, defensively, in case anything reads these constants
+    between this test's body and the next test's setup (e.g. another
+    fixture's own teardown).
+    """
+    _scrub_lazy_coord_dir_constants()
+    yield
+    _scrub_lazy_coord_dir_constants()

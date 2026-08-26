@@ -260,3 +260,50 @@ def test_coord_dir_set_after_import_redirects_agent_server_default_state_dir(
     server = AgentServer(machine_name="laptop")
 
     assert server.state_dir == override
+
+
+# ── #2781 iteration 1: monkeypatch/mock.patch must not permanently freeze
+# these lazy constants for the rest of the pytest process ──────────────────
+#
+# The first version of this issue's fix made COORD_DIR/DB_PATH/USER_CONFIG_PATH/
+# DEFAULT_STATE_DIR lazy via PEP 562 __getattr__, but __getattr__ never raises
+# AttributeError for these known names -- so `monkeypatch.setattr(module, name,
+# ...)` (the pattern used throughout tests/test_db.py, tests/test_config.py,
+# etc.) captures a real value via `getattr(module, name, notset)` instead of
+# the "didn't exist" sentinel, and its teardown then re-binds that value
+# directly into the module's __dict__, permanently defeating __getattr__ for
+# the rest of the process. tests/conftest.py's `_no_frozen_coord_dir_constants`
+# autouse fixture scrubs these names back out of each module's __dict__ after
+# every test to close that hole. These two tests must run in this order (the
+# first does the poisoning tests/test_db.py-style; the second, a fresh test,
+# proves it didn't leak) -- pytest runs tests within one file in declaration
+# order by default, same assumption the tests above already rely on.
+
+
+def test_monkeypatch_setattr_poisons_coord_dir_module_dict_during_the_test(
+    monkeypatch, tmp_path
+) -> None:
+    import coord.db as db_mod
+
+    monkeypatch.setattr(db_mod, "COORD_DIR", tmp_path / "poison")
+
+    assert db_mod.COORD_DIR == tmp_path / "poison"
+
+
+def test_coord_dir_stays_lazy_after_a_prior_tests_monkeypatch_setattr(
+    monkeypatch, tmp_path
+) -> None:
+    """If the previous test's ``monkeypatch.setattr`` teardown had leaked a
+    frozen ``Path`` into ``coord.db.__dict__`` (the defect this iteration
+    fixes), this would observe that stale value here regardless of
+    ``$COORD_DIR`` -- a name bound directly in a module's ``__dict__`` always
+    wins over ``__getattr__``, per normal Python attribute lookup. Passing
+    proves ``tests/conftest.py``'s ``_no_frozen_coord_dir_constants`` autouse
+    cleanup ran between the two tests.
+    """
+    import coord.db as db_mod
+
+    override = tmp_path / "still-lazy"
+    monkeypatch.setenv("COORD_DIR", str(override))
+
+    assert db_mod.COORD_DIR == override
