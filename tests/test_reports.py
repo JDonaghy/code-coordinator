@@ -2437,6 +2437,7 @@ def _leg(
     tokens_out: int = 0,
     cache_read: int = 0,
     cache_creation: int = 0,
+    num_turns: int = 0,
     dispatched_at: float | None = None,
     finished_at: float | None = None,
     for_issue_number: int | None = None,
@@ -2453,6 +2454,7 @@ def _leg(
         "output_tokens": tokens_out,
         "cache_read_tokens": cache_read,
         "cache_creation_tokens": cache_creation,
+        "num_turns": num_turns,
         "dispatched_at": _U_NOW - 3600 if dispatched_at is None else dispatched_at,
         "finished_at": _U_NOW - 1800 if finished_at is None else finished_at,
     }
@@ -2565,6 +2567,99 @@ class TestUsageMatchesCoordUsage:
         result = fold_usage(rows, _unbounded_window())
         assert result.rows[0]["cost_captured"] == pytest.approx(2.0)
         assert result.rows[0]["cost_est"] == 0.0
+
+
+class TestUsageSurfacesCacheReadAndTurns:
+    """#2786: the column that carries the money.  `tokens_in` was ~0.001% of
+    `work`-leg spend while cache-read tokens (priced identically in
+    `usage_rollup.leg_cost`) were ~66% of it and never shown — this is the
+    fix, plus the persisted `num_turns` that makes "long context" and "many
+    turns" distinguishable."""
+
+    def test_cache_read_and_create_and_turns_are_columns(self) -> None:
+        from coord.reports import USAGE_ISSUE_COLUMNS, USAGE_REPO_COLUMNS
+
+        for columns in (USAGE_ISSUE_COLUMNS, USAGE_REPO_COLUMNS):
+            assert "cache_read" in columns
+            assert "cache_create" in columns
+            assert "turns" in columns
+
+    def test_tokens_in_stays_raw_input_not_a_sum(self) -> None:
+        """A leg whose real cost is dominated by cache reads must not
+        silently inflate `tokens_in` — that column keeps meaning exactly
+        what it always meant (raw uncached input tokens)."""
+        from coord.reports import fold_usage
+
+        rows = [
+            _leg(
+                "api", 1, cost_usd=None,
+                tokens_in=300, tokens_out=5_000,
+                cache_read=11_300_000, cache_creation=150_000,
+                num_turns=87,
+            )
+        ]
+        result = fold_usage(rows, _unbounded_window())
+        row = result.rows[0]
+        # The bug: this leg's real cost is dominated by 11.3M cache-read
+        # tokens, but `tokens_in` (raw input) stays a tiny 300 — that is
+        # correct, not a regression, per the issue's explicit design ("leave
+        # tokens_in meaning exactly what it means today").
+        assert row["tokens_in"] == 300
+        assert row["tokens_out"] == 5_000
+        # ...and the number that actually carries the money is now visible
+        # alongside it, not hidden.
+        assert row["cache_read"] == 11_300_000
+        assert row["cache_create"] == 150_000
+        assert row["turns"] == 87
+
+    def test_tok_per_turn_is_zero_when_no_turns_recorded(self) -> None:
+        """A row predating `num_turns` (reads 0) must not divide by zero."""
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1, cost_usd=1.0, tokens_in=100, tokens_out=100, cache_read=1_000)]
+        result = fold_usage(rows, _unbounded_window())
+        assert result.rows[0]["turns"] == 0
+        assert result.rows[0]["tok_per_turn"] == 0
+
+    def test_tok_per_turn_is_total_tokens_over_turns(self) -> None:
+        from coord.reports import fold_usage
+
+        rows = [
+            _leg(
+                "api", 1, cost_usd=1.0,
+                tokens_in=100, tokens_out=100, cache_read=800, cache_creation=0,
+                num_turns=10,
+            )
+        ]
+        result = fold_usage(rows, _unbounded_window())
+        # (100 + 100 + 800 + 0) / 10 = 100.
+        assert result.rows[0]["tok_per_turn"] == 100
+
+    def test_totals_row_also_carries_the_new_columns(self) -> None:
+        from coord.reports import fold_usage
+
+        rows = _usage_fixture_rows()
+        result = fold_usage(rows, _unbounded_window())
+        for key in ("cache_read", "cache_create", "turns"):
+            assert key in result.totals
+
+    def test_cost_totals_are_unchanged_by_the_new_columns(self) -> None:
+        """Display + capture only — no pricing change. The same fixture's
+        cost figures must come out byte-identical to what they were before
+        cache_read/cache_create/turns existed."""
+        from coord.reports import fold_usage
+
+        rows = _usage_fixture_rows()
+        result = fold_usage(rows, _unbounded_window())
+        assert result.totals["cost_total"] == pytest.approx(
+            sum(r["cost_total"] for r in result.rows)
+        )
+        # api#7 has a captured $1.50 leg plus an estimated opus leg; this is
+        # the same figure `TestUsageMatchesCoordUsage` cross-checks against
+        # `coord usage --by-issue`'s own aggregate, unaffected by the new
+        # columns landing alongside it.
+        row7 = next(r for r in result.rows if r.get("issue") == 7)
+        assert row7["cost_captured"] == pytest.approx(1.5)
 
 
 class TestUsagePricingFollowsConfig:

@@ -3028,20 +3028,26 @@ def update_assignment_tokens(
     output_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    num_turns: int = 0,
 ) -> None:
-    """#546/#665: record token counts — routes to the daemon when set.
+    """#546/#665/#2786: record token counts (+ turns) — routes to the daemon when set.
 
-    Only writes when at least one token count is non-zero (interactive/Max
-    sessions produce no per-token data and should not overwrite 0 with 0).
-    Idempotent: the UPDATE only fires when the row's ``input_tokens`` is still
-    0 (first writer wins).  Silently swallows ``OperationalError`` so
-    pre-migration databases (tests, older installs that haven't restarted the
-    coordinator yet) never crash the notify path.
+    Only writes when at least one token count or ``num_turns`` is non-zero
+    (interactive/Max sessions produce no per-token data and should not
+    overwrite 0 with 0). Idempotent: the UPDATE only fires when the row's
+    ``input_tokens`` is still 0 (first writer wins). Silently swallows
+    ``OperationalError`` so pre-migration databases (tests, older installs
+    that haven't restarted the coordinator yet) never crash the notify path.
+
+    ``num_turns`` (#2786) rides the same write as the four token counts —
+    it comes off the same final `result` event (``WorkerSummary.num_turns``,
+    coord/worker_events.py) — rather than a separate column update, so it
+    can't drift out of sync with them.
     """
     if not assignment_id:
         return
     total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
-    if total <= 0:
+    if total <= 0 and num_turns <= 0:
         return
     svc = _board_service()
     resp = _route_write(
@@ -3053,6 +3059,7 @@ def update_assignment_tokens(
             "output_tokens": output_tokens,
             "cache_creation_tokens": cache_creation_tokens,
             "cache_read_tokens": cache_read_tokens,
+            "num_turns": num_turns,
         },
     )
     if resp is not None:
@@ -3063,6 +3070,7 @@ def update_assignment_tokens(
         output_tokens=output_tokens,
         cache_creation_tokens=cache_creation_tokens,
         cache_read_tokens=cache_read_tokens,
+        num_turns=num_turns,
     )
 
 
@@ -3073,12 +3081,13 @@ def _update_assignment_tokens_local(
     output_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    num_turns: int = 0,
 ) -> None:
-    """Write token counts directly to the local DB.  Called by the daemon endpoint."""
+    """Write token counts (+ turns) directly to the local DB.  Called by the daemon endpoint."""
     if not assignment_id:
         return
     total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
-    if total <= 0:
+    if total <= 0 and num_turns <= 0:
         return
     conn = get_connection()
 
@@ -3086,12 +3095,12 @@ def _update_assignment_tokens_local(
         sql.execute(conn,
             "UPDATE assignments SET "
             "input_tokens=?, output_tokens=?, "
-            "cache_creation_tokens=?, cache_read_tokens=? "
+            "cache_creation_tokens=?, cache_read_tokens=?, num_turns=? "
             "WHERE assignment_id=? "
             "AND (input_tokens IS NULL OR input_tokens = 0)",
             (
                 input_tokens, output_tokens,
-                cache_creation_tokens, cache_read_tokens,
+                cache_creation_tokens, cache_read_tokens, num_turns,
                 assignment_id,
             ),
         )

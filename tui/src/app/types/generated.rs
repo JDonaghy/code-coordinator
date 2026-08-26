@@ -357,6 +357,10 @@ pub struct Assignment {
     /// operator having to grep the raw worker transcript (#2417).
     #[serde(default)]
     pub(crate) dispatched_by_assignment_id: Option<String>,
+    /// Wire field from `coord.board_schema` (#1941) — no TUI consumer yet.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) num_turns: Option<i64>,
     /// #1337: true when the daemon bounded `review_findings` on the /board
     /// wire (the collection carries a preview; the full body lives on
     /// `GET /assignment/{id}`).  Absent (→ false) on pre-#1337 daemons and

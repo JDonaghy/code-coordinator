@@ -1050,19 +1050,20 @@ def _capture_cost_from_entry_best_effort(assignment_id: str, entry: dict) -> Non
 
 
 def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
-    """#667: persist token counts from a /status completed entry.
+    """#667/#2786: persist token counts (+ turns) from a /status completed entry.
 
     The agent now parses its own log and includes
     ``input_tokens`` / ``output_tokens`` / ``cache_creation_tokens`` /
-    ``cache_read_tokens`` in the completed entry.  We write them to the DB
-    here so a passive reconcile also captures tokens (not just cost).
-    Best-effort — any failure is swallowed.
+    ``cache_read_tokens`` / ``num_turns`` in the completed entry.  We write
+    them to the DB here so a passive reconcile also captures tokens (not
+    just cost).  Best-effort — any failure is swallowed.
     """
     try:
         input_tokens = int(entry.get("input_tokens") or 0)
         output_tokens = int(entry.get("output_tokens") or 0)
         cache_creation_tokens = int(entry.get("cache_creation_tokens") or 0)
         cache_read_tokens = int(entry.get("cache_read_tokens") or 0)
+        num_turns = int(entry.get("num_turns") or 0)
         if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens == 0:
             return
         from coord.state import update_assignment_tokens  # noqa: PLC0415
@@ -1073,6 +1074,7 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
             output_tokens=output_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cache_read_tokens=cache_read_tokens,
+            num_turns=num_turns,
         )
     except Exception:  # noqa: BLE001 — never let token capture break the reconcile
         pass

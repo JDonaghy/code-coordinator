@@ -144,6 +144,11 @@ class BoardAssignment:
     verdict_source_reason: str | None = None
     stop_reason: str | None = None
     dispatched_by_assignment_id: str | None = None
+    # #2786: worker-reported turn count — see the four token columns above
+    # (input_tokens/output_tokens/cache_creation_tokens/cache_read_tokens)
+    # for the sibling fields this rides alongside. Appended last, matching
+    # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
+    num_turns: int | None = None
 
 
 @dataclasses.dataclass(kw_only=True)

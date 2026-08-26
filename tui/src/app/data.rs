@@ -1631,6 +1631,7 @@ pub(crate) fn load_data() -> BoardData {
                 verdict_source: None,
                 verdict_source_reason: None,
                 stop_reason: None,
+                num_turns: None,
             })
         }) {
             Ok(r) => r,

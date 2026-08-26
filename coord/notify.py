@@ -2516,6 +2516,7 @@ def _capture_cost(transition: Transition, entry: dict, record: dict | None = Non
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    num_turns: int = 0
     provider_name = (record or {}).get("provider_name")
 
     log_path = entry.get("log_path")
@@ -2530,6 +2531,8 @@ def _capture_cost(transition: Transition, entry: dict, record: dict | None = Non
                 output_tokens = parsed.output_tokens
                 cache_creation_tokens = parsed.cache_creation_tokens
                 cache_read_tokens = parsed.cache_read_tokens
+                # #2786: and the turn count, off the same `result` event.
+                num_turns = parsed.num_turns
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "_capture_cost: failed to parse log for %s: %s",
@@ -2554,6 +2557,7 @@ def _capture_cost(transition: Transition, entry: dict, record: dict | None = Non
             output_tokens = int(entry.get("output_tokens") or 0)
             cache_creation_tokens = int(entry.get("cache_creation_tokens") or 0)
             cache_read_tokens = int(entry.get("cache_read_tokens") or 0)
+            num_turns = int(entry.get("num_turns") or 0)
         except (TypeError, ValueError):
             pass
 
@@ -2566,7 +2570,8 @@ def _capture_cost(transition: Transition, entry: dict, record: dict | None = Non
                 transition.assignment_id, exc,
             )
 
-    # #546: persist token counts (best-effort; silent on missing columns).
+    # #546/#2786: persist token counts + turns (best-effort; silent on
+    # missing columns).
     if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens > 0:
         try:
             update_assignment_tokens(
@@ -2575,6 +2580,7 @@ def _capture_cost(transition: Transition, entry: dict, record: dict | None = Non
                 output_tokens=output_tokens,
                 cache_creation_tokens=cache_creation_tokens,
                 cache_read_tokens=cache_read_tokens,
+                num_turns=num_turns,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -2770,6 +2776,7 @@ def _capture_cost_and_tokens_for_review(
                 output_tokens=parsed.output_tokens,
                 cache_creation_tokens=parsed.cache_creation_tokens,
                 cache_read_tokens=parsed.cache_read_tokens,
+                num_turns=parsed.num_turns,
             )
             wrote = True
         except Exception as exc:  # noqa: BLE001

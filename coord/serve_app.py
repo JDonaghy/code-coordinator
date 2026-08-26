@@ -2996,6 +2996,7 @@ def openapi_spec() -> dict:
                                     "output_tokens": {"type": "integer"},
                                     "cache_creation_tokens": {"type": "integer"},
                                     "cache_read_tokens": {"type": "integer"},
+                                    "num_turns": {"type": "integer"},
                                     "is_interactive": {"type": "boolean"},
                                     "smoke_tests": {
                                         "type": "array",
@@ -5887,10 +5888,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         return JSONResponse({"ok": True})
 
     async def post_assignment_usage(request: Request) -> Response:
-        # #665/#749: route cost/token/is_interactive/smoke_tests writes through
-        # the daemon.  Body: {assignment_id, cost_usd?, input_tokens?,
-        #        output_tokens?, cache_creation_tokens?, cache_read_tokens?,
-        #        is_interactive?, smoke_tests?}
+        # #665/#749/#2786: route cost/token/turns/is_interactive/smoke_tests
+        # writes through the daemon.  Body: {assignment_id, cost_usd?,
+        #        input_tokens?, output_tokens?, cache_creation_tokens?,
+        #        cache_read_tokens?, num_turns?, is_interactive?, smoke_tests?}
         # One round-trip covers all four update helpers; the daemon calls the
         # _local forms directly so it never recurses back out over HTTP.
         from coord import state  # noqa: PLC0415
@@ -5906,7 +5907,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 state._update_assignment_cost_local(aid, body["cost_usd"])
             if any(
                 k in body
-                for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+                for k in (
+                    "input_tokens", "output_tokens", "cache_creation_tokens",
+                    "cache_read_tokens", "num_turns",
+                )
             ):
                 state._update_assignment_tokens_local(
                     aid,
@@ -5914,6 +5918,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     output_tokens=int(body.get("output_tokens") or 0),
                     cache_creation_tokens=int(body.get("cache_creation_tokens") or 0),
                     cache_read_tokens=int(body.get("cache_read_tokens") or 0),
+                    num_turns=int(body.get("num_turns") or 0),
                 )
             if body.get("is_interactive"):
                 state._mark_assignment_interactive_local(aid)

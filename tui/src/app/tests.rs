@@ -2138,6 +2138,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
         BoardData {
             assignments: vec![work],
@@ -5366,6 +5367,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         }
     }
 
@@ -6821,6 +6823,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -7395,6 +7398,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -7529,6 +7533,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -7796,6 +7801,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -8904,6 +8910,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         }
     }
 
@@ -12684,6 +12691,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -12776,6 +12784,7 @@
                 verdict_source: None,
                 verdict_source_reason: None,
                 stop_reason: None,
+                num_turns: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -12862,6 +12871,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -12937,6 +12947,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -13023,6 +13034,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -13098,6 +13110,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -13189,6 +13202,7 @@
                 verdict_source: None,
                 verdict_source_reason: None,
                 stop_reason: None,
+                num_turns: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -13274,6 +13288,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -13349,6 +13364,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -13443,6 +13459,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -13537,6 +13554,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -13745,6 +13763,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -13863,6 +13882,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -13944,6 +13964,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -14030,6 +14051,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -14105,6 +14127,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -14188,6 +14211,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -14353,6 +14377,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -14456,6 +14481,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -14530,6 +14556,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work + Review done; Merge is Pending (no merge_queue entry yet) and
@@ -14996,6 +15023,7 @@
                 verdict_source: None,
                 verdict_source_reason: None,
                 stop_reason: None,
+                num_turns: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -15109,6 +15137,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -15203,6 +15232,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -15338,6 +15368,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -15427,6 +15458,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -15510,6 +15542,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -21371,6 +21404,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -21537,6 +21571,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -21744,6 +21779,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         let data = BoardData {
@@ -21880,6 +21916,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
         let sibling = Assignment {
             id: "41249c1cebbd".to_string(),
@@ -21956,6 +21993,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         let data = BoardData {
@@ -22088,6 +22126,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         let data = BoardData {
@@ -22698,6 +22737,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         let data = BoardData {
@@ -23166,6 +23206,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -32409,6 +32450,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         // Review for the fix — approved.
@@ -32485,6 +32527,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -32638,6 +32681,7 @@
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
 
         // Model-level assertions on the plain `CoordApp` — `driver.app()`
@@ -36487,6 +36531,7 @@ Milestone tracking issue.
             verdict_source: None,
             verdict_source_reason: None,
             stop_reason: None,
+            num_turns: None,
         });
 
         assert!(app.maybe_bind_pending_milestone_chat());
