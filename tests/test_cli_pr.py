@@ -190,6 +190,9 @@ class TestPrMerge:
                 "coord.ci_store.build_ci_store",
                 return_value=_FakeCiStore([], expects=True),
             ),
+            # Confirmed non-conflicting: absence must read as "CI never ran",
+            # not the #1877 conflict carve-out.
+            patch("coord.github_ops.check_pr_mergeable", return_value=True),
             patch("coord.github_ops.merge_pr") as merge,
         ):
             result = _invoke("pr", "merge", "api", "7", config_file=config_file)
@@ -197,6 +200,37 @@ class TestPrMerge:
         assert result.exit_code != 0
         assert "no reported checks" in result.output
         merge.assert_not_called()
+
+    def test_absent_checks_do_not_block_a_base_conflicting_pr(
+        self, config_file: Path
+    ) -> None:
+        """#2790-review (non-blocking): an empty check list is ALSO what
+        GitHub reports for a PR that conflicts with its base — no
+        `pull_request`-triggered workflow can ever run for it. That must not
+        read as "CI never ran" (mirrors `coord.merge_queue`'s own #1877
+        carve-out) — the merge attempt itself should surface the real
+        conflict instead.
+        """
+        with (
+            patch("coord.github_ops.get_pr_head_ref", return_value="throwaway"),
+            patch(
+                "coord.ci_store.build_ci_store",
+                return_value=_FakeCiStore([], expects=True),
+            ),
+            patch("coord.github_ops.check_pr_mergeable", return_value=False),
+            patch(
+                "coord.github_ops.merge_pr",
+                return_value=(False, "PR has conflicts"),
+            ) as merge,
+        ):
+            result = _invoke("pr", "merge", "api", "7", config_file=config_file)
+
+        # Not refused on "no reported checks" — falls through to the real
+        # merge attempt, which reports the actual conflict.
+        assert "no reported checks" not in result.output
+        merge.assert_called_once()
+        assert result.exit_code != 0
+        assert "PR has conflicts" in result.output
 
     def test_force_merge_overrides_failing_checks(self, config_file: Path) -> None:
         with (
@@ -235,6 +269,94 @@ class TestPrMerge:
         ):
             result = _invoke("pr", "merge", "api", "7", config_file=config_file)
 
+        assert result.exit_code != 0
+        assert "coord merge --only work-9" in result.output
+        merge.assert_not_called()
+
+    def test_merged_queue_history_does_not_block_a_rematch(
+        self, config_file: Path
+    ) -> None:
+        """#2790-review (non-blocking): a queue row already recorded as
+        MERGED is kept forever as history (`prune_stale_queue_entries` only
+        prunes non-MERGED rows) — a later PR that happens to match its PR
+        number/branch must not be refused and pointed at a long-dead
+        `coord merge --only <id>`.
+        """
+        from coord.merge_queue import MERGED, QueuedMerge, save_queue
+
+        entry = QueuedMerge(
+            assignment_id="work-9",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="throwaway",
+            target_branch="main",
+            issue_number=9,
+            issue_title="Some issue",
+            pr_number=7,
+            state=MERGED,
+        )
+        save_queue([entry])
+
+        with (
+            patch("coord.github_ops.get_pr_head_ref", return_value="throwaway"),
+            patch(
+                "coord.ci_store.build_ci_store",
+                return_value=_FakeCiStore([_passing_check()]),
+            ),
+            patch("coord.github_ops.merge_pr", return_value=(True, "merged")) as merge,
+        ):
+            result = _invoke("pr", "merge", "api", "7", config_file=config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "coord merge --only" not in result.output
+        merge.assert_called_once()
+
+    def test_merge_queue_conflict_check_routes_through_daemon(
+        self, config_file: Path
+    ) -> None:
+        """#2790-review (blocking): the merge queue lives in the canonical,
+        host-local DB — on a thin client, a bare `coord.merge_queue.
+        load_queue()` would silently see an empty/stale local DB instead of
+        the fleet's real queue, and this check would always pass. When a
+        board service is configured, the check must read the queue through
+        `/board` (like `coord merge --plan` does), not the local sqlite DB.
+        """
+        from coord.client import ServiceConfig
+
+        svc = ServiceConfig(url="http://dellserver:7435")
+        payload = {
+            "merge_queue": [
+                {
+                    "assignment_id": "work-9",
+                    "repo_name": "api",
+                    "repo_github": "acme/api",
+                    "branch": "throwaway",
+                    "target_branch": "main",
+                    "issue_number": 9,
+                    "issue_title": "Some issue",
+                    "state": "pending",
+                    "pr_number": 7,
+                }
+            ]
+        }
+
+        # No local queue entry at all — proves the daemon payload, not the
+        # local DB, is what triggers the refusal. Patches `board_service.
+        # resolve` directly (not `coord.client.resolve_board_service`, which
+        # `_load_config` also consults) so only the queue-conflict check
+        # under test is routed to the daemon — `_load_config` keeps loading
+        # `config_file` locally, exactly as the CLI invocation intends.
+        with (
+            patch("coord.board_service.resolve", return_value=svc),
+            patch(
+                "coord.client.fetch_board_payload", return_value=payload
+            ) as fetch_mock,
+            patch("coord.github_ops.get_pr_head_ref", return_value="throwaway"),
+            patch("coord.github_ops.merge_pr") as merge,
+        ):
+            result = _invoke("pr", "merge", "api", "7", config_file=config_file)
+
+        fetch_mock.assert_called_once_with(svc)
         assert result.exit_code != 0
         assert "coord merge --only work-9" in result.output
         merge.assert_not_called()
