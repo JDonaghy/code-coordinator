@@ -311,38 +311,43 @@ class _SchemaNegotiationMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):  # noqa: ANN001, ANN201
-        raw = request.headers.get("x-coord-schema")
-        if raw is None:
-            request.state.schema_version = MIN_SCHEMA_VERSION
-            return await call_next(request)
+        # Absent header means "today's shape", i.e. schema 1 -- but that must
+        # be *one* answer to "what version is this request", not two. So an
+        # absent header is treated as the literal string "1" and falls into
+        # the exact same parse-and-range-check path an explicit header takes,
+        # rather than being special-cased straight to MIN_SCHEMA_VERSION.
+        # Today MIN_SCHEMA_VERSION == SCHEMA_VERSION == 1, so the two would
+        # happen to agree either way -- but MIN_SCHEMA_VERSION is documented
+        # to rise once v1 is retired, and only this shared path guarantees
+        # "absent" keeps meaning "1" (not "whatever the new minimum is") when
+        # that happens, with zero changes required here.
+        raw = request.headers.get("x-coord-schema", "1")
         try:
             version = int(raw)
         except ValueError:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"X-Coord-Schema must be an integer, got {raw!r} "
-                        f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
-                    ),
-                    "schema_min": MIN_SCHEMA_VERSION,
-                    "schema_max": SCHEMA_VERSION,
-                },
-                status_code=400,
+            return self._schema_refused(
+                f"X-Coord-Schema must be an integer, got {raw!r} "
+                f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
             )
         if version < MIN_SCHEMA_VERSION or version > SCHEMA_VERSION:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"unsupported X-Coord-Schema: {version} "
-                        f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
-                    ),
-                    "schema_min": MIN_SCHEMA_VERSION,
-                    "schema_max": SCHEMA_VERSION,
-                },
-                status_code=400,
+            return self._schema_refused(
+                f"unsupported X-Coord-Schema: {version} "
+                f"(supported: {MIN_SCHEMA_VERSION}-{SCHEMA_VERSION})"
             )
         request.state.schema_version = version
         return await call_next(request)
+
+    @staticmethod
+    def _schema_refused(message: str) -> JSONResponse:
+        """Shared 4xx shape for both the non-integer and out-of-range cases."""
+        return JSONResponse(
+            {
+                "error": message,
+                "schema_min": MIN_SCHEMA_VERSION,
+                "schema_max": SCHEMA_VERSION,
+            },
+            status_code=400,
+        )
 
 
 def _reload_config_if_stale(
