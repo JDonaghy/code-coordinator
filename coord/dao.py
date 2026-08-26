@@ -71,7 +71,20 @@ from coord.db import DB_PATH
 
 # Bump when the /board payload shape changes incompatibly.  Clients may branch
 # on this; today everything is additive.
+#
+# #1943: this is the *maximum* schema version the daemon can serve. A client
+# negotiates against it via the ``X-Coord-Schema`` request header (see the
+# schema-negotiation middleware in ``coord.serve_app``) -- absent or ``1``
+# means today's shape, byte-identical to pre-#1943 responses. The minimum
+# served version is :data:`MIN_SCHEMA_VERSION`, below.
 SCHEMA_VERSION = 1
+
+# #1943: the oldest schema version the daemon still serves. A client whose
+# ``X-Coord-Schema`` falls outside ``[MIN_SCHEMA_VERSION, SCHEMA_VERSION]``
+# gets a clear 4xx naming this range -- never a silent downgrade to v1, which
+# would look like success while quietly shipping the wrong shape. Equal to
+# ``SCHEMA_VERSION`` until a v2 body exists and versions start being retired.
+MIN_SCHEMA_VERSION = 1
 
 # #762: terminal assignment statuses.  Anything NOT in this set (running /
 # pending) is "in-flight" and always kept on the board projection.
