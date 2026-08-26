@@ -204,7 +204,7 @@ def test_reused_branch_with_new_commits_not_marked_merged(monkeypatch, config) -
                 {"number": 7, "state": "MERGED", "mergedAt": "2026-06-01T00:00:00Z",
                  "headRefOid": "oldshaFromFirstMerge"},
             ])
-        if args and args[0] == "api" and "branches" in args[1]:
+        if args and args[0] == "api" and any("branches" in a for a in args[1:]):
             import json as _json
             return _json.dumps({"commit": {"sha": "newshaFromFixCommit"}})
         raise AssertionError(f"unexpected gh call: {args}")

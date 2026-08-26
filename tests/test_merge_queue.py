@@ -3423,6 +3423,136 @@ class TestPassesMergeGates:
         assert review_failure.reason == mq.UNKNOWN_BRANCH_HEAD_REASON
 
 
+# ── #2809: structured rate-limit detail survives from a live `get_branch_sha`
+# call all the way to the operator-facing gate-refusal string, instead of
+# being swallowed into the generic UNKNOWN_BRANCH_HEAD_REASON sentence.
+
+
+class _RateLimitedGh(FakeGh):
+    """A `gh_ops` whose `get_branch_sha` supports `raise_on_transient`
+    (like the real `coord.github_ops.get_branch_sha`) and raises
+    `GhRateLimitError` — simulating the #2809 incident: a live branch-head
+    probe hitting GitHub's secondary rate limiter."""
+
+    def get_branch_sha(
+        self, repo: str, branch: str, *, raise_on_transient: bool = False,
+    ) -> str | None:
+        if raise_on_transient:
+            from coord.github_ops import GhRateLimitError
+            raise GhRateLimitError(
+                "gh api ... failed: HTTP 403: secondary rate limit",
+                status_code=403, request_id="E126:C7B0E:4B13E6D",
+                retry_after_s=45.0, secondary=True,
+            )
+        return None
+
+
+class TestUnknownBranchHeadReasonEnrichment:
+    def test_none_returns_the_unchanged_constant(self) -> None:
+        assert mq.unknown_branch_head_reason(None) == mq.UNKNOWN_BRANCH_HEAD_REASON
+
+    def test_bare_transient_error_with_no_detail_returns_unchanged_constant(self) -> None:
+        from coord.github_ops import GhTransientError
+
+        reason = mq.unknown_branch_head_reason(GhTransientError("HTTP 401: Bad credentials"))
+        assert reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+
+    def test_rate_limit_error_appends_structured_detail(self) -> None:
+        from coord.github_ops import GhRateLimitError
+
+        exc = GhRateLimitError(
+            "gh api ... failed", status_code=403, request_id="E126:C7B0E",
+            retry_after_s=45.0, secondary=True,
+        )
+        reason = mq.unknown_branch_head_reason(exc)
+        # The generic sentence stays an exact PREFIX (`coord.drive.
+        # _merge_gate_kind` substring-matches the bare constant against
+        # this), with the new detail appended, not interpolated inline.
+        assert reason.startswith(mq.UNKNOWN_BRANCH_HEAD_REASON)
+        assert "secondary rate limit" in reason
+        assert "HTTP 403" in reason
+        assert "E126:C7B0E" in reason
+        assert "45s" in reason
+
+    def test_primary_rate_limit_is_worded_distinctly_from_secondary(self) -> None:
+        from coord.github_ops import GhRateLimitError
+
+        exc = GhRateLimitError(
+            "gh api ... failed", status_code=403, request_id=None,
+            retry_after_s=None, secondary=False,
+        )
+        reason = mq.unknown_branch_head_reason(exc)
+        assert "secondary" not in reason
+        assert "rate limit" in reason
+
+
+class TestGhGetBranchShaThreeTuple:
+    def test_unsupported_stub_returns_none_error(self) -> None:
+        sha, probe_failed, error = mq._gh_get_branch_sha(FakeGh(), "acme/api", "main")
+        assert sha is None
+        assert probe_failed is False
+        assert error is None
+
+    def test_rate_limit_confirms_transient_and_returns_the_error_object(self) -> None:
+        gh = _RateLimitedGh()
+        sha, probe_failed, error = mq._gh_get_branch_sha(gh, "acme/api", "main")
+        assert sha is None
+        assert probe_failed is True
+        assert error is not None
+        assert error.status_code == 403
+        assert error.request_id == "E126:C7B0E:4B13E6D"
+
+
+class TestLiveGateEntryRateLimitPropagation:
+    """`live_gate_entry` is the exact swallow site #2809 named
+    (`gh_ops.get_branch_sha(...)` with no `raise_on_transient`, discarding
+    the 403/Retry-After/request-id) — this is `coord merge --only`'s and
+    `coord.gates.build_gate_report`'s live gate-check path."""
+
+    def test_confirmed_rate_limit_is_captured_on_the_entry(self) -> None:
+        a = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+        )
+        entry = mq.live_gate_entry(a, "acme/api", "main", _RateLimitedGh())
+
+        assert entry.branch_head_sha is None
+        assert entry.branch_head_probe_error is not None
+        assert entry.branch_head_probe_error.status_code == 403
+        assert entry.branch_head_probe_error.secondary is True
+
+    def test_no_gh_ops_leaves_probe_error_none(self) -> None:
+        a = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+        )
+        entry = mq.live_gate_entry(a, "acme/api", "main", None)
+        assert entry.branch_head_probe_error is None
+
+    def test_merge_gate_failures_reports_the_rate_limit_detail(self) -> None:
+        """End-to-end: a rate-limited live probe reaches the operator-facing
+        review-gate refusal string with status/request-id intact, exactly
+        what the issue's evidence shows coord discarding today."""
+        cfg = TestPassesMergeGates._config()
+        work = TestPassesMergeGates._work("w1", test_state="passed")
+        review = TestPassesMergeGates._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"
+        board = TestPassesMergeGates._board(completed=[work, review])
+
+        a = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="worker/w1",
+        )
+        entry = mq.live_gate_entry(a, "acme/api", "main", _RateLimitedGh())
+
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert "HTTP 403" in review_failure.reason
+        assert "E126:C7B0E:4B13E6D" in review_failure.reason
+        assert review_failure.reason.startswith(mq.UNKNOWN_BRANCH_HEAD_REASON)
+
+
 class TestHasPassedTest:
     """#2350: :func:`has_passed_test` — the Merge-only fast path's bare
     recorded-state read, deliberately narrower than :func:`has_smoke_verdict`

@@ -1642,6 +1642,75 @@ class TestGetBranchSha:
                 is None
             )
 
+    def test_calls_gh_with_include_flag(self) -> None:
+        """#2809: `-i` is what lets a rate limit here carry real HTTP
+        headers — see `TestGhRateLimitDetection.
+        test_include_headers_recover_precise_retry_after`."""
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"commit": {"sha": "abc123"}}),
+        ) as gh_mock:
+            github_ops.get_branch_sha("acme/api", "main")
+        gh_mock.assert_called_once_with("api", "-i", "repos/acme/api/branches/main")
+
+    def test_success_tolerates_a_bare_gh_stub_with_no_include_headers(self) -> None:
+        """A test double (or an old `gh`) that just hands back plain JSON
+        with no header block must still parse -- `_parse_gh_include` falls
+        back to treating the whole string as the body."""
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"commit": {"sha": "xyz789"}}),
+        ):
+            assert github_ops.get_branch_sha("acme/api", "main") == "xyz789"
+
+    def test_raise_on_transient_preserves_ghratelimiterror_detail(self) -> None:
+        """#2809: when `_gh` itself raised the structured
+        `GhRateLimitError` (not a bare RuntimeError), that exact object —
+        status/request-id/retry-after intact — must reach the caller, not a
+        re-stringified generic `GhTransientError` that throws the detail
+        away."""
+        rate_limit_exc = github_ops.GhRateLimitError(
+            "gh api ... failed: HTTP 403: API rate limit exceeded",
+            status_code=403, request_id="req-42", retry_after_s=30.0,
+            secondary=True,
+        )
+        with patch("coord.github_ops._gh", side_effect=rate_limit_exc):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops.get_branch_sha(
+                    "acme/api", "main", raise_on_transient=True
+                )
+        assert excinfo.value is rate_limit_exc
+        assert excinfo.value.status_code == 403
+        assert excinfo.value.request_id == "req-42"
+        assert excinfo.value.retry_after_s == 30.0
+        assert excinfo.value.secondary is True
+
+
+class TestGetDefaultBranchHead:
+    def test_calls_gh_with_include_flag(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"commit": {"sha": "abc123"}}),
+        ) as gh_mock:
+            sha = github_ops.get_default_branch_head("acme/api", "main")
+        assert sha == "abc123"
+        gh_mock.assert_called_once_with("api", "-i", "repos/acme/api/branches/main")
+
+    def test_strips_include_headers_before_parsing_json(self) -> None:
+        raw = (
+            "HTTP/2.0 200 OK\r\n"
+            "X-Github-Request-Id: DEAD:BEEF\r\n"
+            "\r\n"
+            '{"commit": {"sha": "abc123"}}'
+        )
+        with patch("coord.github_ops._gh", return_value=raw):
+            assert github_ops.get_default_branch_head("acme/api", "main") == "abc123"
+
+    def test_malformed_response_raises_runtimeerror(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            with pytest.raises(RuntimeError):
+                github_ops.get_default_branch_head("acme/api", "main")
+
 
 class TestGetBranchPatchId:
     """#1475: fetches the three-dot compare diff (no PR required, mirroring
@@ -1803,6 +1872,194 @@ class TestGhForgeAvailabilityRecording:
             return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
         ):
             assert github_ops._gh("issue", "view", "1") == "hi"
+
+
+class TestGhRateLimitDetection:
+    """#2809: `_gh` must classify a rate-limit failure specifically (not just
+    generic "transient"), extract what detail `gh`'s stderr text offers, feed
+    the shared backoff (`coord.github_throttle`), and — for calls that pass
+    `-i` — recover the real `Retry-After`/`X-GitHub-Request-Id` headers from
+    stdout even though the call still exits non-zero.
+    """
+
+    def test_primary_rate_limit_raises_ghratelimiterror(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr=(
+                    "gh: API rate limit exceeded for user ID 3506413. "
+                    "request ID E126:C7B0E:4B13E6D:FBCA178:6A8F32B0 (HTTP 403)"
+                ),
+            ),
+        ):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        exc = excinfo.value
+        assert exc.status_code == 403
+        assert exc.request_id == "E126:C7B0E:4B13E6D:FBCA178:6A8F32B0"
+        assert exc.secondary is False
+        assert exc.from_cache is False
+        # A GhRateLimitError is still a GhTransientError/RuntimeError — every
+        # existing `except` call site catches it unchanged.
+        assert isinstance(exc, github_ops.GhTransientError)
+        assert isinstance(exc, RuntimeError)
+
+    def test_secondary_rate_limit_is_flagged_as_such(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: You have exceeded a secondary rate limit (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        assert excinfo.value.secondary is True
+
+    def test_plain_403_without_rate_limit_wording_is_not_misclassified(
+        self, coord_db,
+    ) -> None:
+        """A permissions 403 (token lacks a scope) must NOT engage the
+        shared backoff -- no wait fixes a scope problem, and pausing every
+        other `gh` call on the host for it would be pure self-harm."""
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: Resource not accessible by integration (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(RuntimeError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        assert not isinstance(excinfo.value, github_ops.GhRateLimitError)
+        from coord import github_throttle
+        assert github_throttle.current() is None
+
+    def test_rate_limit_feeds_the_shared_backoff(self, coord_db) -> None:
+        from coord import github_throttle
+
+        assert github_throttle.current() is None
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(github_ops.GhRateLimitError):
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        backoff = github_throttle.current()
+        assert backoff is not None
+        assert backoff.status == 403
+
+    def test_include_headers_recover_precise_retry_after(self, coord_db) -> None:
+        """A `-i` call (e.g. get_branch_sha) puts real HTTP headers on
+        stdout even on a non-2xx response -- `_gh` must prefer that
+        `Retry-After` over the (always-None, text has no such field) stderr
+        extraction."""
+        stdout = (
+            "HTTP/2.0 403 Forbidden\r\n"
+            "X-Github-Request-Id: AAAA:BBBB:CCCC\r\n"
+            "Retry-After: 47\r\n"
+            "\r\n"
+            '{"message": "API rate limit exceeded", "status": "403"}'
+        )
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout=stdout,
+                stderr="gh: API rate limit exceeded (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "-i", "repos/acme/api/branches/main")
+        exc = excinfo.value
+        assert exc.status_code == 403
+        assert exc.request_id == "AAAA:BBBB:CCCC"
+        assert exc.retry_after_s == 47.0
+
+
+class TestGhBackoffConsultedBeforeEachCall:
+    """#2809: `_gh` consults the shared backoff BEFORE issuing a network
+    call — deep inside an active window it skips the call entirely (the
+    actual damping), and inside a short remaining window it rides it out
+    with a bounded sleep instead."""
+
+    def test_deep_inside_backoff_skips_the_network_call(self, coord_db) -> None:
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="orig-request-id", retry_after_s=600.0,
+        )
+        run_mock = MagicMock()
+        with patch("coord.github_ops.subprocess.run", run_mock):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("issue", "view", "1")
+        run_mock.assert_not_called()
+        exc = excinfo.value
+        assert exc.from_cache is True
+        assert exc.request_id == "orig-request-id"
+
+    def test_near_end_of_backoff_sleeps_then_proceeds(self, coord_db) -> None:
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id=None, retry_after_s=2.0,
+        )
+        sleeps = []
+        with patch("coord.github_ops.time.sleep", side_effect=sleeps.append), patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
+        ) as run_mock:
+            result = github_ops._gh("issue", "view", "1")
+        assert result == "hi"
+        run_mock.assert_called_once()
+        assert len(sleeps) == 1
+        assert sleeps[0] > 0
+
+    def test_no_backoff_never_sleeps(self, coord_db) -> None:
+        with patch("coord.github_ops.time.sleep") as sleep_mock, patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
+        ):
+            github_ops._gh("issue", "view", "1")
+        sleep_mock.assert_not_called()
+
+
+class TestParseGhInclude:
+    """`_parse_gh_include` splits `gh api -i ...` output into (meta, body) —
+    the seam that recovers `Retry-After`/`X-GitHub-Request-Id` from a real
+    HTTP response rendered as text."""
+
+    def test_splits_headers_from_body(self) -> None:
+        raw = (
+            "HTTP/2.0 200 OK\r\n"
+            "X-Github-Request-Id: DEAD:BEEF\r\n"
+            "\r\n"
+            '{"commit": {"sha": "abc123"}}'
+        )
+        meta, body = github_ops._parse_gh_include(raw)
+        assert meta.status == 200
+        assert meta.request_id == "DEAD:BEEF"
+        assert body == '{"commit": {"sha": "abc123"}}'
+
+    def test_no_header_block_returns_raw_as_body(self) -> None:
+        raw = '{"commit": {"sha": "abc123"}}'
+        meta, body = github_ops._parse_gh_include(raw)
+        assert meta.status is None
+        assert meta.request_id is None
+        assert meta.retry_after_s is None
+        assert body == raw
+
+    def test_lf_only_separator_also_parses(self) -> None:
+        raw = "HTTP/2.0 403 Forbidden\nRetry-After: 12\n\n{}"
+        meta, body = github_ops._parse_gh_include(raw)
+        assert meta.status == 403
+        assert meta.retry_after_s == 12.0
+        assert body == "{}"
 
 
 def _forge_availability_rows(coord_db) -> list[dict]:
