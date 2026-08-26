@@ -6707,6 +6707,24 @@ impl CoordApp {
                     StageStatus::Done
                 } else if issue.is_closed {
                     StageStatus::Skipped
+                } else if entry.is_some_and(|e| e.state == "skipped") {
+                    // #919 review (round 2): `skipped` is the third state the
+                    // server folds into PLAN_NEEDS_ATTENTION
+                    // (`_state_to_plan_status`) and treats as terminal
+                    // alongside `merged` (`_RESOLVE_TERMINAL_STATES`) — a
+                    // superseded row on a still-open issue will never
+                    // self-resolve, so Pending here lit a one-click [Go] that
+                    // `pipeline_merge_state()` (this same commit's sibling
+                    // classifier) would refuse to dispatch. Same false green as
+                    // `conflict`, one state value over.
+                    //
+                    // Deliberately checked *here* rather than in the match arm
+                    // above: unlike conflict/human_required, a superseded row
+                    // routinely survives next to the *successful* attempt for
+                    // the same issue whose own row the reconcile tick then
+                    // prunes (#775), so matching it earlier would paint a
+                    // finished issue red instead of Done/Skipped.
+                    StageStatus::Failed
                 } else {
                     StageStatus::Pending
                 }
