@@ -1685,6 +1685,45 @@ class TestGetBranchSha:
         assert excinfo.value.retry_after_s == 30.0
         assert excinfo.value.secondary is True
 
+    def test_raise_on_transient_reraises_from_cache_backoff_error_despite_message_wording(
+        self,
+    ) -> None:
+        """#2809 review: the from-cache "coordinated backoff active" error
+        `_gh` raises while `github_throttle`'s shared backoff is active
+        (coord/github_ops.py ~337-345) uses `active_backoff.reason` verbatim
+        ("secondary_rate_limit", underscore) and renders "status=403" (not
+        "HTTP 403") — neither of which matches `_is_transient_error`'s
+        substring keyword list. It must still be recognized as transient and
+        re-raised AS-IS, because it already IS a `GhRateLimitError` — the
+        `isinstance` check must not depend on the keyword scan succeeding.
+
+        Before the #2809-review fix this returned `None` with no exception
+        at all: `_gh_get_branch_sha` (merge_queue.py) relies on catching
+        `GhTransientError` to distinguish a CONFIRMED transient failure from
+        a confirmed-absent branch, and losing that distinction here silently
+        regressed #2704's fail-closed smoke-verdict protection.
+        """
+        from_cache_exc = github_ops.GhRateLimitError(
+            "gh api ... skipped: GitHub secondary_rate_limit backoff active "
+            "for 45s more (status=403, request_id=req-cache-1)",
+            status_code=403, request_id="req-cache-1", retry_after_s=45.0,
+            secondary=True, from_cache=True,
+        )
+        # Sanity: this message is exactly the shape that must NOT rely on
+        # keyword matching -- if this assertion ever fails, the from-cache
+        # message wording changed and this test should be revisited.
+        assert not github_ops._is_transient_error(from_cache_exc)
+        with patch("coord.github_ops._gh", side_effect=from_cache_exc):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops.get_branch_sha(
+                    "acme/api", "main", raise_on_transient=True
+                )
+        assert excinfo.value is from_cache_exc
+        assert excinfo.value.status_code == 403
+        assert excinfo.value.request_id == "req-cache-1"
+        assert excinfo.value.retry_after_s == 45.0
+        assert excinfo.value.from_cache is True
+
 
 class TestGetDefaultBranchHead:
     def test_calls_gh_with_include_flag(self) -> None:
@@ -1999,6 +2038,39 @@ class TestGhBackoffConsultedBeforeEachCall:
                 github_ops._gh("issue", "view", "1")
         run_mock.assert_not_called()
         exc = excinfo.value
+        assert exc.from_cache is True
+        assert exc.request_id == "orig-request-id"
+
+    def test_get_branch_sha_reraises_through_a_deep_active_backoff(self, coord_db) -> None:
+        """#2809 review, end-to-end regression for the swallow: with the
+        shared backoff active (as it will be for most calls during a
+        sustained incident — the dominant state, not the exceptional one),
+        `get_branch_sha(..., raise_on_transient=True)` — the exact call
+        `_gh_get_branch_sha`/`evaluate_smoke_verdict` make — must raise
+        `GhTransientError`, not swallow the from-cache error into a bare
+        `None`.
+
+        This combines what neither pre-existing test file combined: a real
+        active `github_throttle` backoff with a real `get_branch_sha` call
+        through the genuine `coord.github_ops` implementation (not a
+        hand-written stub that raises `GhRateLimitError` directly and
+        bypasses `_is_transient_error`'s guard).
+        """
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="orig-request-id", retry_after_s=600.0,
+        )
+        run_mock = MagicMock()
+        with patch("coord.github_ops.subprocess.run", run_mock):
+            with pytest.raises(github_ops.GhTransientError) as excinfo:
+                github_ops.get_branch_sha(
+                    "acme/api", "main", raise_on_transient=True
+                )
+        run_mock.assert_not_called()
+        exc = excinfo.value
+        assert isinstance(exc, github_ops.GhRateLimitError)
         assert exc.from_cache is True
         assert exc.request_id == "orig-request-id"
 

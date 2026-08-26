@@ -1928,7 +1928,17 @@ def get_branch_sha(repo: str, branch: str, *, raise_on_transient: bool = False) 
         data = _json_loads_or(body, default={})
         return data["commit"]["sha"]
     except Exception as exc:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
-        if raise_on_transient and _is_transient_error(exc):
+        # #2809 review: an exception that is ALREADY a GhTransientError (e.g. the
+        # from-cache "coordinated backoff active" GhRateLimitError _gh raises
+        # while a shared backoff window is open) must always be recognized as
+        # transient, even though its message uses `active_backoff.reason`
+        # verbatim ("secondary_rate_limit", underscore) and "status=403"
+        # (not "HTTP 403") — neither of which matches _is_transient_error's
+        # substring keywords. Checking isinstance first (independent of the
+        # keyword scan) is what makes the docstring's "re-raised AS-IS"
+        # promise true for that dominant-during-an-incident code path,
+        # instead of it silently collapsing into `return None`.
+        if raise_on_transient and (isinstance(exc, GhTransientError) or _is_transient_error(exc)):
             raise (exc if isinstance(exc, GhTransientError) else GhTransientError(str(exc))) from exc
         return None
 

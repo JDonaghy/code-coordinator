@@ -67,6 +67,17 @@ _STATE_FILENAME = "github_backoff.json"
 # floor. Used whenever a hit carries no more precise `retry_after_s`.
 DEFAULT_BACKOFF_S = 60.0
 
+# #2809 review: a defensive ceiling on any single recorded wait, however it
+# arrived — a parsed `Retry-After` header, a hand-constructed test value, or
+# a future caller of `record()`. `record()` never shrinks an existing window
+# (`until = max(existing.until, until)`, below), so an outsized value here
+# would otherwise become effectively sticky: every subsequent hit while it's
+# active would inherit it and re-extend it, silently stalling every `gh`
+# caller on this host well past GitHub's own "a few minutes" secondary-limit
+# guidance. 15 minutes is generous headroom above that guidance while still
+# bounding the damage from a malformed/adversarial `retry_after_s`.
+MAX_BACKOFF_S = 900.0
+
 # Never make a single `_gh()` call sleep past this just to ride out a shared
 # cooldown before proceeding — a caller's own retry/timeout loop stays in
 # control of how long IT waits. Deep inside a longer backoff window, `_gh`
@@ -158,10 +169,15 @@ def record(
     while already backing off can only extend it, never pull it in early
     (a later, larger ``retry_after_s`` should win; a smaller one from a
     stale/racing observation should not undo a longer wait already in
-    force).
+    force). Because of that "only extend" rule, *retry_after_s* is clamped
+    to :data:`MAX_BACKOFF_S` before it can ever become ``until`` — otherwise
+    one malformed/oversized value would become sticky, with every later hit
+    re-extending a window already far past what GitHub's own guidance calls
+    for.
     """
     now = now if now is not None else time.time()
     wait = retry_after_s if retry_after_s and retry_after_s > 0 else DEFAULT_BACKOFF_S
+    wait = min(wait, MAX_BACKOFF_S)
     until = now + wait
     try:
         path = _state_path()

@@ -3643,6 +3643,79 @@ class TestLiveGateEntryRateLimitPropagation:
         assert review_failure.reason.startswith(mq.UNKNOWN_BRANCH_HEAD_REASON)
 
 
+class TestLiveAnchorEntry:
+    """`live_anchor_entry` (#2809 review) — factored out of `live_gate_entry`
+    so a caller holding an already-real, already-persisted `QueuedMerge`
+    (not a raw work `Assignment`) can re-anchor it against CURRENT GitHub
+    state in place. `coord merge --only` is the motivating caller: it
+    resolves its entry straight off the queue DB, which may never have been
+    live-anchored (or was, long before this invocation), so its
+    `branch_head_probe_error` was stale/unset — exactly the gap the issue's
+    own `coord merge --only` reproduction hit for the review gate."""
+
+    def _entry(self) -> "mq.QueuedMerge":
+        return mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="worker/w1", target_branch="main", issue_number=1,
+            issue_title="t", state=mq.PENDING,
+        )
+
+    def test_populates_probe_error_on_an_existing_entry(self) -> None:
+        entry = self._entry()
+        assert entry.branch_head_probe_error is None
+
+        mq.live_anchor_entry(entry, _RateLimitedGh())
+
+        assert entry.branch_head_sha is None
+        assert entry.branch_head_probe_error is not None
+        assert entry.branch_head_probe_error.status_code == 403
+        assert entry.branch_head_probe_error.secondary is True
+
+    def test_no_gh_ops_is_a_no_op(self) -> None:
+        entry = self._entry()
+        mq.live_anchor_entry(entry, None)
+        assert entry.branch_head_probe_error is None
+        assert entry.branch_head_sha is None
+
+    def test_refreshes_a_previously_confirmed_sha(self) -> None:
+        """A stale `branch_head_sha` from an earlier tick must be replaced
+        by the live value, not merely left alone when it's already set."""
+        entry = self._entry()
+        entry.branch_head_sha = "stale-sha-from-a-much-earlier-tick"
+
+        class _FreshGh(FakeGh):
+            def get_branch_sha(self, repo, branch, *, raise_on_transient=False):
+                return "fresh-sha"
+
+        mq.live_anchor_entry(entry, _FreshGh())
+
+        assert entry.branch_head_sha == "fresh-sha"
+
+    def test_only_path_merge_gate_failures_reports_enriched_detail_after_anchoring(
+        self,
+    ) -> None:
+        """End-to-end for the non-blocking finding: an entry resolved off
+        the queue DB with NO probe error recorded yet (the `--only` shape)
+        must, after `live_anchor_entry`, produce the same enriched
+        review-gate reason a freshly-built `live_gate_entry` would — not the
+        bare generic fallback string."""
+        cfg = TestPassesMergeGates._config()
+        work = TestPassesMergeGates._work("w1", test_state="passed")
+        review = TestPassesMergeGates._review("w1", verdict="approve")
+        review.review_head_sha = "sha-any"
+        board = TestPassesMergeGates._board(completed=[work, review])
+
+        entry = self._entry()
+        assert entry.branch_head_probe_error is None  # the --only-path gap
+
+        mq.live_anchor_entry(entry, _RateLimitedGh())
+        failures = mq.merge_gate_failures(entry, cfg, board)
+
+        review_failure = next(f for f in failures if f.gate == "review")
+        assert "HTTP 403" in review_failure.reason
+        assert "E126:C7B0E:4B13E6D" in review_failure.reason
+
+
 class TestHasPassedTest:
     """#2350: :func:`has_passed_test` — the Merge-only fast path's bare
     recorded-state read, deliberately narrower than :func:`has_smoke_verdict`

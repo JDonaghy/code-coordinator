@@ -67,6 +67,22 @@ class TestRecordAndCurrent:
         assert b is not None
         assert b.until == pytest.approx(1120.0)
 
+    def test_outsized_retry_after_is_capped_not_sticky(self) -> None:
+        """#2809 review: `record()` never shrinks an existing window (see
+        the test above), so an uncapped, outsized `retry_after_s` — a
+        malformed header, a parsing edge case — would otherwise become
+        effectively sticky: every later hit while it's active inherits
+        `max(existing.until, new_until)` and re-extends a window already far
+        past GitHub's own "a few minutes" secondary-limit guidance. A single
+        huge value must be clamped to `MAX_BACKOFF_S` up front."""
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id=None, retry_after_s=999_999.0, now=1000.0,
+        )
+        b = github_throttle.current(now=1000.0)
+        assert b is not None
+        assert b.until == pytest.approx(1000.0 + github_throttle.MAX_BACKOFF_S)
+
     def test_second_hit_extends_a_shorter_active_window(self) -> None:
         github_throttle.record(
             reason="primary_rate_limit", status=403,

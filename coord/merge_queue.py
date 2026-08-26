@@ -3566,35 +3566,61 @@ def live_gate_entry(
         assignment_type=getattr(a, "type", None) or "work",
         required_gates=list(getattr(a, "required_gates", None) or []),
     )
-    if gh_ops is not None and entry.branch:
-        # #2085: NOT "fail-open, unknown SHA isn't blocking" — an unknown
-        # branch_head_sha now fails has_approved_review CLOSED (not open)
-        # for any review that carries a review_head_sha to compare against.
-        # A transient gh error here degrades to the same conservative
-        # refusal as gh_ops=None, never a silent pass.
-        #
-        # #2809: routed through `_gh_get_branch_sha` (not a bare
-        # `gh_ops.get_branch_sha(...)` try/except) so a CONFIRMED transient
-        # failure — this is THE call the issue's incident traced the swallow
-        # to — is captured on `branch_head_probe_error` instead of collapsing
-        # to the same bare `None` a genuinely-deleted branch produces. The
-        # branch's own probe wins when both fail (its detail is what the
-        # review/smoke gate reasons actually name); the target's is used only
-        # when the branch fetch itself succeeded.
-        entry.branch_head_sha, _, branch_probe_error = _gh_get_branch_sha(
-            gh_ops, entry.repo_github, entry.branch
-        )
-        entry.target_branch_head_sha, _, target_probe_error = _gh_get_branch_sha(
-            gh_ops, entry.repo_github, entry.target_branch
-        )
-        entry.branch_head_probe_error = branch_probe_error or target_probe_error
-        try:
-            entry.branch_patch_id = gh_ops.get_branch_patch_id(
-                entry.repo_github, entry.target_branch, entry.branch
-            )
-        except Exception:  # noqa: BLE001
-            entry.branch_patch_id = None
+    live_anchor_entry(entry, gh_ops)
     return entry
+
+
+def live_anchor_entry(entry: "QueuedMerge", gh_ops: "GhOps | None") -> None:
+    """Refresh *entry*'s #821/#1475/#1479 freshness anchors (``branch_head_sha``,
+    ``branch_patch_id``, ``target_branch_head_sha``, ``branch_head_probe_error``)
+    LIVE via *gh_ops*, in place.
+
+    Factored out of :func:`live_gate_entry` (#2809 review) so a caller that
+    already has a real, persisted :class:`QueuedMerge` — not a raw work
+    :class:`~coord.models.Assignment` — can re-anchor it against the current
+    GitHub state without rebuilding it from scratch. ``coord merge --only``
+    is exactly this: it resolves ``only_entry`` straight off the queue DB
+    (:func:`resolve_entry_key`), which was last live-anchored whenever
+    :func:`process` (or this function) previously ran on it — potentially
+    stale by the time the operator's ``--only`` invocation reports gate
+    status. Without a fresh call here, ``only_entry.branch_head_probe_error``
+    stays at whatever it was (often the dataclass default ``None``), so
+    :func:`merge_gate_failures`' review-gate line can't tell "GitHub
+    confirmed this is unknown" apart from "we never checked" — exactly the
+    gap #2809's incident reproduction (``coord merge --only``) hit.
+
+    *gh_ops* ``None`` or *entry* having no ``branch`` is a no-op — same
+    fail-open behaviour as :func:`live_gate_entry` with no live client.
+    """
+    if gh_ops is None or not entry.branch:
+        return
+    # #2085: NOT "fail-open, unknown SHA isn't blocking" — an unknown
+    # branch_head_sha now fails has_approved_review CLOSED (not open)
+    # for any review that carries a review_head_sha to compare against.
+    # A transient gh error here degrades to the same conservative
+    # refusal as gh_ops=None, never a silent pass.
+    #
+    # #2809: routed through `_gh_get_branch_sha` (not a bare
+    # `gh_ops.get_branch_sha(...)` try/except) so a CONFIRMED transient
+    # failure — this is THE call the issue's incident traced the swallow
+    # to — is captured on `branch_head_probe_error` instead of collapsing
+    # to the same bare `None` a genuinely-deleted branch produces. The
+    # branch's own probe wins when both fail (its detail is what the
+    # review/smoke gate reasons actually name); the target's is used only
+    # when the branch fetch itself succeeded.
+    entry.branch_head_sha, _, branch_probe_error = _gh_get_branch_sha(
+        gh_ops, entry.repo_github, entry.branch
+    )
+    entry.target_branch_head_sha, _, target_probe_error = _gh_get_branch_sha(
+        gh_ops, entry.repo_github, entry.target_branch
+    )
+    entry.branch_head_probe_error = branch_probe_error or target_probe_error
+    try:
+        entry.branch_patch_id = gh_ops.get_branch_patch_id(
+            entry.repo_github, entry.target_branch, entry.branch
+        )
+    except Exception:  # noqa: BLE001
+        entry.branch_patch_id = None
 
 
 # ── Persistence ──────────────────────────────────────────────────────────
