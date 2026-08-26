@@ -3211,15 +3211,82 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         )
         # Re-enqueue the parent merge entry so the next `coord merge` retries.
         # This mirrors the reconcile() path — whichever runs first wins.
+        #
+        # #2565: a `claude -p` conflict-fix worker ends its turn the same
+        # way (exit 0 / EVENT_COMPLETION here) whether it actually resolved
+        # the conflict or judged it SEMANTIC and gave up with a STUCK line —
+        # it has no way to set its own exit code, so this branch previously
+        # treated every clean completion as a resolved conflict and reset
+        # the entry to PENDING regardless. `coord notify` is the routinely-
+        # scheduled path (unlike the full `reconcile()`, which only
+        # `coord resume` calls), so this was the operationally dominant
+        # place the bug bit. Read the worker's own `coord:conflict=semantic`
+        # marker from its transcript first — mirrors
+        # `coord.reconcile._on_conflict_fix_done` — and downgrade to
+        # `succeeded=False` when it's present, so the entry lands on the
+        # same HUMAN_REQUIRED/escalation outcome a reported failure would,
+        # instead of silently retrying the identical, already-diagnosed
+        # conflict.
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
+            from coord.conflict_fix import detect_semantic_conflict  # noqa: PLC0415
             from coord.reconcile import on_conflict_fix_done  # noqa: PLC0415
+
+            log_path = entry.get("log_path")
+            host = _agent_host(transition.machine_name)
+            try:
+                semantic = detect_semantic_conflict(
+                    log_path=log_path,
+                    host=host,
+                    assignment_id=transition.assignment_id,
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never break notify
+                semantic = False
+
+            stuck_summary: str | None = None
+            board = None
+            config = None
+            if semantic:
+                progress = entry.get("progress") or {}
+                stuck_summary = progress.get("stuck")
+                if not stuck_summary and log_path:
+                    try:
+                        from coord.progress import parse_progress  # noqa: PLC0415
+                        stuck_summary = parse_progress(log_path).stuck
+                    except Exception:  # noqa: BLE001
+                        stuck_summary = None
+                # Board/config are only needed to attempt the #1291
+                # escalated retry — load them lazily, and only for this rare
+                # give-up path, so the overwhelming common case (no marker,
+                # a real fix) pays no extra cost.
+                try:
+                    from coord.board_service import read_board  # noqa: PLC0415
+                    from coord.config import load as _load_config  # noqa: PLC0415
+                    board = read_board()
+                    config = _load_config()
+                except Exception:  # noqa: BLE001
+                    board, config = None, None
+
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,
                 fix_assignment_id=transition.assignment_id,
                 machine_name=transition.machine_name,
-                succeeded=True,
+                succeeded=not semantic,
+                semantic=semantic,
+                board=board,
+                config=config,
+                stuck_summary=stuck_summary,
             )
+            if semantic and board is not None:
+                try:
+                    from coord.board_service import write_board  # noqa: PLC0415
+                    write_board(board)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "notify: failed to persist board after semantic "
+                        "conflict-fix escalation for %s",
+                        transition.assignment_id,
+                    )
     elif transition.event == EVENT_COMPLETION and assignment_type == "smoke":
         # #1021: propagate the headless smoke result to the parent work row's
         # Test verdict so the merge gate is satisfied automatically. #2244:

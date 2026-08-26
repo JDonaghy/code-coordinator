@@ -2106,8 +2106,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         if orig is not None:
                             orig.review_state = "done"
                 elif done.type == "conflict-fix":
-                    # #241: re-enqueue the parent merge entry for retry.
-                    _on_conflict_fix_done(done, succeeded=True)
+                    # #241: re-enqueue the parent merge entry for retry —
+                    # UNLESS #2565's semantic-marker check (run inside
+                    # `_on_conflict_fix_done` regardless of `succeeded`)
+                    # finds the worker actually gave up. Pass `agent_entry`/
+                    # `board`/`config` (mirroring the advisory/failed call
+                    # sites below) so that check can run; a clean exit alone
+                    # is not proof of a real resolution.
+                    _on_conflict_fix_done(
+                        done, succeeded=True,
+                        agent_entry=entry, board=board, config=config,
+                    )
         elif agent_status == "advisory":
             # #448: worker exited cleanly but pushed 0 commits. Move to
             # completed with status "advisory" — NOT "failed" — so that
@@ -2587,10 +2596,22 @@ def _on_conflict_fix_done(
 ) -> None:
     """Thin wrapper used by the reconcile() loop.
 
-    On failure it also asks the worker's log whether the give-up was a
-    SEMANTIC conflict (the ``coord:conflict=semantic`` marker), which — with
+    It also asks the worker's log whether it gave up on a SEMANTIC conflict
+    (the ``coord:conflict=semantic`` marker), which — with
     ``pipeline.escalate_semantic_conflicts`` on — buys one escalated attempt
     instead of an immediate HUMAN_REQUIRED (#1291).
+
+    #2565: this check runs regardless of *succeeded*, not just on failure. A
+    ``claude -p`` worker ends its turn (and the harness reports ``exit_code
+    0``/``status done``) the same way whether it resolved the conflict or
+    gave up with a STUCK line — the briefing's "exit non-zero" instruction
+    asks for something outside the worker's control, so a clean exit can
+    NOT be trusted as "succeeded" on its own. The marker in the transcript
+    is the only reliable signal; when it's present the give-up is real even
+    though the agent-reported status is ``done``, so *succeeded* is
+    downgraded to ``False`` before calling :func:`on_conflict_fix_done` —
+    otherwise the entry would be reset to PENDING and silently retried
+    against the identical, already-diagnosed conflict.
 
     #1461 review finding 2: when the conflict-fix worker was itself killed
     by the account's usage limit (flagged on *agent_entry* by
@@ -2610,14 +2631,15 @@ def _on_conflict_fix_done(
     semantic = False
     stuck_summary: str | None = None
     if (
-        not succeeded
-        and not usage_limit_reason
+        not usage_limit_reason
         and board is not None
         and config is not None
     ):
         semantic, stuck_summary = _semantic_verdict(
             fix_assignment, agent_entry, config,
         )
+        if semantic:
+            succeeded = False
 
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
