@@ -2085,6 +2085,10 @@ class Config:
     # #2179 — absent block == disabled == coord never talks to coord-portal.
     portal: PortalConfig = field(default_factory=PortalConfig)
     path: Path | None = None
+    # #2783 — non-fatal parse-time warnings (e.g. an unrecognised repos[] key)
+    # surfaced to an operator via `coord config` / `coord diagnose`. Never
+    # gates loading — a warning is advisory, not a broken config.
+    warnings: list[str] = field(default_factory=list)
 
     def repo(self, name: str) -> Repo | None:
         return next((r for r in self.repos if r.name == name), None)
@@ -2130,7 +2134,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         raise ConfigError(f"Top-level config must be a mapping, got {type(raw).__name__}")
 
     p = path
-    repos = _parse_repos(raw.get("repos"))
+    repos, repo_warnings = _parse_repos(raw.get("repos"))
     machines = _parse_machines(raw.get("machines"), repos)
     _validate_dependencies(repos)
     hooks = _parse_hooks(raw.get("hooks"))
@@ -2183,10 +2187,41 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         notifications=notifications,
         portal=portal,
         path=p,
+        warnings=repo_warnings,
     )
 
 
-def _parse_repos(raw: Any) -> list[Repo]:
+# #2783 — every key `_parse_repos` actually reads. Anything in a repos[] entry
+# outside this set validates clean today (`entry.get(...)` silently returns
+# None for a typo'd or dead key) but is read by no code in coord/ — see
+# docs/ARCHITECTURE.md's `file_groups`/`exclusive_files` note for the
+# motivating example. Kept as a warning, never an error: a forward-looking or
+# hand-typed key is not a broken config, and every agent, the board daemon,
+# and the drive-queue tick all load this same file.
+_KNOWN_REPO_KEYS = frozenset(
+    {
+        "name",
+        "github",
+        "depends_on",
+        "default_branch",
+        "develop_branch",
+        "build_command",
+        "test_command",
+        "ci_command",
+        "run_cmd",
+        "worker_permissions",
+        "housekeeping",
+        "coordinator_only_files",
+        "reference_repos",
+        "new_issue_guidance",
+        "artifact_paths",
+        "provider",
+        "uat_preview",
+    }
+)
+
+
+def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
     if raw is None:
         raise ConfigError("Config must define 'repos'")
     if not isinstance(raw, list):
@@ -2195,6 +2230,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
         raise ConfigError("'repos' must contain at least one repo")
 
     repos: list[Repo] = []
+    warnings: list[str] = []
     seen: set[str] = set()
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
@@ -2212,6 +2248,14 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if name in seen:
             raise ConfigError(f"duplicate repo name: {name!r}")
         seen.add(name)
+
+        unknown_keys = sorted(set(entry) - _KNOWN_REPO_KEYS)
+        for key in unknown_keys:
+            warnings.append(
+                f"repos[{i}] ({name!r}): unrecognised key {key!r} — not read by "
+                "any code in coord/ (see docs/ARCHITECTURE.md); check for a typo "
+                "or drop it"
+            )
 
         depends_on = entry.get("depends_on", []) or []
         if not isinstance(depends_on, list) or not all(isinstance(d, str) for d in depends_on):
@@ -2324,7 +2368,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 uat_preview=uat_preview,
             )
         )
-    return repos
+    return repos, warnings
 
 
 def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsConfig:
