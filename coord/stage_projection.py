@@ -45,7 +45,13 @@ SKIPPED = "skipped"
 
 _MERGED_STATES = frozenset({"merged"})
 _ACTIVE_MERGE_STATES = frozenset({"open", "queued"})
-_FAILED_MERGE_STATES = frozenset({"failed", "human_required"})
+# #919 review: "conflict" is a genuine resting/terminal merge_queue state
+# (coord/merge_queue.py) reached whenever GitHub reports a real merge
+# conflict and no conflict-fix worker is currently resolving it. Without it
+# here, a conflicting entry fell through to the "pending" default in
+# `_merge_stage_status` below, projecting a lit one-click Merge for an item
+# that cannot actually merge — the false green #919 exists to close.
+_FAILED_MERGE_STATES = frozenset({"failed", "human_required", "conflict"})
 
 
 @runtime_checkable
