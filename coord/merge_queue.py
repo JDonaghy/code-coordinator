@@ -14,6 +14,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, NamedTuple, Protocol
 
@@ -2042,12 +2043,42 @@ def _ci_expects_checks(
         return True
 
 
+def _base_commit_time(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    target_branch: str | None,
+) -> float | None:
+    """*target_branch*'s current tip commit timestamp, or ``None`` when it
+    cannot be read (#1826).
+
+    The single place the base anchor is fetched, so :func:`_ci_checks_are_stale`
+    (the predicate) and :func:`ci_staleness_note` (the #1479-parity wording)
+    can never disagree about what "the current base" means. ``None`` covers
+    every unreadable case uniformly — no *gh_ops*, no *target_branch*, a
+    *gh_ops* stand-in with no ``get_branch_commit_timestamp`` (e.g.
+    :class:`coord.gate_snapshot.GateSnapshot`, which deliberately doesn't
+    cache it), or a live lookup that raises or returns ``None`` — and each
+    caller decides for itself which way to lean on it.
+    """
+    if gh_ops is None or not repo_github or not target_branch:
+        return None
+    getter = getattr(gh_ops, "get_branch_commit_timestamp", None)
+    if getter is None:
+        return None
+    try:
+        return getter(repo_github, target_branch)
+    except Exception:  # noqa: BLE001 — unreadable, never a raise out of a gate
+        return None
+
+
 def _ci_checks_are_stale(
     checks: "list[CheckRun]",
     gh_ops: "GhOps | None",
     repo_github: str | None,
     target_branch: str | None,
     smoke: "SmokeVerdictStatus | None",
+    *,
+    fail_closed: bool = True,
 ) -> bool:
     """True when *checks* — already confirmed by the caller to have no
     failed/in-flight entries — are stale relative to *target_branch*'s
@@ -2073,25 +2104,172 @@ def _ci_checks_are_stale(
     the base move wasn't spared), this falls back to a pure timestamp
     comparison — the only evidence available without an anchor.
 
-    Fails closed (returns ``True``) whenever the timestamp comparison itself
-    can't be made: no *gh_ops*, no *target_branch*, a *gh_ops* stand-in with
-    no ``get_branch_commit_timestamp`` (e.g. :class:`coord.gate_snapshot.
-    GateSnapshot`, which doesn't cache it — same documented pessimistic-
-    display tradeoff as :func:`_fetch_compare_files`), or a live lookup that
-    raises or returns ``None``.
+    Fails closed (returns ``True``) whenever the base anchor itself can't be
+    read — see :func:`_base_commit_time` for the cases. That is the right
+    lean for a *gate*: a false "fresh" merges untested code, a false "stale"
+    only costs a re-run (:func:`coord.ci_store.checks_are_stale` documents the
+    same bias). ``fail_closed=False`` inverts it for the one caller that is
+    not a gate — the ``--force-merge`` waiver notice (#1826,
+    :func:`ci_stale_waiver_message`), which is pure advisory prose printed
+    beside a merge that is happening either way. There, an unreadable anchor
+    must not manufacture a "stale CI is being waived" warning about a PR
+    whose checks may well be current; only positive evidence of staleness is
+    worth saying out loud. The flag governs *only* that unreadable-anchor
+    arm — the comparison itself is still
+    :func:`coord.ci_store.checks_are_stale`, never a second notion of stale.
     """
+    if not checks:
+        return False
     if smoke is not None and smoke.spared_reason is not None:
         return False
-    if gh_ops is None or not repo_github or not target_branch:
-        return True
-    getter = getattr(gh_ops, "get_branch_commit_timestamp", None)
-    if getter is None:
-        return True
-    try:
-        base_commit_time = getter(repo_github, target_branch)
-    except Exception:  # noqa: BLE001 — fail-safe: unknown timestamp is stale, not blocking here
-        base_commit_time = None
+    base_commit_time = _base_commit_time(gh_ops, repo_github, target_branch)
+    if base_commit_time is None:
+        return fail_closed
     return checks_are_stale(checks, base_commit_time)
+
+
+def _stale_stamp(ts: float | None) -> str:
+    """UTC ``YYYY-MM-DDTHH:MM:SSZ`` for *ts*, or ``"unknown"`` (#1826).
+
+    The CI analogue of :func:`_short_sha` — the anchor a CI result carries is
+    a run timestamp, not a SHA (GitHub attaches `pull_request` checks to the
+    PR's *merge ref*, whose base parent costs another round trip to resolve),
+    so the staleness prose names times where the Test verdict's names commits.
+    """
+    if ts is None:
+        return "unknown"
+    try:
+        return (
+            datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def ci_staleness_note(
+    checks: "list[CheckRun]",
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    target_branch: str | None,
+) -> str:
+    """The ``(ran against ... , ... now ...)`` clause for a CI-stale refusal
+    (#1826), or ``""`` when the anchors can't be named.
+
+    #1826's acceptance asks that stale CI be reported "in wording that matches
+    #1479's Test-verdict staleness". #1479 prints *recorded against base X,
+    base is now Y* (see :func:`coord.gates.format_report`); this is the same
+    sentence with the anchors CI actually has — the oldest passing check's
+    start time, and the base branch's current tip commit time.
+
+    Costs one extra ``get_branch_commit_timestamp`` round trip, and is called
+    **only** on the already-blocked stale path — never in the common,
+    checks-are-fresh case, which is #1826's explicit "must not add latency to
+    the common case" criterion.
+    """
+    base_commit_time = _base_commit_time(gh_ops, repo_github, target_branch)
+    if base_commit_time is None:
+        return ""
+    started = [c.started_at for c in checks if c.started_at is not None]
+    if not started or len(started) != len(checks):
+        # A check with no `started_at` is exactly what makes
+        # `checks_are_stale` fail closed; there is no honest anchor to print
+        # for it, so print none rather than a partial one.
+        return ""
+    branch = target_branch or "base"
+    return (
+        f" (ran against {branch} as of {_stale_stamp(min(started))}, "
+        f"{branch} now {_stale_stamp(base_commit_time)})"
+    )
+
+
+def ci_stale_reason(
+    checks: "list[CheckRun]",
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    target_branch: str | None,
+    *,
+    suffix: str = "",
+) -> str:
+    """The single rendering of a CI-stale refusal (#1826).
+
+    ``_entry_gate_status`` (board/plan render) and ``process()`` (the live
+    merge attempt) both call this, so the two can never print different prose
+    for the same condition — the #1141 lesson :data:`CI_STALE_PREFIX` already
+    encodes for the machine-readable half, applied to the human half too.
+
+    *suffix* is the extra clause the live path adds once its #2197 auto-rerun
+    budget is spent; it lands before the remedy so the remedy stays the last
+    thing an operator reads.
+    """
+    note = ci_staleness_note(checks, gh_ops, repo_github, target_branch)
+    return (
+        f"{CI_STALE_PREFIX} checks predate the current base{note}{suffix} — "
+        "re-run CI (`coord merge --revalidate`) before merging"
+    )
+
+
+# #1826: `--force-merge` still overrides the CI gate, but the override must
+# never be SILENT — the same posture `epic_closing_keyword_in_commit_forced`
+# already takes for the #1318 gate. A waived stale-CI merge is precisely the
+# 2026-08-04 incident's shape done deliberately, so the audit trail has to
+# record that it was waived rather than leaving "merged, no CI event" to be
+# misread as "merged, CI was green".
+CI_STALE_WAIVED_PREFIX = "CI stale WAIVED:"
+
+
+def ci_stale_waiver_message(
+    entry: "QueuedMerge",
+    ci_store: "CiStore | None",
+    gh_ops: "GhOps | None",
+    smoke: "SmokeVerdictStatus | None" = None,
+) -> str | None:
+    """Advisory message for a ``--force-merge`` that is waiving STALE CI
+    (#1826), or ``None`` when there is nothing to warn about.
+
+    Best-effort by construction: this runs on a merge that is going to happen
+    regardless, so every unreadable input (no PR yet, GitHub unreachable, a
+    ``CiStore``/``GhOps`` stand-in that can't answer) returns ``None`` rather
+    than raising or guessing. Reuses :func:`_ci_checks_are_stale` — with
+    ``fail_closed=False``, since a warning invented from an unreadable anchor
+    is noise, not safety — so there is exactly one notion of "stale CI" in the
+    merge lane, per #1826's own "two independent notions is how these diverge".
+
+    Deliberately silent for failed/in-flight checks: ``--force-merge``
+    overriding a RED or still-running suite is the pre-existing #240 override
+    and already has its own semantics; this names the one condition that used
+    to be invisible.
+
+    Costs one check-list read plus a base-timestamp read — paid *only* under
+    ``--force-merge``, a rare, deliberate, human-initiated act, and never on
+    the ordinary gated path #1826 requires to stay latency-free.
+    """
+    if ci_store is None or not getattr(ci_store, "is_available", False):
+        return None
+    if not entry.pr_number:
+        return None
+    try:
+        checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+    except Exception:  # noqa: BLE001 — advisory only, never blocks the merge
+        return None
+    if not checks or failed_checks(checks) or in_flight_checks(checks):
+        return None
+    try:
+        stale = _ci_checks_are_stale(
+            checks, gh_ops, entry.repo_github, entry.target_branch, smoke,
+            fail_closed=False,
+        )
+    except Exception:  # noqa: BLE001 — advisory only, never blocks the merge
+        return None
+    if not stale:
+        return None
+    note = ci_staleness_note(checks, gh_ops, entry.repo_github, entry.target_branch)
+    return (
+        f"{CI_STALE_WAIVED_PREFIX} --force-merge is merging on checks that "
+        f"predate the current base{note} — the CI gate was waived, NOT "
+        "satisfied; nothing has tested this branch against "
+        f"{entry.target_branch or 'the base'} as it stands now"
+    )
 
 
 def has_smoke_verdict(
@@ -4452,10 +4630,13 @@ def _entry_gate_status(
             if checks and _ci_checks_are_stale(
                 checks, gh_ops, entry.repo_github, entry.target_branch, smoke
             ):
+                # #1826: name the anchors, #1479-style. Costs one extra
+                # timestamp read, only for an entry already blocked.
                 return (
                     PLAN_BLOCKED,
-                    f"{CI_STALE_PREFIX} checks predate the current base — "
-                    "re-run CI (`coord merge --revalidate`) before merging",
+                    ci_stale_reason(
+                        checks, gh_ops, entry.repo_github, entry.target_branch
+                    ),
                 )
     if gh_ops is not None and entry.pr_number:
         try:
@@ -6125,15 +6306,33 @@ def process(
                             checks, gh_ops, entry.repo_github,
                             entry.target_branch, _smoke,
                         ):
+                            # #1826: same renderer the live path uses, so a
+                            # preview and the merge it previews can never
+                            # describe this condition differently.
                             events.append(MergeEvent(
                                 entry, "checks_stale",
-                                "(dry run) would be blocked: CI checks "
-                                "predate the current base — re-run CI "
-                                f"(`coord merge --revalidate`) for {entry.branch}",
+                                "(dry run) would be blocked: "
+                                + ci_stale_reason(
+                                    checks, gh_ops, entry.repo_github,
+                                    entry.target_branch,
+                                )
+                                + f" ({entry.branch})",
                             ))
                             continue
                     else:
                         _ci_note = " [gate: unknown (no PR yet) — CI cannot be evaluated]"
+                elif force_merge and ci.is_available:
+                    # #1826: preview the waiver too — a `--dry-run
+                    # --force-merge` that just says "would merge" hides the
+                    # single most consequential fact about the merge it is
+                    # previewing. Mirrors the live path's
+                    # `checks_stale_forced` event; folded into `_ci_note` so
+                    # the preview stays one line per entry.
+                    _stale_waiver = ci_stale_waiver_message(
+                        entry, ci, gh_ops, _smoke
+                    )
+                    if _stale_waiver:
+                        _ci_note = f" [{_stale_waiver}]"
                 # #1467-review: preview the rebase→squash fallback in
                 # dry-run too. Only reachable when this entry already has a
                 # pr_number — from an earlier (non-dry-run) attempt, or just
@@ -6784,11 +6983,14 @@ def process(
                         entry.error = msg
                         events.append(MergeEvent(entry, "checks_stale_rerun", msg))
                         continue  # #292: skip, don't halt the group
-                    msg = (
-                        f"{CI_STALE_PREFIX} checks predate the current base "
-                        f"— auto-rerun budget exhausted ({entry.ci_stale_reruns}/"
-                        f"{MAX_CI_STALE_RERUNS}); re-run CI (`coord merge "
-                        "--revalidate`) before merging"
+                    # #1826: same renderer the plan path uses, so the two
+                    # surfaces can never describe this condition differently.
+                    msg = ci_stale_reason(
+                        checks, gh_ops, entry.repo_github, entry.target_branch,
+                        suffix=(
+                            f"; auto-rerun budget exhausted "
+                            f"({entry.ci_stale_reruns}/{MAX_CI_STALE_RERUNS})"
+                        ),
                     )
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_stale", msg))
@@ -6801,6 +7003,21 @@ def process(
                 # so a LATER base move starts its own budget from zero
                 # rather than inheriting an unrelated exhausted count.
                 entry.ci_stale_reruns = 0
+            elif force_merge and ci.is_available:
+                # #1826: the override still overrides — but it says so. A
+                # forced merge over STALE CI is the 2026-08-04 incident's
+                # exact shape performed deliberately, and "merged with no CI
+                # event at all" reads in the audit trail identically to
+                # "merged because CI was green". Advisory only: never blocks,
+                # never mutates the entry, and stays silent unless the checks
+                # are POSITIVELY known stale (see `ci_stale_waiver_message`).
+                # Same "an override must never be silent" posture as the
+                # `epic_closing_keyword_in_commit_forced` event below.
+                _stale_waiver = ci_stale_waiver_message(entry, ci, gh_ops, smoke)
+                if _stale_waiver:
+                    events.append(
+                        MergeEvent(entry, "checks_stale_forced", _stale_waiver)
+                    )
             # #1318: cache is_epic_issue lookups for this entry — the same
             # referenced number can show up in both the PR body and one or
             # more commit messages below, and each lookup is a `gh` round

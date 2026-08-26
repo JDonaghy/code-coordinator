@@ -7374,6 +7374,103 @@ class TestProcessCiStaleness:
         assert items[0].state == MERGED
         assert ci.rerun_calls == []  # force_merge skips the CI gate entirely
 
+    def test_force_merge_says_out_loud_that_stale_ci_is_being_waived(self) -> None:
+        """#1826 acceptance: "--force-merge still overrides, and the override
+        says explicitly that stale CI is being waived."
+
+        The override stays an override — the merge happens, no re-run is
+        triggered — but it is no longer SILENT. Before this, a forced merge
+        over stale CI emitted no CI event at all, which reads in the audit
+        trail exactly like "merged because CI was green"."""
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        ci = self._ci(started_at=500.0)
+        events = process(items, gh, ci_store=ci, force_merge=True)
+        assert items[0].state == MERGED
+        assert ci.rerun_calls == []
+        forced = [e for e in events if e.kind == "checks_stale_forced"]
+        assert forced, [e.kind for e in events]
+        assert forced[0].message.startswith(mq.CI_STALE_WAIVED_PREFIX)
+        assert "waived" in forced[0].message.lower()
+        assert "--force-merge" in forced[0].message
+        # ...but a merge that HAPPENED is not a gate refusal: this event must
+        # not be counted as one by the #1896 forge-availability recorder.
+        from coord.forge_availability import MERGE_GATE_REFUSAL_KINDS
+        assert "checks_stale_forced" not in MERGE_GATE_REFUSAL_KINDS
+
+    def test_force_merge_is_quiet_when_the_checks_are_fresh(self) -> None:
+        """The waiver notice is about STALE CI specifically — a forced merge
+        over green, current checks must not cry wolf."""
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        ci = self._ci(started_at=1500.0)
+        events = process(items, gh, ci_store=ci, force_merge=True)
+        assert items[0].state == MERGED
+        assert "checks_stale_forced" not in [e.kind for e in events]
+
+    def test_force_merge_is_quiet_when_the_base_anchor_is_unreadable(self) -> None:
+        """The GATE fails closed on an unreadable base timestamp (a false
+        "stale" only costs a re-run). The WAIVER NOTICE must not — it is
+        advisory prose beside a merge that is happening either way, and
+        inventing "stale CI is being waived" for a PR whose checks may well
+        be current is noise, not safety."""
+        class _NoTimestampGh(FakeGh):
+            pass
+
+        items = [_q("w1", pr=99)]
+        gh = _NoTimestampGh()
+        ci = self._ci(started_at=500.0)
+        events = process(items, gh, ci_store=ci, force_merge=True)
+        assert items[0].state == MERGED
+        assert "checks_stale_forced" not in [e.kind for e in events]
+
+    def test_force_merge_never_blocks_on_a_ci_store_that_raises(self) -> None:
+        """The waiver notice is best-effort: an unreadable CiStore costs the
+        message, never the merge."""
+        class _BoomCi:
+            is_available = True
+            rerun_calls: list = []
+
+            def list_checks_for_pr(self, repo, number):
+                raise RuntimeError("gh pr checks exploded")
+
+        items = [_q("w1", pr=99)]
+        events = process(items, self._Gh(), ci_store=_BoomCi(), force_merge=True)
+        assert items[0].state == MERGED
+        assert "checks_stale_forced" not in [e.kind for e in events]
+
+    def test_dry_run_force_merge_previews_the_waiver(self) -> None:
+        """#1826: a `--dry-run --force-merge` that just says "would merge"
+        hides the single most consequential fact about the merge it previews."""
+        items = [_q("w1", pr=99)]
+        ci = self._ci(started_at=500.0)
+        events = process(
+            items, self._Gh(), ci_store=ci, force_merge=True, dry_run=True
+        )
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged
+        assert mq.CI_STALE_WAIVED_PREFIX in merged[0].message
+
+    def test_stale_reason_names_both_anchors_like_1479(self) -> None:
+        """#1826 acceptance: STALE CI is reported "in wording that matches
+        #1479's Test-verdict staleness" — which names what the verdict was
+        recorded against AND what the anchor is now (`coord.gates`'
+        "recorded against base X, base is now Y"). The CI anchor is a run
+        timestamp rather than a SHA, but the sentence is the same."""
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        ci = self._ci(started_at=500.0)
+        items[0].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS  # skip to the block
+        events = process(items, gh, ci_store=ci)
+        stale = [e for e in events if e.kind == "checks_stale"]
+        assert stale
+        msg = stale[0].message
+        assert msg.startswith(mq.CI_STALE_PREFIX)
+        assert "ran against main as of 1970-01-01T00:08:20Z" in msg
+        assert "main now 1970-01-01T00:16:40Z" in msg
+        # The remedy stays the last thing an operator reads (#1826).
+        assert msg.endswith("re-run CI (`coord merge --revalidate`) before merging")
+
     def test_dry_run_previews_checks_stale_without_rerunning(self) -> None:
         items = [_q("w1", pr=99)]
         gh = self._Gh()
@@ -7386,6 +7483,147 @@ class TestProcessCiStaleness:
         kinds = [e.kind for e in events]
         assert "checks_stale" in kinds
         assert "merged" not in kinds
+
+
+class TestTwoGreenBranchesOneBaseMove:
+    """#1826 regression, the 2026-08-04 incident replayed literally.
+
+    17:50 #1798 merges, `main` green with it included. 18:02 #1796 merges on
+    PR checks that were green against a base predating #1798. Both branches
+    were individually correct; their combination was not, and `main` was red
+    for two hours — every branch cut from it inherited failing CI, so nothing
+    could merge and a release was structurally impossible.
+
+    The sequence, exactly: A and B are both green against base X; A merges,
+    making the base Y; B must NOT merge on its X-based checks. It doesn't
+    matter for this test *which* of the two non-merging outcomes B lands in
+    (#2197's unattended auto-rerun, or the terminal block once that budget is
+    spent) — what #1826 is about is that B does not reach `gh pr merge` on
+    evidence that predates the base it would be merging into.
+    """
+
+    @staticmethod
+    def _ci(started_at: float):
+        """One green check per PR, all started at *started_at* — i.e. both
+        branches' CI ran against base X, before A landed."""
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+
+            def __init__(self):
+                self.rerun_calls: list = []
+
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=started_at, completed_at=None,
+                )]
+
+            def rerun_for_pr(self, repo, number):
+                self.rerun_calls.append((repo, number))
+                return True
+        return _Ci()
+
+    class _MovingBaseGh(FakeGh):
+        """`main`'s tip commit time, which advances the moment a merge lands
+        — the base move that stales every other in-flight branch's checks."""
+
+        BASE_X = 1000.0
+        BASE_Y = 2000.0
+
+        def get_branch_commit_timestamp(self, repo, branch):
+            return self.BASE_Y if self.merge_calls else self.BASE_X
+
+    def _items(self):
+        # size drives merge order (`sequence`): A first, then B.
+        return [
+            _q("A", pr=101, branch="issue-1798-gate", size=10),
+            _q("B", pr=102, branch="issue-1796-fixtures", size=20),
+        ]
+
+    def test_the_second_branch_does_not_merge_on_pre_move_checks(self) -> None:
+        items = self._items()
+        gh = self._MovingBaseGh()
+        ci = self._ci(started_at=1500.0)  # green against base X (1000), not Y (2000)
+
+        events = process(items, gh, ci_store=ci)
+
+        a, b = items
+        # A was fresh against X and merged — the common case keeps working.
+        assert a.state == MERGED
+        # B did NOT merge, and never reached `gh pr merge` at all.
+        assert b.state == PENDING
+        assert [c[1] for c in gh.merge_calls] == [101]
+        # ...and it is B's CI that is named, not its review/test gates.
+        b_events = [e for e in events if e.entry.assignment_id == "B"]
+        assert [e.kind for e in b_events] == ["checks_stale_rerun"]
+        assert "predate the current base" in (b.error or "")
+
+    def test_b_blocks_terminally_once_the_rerun_budget_is_spent(self) -> None:
+        """Same sequence, B having already spent #2197's unattended re-runs:
+        the refusal is terminal, names STALE CI, and carries the remedy."""
+        items = self._items()
+        items[1].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS
+        gh = self._MovingBaseGh()
+        ci = self._ci(started_at=1500.0)
+
+        events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == MERGED
+        assert items[1].state == PENDING
+        assert [c[1] for c in gh.merge_calls] == [101]
+        assert ci.rerun_calls == []  # budget spent — no more unattended re-runs
+        stale = [
+            e for e in events
+            if e.entry.assignment_id == "B" and e.kind == "checks_stale"
+        ]
+        assert stale
+        assert stale[0].message.startswith(mq.CI_STALE_PREFIX)
+        # #1826: an actionable remedy, not just a refusal.
+        assert "coord merge --revalidate" in stale[0].message
+
+    def test_plan_reports_the_same_block_for_b(self, coord_db) -> None:
+        """The board/plan render must agree with the live attempt — an
+        operator reading `coord merge --plan` after A landed sees B blocked
+        on STALE CI, not "ready"."""
+        from coord.models import Board
+
+        items = self._items()
+        items[0].state = MERGED
+        save_queue(items)
+        gh = self._MovingBaseGh()
+        gh.merge_calls.append(("acme/api", 101, "rebase"))  # A has landed
+
+        plan = mq.plan(
+            Board(active=[], completed=[]),
+            TestPlan._config(review_enabled=False, gates=["merge"]),
+            ci_store=self._ci(started_at=1500.0), gh_ops=gh,
+        )
+        rows = [p for p in plan if p.assignment_id == "B"]
+        assert rows and rows[0].status == mq.PLAN_BLOCKED
+        assert (rows[0].reason or "").startswith(mq.CI_STALE_PREFIX)
+
+    def test_a_alone_still_merges_with_no_extra_round_trip(self) -> None:
+        """#1826: "Checks that ran against the current base tip still merge
+        with no extra round trip — this must not add latency to the common
+        case." The #1479-parity anchor prose costs a second timestamp read;
+        it must only be paid on the already-blocked stale path."""
+        items = [_q("A", pr=101, size=10)]
+
+        class _CountingGh(TestTwoGreenBranchesOneBaseMove._MovingBaseGh):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.ts_calls = 0
+
+            def get_branch_commit_timestamp(self, repo, branch):
+                self.ts_calls += 1
+                return super().get_branch_commit_timestamp(repo, branch)
+
+        gh = _CountingGh()
+        process(items, gh, ci_store=self._ci(started_at=1500.0))
+        assert items[0].state == MERGED
+        assert gh.ts_calls == 1  # the gate's own read, and nothing more
 
 
 class TestProcessConflictedEmptyChecks:
