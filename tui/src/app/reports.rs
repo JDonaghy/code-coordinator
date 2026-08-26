@@ -2317,6 +2317,8 @@ mod tests {
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "myrepo".to_string(),
@@ -2329,6 +2331,8 @@ mod tests {
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             ..BoardData::default()

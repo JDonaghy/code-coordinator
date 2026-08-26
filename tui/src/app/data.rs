@@ -1599,6 +1599,38 @@ pub(crate) fn load_data() -> BoardData {
                 dispatched_by_assignment_id: row
                     .get::<_, Option<String>>(40)
                     .unwrap_or(None),
+                // #1941: not read by the local-SQLite path — this branch predates
+                // these `coord.board_schema` columns and none of them are queried
+                // above. `#[allow(dead_code)]` on each in `generated.rs` covers the
+                // same gap on the daemon-backed `/board` path via `#[serde(default)]`.
+                repo_github: None,
+                files_allowed: None,
+                files_forbidden: None,
+                smoke_test: None,
+                smoke_test_reason: None,
+                review_target: None,
+                required_gates: None,
+                plan: None,
+                unreachable_count: None,
+                review_posted_at: None,
+                uat_state: None,
+                uat_reason: None,
+                claude_session_id: None,
+                provider_name: None,
+                review_head_sha: None,
+                completion_summary: None,
+                review_verdict_original: None,
+                review_verdict_override_reason: None,
+                review_patch_id: None,
+                test_head_sha: None,
+                test_patch_id: None,
+                test_base_sha: None,
+                review_scoped: None,
+                review_scope_base_sha: None,
+                test_toolchain: None,
+                verdict_source: None,
+                verdict_source_reason: None,
+                stop_reason: None,
             })
         }) {
             Ok(r) => r,
@@ -1682,6 +1714,21 @@ pub(crate) fn load_data() -> BoardData {
                         milestone_title: None,
                         // #913: merge time — see field doc on MergeQueueEntry.
                         last_attempt: row.get::<_, Option<f64>>(9)?,
+                        // #1941: not read by the local-SQLite path — this SELECT
+                        // predates these `coord.board_schema` columns.
+                        id: None,
+                        repo_name: String::new(),
+                        issue_title: String::new(),
+                        size: None,
+                        enqueued_at: None,
+                        assignment_type: None,
+                        required_gates: None,
+                        ci_infra_reruns: 0,
+                        ci_stale_reruns: 0,
+                        ci_flaky_reruns: 0,
+                        ci_flaky_pending: String::new(),
+                        ci_unreadable_reruns: 0,
+                        ci_fix_dispatches: 0,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1709,6 +1756,12 @@ pub(crate) fn load_data() -> BoardData {
                         proposal_type: row
                             .get::<_, Option<String>>(6)?
                             .unwrap_or_else(|| "work".into()),
+                        // #1941: not read by the local-SQLite path — this SELECT
+                        // predates these `coord.board_schema` columns.
+                        files_likely: None,
+                        briefing: None,
+                        model: None,
+                        required_gates: None,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1746,6 +1799,8 @@ pub(crate) fn load_data() -> BoardData {
                         milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
                         body_truncated: false,
                         body_len: None,
+                        // #1941: fields added to the generated wire DTO; not exercised by this test.
+                        synced_at: None,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())

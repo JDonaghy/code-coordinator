@@ -2109,6 +2109,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
         BoardData {
             assignments: vec![work],
@@ -2818,6 +2847,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let items = app_with_pr.context_menu_items_for_pipeline_row(
             Some(751),
@@ -2920,6 +2963,8 @@
                 milestone_title: Some("v1.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -3949,6 +3994,8 @@
                 milestone_title: Some("v1.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             milestone_work_orders: vec![MilestoneWorkOrder {
                 repo_name: "api".to_string(),
@@ -4830,6 +4877,8 @@
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -4842,6 +4891,8 @@
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             milestone_work_orders: vec![MilestoneWorkOrder {
@@ -5286,6 +5337,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         }
     }
 
@@ -5953,6 +6033,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             });
         }
         app.rebuild_board_sidebar();
@@ -6045,6 +6127,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         seed_open_issue_records(&mut app, "repo-a", &[7]);
         let cache = app.board_issues_cache.clone();
@@ -6071,6 +6167,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // legacy status:refining → now Backlog (New), no Refining bucket
         app.data.open_issues.push(OpenIssue {
@@ -6084,6 +6182,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // status:ready → Refined (Pending)
         app.data.open_issues.push(OpenIssue {
@@ -6097,6 +6197,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -6127,6 +6229,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -6139,6 +6243,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -6151,6 +6257,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // Issue 4: in-flight (open issue with running assignment).
         app.data
@@ -6167,6 +6275,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // Issue 5: completed (closed issue with done assignment).
         app.data
@@ -6183,6 +6293,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -6220,6 +6332,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -6678,6 +6792,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -7100,6 +7243,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         assert_eq!(
             app.merge_stage_status_for(&issue),
@@ -7209,6 +7366,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -7247,6 +7433,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
@@ -7300,6 +7500,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -7363,6 +7592,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         // Real state takes over — the merge_queue entry exists, so the
@@ -7420,6 +7663,20 @@
                 branch: None,
                 milestone_title: None,
                 last_attempt: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                id: None,
+                repo_name: String::new(),
+                issue_title: String::new(),
+                size: None,
+                enqueued_at: None,
+                assignment_type: None,
+                required_gates: None,
+                ci_infra_reruns: 0,
+                ci_stale_reruns: 0,
+                ci_flaky_reruns: 0,
+                ci_flaky_pending: String::new(),
+                ci_unreadable_reruns: 0,
+                ci_fix_dispatches: 0,
             }],
             ..BoardData::default()
         };
@@ -7510,6 +7767,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -7612,6 +7898,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -8587,6 +8875,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         }
     }
 
@@ -8972,6 +9289,20 @@
             branch: Some("ms-9-gate-a".to_string()),
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         let epic = &app.pipeline_issues[0];
@@ -9210,6 +9541,20 @@
             branch: Some("tests/acceptance/ms-38/plans_help_1124".to_string()),
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         let member42 = &app.pipeline_issues[1];
@@ -9399,6 +9744,20 @@
             branch: Some("tests/acceptance/ms-38/plans_help_1124".to_string()),
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         app.active_view = SidebarView::Pipeline;
@@ -9581,6 +9940,20 @@
             branch: Some("tests/acceptance/ms-38/slice_42".to_string()),
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         let member42 = &app.pipeline_issues[1];
@@ -11201,6 +11574,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         assert!(app.merge_blocked_on_review_for_selected_issue());
     }
@@ -11222,6 +11609,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // An approved review on the board unblocks the merge.
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -11248,6 +11649,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -11275,6 +11690,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
     }
@@ -11313,6 +11742,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -11344,6 +11787,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -11386,6 +11843,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // Work assignment carries review_verdict='approve' directly — no
         // separate review assignment is present (the self-approval case).
@@ -11422,6 +11893,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         assert_eq!(
             app.pipeline_merge_state(),
@@ -11449,6 +11934,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -11520,6 +12019,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -11571,6 +12084,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         // Original work (done, request-changes review).
@@ -11668,6 +12195,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
@@ -11716,6 +12257,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         // Bounce scenario: original request-changes, fix approved.
@@ -11775,6 +12330,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -12086,6 +12655,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -12149,6 +12747,35 @@
                 for_issue_number: None,
                 driven_by: None,
                 dispatched_by_assignment_id: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                repo_github: None,
+                files_allowed: None,
+                files_forbidden: None,
+                smoke_test: None,
+                smoke_test_reason: None,
+                review_target: None,
+                required_gates: None,
+                plan: None,
+                unreachable_count: None,
+                review_posted_at: None,
+                uat_state: None,
+                uat_reason: None,
+                claude_session_id: None,
+                provider_name: None,
+                review_head_sha: None,
+                completion_summary: None,
+                review_verdict_original: None,
+                review_verdict_override_reason: None,
+                review_patch_id: None,
+                test_head_sha: None,
+                test_patch_id: None,
+                test_base_sha: None,
+                review_scoped: None,
+                review_scope_base_sha: None,
+                test_toolchain: None,
+                verdict_source: None,
+                verdict_source_reason: None,
+                stop_reason: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -12206,6 +12833,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -12252,6 +12908,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -12309,6 +12994,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -12355,6 +13069,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -12417,6 +13160,35 @@
                 for_issue_number: None,
                 driven_by: None,
                 dispatched_by_assignment_id: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                repo_github: None,
+                files_allowed: None,
+                files_forbidden: None,
+                smoke_test: None,
+                smoke_test_reason: None,
+                review_target: None,
+                required_gates: None,
+                plan: None,
+                unreachable_count: None,
+                review_posted_at: None,
+                uat_state: None,
+                uat_reason: None,
+                claude_session_id: None,
+                provider_name: None,
+                review_head_sha: None,
+                completion_summary: None,
+                review_verdict_original: None,
+                review_verdict_override_reason: None,
+                review_patch_id: None,
+                test_head_sha: None,
+                test_patch_id: None,
+                test_base_sha: None,
+                review_scoped: None,
+                review_scope_base_sha: None,
+                test_toolchain: None,
+                verdict_source: None,
+                verdict_source_reason: None,
+                stop_reason: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -12473,6 +13245,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -12519,6 +13320,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -12584,6 +13414,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12649,6 +13508,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -12682,6 +13570,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let issue = &app.pipeline_issues[0];
         // Lifecycle section must say "done" (open-but-merged path).
@@ -12709,6 +13611,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.pipeline_lifecycle_section(issue), "done");
@@ -12800,6 +13716,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -12889,6 +13834,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -12941,6 +13915,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12998,6 +14001,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -13044,6 +14076,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -13098,6 +14159,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -13234,6 +14324,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -13308,6 +14427,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -13353,6 +14501,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work + Review done; Merge is Pending (no merge_queue entry yet) and
@@ -13477,6 +14654,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
@@ -13498,6 +14689,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
@@ -13522,6 +14727,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         // Failing CI → Failed.
@@ -13748,6 +14967,35 @@
                 for_issue_number: None,
                 driven_by: None,
                 dispatched_by_assignment_id: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                repo_github: None,
+                files_allowed: None,
+                files_forbidden: None,
+                smoke_test: None,
+                smoke_test_reason: None,
+                review_target: None,
+                required_gates: None,
+                plan: None,
+                unreachable_count: None,
+                review_posted_at: None,
+                uat_state: None,
+                uat_reason: None,
+                claude_session_id: None,
+                provider_name: None,
+                review_head_sha: None,
+                completion_summary: None,
+                review_verdict_original: None,
+                review_verdict_override_reason: None,
+                review_patch_id: None,
+                test_head_sha: None,
+                test_patch_id: None,
+                test_base_sha: None,
+                review_scoped: None,
+                review_scope_base_sha: None,
+                test_toolchain: None,
+                verdict_source: None,
+                verdict_source_reason: None,
+                stop_reason: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13762,6 +15010,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -13818,6 +15080,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -13883,6 +15174,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -13989,6 +15309,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -14049,6 +15398,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -14103,6 +15481,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -15454,6 +16861,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // Seed the cache directly — bypasses the gh subprocess.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -15528,6 +16949,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // Seed the cache with a fully populated PR including review.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -15605,6 +17040,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         app.fetched_prs_cache.borrow_mut().insert(
             ("acme/api".to_string(), 244),
@@ -15667,6 +17116,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
         // doesn't actually shell out to gh during the test.  An empty
@@ -16330,6 +17793,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -16376,6 +17841,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -16426,6 +17893,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -16492,6 +17961,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         };
         let app = make_test_app(BoardData {
             pipeline_tracked_labels: vec!["coord".to_string()],
@@ -16532,6 +18003,20 @@
                 branch: None,
                 milestone_title: None,
                 last_attempt: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                id: None,
+                repo_name: String::new(),
+                issue_title: String::new(),
+                size: None,
+                enqueued_at: None,
+                assignment_type: None,
+                required_gates: None,
+                ci_infra_reruns: 0,
+                ci_stale_reruns: 0,
+                ci_flaky_reruns: 0,
+                ci_flaky_pending: String::new(),
+                ci_unreadable_reruns: 0,
+                ci_fix_dispatches: 0,
             }],
             ..BoardData::default()
         });
@@ -17636,6 +19121,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 10),
@@ -17657,6 +19144,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 11),
@@ -17678,6 +19167,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 12),
@@ -18258,6 +19749,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
 
         let toasts_before = app.toasts.len();
@@ -18576,6 +20081,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.issue_number = 42;
@@ -18779,6 +20298,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let briefing = app.troubleshoot_briefing("api", 42);
         assert!(
@@ -19252,6 +20785,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // Query the helper directly rather than via rebuild so we don't trip
         // the "same issue — skip auto-focus" guard.
@@ -19357,6 +20904,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         // #1429: last per-issue stage is "merge" again.
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
@@ -19464,6 +21025,11 @@
             issue_title: "t".to_string(),
             rationale: "r".to_string(),
             proposal_type: "work".to_string(),
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            files_likely: None,
+            briefing: None,
+            model: None,
+            required_gates: None,
         });
         app.rebuild_board_sidebar();
         assert!(
@@ -19776,6 +21342,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -19913,6 +21508,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -20091,6 +21715,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         let data = BoardData {
@@ -20198,6 +21851,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
         let sibling = Assignment {
             id: "41249c1cebbd".to_string(),
@@ -20245,6 +21927,35 @@
             // #2417: this is the link — the sibling was dispatched BY the
             // origin's own turn.
             dispatched_by_assignment_id: Some("b1b6f90ca426".to_string()),
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         let data = BoardData {
@@ -20348,6 +22059,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         let data = BoardData {
@@ -20929,6 +22669,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         let data = BoardData {
@@ -21176,6 +22945,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -21217,6 +22988,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // Issue 2: new-issue-chat only, no label → Backlog.
         app.data.open_issues.push(OpenIssue {
@@ -21230,6 +23003,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -21362,6 +23137,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -23066,6 +24870,8 @@
             milestone_title: Some("v0.5".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -23078,6 +24884,8 @@
             milestone_title: Some("v0.6".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -23090,6 +24898,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -23149,6 +24959,8 @@
             milestone_title: Some("v0.7".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 42);
@@ -23183,6 +24995,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // Then a named milestone.
         app.data.open_issues.push(OpenIssue {
@@ -23196,6 +25010,8 @@
             milestone_title: Some("v0.1".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -23224,6 +25040,8 @@
             milestone_title: Some("v1.0".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -23236,6 +25054,8 @@
             milestone_title: Some("v2.0".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data
             .assignments
@@ -23357,6 +25177,8 @@
                 milestone_title: Some("v1.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -23369,6 +25191,8 @@
                 milestone_title: Some("v2.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -23381,6 +25205,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
         ];
         // Set pipeline_issues to match — all in "new" state (no work assignments).
@@ -23467,6 +25293,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -23479,6 +25307,8 @@
                 milestone_title: Some("v3.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
         ];
         app.pipeline_issues = vec![
@@ -23608,6 +25438,8 @@
                 milestone_title: Some("v1.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -23620,6 +25452,8 @@
                 milestone_title: Some("v2.0".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -23632,6 +25466,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
         ];
         app.pipeline_issues = vec![
@@ -23908,6 +25744,8 @@
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 // #102 carries NO tracked label of its own — only its parent
                 // epic #100 does. This is the exact shape of the reported
@@ -23924,6 +25762,8 @@
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -24002,6 +25842,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             // tracking_issue 999 is NOT itself a tracked issue anywhere.
             epic_children: vec![EpicChildren {
@@ -24094,6 +25936,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 // Open + independently tracked child — Ready, so the
                 // nested row survives the #1281 In-progress filter.
@@ -24108,6 +25952,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -24177,6 +26023,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 // Untracked child — forced out of `pipeline_issues` below
                 // (the only production cause of `resolve_nested_child_index`
@@ -24192,6 +26040,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 // A totally unrelated tracked issue — its Pipeline doc tab
                 // is the one that must NOT outrank the child selection below.
@@ -24206,6 +26056,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -24302,6 +26154,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             // #103 has no cached OpenIssue at all → `build_dag_nodes`
             // resolves it to `NodeState::Done` via the aged-out ⇒ terminal
@@ -24510,6 +26364,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         new_issues.extend(app.pipeline_issues.clone());
         app.pipeline_issues = new_issues;
@@ -25186,6 +27042,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
 
         // A completely-gone issue (#99) — no longer in pipeline OR open_issues.
@@ -27806,6 +29664,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         }
     }
 
@@ -27958,6 +29830,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
             OpenIssue {
                 repo_name: "repo-b".to_string(),
@@ -27970,6 +29844,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             },
         ];
         let matches = app.finder_matches("telescope");
@@ -28010,6 +29886,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         }];
         app.rebuild_board_sidebar();
         app.issue_finder = Some(IssueFinder {
@@ -28042,6 +29920,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         }];
         app.pipeline_issues = vec![PipelineIssue {
             number: 42,
@@ -28467,6 +30347,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
 
         // Pre-select the issue in the sidebar (milestone 0, issue 0 within that
@@ -28520,6 +30402,8 @@
             milestone_title: None,
             body_truncated: true,
             body_len: Some(9999),
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // The background detail fetch already landed.
         app.issue_detail_cache.insert(
@@ -28648,6 +30532,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         // Pre-select the issue row so the Issue tab has content to switch to.
         app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
@@ -29314,6 +31200,8 @@
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
 
         // Add a pipeline issue so pipeline_lifecycle_section has data to check.
@@ -29353,6 +31241,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         }
     }
 
@@ -29369,6 +31271,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         }
     }
 
@@ -29542,6 +31458,20 @@
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         }
     }
 
@@ -30450,6 +32380,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         // Review for the fix — approved.
@@ -30497,6 +32456,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -30512,6 +32500,20 @@
             branch: Some(branch.clone()), // same branch as the fix
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         };
 
         let gates = vec!["review".to_string(), "test".to_string(), "merge".to_string()];
@@ -30607,6 +32609,35 @@
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
 
         // Model-level assertions on the plain `CoordApp` — `driver.app()`
@@ -31607,6 +33638,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -31685,6 +33718,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             pipeline_tracked_labels: vec!["coord".to_string()],
@@ -31772,6 +33807,8 @@
                 milestone_title: Some("Sprint 1".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -31845,6 +33882,8 @@
                 milestone_title: Some("Sprint 1".to_string()),
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -31917,6 +33956,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -31974,6 +34015,8 @@
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -32302,6 +34345,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -32366,6 +34411,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -32470,6 +34517,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         });
@@ -32560,6 +34609,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             merge_queue: vec![MergeQueueEntry {
                 assignment_id: "stale-merge".to_string(),
@@ -32573,6 +34624,20 @@
                 branch: None,
                 milestone_title: None,
                 last_attempt: Some(1.0), // near-epoch — ancient, outside the default 2h window
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                id: None,
+                repo_name: String::new(),
+                issue_title: String::new(),
+                size: None,
+                enqueued_at: None,
+                assignment_type: None,
+                required_gates: None,
+                ci_infra_reruns: 0,
+                ci_stale_reruns: 0,
+                ci_flaky_reruns: 0,
+                ci_flaky_pending: String::new(),
+                ci_unreadable_reruns: 0,
+                ci_fix_dispatches: 0,
             }],
             ..BoardData::default()
         });
@@ -32676,6 +34741,8 @@
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             issue_stage_projection: vec![IssueStageProjection {
@@ -33220,6 +35287,8 @@
             milestone_title: milestone_title.map(|s| s.to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         }
     }
 
@@ -34389,6 +36458,35 @@ Milestone tracking issue.
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         });
 
         assert!(app.maybe_bind_pending_milestone_chat());
@@ -34447,6 +36545,8 @@ Milestone tracking issue.
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             assignments: vec![make_assignment_typed("running", 42, "api", Some("work"))],
             ..BoardData::default()
@@ -34635,6 +36735,8 @@ Milestone tracking issue.
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             assignments: vec![make_assignment_typed("running", 42, "api", Some("work"))],
             ..BoardData::default()
@@ -35189,6 +37291,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35201,6 +37305,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35213,6 +37319,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35225,6 +37333,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35665,6 +37775,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35677,6 +37789,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35689,6 +37803,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35701,6 +37817,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             assignments: vec![
@@ -36022,6 +38140,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36034,6 +38154,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36046,6 +38168,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36058,6 +38182,8 @@ Milestone tracking issue.
                     milestone_title: Some("v1.0".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -36650,6 +38776,20 @@ Milestone tracking issue.
             branch: None,
             milestone_title: None,
             last_attempt: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            id: None,
+            repo_name: String::new(),
+            issue_title: String::new(),
+            size: None,
+            enqueued_at: None,
+            assignment_type: None,
+            required_gates: None,
+            ci_infra_reruns: 0,
+            ci_stale_reruns: 0,
+            ci_flaky_reruns: 0,
+            ci_flaky_pending: String::new(),
+            ci_unreadable_reruns: 0,
+            ci_fix_dispatches: 0,
         });
         let epic = app
             .pipeline_issues
@@ -36777,6 +38917,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36789,6 +38931,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36801,6 +38945,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -36976,6 +39122,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36988,6 +39136,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -37092,6 +39242,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37104,6 +39256,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37116,6 +39270,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -37214,6 +39370,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37226,6 +39384,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37238,6 +39398,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 // Merged-but-not-closed: the GitHub issue itself stays
                 // `open` in the sync cache, but `merge_stage_status_for`
@@ -37256,6 +39418,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -37415,6 +39579,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37427,6 +39593,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37439,6 +39607,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -37656,6 +39826,8 @@ Milestone tracking issue.
             milestone_title: Some("v9.0".to_string()),
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         };
         let coord = || vec!["coord".to_string()];
         let coord_epic = || vec!["coord".to_string(), "epic".to_string()];
@@ -37913,6 +40085,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37925,6 +40099,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37937,6 +40113,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -37949,6 +40127,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -38036,6 +40216,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -38048,6 +40230,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -42093,6 +44277,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         };
         let coord = || vec!["coord".to_string()];
         let data = BoardData {
@@ -42229,6 +44415,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -42241,6 +44429,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -42253,6 +44443,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -42320,6 +44512,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -42332,6 +44526,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -42584,6 +44780,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         let target = ContextMenuTarget::BoardRow {
             issue_number: Some(42),
@@ -42627,6 +44825,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
         app.rebuild_board_sidebar();
@@ -42727,6 +44927,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
 
@@ -42909,6 +45111,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
         app.rebuild_board_sidebar();
@@ -49003,6 +51207,8 @@ Milestone tracking issue.
                     milestone_title: Some("Sprint 1".to_string()),
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -49127,6 +51333,8 @@ Milestone tracking issue.
                         milestone_title: None,
                         body_truncated: false,
                         body_len: None,
+                        // #1941: fields added to the generated wire DTO; not exercised by this test.
+                        synced_at: None,
                     },
                     OpenIssue {
                         repo_name: "myrepo".to_string(),
@@ -49139,6 +51347,8 @@ Milestone tracking issue.
                         milestone_title: None,
                         body_truncated: false,
                         body_len: None,
+                        // #1941: fields added to the generated wire DTO; not exercised by this test.
+                        synced_at: None,
                     },
                 ],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
@@ -49205,6 +51415,8 @@ Milestone tracking issue.
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -49417,6 +51629,8 @@ Milestone tracking issue.
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         }
     }
 

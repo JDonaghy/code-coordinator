@@ -2133,7 +2133,7 @@ def _board_response_schema(components: dict) -> dict:
     }
 
 
-def _openapi_spec() -> dict:
+def openapi_spec() -> dict:
     """#757: the daemon's OpenAPI 3 document.
 
     ``GET /board`` is fully specified (see :func:`_board_response_schema`);
@@ -2141,6 +2141,13 @@ def _openapi_spec() -> dict:
     handler's own ``KeyError``/``TypeError`` validation) but keep the body
     loosely typed beyond that, since most bodies are hand-assembled dicts
     rather than a single dataclass round-trip.
+
+    Public (no leading underscore) since #1941: ``scripts/codegen.py``'s Rust
+    generator imports this as its source of truth for the seven `/board`
+    projections, the same way ``coord.dashboard.server.openapi_spec()`` is
+    already the TS generator's source — see that function's docstring.
+    ``coord/agent_app.py`` keeps its own ``_openapi_spec()`` private; nothing
+    outside that module consumes it (yet).
     """
     components: dict = {}
     board_schema = _board_response_schema(components)
@@ -8100,7 +8107,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # #757: served OpenAPI 3 spec + Swagger UI docs page. Not exempted from
     # the bearer-auth middleware below (only /healthz is) — "behind the
     # daemon's bearer auth where applicable" per the issue.
-    routes.extend(openapi_and_docs_routes(_openapi_spec()))
+    routes.extend(openapi_and_docs_routes(openapi_spec()))
     # #762: gzip the /board projection (markdown-heavy JSON compresses ~9×), so a
     # large payload can't overrun the TUI's fetch timeout on a slow link.  Gzip is
     # outermost so it compresses every response (incl. auth rejections); ureq on
