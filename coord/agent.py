@@ -39,8 +39,28 @@ if TYPE_CHECKING:
     from coord.providers.claude_pty import ClaudePtyProvider
 
 
-DEFAULT_STATE_DIR = default_coord_dir()
 DEFAULT_WORKER_BINARY = "claude"
+
+# DEFAULT_STATE_DIR is resolved lazily via __getattr__ below (#2781), not
+# bound here at import time -- see that function's docstring.
+
+
+def __getattr__(name: str) -> Path:
+    """PEP 562 lazy fallback for ``DEFAULT_STATE_DIR`` (#2781).
+
+    Pre-#2781 this was bound eagerly at import time, so ``$COORD_DIR`` set
+    *after* this module was first imported -- e.g. by a pytest fixture --
+    never reached it, unlike :func:`default_coord_dir` itself which is
+    "computed fresh on every call" by design. This only engages when the
+    name hasn't been bound directly in this module's namespace, so
+    ``monkeypatch.setattr(coord.agent, "DEFAULT_STATE_DIR", ...)`` (used
+    throughout the test suite) still takes priority exactly as before:
+    Python calls ``__getattr__`` only when normal attribute lookup fails.
+    """
+    if name == "DEFAULT_STATE_DIR":
+        return default_coord_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Module logger — surfaced in the daemon / agent server logs so agent-side
 # events (e.g. #1295 "sweep would touch a live worktree", "stash copied 0
@@ -3145,7 +3165,7 @@ def setup_interactive_worktree(
         :class:`OSError`: when the worktree base directory cannot be created.
     """
     if state_dir is None:
-        state_dir = DEFAULT_STATE_DIR
+        state_dir = sys.modules[__name__].DEFAULT_STATE_DIR
 
     worktree_base = state_dir / "worktrees"
     worktree_path = worktree_base / assignment_id
@@ -5005,7 +5025,7 @@ class AgentServer:
         machine_name: str,
         capabilities: Iterable[str] = (),
         repos: Iterable[str] = (),
-        state_dir: Path = DEFAULT_STATE_DIR,
+        state_dir: Path | None = None,
         worker_command: WorkerCommandBuilder | None = None,
         repo_paths: dict[str, str] | None = None,
         # RESTART-ONLY (#2299). These two are read by `_spawn` for every
@@ -5078,7 +5098,9 @@ class AgentServer:
         self.repo_paths = dict(repo_paths or {})
         self.artifact_paths: dict[str, list[str]] = dict(artifact_paths or {})
         self.build_commands: dict[str, str] = dict(build_commands or {})
-        self.state_dir = Path(state_dir)
+        self.state_dir = Path(
+            state_dir if state_dir is not None else sys.modules[__name__].DEFAULT_STATE_DIR
+        )
         self.log_dir = self.state_dir / "logs"
         self.state_path = self.state_dir / "agent_state.json"
         self.worker_command = worker_command or default_worker_command
