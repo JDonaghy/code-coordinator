@@ -2011,6 +2011,16 @@ def merge(
             host=cfg_only.ci_store.host,
             token_env=cfg_only.ci_store.token_env,
         )
+        # #2809 review: `only_entry` came straight off the queue DB
+        # (`resolve_entry_key`) and may have been live-anchored on a much
+        # earlier tick (or never, e.g. a manually-inserted entry) — its
+        # `branch_head_probe_error` can be stale or unset. Re-anchor against
+        # the CURRENT GitHub state so the review-gate report line below can
+        # distinguish "GitHub confirmed unknown" (enriched status/request-id/
+        # retry-after) from "never probed" (the generic fallback string) —
+        # this is the exact `coord merge --only` invocation the issue's own
+        # reproduction names for the review gate specifically.
+        mq.live_anchor_entry(only_entry, gh_ops)
         # #1695: name the blocking gate(s) up front. Under #1695 a gate-blocked
         # row IS enqueued (visibly BLOCKED) instead of being dropped, so
         # `--only` now resolves it — and the operator needs to be told, before

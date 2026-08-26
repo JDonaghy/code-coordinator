@@ -2966,6 +2966,103 @@ class TestGateBlockedRowEntersQueueBlocked:
         merge_fn.assert_called_once()
 
 
+class TestOnlyLiveAnchorsBeforeReportingGateFailures:
+    """#2809 review (non-blocking finding): `coord merge --only <aid>`
+    resolves its entry straight off the queue DB (`resolve_entry_key`) —
+    `branch_head_probe_error` is documented as transient/never-persisted, so
+    a row loaded this way starts every `--only` invocation with that field
+    back at its dataclass default of `None`, no matter what an earlier
+    `--dry-run` scan observed. Without a live re-anchor, the review-gate
+    line falls back to the bare generic "branch head unknown" sentence even
+    while GitHub is actively rate-limiting every probe — exactly the
+    `coord merge --only` invocation the issue's own reproduction names.
+    """
+
+    def _run(self, config_file: Path, argv: list[str], *, merge_ok: bool = True):
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.get_branch_diff_size", return_value=10), \
+             patch("coord.github_ops.work_is_terminal", return_value=False), \
+             patch(
+                 "coord.github_ops.list_remote_branch_names",
+                 return_value={"main", "issue-2809-rate-limited"},
+             ), \
+             patch(
+                 "coord.github_ops.get_branch_sha",
+                 # autospec=True: `_gh_get_branch_sha` detects
+                 # `raise_on_transient` support via
+                 # `inspect.signature(gh_ops.get_branch_sha)` — a plain
+                 # `side_effect=` mock (no spec) reports a generic
+                 # `(*args, **kwargs)` signature and would be silently
+                 # treated as an unsupporting stub, never exercising the
+                 # `raise_on_transient=True` path this test targets.
+                 autospec=True,
+                 side_effect=self._rate_limited_get_branch_sha,
+             ):
+            create.return_value = {"number": 2809, "url": "u/2809", "existed": False}
+            merge_fn.return_value = (True, "ok") if merge_ok else (False, "nope")
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), *argv]
+            )
+        return result, merge_fn
+
+    @staticmethod
+    def _rate_limited_get_branch_sha(repo, branch, *, raise_on_transient=False):
+        if raise_on_transient:
+            from coord import github_ops
+            raise github_ops.GhRateLimitError(
+                "gh api ... failed: HTTP 403: secondary rate limit",
+                status_code=403, request_id="E126:C7B0E:4B13E6D",
+                retry_after_s=45.0, secondary=True,
+            )
+        return None
+
+    @staticmethod
+    def _approved_but_rate_limited_board():
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=2809,
+            issue_title="#2809", assignment_id="w2809", type="work",
+            status="done", branch="issue-2809-rate-limited",
+            test_state="passed",  # smoke gate satisfied — isolate the review gate
+        )
+        review = Assignment(
+            machine_name="other", repo_name="api", issue_number=2809,
+            issue_title="[review] #2809", assignment_id="rev-w2809",
+            type="review", status="done",
+            review_of_assignment_id="w2809", review_verdict="approve",
+            review_head_sha="sha-the-review-actually-saw",
+        )
+        return Board(active=[], completed=[work, review])
+
+    def test_only_reports_the_enriched_rate_limit_detail_not_the_bare_fallback(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        save_board(self._approved_but_rate_limited_board())
+        self._run(config_file, ["--dry-run"])  # scan enqueues the (blocked) entry
+
+        # #2809 review: this is the crux — reloading straight from the queue
+        # DB (what `--only` does) must NOT already carry the probe error,
+        # confirming the enrichment below comes from `--only`'s own live
+        # re-anchor, not a value that happened to survive persistence.
+        reloaded = mq.resolve_entry_key(mq.load_queue(), "w2809")
+        assert reloaded is not None
+        assert reloaded.branch_head_probe_error is None
+
+        result, merge_fn = self._run(config_file, ["--only", "w2809"])
+
+        combined = result.output + (result.stderr or "")
+        assert "gate review" in combined, combined
+        assert "HTTP 403" in combined, combined
+        assert "E126:C7B0E:4B13E6D" in combined, combined
+        merge_fn.assert_not_called()
+
+
 class TestMergeGateFailuresPredicate:
     """#1695: `merge_gate_failures` is the reason-carrying form of
     `passes_merge_gates`; the two must never disagree."""
