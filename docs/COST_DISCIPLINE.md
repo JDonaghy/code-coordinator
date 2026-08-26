@@ -42,6 +42,23 @@ Minimize direct code work in the coordinator — instead, write a good briefing 
   platform-specific code in shared/cross-platform paths. Catching after merge costs an entire
   round-trip.
 
+## Operator sessions: dispatch, don't do
+
+If you're the interactive coordinator session — not a dispatched `type=work`/`review` leg — and
+the user asks for a change in any repo listed in `coordinator.yml`, **don't edit that repo's tree
+yourself**: file a GitHub issue and `coord drive-queue add` it. That gets the change tested,
+independently reviewed, merged, and deployed; hand-editing it in the session skips all four.
+
+Doc-only edits to **code-coordinator itself** are the documented exception for *who* does the
+work (see the next section) — **not** for *how* it lands: every commit on `main`, doc-only ones
+included, is squash-merged from a branch's PR, never pushed to `main` directly. Use
+`EnterWorktree`, branch, commit, push, open the PR, let it merge, then `ExitWorktree`.
+
+Caught 2026-08-21: this exact rule used to live inline in `CLAUDE.md`, got moved to this doc by
+#2195, and was then skipped — an operator session hand-implemented a natal-chart feature directly
+instead of dispatching it. It is restated at the top of `CLAUDE.md` as a one-line pointer for
+exactly that reason. If you're a worker or reviewer leg, this section isn't for you.
+
 ## Only the coordinator writes docs — the operator's half
 
 Workers must not update README, CHANGELOG, or shared documentation files; parallel doc edits
@@ -60,8 +77,30 @@ issue itself explicitly says this." That was the correct answer, and it would be
 answer every time. Doc-only issues are coordinator work by policy — do them in the operator
 session, or split them so the worker does the code half and the coordinator does the doc half.
 
+## Rules for the coordinator session
+
+- **Prefer `coord issue` / `coord repo` / `coord milestone` over raw `gh`.** Workers can't reach
+  `gh` at all (deny-listed — see `CLAUDE.md`'s "Rules for workers"); an interactive coordinator
+  session technically can, but should still route issue/PR/milestone reads and writes through the
+  `coord` seam wherever a subcommand covers it — that's what keeps the backend-agnostic forge seam
+  ([`FORGE_MIGRATION.md`](FORGE_MIGRATION.md)) actually exercised instead of quietly
+  bypassed by the one class of session most likely to reach for `gh` out of habit. Reads are
+  covered too — `coord issue list` and `coord issue view` shipped in #2484, so a plain issue
+  listing/search or an issue-plus-comments lookup has no excuse to reach for `gh`. Where no
+  `coord` subcommand covers what's needed — the seam is wide but not total, so check
+  `coord <group> --help` before concluding either way — falling back to `gh` for that one call is
+  fine, but say so and treat it as a gap to flag or file, not a silent workaround.
+
 ## Where the money actually goes
 
 Measuring fleet spend is its own trap — bare `coord usage` undercounts, and estimated columns
 are not authoritative. See [`OPERATING_GOTCHAS.md`](OPERATING_GOTCHAS.md) for the measurement
 rules and #17 for the #2132 review-verdict cost analysis.
+
+**The dominant line item is cache reads, not output** (measured 2026-08-25, 7-day window). Across
+`type='work'` legs: 3,483.6M cache-read tokens ($1,045) against 15.7M output ($236) and 46.1M
+cache-creation ($173) — a 75:1 read-to-create ratio, so prompt caching is working nearly
+perfectly and cache *misses* are not the problem. Cache-read cost is `context size × turns per
+leg`: every turn re-reads the whole context. That is why `CLAUDE.md`'s size is a fleet-wide cost
+lever and why this file exists — see #2787. `num_turns` is not yet persisted (#2786), so
+"long context" and "many turns" cannot yet be told apart from the ledger.
