@@ -31,10 +31,11 @@ from coord import sql
 class _FakeCursor:
     """Spies on what would reach a real DB-API cursor."""
 
-    def __init__(self, fetchone_result=None):
+    def __init__(self, fetchone_result=None, fetchall_result=None):
         self.executed: list[tuple[str, object]] = []
         self.executemany_calls: list[tuple[str, object]] = []
         self._fetchone_result = fetchone_result
+        self._fetchall_result = fetchall_result if fetchall_result is not None else []
 
     def execute(self, sql_text, params=()):
         self.executed.append((sql_text, params))
@@ -44,6 +45,9 @@ class _FakeCursor:
 
     def fetchone(self):
         return self._fetchone_result
+
+    def fetchall(self):
+        return self._fetchall_result
 
 
 class _FakeConnection:
@@ -56,8 +60,8 @@ class _FakeConnection:
     without requiring the dependency to be installed.
     """
 
-    def __init__(self, fetchone_result=None):
-        self.cur = _FakeCursor(fetchone_result=fetchone_result)
+    def __init__(self, fetchone_result=None, fetchall_result=None):
+        self.cur = _FakeCursor(fetchone_result=fetchone_result, fetchall_result=fetchall_result)
 
     def cursor(self):
         return self.cur
@@ -338,6 +342,70 @@ def test_insert_ignore_emits_backend_specific_idiom():
     sql.insert_ignore(pg_conn, "t", ["id", "a"], (1, "x"))
     [(sent_sql, _)] = pg_conn.cur.executed
     assert sent_sql == "INSERT INTO t (id, a) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+
+
+# ── table_columns (#2782) ───────────────────────────────────────────────────
+
+
+def test_table_columns_sqlite_reports_name_and_type(memdb):
+    assert sql.table_columns(memdb, "t") == [
+        ("id", "INTEGER"),
+        ("a", "TEXT"),
+        ("b", "TEXT"),
+    ]
+
+
+def test_table_columns_sqlite_empty_for_missing_table(memdb):
+    assert sql.table_columns(memdb, "no_such_table") == []
+
+
+def test_table_columns_postgres_queries_information_schema():
+    conn = _FakePostgresConnection(fetchall_result=[("id", "integer"), ("a", "text")])
+    result = sql.table_columns(conn, "t")
+    assert result == [("id", "integer"), ("a", "text")]
+    [(sent_sql, sent_params)] = conn.cur.executed
+    assert sent_sql == (
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = %s ORDER BY ordinal_position"
+    )
+    assert sent_params == ("t",)
+
+
+def test_table_columns_postgres_tolerates_dict_row_factory():
+    # apply_row_factory(conn) would have installed psycopg's dict_row on a
+    # real connection -- rows come back dict-like, not as plain tuples.
+    conn = _FakePostgresConnection(
+        fetchall_result=[{"column_name": "id", "data_type": "integer"}]
+    )
+    assert sql.table_columns(conn, "t") == [("id", "integer")]
+
+
+# ── WAL helpers: sqlite_journal_mode / sqlite_wal_checkpoint_truncate (#2782) ─
+
+
+def test_sqlite_journal_mode_reports_wal_after_connection_setup(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "wal.db"))
+    try:
+        sql.apply_connection_setup(conn)
+        assert sql.sqlite_journal_mode(conn) == "wal"
+    finally:
+        conn.close()
+
+
+def test_sqlite_journal_mode_reports_non_wal_on_memory_db(memdb):
+    assert sql.sqlite_journal_mode(memdb) != "wal"
+
+
+def test_sqlite_wal_checkpoint_truncate_returns_three_ints(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "wal2.db"))
+    try:
+        sql.apply_connection_setup(conn)
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        busy, log_pages, checkpointed = sql.sqlite_wal_checkpoint_truncate(conn)
+        assert (busy, log_pages, checkpointed) == (0, 0, 0)
+    finally:
+        conn.close()
 
 
 # ── row factory ──────────────────────────────────────────────────────────
@@ -944,4 +1012,63 @@ def test_no_sqlite_named_exception_outside_the_dialect_seam():
         "(a psycopg exception is never an instance of a sqlite3 one). Widen "
         "the except to `sql.driver_errors()`, or raise a coord-owned "
         "exception type, instead:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no SQLite-only construct in statement text
+# ── outside coord/db.py and the seam itself (#2782) ─────────────────────────
+#
+# #1948's last unmet acceptance box: "coord/db.py is the only module naming a
+# SQLite-specific DDL construct." Phase C's own seam (coord/sql.py) legitimately
+# names these too -- that's the whole point of a seam -- so the box becomes
+# "no module outside coord/db.py *and* coord/sql.py". #2782 closes the three
+# residual sites (housekeeping.py's PRAGMA table_info, serve_app.py's PRAGMA
+# journal_mode / PRAGMA wal_checkpoint) by routing them through named
+# coord.sql helpers (table_columns / sqlite_journal_mode /
+# sqlite_wal_checkpoint_truncate) instead of leaving the literal PRAGMA text
+# at the call site.
+
+_SQLITE_ONLY_MARKERS = ("PRAGMA", "AUTOINCREMENT", "INSERT OR IGNORE")
+_DB_MODULE_RELPATH = "coord/db.py"
+
+
+def test_no_sqlite_only_construct_in_statement_text_outside_db_and_seam():
+    """No ``coord/**`` module besides ``coord/db.py`` and ``coord/sql.py``
+    names a SQLite-only construct (``PRAGMA``, ``AUTOINCREMENT``,
+    ``INSERT OR IGNORE``) in its own statement text.
+
+    ``PRAGMA``/``AUTOINCREMENT`` have no Postgres equivalent at all;
+    ``INSERT OR IGNORE`` has a portable substitute the seam already provides
+    (:func:`coord.sql.insert_ignore`). Any of the three appearing as
+    statement text outside ``coord/db.py``'s schema DDL or ``coord/sql.py``'s
+    seam helpers is exactly the box #1948 left open and #2782 closes.
+
+    Only string literals that are themselves SQL/PRAGMA statement text (the
+    same ``_SQL_LIKE_RE`` gate the ratchets above use) count — prose in a
+    docstring or comment that merely *mentions* ``PRAGMA`` is not a
+    violation, only text that *is* one.
+
+    Deliberately reintroducing e.g. ``conn.execute("PRAGMA journal_mode")``
+    in ``coord/serve_app.py``, or any other non-db.py/sql.py module, makes
+    this red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        if rel == _DB_MODULE_RELPATH:
+            continue
+        _src, tree = _parse(path)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            text = node.value
+            if not _SQL_LIKE_RE.match(text):
+                continue
+            if not any(marker in text for marker in _SQLITE_ONLY_MARKERS):
+                continue
+            violations.append(f"{rel}:{node.lineno}: {text.strip()}")
+    assert not violations, (
+        "SQLite-only construct (PRAGMA/AUTOINCREMENT/INSERT OR IGNORE) in "
+        "statement text outside coord/db.py and the coord.sql dialect seam "
+        "(#2782/#1948) — route this through a coord.sql seam helper "
+        "instead:\n" + "\n".join(violations)
     )

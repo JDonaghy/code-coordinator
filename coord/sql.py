@@ -432,6 +432,84 @@ def apply_connection_setup(conn: Any, *, read_only: bool = False) -> None:
         raise UnsupportedDialectError(dialect)
 
 
+def table_columns(conn: Any, table: str) -> list[tuple[str, str]]:
+    """Return ``[(name, type), ...]`` for *table*'s columns, in schema order
+    (empty if *table* doesn't exist) -- portably across SQLite's
+    ``PRAGMA table_info(...)`` and Postgres's standard
+    ``information_schema.columns`` (#2782).
+
+    SQLite has no ANSI ``information_schema`` -- ``PRAGMA table_info`` is its
+    (connection-scoped, non-parameterizable-by-table-name) introspection
+    idiom, which is exactly the kind of SQLite-only statement text #1948's
+    seam exists to keep out of every module but this one and ``coord/db.py``.
+    Postgres exposes the same information through the SQL-standard
+    ``information_schema.columns`` view instead, queryable with a normal
+    parameterized ``WHERE table_name = ?`` -- no pragma, no per-backend
+    branch at the call site.
+
+    The table name is interpolated into the SQLite ``PRAGMA`` text (pragmas
+    do not accept bound parameters for their target object -- the same
+    constraint the ``f"PRAGMA table_info({table})"`` call site this
+    replaces already lived with); every call site passes a hardcoded table
+    constant, never user input.
+
+    Row access tolerates either a tuple-row or a dict-like row (e.g.
+    ``psycopg.rows.dict_row``, which :func:`apply_row_factory` may already
+    have installed on *conn*) -- same fallback shape
+    :func:`insert_returning_id` uses, since which row-factory (if any) a
+    caller applied before calling this is not this function's concern.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        cur = execute(conn, f"PRAGMA table_info({table})")  # noqa: S608 -- table name, not user input
+        return [(row[1], row[2] or "TEXT") for row in cur.fetchall()]
+    if dialect == DIALECT_POSTGRES:
+        cur = execute(
+            conn,
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ? ORDER BY ordinal_position",
+            (table,),
+        )
+        columns = []
+        for row in cur.fetchall():
+            try:
+                columns.append((row["column_name"], row["data_type"]))
+            except (KeyError, TypeError, IndexError):
+                columns.append((row[0], row[1]))
+        return columns
+    raise UnsupportedDialectError(dialect)
+
+
+# ── WAL (#2782) ───────────────────────────────────────────────────────────
+#
+# WAL is a SQLite storage concept with no Postgres equivalent at all -- unlike
+# every other split in this seam, there is no translation to grow here.  These
+# two helpers exist purely so the literal ``PRAGMA`` text for them lives in
+# exactly one place (this module) instead of at the two call sites in
+# coord/serve_app.py -- callers MUST dialect-guard with :func:`detect_dialect`
+# before calling either; neither checks the dialect itself, matching
+# :func:`table_columns`'s SQLite branch (a helper that unconditionally speaks
+# one dialect's statement text, not one that decides whether to).
+
+
+def sqlite_journal_mode(conn: Any) -> str:
+    """Return SQLite's current ``journal_mode`` (e.g. ``"wal"``,
+    ``"delete"``) via ``PRAGMA journal_mode``.  SQLite-only -- callers must
+    already know *conn* is a SQLite connection before calling this."""
+    return execute(conn, "PRAGMA journal_mode").fetchone()[0]
+
+
+def sqlite_wal_checkpoint_truncate(conn: Any) -> tuple[int, int, int]:
+    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the three integers
+    SQLite reports: ``(busy, log, checkpointed)`` -- ``busy`` is 1 if an
+    active reader blocked the truncate, ``log`` is WAL frames written since
+    the last checkpoint, ``checkpointed`` is frames successfully
+    checkpointed.  SQLite-only -- callers must already know *conn* is a
+    SQLite connection, in WAL mode, before calling this."""
+    row = execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    return (row[0], row[1], row[2]) if row else (0, 0, 0)
+
+
 def driver_error(conn: Any) -> type[BaseException]:
     """The DB-API ``Error`` base class *conn*'s driver raises (#2766).
 
