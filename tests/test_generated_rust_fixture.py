@@ -98,6 +98,100 @@ def test_new_field_on_a_board_projection_changes_the_generated_output(monkeypatc
     assert committed != changed
 
 
+def _implicit_doctest_lines(rust_src: str) -> list[str]:
+    """Doc-comment lines rustdoc would treat as an *implicit* code block.
+
+    In Markdown, a 4-space-indented line following a blank line is a code
+    block — and rustdoc compiles a doc-comment code block with no language
+    annotation as a **Rust doctest**. So a generated header that documents a
+    shell command as an indented block (or in a bare ``` fence) makes
+    `cargo test --doc` fail to compile with `error: expected item, found
+    `.``, even though nothing about the emitted Rust *types* is wrong.
+
+    Returns the offending doc lines, so the assertion can name them.
+    """
+    offenders: list[str] = []
+    in_fence = False
+    prev_blank = True
+    for raw in rust_src.splitlines():
+        stripped = raw.strip()
+        if not (stripped.startswith("//!") or stripped.startswith("///")):
+            in_fence = False
+            prev_blank = True
+            continue
+        body = stripped[3:]
+        # rustdoc strips one leading space after the marker; the *next* four
+        # are what make it a code block.
+        if body.startswith(" "):
+            body = body[1:]
+        if body.lstrip().startswith("```"):
+            in_fence = not in_fence
+            prev_blank = False
+            continue
+        if in_fence:
+            continue
+        if not body.strip():
+            prev_blank = True
+            continue
+        if prev_blank and body.startswith("    "):
+            offenders.append(stripped)
+        prev_blank = False
+    return offenders
+
+
+def test_generated_rust_has_no_accidental_doctests():
+    """No doc comment in the generated file becomes a compiled Rust doctest.
+
+    Regression guard: #1941's first cut documented the regeneration command
+    as a 4-space-indented block, which rustdoc picked up as the crate's only
+    doctest and tried to compile as Rust — `cargo test --doc` went red on a
+    shell command. Prose the generator emits must live in a `text`-annotated
+    fence (or inline), never an indented block.
+    """
+    offenders = _implicit_doctest_lines(generate_rust())
+    assert not offenders, (
+        "scripts/codegen.py emits doc-comment lines rustdoc will compile as a "
+        f"Rust doctest: {offenders}. Wrap shell/prose blocks in a ```text "
+        "fence instead of indenting them four spaces."
+    )
+
+
+def test_committed_generated_rs_has_no_accidental_doctests():
+    """The same guard against the file as committed, which is what
+    `cargo test --doc` actually reads."""
+    offenders = _implicit_doctest_lines(RUST_OUTPUT_PATH.read_text())
+    assert not offenders, (
+        f"{RUST_OUTPUT_PATH} carries doc-comment lines rustdoc will compile "
+        f"as a Rust doctest: {offenders}."
+    )
+
+
+def test_implicit_doctest_detector_actually_detects_one():
+    """The guard above only means something if it fires on the real defect —
+    pin it to the exact header shape that broke `cargo test --doc`."""
+    broken = (
+        "//! AUTO-GENERATED\n"
+        "//!\n"
+        "//!     .venv/bin/python scripts/codegen.py --rust\n"
+        "//!\n"
+        "pub struct Assignment {}\n"
+    )
+    assert _implicit_doctest_lines(broken) == [
+        "//!     .venv/bin/python scripts/codegen.py --rust"
+    ]
+
+    fixed = (
+        "//! AUTO-GENERATED\n"
+        "//!\n"
+        "//! ```text\n"
+        "//! .venv/bin/python scripts/codegen.py --rust\n"
+        "//! ```\n"
+        "//!\n"
+        "pub struct Assignment {}\n"
+    )
+    assert _implicit_doctest_lines(fixed) == []
+
+
 def test_check_flag_fails_when_generated_rs_is_stale(tmp_path, monkeypatch):
     """`--rust --check` is the CLI seam CI actually invokes — cover it
     directly rather than only its `generate_rust()` half."""

@@ -4,7 +4,15 @@
 //! `/board` response schema — itself built from the explicit wire DTOs in
 //! `coord/board_schema.py` (#1849) — #1941. Regenerate after any field change:
 //!
-//!     .venv/bin/python scripts/codegen.py --rust
+//! ```text
+//! .venv/bin/python scripts/codegen.py --rust
+//! ```
+//!
+//! (The fence is load-bearing, and `text` is the load-bearing part of *it*:
+//! a 4-space-indented block in a doc comment is a Markdown code block, and
+//! rustdoc compiles an unannotated code block as a Rust doctest — so writing
+//! that command as an indented block, or in a bare ``` fence, breaks
+//! `cargo test --doc` with `error: expected item, found `.``.)
 //!
 //! `tests/test_generated_rust_fixture.py` fails CI if this file drifts from what
 //! the generator produces right now, so a stale checkout can't merge — the Rust
