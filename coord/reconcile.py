@@ -2362,8 +2362,17 @@ def _post_human_required_comment_raw(
     entry: QueuedMerge,
     fix_assignment_id: str,
     machine_name: str,
+    *,
+    semantic_escalation_note: str | None = None,
 ) -> None:
-    """Notify the user on GitHub that a conflict-fix worker gave up."""
+    """Notify the user on GitHub that a conflict-fix worker gave up.
+
+    *semantic_escalation_note* (#2566): when the conflict-fix worker judged
+    the conflict SEMANTIC but ``pipeline.escalate_semantic_conflicts`` is
+    off, callers pass a short explanation so the comment says *why* there
+    was no tier-2 attempt instead of reading as though escalation ran and
+    failed.
+    """
     from coord import github_ops  # noqa: PLC0415
 
     body = (
@@ -2373,7 +2382,8 @@ def _post_human_required_comment_raw(
         f"`{entry.branch}` onto `{entry.target_branch}` and exited "
         "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
         f"**Last error:** `{entry.error or 'unknown'}`\n\n"
-        "Manual resolution required: rebase the branch locally and "
+        + (f"{semantic_escalation_note}\n\n" if semantic_escalation_note else "")
+        + "Manual resolution required: rebase the branch locally and "
         "`git push --force-with-lease`, then re-run `coord merge`. The "
         "coordinator will not re-dispatch a conflict-fix for this entry "
         "in the current session."
@@ -2487,6 +2497,16 @@ def on_conflict_fix_done(
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
 
+    #2566: when *semantic* is ``True`` and the tier-2 escalation didn't
+    fire specifically because ``pipeline.escalate_semantic_conflicts`` is
+    off (as opposed to it already having had its one escalation this
+    entry, or dispatch itself failing), both the parked entry's ``error``
+    and the GitHub comment say so explicitly — see
+    :func:`coord.conflict_fix.semantic_escalation_disabled`. Otherwise the
+    dark default is indistinguishable from "escalation ran and failed",
+    and an operator reading ``conflict_fix.py`` has no way to tell the
+    tier is switched off short of grepping ``coordinator.yml``.
+
     *usage_limit_reason* (#1461 review finding 2): when the conflict-fix
     worker was killed by the account's usage limit mid-fix, it did not
     actually fail to resolve anything — frame the parked entry as "wait for
@@ -2505,6 +2525,7 @@ def on_conflict_fix_done(
     items = mq.load_queue()
     changed = False
     failed_entry: mq.QueuedMerge | None = None
+    failed_entry_note: str | None = None
     escalated: tuple[mq.QueuedMerge, str, str, str] | None = None
     for entry in items:
         if entry.assignment_id != parent_assignment_id:
@@ -2559,11 +2580,39 @@ def on_conflict_fix_done(
                         fix.machine_name or "",
                     )
                 else:
-                    entry.state = mq.HUMAN_REQUIRED
-                    entry.error = (
-                        f"{existing_error}; conflict-fix worker did not "
-                        "resolve. Manual rebase required."
+                    from coord.conflict_fix import (  # noqa: PLC0415
+                        semantic_escalation_disabled,
                     )
+
+                    entry.state = mq.HUMAN_REQUIRED
+                    if semantic and semantic_escalation_disabled(config):
+                        # #2566: the worker judged this SEMANTIC and there
+                        # is a whole second tier built for exactly this
+                        # (#1291) — but `pipeline.escalate_semantic_
+                        # conflicts` ships dark, so it never ran. Say so,
+                        # instead of reading as "escalation tried and
+                        # failed" indistinguishably from every other
+                        # conflict-fix give-up.
+                        failed_entry_note = (
+                            "No tier-2 attempt was made: this conflict-fix "
+                            "worker judged the conflict **semantic**, but "
+                            "`pipeline.escalate_semantic_conflicts` is "
+                            "disabled (the default) — set it to `true` in "
+                            "`coordinator.yml` to allow one escalated "
+                            "attempt from a stronger model on future "
+                            "semantic conflicts."
+                        )
+                        entry.error = (
+                            f"{existing_error}; semantic conflict, but "
+                            "pipeline.escalate_semantic_conflicts is "
+                            "disabled — no tier-2 attempt made. Manual "
+                            "rebase required."
+                        )
+                    else:
+                        entry.error = (
+                            f"{existing_error}; conflict-fix worker did not "
+                            "resolve. Manual rebase required."
+                        )
                     failed_entry = entry
         changed = True
     if changed:
@@ -2583,6 +2632,7 @@ def on_conflict_fix_done(
             entry=failed_entry,
             fix_assignment_id=fix_assignment_id,
             machine_name=machine_name,
+            semantic_escalation_note=failed_entry_note,
         )
 
 

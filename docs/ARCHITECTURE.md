@@ -196,7 +196,7 @@ A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, 
 1. **Test gate (the #1 cause).** No review is dispatched until the work's Test stage has a verdict (see step 3 of the auto-loop above). **Symptom:** work `done`, but no `type="review"` assignment exists and `review_state` is null. **Fix:** `coord test <work_assignment_id> --passed` (`--skipped` for trivial, `--fail --reason "…"` for broken), then `coord pr <id>` opens/reuses the PR and dispatches the review. In the TUI: **P / S / F** on the Test stage.
 2. **Review not approved.** The merge gate is `has_approved_review` — a `type="review"` assignment with `review_verdict="approve"` for the work behind the queue entry. No review or `request-changes` → merge refuses with *"review required but not approved"*.
 3. **CI red.** Merge is gated on `gh pr checks` (#240). Failing/pending checks block it (surfaced in the queue entry's `error`). `coord merge --force-merge` overrides.
-4. **PR conflicts.** `mergeable=CONFLICTING` → `coord merge` auto-dispatches a conflict-fix worker (#241) to rebase; on success it re-enqueues and merges, on a semantic conflict it marks the entry `HUMAN_REQUIRED`. This worker runs invisibly — check for a `type="conflict-fix"` running assignment before assuming nothing happened.
+4. **PR conflicts.** `mergeable=CONFLICTING` → `coord merge` auto-dispatches a conflict-fix worker (#241) to rebase; on success it re-enqueues and merges, on a semantic conflict it marks the entry `HUMAN_REQUIRED`. This worker runs invisibly — check for a `type="conflict-fix"` running assignment before assuming nothing happened. A semantic verdict has a stronger-model second tier (#1291), but `pipeline.escalate_semantic_conflicts` defaults off — see [Mechanical merge conflicts auto-rebase (#241)](#mechanical-merge-conflicts-auto-rebase-241) below; the entry's `error` says explicitly when that's why it parked (#2566).
 5. **Queue clog / group halt.** `coord merge` processes each `(repo, target_branch)` group together; pre-#292 it `break`s on the first blocked entry (now skip-and-`continue`). A queue full of stale entries (for already-closed issues) can stall everything behind them. To merge one issue past a clog: `coord merge --repo <r> --order <assignment_id>` jumps it to the front. To declog: delete `merge_queue` rows whose GitHub issue is already closed — they are never auto-pruned (the closed-issue filter only blocks *new* enqueues).
 6. **Post-bounce keying (#292).** After a review bounce (request-changes → fix → approve), the queue entry can be keyed to the *original* (request-changes) work while the approval sits on the *fix* assignment, so `has_approved_review` fails. Fixed in #292; the pre-fix manual workaround was re-keying `merge_queue.assignment_id` to the approved fix.
 
@@ -368,9 +368,23 @@ When `coord merge` fails because the worker's branch is out of date on a rebasea
 the coordinator dispatches a `type="conflict-fix"` worker that rebases, resolves obvious
 additive merges, runs tests, and `git push --force-with-lease`. On success the merge
 re-enqueues automatically; on failure the entry is marked `HUMAN_REQUIRED` and surfaced in
-the TUI. Semantic conflicts (same function modified two ways) are not attempted — the worker
-exits and posts a comment for manual resolution. `gh` is denied for `conflict-fix` workers;
-only the coordinator drives merge retries.
+the TUI. Semantic conflicts (same function modified two ways) are diagnosed but not resolved
+by this worker — it emits a `coord:conflict=semantic` marker on its `STUCK:` line and gives
+up rather than guess.
+
+A second, stronger tier exists for exactly that case (#1291): `pipeline.
+escalate_semantic_conflicts`, checked in `coord/reconcile.py`'s
+`_try_semantic_escalation`, buys ONE escalated `[semantic-merge]` conflict-fix attempt from a
+stronger model (`pipeline.semantic_conflict_model`) before the entry parks. **It defaults to
+`False` and ships dark** — on a stock `coordinator.yml` this tier never fires, by design,
+until it earns trust on real conflicts. #2566: because that used to be invisible (a semantic
+give-up with the flag off looked identical to "escalation ran and failed"), `on_conflict_fix_done`
+now says so explicitly — both the parked entry's `error` and the GitHub HUMAN_REQUIRED comment
+name `pipeline.escalate_semantic_conflicts` as the reason no tier-2 attempt was made
+(`coord.conflict_fix.semantic_escalation_disabled`). Turning the tier on is a deliberate
+`coordinator.yml` edit, not something this repo defaults for every fleet. `gh` is denied for
+`conflict-fix` workers (including the escalated one); only the coordinator drives merge
+retries.
 
 ### Why Test precedes Review (the #520 reversal)
 

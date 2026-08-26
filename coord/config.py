@@ -1011,6 +1011,17 @@ class PipelineConfig:
     there is no loop.  It is still subject to every merge gate (tests,
     ``coord verify-merge``, CI, review) — nothing is force-merged.
 
+    #2566: shipping dark by default means the tier this flag guards can
+    look, from the outside, like it silently failed rather than never ran.
+    When a conflict-fix worker's SEMANTIC verdict is read (see #2565) and
+    this flag is off, ``coord.reconcile.on_conflict_fix_done`` says so
+    explicitly in the parked entry's error and in the GitHub comment —
+    :func:`coord.conflict_fix.semantic_escalation_disabled` is the
+    predicate. That closes the *legibility* half of the gap; turning the
+    tier on for real is still a ``coordinator.yml`` decision an operator
+    makes deliberately, not something this repo's code can default for
+    every fleet.
+
     ``convergence_rounds`` (#846) is the number of fix/review rounds
     (``Assignment.review_iteration``) an assignment may accumulate without
     reaching a green test verdict + approved review before it is flagged as
