@@ -9,8 +9,9 @@ import socket
 import subprocess
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
+from coord import github_throttle
 from coord.forge_availability import record_gh_call
 
 
@@ -52,6 +53,51 @@ class GhTransientError(GhError):
     this specifically, mirroring how :class:`GhNotFound` lets a caller
     distinguish "gone" from "unreachable" for other resources.
     """
+
+
+class GhRateLimitError(GhTransientError):
+    """Raised by :func:`_gh` when a ``gh`` failure is specifically a GitHub
+    rate limit — primary (core quota exhausted) or secondary (abuse-
+    detection, #2809's incident) — rather than some other transient infra
+    failure (auth, network).
+
+    A :class:`GhTransientError` subclass, so every existing
+    ``except GhTransientError`` (and ``except RuntimeError``) call site
+    catches this without modification. Callers that need to react to a rate
+    limit *specifically* — log the real cause instead of a generic "GitHub
+    unreachable, unauthenticated, or rate-limited" string, or honour
+    ``retry_after_s`` — catch this subclass and read its attributes instead
+    of re-parsing the message text.
+
+    ``status_code``/``request_id``/``retry_after_s`` are best-effort: parsed
+    from ``gh``'s stderr text (always available) and, for the ``-i``-
+    augmented calls in this module (:func:`get_branch_sha`,
+    :func:`get_default_branch_head`), from the real HTTP response headers
+    GitHub sent (more precise — the stderr text alone never carries
+    ``Retry-After``). Any of the three may be ``None`` when it could not be
+    recovered from either source. ``from_cache=True`` marks an instance
+    raised WITHOUT a fresh network call, by :func:`_gh` short-circuiting an
+    already-known active backoff (see :mod:`coord.github_throttle`) — its
+    fields describe the ORIGINAL hit that started that backoff, not a new
+    one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        request_id: str | None = None,
+        retry_after_s: float | None = None,
+        secondary: bool = False,
+        from_cache: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.request_id = request_id
+        self.retry_after_s = retry_after_s
+        self.secondary = secondary
+        self.from_cache = from_cache
 
 
 class GhTooOldForJsonChecks(GhError):
@@ -139,6 +185,115 @@ def _classify_gh_exit(stderr: str) -> str:
     return "transient" if _is_transient_error(RuntimeError(stderr)) else "app_error"
 
 
+# ── #2809: rate-limit detection + structured detail extraction ─────────────
+#
+# GitHub's secondary (abuse-detection) limiter doesn't show up in `gh api
+# rate_limit` at all -- the ONLY signal it ever gives is a 403 on the actual
+# call. Before this, every such 403 was folded into a generic "transient"
+# bucket indistinguishable from an auth failure or a dead network, and its
+# `Retry-After`/request-ID were discarded outright (issue evidence:
+# `coord/github_ops.py:1697`, `coord/merge_queue.py:3489-3498`). The two
+# helpers below recover as much of that detail as each call site can offer:
+# `_extract_rate_limit_detail` always works (parses `gh`'s stderr text, which
+# every call gets); `_parse_gh_include` additionally recovers the exact
+# `Retry-After` header when the caller passed `-i` to `gh api` (real HTTP
+# headers on stdout -- see `get_branch_sha`/`get_default_branch_head`,
+# verified empirically: `-i` puts headers+body on stdout even on a non-2xx
+# response, `gh`'s own short diagnostic still goes to stderr separately).
+
+_HTTP_STATUS_IN_MESSAGE_RE = re.compile(r"\(HTTP (\d{3})\)")
+_REQUEST_ID_RE = re.compile(r"request ID\s+([A-Za-z0-9:_-]+)", re.IGNORECASE)
+_STATUS_LINE_RE = re.compile(r"^HTTP/\S+\s+(\d{3})")
+
+
+class GhResponseMeta(NamedTuple):
+    """Structured detail recovered from one `gh api -i` response."""
+
+    status: int | None
+    request_id: str | None
+    retry_after_s: float | None
+
+
+def _classify_rate_limit(stderr: str) -> tuple[bool, bool]:
+    """``(is_rate_limit, is_secondary)`` for one `gh` stderr string.
+
+    Deliberately narrower than :func:`_is_transient_error` — a bare "HTTP
+    403" is also how a plain permissions failure (token lacks a scope) looks,
+    and that must NOT engage the shared backoff in :mod:`coord.github_throttle`
+    (it would pause every other `gh` call on the host for a problem no wait
+    will ever fix). Only an explicit "rate limit" mention in the message
+    counts.
+    """
+    low = stderr.lower()
+    if "secondary rate limit" in low:
+        return True, True
+    if "rate limit" in low:
+        return True, False
+    return False, False
+
+
+def _extract_rate_limit_detail(stderr: str) -> GhResponseMeta:
+    """Best-effort status/request-id extraction from `gh`'s plain stderr
+    text (no `-i`, no headers) -- covers every `_gh` call site, not just the
+    two that pass `-i`. `retry_after_s` is always ``None`` here: GitHub does
+    not put it in the message body, only in the (unavailable-without-``-i``)
+    `Retry-After` header.
+    """
+    status = None
+    m = _HTTP_STATUS_IN_MESSAGE_RE.search(stderr)
+    if m:
+        status = int(m.group(1))
+    request_id = None
+    m = _REQUEST_ID_RE.search(stderr)
+    if m:
+        request_id = m.group(1)
+    return GhResponseMeta(status=status, request_id=request_id, retry_after_s=None)
+
+
+def _parse_gh_include(raw: str) -> tuple[GhResponseMeta, str]:
+    """Split `gh api -i ...` output into ``(meta, body)``.
+
+    ``-i`` prefixes the response body with the HTTP status line and response
+    headers (a blank line separates the two, same as a raw HTTP response
+    rendered as text) -- this is how the real ``Retry-After`` and
+    ``X-GitHub-Request-Id`` headers get recovered at all, since neither
+    appears in the JSON error body or in `gh`'s own stderr diagnostic.
+
+    Falls back to ``(empty meta, raw)`` when *raw* doesn't look like an
+    ``-i`` response (no header block found) — this is what makes it safe to
+    call unconditionally on both the ``-i``-augmented success path (strip
+    the headers `get_branch_sha` doesn't want) and on test fixtures that
+    still hand back a bare JSON string with no headers at all.
+    """
+    normalized = raw.replace("\r\n", "\n")
+    if "\n\n" not in normalized:
+        return GhResponseMeta(None, None, None), raw
+    head, _, body = normalized.partition("\n\n")
+    lines = head.splitlines()
+    if not lines or not lines[0].startswith("HTTP/"):
+        return GhResponseMeta(None, None, None), raw
+    status = None
+    m = _STATUS_LINE_RE.match(lines[0])
+    if m:
+        status = int(m.group(1))
+    request_id = None
+    retry_after: float | None = None
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "x-github-request-id":
+            request_id = value
+        elif key == "retry-after":
+            try:
+                retry_after = float(value)
+            except ValueError:
+                pass
+    return GhResponseMeta(status, request_id, retry_after), body
+
+
 def _gh(*args: str) -> str:
     """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
 
@@ -154,7 +309,43 @@ def _gh(*args: str) -> str:
     future one — gets the same fail-safe behavior the pre-#1483 direct
     ``shutil.which("gh")`` + ``subprocess.run(..., check=False)`` call sites
     had, for free, without each caller having to remember to guard for it.
+
+    #2809: also the single seam that consults and feeds
+    :mod:`coord.github_throttle`'s shared backoff. A rate-limit failure
+    below records the hit there so every OTHER `gh` caller on this host
+    learns about it on their very next call; a call that starts while an
+    earlier hit's backoff is still active either rides it out (a short,
+    jittered sleep) or — deep inside a longer window — skips the network
+    call entirely and raises immediately, reusing the ORIGINAL hit's detail.
+    That skip is the actual damping: fewer requests reach a limiter that
+    only decays when request volume drops.
     """
+    backoff_sleep_s, active_backoff = github_throttle.consult()
+    if active_backoff is not None:
+        remaining = active_backoff.until - time.time()
+        if remaining > github_throttle.MAX_PRECALL_SLEEP_S:
+            # Still well inside a known backoff window -- don't add another
+            # request to a limiter that only recovers when the rate drops.
+            # This is not a fresh observation, so it is not re-recorded.
+            record_gh_call(
+                args, outcome="transient", duration_s=0.0,
+                detail=(
+                    f"skipped: coordinated backoff active ({active_backoff.reason}, "
+                    f"{remaining:.0f}s remaining)"
+                ),
+            )
+            raise GhRateLimitError(
+                f"gh {' '.join(args)} skipped: GitHub {active_backoff.reason} "
+                f"backoff active for {remaining:.0f}s more "
+                f"(status={active_backoff.status}, request_id={active_backoff.request_id})",
+                status_code=active_backoff.status,
+                request_id=active_backoff.request_id,
+                retry_after_s=remaining,
+                secondary=active_backoff.reason == "secondary_rate_limit",
+                from_cache=True,
+            )
+        if backoff_sleep_s > 0:
+            time.sleep(backoff_sleep_s)
     # #1896 Phase 0: time + classify every `gh` invocation through this one
     # seam so `coord diagnose --forge-availability` has real data on how
     # often the forge is actually unreachable, not just anecdote from one
@@ -186,6 +377,30 @@ def _gh(*args: str) -> str:
         # availability signal) from an ordinary application-level error like
         # "label not found" (not one) — see `_classify_gh_exit`.
         record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration, detail=stderr)
+        is_rate_limit, is_secondary = _classify_rate_limit(stderr)
+        if is_rate_limit:
+            text_meta = _extract_rate_limit_detail(stderr)
+            # `-i` callers (get_branch_sha/get_default_branch_head) get
+            # headers on stdout even on a non-2xx response -- prefer that
+            # over the text-only extraction above whenever it parsed one.
+            header_meta = (
+                _parse_gh_include(result.stdout)[0]
+                if result.stdout.startswith("HTTP/") else None
+            )
+            status = (header_meta.status if header_meta else None) or text_meta.status
+            request_id = (
+                (header_meta.request_id if header_meta else None) or text_meta.request_id
+            )
+            retry_after = header_meta.retry_after_s if header_meta else None
+            github_throttle.record(
+                reason="secondary_rate_limit" if is_secondary else "primary_rate_limit",
+                status=status, request_id=request_id, retry_after_s=retry_after,
+            )
+            raise GhRateLimitError(
+                f"gh {' '.join(args)} failed: {stderr}",
+                status_code=status, request_id=request_id, retry_after_s=retry_after,
+                secondary=is_secondary,
+            )
         raise RuntimeError(f"gh {' '.join(args)} failed: {stderr}")
     record_gh_call(args, outcome="ok", duration_s=duration)
     return result.stdout.strip()
@@ -1657,8 +1872,13 @@ def create_commit_with_files(
 
 def get_default_branch_head(repo: str, branch: str) -> str:
     """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
-    raw = _gh("api", f"repos/{repo}/branches/{branch}")
-    data = _json_loads_or(raw, default=None)
+    # #2809: `-i` so a 403 on this call carries the real `Retry-After` /
+    # `X-GitHub-Request-Id` headers into `_gh`'s `GhRateLimitError` — see
+    # `_parse_gh_include`. Harmless on success: `_parse_gh_include` below
+    # strips the header block back off before this parses the JSON body.
+    raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}")
+    _meta, body = _parse_gh_include(raw)
+    data = _json_loads_or(body, default=None)
     # #1353: every caller of this already catches RuntimeError to mean "HEAD
     # lookup failed" — raise that instead of letting an empty/malformed
     # exit-0 response crash with an unattributable JSONDecodeError/KeyError.
@@ -1684,19 +1904,32 @@ def get_branch_sha(repo: str, branch: str, *, raise_on_transient: bool = False) 
     :func:`_is_transient_error` — rather than a confirmed-absent branch. Opt
     in only where the caller can act differently on "GitHub couldn't answer"
     versus "the branch is gone" — today that's
-    :func:`coord.merge_queue.evaluate_smoke_verdict`, via
+    :func:`coord.merge_queue.evaluate_smoke_verdict` and
+    :func:`coord.merge_queue.live_gate_entry`, both via
     :func:`coord.merge_queue._gh_get_branch_sha`, which detects support for
     this kwarg before passing it (``GhOps`` is duck-typed; most stand-ins,
     e.g. :class:`coord.gate_snapshot.GateSnapshot`, don't implement it and
     are unaffected).
+
+    #2809: this is THE call named in that issue's incident (its ``-i``
+    addition is what lets a rate limit here carry the real ``Retry-After``
+    header — see :func:`get_default_branch_head`). When *exc* raised by
+    ``_gh`` is already a :class:`GhTransientError` (including the
+    :class:`GhRateLimitError` subclass with its status/request-id/retry-after
+    detail), it is re-raised AS-IS rather than rewrapped — rewrapping into a
+    fresh ``GhTransientError(str(exc))`` would stringify away exactly the
+    structured detail #2809 asks to preserve.
     """
     try:
-        raw = _gh("api", f"repos/{repo}/branches/{branch}")
-        data = _json_loads_or(raw, default={})
+        # #2809: `-i` recovers the real HTTP headers (Retry-After,
+        # X-GitHub-Request-Id) on a 403 — see `get_default_branch_head`.
+        raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}")
+        _meta, body = _parse_gh_include(raw)
+        data = _json_loads_or(body, default={})
         return data["commit"]["sha"]
     except Exception as exc:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
         if raise_on_transient and _is_transient_error(exc):
-            raise GhTransientError(str(exc)) from exc
+            raise (exc if isinstance(exc, GhTransientError) else GhTransientError(str(exc))) from exc
         return None
 
 

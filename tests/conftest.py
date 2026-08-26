@@ -681,6 +681,30 @@ def _no_real_notifier_state(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_github_backoff_store(monkeypatch, tmp_path):
+    """#2809: never let a test write the OPERATOR'S real
+    ``~/.coord/github_backoff.json``.
+
+    Same hazard as ``_no_real_pause_store`` (#2101) / ``_no_real_notifier_
+    state`` (#1632) / ``_no_real_roll_pending_store`` (#2587), one file
+    over: this file is the shared "GitHub is rate-limiting us, back off"
+    signal every `gh` call consults (``coord.github_throttle``, via
+    ``coord.github_ops._gh``). A leaked test write could plant a stale
+    backoff that silently stalls a real fleet's `gh` calls for up to a
+    minute, or — the opposite direction — coincidentally clear one a real
+    incident just recorded.
+
+    ``coord.github_throttle._state_path`` reads
+    ``$COORD_GITHUB_BACKOFF_STATE`` first for exactly this redirect, the
+    same env-var seam ``_no_real_notifier_state``/``_no_real_roll_pending_
+    store`` use rather than a monkeypatched private function.
+    """
+    monkeypatch.setenv(
+        "COORD_GITHUB_BACKOFF_STATE", str(tmp_path / "github-backoff-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_roll_pending_store(monkeypatch, tmp_path):
     """#2587: never let a test write the OPERATOR'S real
     ``~/.coord/roll_pending.json``.

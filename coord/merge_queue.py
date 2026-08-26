@@ -430,6 +430,48 @@ UNKNOWN_BRANCH_HEAD_REASON = (
 )
 
 
+def unknown_branch_head_reason(probe_error: "GhTransientError | None" = None) -> str:
+    """:data:`UNKNOWN_BRANCH_HEAD_REASON`, enriched with *probe_error*'s
+    structured detail when there is any to add (#2809).
+
+    #2809: the generic string collapses three very different causes — GitHub
+    unreachable, `gh` unauthenticated, or rate-limited — into one sentence an
+    operator cannot act on differently. When *probe_error* is the
+    :class:`~coord.github_ops.GhRateLimitError` subclass (raised by a live
+    :func:`~coord.github_ops.get_branch_sha` call, threaded through by
+    :func:`_gh_get_branch_sha`/:func:`live_gate_entry`), this appends the
+    real HTTP status, GitHub request ID, and (when GitHub sent one) the
+    ``Retry-After`` wait — exactly the detail the issue's evidence shows was
+    being silently discarded.
+
+    Returns the UNCHANGED constant — byte for byte — whenever *probe_error*
+    is ``None`` or carries no structured detail (e.g. a plain
+    :class:`~coord.github_ops.GhTransientError` for an auth/network failure,
+    or a caller whose ``gh_ops`` stand-in doesn't support
+    ``raise_on_transient`` at all): every existing caller of the bare
+    constant, and every :func:`_merge_gate_kind` classifier that substring-
+    matches against it, keeps working unchanged — this only ever ADDS a
+    suffix, never rewords the prefix `_merge_gate_kind` depends on.
+    """
+    if probe_error is None:
+        return UNKNOWN_BRANCH_HEAD_REASON
+    status = getattr(probe_error, "status_code", None)
+    request_id = getattr(probe_error, "request_id", None)
+    retry_after = getattr(probe_error, "retry_after_s", None)
+    if status is None and request_id is None and retry_after is None:
+        return UNKNOWN_BRANCH_HEAD_REASON
+    secondary = getattr(probe_error, "secondary", False)
+    bits = []
+    if status is not None:
+        kind = "secondary rate limit" if secondary else "rate limit"
+        bits.append(f"GitHub {kind}, HTTP {status}")
+    if request_id:
+        bits.append(f"request {request_id}")
+    if retry_after is not None and retry_after > 0:
+        bits.append(f"retry after ~{retry_after:.0f}s")
+    return f"{UNKNOWN_BRANCH_HEAD_REASON} [{', '.join(bits)}]"
+
+
 class ApprovalScan(NamedTuple):
     """The result of one walk over *board*'s approving reviews for an entry.
 
@@ -1160,7 +1202,11 @@ def merge_gate_failures(
             failures.append(MergeGateFailure(
                 gate="review",
                 reason=(
-                    UNKNOWN_BRANCH_HEAD_REASON
+                    # #2809: `a` is the live-anchored entry `live_gate_entry`
+                    # built — carries the confirmed probe error, when there
+                    # was one, so this names the real cause instead of the
+                    # generic sentence.
+                    unknown_branch_head_reason(getattr(a, "branch_head_probe_error", None))
                     if review_scan.unknown_head
                     else "review required but not approved"
                 ),
@@ -1312,6 +1358,12 @@ class SmokeVerdictStatus:
     recorded_sha: str | None = None
     current_sha: str | None = None
     spared_reason: str | None = None  # set only on `ok=True` after a base move (#1847)
+    # #2809: the confirmed transient error behind a SMOKE_UNKNOWN verdict —
+    # often `GhRateLimitError` — so `short_reason`/`message` below can report
+    # the real status/request-id/retry-after instead of only the generic
+    # sentence. `None` for every other kind, and for a SMOKE_UNKNOWN whose
+    # `gh_ops` stand-in didn't support `raise_on_transient` at all.
+    probe_error: "GhTransientError | None" = None
 
     @property
     def short_reason(self) -> str | None:
@@ -1322,7 +1374,7 @@ class SmokeVerdictStatus:
         if self.ok:
             return None
         if self.kind == SMOKE_UNKNOWN:
-            return UNKNOWN_BRANCH_HEAD_REASON
+            return unknown_branch_head_reason(self.probe_error)
         if self.kind == SMOKE_STALE:
             if self.anchor == "run":
                 return (
@@ -1345,8 +1397,10 @@ class SmokeVerdictStatus:
             return None
         if self.kind == SMOKE_UNKNOWN:
             # #2704: never fabricate SMOKE_OK on evidence this call never
-            # actually obtained — see `UNKNOWN_BRANCH_HEAD_REASON`.
-            return UNKNOWN_BRANCH_HEAD_REASON
+            # actually obtained — see `UNKNOWN_BRANCH_HEAD_REASON`. #2809:
+            # `unknown_branch_head_reason` appends real status/request-id/
+            # retry-after when `probe_error` carries any.
+            return unknown_branch_head_reason(self.probe_error)
         if self.kind == SMOKE_STALE:
             aid = self.assignment_id or "<assignment>"
             if self.anchor == "run":
@@ -2416,9 +2470,9 @@ _RAISE_ON_TRANSIENT_KW = "raise_on_transient"
 
 def _gh_get_branch_sha(
     gh_ops: "GhOps", repo: str, branch: str
-) -> tuple[str | None, bool]:
-    """``(sha, probe_failed_transiently)`` for one ``gh_ops.get_branch_sha``
-    call (#2704).
+) -> tuple[str | None, bool, "GhTransientError | None"]:
+    """``(sha, probe_failed_transiently, error)`` for one
+    ``gh_ops.get_branch_sha`` call (#2704, extended by #2809).
 
     ``probe_failed_transiently`` is ``True`` only when *gh_ops* both
     declares support for ``raise_on_transient`` and raised
@@ -2426,6 +2480,14 @@ def _gh_get_branch_sha(
     transient failure (GitHub unreachable, ``gh`` unauthenticated, a rate
     limit), never a merely-empty result. See the module-level comment above
     for why support is detected rather than assumed.
+
+    #2809: ``error`` is the caught exception itself (``None`` unless
+    ``probe_failed_transiently``) — often the
+    :class:`~coord.github_ops.GhRateLimitError` subclass, which carries the
+    HTTP status/request-id/retry-after this issue asks to preserve rather
+    than fold into a bare bool. Callers that only need the #2704 bool keep
+    ignoring the third element; :func:`unknown_branch_head_reason` is what
+    turns it into operator-facing detail.
     """
     fn = gh_ops.get_branch_sha
     try:
@@ -2434,15 +2496,15 @@ def _gh_get_branch_sha(
         supports = False
     if not supports:
         try:
-            return fn(repo, branch), False
+            return fn(repo, branch), False, None
         except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
-            return None, False
+            return None, False, None
     try:
-        return fn(repo, branch, raise_on_transient=True), False
-    except GhTransientError:
-        return None, True
+        return fn(repo, branch, raise_on_transient=True), False, None
+    except GhTransientError as exc:
+        return None, True, exc
     except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
-        return None, False
+        return None, False, None
 
 
 def evaluate_smoke_verdict(
@@ -2603,6 +2665,12 @@ def evaluate_smoke_verdict(
     # `except Exception` below and never mistaken for this.
     base_sha_probe_failed = False
     branch_sha_probe_failed = False
+    # #2809: the actual exception behind each `*_probe_failed` bool above —
+    # `None` until a probe confirms one — so the SMOKE_UNKNOWN verdicts built
+    # below can carry the real status/request-id/retry-after through
+    # `unknown_branch_head_reason` instead of just the generic sentence.
+    base_sha_probe_error: "GhTransientError | None" = None
+    branch_sha_probe_error: "GhTransientError | None" = None
 
     # #1640: the first row rejected purely for staleness, so a refusal can
     # name the case ("recorded at X, base now Y") instead of claiming no
@@ -2647,7 +2715,7 @@ def evaluate_smoke_verdict(
             and repo_github
             and target_branch
         ):
-            current_base_sha, base_sha_probe_failed = _gh_get_branch_sha(
+            current_base_sha, base_sha_probe_failed, base_sha_probe_error = _gh_get_branch_sha(
                 gh_ops, repo_github, target_branch
             )
             base_sha_attempted = True
@@ -2669,6 +2737,7 @@ def evaluate_smoke_verdict(
                     assignment_id=getattr(a, "assignment_id", None),
                     anchor="base",
                     recorded_sha=test_base_sha,
+                    probe_error=base_sha_probe_error,
                 )
             continue
 
@@ -2723,8 +2792,8 @@ def evaluate_smoke_verdict(
             and repo_github
             and entry_branch
         ):
-            current_branch_sha, branch_sha_probe_failed = _gh_get_branch_sha(
-                gh_ops, repo_github, entry_branch
+            current_branch_sha, branch_sha_probe_failed, branch_sha_probe_error = (
+                _gh_get_branch_sha(gh_ops, repo_github, entry_branch)
             )
             branch_sha_attempted = True
 
@@ -2741,6 +2810,7 @@ def evaluate_smoke_verdict(
                     assignment_id=getattr(a, "assignment_id", None),
                     anchor="branch",
                     recorded_sha=test_head_sha,
+                    probe_error=branch_sha_probe_error,
                 )
             continue
 
@@ -3143,6 +3213,16 @@ class QueuedMerge:
     # this entry (transient, like branch_head_sha/branch_patch_id — never
     # persisted to the queue DB).
     target_branch_head_sha: str | None = None
+    # #2809: the `GhTransientError` (often the `GhRateLimitError` subclass)
+    # that made `branch_head_sha` unknown, when the failure was CONFIRMED
+    # transient — i.e. `_gh_get_branch_sha` raised rather than merely
+    # returning a falsy SHA. `None` covers both "never probed" and "probed
+    # fine" as well as "probed and gh_ops doesn't support raise_on_transient
+    # at all" — every one of those degrades to the pre-#2809 generic
+    # `UNKNOWN_BRANCH_HEAD_REASON` string, never a fabricated cause.
+    # Transient like branch_head_sha/branch_patch_id/target_branch_head_sha
+    # above — recomputed every tick, never persisted to the queue DB.
+    branch_head_probe_error: "GhTransientError | None" = None
     # #1077: the originating assignment's `type` (e.g. "work", "mock-author"),
     # captured at enqueue time. Drives both the PR-body "Closes #N" vs
     # "Refs #N" keyword (`_briefing_body`) and whether `process()` closes
@@ -3487,21 +3567,27 @@ def live_gate_entry(
         required_gates=list(getattr(a, "required_gates", None) or []),
     )
     if gh_ops is not None and entry.branch:
-        try:
-            entry.branch_head_sha = gh_ops.get_branch_sha(entry.repo_github, entry.branch)
         # #2085: NOT "fail-open, unknown SHA isn't blocking" — an unknown
         # branch_head_sha now fails has_approved_review CLOSED (not open)
         # for any review that carries a review_head_sha to compare against.
         # A transient gh error here degrades to the same conservative
         # refusal as gh_ops=None, never a silent pass.
-        except Exception:  # noqa: BLE001
-            entry.branch_head_sha = None
-        try:
-            entry.target_branch_head_sha = gh_ops.get_branch_sha(
-                entry.repo_github, entry.target_branch
-            )
-        except Exception:  # noqa: BLE001
-            entry.target_branch_head_sha = None
+        #
+        # #2809: routed through `_gh_get_branch_sha` (not a bare
+        # `gh_ops.get_branch_sha(...)` try/except) so a CONFIRMED transient
+        # failure — this is THE call the issue's incident traced the swallow
+        # to — is captured on `branch_head_probe_error` instead of collapsing
+        # to the same bare `None` a genuinely-deleted branch produces. The
+        # branch's own probe wins when both fail (its detail is what the
+        # review/smoke gate reasons actually name); the target's is used only
+        # when the branch fetch itself succeeded.
+        entry.branch_head_sha, _, branch_probe_error = _gh_get_branch_sha(
+            gh_ops, entry.repo_github, entry.branch
+        )
+        entry.target_branch_head_sha, _, target_probe_error = _gh_get_branch_sha(
+            gh_ops, entry.repo_github, entry.target_branch
+        )
+        entry.branch_head_probe_error = branch_probe_error or target_probe_error
         try:
             entry.branch_patch_id = gh_ops.get_branch_patch_id(
                 entry.repo_github, entry.target_branch, entry.branch
