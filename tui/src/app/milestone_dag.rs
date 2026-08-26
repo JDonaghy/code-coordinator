@@ -1351,6 +1351,8 @@ mod pure_tests {
             milestone_title: None,
             body_truncated: false,
             body_len: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            synced_at: None,
         }
     }
 
@@ -1408,6 +1410,35 @@ mod pure_tests {
             for_issue_number: None,
             driven_by: None,
             dispatched_by_assignment_id: None,
+            // #1941: fields added to the generated wire DTO; not exercised by this test.
+            repo_github: None,
+            files_allowed: None,
+            files_forbidden: None,
+            smoke_test: None,
+            smoke_test_reason: None,
+            review_target: None,
+            required_gates: None,
+            plan: None,
+            unreachable_count: None,
+            review_posted_at: None,
+            uat_state: None,
+            uat_reason: None,
+            claude_session_id: None,
+            provider_name: None,
+            review_head_sha: None,
+            completion_summary: None,
+            review_verdict_original: None,
+            review_verdict_override_reason: None,
+            review_patch_id: None,
+            test_head_sha: None,
+            test_patch_id: None,
+            test_base_sha: None,
+            review_scoped: None,
+            review_scope_base_sha: None,
+            test_toolchain: None,
+            verdict_source: None,
+            verdict_source_reason: None,
+            stop_reason: None,
         }
     }
 

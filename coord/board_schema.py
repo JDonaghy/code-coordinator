@@ -284,7 +284,8 @@ BOARD_PROJECTIONS: dict[str, type] = {
 #: types them ``integer`` and never ``boolean``, so the wire shape survives a
 #: storage-engine swap (Postgres would make these real ``BOOLEAN``s).  This is
 #: the DTO-level counterpart of ``coord/board_bool_guard.py``'s consumer-side
-#: check against ``tui/src/app/types.rs``.
+#: check against the real Rust wire structs (``tui/src/app/types.rs`` and,
+#: since #1941, its generated ``types/generated.rs`` sibling).
 INTEGER_BACKED_BOOLEANS: frozenset[str] = frozenset(
     {"is_interactive", "review_scoped", "hold_after", "no_acceptance"}
 )

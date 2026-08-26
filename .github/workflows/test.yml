@@ -309,3 +309,14 @@ jobs:
   # Do not re-add a webapp job here. There is no webapp source in this repo
   # for it to run against, and a job that installs Node to build nothing is
   # how the previous `acceptance`-on-every-push waste (#2389) started.
+  #
+  # #1941: `scripts/codegen.py` also generates coord-tui's RUST wire types
+  # (`--rust`), and unlike the TS half above, `tui/` never left this repo —
+  # so that drift gate needs no separate job or `coord-web` checkout at all.
+  # It rides the ordinary `pytest --ignore=tests/acceptance` runs above, as
+  # `tests/test_generated_rust_fixture.py::
+  # test_committed_generated_rs_matches_generator_output`, the same way the
+  # TS-side `tests/test_generated_types_fixture.py` already rides them for
+  # the half of that check this repo can still make (the generator runs and
+  # covers every schema; the coord-web byte-comparison itself is that repo's
+  # own CI, per the paragraph above).

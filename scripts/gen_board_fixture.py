@@ -2,10 +2,11 @@
 
 The `/board` payload is each board table projected through its explicit wire
 DTO in `coord/board_schema.py` (#1849 — before that the wire schema literally
-*was* the SQLite DDL).  The Rust structs (`tui/src/app/types.rs`) are
-hand-typed mirrors of those DTOs.  A single type mismatch (the classic case: a
-SQLite `INTEGER` boolean vs a Rust `bool`) fails the **entire** `BoardPayload`
-parse and blanks the board (#632/#546/#628).
+*was* the SQLite DDL).  The Rust structs mirroring those DTOs are generated
+from the same served schema (`tui/src/app/types/generated.rs`, `scripts/
+codegen.py --rust`, #1941) rather than hand-typed.  A single type mismatch
+(the classic case: a SQLite `INTEGER` boolean vs a Rust `bool`) fails the
+**entire** `BoardPayload` parse and blanks the board (#632/#546/#628).
 
 This script builds a representative, freshly-migrated coord.db (headless +
 interactive assignments, a review, a merge-queue row, a proposal, an open

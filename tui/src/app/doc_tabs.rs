@@ -2741,6 +2741,8 @@ mod tests {
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             ..BoardData::default()
         };
@@ -2770,6 +2772,8 @@ mod tests {
                     milestone_title: None,
                     body_truncated: false,
                     body_len: None,
+                    // #1941: fields added to the generated wire DTO; not exercised by this test.
+                    synced_at: None,
                 })
                 .collect(),
             pipeline_repos: vec![(
@@ -2823,6 +2827,8 @@ mod tests {
                 milestone_title: None,
                 body_truncated: false,
                 body_len: None,
+                // #1941: fields added to the generated wire DTO; not exercised by this test.
+                synced_at: None,
             }],
             pipeline_repos: vec![(
                 "claude-coordinator".to_string(),

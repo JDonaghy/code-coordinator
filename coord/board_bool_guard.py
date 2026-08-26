@@ -3,18 +3,20 @@
 SQLite has no native boolean type — a column declared ``INTEGER DEFAULT 0``
 and used as a flag (e.g. ``is_interactive``) serializes on the `/board` wire
 as a raw JSON ``0``/``1``, not ``true``/``false``.  The Rust side
-(``tui/src/app/types.rs``) hand-mirrors DB columns into typed structs; if a
-*new* such column is ever typed as a plain ``bool`` there (instead of going
-through ``de_bool_from_int_or_bool`` or an equivalent coercing
-deserializer), that ONE field fails the parse of the **entire**
+(``tui/src/app/types.rs`` and, since #1941, its generated ``types/
+generated.rs`` sibling — see that file's own header) mirrors DB columns into
+typed structs; if a *new* such column is ever typed as a plain ``bool`` there
+(instead of going through ``de_bool_from_int_or_bool`` or an equivalent
+coercing deserializer), that ONE field fails the parse of the **entire**
 ``BoardPayload`` and blanks the whole TUI board (#632/#546/#628).
 
 This module is the producer-side (Python) half of the seam check: it reads
 the Rust struct definitions as text, finds `bool`-typed fields with no
 custom deserializer, and cross-references them against the live SQLite
-schema. ``tests/test_board_fixture.py`` wires this up against the real
-``tui/src/app/types.rs`` + a freshly-migrated DB so CI goes red the moment
-someone adds an unguarded INTEGER-backed bool field.
+schema. ``tests/test_board_fixture.py`` wires this up against the real Rust
+source (``tui/src/app/types.rs`` concatenated with its generated ``types/
+generated.rs`` sibling, #1941) + a freshly-migrated DB so CI goes red the
+moment someone adds an unguarded INTEGER-backed bool field.
 
 #1849 added the *other* half of this guard, one level up: the ``/board`` wire
 contract is now the explicit DTOs in ``coord/board_schema.py``, and

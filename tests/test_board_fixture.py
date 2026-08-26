@@ -1,15 +1,24 @@
 """#748: golden /board fixture freshness + the INTEGER-bool producer guard.
 
-Closes the #632 blank-board class: the Rust structs (tui/src/app/types.rs)
-are hand-typed mirrors of the wire, and one unguarded type mismatch —
-classically a SQLite INTEGER boolean parsed into a strict Rust `bool` —
-fails the ENTIRE BoardPayload parse and blanks the whole TUI board.
+Closes the #632 blank-board class: the Rust structs mirroring the wire, and
+one unguarded type mismatch — classically a SQLite INTEGER boolean parsed
+into a strict Rust `bool` — fails the ENTIRE BoardPayload parse and blanks
+the whole TUI board.
 
 #1849 moved the wire contract itself off the DDL and into explicit DTOs
 (coord/board_schema.py); the DTO-side half of this guard — every
 INTEGER-backed boolean stays a JSON integer whatever the storage engine
 does — lives in tests/test_board_schema.py. This file keeps the
-consumer-side half, against the real types.rs.
+consumer-side half, against the real Rust source.
+
+#1941: the wire structs moved out of hand-written `tui/src/app/types.rs` into
+the generated sibling module `tui/src/app/types/generated.rs` (`scripts/
+codegen.py --rust`). The guard now scans the concatenation of both files
+(`_rust_wire_source()`) rather than just `types.rs` alone — the generated
+file is where every guarded field (`is_interactive`, `hold_after`, …) lives
+today, but nothing stops a future hand-added wire mirror from landing back in
+`types.rs`, and this check exists precisely to watch whichever file is the
+real consumer.
 
 This file is the Python half of a same-fixture, both-sides-of-the-wire
 check:
@@ -40,6 +49,14 @@ from coord.db import _ensure_schema
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
 TYPES_RS_PATH = REPO_ROOT / "tui" / "src" / "app" / "types.rs"
+#: #1941: the generated wire-DTO sibling module — see module docstring.
+GENERATED_RS_PATH = REPO_ROOT / "tui" / "src" / "app" / "types" / "generated.rs"
+
+
+def _rust_wire_source() -> str:
+    """Text of every Rust file that may declare a `/board` wire field —
+    `types.rs` plus its generated `generated.rs` sibling (#1941)."""
+    return TYPES_RS_PATH.read_text() + "\n" + GENERATED_RS_PATH.read_text()
 
 # Mirrors the table set actually projected onto the /board wire
 # (coord/dao.py::SqliteStore.board_projection).
@@ -110,16 +127,16 @@ def test_board_sample_fixture_parses_as_representative_payload():
 
 def test_no_unguarded_integer_bool_columns_reach_the_wire():
     """The real-world check: cross-reference the live schema against the real
-    tui/src/app/types.rs. Fails the moment a future
-    `ALTER TABLE ... ADD COLUMN x INTEGER` (meant as a bool) ships without a
-    matching `deserialize_with = "de_bool_from_int_or_bool"` guard on the
-    Rust side — i.e. it kills the #632 class before it can reoccur.
+    Rust consumer (`types.rs` + its generated `generated.rs` sibling, #1941).
+    Fails the moment a future `ALTER TABLE ... ADD COLUMN x INTEGER` (meant as
+    a bool) ships without a matching
+    `deserialize_with = "de_bool_from_int_or_bool"` guard on the Rust side —
+    i.e. it kills the #632 class before it can reoccur.
     """
-    rust_src = TYPES_RS_PATH.read_text()
-    mismatches = find_integer_bool_mismatches(rust_src, _migrated_schema_columns())
+    mismatches = find_integer_bool_mismatches(_rust_wire_source(), _migrated_schema_columns())
     assert mismatches == [], (
         f"INTEGER column(s) {mismatches} map to an unguarded Rust `bool` field in "
-        f"{TYPES_RS_PATH} — add "
+        f"{TYPES_RS_PATH} or {GENERATED_RS_PATH} — add "
         '`#[serde(default, deserialize_with = "de_bool_from_int_or_bool")]` '
         "(see #632/#748), or that column will blank the entire /board parse "
         "the first time it is 0."

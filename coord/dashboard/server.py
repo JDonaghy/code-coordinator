@@ -411,10 +411,12 @@ def openapi_spec() -> dict:
     ``action`` enum but leaves the response loosely typed since each action
     returns a distinct ad-hoc shape.
 
-    Public (no leading underscore) because ``scripts/codegen.py`` imports it
-    as its source of truth; ``coord/agent_app.py`` and ``coord/serve_app.py``
-    keep their own ``_openapi_spec()`` private since nothing outside those
-    modules consumes them (yet).
+    Public (no leading underscore) because ``scripts/codegen.py``'s TS
+    generator imports it as its source of truth. ``coord/serve_app.py``'s own
+    ``openapi_spec()`` is public too (#1941) — the same script's Rust
+    generator reads it for the `/board` projections. ``coord/agent_app.py``
+    keeps its own ``_openapi_spec()`` private since nothing outside that
+    module consumes it (yet).
     """
     components: dict = {}
     assignment_ref = dataclass_schema(Assignment, components)
