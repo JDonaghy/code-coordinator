@@ -694,3 +694,131 @@ class TestDriveResumeOfAFailedWorkRow:
         # -> fable) for a run that never used a claude model.
         assert "escalating model" not in out
         assert payload["model"] == "opencode/glm-5.2"
+
+
+# ── #2565: a semantic conflict-fix give-up must not be read as success ──────
+
+
+class TestReconcileConflictFixSemanticMarker:
+    """A `claude -p` conflict-fix worker ends its turn (exit 0, agent-
+    reported status "done") the same way whether it actually resolved the
+    conflict or judged it SEMANTIC and gave up — the worker has no way to
+    set its own exit code, so `reconcile()`'s "done" branch cannot trust a
+    clean completion alone. The `coord:conflict=semantic` marker in the
+    worker's own transcript is the only reliable signal; when it's present,
+    `reconcile()` must route the merge entry to the same outcome a
+    `succeeded=False` semantic give-up already gets — never silently reset
+    it to PENDING, which would just re-dispatch a `coord merge` retry
+    against the identical, already-diagnosed conflict."""
+
+    @patch("coord.reconcile._query_agent")
+    def test_done_conflict_fix_with_semantic_marker_does_not_reset_to_pending(
+        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=CONFLICT,
+                error="Merge conflict in foo.py",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[conflict-fix] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state == HUMAN_REQUIRED
+        assert "Manual rebase required" in (entry.error or "")
+
+    @patch("coord.reconcile._query_agent")
+    def test_done_conflict_fix_without_marker_still_resets_to_pending(
+        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        """The overwhelming common case — a real fix, no marker in the log —
+        is unaffected: `reconcile()` still re-enqueues the merge entry."""
+        from coord import merge_queue as mq
+        from coord.merge_queue import CONFLICT, PENDING, QueuedMerge
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=CONFLICT,
+                error="Merge conflict in foo.py",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[conflict-fix] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state == PENDING
+        assert entry.error is None

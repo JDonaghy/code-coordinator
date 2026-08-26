@@ -66,12 +66,13 @@ Don't try to use them — the harness will reject the call.
 - If conflicts are mechanical (non-overlapping struct fields, list entries, \
 imports, separate functions), resolve them additively — keep both sides.
 - If conflicts are SEMANTIC (same function modified two ways, contradictory \
-logic), DO NOT GUESS. Exit non-zero with a STUCK: line that starts with the \
-marker `coord:conflict=semantic` and then names the conflicting files and \
-line ranges, e.g.
+logic), DO NOT GUESS. Stop and end your turn with a STUCK: line that starts \
+with the marker `coord:conflict=semantic` and then names the conflicting \
+files and line ranges, e.g.
   STUCK: coord:conflict=semantic src/foo.py:40-72 — both sides rewrote \
 parse_args() differently
-The coordinator reads that marker and decides what happens next.
+The coordinator reads that marker from your transcript, not your process \
+exit code (which you cannot control), and decides what happens next.
 
 Progress reporting:
 - After each significant step (rebase started, conflicts resolved, tests \
@@ -273,14 +274,15 @@ entry-point registration. Those stay sealed even for you.
 `manifest.d/<issue>.(yml|json)` fragment — it also touches a test body or \
 any other sealed file, OR the manifest conflict itself is not a clean \
 additive case (e.g. the same issue's own block was edited two different \
-ways) — DO NOT GUESS and do NOT touch it. Exit non-zero with a STUCK: line \
-that starts with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and then \
-names the file(s) in conflict, e.g.
+ways) — DO NOT GUESS and do NOT touch it. Stop and end your turn with a \
+STUCK: line that starts with the exact marker \
+`{SEALED_SCOPE_STUCK_MARKER}` and then names the file(s) in conflict, e.g.
   STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-33/audit.rs:1-40 \
 — conflict is in a test body, not {SEALED_MANIFEST_FILENAME}
-The coordinator reads that marker and hands this off to a human — there is \
-no stronger-model retry for this class of conflict, since the file stays \
-sealed regardless of which model resolves it.
+The coordinator reads that marker from your transcript, not your process \
+exit code (which you cannot control), and hands this off to a human — \
+there is no stronger-model retry for this class of conflict, since the \
+file stays sealed regardless of which model resolves it.
 
 Progress reporting:
 - After each significant step (rebase started, manifest conflict resolved, \
@@ -358,7 +360,7 @@ def build_sealed_manifest_conflict_briefing(
         "touches a test body, `contract.md`, a mock, a fixture, an "
         "entry-point registration, or anything else sealed — or the "
         "manifest conflict is not a clean additive case — DO NOT touch it. "
-        "Exit non-zero with a `STUCK:` line "
+        "Stop and end your turn with a `STUCK:` line "
         f"starting with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and "
         "the file(s)/reason, e.g.",
         "",
@@ -366,9 +368,11 @@ def build_sealed_manifest_conflict_briefing(
         "audit.rs:1-40 — conflict is in a test body, not "
         f"{SEALED_MANIFEST_FILENAME}",
         "",
-        "The coordinator reads that marker and hands this off to a human — "
-        "there is no stronger-model retry for this class of conflict, since "
-        "the file stays sealed regardless of which model resolves it.",
+        "The coordinator reads that marker from your transcript, not your "
+        "process exit code (which you cannot control), and hands this off "
+        "to a human — there is no stronger-model retry for this class of "
+        "conflict, since the file stays sealed regardless of which model "
+        "resolves it.",
         "",
         "You will NOT use `gh` or `git push --force` — both are denied by "
         "the harness. The coordinator owns PR retries and issue posting.",
@@ -514,18 +518,19 @@ def build_conflict_fix_briefing(
         "",
         "If the conflict is **semantic** — the same function modified two",
         "different ways, contradictory logic, an API rename that the other",
-        "side doesn't know about — DO NOT guess. Exit non-zero with a",
-        "`STUCK:` line that begins with the exact marker",
+        "side doesn't know about — DO NOT guess. Stop and end your turn",
+        "with a `STUCK:` line that begins with the exact marker",
         f"`{SEMANTIC_STUCK_MARKER}` and then names the file(s) and line",
         "ranges in conflict, e.g.",
         "",
         f"    STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:40-72 — both sides",
         "    rewrote parse_args() differently",
         "",
-        "The coordinator reads that marker to decide what happens next: the",
-        f"outcome is posted on issue #{entry.issue_number} and the merge",
-        "entry is either escalated for one stronger attempt or marked as",
-        "needing human resolution.",
+        "The coordinator reads that marker from your transcript, not your",
+        "process exit code (which you cannot control), to decide what",
+        f"happens next: the outcome is posted on issue #{entry.issue_number}",
+        "and the merge entry is either escalated for one stronger attempt",
+        "or marked as needing human resolution.",
         "",
         "You will NOT use `gh` or `git push --force` — both are denied by",
         "the harness. The coordinator owns PR retries and issue posting.",

@@ -1006,6 +1006,76 @@ class TestReconcileHook:
             _on_conflict_fix_done(fix, succeeded=True)
         post.assert_not_called()
 
+    def test_clean_exit_with_semantic_marker_is_not_treated_as_success(
+        self, two_machine_config: Config, coord_db, tmp_path,
+    ) -> None:
+        """#2565: a `claude -p` conflict-fix worker ends its turn (exit 0,
+        agent status "done") the same way whether it fixed the conflict or
+        gave up — it has no way to set its own exit code. A worker that
+        diagnosed the conflict as SEMANTIC and gave up with the
+        `coord:conflict=semantic` STUCK marker must not be treated as a
+        success just because the caller passed `succeeded=True`: the entry
+        must NOT be reset to PENDING (which would silently re-attempt the
+        identical, already-diagnosed conflict) — it must land exactly where
+        a `succeeded=False` semantic give-up already lands.
+        """
+        from coord import merge_queue as mq
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue()
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        # escalate_semantic_conflicts defaults off on two_machine_config, so
+        # this lands on the same HUMAN_REQUIRED outcome a `succeeded=False`
+        # semantic give-up would — never PENDING.
+        _on_conflict_fix_done(
+            fix, succeeded=True,
+            agent_entry={"log_path": str(log)},
+            board=Board(), config=two_machine_config,
+        )
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state == HUMAN_REQUIRED
+        assert "Manual rebase required" in (entry.error or "")
+
+    def test_clean_exit_without_marker_still_resets_to_pending(
+        self, two_machine_config: Config, coord_db, tmp_path,
+    ) -> None:
+        """The common case — a real fix, no marker in the log — is
+        unaffected by #2565's check: it still resets the entry to
+        PENDING."""
+        from coord import merge_queue as mq
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue()
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        _on_conflict_fix_done(
+            fix, succeeded=True,
+            agent_entry={"log_path": str(log)},
+            board=Board(), config=two_machine_config,
+        )
+
+        entry = mq.load_queue()[0]
+        assert entry.state == PENDING
+        assert entry.error is None
+
     def test_notify_path_resets_entry_to_pending(self, coord_db) -> None:
         """coord notify must re-enqueue the parent merge entry when a
         conflict-fix worker completes — the bug that caused the Merge box
@@ -1053,6 +1123,66 @@ class TestReconcileHook:
             "conflict-fix completion via notify should reset queue entry to PENDING"
         )
         assert queue[0].error is None
+
+    def test_notify_path_semantic_marker_does_not_reset_to_pending(
+        self, coord_db, tmp_path,
+    ) -> None:
+        """#2565: `coord notify` is the routinely-scheduled path (unlike
+        the full `reconcile()`, which only `coord resume` calls), so its
+        `post_transition` conflict-fix branch is where the bug actually
+        bit: it called `on_conflict_fix_done(succeeded=True)` unconditionally
+        on every clean exit, without ever reading the worker's own
+        `coord:conflict=semantic` STUCK marker. Assert the marker now
+        overrides the reported success here too.
+        """
+        from coord import merge_queue as mq
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.notify import post_transition, Transition, EVENT_COMPLETION
+
+        self._populate_queue()
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+
+        transition = Transition(
+            assignment_id="fix-id",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "conflict-fix",
+            "review_of_assignment_id": "abc123",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1060.0,
+            "branch": "issue-1-fix",
+            "log_path": str(log),
+        }
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.github_ops.post_issue_comment"),
+        ):
+            post_transition(transition, record, entry)
+
+        queue = mq.load_queue()
+        assert len(queue) == 1
+        assert queue[0].state == HUMAN_REQUIRED, (
+            "a semantic give-up must never be reset to PENDING just because "
+            "the worker exited cleanly"
+        )
+        assert "Manual rebase required" in (queue[0].error or "")
 
 
 # ── #2555 end-to-end: additive manifest.yml collision merges with no human ─
