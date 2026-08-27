@@ -57,9 +57,13 @@ repos:
     # (coord/**+tests/** -> pytest, tui/** -> cargo test, docs-only -> skip),
     # the quadraui path-dep symlink for tui/, and flake-tolerant re-runs.
     # `dispatch_smoke` runs this in place on whichever machine it dispatches
-    # to (see the `smoke_tests.capability_rules` rust rule below), so that
-    # machine's repo_paths checkout needs a `quadraui` sibling directory —
-    # true for every machine below (repo_paths list quadraui alongside it).
+    # to (see the `smoke_tests.capability_rules` rust rule below). #2804:
+    # the Rust arm no longer symlinks a `quadraui` sibling at all —
+    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so
+    # `cargo` resolves it itself and this runner never touches
+    # `~/src/quadraui`. `quadraui` still needs its OWN `repo_paths` entry
+    # below (it's dispatched to directly, as its own repo), just not as a
+    # build-time sibling of tui/.
     test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo code-coordinator"
     # #2091: `ci_command` is the command THIS REPO'S CI actually runs. The
     # Test stage prefers it over `test_command` (and over

@@ -11,7 +11,7 @@ from typing import Iterable
 
 from coord.config import Config
 from coord.deps import build_dep_graph, transitive_deps
-from coord.models import Proposal
+from coord.models import Board, Proposal
 
 CURRENT = "current"
 STALE = "stale"
@@ -171,27 +171,96 @@ def stale_or_dirty(freshness: Iterable[RepoFreshness]) -> list[RepoFreshness]:
     return [f for f in freshness if f.state in (STALE, DIRTY, MISSING)]
 
 
-def format_briefing_addendum(freshness: list[RepoFreshness]) -> str:
+def repo_busy_elsewhere(
+    dep_repo_name: str,
+    machine_name: str,
+    config: Config,
+    board: Board,
+    *,
+    also_running: Iterable[str] = (),
+) -> bool:
+    """True if *dep_repo_name*'s single shared checkout on *machine_name* is
+    a build input some OTHER assignment may be relying on right now (#2804).
+
+    A repo "relies on" *dep_repo_name* if it EITHER is *dep_repo_name* —
+    someone is actively working the dependency itself — OR *dep_repo_name*
+    is in its transitive ``depends_on`` set, meaning that repo's build reads
+    *dep_repo_name*'s on-disk checkout directly (a relative sibling path,
+    e.g. vimcode's `quadraui-pin.txt` convention, #638/#625). Either way,
+    that checkout is not this dispatch's alone to `git pull`/`checkout` —
+    doing so changes a concurrent build's inputs mid-flight, which is
+    exactly the scheduling-dependent phantom pin-mismatch #2804 is about:
+    the fix worker rebuilding against a *moved* `~/src/quadraui` reported a
+    red that had nothing to do with its own branch.
+
+    Checks the board's own ``active`` assignments with ``status ==
+    "running"`` on *machine_name*, plus *also_running* — repo names for
+    sibling proposals in the SAME dispatch batch that have not reached the
+    board yet (a `coord approve` of several proposals at once can put two
+    dependents of the same repo on one machine before either is recorded
+    there).
+
+    Pure/read-only: this only answers "would touching it be unsafe right
+    now" — the callers (`coord approve` / `coord assign`) are the ones that
+    decide to skip the pull.
+    """
+    graph = build_dep_graph(config.repos)
+
+    def _touches(repo_name: str) -> bool:
+        return repo_name == dep_repo_name or dep_repo_name in transitive_deps(repo_name, graph)
+
+    for a in board.active:
+        if a.status == "running" and a.machine_name == machine_name and _touches(a.repo_name):
+            return True
+    return any(_touches(name) for name in also_running)
+
+
+def format_briefing_addendum(
+    freshness: list[RepoFreshness],
+    *,
+    busy: Iterable[str] = (),
+) -> str:
     """Markdown block to append to a worker's briefing when deps are stale.
 
     #268: build deps are tagged with **(build dep)** so the worker knows
     to actually pull + build against them; reference repos are tagged
     **(reference)** so the worker knows it can read them for context but
     shouldn't expect them to be part of the build.
+
+    #2804: *busy* names build deps whose single shared checkout some OTHER
+    assignment on this machine may be building against right now (see
+    :func:`repo_busy_elsewhere`). Those entries must never be told to pull
+    — the checkout isn't this worker's alone, and moving it is exactly the
+    scheduling-dependent phantom #2804 is about. They get a distinct
+    "do not touch" instruction instead of the ordinary pull line.
     """
     needs = stale_or_dirty(freshness)
     if not needs:
         return ""
+    busy_set = set(busy)
     lines = [
         "",
         "### Stale dependencies",
-        "Before building, pull these repos.  Entries tagged "
-        "*(reference)* are not part of this repo's build — they're "
-        "siblings the worker may want to read for context.",
+        "Entries tagged *(reference)* are not part of this repo's build — "
+        "they're siblings the worker may want to read for context. "
+        "Otherwise, pull before building — UNLESS an entry says not to "
+        "(#2804): some are a single checkout shared with a concurrent "
+        "assignment on this machine, and pulling one out from under that "
+        "assignment is not this worker's call to make.",
     ]
     for f in needs:
         tag = " *(reference)*" if f.kind == REFERENCE else " *(build dep)*"
-        if f.state == STALE:
+        if f.kind == BUILD and f.repo_name in busy_set:
+            lines.append(
+                f"- `{f.repo_name}`{tag}: stale, but another assignment on "
+                "this machine may be building against its shared checkout "
+                "right now — do NOT `git pull`/`checkout`/symlink-swap it "
+                "(#2804). Build against whatever is currently checked out "
+                "there as-is; a pin-mismatch you hit anyway is a real "
+                "disagreement to report, not an artifact to fix by moving "
+                "the shared checkout."
+            )
+        elif f.state == STALE:
             lines.append(
                 f"- `{f.repo_name}`{tag} (local {f.local_sha[:7] if f.local_sha else '?'} "
                 f"→ remote {f.remote_sha[:7] if f.remote_sha else '?'})"

@@ -12,8 +12,9 @@
 # actually break anything?").  `coord drive` (#1392, the Python port of the
 # former drive-issue.sh) only OBSERVES the verdict this produces.
 #
-# #1392 kept this as shell on purpose: venv creation, the cargo env, and the
-# quadraui sibling symlink are genuinely shell work.  Its four sharp-edged
+# #1392 kept this as shell on purpose: venv creation and the cargo env are
+# genuinely shell work (see #2 below for why there is no quadraui sibling
+# symlink here as of #2804/#1973).  Its four sharp-edged
 # parsers were extracted to tested Python in coord/test_report.py (#1436) —
 # that module is the reference behaviour; the grep/awk below still mirrors it.
 #
@@ -41,12 +42,25 @@
 #     silently reporting SKIP.  A silent green Test gate on unrun tests is
 #     exactly the failure mode #1408 exists to close.
 #
-#  2. THE quadraui PATH DEP.  tui/Cargo.toml points at
-#     `../../quadraui/quadraui`, which is resolved RELATIVE TO THE WORKTREE —
-#     so in a scratch worktree it dangles and the build fails outright.  A
-#     sibling symlink to the real checkout is required.  Verified: without it
-#     the path does not exist; with it, the build succeeds.  (code-coordinator
-#     routing only; a repo run via `--fallback-command` builds itself.)
+#  2. THE quadraui PATH DEP — RETIRED, #2804.  Before #1973, tui/Cargo.toml
+#     pointed straight at `../../quadraui/quadraui`, resolved RELATIVE TO
+#     THE WORKTREE — so a scratch worktree needed a `quadraui` sibling
+#     symlinked in or the build dangled.  This runner used to create that
+#     symlink at `$(dirname "$WT")/quadraui`, ONE location shared by every
+#     worktree this machine ever tests — which is precisely the shared-
+#     mutable-checkout hazard #2804 is about (a concurrent run repointing it
+#     mid-build would silently change what THIS run compiled against).
+#     #1973 pinned `tui/Cargo.toml` to a quadraui git rev instead, so a
+#     normal `cargo build`/`cargo test` from tui/ never touches
+#     `~/src/quadraui` at all — this runner no longer creates or consults
+#     the shared symlink for that reason, not just to dodge #2804.  The one
+#     remaining local-path override (`tui/cargo-config-local-quadraui.toml.
+#     example`, copied to the git-ignored `tui/.cargo/config.toml`) is an
+#     opt-in, human-attended co-dev workflow — see
+#     `coord/skills/tui-quadraui-workflow/SKILL.md` — that must be reverted
+#     before a branch is pushed, so a Test-stage worktree should never see
+#     it; this runner does not special-case it.  (code-coordinator routing
+#     only; a repo run via `--fallback-command` builds itself.)
 #
 #  3. FLAKE FILTERING.  The tui suite has known races under full-parallel
 #     `cargo test` (#1260 tracks 3 in commands::tests; this script also caught
@@ -123,7 +137,6 @@ REPORT=""
 REPO_NAME="code-coordinator"
 FALLBACK_CMD=""
 PRINT_ROUTING=0
-QUADRAUI_SRC="${QUADRAUI_SRC:-$HOME/src/quadraui}"
 # Persistent so the 3m12s cold Rust build is paid once, not once per fix round
 # (warm rebuilds land in 10-35s).
 CARGO_TARGET="${COORD_TEST_CARGO_TARGET:-${TMPDIR:-/tmp}/coord-test-cargo-target-$(id -u)}"
@@ -931,19 +944,11 @@ run_rust() {
     export PATH
     log "cargo: $cargo"
 
-    # tui/Cargo.toml: quadraui = { path = "../../quadraui/quadraui" }, resolved
-    # from tui/ — so the worktree needs a quadraui sibling or the build dies.
-    local sibling
-    sibling="$(dirname "$WT")/quadraui"
-    if [[ ! -e "$sibling" ]]; then
-        [[ -d "$QUADRAUI_SRC" ]] || {
-            say "FAIL(rust): quadraui checkout not found at $QUADRAUI_SRC"
-            return 1
-        }
-        log "linking $sibling → $QUADRAUI_SRC (path-dep resolution)"
-        ln -sfn "$QUADRAUI_SRC" "$sibling"
-    fi
-    log "quadraui branch: $(git -C "$QUADRAUI_SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    # #2804: NO quadraui sibling symlink here — see header comment #2.
+    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so
+    # `cargo` fetches it itself; touching `~/src/quadraui` (or a shared
+    # symlink to it) from here would be exactly the shared-mutable-checkout
+    # hazard this issue is about, for zero build benefit.
 
     export CARGO_TARGET_DIR="$CARGO_TARGET"
     local out="$WT/.cargo.out"

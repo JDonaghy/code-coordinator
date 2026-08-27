@@ -265,3 +265,122 @@ def test_reference_repos_self_reference_raises() -> None:
     import pytest
     with pytest.raises(ConfigError, match="cannot reference itself"):
         _validate_dependencies(repos)
+
+
+# ── #2804: never pull a shared build-dep checkout out from under a ──────────
+# concurrent assignment on the same machine ─────────────────────────────────
+
+
+def _running(machine_name: str, repo_name: str, status: str = "running"):
+    from coord.models import Assignment
+
+    return Assignment(
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=1,
+        issue_title="t",
+        status=status,
+    )
+
+
+def test_repo_busy_elsewhere_true_when_dependent_running_on_machine() -> None:
+    """The vimcode#555 shape: quadraui is stale, but a vimcode assignment
+    (which `depends_on: [quadraui]`) is running on the same machine right
+    now — pulling quadraui there is unsafe."""
+    from coord.freshness import repo_busy_elsewhere
+    from coord.models import Board
+
+    cfg = _config(
+        [
+            Repo(name="vimcode", github="acme/vimcode", depends_on=["quadraui"]),
+            Repo(name="quadraui", github="acme/quadraui"),
+        ]
+    )
+    board = Board(active=[_running("precision", "vimcode")])
+    assert repo_busy_elsewhere("quadraui", "precision", cfg, board) is True
+
+
+def test_repo_busy_elsewhere_false_on_a_different_machine() -> None:
+    from coord.freshness import repo_busy_elsewhere
+    from coord.models import Board
+
+    cfg = _config(
+        [
+            Repo(name="vimcode", github="acme/vimcode", depends_on=["quadraui"]),
+            Repo(name="quadraui", github="acme/quadraui"),
+        ]
+    )
+    board = Board(active=[_running("elitebook", "vimcode")])
+    assert repo_busy_elsewhere("quadraui", "precision", cfg, board) is False
+
+
+def test_repo_busy_elsewhere_ignores_non_running_assignments() -> None:
+    from coord.freshness import repo_busy_elsewhere
+    from coord.models import Board
+
+    cfg = _config(
+        [
+            Repo(name="vimcode", github="acme/vimcode", depends_on=["quadraui"]),
+            Repo(name="quadraui", github="acme/quadraui"),
+        ]
+    )
+    board = Board(active=[_running("precision", "vimcode", status="pending")])
+    assert repo_busy_elsewhere("quadraui", "precision", cfg, board) is False
+
+
+def test_repo_busy_elsewhere_true_via_same_batch() -> None:
+    """A sibling proposal in the SAME `coord approve` batch hasn't reached
+    the board yet, but is about to build on the same machine — this is the
+    two-proposals-one-approve-call shape of #2804."""
+    from coord.freshness import repo_busy_elsewhere
+    from coord.models import Board
+
+    cfg = _config(
+        [
+            Repo(name="vimcode", github="acme/vimcode", depends_on=["quadraui"]),
+            Repo(name="coord-tui", github="acme/coord-tui", depends_on=["quadraui"]),
+            Repo(name="quadraui", github="acme/quadraui"),
+        ]
+    )
+    board = Board()
+    assert (
+        repo_busy_elsewhere(
+            "quadraui", "precision", cfg, board, also_running=["coord-tui"]
+        )
+        is True
+    )
+
+
+def test_repo_busy_elsewhere_true_when_the_dep_itself_is_the_running_repo() -> None:
+    """A `type=work` assignment on quadraui itself also counts — someone may
+    be actively moving its checkout onto their own branch right now."""
+    from coord.freshness import repo_busy_elsewhere
+    from coord.models import Board
+
+    cfg = _config([Repo(name="quadraui", github="acme/quadraui")])
+    board = Board(active=[_running("precision", "quadraui")])
+    assert repo_busy_elsewhere("quadraui", "precision", cfg, board) is True
+
+
+def test_briefing_addendum_marks_busy_build_dep_do_not_touch() -> None:
+    """A busy build dep gets a distinct "do not touch" line instead of the
+    ordinary pull instruction, and never the ordinary sha-diff line."""
+    fs = [
+        compare(
+            "quadraui",
+            {"sha": "old1234567", "branch": "main", "dirty": False},
+            "new9876543",
+        ),
+    ]
+    body = format_briefing_addendum(fs, busy={"quadraui"})
+    assert "`quadraui` *(build dep)*" in body
+    assert "do NOT" in body
+    assert "#2804" in body
+    assert "→" not in body  # not the ordinary "local X → remote Y" line
+
+
+def test_briefing_addendum_busy_is_a_noop_when_not_stale() -> None:
+    """`busy` only changes wording for entries that already needed a pull —
+    it must not conjure up an entry for a repo that's CURRENT."""
+    fs = [compare("quadraui", {"sha": "x", "branch": "main", "dirty": False}, "x")]
+    assert format_briefing_addendum(fs, busy={"quadraui"}) == ""
