@@ -120,6 +120,34 @@ purpose: the daemon-host gate itself (`daemon_name in busy_hosts` in
 message in `coord/release_cordon.py`) lives outside this module and needs
 its own look before any loosening — this is the finding, not the fix.
 
+#2854 IS THE LOOK #2618 DEFERRED
+---------------------------------
+#2618's finding was narrow on purpose: a live drive can now survive a
+`coord-serve` restart, so "occupied anywhere" no longer needs to defer the
+whole fleet — but `assess_quiescence` kept charging a between-legs `running`
+row to its host for the entry's entire remaining lifetime regardless,
+because #2240 only ever narrowed WHICH host that charge lands on, never
+whether it should still apply once the thing it was protecting (an
+in-flight worker process) is gone. Measured 2026-08-27: a propagate run
+cordoned two idle hosts because a third issue's *work* leg had started three
+minutes earlier, with smoke, review and merge still ahead of it — on that
+day's numbers, an hour or more of cordon for hosts with nothing running on
+them at all.
+
+`assess_quiescence`'s `now`/`settle_seconds` close that gap: a between-legs
+row (no live assignment right now) whose gap has already outlasted a short
+debounce is moved out of `busy` into `Quiescence.settled` instead — visible,
+never a silent drop, same as `stale` above. The debounce exists because "no
+live assignment right now" is one momentary read of a gap that is normally
+seconds long (see #2240's section below); requiring it to have already held
+for `settle_seconds` (default 20s, matching #2139's identical-shaped
+idle-restart debounce) is what keeps a lucky poll from reading a gap that is
+about to close as though it were actually open. See `assess_quiescence`'s
+own docstring for the exact mechanics, and #2854 for the fuller risk
+analysis (`notify.lock`, intra-issue version skew, the drive process itself
+never updating mid-run) that this fix does not, and does not need to, change
+anything about.
+
 LANE ORDER ANSWERS THE SKEW QUESTION
 ------------------------------------
 #1835 asks whether a fleet mid-roll — hosts at two versions — is safe for
@@ -534,6 +562,14 @@ NO_OP_STATUSES: frozenset[str] = frozenset(
 #: must not schedule an update the agent would then refuse.
 LIVE_ASSIGNMENT_STATUSES: frozenset[str] = frozenset({"RUNNING", "PENDING"})
 
+#: #2854: how long a host must show NO live assignment for an in-flight
+#: (but between-legs) drive-queue entry before that gap counts as settled
+#: enough to roll. Mirrors the #2139 idle-restart debounce's 20s window —
+#: same shape of problem (a momentarily-quiet host that is about to become
+#: busy again as the next leg lands), same fix. See :func:`assess_quiescence`
+#: for how this is spent.
+DEFAULT_BETWEEN_LEGS_SETTLE_SECONDS = 20.0
+
 
 # ── busy signals ─────────────────────────────────────────────────────────────
 
@@ -663,6 +699,14 @@ class Quiescence:
     #: doing the same disproof on its own cadence; this is the same evidence,
     #: re-checked on READ so a stopped timer cannot make it unfalsifiable.
     stale: tuple[str, ...] = ()
+    #: #2854: `running` queue rows that are genuinely BETWEEN LEGS (no live
+    #: assignment right now) and have stayed that way for at least the
+    #: settle window — see :func:`assess_quiescence`'s *now*/*settle_seconds*.
+    #: Not a busy signal (the whole point is that it does NOT block); not
+    #: silent either, same reasoning as `stale` above: a host rolled while
+    #: its issue's drive-queue row is still `running` must leave a readable
+    #: trace of why that was safe, not just a quiet absence from `busy`.
+    settled: tuple[str, ...] = ()
 
     @property
     def reason(self) -> str:
@@ -723,6 +767,7 @@ class Quiescence:
             "busy": [asdict(b) for b in self.busy],
             "fired_holds": list(self.fired_holds),
             "stale": list(self.stale),
+            "settled": list(self.settled),
         }
 
 
@@ -769,6 +814,37 @@ def _live_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str
     return hosts
 
 
+def _last_assignment_rows(
+    assignments: Iterable[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """``repo#issue`` → the single MOST RECENT assignment row for that key.
+
+    Any status, terminal included. The shared selection behind
+    :func:`_last_assignment_hosts` (which host) and
+    :func:`_last_assignment_idle_since` (#2854: how long that host has been
+    gone) — both must agree on WHICH row is "last", or a between-legs host
+    and its settle-window clock could end up describing two different
+    assignments.
+
+    Ordered by ``dispatched_at``, with rows that carry no timestamp treated
+    as oldest — a row we cannot place in time must never displace one we can.
+    """
+    best: dict[str, tuple[float, Mapping[str, Any]]] = {}
+    for row in assignments:
+        machine = str(row.get("machine_name") or row.get("machine") or "") or None
+        if not machine:
+            continue
+        try:
+            when = float(row.get("dispatched_at") or 0.0)
+        except (TypeError, ValueError):
+            when = 0.0
+        key = _queue_key(row)
+        previous = best.get(key)
+        if previous is None or when >= previous[0]:
+            best[key] = (when, row)
+    return {key: row for key, (_, row) in best.items()}
+
+
 def _last_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     """``repo#issue`` → the machine that ran its MOST RECENT assignment (#2240).
 
@@ -781,23 +857,43 @@ def _last_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str
     NOT there is a drive whose every leg fell out of retention, and such an
     entry keeps the old unattributable reading.
 
-    Ordered by ``dispatched_at``, with rows that carry no timestamp treated
-    as oldest — a row we cannot place in time must never displace one we can.
+    See :func:`_last_assignment_rows` for the row-selection rule this reads.
     """
-    best: dict[str, tuple[float, str]] = {}
-    for row in assignments:
-        machine = str(row.get("machine_name") or row.get("machine") or "") or None
-        if not machine:
+    return {
+        key: str(row.get("machine_name") or row.get("machine") or "")
+        for key, row in _last_assignment_rows(assignments).items()
+    }
+
+
+def _last_assignment_idle_since(
+    assignments: Iterable[Mapping[str, Any]],
+) -> dict[str, float]:
+    """``repo#issue`` → when its last-known host stopped running it (#2854).
+
+    ``finished_at`` off the SAME row :func:`_last_assignment_hosts` already
+    picked as "most recent" (see :func:`_last_assignment_rows`) — never a
+    second, independently-selected row, which could disagree about which
+    assignment is even being described.
+
+    A key is absent from the result — not mapped to ``0.0`` or any other
+    guess — when that row carries no readable ``finished_at`` (a legacy row,
+    or one written before the field existed). :func:`assess_quiescence`
+    treats an absent entry exactly like "not yet settled": a between-legs
+    gap this function cannot measure must never be read as long enough to
+    roll on a guess, the same "missing data fails toward the conservative
+    reading" rule the rest of this module already follows (see e.g.
+    `DRIFT_UNKNOWN` in `coord/release_cordon.py`).
+    """
+    out: dict[str, float] = {}
+    for key, row in _last_assignment_rows(assignments).items():
+        raw = row.get("finished_at")
+        if raw is None:
             continue
         try:
-            when = float(row.get("dispatched_at") or 0.0)
+            out[key] = float(raw)
         except (TypeError, ValueError):
-            when = 0.0
-        key = _queue_key(row)
-        previous = best.get(key)
-        if previous is None or when >= previous[0]:
-            best[key] = (when, machine)
-    return {key: machine for key, (_, machine) in best.items()}
+            continue
+    return out
 
 
 def busy_host_for_entry(
@@ -895,6 +991,8 @@ def assess_quiescence(
     assignments: Iterable[Mapping[str, Any]] = (),
     issues: Iterable[Mapping[str, Any]] = (),
     extra_busy: Iterable[Busy] = (),
+    now: float | None = None,
+    settle_seconds: float = DEFAULT_BETWEEN_LEGS_SETTLE_SECONDS,
 ) -> Quiescence:
     """Is the fleet idle enough to restart every agent on it?
 
@@ -955,6 +1053,38 @@ def assess_quiescence(
     ``running`` row, never retry or block one — that stays the tick's job.
     It closes exactly the gap that let a landed row block a roll forever
     with no clock and no way to contradict it.
+
+    #2854: ROLL BETWEEN LEGS, NOT BETWEEN ISSUES. Even after #2240 narrowed a
+    between-legs ``running`` row from fleet-wide to its one last-known host,
+    that host stayed charged as busy for the entry's ENTIRE remaining
+    lifetime — work, test, review, merge — including every gap between legs
+    where no worker process is actually running there. #2618 established
+    that a between-legs gap has nothing an agent restart could kill (no
+    poll in flight survives a restart uneventfully, and no unretried write
+    is outstanding either); this is the other half — actually treating that
+    gap as idle instead of only proving it *could* be.
+
+    A between-legs row (no entry in *live_assignment_hosts*) is no longer
+    unconditionally busy for its attributed host. It stays busy — same as
+    before — unless ALL of: *now* is given (a caller that never asks for the
+    settle window gets the old, safer-by-default behaviour), the row's last
+    known host can actually be named, and :func:`_last_assignment_idle_since`
+    can prove *at least* `settle_seconds` have passed since that host's last
+    assignment for this entry actually **finished** (``finished_at`` — not
+    when it was dispatched, which would only ever UNDERSTATE how recently a
+    worker was alive there). Meeting all three moves the entry into
+    :attr:`Quiescence.settled` instead of :attr:`Quiescence.busy` — visible,
+    exactly like `stale` above, never a silent drop.
+
+    The settle window itself exists because "no live assignment right now"
+    is a single, momentary read, and the between-legs gap it is trying to
+    catch is normally seconds long (see the module docstring's #2240
+    section) — a read that happens to land exactly inside one is not
+    evidence the gap will still be open by the time a roll actually acts on
+    it. Requiring the gap to have already lasted `settle_seconds` (default
+    :data:`DEFAULT_BETWEEN_LEGS_SETTLE_SECONDS`, the same 20s the #2139
+    idle-restart debounce uses for an identical shape of flapping) is a
+    debounce, not a probability judgement — same mechanism, same reason.
     """
     queue_entries = list(queue_entries)
     assignments = list(assignments)
@@ -962,10 +1092,12 @@ def assess_quiescence(
     board = build_board_view({"assignments": assignments, "issues": issues})
     live_assignment_hosts = _live_assignment_hosts(assignments)
     last_assignment_hosts = _last_assignment_hosts(assignments)
+    last_assignment_idle_since = _last_assignment_idle_since(assignments)
 
     busy: list[Busy] = []
     fired: list[str] = []
     stale: list[str] = []
+    settled: list[str] = []
 
     for entry in queue_entries:
         state = str(entry.get("state") or "")
@@ -980,29 +1112,44 @@ def assess_quiescence(
                 host = busy_host_for_entry(
                     entry, live_assignment_hosts, last_assignment_hosts
                 )
-                # #2240: say WHICH reading named the host. "between legs,
-                # attributed to its last known host" is the difference
-                # between a signal holding one machine and one holding the
-                # fleet, and a deferral nobody can take apart is a deferral
-                # nobody can act on.
-                detail = "restarting agents now would kill it mid-flight"
-                if (
-                    host
+                between_legs = (
+                    host is not None
                     and not entry.get("machine")
                     and key not in live_assignment_hosts
-                ):
-                    detail += (
-                        "; between legs — attributed to its last known host "
-                        "(#2240)"
-                    )
-                busy.append(
-                    Busy(
-                        kind="drive-queue entry running",
-                        subject=key,
-                        detail=detail,
-                        host=host,
-                    )
                 )
+                # #2854: a between-legs row whose gap has already outlasted
+                # the settle window is treated as genuinely idle for its
+                # host, not merely "attributed and busy anyway" — see this
+                # function's own docstring. `idle_for` stays `None` (never
+                # settled) whenever it cannot be PROVEN: no `now`, or no
+                # readable `finished_at` for the last assignment.
+                idle_for = None
+                if between_legs and now is not None:
+                    idle_since = last_assignment_idle_since.get(key)
+                    if idle_since is not None:
+                        idle_for = now - idle_since
+                if idle_for is not None and idle_for >= settle_seconds:
+                    settled.append(key)
+                else:
+                    # #2240: say WHICH reading named the host. "between legs,
+                    # attributed to its last known host" is the difference
+                    # between a signal holding one machine and one holding
+                    # the fleet, and a deferral nobody can take apart is a
+                    # deferral nobody can act on.
+                    detail = "restarting agents now would kill it mid-flight"
+                    if between_legs:
+                        detail += (
+                            "; between legs — attributed to its last known "
+                            "host (#2240)"
+                        )
+                    busy.append(
+                        Busy(
+                            kind="drive-queue entry running",
+                            subject=key,
+                            detail=detail,
+                            host=host,
+                        )
+                    )
         # A *fired* gate is the opposite of busy — the queue has stopped
         # itself waiting for precisely this deploy. Recorded, never counted.
         if str(entry.get("hold_state") or "") == HOLD_FIRED:
@@ -1034,6 +1181,7 @@ def assess_quiescence(
         busy=tuple(busy),
         fired_holds=tuple(dict.fromkeys(fired)),
         stale=tuple(dict.fromkeys(stale)),
+        settled=tuple(dict.fromkeys(settled)),
     )
 
 
