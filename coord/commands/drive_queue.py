@@ -413,7 +413,7 @@ def drive_queue_add(
     # misrepresent it as not-yet-started. This is enqueue-time ONLY: never
     # mirrored onto `coord drive-queue remove`, which must not untrack.
     if previous is None or previous.state != STATE_RUNNING:
-        apply_pipeline_track_labels_best_effort(repo, issue, config_path)
+        apply_pipeline_track_labels_best_effort(repo, issue)
     if auto_after:
         _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
