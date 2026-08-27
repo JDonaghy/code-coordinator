@@ -1349,131 +1349,161 @@ impl CoordApp {
         };
         let notes_h = (notes_rows as f32 * lh).min(rect.height * 0.5);
 
-        // #2271: the chart, when the report declares one this build can draw
-        // and the panel is tall enough that giving it rows does not gut the
-        // table. Both stay visible — the numbers are what get quoted, the
-        // chart is what gets scanned — and a `ChartPlan::None` costs exactly
-        // zero rows, which is what makes a chart-free (or older-daemon)
-        // report render byte-identically to before.
-        let plan = Self::reports_chart_plan(result, QUADRAUI_MULTI_SERIES_BARS);
         let body_h = (rect.height - notes_h).max(0.0);
-        let roomy = rect.height >= Self::REPORTS_CHART_MIN_PANEL_ROWS * lh;
-        let (chart_h, degrade_h) = match &plan {
-            ChartPlan::Render { .. } if roomy => {
-                ((Self::REPORTS_CHART_ROWS as f32 * lh).min(body_h * 0.45), 0.0)
-            }
-            // The reason line is one row and is worth it even when cramped:
-            // "no chart, and here is why" is the whole point of degrading.
-            ChartPlan::Degrade(_) if body_h > lh * 2.0 => (0.0, lh),
-            _ => (0.0, 0.0),
-        };
-        match &plan {
-            ChartPlan::Render { chart, title } if chart_h > 0.0 => {
-                // The caption row comes out of the chart's own allotment, so
-                // a titled chart never steals a row from the table.
-                let title_h = if title.is_empty() { 0.0 } else { lh };
-                if title_h > 0.0 {
-                    backend.draw_list(
-                        Rect::new(rect.x, rect.y, rect.width, title_h),
-                        &Self::reports_caption_list("reports-chart-title", &format!("  {title}")),
+
+        // #2827: `trend` renders as two stacked charts instead of the
+        // generic chart-plan + table below — see `render_trend_charts`'s
+        // doc comment for why this report cannot use the #2271 mechanism
+        // (one `y_range` can't honestly hold both a merge count and a
+        // dollar figure). This is a named, deliberate exception to "no
+        // report knows its own column names", the same exception #2405
+        // took for the Pipeline completed-issues grid.
+        if result.report_id == "trend" {
+            self.render_trend_charts(
+                backend,
+                Rect::new(rect.x, rect.y, rect.width, body_h),
+                lh,
+                result,
+            );
+        } else {
+            // #2271: the chart, when the report declares one this build can
+            // draw and the panel is tall enough that giving it rows does not
+            // gut the table. Both stay visible — the numbers are what get
+            // quoted, the chart is what gets scanned — and a
+            // `ChartPlan::None` costs exactly zero rows, which is what makes
+            // a chart-free (or older-daemon) report render byte-identically
+            // to before.
+            let plan = Self::reports_chart_plan(result, QUADRAUI_MULTI_SERIES_BARS);
+            let roomy = rect.height >= Self::REPORTS_CHART_MIN_PANEL_ROWS * lh;
+            let (chart_h, degrade_h) = match &plan {
+                ChartPlan::Render { .. } if roomy => {
+                    ((Self::REPORTS_CHART_ROWS as f32 * lh).min(body_h * 0.45), 0.0)
+                }
+                // The reason line is one row and is worth it even when
+                // cramped: "no chart, and here is why" is the whole point of
+                // degrading.
+                ChartPlan::Degrade(_) if body_h > lh * 2.0 => (0.0, lh),
+                _ => (0.0, 0.0),
+            };
+            match &plan {
+                ChartPlan::Render { chart, title } if chart_h > 0.0 => {
+                    // The caption row comes out of the chart's own
+                    // allotment, so a titled chart never steals a row from
+                    // the table.
+                    let title_h = if title.is_empty() { 0.0 } else { lh };
+                    if title_h > 0.0 {
+                        backend.draw_list(
+                            Rect::new(rect.x, rect.y, rect.width, title_h),
+                            &Self::reports_caption_list(
+                                "reports-chart-title",
+                                &format!("  {title}"),
+                            ),
+                        );
+                    }
+                    // No hover point and no crosshair: the chart is a scan
+                    // aid sitting above the table that carries the exact
+                    // numbers, so there is nothing a tooltip would add that
+                    // a glance down does not already give. The returned
+                    // `ChartLayout` is discarded for the same reason —
+                    // nothing hit-tests it.
+                    backend.draw_chart(
+                        Rect::new(rect.x, rect.y + title_h, rect.width, chart_h - title_h),
+                        chart,
+                        None,
+                        None,
                     );
                 }
-                // No hover point and no crosshair: the chart is a scan aid
-                // sitting above the table that carries the exact numbers, so
-                // there is nothing a tooltip would add that a glance down
-                // does not already give. The returned `ChartLayout` is
-                // discarded for the same reason — nothing hit-tests it.
-                backend.draw_chart(
-                    Rect::new(
-                        rect.x,
-                        rect.y + title_h,
-                        rect.width,
-                        chart_h - title_h,
-                    ),
-                    chart,
-                    None,
-                    None,
-                );
+                ChartPlan::Degrade(reason) if degrade_h > 0.0 => {
+                    backend.draw_list(
+                        Rect::new(rect.x, rect.y, rect.width, degrade_h),
+                        &Self::reports_caption_list(
+                            "reports-chart-degraded",
+                            &format!("  {reason}"),
+                        ),
+                    );
+                }
+                _ => {}
             }
-            ChartPlan::Degrade(reason) if degrade_h > 0.0 => {
+
+            let top_h = chart_h + degrade_h;
+            let table_h = (body_h - top_h).max(0.0);
+            let table_rect = Rect::new(rect.x, rect.y + top_h, rect.width, table_h);
+
+            if result.rows.is_empty() {
+                // An empty table renders as a bare header row, which reads
+                // like a broken fetch. Say what actually happened instead.
                 backend.draw_list(
-                    Rect::new(rect.x, rect.y, rect.width, degrade_h),
-                    &Self::reports_caption_list("reports-chart-degraded", &format!("  {reason}")),
+                    table_rect,
+                    &plain_list(
+                        "reports-no-activity",
+                        &match Self::reports_window_label(result) {
+                            Some(window) => format!("  No activity in this window ({window})."),
+                            None => "  No activity in this window.".to_string(),
+                        },
+                        0,
+                    ),
                 );
+            } else if table_h > 0.0 {
+                // A sort left over from a previous run whose column no
+                // longer exists is dropped rather than carried:
+                // `reports_sort` is cleared on every run
+                // (`reports_start_run`), so this only catches a result
+                // swapped in by some other path.
+                let sort = self
+                    .reports_sort
+                    .filter(|(col, _)| *col < result.columns.len());
+                let table = DataTable {
+                    id: WidgetId::new("reports-result"),
+                    columns: Self::reports_result_columns(result),
+                    rows: Self::reports_result_rows(
+                        result,
+                        &Self::reports_row_order(result, sort),
+                    ),
+                    selected_idx: None,
+                    scroll_offset: self.reports_result_scroll,
+                    // The ▲/▼ header indicator is drawn by the primitive
+                    // itself — the app only says which column and which way.
+                    sort,
+                    has_focus: false,
+                    show_scrollbar: true,
+                    min_total_width: Self::reports_table_min_width(result),
+                    // Horizontal scrolling is *reachable* (the floor above
+                    // can make the content wider than the viewport, and the
+                    // primitive then paints its h-scrollbar) but not yet
+                    // *drivable* — no drag/wheel handler moves this. Held at
+                    // 0.0 deliberately: `DataTableLayout::hit_test` has no
+                    // concept of `h_scroll`, so a non-zero value here would
+                    // shift the painted headers out from under the hit-test
+                    // and route column-sort clicks to the wrong column.
+                    //
+                    // #1853 confirmed that reading is still correct, and
+                    // that Audit (which *does* drive `audit_h_scroll`) has
+                    // the same latent mis-routing — unnoticed only because a
+                    // stray header click there does nothing. Filed
+                    // separately; not touched here. Column resize does not
+                    // reopen the question: `drag_divider` moves width
+                    // *between* a pair and freezes the rest, so total
+                    // content width is unchanged by a drag and a resize can
+                    // never newly force horizontal scrolling.
+                    h_scroll: 0.0,
+                    // #1853: user-dragged widths for *this* column set, or
+                    // empty when the last drag belonged to a different
+                    // report (or a differently-shaped result from the same
+                    // one).
+                    column_overrides: self.reports_active_overrides(result),
+                    // #1763: pinned Σ row (quadraui#432) when the report
+                    // supplies one — `usage` does, `issue-activity` does
+                    // not.
+                    footer: Self::reports_footer_row(result),
+                };
+                // Cache the painted geometry *with the rect it was painted
+                // into* — unlike Audit's table this one does not start at
+                // the main panel's origin (the section stack is above it),
+                // so a bare `pos - main_b` would mis-hit-test by the stack's
+                // height.
+                let layout = backend.draw_data_table(table_rect, &table, None);
+                *self.reports_table_layout.borrow_mut() = Some((table_rect, layout));
             }
-            _ => {}
-        }
-
-        let top_h = chart_h + degrade_h;
-        let table_h = (body_h - top_h).max(0.0);
-        let table_rect = Rect::new(rect.x, rect.y + top_h, rect.width, table_h);
-
-        if result.rows.is_empty() {
-            // An empty table renders as a bare header row, which reads like
-            // a broken fetch. Say what actually happened instead.
-            backend.draw_list(
-                table_rect,
-                &plain_list(
-                    "reports-no-activity",
-                    &match Self::reports_window_label(result) {
-                        Some(window) => format!("  No activity in this window ({window})."),
-                        None => "  No activity in this window.".to_string(),
-                    },
-                    0,
-                ),
-            );
-        } else if table_h > 0.0 {
-            // A sort left over from a previous run whose column no longer
-            // exists is dropped rather than carried: `reports_sort` is
-            // cleared on every run (`reports_start_run`), so this only
-            // catches a result swapped in by some other path.
-            let sort = self
-                .reports_sort
-                .filter(|(col, _)| *col < result.columns.len());
-            let table = DataTable {
-                id: WidgetId::new("reports-result"),
-                columns: Self::reports_result_columns(result),
-                rows: Self::reports_result_rows(result, &Self::reports_row_order(result, sort)),
-                selected_idx: None,
-                scroll_offset: self.reports_result_scroll,
-                // The ▲/▼ header indicator is drawn by the primitive
-                // itself — the app only says which column and which way.
-                sort,
-                has_focus: false,
-                show_scrollbar: true,
-                min_total_width: Self::reports_table_min_width(result),
-                // Horizontal scrolling is *reachable* (the floor above can
-                // make the content wider than the viewport, and the
-                // primitive then paints its h-scrollbar) but not yet
-                // *drivable* — no drag/wheel handler moves this. Held at
-                // 0.0 deliberately: `DataTableLayout::hit_test` has no
-                // concept of `h_scroll`, so a non-zero value here would
-                // shift the painted headers out from under the hit-test
-                // and route column-sort clicks to the wrong column.
-                //
-                // #1853 confirmed that reading is still correct, and that
-                // Audit (which *does* drive `audit_h_scroll`) has the same
-                // latent mis-routing — unnoticed only because a stray
-                // header click there does nothing. Filed separately; not
-                // touched here. Column resize does not reopen the question:
-                // `drag_divider` moves width *between* a pair and freezes
-                // the rest, so total content width is unchanged by a drag
-                // and a resize can never newly force horizontal scrolling.
-                h_scroll: 0.0,
-                // #1853: user-dragged widths for *this* column set, or
-                // empty when the last drag belonged to a different report
-                // (or a differently-shaped result from the same one).
-                column_overrides: self.reports_active_overrides(result),
-                // #1763: pinned Σ row (quadraui#432) when the report
-                // supplies one — `usage` does, `issue-activity` does not.
-                footer: Self::reports_footer_row(result),
-            };
-            // Cache the painted geometry *with the rect it was painted
-            // into* — unlike Audit's table this one does not start at the
-            // main panel's origin (the section stack is above it), so a
-            // bare `pos - main_b` would mis-hit-test by the stack's height.
-            let layout = backend.draw_data_table(table_rect, &table, None);
-            *self.reports_table_layout.borrow_mut() = Some((table_rect, layout));
         }
 
         if notes_h > 0.0 {
@@ -1496,6 +1526,234 @@ impl CoordApp {
                     show_v_scrollbar: true,
                 },
             );
+        }
+    }
+
+    // ── #2827: the Trend report's two-chart body ─────────────────────────
+    //
+    // `trend` (#2826) buckets merges over time and cannot be read honestly
+    // as one `quadraui::Chart`: `merged` is a small integer count (0-20ish)
+    // and `cost_per_issue` is a dollar figure (0-50ish) on the SAME row, and
+    // `Chart` has exactly one `y_range` for the whole widget — normalising
+    // both onto it would either flatten `merged` to a smear along the floor
+    // or destroy the ability to read either value's actual magnitude, which
+    // is the entire point of a "does cost fall while throughput rises"
+    // panel. So this does not go through the #2271 `ReportResult.chart`
+    // declaration mechanism at all (`trend` declares none server-side,
+    // deliberately) — it draws two independent `Chart` widgets, stacked,
+    // called directly from `render_reports_result` whenever
+    // `result.report_id == "trend"`.
+    //
+    // Both charts share the SAME range selector: the `range` `ReportParam`
+    // (`1d`/`3d`/`7d`/`1m`, ≤5 choices) already renders as a
+    // `SegmentedControl` in this report's sidebar form via the fully
+    // generic `reports_param_form` above — nothing new is added for it.
+    // "Shared" just means there is exactly one such control, not one per
+    // chart, which falls out for free from both charts reading the same
+    // `ReportResult`.
+    //
+    // This is a *named exception* to the module-doc rule that no code here
+    // knows a specific report's column names — the same exception #2405
+    // took for the Pipeline completed-issues grid, for the same reason:
+    // there is no report-agnostic spelling of what this needs. Adding a
+    // `trend`-shaped report #2 would require touching this block; nothing
+    // else in this file is affected.
+
+    /// `merged` (chart A, `ChartKind::Bar`): a discrete per-bucket count,
+    /// always present (`coord/reports.py`'s `fold_trend` never emits `null`
+    /// here) and genuinely zero for an empty bucket — a bar can honestly
+    /// *be* zero, which is why this is the one column of the two that never
+    /// needs a "what does a missing value mean" decision.
+    pub(crate) fn trend_merged_series(result: &ReportResult) -> Series {
+        Series {
+            label: "Merged".to_string(),
+            data: result
+                .rows
+                .iter()
+                .map(|r| Self::reports_chart_value(r, "merged").unwrap_or(0.0))
+                .collect(),
+            color: None,
+            fill: false,
+        }
+    }
+
+    /// `cost_per_issue` (chart B, `ChartKind::Line`, `fill: true`): a
+    /// trailing-window mean that comes back `null` — never `0.0` — for a
+    /// bucket whose trailing window saw no merge at all (`fold_trend`'s own
+    /// doc comment, #2826). Coercing that to `0.0` would draw a cost
+    /// collapse that never happened, which the issue calls out as the one
+    /// wrong answer.
+    ///
+    /// The rendering choice here is **hold the value** — forward-fill a
+    /// `null` bucket with the most recent known reading, and seed any
+    /// *leading* run of `null`s (no "previous" reading yet) with the first
+    /// reading that does exist — rather than shortening the series to start
+    /// at the first non-null bucket. That second option reads as more
+    /// "honest" in isolation, but quadraui's TUI chart rasteriser places
+    /// data point `i` of an `n`-point series at `i / (n-1)` of the plot
+    /// width — `Chart::x_range` is not consulted for point placement at all
+    /// (`primitives/chart.rs::layout`) — so a series shortened to skip its
+    /// leading nulls would not start partway across the plot where those
+    /// buckets actually sit; it would stretch to fill the *entire* width,
+    /// silently misrepresenting when the visible data actually begins.
+    /// Holding the value keeps this series exactly `result.rows.len()` long,
+    /// pixel-aligned with the `merged` bars above it, at the cost of a flat
+    /// stretch during a genuine no-merge gap — a truthful "nothing changed"
+    /// reading, not a fabricated one.
+    ///
+    /// Returns `None` only when not a single bucket has a reading (no merge
+    /// anywhere in the window or its lookback) — there is no "first known
+    /// value" to hold in that case, so the chart is dropped rather than
+    /// drawn from nothing.
+    pub(crate) fn trend_cost_series(result: &ReportResult) -> Option<Series> {
+        let raw: Vec<Option<f64>> = result
+            .rows
+            .iter()
+            .map(|r| Self::reports_chart_value(r, "cost_per_issue"))
+            .collect();
+        // Seed with the FIRST known reading (not `0.0`) so a *leading* run
+        // of nulls — no "previous" reading exists yet — is backward-filled
+        // from it rather than reading as a cost of zero. The `?` here is
+        // also the "not a single bucket has a reading" early-out this
+        // function's doc comment promises.
+        let mut held = raw.iter().find_map(|v| *v)?;
+        let data: Vec<f64> = raw
+            .into_iter()
+            .map(|v| {
+                if let Some(v) = v {
+                    held = v;
+                }
+                held
+            })
+            .collect();
+        Some(Series {
+            label: "$ / issue".to_string(),
+            data,
+            color: None,
+            fill: true,
+        })
+    }
+
+    /// Minimum body height (in rows) the two charts need to be worth
+    /// drawing at all: one caption row + a handful of plot rows each. Below
+    /// this, a two-pixel-tall chart helps nobody — same posture as
+    /// `REPORTS_CHART_MIN_PANEL_ROWS` for the single-chart case.
+    const TREND_CHART_MIN_PANEL_ROWS: f32 = 10.0;
+
+    /// The Trend report's main-panel body: two stacked charts, each with a
+    /// one-row caption, sharing `rect`'s full width. Takes `result`
+    /// explicitly (rather than re-reading `self.reports_result`) because
+    /// the caller already holds the borrow.
+    fn render_trend_charts(
+        &self,
+        backend: &mut dyn Backend,
+        rect: Rect,
+        lh: f32,
+        result: &ReportResult,
+    ) {
+        if result.rows.is_empty() {
+            // Mirrors the generic table path's empty-window message — this
+            // report takes the whole body rect itself, so it needs its own
+            // copy rather than falling through to the table's.
+            backend.draw_list(
+                rect,
+                &plain_list(
+                    "trend-empty",
+                    &match Self::reports_window_label(result) {
+                        Some(window) => format!("  No buckets in this window ({window})."),
+                        None => "  No buckets in this window.".to_string(),
+                    },
+                    0,
+                ),
+            );
+            return;
+        }
+
+        let caption_h = lh;
+        if rect.height < Self::TREND_CHART_MIN_PANEL_ROWS * lh {
+            backend.draw_list(
+                rect,
+                &plain_list(
+                    "trend-too-short",
+                    "  Panel too short to draw the trend charts — resize the window.",
+                    0,
+                ),
+            );
+            return;
+        }
+
+        let each_h = ((rect.height - caption_h * 2.0) / 2.0).floor();
+        let top_caption = Rect::new(rect.x, rect.y, rect.width, caption_h);
+        let top_chart = Rect::new(rect.x, rect.y + caption_h, rect.width, each_h);
+        let bottom_caption_y = rect.y + caption_h + each_h;
+        let bottom_caption = Rect::new(rect.x, bottom_caption_y, rect.width, caption_h);
+        let bottom_chart_y = bottom_caption_y + caption_h;
+        let bottom_chart = Rect::new(
+            rect.x,
+            bottom_chart_y,
+            rect.width,
+            (rect.y + rect.height - bottom_chart_y).max(0.0),
+        );
+
+        backend.draw_list(
+            top_caption,
+            &Self::reports_caption_list(
+                "trend-throughput-title",
+                "  Throughput — merges per bucket",
+            ),
+        );
+        let merged_chart = Chart {
+            id: WidgetId::new("trend-chart-merged"),
+            kind: ChartKind::Bar,
+            series: vec![Self::trend_merged_series(result)],
+            x_label: None,
+            y_label: Some("Merged".to_string()),
+            y_range: None,
+            x_range: None,
+            show_legend: false,
+            y_ticks: None,
+            x_ticks: None,
+            show_grid: true,
+        };
+        // No hover point/crosshair: same reasoning as the #2271 single
+        // chart — this is a scan aid, nothing hit-tests the returned
+        // layout.
+        backend.draw_chart(top_chart, &merged_chart, None, None);
+
+        backend.draw_list(
+            bottom_caption,
+            &Self::reports_caption_list(
+                "trend-efficiency-title",
+                "  Efficiency — $/issue (trailing mean)",
+            ),
+        );
+        match Self::trend_cost_series(result) {
+            Some(series) => {
+                let cost_chart = Chart {
+                    id: WidgetId::new("trend-chart-cost"),
+                    kind: ChartKind::Line,
+                    series: vec![series],
+                    x_label: None,
+                    y_label: Some("$/Issue".to_string()),
+                    y_range: None,
+                    x_range: None,
+                    show_legend: false,
+                    y_ticks: None,
+                    x_ticks: None,
+                    show_grid: true,
+                };
+                backend.draw_chart(bottom_chart, &cost_chart, None, None);
+            }
+            None => {
+                backend.draw_list(
+                    bottom_chart,
+                    &plain_list(
+                        "trend-chart-cost-empty",
+                        "  No cost data yet — no merges in this window or its lookback.",
+                        0,
+                    ),
+                );
+            }
         }
     }
 
