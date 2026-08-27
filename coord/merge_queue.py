@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, NamedTuple, Protocol
+from typing import Any, Iterable, Mapping, NamedTuple, Protocol
 
 from coord import sql
 from coord.audit import record_audit
@@ -1910,6 +1910,47 @@ def is_ci_terminal_reason(reason: str | None) -> bool:
         or is_ci_flaky_reason(reason)
         or is_ci_unreadable_reason(reason)
     )
+
+
+def ci_rollup_all_clear(summary: Any) -> bool:
+    """``True`` when a ``merge_plan`` row's ``ci_summary`` positively shows
+    every check on that PR has finished and none of them failed (#2158,
+    generalised by #2808).
+
+    *summary* is the wire form of :class:`coord.ci_store.CiCheckSummary` —
+    ``asdict``'d into the ``/board`` payload by ``serve_app`` — or ``None``
+    (no PR, no ``ci_store``, or a gate snapshot that has not fetched this PR
+    yet). Anything that is not a readable rollup, or a rollup with nothing in
+    it at all, returns ``False``: callers use this as evidence AGAINST a
+    persisted "CI running: ..."/"CI infra: ..."/"CI re-checking: ..."
+    reading, and absence of a rollup is not evidence. ``passed > 0`` (rather
+    than ``passed + failed > 0``) with ``failed == 0`` is the same "all
+    green" reading :func:`_entry_gate_status` arrives at when it returns
+    ``PLAN_READY``.
+
+    #2808: originally private to :mod:`coord.drive_queue` (as
+    ``_ci_rollup_all_clear``), where it recovers ``coord drive-queue``'s
+    `parked` reconciliation from the exact same bug this generalises for
+    :func:`coord.drive_state._merge_entry` — a fresh, empty ``reason`` from
+    ``_entry_gate_status`` (``PLAN_READY``, nothing blocking) getting
+    discarded in favour of a raw queue row's ``error`` string that only a
+    LIVE ``coord merge`` attempt ever rewrites, and #1891's "wait, don't
+    retry" contract means nothing ever runs one again while the frozen
+    reading itself is what keeps the driver waiting. Moved here — the
+    ``CiCheckSummary`` wire-form reader belongs beside the other CI-reason
+    predicates, not duplicated per caller (the exact "two independent
+    implementations that agree today are a split-brain waiting to happen"
+    shape :func:`is_ci_terminal_reason` above was already written to avoid).
+    """
+    if not isinstance(summary, Mapping):
+        return False
+    try:
+        passed = int(summary.get("passed") or 0)
+        failed = int(summary.get("failed") or 0)
+        running = int(summary.get("running") or 0)
+    except (TypeError, ValueError):  # a malformed rollup is not evidence
+        return False
+    return running == 0 and failed == 0 and passed > 0
 
 
 # #1892: auto-reruns `process()` will trigger for a single entry's verdictless
@@ -5016,16 +5057,18 @@ def plan(
                 # #2446: `ci_summary` MUST stay derived from the same
                 # (already required-narrowed) `list_checks_for_pr` view
                 # `_entry_gate_status` just consulted above — do not widen it
-                # to the unfiltered check list. `coord.drive_queue
-                # ._ci_rollup_all_clear` reads this exact field as positive
-                # evidence that a frozen "CI running:" raw-row string has
-                # gone stale, and that evidence is only valid when it is
-                # counting the SAME checks the live gate decision is based
-                # on (see that function's docstring); widening it here would
-                # make a still-pending ADVISORY check block the #2158
-                # park-recovery self-heal even though the gate itself (and
-                # GitHub's own merge button) is already clear. Advisory
-                # visibility is a genuinely separate concern — see
+                # to the unfiltered check list. :func:`ci_rollup_all_clear`
+                # (used by both `coord.drive_queue`'s #2158 park-recovery and
+                # `coord.drive_state`'s #2808 recovery) reads this exact
+                # field as positive evidence that a frozen "CI running:"
+                # raw-row string has gone stale, and that evidence is only
+                # valid when it is counting the SAME checks the live gate
+                # decision is based on (see that function's docstring);
+                # widening it here would make a still-pending ADVISORY check
+                # block the #2158 park-recovery self-heal even though the
+                # gate itself (and GitHub's own merge button) is already
+                # clear. Advisory visibility is a genuinely separate concern
+                # — see
                 # `ci_summary_all` below.
                 if ci_store is not None and ci_store.is_available and entry.pr_number:
                     checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)

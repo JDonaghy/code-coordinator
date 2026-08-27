@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from coord.merge_queue import (
+    ci_rollup_all_clear,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
@@ -614,6 +615,42 @@ def _merge_entry(
         # time. `plan_entry["reason"]` (i.e. `reason` here) already carries
         # it whenever it applies — there is nothing for the raw row to
         # recover that the fresh plan reading doesn't already have.
+
+        # #2808: positive evidence AGAINST the raw-row fallback/recovery
+        # above, mirroring `coord.drive_queue`'s #2158 `ci_rollup_all_clear`
+        # recovery for the identical bug in the `parked`-entry path
+        # (claude-coordinator#2138: a `parked` entry sat behind a stale "CI
+        # running: ..." reading for 7h25m after CI had actually gone green
+        # 41s before the park was written). Both the bare `or` fallback just
+        # above AND the shadowing loop just above THIS comment trust the raw
+        # row's PERSISTED `error` whenever the fresh `plan_entry["reason"]`
+        # is falsy — correct when nothing has re-derived the gate yet
+        # (`_gate_refresher` lagging, or the daemon-host tick which never
+        # populates `merge_plan` at all), wrong when the fresh reading is
+        # falsy BECAUSE `_entry_gate_status` confidently found nothing
+        # blocking (`PLAN_READY`) and the raw row is simply a frozen
+        # leftover from an earlier live `coord merge` attempt. #1891's own
+        # "wait, don't retry" contract is exactly what keeps that leftover
+        # frozen forever once this happens: nothing ever runs a live `coord
+        # merge` again while `is_ci_pending_reason(state.merge_reason)`
+        # itself is what tells `coord.drive._decide_merge` to keep waiting —
+        # a self-sustaining stale read with no path back to correctness
+        # (claude-coordinator#2808: `coord drive` held a fully green,
+        # already-`--dry-run`-mergeable PR for 3h22m on exactly this).
+        # `plan_entry["ci_summary"]` is the SAME tick-refreshed check-run
+        # rollup `_entry_gate_status` itself just consulted to decide
+        # `PLAN_READY` (`coord.gate_snapshot`, refreshed every ~30s) —
+        # independent of whatever text is frozen on the raw row — so a
+        # rollup that positively shows every check finished and none failed
+        # is direct evidence the raw reading is stale, not merely absent.
+        # Deliberately gated on `not plan_entry.get("reason")`, the SAME
+        # "plan itself is silent" restriction #2158 uses: a fresh reading
+        # that names a DIFFERENT live objection (review/smoke/UAT/a genuine
+        # "CI failed: ...") already won above and is left untouched.
+        if not plan_entry.get("reason") and ci_rollup_all_clear(
+            plan_entry.get("ci_summary")
+        ):
+            reason = None
 
     return {
         "status": status,
