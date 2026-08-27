@@ -30,6 +30,7 @@ TWO POSTURES WORTH KEEPING WHEN EDITING THIS FILE:
 from __future__ import annotations
 
 import json as _json
+import logging
 import socket
 import subprocess
 import time
@@ -103,6 +104,8 @@ from coord.overlap_predict import (
     predictions_from_audit,
     tally,
 )
+
+log = logging.getLogger(__name__)
 
 # Wall-clock ceiling for the `coord drive --tmux` launch subprocess.  The
 # launch itself only blocks for #1606's liveness verification (16 × 0.5s) plus
@@ -3226,7 +3229,17 @@ def _fetch_live_blocked_gate(
     the whole queue and not forever — an entry that resumes leaves `blocked`
     and stops costing anything; one confirmed still-shut is untouched and
     re-pays this same bounded cost next tick, identical to how a
-    still-CI-pending `parked` entry already does.
+    still-CI-pending `parked` entry already does. This no longer holds
+    exactly once the #2806 self-heal below fires: `enqueue_approved_work`
+    scans the WHOLE `board.completed` list, not just this tick's qualifying
+    blocked entries, so an entry that will never earn a queue row (its Work
+    never satisfies the review/smoke gates) repeats that full-board scan
+    every tick indefinitely rather than paying a bounded per-entry cost —
+    accepted for now since `coord serve`'s passive tick already runs the
+    same call roughly every `COORD_RECONCILE_INTERVAL` (~30s), far more
+    often than this tick's own cadence, so this self-heal is a rare-race
+    backstop rather than the common path; revisit with a cooldown/backoff
+    per entry if the full-board scan cost ever shows up in practice.
 
     #2806 SELF-HEAL. A qualifying entry with a real branch/PR behind it can
     still have no ``coord.merge_queue`` row yet — the merge queue is
@@ -3268,10 +3281,6 @@ def _fetch_live_blocked_gate(
     blocked, but distinctly reported as unreadable when the second dict
     says why" (`_reconcile_blocked` never guesses at a gate reading).
     """
-    import logging  # noqa: PLC0415
-
-    _log = logging.getLogger(__name__)
-
     targets = [
         e for e in entries
         if e.state == STATE_BLOCKED
@@ -3301,7 +3310,7 @@ def _fetch_live_blocked_gate(
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }
     except Exception as exc:  # noqa: BLE001 — see the fail-soft note above
-        _log.warning(
+        log.warning(
             "blocked-gate sweep (#2806): could not build board/config/queue "
             "for this tick's %d qualifying blocked entr%s — every one falls "
             "back to the board-only reading, unreadable: %r",
@@ -3321,7 +3330,7 @@ def _fetch_live_blocked_gate(
                 entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
             }
         except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
-            _log.info(
+            log.warning(
                 "blocked-gate sweep (#2806): enqueue_approved_work self-heal "
                 "failed, continuing with the queue as already loaded: %r", exc,
             )
@@ -3346,19 +3355,19 @@ def _fetch_live_blocked_gate(
             # wins outright and this text is never consulted again.
             if not is_pre_dispatch_block_reason(getattr(e, "last_reason", "") or ""):
                 unreadable[e.key] = reason
-                _log.info("blocked-gate sweep (#2806): %s — %s", e.key, reason)
+                log.warning("blocked-gate sweep (#2806): %s — %s", e.key, reason)
             continue
         if not q.pr_number:
             reason = "merge-queue row has no PR number yet"
             unreadable[e.key] = reason
-            _log.info("blocked-gate sweep (#2806): %s — %s", e.key, reason)
+            log.warning("blocked-gate sweep (#2806): %s — %s", e.key, reason)
             continue
         try:
             status, _reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
         except Exception as exc:  # noqa: BLE001 — leave this one entry to the fallback
             reason = f"entry_gate_status raised: {exc!r}"
             unreadable[e.key] = reason
-            _log.warning("blocked-gate sweep (#2806): %s — %s", e.key, reason)
+            log.warning("blocked-gate sweep (#2806): %s — %s", e.key, reason)
             continue
         overrides[e.key] = status != _mq.PLAN_READY
     return overrides, unreadable
