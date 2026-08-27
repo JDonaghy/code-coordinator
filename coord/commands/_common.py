@@ -483,8 +483,33 @@ PIPELINE_TRACK_LABELS_ADD = {"coord", "status:ready"}
 PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT = {"status:refining", "status:backlog"}
 
 
+def resolve_repo_slug_best_effort(config: Config | None, repo: str) -> str | None:
+    """Non-fatal sibling of :func:`_resolve_repo_slug` (#2839 review).
+
+    Returns the GitHub ``OWNER/REPO`` slug for *repo*, or ``None`` when it
+    cannot be determined. Unlike ``_resolve_repo_slug`` it never calls
+    ``sys.exit`` — it is for callers whose own job is not "talk to the
+    forge", where an unresolvable name must degrade rather than abort.
+
+    *config* is ``None`` when the caller could not load one at all (a thin
+    client whose board daemon is momentarily unreachable); that is a
+    legitimate, expected input, not an error.
+    """
+    if config is not None:
+        repo_entry = config.repo(repo)
+        if repo_entry is not None:
+            return repo_entry.github
+    # Not in coordinator.yml (or no config at all): a raw `OWNER/REPO` slug is
+    # still directly usable by the forge backend — same accepted fallback
+    # `_resolve_repo_slug` validates. Anything else is a bare local name we
+    # cannot map, so say so with `None` rather than guessing.
+    if "/" in repo:
+        return repo
+    return None
+
+
 def apply_pipeline_track_labels_best_effort(
-    repo: str, issue: int,
+    repo: str, issue: int, *, config: Config | None,
 ) -> None:
     """Best-effort ``coord`` + ``status:ready`` label application (#2839).
 
@@ -502,19 +527,30 @@ def apply_pipeline_track_labels_best_effort(
     already-absent ``remove`` labels, so re-running this on an
     already-tracked issue is a silent no-op, not a duplicate write.
 
-    Deliberately does **not** resolve *repo*'s GitHub slug via
-    ``_load_config``/``cfg.repo`` (#2839 review): ``_load_config`` turns a
-    config-load failure — e.g. a thin client's ``fetch_remote_config``
-    round-trip to a momentarily-unreachable board daemon — into
-    ``sys.exit(2)``, and ``SystemExit`` is a ``BaseException``, not an
-    ``Exception``, so it would blow straight through the ``except
-    Exception`` below and kill the whole ``drive-queue add`` process after
-    the board row was already written. Passing ``repo_github=None`` instead
-    lets ``apply_issue_labels``/``_apply_issue_labels_local`` fall back to
-    ``repo_github or repo_name`` (``coord/state.py``) — the same slug
-    ``_load_config`` would have produced for a plain (non-slug) repo name —
-    without a second, uncachable network round-trip to the daemon on every
-    single ``add``.
+    *config* is passed IN, already loaded, rather than loaded here — the two
+    halves of the #2839 review, together:
+
+    * It must not be loaded via ``_load_config`` inside this function.
+      ``_load_config`` turns a config-load failure (a thin client's
+      ``fetch_remote_config`` round-trip to a momentarily-unreachable board
+      daemon; a briefly-unreadable ``coordinator.yml``) into ``sys.exit(2)``,
+      and ``SystemExit`` is a ``BaseException``, not an ``Exception``, so it
+      would blow straight through the ``except`` below and kill the whole
+      ``drive-queue add`` process *after* the board row was written.
+    * But the slug must still be RESOLVED. ``coordinator.yml``'s ``name:``
+      key is routinely not the GitHub slug (this repo's own
+      ``coordinator.example.yml`` documents ``name: code-coordinator`` vs
+      ``github: JDonaghy/claude-coordinator``), and
+      ``_apply_issue_labels_local``'s ``repo_github or repo_name`` fallback
+      would hand that bare local name to ``gh issue edit --repo``, which
+      requires ``[HOST/]OWNER/REPO`` and errors out — so the label would
+      still never land for exactly the repos #2839 was filed about, only
+      now silently.
+
+    Taking the caller's already-loaded ``Config`` satisfies both: real slug
+    resolution, no second (uncachable, per-``add``) round trip to the daemon,
+    and no ``SystemExit`` path inside a best-effort helper. ``config=None``
+    is accepted and simply degrades to the ``repo_name`` fallback.
     """
     from coord.state import apply_issue_labels  # noqa: PLC0415
 
@@ -523,7 +559,7 @@ def apply_pipeline_track_labels_best_effort(
             repo, issue,
             add=PIPELINE_TRACK_LABELS_ADD,
             remove=PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT,
-            repo_github=None,
+            repo_github=resolve_repo_slug_best_effort(config, repo),
         )
     except Exception as exc:  # noqa: BLE001 — see docstring: must never block the enqueue
         log.warning(
