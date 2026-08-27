@@ -93,6 +93,7 @@ from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
 from coord.merge_queue import (
     PLAN_READY,
+    ci_rollup_all_clear,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_terminal_reason,
@@ -1052,32 +1053,6 @@ class BoardView:
         return self.issues.get(key, IssueFacts())
 
 
-def _ci_rollup_all_clear(summary: Any) -> bool:
-    """``True`` when a ``merge_plan`` row's ``ci_summary`` positively shows
-    every check on that PR has finished and none of them failed (#2158).
-
-    *summary* is the wire form of :class:`coord.ci_store.CiCheckSummary` —
-    ``asdict``'d into the ``/board`` payload by ``serve_app`` — or ``None``
-    (no PR, no ``ci_store``, or a gate snapshot that has not fetched this PR
-    yet).  Anything that is not a readable rollup, or a rollup with nothing
-    in it at all, returns ``False``: the caller uses this as evidence AGAINST
-    a persisted "CI running:" reading, and absence of a rollup is not
-    evidence.  ``passed > 0`` (rather than ``passed + failed > 0``) with
-    ``failed == 0`` is the same "all green" reading
-    ``coord.merge_queue._entry_gate_status`` arrives at when it returns
-    ``PLAN_READY``.
-    """
-    if not isinstance(summary, Mapping):
-        return False
-    try:
-        passed = int(summary.get("passed") or 0)
-        failed = int(summary.get("failed") or 0)
-        running = int(summary.get("running") or 0)
-    except (TypeError, ValueError):  # a malformed rollup is not evidence
-        return False
-    return running == 0 and failed == 0 and passed > 0
-
-
 def build_board_view(
     payload: Mapping[str, Any],
     live_sessions: Iterable[Mapping[str, Any] | str] = (),
@@ -1249,7 +1224,7 @@ def build_board_view(
         # may well still be the true reading of that failure (the plan can
         # never re-derive it — #1892), so a rollup showing red is not evidence
         # the infra park has cleared.
-        if not plan_reason and _ci_rollup_all_clear((plan_row or {}).get("ci_summary")):
+        if not plan_reason and ci_rollup_all_clear((plan_row or {}).get("ci_summary")):
             continue
         got = slot(key)
         got["merge_ci_pending"] = True

@@ -748,6 +748,92 @@ def test_merge_entry_prefers_the_raw_rows_ci_pending_reason_over_the_plans_gener
     assert state.merge_reason.startswith("CI running:")
 
 
+def test_merge_entry_does_not_freeze_a_stale_raw_ci_pending_reason_forever():
+    """#2808: claude-coordinator#2782's drive polled a PR for 3h22m insisting
+    "CI running: test (3.12), test (3.13), no-gh-on-path" while `coord merge
+    --dry-run` read the SAME PR, at the SAME moment, as ready to merge — CI
+    had actually finished ~6h45m earlier. The raw queue row's `error` is only
+    ever rewritten by a LIVE `coord merge` attempt, and #1891's "wait, don't
+    retry" contract means nothing ever runs one again once `_decide_merge`
+    starts waiting on exactly that frozen string — a self-sustaining stale
+    read with no path back to correctness.
+
+    `_entry_gate_status`'s fresh re-derivation (`plan_entry`) has since found
+    nothing blocking at all (`reason=None`, `PLAN_READY`) and its own
+    tick-refreshed `ci_summary` rollup positively confirms every check
+    finished with none failing — the same positive-evidence signal
+    `coord.drive_queue`'s #2158 fix already trusts over an identical frozen
+    raw reading in the `parked`-entry path (claude-coordinator#2138). Without
+    the #2808 recovery, the bare ``plan_entry.get("reason") or
+    raw_entry.get("error")`` fallback (and the #2712 loop right after it)
+    both silently prefer the frozen raw string, so `merge_reason` reads "CI
+    running: ..." forever and `_decide_merge`'s `is_ci_pending_reason` wait
+    arm (coord/drive.py) never releases."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "READY",
+                "reason": None,
+                "assignment_id": "w1",
+                "ci_summary": {"passed": 7, "failed": 0, "running": 0},
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": "CI running: test (3.12), test (3.13), no-gh-on-path",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason == ""
+    assert state.merge_status == "READY"
+
+
+def test_merge_entry_ci_pending_recovery_still_defers_to_a_live_ci_shaped_fresh_reason():
+    """#2808 companion: the positive-evidence override above must stay
+    scoped to a fresh reading that found NOTHING blocking (`reason` falsy) —
+    exactly #2158's own restriction for the `parked`-entry path. When the
+    fresh re-derivation itself names a live, CI-shaped objection (here: a
+    genuine "checks failed" reading of the same in-flight run — the #2712
+    race this loop exists for), that fresh non-empty reason must still win
+    outright and the raw-row recovery must not be reached at all, whatever
+    `ci_summary` says — it is never even consulted."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "BLOCKED",
+                "reason": "checks failed: test (3.12) (failure)",
+                "assignment_id": "w1",
+                # Deliberately contradicts the frozen raw reading below —
+                # proves the override never even looks at `ci_summary` once
+                # `reason` is non-empty.
+                "ci_summary": {"passed": 7, "failed": 0, "running": 0},
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": "CI running: test (3.12), test (3.13), no-gh-on-path",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason.startswith("CI running:")
+
+
 def test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue():
     """#1505 review fix: `merge_queue.plan()` collapses CONFLICT into
     NEEDS_ATTENTION for display, and `merge_plan` is what a normal
