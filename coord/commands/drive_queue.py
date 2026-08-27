@@ -3196,10 +3196,11 @@ def _fetch_live_ci_gate(
 
 def _fetch_live_blocked_gate(
     entries: list, config_path: Path | None
-) -> dict[str, bool]:
-    """``{entry_key: still_blocked}`` for every RE-EVALUABLE ``blocked``
-    entry (#2230) — the counterpart of :func:`_fetch_live_ci_gate` above:
-    same mechanism, same bound, a different queue state.
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """``({entry_key: still_blocked}, {entry_key: unreadable_reason})`` for
+    every RE-EVALUABLE ``blocked`` entry (#2230) — the counterpart of
+    :func:`_fetch_live_ci_gate` above: same mechanism, same bound, a
+    different queue state.
 
     THE GAP THIS CLOSES. `blocked` used to be terminal: once
     `_reconcile_running` exhausted an entry's attempts, nothing ever asked
@@ -3227,28 +3228,62 @@ def _fetch_live_blocked_gate(
     re-pays this same bounded cost next tick, identical to how a
     still-CI-pending `parked` entry already does.
 
+    #2806 SELF-HEAL. A qualifying entry with a real branch/PR behind it can
+    still have no ``coord.merge_queue`` row yet — the merge queue is
+    populated by ``enqueue_approved_work``, run independently (the board
+    daemon's passive tick, or an operator's own ``coord merge``), not by
+    this tick — so a board row that turned gate-clear only moments ago can
+    race this exact read. `coord merge --only`'s #1845 fix hit the identical
+    race and answered it by running `enqueue_approved_work` once, inline,
+    before giving up; this mirrors that precedent: when at least one target
+    has no queue row, one bounded `enqueue_approved_work(cfg, board)` call
+    runs (never more than once per tick, whatever the target count), then
+    every such target is looked up again against the refreshed queue before
+    this function concedes it has nothing.
+
+    #2806 VISIBILITY. `_fetch_live_ci_gate`'s sibling docstring, and this
+    one before #2806, both describe "a key ABSENT" as if it were one thing —
+    it is actually at least four (no queue row even after the self-heal
+    above, no PR number yet, `entry_gate_status` raising, or the whole
+    fetch failing closed before any entry is even tried) and NONE of them
+    used to be logged anywhere, so a run of them looked, from the tick's own
+    output, identical to the gate genuinely still being shut. Every one is
+    now (a) logged here, so `journalctl` names the actual cause instead of
+    silence, and (b) surfaced in the second returned dict, keyed by entry,
+    with a short human-readable reason — :func:`coord.drive_queue.
+    _reconcile_blocked_unreadable` turns a present key there into a
+    distinct, operator-visible "could not read this gate" outcome instead
+    of folding it into "still shut" the way an absent key from the FIRST
+    dict alone always has and still does (see that function's docstring for
+    why the two must never render identically).
+
     Same fail-open-per-entry, fail-closed-overall contract as
-    `_fetch_live_ci_gate`: a key ABSENT from the result (no queue row, no PR
-    yet, a `ci_store` that failed to build, any exception) leaves that entry
-    to `plan_tick`'s cheap board-only fallback
+    `_fetch_live_ci_gate` otherwise: a key ABSENT from the FIRST dict (no
+    queue row, no PR yet, a `ci_store` that failed to build, any exception)
+    leaves that entry to `plan_tick`'s cheap board-only fallback
     (`IssueFacts.merge_gate_status`, populated for free on a thin client's
     live `/board`) — which on the daemon-host tick (the only host this
     actually runs on, `docs/DRIVE_QUEUE.md` §2) has no `merge_plan` section
-    to read at all, so an absent key there means simply "no evidence, stays
-    blocked" (`_reconcile_blocked` never guesses).
+    to read at all, so an absent key there means "no evidence, stays
+    blocked, but distinctly reported as unreadable when the second dict
+    says why" (`_reconcile_blocked` never guesses at a gate reading).
     """
+    import logging  # noqa: PLC0415
+
+    _log = logging.getLogger(__name__)
+
     targets = [
         e for e in entries
         if e.state == STATE_BLOCKED
         and not is_permanent_block_reason(getattr(e, "last_reason", "") or "")
     ]
     if not targets:
-        return {}
+        return {}, {}
 
     from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
 
     if resolve_board_service() is not None:
-        return {}
+        return {}, {}
 
     try:
         from coord import github_ops as _gh_ops  # noqa: PLC0415
@@ -3265,20 +3300,68 @@ def _fetch_live_blocked_gate(
         queue_by_key = {
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }
-    except Exception:  # noqa: BLE001 — see the fail-soft note above
-        return {}
+    except Exception as exc:  # noqa: BLE001 — see the fail-soft note above
+        _log.warning(
+            "blocked-gate sweep (#2806): could not build board/config/queue "
+            "for this tick's %d qualifying blocked entr%s — every one falls "
+            "back to the board-only reading, unreadable: %r",
+            len(targets), "y" if len(targets) == 1 else "ies", exc,
+        )
+        return {}, {}
+
+    # #2806 self-heal: mirror `coord merge --only`'s #1845 fix — a target
+    # with no queue row yet may simply not have been enqueued by
+    # `enqueue_approved_work` (the board daemon's passive tick, or an
+    # operator's own `coord merge`) since its board row turned gate-clear.
+    # One bounded call, never more than once per tick.
+    if any(queue_by_key.get(e.key) is None for e in targets):
+        try:
+            _mq.enqueue_approved_work(cfg, board)
+            queue_by_key = {
+                entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
+            }
+        except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
+            _log.info(
+                "blocked-gate sweep (#2806): enqueue_approved_work self-heal "
+                "failed, continuing with the queue as already loaded: %r", exc,
+            )
 
     overrides: dict[str, bool] = {}
+    unreadable: dict[str, str] = {}
     for e in targets:
         q = queue_by_key.get(e.key)
-        if q is None or not q.pr_number:
+        if q is None:
+            reason = "no merge-queue row for this entry, even after the self-heal enqueue attempt"
+            # #2589/#2635: a genuinely pre-dispatch cause (no branch/PR was
+            # EVER created) will never have a merge-queue row, forever — that
+            # is already reported distinctly by `coord drive-queue list`'s
+            # own #2589 terminal note, and reporting "unreadable" (which
+            # reads as "retry might help") on top of it would contradict
+            # that note. But #2635 also showed this TEXT classification can
+            # be wrong per-run (a retry's own launch dispatched nothing only
+            # because an earlier attempt's work was still in flight) — so it
+            # only suppresses here, where there is in fact no queue row to
+            # contradict it. The instant a queue row (with or without a PR
+            # yet) or a probe result exists below, that positive evidence
+            # wins outright and this text is never consulted again.
+            if not is_pre_dispatch_block_reason(getattr(e, "last_reason", "") or ""):
+                unreadable[e.key] = reason
+                _log.info("blocked-gate sweep (#2806): %s — %s", e.key, reason)
+            continue
+        if not q.pr_number:
+            reason = "merge-queue row has no PR number yet"
+            unreadable[e.key] = reason
+            _log.info("blocked-gate sweep (#2806): %s — %s", e.key, reason)
             continue
         try:
             status, _reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
-        except Exception:  # noqa: BLE001 — leave this one entry to the fallback
+        except Exception as exc:  # noqa: BLE001 — leave this one entry to the fallback
+            reason = f"entry_gate_status raised: {exc!r}"
+            unreadable[e.key] = reason
+            _log.warning("blocked-gate sweep (#2806): %s — %s", e.key, reason)
             continue
         overrides[e.key] = status != _mq.PLAN_READY
-    return overrides
+    return overrides, unreadable
 
 
 def _fetch_live_prereq_terminal(
@@ -4284,7 +4367,9 @@ def drive_queue_tick(
         # entries — see `_fetch_live_blocked_gate`'s docstring for the gap
         # this closes (quadraui#309 sat `blocked` ~11h on a merge that was
         # landable for most of that window, and nothing ever looked again).
-        live_blocked_gate = _fetch_live_blocked_gate(entries, config_path)
+        live_blocked_gate, live_blocked_unreadable = _fetch_live_blocked_gate(
+            entries, config_path
+        )
 
         # #2350: for every entry the two live re-checks above just found
         # clear, also confirm — from the board's own recorded Test/Review
@@ -4343,6 +4428,7 @@ def drive_queue_tick(
             live_ci_gate=live_ci_gate,
             live_ci_gate_reason=live_ci_gate_reason,
             live_blocked_gate=live_blocked_gate,
+            live_blocked_unreadable=live_blocked_unreadable,
             editable_drift=editable_drift,
             merge_only_ready=merge_only_ready,
             roll_pending_reason=roll_pending.describe() if roll_pending is not None else "",
@@ -4551,6 +4637,33 @@ def drive_queue_tick(
                     f"queue_state=blocked | resumes={entry.resumes if entry else '?'}"
                     f"/{MAX_BLOCKED_RESUMES} | position="
                     f"{entry.position if entry else '?'}"
+                ),
+                command=_requeue_command(entry, item.key),
+            )
+
+        # #2806: a `blocked` entry #2230's sweep targeted this tick, but whose
+        # live gate probe came back with no evidence at all — a merge-queue
+        # row not enqueued yet, a missing PR number, `entry_gate_status`
+        # raising. Distinct from BOTH the silent "no evidence, never asked"
+        # case (pre-#2806 behaviour, still silent) and the oscillating loop
+        # above: this says "I tried to read this entry's gate and could not",
+        # which must never render the same as "I read it and it is still
+        # shut" — see `coord.drive_queue._reconcile_blocked_unreadable`'s
+        # docstring for the incident (vimcode#555) this closes.
+        for item in plan.reconciles:
+            if item.outcome != "gate_unreadable":
+                continue
+            parsed = parse_key(item.key)
+            if parsed is None:
+                continue
+            entry = by_key.get(item.key)
+            _escalate(
+                parsed[0],
+                parsed[1],
+                reason=item.reason,
+                gates=(
+                    f"queue_state=blocked | gate_reading=unreadable | "
+                    f"position={entry.position if entry else '?'}"
                 ),
                 command=_requeue_command(entry, item.key),
             )

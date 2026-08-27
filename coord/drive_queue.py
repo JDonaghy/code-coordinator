@@ -3347,24 +3347,92 @@ def _blocked_gate_reading(
     return None
 
 
+def _reconcile_blocked_unreadable(
+    entry: QueueEntry, live_blocked_unreadable: Mapping[str, str] | None
+) -> Reconcile | None:
+    """#2806: the other half of a ``None`` :func:`_blocked_gate_reading` —
+    "I could not read this entry's gate" as opposed to "I read it and it is
+    still shut". Before this, both collapsed into the SAME silent ``None``
+    from :func:`_reconcile_blocked`, indistinguishable to an operator: a
+    `blocked` entry with a real branch/PR whose live probe simply failed
+    this tick (an exception, a merge-queue row not enqueued yet — see
+    :func:`coord.commands.drive_queue._fetch_live_blocked_gate`'s docstring
+    for the mechanics) rendered EXACTLY like one the probe genuinely
+    re-confirmed still shut, and — because neither case ever wrote anything
+    — a run of bad luck across every tick looked identical to a gate that
+    truly never cleared. vimcode#555 sat `blocked` across four ticks this
+    way with its merge gate fully clear the whole time.
+
+    Returns ``None`` (render exactly as before #2806) when
+    *live_blocked_unreadable* carries no note for this key — the shell's
+    probe was never even attempted for this entry this tick (not a
+    re-evaluable target at all, or the WHOLE sweep failed closed before
+    reaching any entry), OR the entry's OWN cause is #2589's pre-dispatch
+    shape (:func:`is_pre_dispatch_block_reason` — no branch/PR was ever
+    created, so there will never be anything for the live probe to read; a
+    "could not read" note there would be actively misleading, implying a
+    retry might help) AND the shell found no actual merge-queue evidence
+    contradicting that text — the pre-#2806 shape, still silent exactly as
+    before. That suppression is applied by the shell
+    (:func:`coord.commands.drive_queue._fetch_live_blocked_gate`), not here:
+    #2635 already established that this text classification is per-RUN, not
+    per-ENTRY, and can be wrong (a retry's own launch dispatched nothing
+    purely because an earlier attempt's work was still in flight, leaving a
+    real branch/PR behind) — this function only ever sees whatever key the
+    shell decided to hand it, so a `live_blocked_unreadable` entry present
+    here has ALREADY survived that check.
+
+    Otherwise the shell's probe WAS attempted, targeted this exact entry,
+    and still came back with no key — carried here as a short human-readable
+    reason (`"no merge-queue row yet"`, `"no PR number yet"`, an exception
+    summary, …). That is new, actionable information: unlike a confirmed
+    still-shut gate, a failed probe says nothing about whether the entry is
+    actually landable — the very case #2350's `merge_only` fast path exists
+    for might be sitting one probe retry away. So this writes `last_reason`
+    (visible on `coord drive-queue list`/`status`) and escalates
+    (:func:`coord.commands.drive_queue._escalate`, mirroring the
+    `oscillating` outcome's own channel — #2230's "no second alert channel"
+    posture) every tick the condition holds, the same posture `oscillating`
+    already takes for its own distinct-from-silence signal.
+    """
+    note = (live_blocked_unreadable or {}).get(entry.key)
+    if not note:
+        return None
+    reason = (
+        f"{entry.key}'s merge gate could not be read this tick ({note}) — "
+        "this is NOT a confirmed-still-shut gate, only a failed probe; "
+        "#2230's sweep will try again next tick rather than guessing (#2806)"
+    )
+    return Reconcile(
+        entry.key,
+        "gate_unreadable",
+        reason,
+        occupies=False,
+        updates={"last_reason": reason},
+    )
+
+
 def _reconcile_blocked(
     entry: QueueEntry,
     facts: IssueFacts,
     live_blocked_gate: Mapping[str, bool] | None,
     merge_only_ready: Mapping[str, bool] | None = None,
+    live_blocked_unreadable: Mapping[str, str] | None = None,
 ) -> Reconcile | None:
     """Re-examine ONE `blocked` entry against the current gate reading.
 
     Returns ``None`` — nothing to report, nothing to write — in every case
-    except a CONFIRMED-clear reading, which is deliberate: a `blocked` entry
-    this sweep cannot say anything new about must render EXACTLY as it did
-    before #2230 existed. Three ways to land there:
+    except a CONFIRMED-clear reading OR a probe that came back unreadable
+    (#2806), which is deliberate: a `blocked` entry this sweep cannot say
+    anything new about must render EXACTLY as it did before #2230 existed.
+    Three ways to land there:
 
     * the block is PERMANENT (:func:`is_permanent_block_reason`) — #1844's
       guard refusal or #2019's dead end — neither of which any amount of
       re-checking can ever change;
     * there is no evidence either way (:func:`_blocked_gate_reading` returns
-      ``None``) — an entry that never reached the merge queue at all (a
+      ``None``) AND :func:`_reconcile_blocked_unreadable` also has nothing
+      to add — an entry that never reached the merge queue at all (a
       dispatch-time failure, an unsatisfiable ``after=``) has nothing this
       sweep can cheaply re-check, and guessing would be exactly the "worse
       than nothing" sweep the issue warns a naive "retry everything" pass
@@ -3372,8 +3440,15 @@ def _reconcile_blocked(
     * the gate is CONFIRMED still shut — the common, honest outcome for a
       `blocked` entry that has not in fact recovered yet.
 
-    Only a confirmed-clear reading does anything, and even then only up to
-    :data:`MAX_BLOCKED_RESUMES` — past that ceiling the entry stays
+    #2806: when there is no evidence either way BUT the shell's live probe
+    was actually attempted against this entry and came back empty (as
+    opposed to never having been asked at all), :func:`_reconcile_blocked_
+    unreadable` reports THAT distinctly — "could not read", never silently
+    folded into "still shut". See its own docstring for why the two must
+    not render identically to an operator.
+
+    Only a confirmed-clear reading does anything else, and even then only up
+    to :data:`MAX_BLOCKED_RESUMES` — past that ceiling the entry stays
     `blocked`, but its `last_reason` is rewritten to say so out loud (the
     issue's explicit ask), which is also what feeds the oscillation signal
     into `coord drive-queue list`/`status` without inventing a second alert
@@ -3393,7 +3468,9 @@ def _reconcile_blocked(
     if is_permanent_block_reason(entry.last_reason):
         return None
     reading = _blocked_gate_reading(entry, facts, live_blocked_gate)
-    if reading is None or reading:
+    if reading is None:
+        return _reconcile_blocked_unreadable(entry, live_blocked_unreadable)
+    if reading:
         return None
 
     if entry.resumes >= MAX_BLOCKED_RESUMES:
@@ -3702,6 +3779,7 @@ def plan_tick(
     live_ci_gate: Mapping[str, bool] | None = None,
     live_ci_gate_reason: Mapping[str, str] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
+    live_blocked_unreadable: Mapping[str, str] | None = None,
     editable_drift: tuple[str, str] | None = None,
     merge_only_ready: Mapping[str, bool] | None = None,
     roll_pending_reason: str = "",
@@ -3850,6 +3928,17 @@ def plan_tick(
     still finds it blocked. Same authority rule as *live_ci_gate*: present
     beats the cached board's `IssueFacts.merge_gate_status`; absent falls
     through to it. See :func:`_blocked_gate_reading`.
+
+    *live_blocked_unreadable* (#2806) maps a `blocked` entry's key to a
+    short human-readable reason the shell's live probe for THAT entry was
+    attempted this tick but came back with no evidence at all — a key
+    ABSENT from *live_blocked_gate* is ambiguous on its own (never asked, or
+    asked and failed?); this dict disambiguates it. Only consulted once
+    *live_blocked_gate* and the cached board both have nothing for this
+    entry (:func:`_blocked_gate_reading` returns ``None``) — see
+    :func:`_reconcile_blocked_unreadable` for the full decision and why "I
+    could not read this gate" must render differently from "I read it and
+    it is still shut".
 
     *merge_only_ready* (#2350) maps a key to whether — GIVEN this SAME tick
     already found its live gate clear (*live_ci_gate* reading `False` for a
@@ -4163,7 +4252,11 @@ def plan_tick(
                 # explicitly not the #2055 fix and is not this one either;
                 # see :func:`_reconcile_blocked` for the full decision.
                 blocked_reconcile = _reconcile_blocked(
-                    entry, facts, live_blocked_gate, merge_only_ready
+                    entry,
+                    facts,
+                    live_blocked_gate,
+                    merge_only_ready,
+                    live_blocked_unreadable,
                 )
             if blocked_reconcile is not None:
                 reconciles.append(blocked_reconcile)
