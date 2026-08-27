@@ -3660,6 +3660,28 @@ def post_orphaned_review_findings(
     return posted_ids
 
 
+def _dispatch_board_pending_pr_opens(config: Config) -> None:
+    """Load the board, open PRs for any work-leg completions still missing
+    one, and save (#2844).
+
+    Runs BEFORE smoke/review dispatch so the ``pull_request`` CI run starts
+    the instant a work leg pushes its branch, overlapping the ~20-minute
+    smoke leg and the review leg instead of being serialised after both.
+    `dispatch_pending_pr_opens` (:mod:`coord.review`) is itself idempotent —
+    it always finds-or-creates via GitHub — so calling it every pass, even
+    after `dispatch_review` already opened the PR, only ever finds the
+    existing one. Mirrors :func:`_dispatch_board_pending_smoke` exactly, and
+    is safe to call even when the board file doesn't exist.
+    """
+    from coord.board_service import read_board, write_board
+    from coord.review import dispatch_pending_pr_opens
+
+    board = read_board()
+    opened = dispatch_pending_pr_opens(board, config)
+    if opened:
+        write_board(board)
+
+
 def _dispatch_board_pending_smoke(config: Config) -> None:
     """Load the board, dispatch any pending Test-stage smoke, and save.
 
@@ -4223,6 +4245,15 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: stuck test_state sweep failed")
 
+    # Step 2.5 (#2844): open PRs for work-leg completions still missing one —
+    # BEFORE the Test-stage dispatch below, so the pull_request CI run starts
+    # overlapping smoke instead of waiting for review dispatch to open the
+    # PR ~20 minutes later.
+    try:
+        _dispatch_board_pending_pr_opens(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: PR-open dispatch failed")
+
     # Step 3: dispatch pending Test-stage smoke (#1426).  Runs BEFORE review
     # dispatch to mirror the pipeline's Work -> Test -> Review order.
     try:
@@ -4524,6 +4555,13 @@ def run(
     # dispatch — skipped while `_roll_pending` is true, same posture the
     # drive-queue tick takes under a pending roll.
     if not _roll_pending:
+        # #2844: open PRs for work-leg completions still missing one, before
+        # smoke/review dispatch — see _dispatch_board_pending_pr_opens.
+        try:
+            _dispatch_board_pending_pr_opens(config)
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             _dispatch_board_pending_smoke(config)
         except Exception:  # noqa: BLE001

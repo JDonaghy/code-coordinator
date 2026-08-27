@@ -2920,6 +2920,216 @@ def test_dispatch_review_passes_assignment_type_to_pr_lookup(
     assert captured.get("assignment_type") == "mock-author"
 
 
+# ── open_pr_for_completed_work / dispatch_pending_pr_opens (#2844) ──────────
+#
+# #2844: the PR used to open at review-dispatch time — after the ~20-minute
+# smoke leg finished — serialising CI onto the end of the pipeline instead of
+# overlapping it. These cover the new early-open path that fires the moment
+# a work leg pushes its branch.
+
+
+def test_open_pr_for_completed_work_opens_immediately_after_work_done(
+    two_machine_config: Config,
+) -> None:
+    """A `status="done"` work row with a branch gets its PR opened right
+    away — not gated on any test/review state — and the URL is cached on
+    the assignment."""
+    from coord.review import open_pr_for_completed_work
+
+    completed = _completed_assignment()
+    calls: list[dict] = []
+
+    def _pr_lookup(repo_github, **kw):
+        calls.append(kw)
+        return {"number": 7, "url": "https://github.com/acme/api/pull/7", "existed": False}
+
+    pr = open_pr_for_completed_work(
+        completed, two_machine_config,
+        pr_lookup=_pr_lookup,
+        commits_ahead_checker=lambda repo, base, branch: 3,
+    )
+
+    assert pr == {"number": 7, "url": "https://github.com/acme/api/pull/7", "existed": False}
+    assert completed.pr_url == "https://github.com/acme/api/pull/7"
+    assert len(calls) == 1
+    assert calls[0]["branch"] == "issue-1-fix"
+    assert calls[0]["assignment_type"] == "work"
+
+
+def test_open_pr_for_completed_work_skips_zero_commit_branch(
+    two_machine_config: Config,
+) -> None:
+    """#1534's zero-commit gate applies to the early open too — an empty
+    branch must never get a PR, early or late."""
+    from coord.review import open_pr_for_completed_work
+
+    completed = _completed_assignment()
+    calls: list[dict] = []
+
+    def _pr_lookup(repo_github, **kw):
+        calls.append(kw)
+        return {"number": 7, "url": "u", "existed": False}
+
+    pr = open_pr_for_completed_work(
+        completed, two_machine_config,
+        pr_lookup=_pr_lookup,
+        commits_ahead_checker=lambda repo, base, branch: 0,
+    )
+
+    assert pr is None
+    assert completed.pr_url is None
+    assert calls == []
+
+
+def test_dispatch_pending_pr_opens_opens_for_done_work_with_branch(
+    two_machine_config: Config,
+) -> None:
+    """The bulk pass finds every eligible done/work-like/branched row and
+    opens (or finds) a PR for each, recording pr_url on the row."""
+    from coord.review import dispatch_pending_pr_opens
+
+    completed = _completed_assignment()
+    board = Board(completed=[completed])
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 9, "url": "https://github.com/acme/api/pull/9", "existed": False}
+
+    opened = dispatch_pending_pr_opens(
+        board, two_machine_config,
+        pr_lookup=_pr_lookup,
+        commits_ahead_checker=lambda repo, base, branch: 1,
+    )
+
+    assert opened == [completed]
+    assert completed.pr_url == "https://github.com/acme/api/pull/9"
+
+
+def test_dispatch_pending_pr_opens_skips_rows_that_already_have_a_pr(
+    two_machine_config: Config,
+) -> None:
+    """A row that already carries pr_url is skipped — no redundant lookup."""
+    from coord.review import dispatch_pending_pr_opens
+
+    completed = replace(_completed_assignment(), pr_url="https://github.com/acme/api/pull/1")
+    board = Board(completed=[completed])
+    calls = {"n": 0}
+
+    def _pr_lookup(repo_github, **kw):
+        calls["n"] += 1
+        return {"number": 1, "url": "u", "existed": True}
+
+    opened = dispatch_pending_pr_opens(board, two_machine_config, pr_lookup=_pr_lookup)
+
+    assert opened == []
+    assert calls["n"] == 0
+
+
+def test_dispatch_pending_pr_opens_skips_failed_and_non_done_rows(
+    two_machine_config: Config,
+) -> None:
+    """A failed work leg must never get an early-opened orphan PR (#2844's
+    'failed work legs' requirement) — only status='done' rows qualify."""
+    from coord.review import dispatch_pending_pr_opens
+
+    failed = replace(_completed_assignment(), status="failed")
+    running_like = replace(_completed_assignment(), status="running")
+    no_branch = replace(_completed_assignment(), branch=None)
+    board = Board(completed=[failed, running_like, no_branch])
+    calls = {"n": 0}
+
+    def _pr_lookup(repo_github, **kw):
+        calls["n"] += 1
+        return {"number": 1, "url": "u", "existed": True}
+
+    opened = dispatch_pending_pr_opens(board, two_machine_config, pr_lookup=_pr_lookup)
+
+    assert opened == []
+    assert calls["n"] == 0
+
+
+def test_dispatch_pending_pr_opens_skips_terminal_rows(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#522-style chokepoint: never open a PR for work GitHub already
+    considers finished (issue closed / PR merged)."""
+    from coord.review import dispatch_pending_pr_opens
+
+    monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+    completed = _completed_assignment()
+    board = Board(completed=[completed])
+    calls = {"n": 0}
+
+    def _pr_lookup(repo_github, **kw):
+        calls["n"] += 1
+        return {"number": 1, "url": "u", "existed": True}
+
+    opened = dispatch_pending_pr_opens(board, two_machine_config, pr_lookup=_pr_lookup)
+
+    assert opened == []
+    assert calls["n"] == 0
+
+
+def test_dispatch_pending_pr_opens_off_when_reviews_disabled(repo: Repo) -> None:
+    """Gated on reviews.enabled/auto_dispatch — this path exists purely to
+    feed dispatch_review's own PR lookup earlier, so it's a no-op when
+    reviews are off entirely."""
+    from coord.review import dispatch_pending_pr_opens
+
+    cfg = Config(
+        repos=[repo],
+        machines=[],
+        reviews=ReviewsConfig(enabled=False, auto_dispatch=False),
+    )
+    completed = _completed_assignment()
+    board = Board(completed=[completed])
+    calls = {"n": 0}
+
+    def _pr_lookup(repo_github, **kw):
+        calls["n"] += 1
+        return {"number": 1, "url": "u", "existed": True}
+
+    opened = dispatch_pending_pr_opens(board, cfg, pr_lookup=_pr_lookup)
+
+    assert opened == []
+    assert calls["n"] == 0
+
+
+def test_dispatch_pending_pr_opens_is_idempotent_with_dispatch_review(
+    two_machine_config: Config,
+) -> None:
+    """Opening early and then reaching dispatch_review later must not create
+    a second PR — both look the branch up fresh and get the same one back."""
+    from coord.review import dispatch_pending_pr_opens
+
+    completed = replace(_completed_assignment(), review_state="pending")
+    board = Board(completed=[completed])
+    create_calls = {"n": 0}
+
+    def _find_or_create(repo_github, **kw):
+        # Simulate GitHub: first call creates, every later call finds it.
+        create_calls["n"] += 1
+        existed = create_calls["n"] > 1
+        return {"number": 123, "url": "https://github.com/acme/api/pull/123", "existed": existed}
+
+    opened = dispatch_pending_pr_opens(
+        board, two_machine_config, pr_lookup=_find_or_create,
+    )
+    assert opened == [completed]
+    assert create_calls["n"] == 1
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-id-late"}),
+        pr_lookup=_find_or_create,
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert create_calls["n"] == 2, "dispatch_review must reuse the same PR, not create a new one"
+
+
 # ── Reviewer system prompt ──────────────────────────────────────────────────
 
 
