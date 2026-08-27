@@ -38,6 +38,10 @@ from coord.models import POLICY_REFUSAL_MARKER
 from coord.reports import (
     COMPLETED_COLUMNS,
     REPORTS,
+    TREND_COLUMN_META,
+    TREND_COLUMNS,
+    TREND_RANGE_CHOICES,
+    TREND_TRAILING_BUCKETS,
     ColumnMeta,
     ReportError,
     ReportResult,
@@ -52,15 +56,18 @@ from coord.reports import (
     fold_drive_queue_status,
     fold_issue_activity,
     fold_queue_outcomes,
+    fold_trend,
     parse_duration,
     resolve_params,
     resolve_queue_outcomes_window,
+    resolve_trend_range,
     result_to_csv,
     run_completed,
     run_decisions,
     run_drive_queue_status,
     run_queue_outcomes,
     run_report,
+    run_trend,
 )
 from coord.serve_app import build_app
 
@@ -1399,14 +1406,14 @@ class TestCatalogue:
     def test_the_registered_reports(self) -> None:
         assert set(REPORTS) == {
             "issue-activity", "completed", "drive-queue-status", "decisions",
-            "usage", "queue-outcomes",
+            "usage", "queue-outcomes", "trend",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
             "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "usage",
+            "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -1570,7 +1577,7 @@ class TestCli:
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "usage",
+            "queue-outcomes", "trend", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -2029,7 +2036,7 @@ class TestDaemonEndpoints:
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "usage",
+            "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -4724,12 +4731,316 @@ class TestRowIdentity:
 
     def test_reports_without_a_per_row_issue_declare_none(self) -> None:
         by_id = {r["id"]: r for r in catalogue()["reports"]}
-        # `usage` can be grouped by repo, `decisions` rows are cards, and
+        # `usage` can be grouped by repo, `decisions` rows are cards,
         # `queue-outcomes` rows are per-period aggregates whose `issues`
-        # column is a LIST — none has a single `(repo, issue)`.
-        for report_id in ("usage", "decisions", "queue-outcomes", "drive-queue-status"):
+        # column is a LIST, and `trend` rows are time BUCKETS, not issues —
+        # none has a single `(repo, issue)`.
+        for report_id in (
+            "usage", "decisions", "queue-outcomes", "drive-queue-status", "trend",
+        ):
             assert by_id[report_id]["row_identity"] is None
 
     def test_the_key_is_always_present_so_a_client_can_rely_on_it(self) -> None:
         for rep in catalogue()["reports"]:
             assert "row_identity" in rep
+
+
+# ── #2826: the `trend` report ────────────────────────────────────────────
+
+#: `7d`'s bucket width (6h) and point count (28), chosen so `TR_END` lands
+#: window_start on a clean `0.0` and every fixture timestamp below can be
+#: written as a small offset from it rather than an absolute epoch.
+TR_BUCKET = 6 * 3600.0
+TR_POINTS = 28
+TR_END = TR_POINTS * TR_BUCKET
+
+
+def _trend_issue(number: int, *, repo: str = "myrepo", state: str = "closed") -> dict:
+    return {"repo_name": repo, "number": number, "title": f"issue {number}", "state": state}
+
+
+def _trend_assignment(
+    number: int, dispatched: float, finished: float, cost: float, *, repo: str = "myrepo"
+) -> dict:
+    return {
+        "repo_name": repo,
+        "issue_number": number,
+        "dispatched_at": dispatched,
+        "finished_at": finished,
+        "model": "sonnet",
+        "cost_usd": cost,
+    }
+
+
+def _trend_fold(issues, assignments, merge_queue=(), **kw) -> ReportResult:
+    return fold_trend(
+        list(issues), list(assignments), list(merge_queue), TR_END,
+        range_="7d", generated_at=TR_END, **kw,
+    )
+
+
+class TestFoldTrend:
+    def test_columns_are_the_wire_contract(self) -> None:
+        result = _trend_fold([], [], [])
+        assert result.report_id == "trend"
+        assert result.columns == TREND_COLUMNS == [
+            "bucket_start", "merged", "cost_per_issue", "legs_per_issue",
+        ]
+        assert [m.id for m in result.column_meta] == result.columns
+
+    def test_column_meta_declares_money_and_float_kinds(self) -> None:
+        meta = {m.id: m for m in TREND_COLUMN_META}
+        assert meta["bucket_start"].kind == "timestamp"
+        assert meta["merged"].kind == "int"
+        assert meta["cost_per_issue"].kind == "money"
+        assert meta["legs_per_issue"].kind == "float"
+
+    def test_bucket_width_and_point_count_match_the_range_table(self) -> None:
+        # #2826's table: 1d=hourly/24, 3d=3-hourly/24, 7d=6-hourly/28,
+        # 1m=daily/30 — ~24-30 points either way.
+        assert resolve_trend_range("1d") == (3600.0, 24)
+        assert resolve_trend_range("3d") == (3 * 3600.0, 24)
+        assert resolve_trend_range("7d") == (6 * 3600.0, 28)
+        assert resolve_trend_range("1m") == (86400.0, 30)
+
+    def test_an_unknown_range_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_trend_range("9d")
+        assert "range" in str(exc.value)
+
+    def test_trailing_window_width_is_five_buckets(self) -> None:
+        assert TREND_TRAILING_BUCKETS == 5
+
+    def test_rows_are_one_per_bucket_spanning_the_whole_range(self) -> None:
+        result = _trend_fold([], [], [])
+        assert len(result.rows) == TR_POINTS
+        assert result.rows[0]["bucket_start"] == 0.0
+        assert result.rows[-1]["bucket_start"] == (TR_POINTS - 1) * TR_BUCKET
+        assert result.window == (0.0, TR_END)
+
+    def test_an_empty_fold_is_null_everywhere_not_zero(self) -> None:
+        """The #2826 headline rule: an empty trailing window must never come
+        back as `0.0` — the chart widget this report feeds has no way to
+        draw a gap, so a `0.0` here would read as a cost collapse that never
+        happened."""
+        result = _trend_fold([], [], [])
+        assert all(r["merged"] == 0 for r in result.rows)
+        assert all(r["cost_per_issue"] is None for r in result.rows)
+        assert all(r["legs_per_issue"] is None for r in result.rows)
+
+    def test_merged_counts_only_issues_ended_in_that_bucket(self) -> None:
+        issues = [_trend_issue(1), _trend_issue(2), _trend_issue(3)]
+        assignments = [
+            _trend_assignment(1, 900.0, 1000.0, 3.0),  # bucket 0
+            _trend_assignment(2, 4900.0, 5000.0, 1.0),  # bucket 0
+            _trend_assignment(3, 432000.0 + 50, 432000.0 + 100, 10.0),  # bucket 20
+        ]
+        result = _trend_fold(issues, assignments, [])
+        assert result.rows[0]["merged"] == 2
+        assert result.rows[20]["merged"] == 1
+        assert sum(r["merged"] for r in result.rows) == 3
+
+    def test_cost_per_issue_is_a_trailing_mean_not_a_per_bucket_mean(self) -> None:
+        issues = [_trend_issue(1), _trend_issue(2)]
+        assignments = [
+            _trend_assignment(1, 900.0, 1000.0, 3.0),  # bucket 0, $3
+            _trend_assignment(2, 4900.0, 5000.0, 1.0),  # bucket 0, $1
+        ]
+        result = _trend_fold(issues, assignments, [])
+        # bucket 0: mean of the two issues that just merged.
+        assert result.rows[0]["cost_per_issue"] == pytest.approx(2.0)
+        # bucket 4 is still within the 5-bucket trailing window of bucket 0
+        # (this bucket plus the previous 4 reaches back to bucket 0) — same
+        # mean, NOT a per-bucket mean of a bucket with zero merges of its own.
+        assert result.rows[4]["merged"] == 0
+        assert result.rows[4]["cost_per_issue"] == pytest.approx(2.0)
+        # bucket 5 is one bucket PAST the trailing window — no merge falls in
+        # buckets {1..5}, so the mean is undefined: None, never a stale or a
+        # false $0 value.
+        assert result.rows[5]["cost_per_issue"] is None
+        assert result.rows[5]["legs_per_issue"] is None
+
+    def test_the_earliest_bucket_gets_a_full_trailing_window_via_lookback(self) -> None:
+        """A merge just BEFORE the visible window still feeds bucket 0's
+        trailing mean — otherwise bucket 0 would get a narrower trailing
+        window than every other bucket in the series."""
+        issues = [_trend_issue(1), _trend_issue(2)]
+        assignments = [
+            # Ends inside the lookback (`fetch_start` reaches back 4 buckets
+            # before `window_start`), but before the visible window opens.
+            _trend_assignment(1, -70000.0, -68000.0, 4.0),
+            _trend_assignment(2, 900.0, 1000.0, 2.0),  # bucket 0
+        ]
+        result = _trend_fold(issues, assignments, [])
+        # Bucket 0 itself sees only ONE merge (issue 2) ...
+        assert result.rows[0]["merged"] == 1
+        # ... but issue 1's cost still feeds bucket 0's trailing mean.
+        assert result.rows[0]["cost_per_issue"] == pytest.approx(3.0)  # (4 + 2) / 2
+
+    def test_legs_per_issue_averages_agent_sessions_not_issue_count(self) -> None:
+        """myrepo#1 was dispatched twice (a retry) — `legs` is 2 for that ONE
+        issue, mirroring `completed`'s own `legs` semantics (#2472)."""
+        issues = [_trend_issue(1)]
+        assignments = [
+            _trend_assignment(1, 700.0, 800.0, 1.0),
+            _trend_assignment(1, 800.0, 1000.0, 1.0),
+        ]
+        result = _trend_fold(issues, assignments, [])
+        assert result.rows[0]["legs_per_issue"] == pytest.approx(2.0)
+
+    def test_merged_is_defined_exactly_like_completed(self) -> None:
+        """An OPEN issue with no merge_queue row is not MERGED — the same
+        rule `completed`'s ENDED uses, so the two reports can never silently
+        disagree on what counts."""
+        issues = [_trend_issue(1, state="open")]
+        assignments = [_trend_assignment(1, 900.0, 1000.0, 3.0)]
+        result = _trend_fold(issues, assignments, [])
+        assert all(r["merged"] == 0 for r in result.rows)
+
+    def test_a_merge_queue_row_makes_an_open_issue_count(self) -> None:
+        issues = [_trend_issue(1, state="open")]
+        assignments = [_trend_assignment(1, 900.0, 950.0, 3.0)]
+        merge_queue = [
+            {"repo_name": "myrepo", "issue_number": 1, "state": "merged", "last_attempt": 1000.0}
+        ]
+        result = _trend_fold(issues, assignments, merge_queue)
+        assert result.rows[0]["merged"] == 1
+
+    def test_repo_filter_restricts_to_one_coord_local_repo(self) -> None:
+        issues = [_trend_issue(1), _trend_issue(1, repo="other")]
+        assignments = [
+            _trend_assignment(1, 900.0, 1000.0, 3.0),
+            _trend_assignment(1, 900.0, 1000.0, 5.0, repo="other"),
+        ]
+        result = _trend_fold(issues, assignments, [], repo="other")
+        assert result.rows[0]["merged"] == 1
+        assert result.rows[0]["cost_per_issue"] == pytest.approx(5.0)
+
+    def test_notes_report_how_many_buckets_are_null(self) -> None:
+        issues = [_trend_issue(1), _trend_issue(2)]
+        assignments = [
+            _trend_assignment(1, 900.0, 1000.0, 3.0),
+            _trend_assignment(2, 4900.0, 5000.0, 1.0),
+        ]
+        result = _trend_fold(issues, assignments, [])
+        null_count = sum(1 for r in result.rows if r["cost_per_issue"] is None)
+        assert null_count > 0
+        assert any(f"{null_count} of {TR_POINTS} bucket" in n for n in result.notes)
+
+    def test_short_ranges_carry_an_honesty_note_long_ones_dont(self) -> None:
+        result_1d = fold_trend([], [], [], 24 * 3600.0, range_="1d", generated_at=24 * 3600.0)
+        assert any("noisy" in n for n in result_1d.notes)
+        result_7d = _trend_fold([], [], [])
+        assert not any("noisy" in n for n in result_7d.notes)
+
+    def test_the_result_is_json_serialisable(self) -> None:
+        issues = [_trend_issue(1)]
+        assignments = [_trend_assignment(1, 900.0, 1000.0, 3.0)]
+        json.dumps(_trend_fold(issues, assignments, []).to_dict())
+
+
+class TestRunTrend:
+    def test_range_and_until_bound_the_window(self) -> None:
+        seen: list[tuple] = []
+
+        def source():
+            seen.append(())
+            return ([], [], [])
+
+        result = run_trend(range="1d", until="100000", source=source)
+        assert seen, "the source seam must actually be used"
+        assert result.window == (100000.0 - 24 * 3600.0, 100000.0)
+        assert len(result.rows) == 24
+
+    def test_an_empty_until_means_now(self) -> None:
+        result = run_trend(range="1d", now=100000.0, source=lambda: ([], [], []))
+        assert result.window == (100000.0 - 24 * 3600.0, 100000.0)
+
+    def test_run_report_routes_to_it_with_defaults(self) -> None:
+        result = run_report("trend", {}, source=lambda: ([], [], []), now=100000.0)
+        assert result.report_id == "trend"
+        # default range is `7d`: 28 buckets x 6h.
+        assert result.window == (100000.0 - 28 * 6 * 3600.0, 100000.0)
+
+    def test_a_bad_range_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["trend"], {"range": "9d"})
+        assert "range" in str(exc.value)
+
+
+class TestTrendAgainstTheRealSchema:
+    """Same posture as `TestCompletedAgainstTheRealSchema`: `run_trend`'s
+    default source reads the SAME three real tables `run_completed`'s does
+    (#2826 reuses `fold_completed`'s own fold, not just its idea), so this
+    pins that the real board schema still reaches it end to end."""
+
+    def _seed(self, coord_db) -> None:
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, state) "
+                "VALUES ('api', 1629, 'Closed and done', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title, status, dispatched_at, finished_at, "
+                "model, cost_usd, input_tokens, output_tokens) "
+                "VALUES ('a1', 'precision', 'api', 1629, 'Closed and done', 'done', "
+                "1000.0, 2000.0, 'sonnet', 1.25, 4000, 700)"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1629, "
+                "'Closed and done', 'merged', 2500.0)"
+            )
+
+    def test_the_default_source_reads_the_real_tables(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = run_trend(range="1d", until="6100", repo="api")
+        assert sum(r["merged"] for r in result.rows) == 1
+        priced = [r["cost_per_issue"] for r in result.rows if r["cost_per_issue"] is not None]
+        assert priced == [pytest.approx(1.25)]
+
+    def test_it_runs_through_the_cli(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "trend", "--param", "until=6100",
+             "--param", "range=1d", "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "trend"
+        assert sum(r["merged"] for r in body["rows"]) == 1
+
+    def test_it_runs_through_the_daemon_route(self, report_client, rw_db) -> None:
+        # `rw_db`, not `coord_db` — the ASGI worker thread runs the handler,
+        # and the autouse `:memory:` conn is thread-bound (see that fixture).
+        self._seed(rw_db)
+        resp = report_client.get("/report/trend?until=6100&range=1d")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["report_id"] == "trend"
+        assert sum(r["merged"] for r in body["rows"]) == 1
+
+
+class TestTrendCatalogue:
+    def test_trend_is_a_real_catalogue_entry(self) -> None:
+        ids = [r["id"] for r in catalogue()["reports"]]
+        assert "trend" in ids
+
+    def test_its_params_are_range_until_and_repo(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "trend")
+        assert rep["title"] == "Trend"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"range", "until", "repo"}
+        assert params["range"]["kind"] == "choice"
+        assert params["range"]["choices"] == list(TREND_RANGE_CHOICES)
+        assert params["range"]["default"] == "7d"
+        assert params["until"]["kind"] == "text"
+        assert params["repo"]["default"] == ""
+
+    def test_row_identity_is_none_rows_are_buckets_not_issues(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "trend")
+        assert rep["row_identity"] is None
