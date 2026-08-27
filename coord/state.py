@@ -6327,7 +6327,29 @@ def _enqueue_drive_queue_local(
 
     entry_id = retry_on_locked(_write)
     if position is not None:
-        _move_drive_queue_entry_local(repo_name, issue_number, position)
+        # #2846: the row above is already durably committed (upsert by
+        # natural key) by the time we get here — the enqueue itself
+        # happened. The position move is a *separate* transaction
+        # (`_move_drive_queue_entry_local`), and if its own retry budget is
+        # exhausted by sustained contention, re-raising here would surface a
+        # 503 for a call that in fact succeeded, same shape as the cache-mirror
+        # sites above. Log loudly and still return `entry_id`: a position
+        # that didn't land self-heals on the next explicit move/renumber
+        # (e.g. queue drift correction, or another `add --position`), same
+        # self-heal framing used there.
+        try:
+            _move_drive_queue_entry_local(repo_name, issue_number, position)
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            if not is_lock_contention_error(exc):
+                raise
+            _log.error(
+                "#2846: positioning drive-queue entry %s (repo=%s, issue=%s) "
+                "at %s hit a lock that never cleared after retrying; the "
+                "entry itself was already enqueued, so not failing the call "
+                "— the position will catch up on the next explicit move or "
+                "renumber: %s",
+                entry_id, repo_name, issue_number, position, exc,
+            )
     return entry_id
 
 
