@@ -14,6 +14,10 @@ Public entry points:
 - `dispatch_review(...)`        — full path: find/open PR, pick reviewer,
   build briefing, send to agent server, add a review `Assignment` to the
   board. Called from reconcile when a work assignment transitions to done.
+- `dispatch_pending_pr_opens(...)` — #2844: open a PR the instant a work leg
+  pushes its branch, rather than waiting for `dispatch_review` to do it once
+  the Test/smoke leg finishes — lets the `pull_request` CI run overlap smoke
+  and review instead of being serialised after both.
 
 Why a separate module: the work-dispatch path (`coord/dispatch.py`) is shaped
 around `Proposal` objects from the brain. Reviews are triggered by completion
@@ -1869,6 +1873,177 @@ def _find_or_open_pr(
         return None
 
 
+def _resolve_pr_base_branch(
+    completed: Assignment,
+    repo,
+    *,
+    milestone_fetcher=None,
+) -> str:
+    """Resolve the PR base branch for `completed` (#1077's develop_branch /
+    milestone routing).
+
+    Shared by :func:`dispatch_review` and :func:`dispatch_pending_pr_opens`
+    (#2844) so an early PR-open and the later review dispatch always agree
+    on the base — opening against the wrong base would surface as a PR that
+    `find_pr_for_branch` still finds, but whose diff nobody intended.
+    """
+    base_branch = repo.default_branch
+    if getattr(repo, "develop_branch", None):
+        from coord.branch_model import resolve_base_branch  # noqa: PLC0415
+
+        fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
+        milestone_number = fetch_milestone(repo.github, completed.issue_number)
+        base_branch = resolve_base_branch(repo, milestone_number)
+    return base_branch
+
+
+def open_pr_for_completed_work(
+    completed: Assignment,
+    config: Config,
+    *,
+    pr_lookup=_find_or_open_pr,
+    milestone_fetcher=None,
+    commits_ahead_checker=None,
+) -> dict | None:
+    """Open (or find) the PR for `completed` as soon as its branch is pushed
+    (#2844), instead of waiting until review dispatch — which itself waits
+    for the Test/smoke leg to finish, ~20 minutes later.
+
+    Opening this early is what lets GitHub's ``pull_request`` CI run overlap
+    the smoke leg and the review leg instead of being serialised after both
+    — the ~25-minute median dead time #2844 measured across 8 issues.
+
+    Returns the ``{number, url, existed}`` dict `pr_lookup` (default
+    :func:`_find_or_open_pr`) returns, or ``None`` when a PR should not be
+    opened yet: no repo config, no branch, the branch has 0 commits ahead of
+    its base (#1534's zero-commit gate, applied here too so an empty branch
+    never gets a PR), or `pr_lookup` itself fails.
+
+    Stores the resulting URL on ``completed.pr_url`` as a side effect, purely
+    so a caller scanning the board can skip a row without a fresh GitHub
+    round-trip (see :func:`dispatch_pending_pr_opens`). This is advisory
+    only: `dispatch_review`'s own `pr_lookup` call and the merge phase's
+    `create_pr` both re-resolve the PR from GitHub
+    (``github_ops.find_pr_for_branch``) rather than trusting a cached field,
+    so a stale or missing ``pr_url`` here can never cause a duplicate PR —
+    it can only cost one redundant lookup.
+    """
+    repo = config.repo(completed.repo_name)
+    if repo is None or not completed.branch:
+        return None
+
+    base_branch = _resolve_pr_base_branch(
+        completed, repo, milestone_fetcher=milestone_fetcher
+    )
+
+    # #1534: same zero-commit gate `dispatch_review` applies — never open a
+    # PR for a branch that (as far as GitHub can confirm) carries no commits
+    # over its base. Fail-open: `commits_ahead_checker` returns `None` (never
+    # a bare 0) on any lookup failure, so a transient `gh` blip can't block a
+    # legitimate early PR-open.
+    _ahead_check = commits_ahead_checker or github_ops.branch_commits_ahead
+    _ahead = _ahead_check(repo.github, base_branch, completed.branch)
+    if _ahead == 0:
+        return None
+
+    try:
+        pr = pr_lookup(
+            repo.github,
+            branch=completed.branch,
+            default_branch=base_branch,
+            issue_number=completed.issue_number,
+            issue_title=completed.issue_title,
+            assignment_type=completed.type,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; dispatch_review retries later
+        log.warning(
+            "[pr-open] %s: pr_lookup raised opening/finding a PR for branch "
+            "%r — will retry from dispatch_review or the next pass",
+            completed.assignment_id, completed.branch, exc_info=True,
+        )
+        return None
+
+    if pr:
+        completed.pr_url = pr.get("url")
+    return pr
+
+
+def dispatch_pending_pr_opens(
+    board: Board,
+    config: Config,
+    *,
+    pr_lookup=_find_or_open_pr,
+    milestone_fetcher=None,
+    commits_ahead_checker=None,
+) -> list[Assignment]:
+    """Bulk PR-open pass (#2844) — open a PR the instant a work leg pushes a
+    branch, rather than waiting for review dispatch to do it after the
+    Test/smoke leg finishes.
+
+    Scans `board.completed` for work-like rows that are ``status="done"``
+    (a work leg that never reaches "done" never appears here, so a failed
+    work leg can never leave an orphan PR open — #2844's "failed work legs"
+    requirement), carry a branch, and have no `pr_url` recorded yet. Both
+    `reconcile()` and `coord notify` are expected to route through here every
+    pass — the same bulk-choke-point shape as
+    :func:`coord.smoke.dispatch_pending_smoke` and
+    :func:`dispatch_pending_reviews` — so a row missed on an earlier pass (no
+    repo config yet, a transient `gh` failure) is retried automatically.
+
+    Gated on ``reviews.enabled``/``reviews.auto_dispatch``: this path exists
+    solely to feed `dispatch_review`'s own PR lookup earlier, so when reviews
+    are off there is no reason to open a PR ahead of anything.
+
+    Idempotent by construction: `pr_lookup` (`_find_or_open_pr`) always
+    checks `find_pr_for_branch` before creating, and both `dispatch_review`
+    and the merge phase's `create_pr` do the same — so calling this every
+    tick, including after review dispatch already opened the PR itself, only
+    ever finds the existing one.
+
+    Returns the `completed` `Assignment`s a PR was opened/found for this
+    pass. The caller is responsible for persisting the board (only `pr_url`
+    is mutated on `board`-owned rows).
+    """
+    if not (config.reviews.enabled and config.reviews.auto_dispatch):
+        return []
+
+    opened: list[Assignment] = []
+    for completed in board.completed:
+        if completed.type not in WORK_LIKE_TYPES:
+            continue
+        if completed.status != "done":
+            continue
+        if not completed.branch:
+            continue
+        if completed.pr_url:
+            continue
+        repo = config.repo(completed.repo_name)
+        if repo is None:
+            continue
+        # #522-style chokepoint: never open a PR for work GitHub already
+        # considers finished (issue closed / a PR already merged) — mirrors
+        # dispatch_review's own terminal check so a stray late pass can't
+        # reopen a PR against dead work.
+        if github_ops.work_is_terminal(
+            repo.github,
+            completed.issue_number,
+            completed.branch,
+            trust_issue_closed=trust_issue_closed_for(completed.type),
+        ):
+            continue
+        pr = open_pr_for_completed_work(
+            completed,
+            config,
+            pr_lookup=pr_lookup,
+            milestone_fetcher=milestone_fetcher,
+            commits_ahead_checker=commits_ahead_checker,
+        )
+        if pr:
+            opened.append(completed)
+
+    return opened
+
+
 def _fetch_agent_advertised_repos(
     host: str,
     port: int = AGENT_PORT,
@@ -2101,13 +2276,9 @@ def dispatch_review(
     # `branch` payload field below, so they never disagree. The milestone
     # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
     # opted in — a non-opted-in repo pays zero extra cost.
-    base_branch = repo.default_branch
-    if getattr(repo, "develop_branch", None):
-        from coord.branch_model import resolve_base_branch  # noqa: PLC0415
-
-        fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
-        milestone_number = fetch_milestone(repo.github, completed.issue_number)
-        base_branch = resolve_base_branch(repo, milestone_number)
+    base_branch = _resolve_pr_base_branch(
+        completed, repo, milestone_fetcher=milestone_fetcher
+    )
 
     # #1534: ZERO-COMMIT GATE.  Refuse to spend a metered review on a branch
     # that carries no commits over its base — there is literally nothing to

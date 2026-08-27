@@ -2226,6 +2226,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 _escalate_spend_ceiling_best_effort(a, entry)
         changed.append(a.assignment_id)
 
+    # Open PRs for completed work-like assignments still missing one (#2844).
+    # Runs BEFORE smoke/review dispatch below so the pull_request CI run
+    # starts overlapping the smoke leg instead of waiting for review dispatch
+    # to open the PR itself once smoke finishes. Idempotent — see
+    # dispatch_pending_pr_opens's docstring.
+    from coord.review import dispatch_pending_pr_opens
+
+    for opened in dispatch_pending_pr_opens(board, config):
+        if opened.assignment_id is not None:
+            changed.append(opened.assignment_id)
+
     # Dispatch pending reviews for all completed work assignments.
     # We iterate board.completed (not just newly-done) so that a failed
     # dispatch on a previous reconcile pass is retried here automatically.
