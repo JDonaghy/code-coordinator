@@ -908,11 +908,16 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # have happened at all). Feed the same seam so it defers like a live
     # assignment instead of getting reaped.
     extra_busy.extend(_confirmation_running_busy())
+    # #2854: `now` opts this run into the between-legs settle window — a
+    # drive-queue row that is `running` but has genuinely had no live
+    # assignment on its last-known host for at least the settle window rolls
+    # that host without waiting for the row to reach a terminal state.
     quiescence = rp.assess_quiescence(
         queue_entries=board.get("drive_queue") or [],
         assignments=board.get("assignments") or [],
         issues=board.get("issues") or [],
         extra_busy=extra_busy,
+        now=time.time(),
     )
     record.quiescence = quiescence.to_dict()
     if quiescence.stale:
@@ -925,6 +930,19 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             "note: ignoring stale drive-queue row(s) whose issue already "
             f"landed: {', '.join(quiescence.stale)} (run `coord drive-queue "
             "tick --reconcile-only` to clear them for good)",
+            err=True,
+        )
+    if quiescence.settled:
+        # #2854: a `running` row whose host rolled BETWEEN LEGS — the row
+        # itself is still in flight, only the settled host is being treated
+        # as idle. Printed unconditionally, same reasoning as `stale` above:
+        # a host rolled mid-drive must leave a readable trace of why that was
+        # judged safe.
+        click.echo(
+            "note: rolling host(s) for drive-queue row(s) that are between "
+            f"legs and past the settle window: {', '.join(quiescence.settled)} "
+            "(#2854 — the row itself is still running; only the currently "
+            "idle host is being treated as quiescent)",
             err=True,
         )
 
@@ -2705,14 +2723,21 @@ def _drain(
                 rp.Busy(kind="board unreadable", subject="/board", detail=board_error)
             )
         extra_busy.extend(extra_busy_fetch())
+        # #2854: same settle-window opt-in as the top-level `propagate` call
+        # site — one clock read per poll, reused for both the settle window
+        # and `elapsed` below, so a between-legs gap that crosses the settle
+        # threshold mid-drain clears within THIS wait rather than only on
+        # the next `coord release propagate` tick.
+        poll_now = now_fn()
         quiescence = rp.assess_quiescence(
             queue_entries=board.get("drive_queue") or [],
             assignments=board.get("assignments") or [],
             issues=board.get("issues") or [],
             extra_busy=extra_busy,
+            now=poll_now,
         )
         busy = bool(quiescence.fleet_wide_busy) or daemon_host in quiescence.busy_hosts()
-        elapsed = now_fn() - start
+        elapsed = poll_now - start
         if not busy:
             return rw.DrainOutcome(drained=True, elapsed_seconds=elapsed, detail="drained")
         detail = quiescence.busy_reason_for_host(daemon_host) or quiescence.reason
