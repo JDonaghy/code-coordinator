@@ -534,6 +534,171 @@ class TestCompositeRevalidation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3a2. #2829: the base-SHA recheck an unattended caller must run before it
+#      acts on a lock-free composite's result — `_auto_revalidate_tick`
+#      (coord/serve_app.py) is the caller; these tests cover the primitives
+#      it relies on: `RevalidationResult.validated_base_sha`,
+#      `revalidated_base_still_current`, and `recorded_validated_base_shas`.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _head_sha(repo: Path, ref: str = "main") -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+class TestValidatedBaseShaOnResult:
+    """`RevalidationResult.validated_base_sha` must name the actual base a
+    run validated against — the anchor #2829's recheck compares later."""
+
+    def test_success_carries_the_base_it_validated(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        expected = _head_sha(git_fleet)
+        with patch("coord.state.record_test_verdict"), \
+             patch("coord.state.record_test_staleness_anchor"):
+            result = rv.revalidate(
+                TestCompositeRevalidation._candidates(),
+                _live_config(git_fleet), runner=lambda *a: _Run(0),
+            )
+        assert result.ok
+        assert result.validated_base_sha == expected
+
+    def test_suite_failure_still_carries_the_base(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """A worktree WAS built and validated against a real base even
+        though the suite then failed -- the caller needs that SHA to reason
+        about the failure, not just about a success."""
+        result = rv.revalidate(
+            TestCompositeRevalidation._candidates(), _live_config(git_fleet),
+            runner=lambda *a: _Run(1, stderr="boom"),
+        )
+        assert result.ok is False
+        assert result.validated_base_sha == _head_sha(git_fleet)
+
+    def test_setup_failure_never_claims_a_validated_base(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """No worktree was ever built for a SETUP failure -- there is
+        nothing to have validated against."""
+        result = rv.revalidate(
+            TestCompositeRevalidation._candidates(),
+            _live_config(git_fleet, test_command=None),
+            runner=lambda *a: _Run(0),
+        )
+        assert result.ok is False
+        assert result.kind == rv.KIND_SETUP
+        assert result.validated_base_sha is None
+
+
+class TestRevalidatedBaseStillCurrent:
+    """The correctness crux: an unattended caller re-checks this immediately
+    before merging anything a lock-free composite validated."""
+
+    def test_true_when_base_unmoved(self, git_fleet: Path, coord_db) -> None:
+        cfg = _live_config(git_fleet)
+        assert rv.revalidated_base_still_current(
+            cfg, "api", "main", _head_sha(git_fleet),
+        ) is True
+
+    def test_false_once_a_concurrent_merge_moves_the_base(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """Simulates exactly the race #2829 exists to close: another merge
+        landed on `main` while this (lock-free) composite was running."""
+        cfg = _live_config(git_fleet)
+        validated = _head_sha(git_fleet)
+
+        origin = git_fleet.parent / "origin.git"
+        mover = git_fleet.parent / "mover"
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(mover)],
+            check=True, capture_output=True, text=True,
+        )
+        _git(mover, "config", "user.email", "t@example.com")
+        _git(mover, "config", "user.name", "t")
+        (mover / "concurrent.txt").write_text("a different merge landed\n")
+        _git(mover, "add", ".")
+        _git(mover, "commit", "-q", "-m", "concurrent merge")
+        _git(mover, "push", "-q", "origin", "main")
+
+        assert rv.revalidated_base_still_current(
+            cfg, "api", "main", validated,
+        ) is False
+
+    def test_fail_closed_on_none_sha(self, git_fleet: Path, coord_db) -> None:
+        """`None` means nothing was ever validated (a SETUP result) -- never
+        treat that as 'confirmed unchanged'."""
+        cfg = _live_config(git_fleet)
+        assert rv.revalidated_base_still_current(cfg, "api", "main", None) is False
+
+    def test_fail_closed_on_missing_checkout(self, tmp_path: Path, coord_db) -> None:
+        cfg = _live_config(tmp_path / "does-not-exist")
+        assert rv.revalidated_base_still_current(
+            cfg, "api", "main", "deadbeef",
+        ) is False
+
+
+class TestRecordedValidatedBaseShas:
+    """Maps each recorded (merge-eligible) candidate to the SHA the run that
+    actually cleared it validated against — the input to the recheck above,
+    for both a clean composite and a fallen-back-to-per-entry batch."""
+
+    def test_clean_composite_maps_every_recorded_id_to_the_shared_base(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        cands = TestCompositeRevalidation._candidates()
+        with patch("coord.state.record_test_verdict"), \
+             patch("coord.state.record_test_staleness_anchor"):
+            batch = rv.revalidate_group(
+                cands, _live_config(git_fleet), runner=lambda *a: _Run(0),
+            )
+        assert batch.ok
+        assert not batch.fell_back
+        mapping = rv.recorded_validated_base_shas(batch, cands)
+        assert set(mapping) == {"w1", "w2"}
+        assert mapping["w1"] == mapping["w2"] == batch.composite.validated_base_sha
+        assert mapping["w1"] is not None
+
+    def test_fallback_maps_each_survivor_to_its_own_solo_base(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """Composite (both branches present) fails; each branch passes
+        alone -- the #1715 narrowing path. Both survivors were validated,
+        just by separate runs, and the mapping must reflect that."""
+        cands = TestCompositeRevalidation._candidates()
+
+        def runner(command, cwd, timeout):
+            both = (Path(cwd) / "f101.txt").exists() and (Path(cwd) / "f102.txt").exists()
+            return _Run(1, stderr="composite red") if both else _Run(0)
+
+        with patch("coord.state.record_test_verdict"), \
+             patch("coord.state.record_test_staleness_anchor"):
+            batch = rv.revalidate_group(cands, _live_config(git_fleet), runner=runner)
+
+        assert batch.fell_back
+        assert sorted(batch.recorded) == ["w1", "w2"]
+        mapping = rv.recorded_validated_base_shas(batch, cands)
+        assert set(mapping) == {"w1", "w2"}
+        for sha in mapping.values():
+            assert sha is not None
+
+    def test_unrecorded_candidate_is_absent_from_the_mapping(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        cands = TestCompositeRevalidation._candidates()
+        with patch("coord.state.record_test_verdict"):
+            batch = rv.revalidate_group(
+                cands, _live_config(git_fleet),
+                runner=lambda *a: _Run(1, stderr="boom"),
+            )
+        assert batch.recorded == []
+        assert rv.recorded_validated_base_shas(batch, cands) == {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3a. #1924: the composed-suite subprocess must not inherit `coord serve`'s
 #     own daemon-routing guard vars (e.g. `COORD_MERGE_ON_DAEMON`) — a thin
 #     client's `--revalidate` is routed to the daemon, whose process has that
@@ -2236,3 +2401,200 @@ class TestRevalidateConflictBlackBox:
         assert result.exit_code == 0, result.output
         dcf.assert_not_called()
         assert _states() == {"w1": mq.MERGED, "w2": mq.MERGED}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. #2829: `_auto_revalidate_tick` — the unattended sibling of `--revalidate`
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAutoRevalidateTick:
+    """``coord.serve_app._auto_revalidate_tick`` — the daemon tick behind
+    ``merge.auto_revalidate``. Reuses the ``blackbox`` fixture (real git
+    fleet, two genuinely stale entries) for the happy-path tests so the
+    composite the tick runs is the REAL suite, not a stub -- the same
+    discipline :class:`TestMergeRevalidateBlackBox` uses for the CLI path.
+    """
+
+    @staticmethod
+    def _auto_config(cfg_path: Path, *, max_batch: int = 3):
+        from coord.config import load as load_config
+
+        config = load_config(cfg_path)
+        config.merge.auto_revalidate = True
+        config.merge.auto_revalidate_max_batch = max_batch
+        return config
+
+    def test_no_eligible_candidates_is_a_no_op(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord.serve_app import _auto_revalidate_tick
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(CONFIG_YAML.format(repo_path=str(git_fleet)))
+        config = self._auto_config(cfg_path)
+
+        assert _auto_revalidate_tick(config) == []
+
+    def test_merges_both_stale_entries_after_one_composite_run(
+        self, blackbox,
+    ) -> None:
+        """The headline case: a lock-free composite passes, the base-SHA
+        recheck confirms nothing moved, and both entries merge -- exactly
+        what an operator's ``coord merge --revalidate`` would have done by
+        hand."""
+        from coord.serve_app import _auto_revalidate_tick
+
+        cfg_path, checkout = blackbox
+        config = self._auto_config(cfg_path)
+
+        stack = _gh_patches(checkout)
+        for p in stack:
+            p.start()
+        try:
+            events = _auto_revalidate_tick(config)
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+        merged = {ev.entry.assignment_id for ev in events if ev.kind == "merged"}
+        assert merged == {"w1", "w2"}, [
+            (ev.kind, ev.entry.assignment_id) for ev in events
+        ]
+        assert _states() == {"w1": mq.MERGED, "w2": mq.MERGED}
+
+    def test_discards_the_result_when_the_base_moves_before_the_recheck(
+        self, blackbox, monkeypatch,
+    ) -> None:
+        """The correctness crux (#2829): simulates a concurrent merge moving
+        the base while the (lock-free) composite is running, by making the
+        recheck report "moved" regardless. Nothing may merge on that
+        result -- the composite validated a tree that is no longer the
+        base, and merging it anyway is exactly the soundness bug the recheck
+        exists to prevent."""
+        from coord import revalidate as rv
+        from coord.serve_app import _auto_revalidate_tick
+
+        cfg_path, checkout = blackbox
+        config = self._auto_config(cfg_path)
+
+        monkeypatch.setattr(
+            rv, "revalidated_base_still_current", lambda *a, **kw: False,
+        )
+
+        stack = _gh_patches(checkout)
+        for p in stack:
+            p.start()
+        try:
+            events = _auto_revalidate_tick(config)
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+        assert events == []
+        # The composite still ran for real (that work wasn't wasted) --
+        # what must NOT have happened is a merge off its result.
+        assert _states() == {"w1": mq.PENDING, "w2": mq.PENDING}
+
+    def test_processes_only_one_group_per_tick(
+        self, git_fleet: Path, tmp_path: Path, coord_db, monkeypatch,
+    ) -> None:
+        """Per-tick ceiling (#2829): even with two eligible ``(repo,
+        target_branch)`` groups, at most ONE composite runs per call --
+        never a burst."""
+        from coord import merge_queue as mq2
+        from coord import revalidate as rv
+        from coord.serve_app import _auto_revalidate_tick
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(CONFIG_YAML.format(repo_path=str(git_fleet)))
+        config = self._auto_config(cfg_path)
+
+        e1 = _entry("w1", issue=101, target="main")
+        e2 = _entry("w2", issue=102, target="develop")
+        cand1 = mq2.RevalidationCandidate(
+            entry=e1, work_assignment_id="w1",
+            smoke=mq2.SmokeVerdictStatus(ok=False, kind=mq2.SMOKE_STALE, assignment_id="w1"),
+        )
+        cand2 = mq2.RevalidationCandidate(
+            entry=e2, work_assignment_id="w2",
+            smoke=mq2.SmokeVerdictStatus(ok=False, kind=mq2.SMOKE_STALE, assignment_id="w2"),
+        )
+        monkeypatch.setattr(mq2, "load_queue", lambda: [e1, e2])
+        monkeypatch.setattr(
+            mq2, "revalidation_candidates", lambda *a, **kw: [cand1, cand2],
+        )
+
+        calls: list[list] = []
+
+        def fake_group(group, cfg, echo=None):
+            calls.append(list(group))
+            return rv.BatchRevalidationResult(
+                composite=rv.RevalidationResult(
+                    ok=False, kind=rv.KIND_SUITE, reason="boom",
+                ),
+            )
+
+        monkeypatch.setattr(rv, "revalidate_group", fake_group)
+
+        _auto_revalidate_tick(config)
+
+        assert len(calls) == 1, (
+            f"expected exactly one composite call per tick, got {len(calls)}"
+        )
+        assert len(calls[0]) == 1, "each group here has exactly one candidate"
+
+    def test_caps_batch_size_to_auto_revalidate_max_batch(
+        self, git_fleet: Path, tmp_path: Path, coord_db, monkeypatch,
+    ) -> None:
+        """Batch ceiling (#2829): ``auto_revalidate_max_batch`` caps how many
+        candidates ONE group's composite may cover, well under
+        ``coord.revalidate.MAX_REVALIDATION_BATCH``."""
+        from coord import merge_queue as mq2
+        from coord import revalidate as rv
+        from coord.serve_app import _auto_revalidate_tick
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(CONFIG_YAML.format(repo_path=str(git_fleet)))
+        config = self._auto_config(cfg_path, max_batch=1)
+
+        e1 = _entry("w1", issue=101, target="main")
+        e2 = _entry("w2", issue=102, target="main")
+        cand1 = mq2.RevalidationCandidate(
+            entry=e1, work_assignment_id="w1",
+            smoke=mq2.SmokeVerdictStatus(ok=False, kind=mq2.SMOKE_STALE, assignment_id="w1"),
+        )
+        cand2 = mq2.RevalidationCandidate(
+            entry=e2, work_assignment_id="w2",
+            smoke=mq2.SmokeVerdictStatus(ok=False, kind=mq2.SMOKE_STALE, assignment_id="w2"),
+        )
+        monkeypatch.setattr(mq2, "load_queue", lambda: [e1, e2])
+        monkeypatch.setattr(
+            mq2, "revalidation_candidates", lambda *a, **kw: [cand1, cand2],
+        )
+
+        calls: list[list] = []
+
+        def fake_group(group, cfg, echo=None):
+            calls.append(list(group))
+            return rv.BatchRevalidationResult(
+                composite=rv.RevalidationResult(
+                    ok=False, kind=rv.KIND_SUITE, reason="boom",
+                ),
+            )
+
+        monkeypatch.setattr(rv, "revalidate_group", fake_group)
+
+        _auto_revalidate_tick(config)
+
+        assert len(calls) == 1
+        assert len(calls[0]) == 1, (
+            "auto_revalidate_max_batch=1 must cap the composite to one "
+            "candidate even though two were eligible"
+        )
+
+    # The lock-ordering test (composite runs unlocked, merge step blocks on
+    # `_merge_lock`) needs a cross-thread-safe DB connection, which is
+    # `rw_db` in tests/test_serve.py (mirroring production's
+    # `check_same_thread=False`) -- the autouse `coord_db` fixture used here
+    # is thread-bound `:memory:` and cannot be touched from a background
+    # thread. See test_serve.py::test_auto_revalidate_composite_runs_with_merge_lock_released.

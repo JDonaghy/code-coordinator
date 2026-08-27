@@ -202,6 +202,18 @@ _stdio_capture_install_lock = threading.Lock()
 # ``drop`` shortcut in ``post_merge`` below, both of which touch the
 # identical table via the identical pattern.
 #
+# #2829: NOT every caller that touches revalidation belongs inside this
+# lock, though — ``_auto_revalidate_tick`` deliberately takes it ONLY around
+# its base-SHA recheck + the actual load->mutate->save merge step, and
+# explicitly NOT around ``coord.revalidate.revalidate_group``'s composite
+# suite run (which can take up to 30 minutes and does not touch the
+# merge-queue table at all — it writes test verdicts to the assignments
+# table via `coord.state.record_test_verdict`). See that function's own
+# docstring for why: an unattended tick holding this lock for a 30-minute
+# composite would wedge every other merge in the fleet for as long as
+# nobody notices, which is exactly the amplification the next paragraph
+# describes for the ATTENDED daemon route.
+#
 # Trade-off (#1400-review, not addressed here): this is a bare
 # ``threading.Lock()`` with no timeout, so a hung ``merge_cmd.callback()``
 # (stuck ``gh``/git subprocess, network partition) now wedges every
@@ -1277,13 +1289,15 @@ def _auto_drain_tick(config: Config) -> "list":
     must not silence the enqueue/reconcile steps — the caller wraps this in its
     own ``try/except``.
 
-    #1769: and **no revalidation**.  ``coord merge --revalidate`` re-tests a
-    stale-but-``passed`` verdict against the current base, but this unattended
-    tick deliberately does not: a merge path that starts suite runs on its own
-    schedule is the shape that was gated off after the 2026-06-07 auto-loop
-    incident — the same reason ``merge.auto_drain`` itself defaults to
-    ``false``.  A stale entry stays ``BLOCKED`` here until an operator asks for
-    the re-test explicitly.
+    #1769: and **no revalidation** — this function itself never re-tests a
+    stale-but-``passed`` verdict; a stale entry stays ``BLOCKED`` here exactly
+    as before.  #2829 adds that capability as a SIBLING tick,
+    :func:`_auto_revalidate_tick`, gated on its own ``merge.auto_revalidate``
+    flag (default ``false``, its own trust bar) rather than folded in here —
+    see that function's docstring for why unattended revalidation needed a
+    lock-hold restructure that has nothing to do with this function's own
+    correctness, and for why the 2026-06-07 token-burn guard that keeps
+    ``auto_drain`` off doesn't actually apply to it.
 
     Mutates merge-queue rows in place and persists the changes.  Returns the
     list of :class:`~coord.merge_queue.MergeEvent` objects so the caller can
@@ -1428,6 +1442,230 @@ def _auto_drain_tick(config: Config) -> "list":
             event_type=f"merge_{ev.kind}",
             actor="daemon",
             summary=f"auto-drain {ev.kind}: {ev.entry.repo_name}#{ev.entry.issue_number} — {ev.message}",
+            repo=ev.entry.repo_name,
+            issue=ev.entry.issue_number,
+            assignment_id=ev.entry.assignment_id,
+            details={"kind": ev.kind, "pr_number": ev.entry.pr_number},
+        )
+
+    return events
+
+
+def _auto_revalidate_tick(config: Config) -> "list":
+    """Unattended stale-verdict resolution for the merge lane (#2829).
+
+    Opt-in via ``merge.auto_revalidate`` (default ``false``, its own trust
+    bar in ``docs/MERGE_AUTO_DRAIN_TRUST_BAR.md`` — a strictly larger grant
+    than ``auto_drain`` since this *starts test runs*, not just merges
+    pre-approved ones). Does, unattended, what an operator does by hand with
+    ``coord merge --revalidate``: compose every stale-but-``passed`` entry
+    for one ``(repo, target_branch)`` group onto the current base, run the
+    suite once, and merge on green — see :mod:`coord.revalidate`'s module
+    docstring for the full algorithm and why a composite re-confirmation
+    (not a first proof) is a sound thing to act on.
+
+    THE LOCK-HOLD RESTRUCTURE THIS EXISTS FOR (#2829): naively wiring
+    ``coord merge --revalidate``'s existing plumbing
+    (``coord.commands.merge._apply_revalidation`` → ``process()``) into a
+    tick would run the WHOLE composite — up to
+    ``coord.revalidate.DEFAULT_TIMEOUT_SECONDS × (1 +
+    merge.auto_revalidate_max_batch)`` in the worst case — inside
+    ``_merge_lock``, exactly as the daemon ``/merge`` route already does for
+    an attended ``--revalidate`` call. Attended, an operator watching that is
+    fine. Unattended, on a schedule, that wedges every other merge in the
+    fleet for as long as nobody notices. So this function does NOT call that
+    plumbing. It runs :func:`coord.revalidate.revalidate_group` with
+    **``_merge_lock`` released**, and takes the lock only immediately before
+    merging — and even then only after
+    :func:`coord.revalidate.revalidated_base_still_current` confirms the
+    base the (lock-free) composite validated is still current. If the base
+    moved while the suite ran, this tick's result is discarded — nothing
+    merges, nothing is reverted, and the next tick's :func:`coord.merge_queue
+    .plan` naturally sees the recorded verdict's anchor no longer matches the
+    new base (STALE again) and tries the whole thing again from scratch. That
+    recheck is the correctness crux named in #2829: skipping it would trade
+    the liveness bug this function fixes for a soundness bug (merging a tree
+    the suite never actually validated).
+
+    TWO CEILINGS, PER THE TRUST BAR:
+
+    * **At most one composite per tick, never a burst** — enforced in code
+      (there is nothing to configure): only the first ``(repo,
+      target_branch)`` group, in :func:`coord.revalidate.group_candidates`'s
+      sorted order, is ever revalidated in a single call. Any other eligible
+      groups simply wait for a later tick.
+    * **``merge.auto_revalidate_max_batch``** (default 3, clamped to
+      :data:`coord.revalidate.MAX_REVALIDATION_BATCH`) caps how many
+      candidates that one group's composite may cover — a RED composite's
+      1+N solo-run fallback is what actually holds ``_merge_lock`` once the
+      merge step below runs, so that worst case must stay small when nobody
+      is watching it happen.
+
+    Deliberately does NOT dispatch a #241 conflict-fix worker for a
+    candidate :func:`coord.revalidate.revalidate_group` finds
+    ``conflicted`` (unlike ``coord merge --revalidate``'s own
+    ``_dispatch_revalidation_conflicts``) — this whole feature's argument
+    for running unattended is that it spends no tokens (see
+    :mod:`coord.revalidate`'s module docstring), and dispatching a worker
+    would break that. A conflicted candidate is simply left exactly as
+    :func:`~coord.revalidate.revalidate_group` leaves it: blocked, with its
+    compose failure quoted, for a human or ``coord merge --revalidate`` to
+    pick up.
+
+    Prerequisite (#2028, named in the issue, not enforced here — this
+    function has no way to know which repos' suites touch daemon-host
+    ambient state): a repo whose suite reads the daemon host's own state
+    (the `tui/**` fixtures #2028 fixed) can never pass a composite reliably,
+    so turning this on for such a repo before that fix is live makes things
+    strictly worse than the manual status quo.
+
+    Returns the list of :class:`~coord.merge_queue.MergeEvent` objects the
+    merge step produced this tick — empty when there was nothing eligible, the
+    composite (or its per-entry fallback) recorded no fresh verdict, or the
+    base moved before the recheck could clear it to merge.
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord import merge_queue as mq  # noqa: PLC0415
+    from coord import revalidate as rv  # noqa: PLC0415
+    from coord.ci_store import build_ci_store  # noqa: PLC0415
+    from coord.merge_queue import PENDING, PLAN_READY  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+
+    board = build_board()
+    all_items = mq.load_queue()
+    pending = [item for item in all_items if item.state == PENDING]
+    if not pending:
+        return []
+
+    candidates = mq.revalidation_candidates(pending, board, config, github_ops)
+    if not candidates:
+        log.debug("auto-revalidate: no entry blocked solely on a stale verdict")
+        return []
+
+    groups = rv.group_candidates(candidates)
+    (repo_name, target_branch), group = groups[0]
+    if len(groups) > 1:
+        log.debug(
+            "auto-revalidate: %d eligible (repo, target_branch) group(s) "
+            "this tick; revalidating only %s -> %s (at most one composite "
+            "per tick, #2829)",
+            len(groups), repo_name, target_branch,
+        )
+
+    batch_cap = min(
+        max(1, config.merge.auto_revalidate_max_batch), rv.MAX_REVALIDATION_BATCH,
+    )
+    if len(group) > batch_cap:
+        log.debug(
+            "auto-revalidate: capping %s -> %s from %d to %d candidate(s) "
+            "(merge.auto_revalidate_max_batch)",
+            repo_name, target_branch, len(group), batch_cap,
+        )
+        group = group[:batch_cap]
+
+    # ── composite (+ per-entry fallback) runs with _merge_lock RELEASED ─────
+    # This is the whole point (#2829): the 30-min-per-run, 1+N-worst-case
+    # suite work happens while every other merge in the fleet can proceed.
+    batch = rv.revalidate_group(group, config, echo=log.info)
+    for line in rv.format_batch(batch):
+        log.info("auto-revalidate: %s", line)
+
+    if not batch.recorded:
+        return []
+
+    validated = rv.recorded_validated_base_shas(batch, group)
+
+    # ── lock taken ONLY for the base-SHA recheck + the merge itself ─────────
+    with _merge_lock:
+        safe_ids = [
+            aid for aid in batch.recorded
+            if rv.revalidated_base_still_current(
+                config, repo_name, target_branch, validated.get(aid),
+            )
+        ]
+        stale_ids = [aid for aid in batch.recorded if aid not in safe_ids]
+        for aid in stale_ids:
+            log.warning(
+                "auto-revalidate: %s: base moved (or could not be "
+                "reconfirmed) since the composite validated it -- "
+                "discarding this tick's result for it, will re-revalidate "
+                "next tick (#2829)",
+                aid,
+            )
+        if not safe_ids:
+            return []
+
+        # Reload: revalidate_group already wrote fresh test verdicts to the
+        # assignments table (not the merge-queue table), so a fresh board +
+        # plan() is what actually sees them as no-longer-stale.
+        fresh_board = build_board()
+        try:
+            ci_store = build_ci_store(
+                config.ci_store.type, host=config.ci_store.host,
+                token_env=config.ci_store.token_env,
+            )
+        except Exception:  # noqa: BLE001
+            ci_store = None
+        merge_plan = mq.plan(fresh_board, config, ci_store=ci_store, gh_ops=github_ops)
+        ready_aids = {
+            pm.assignment_id for pm in merge_plan
+            if pm.status == PLAN_READY and pm.assignment_id in safe_ids
+        }
+        if not ready_aids:
+            log.debug(
+                "auto-revalidate: revalidated entries not yet PLAN_READY "
+                "(another gate still blocks) -- nothing to merge this tick"
+            )
+            return []
+
+        fresh_items = mq.load_queue()
+        to_merge = [
+            item for item in fresh_items
+            if item.assignment_id in ready_aids and item.state == PENDING
+        ]
+        if not to_merge:
+            return []
+
+        events = mq.process(
+            to_merge,
+            github_ops,
+            method="rebase",
+            dry_run=False,
+            presorted=False,
+            ci_store=ci_store,
+            force_merge=False,
+            config=config,
+            board=fresh_board,
+            skip_review=False,
+            skip_smoke=False,
+        )
+
+        # #2246: same sibling-conflict sweep _auto_drain_tick runs after a
+        # merge — a branch this just landed may have made a queued sibling
+        # PR conflicting, and this tick has no other moment to notice.
+        try:
+            events.extend(mq.sweep_sibling_conflicts(events, to_merge, github_ops))
+        except Exception:  # noqa: BLE001
+            log.warning("auto-revalidate: sibling-conflict sweep failed", exc_info=True)
+
+        fresh = mq.load_queue()
+        by_id = {item.assignment_id: item for item in to_merge}
+        merged = [by_id.get(item.assignment_id, item) for item in fresh]
+        mq.save_queue(merged)
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    for ev in events:
+        record_audit(
+            tier="operational",
+            category="merge",
+            event_type=f"merge_{ev.kind}",
+            actor="daemon",
+            summary=f"auto-revalidate {ev.kind}: {ev.entry.repo_name}#{ev.entry.issue_number} — {ev.message}",
             repo=ev.entry.repo_name,
             issue=ev.entry.issue_number,
             assignment_id=ev.entry.assignment_id,
@@ -7801,6 +8039,35 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         _audit_enqueued(enqueued)
                 except Exception:  # noqa: BLE001
                     log.warning("passive enqueue tick failed", exc_info=True)
+                # Step 2b: #2829 auto-revalidate stale-but-passed merge-queue
+                # entries. Runs AFTER enqueue (a freshly-enqueued entry is
+                # never itself revalidation-eligible on the same tick it was
+                # enqueued, but this ordering matches auto-drain's below) and
+                # BEFORE auto-drain, so an entry this step just cleared can
+                # merge as part of the SAME tick's drain when both flags are
+                # on, instead of waiting a full tick. Default-off
+                # (merge.auto_revalidate: false) — no behaviour change for
+                # users who haven't opted in. Independent try/except so a
+                # revalidation failure never silences the other tick steps;
+                # see `_auto_revalidate_tick`'s own docstring for why this is
+                # safe to run unattended (no worker dispatch, no tokens) and
+                # for the lock-hold restructure that makes it safe to run on
+                # a schedule at all.
+                if config.merge.auto_revalidate:
+                    try:
+                        revalidate_events = await run_in_threadpool(
+                            _auto_revalidate_tick, config
+                        )
+                        for ev in revalidate_events:
+                            log.info(
+                                "auto-revalidate: %s %s #%d — %s",
+                                ev.kind,
+                                ev.entry.repo_name,
+                                ev.entry.issue_number,
+                                ev.message,
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-revalidate tick failed", exc_info=True)
                 # Step 3: #781 auto-drain READY merge-queue entries.
                 # Runs AFTER enqueue so freshly-approved work can be picked up
                 # in the same tick.  Default-off (merge.auto_drain: false) —

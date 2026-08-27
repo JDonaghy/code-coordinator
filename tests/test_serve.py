@@ -6136,6 +6136,128 @@ def test_auto_drain_serializes_on_merge_lock(
     assert result["events"] == []
 
 
+# ── #2829: _auto_revalidate_tick — the merge.auto_revalidate daemon tick ────
+
+
+def _make_auto_revalidate_config(
+    tmp_path: "Path", *, auto_revalidate: bool = True, max_batch: int = 3,
+) -> "Path":
+    """Write a coordinator.yml with merge.auto_revalidate set and return its path."""
+    content = (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    capabilities: [python]\n"
+        "    repos: [api]\n"
+        "\n"
+        f"merge:\n"
+        f"  auto_revalidate: {'true' if auto_revalidate else 'false'}\n"
+        f"  auto_revalidate_max_batch: {max_batch}\n"
+    )
+    p = tmp_path / "coord-auto-revalidate.yml"
+    p.write_text(content)
+    return p
+
+
+def test_auto_revalidate_config_default_off(valid_config_path: "Path") -> None:
+    """#2829: merge.auto_revalidate defaults to False when the merge: block
+    is absent -- byte-identical to today for anyone who hasn't opted in."""
+    from coord.config import load as load_config
+
+    cfg = load_config(valid_config_path)
+    assert cfg.merge.auto_revalidate is False
+    assert cfg.merge.auto_revalidate_max_batch == 3
+
+
+def test_auto_revalidate_composite_runs_with_merge_lock_released(
+    tmp_path: "Path", rw_db, monkeypatch,
+) -> None:
+    """#2829's core restructure: `coord.revalidate.revalidate_group`'s
+    composite (which can run for up to `DEFAULT_TIMEOUT_SECONDS` and, on a
+    red result, `1 + N` times that) must run with `_merge_lock` RELEASED --
+    the whole point of moving unattended revalidation out of the daemon
+    route's existing lock-everything shape. `_merge_lock` may only be taken
+    for the base-SHA recheck and the merge step that follows it.
+
+    Holds `_merge_lock` in the main thread, starts `_auto_revalidate_tick`
+    on a background thread, and asserts the (stubbed) composite still runs
+    to completion while the lock is held -- then that the function blocks
+    from that point on until the lock is released.
+    """
+    import threading
+
+    from coord import merge_queue as mq
+    from coord import revalidate as rv
+    from coord.config import load as load_config
+    from coord.serve_app import _auto_revalidate_tick, _merge_lock
+
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
+
+    entry = mq.QueuedMerge(
+        assignment_id="work-reval1", repo_name="api", repo_github="acme/api",
+        branch="issue-77-impl", target_branch="main", issue_number=77,
+        issue_title="The issue", state=mq.PENDING,
+    )
+    candidate = mq.RevalidationCandidate(
+        entry=entry, work_assignment_id="work-reval1",
+        smoke=mq.SmokeVerdictStatus(
+            ok=False, kind=mq.SMOKE_STALE, assignment_id="work-reval1",
+        ),
+    )
+    monkeypatch.setattr(mq, "load_queue", lambda: [entry])
+    monkeypatch.setattr(mq, "revalidation_candidates", lambda *a, **kw: [candidate])
+
+    composite_started = threading.Event()
+
+    def fake_group(group, cfg, echo=None):
+        composite_started.set()
+        return rv.BatchRevalidationResult(
+            composite=rv.RevalidationResult(
+                ok=True, recorded=["work-reval1"], validated_base_sha="irrelevant",
+            ),
+            recorded=["work-reval1"],
+        )
+
+    monkeypatch.setattr(rv, "revalidate_group", fake_group)
+    monkeypatch.setattr(rv, "revalidated_base_still_current", lambda *a, **kw: True)
+    # Nothing READY once the merge step actually runs -- this test asserts
+    # lock ORDERING, not a merge outcome, so `plan()` returning empty is the
+    # simplest way to let the function return cleanly once unblocked.
+    monkeypatch.setattr(mq, "plan", lambda *a, **kw: [])
+
+    cfg = load_config(_make_auto_revalidate_config(tmp_path))
+    assert cfg.merge.auto_revalidate is True
+
+    result: dict = {}
+
+    def _run():
+        result["events"] = _auto_revalidate_tick(cfg)
+
+    _merge_lock.acquire()
+    try:
+        t = threading.Thread(target=_run)
+        t.start()
+        assert composite_started.wait(timeout=2), (
+            "the composite never ran -- _auto_revalidate_tick must not take "
+            "_merge_lock before running coord.revalidate.revalidate_group (#2829)"
+        )
+        t.join(timeout=0.3)
+        assert t.is_alive(), (
+            "_auto_revalidate_tick returned while _merge_lock was still held "
+            "externally -- its base-SHA recheck + merge step must block on it"
+        )
+    finally:
+        _merge_lock.release()
+    t.join(timeout=5)
+    assert not t.is_alive(), "_auto_revalidate_tick did not finish after _merge_lock was released"
+    assert result["events"] == []
+
+
 # ── #1038: operational-tier audit hooks ──────────────────────────────────────
 
 

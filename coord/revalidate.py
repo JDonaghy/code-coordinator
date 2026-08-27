@@ -81,11 +81,31 @@ terminates with a clear reason rather than spinning.
 
 OPT-IN, ALWAYS
 --------------
-None of this may ever run unattended. ``merge.auto_drain`` is ``false`` by
-design after the 2026-06-07 token-burn incident, and the daemon's
-``_auto_drain_tick`` passes ``revalidate=False`` permanently. Batch
-revalidation inherits that posture wholesale: an operator asks for it, or it
-does not happen.
+None of *this module's own functions* start running on a schedule — ``coord
+merge --revalidate`` is the only caller that invokes :func:`revalidate` /
+:func:`revalidate_group` directly, and the daemon's ``_auto_drain_tick``
+passes ``revalidate=False`` permanently, exactly as before.
+
+#2829 adds a SIBLING unattended caller instead of changing that:
+:func:`coord.serve_app._auto_revalidate_tick`, gated on its own
+``merge.auto_revalidate`` flag (default ``false``, its own trust bar in
+``docs/MERGE_AUTO_DRAIN_TRUST_BAR.md``). The argument for treating this
+differently from the 2026-06-07 token-burn shape that keeps ``auto_drain``
+off: nothing here dispatches a worker or spends a token either way — see the
+module-level paragraph above — so the guard that incident justifies does not
+apply to this code path. What DOES apply, and what makes this "not a
+one-line flag flip", is the lock-hold hazard: calling ``coord merge
+--revalidate``'s existing plumbing (``_apply_revalidation`` →
+``revalidate_group`` → ``process()``, all under ``_merge_lock`` on the daemon
+route) from an unattended tick would hold that lock for up to
+``DEFAULT_TIMEOUT_SECONDS × (1 + N)`` on every tick, wedging every other
+merge in the fleet for as long as a sleeping operator doesn't notice.
+``_auto_revalidate_tick`` therefore does NOT reuse that call chain — it runs
+:func:`revalidate_group` with **no lock held at all**, and takes
+``_merge_lock`` only immediately before merging, after
+:func:`revalidated_base_still_current` confirms the base the composite
+validated is still current. See that function's docstring for why the
+recheck is the correctness crux, not an optional extra.
 """
 
 from __future__ import annotations
@@ -348,6 +368,15 @@ class RevalidationResult:
 
     ``kind`` classifies a failure (#1715) so :func:`revalidate_group` can tell
     "this branch broke it" from "nothing here could ever have run".
+
+    ``validated_base_sha`` (#2829) is ``origin/<target_branch>``'s SHA at the
+    moment this run's worktree was built — ``None`` when no worktree was ever
+    created (every :data:`KIND_SETUP` return). It is the anchor an unattended
+    caller re-checks immediately before merging (see
+    :func:`revalidated_base_still_current`): a caller that takes no lock
+    while the suite runs must confirm, right before it acts on ``recorded``,
+    that this SHA is still what the base actually is — otherwise it would be
+    merging a tree the suite never validated.
     """
 
     ok: bool
@@ -357,6 +386,7 @@ class RevalidationResult:
     recorded: list[str] = field(default_factory=list)
     worktree: Path | None = None
     kind: str = KIND_OK
+    validated_base_sha: str | None = None
 
     def __bool__(self) -> bool:  # pragma: no cover — convenience only
         return self.ok
@@ -746,6 +776,15 @@ def revalidate(
             ),
         )
 
+    # #2829: the base every return from here on actually validated against —
+    # stamped on every `RevalidationResult` below (success or failure) so an
+    # unattended caller that runs this whole function with no lock held can,
+    # right before it acts on a green result, re-check this SHA is still
+    # current (see `revalidated_base_still_current`). Read once, right after
+    # the worktree is built from it, rather than re-derived later — this IS
+    # the base the composed tree and the suite run actually saw.
+    base_sha = _rev_parse(repo_dir, f"origin/{target_branch}")
+
     composed: list[str] = []
     # `git merge` (not rebase) with an explicit commit: we only need a tree
     # that contains every candidate's content on top of the current base.
@@ -769,6 +808,7 @@ def revalidate(
                 output=_tail(merged.stdout + "\n" + merged.stderr),
                 composed=list(composed),
                 worktree=wt_path,
+                validated_base_sha=base_sha,
             )
         composed.append(branch)
         echo(f"    composed {branch}")
@@ -786,6 +826,7 @@ def revalidate(
                 reason=f"revalidation build timed out after {timeout}s",
                 composed=list(composed),
                 worktree=wt_path,
+                validated_base_sha=base_sha,
             )
         if built.returncode != 0:
             build_output = (built.stdout or "") + "\n" + (built.stderr or "")
@@ -814,6 +855,7 @@ def revalidate(
                 output=_tail(build_output),
                 composed=list(composed),
                 worktree=wt_path,
+                validated_base_sha=base_sha,
             )
 
     echo(f"    running tests: {test_command}")
@@ -826,6 +868,7 @@ def revalidate(
             reason=f"revalidation suite timed out after {timeout}s",
             composed=list(composed),
             worktree=wt_path,
+            validated_base_sha=base_sha,
         )
     if tested.returncode != 0:
         test_output = (tested.stdout or "") + "\n" + (tested.stderr or "")
@@ -854,6 +897,7 @@ def revalidate(
             output=_tail(test_output),
             composed=list(composed),
             worktree=wt_path,
+            validated_base_sha=base_sha,
         )
 
     # ── Suite green: record the fresh verdicts ──────────────────────────────
@@ -862,8 +906,11 @@ def revalidate(
     # The commits this run ACTUALLY validated, read from the local refs the
     # worktree was built from — not re-discovered from GitHub afterwards. See
     # `record_test_staleness_anchor`'s docstring for why that distinction is
-    # load-bearing rather than an optimisation.
-    validated_base_sha = _rev_parse(repo_dir, f"origin/{target_branch}")
+    # load-bearing rather than an optimisation. Same value as `base_sha`
+    # above (nothing has fetched again since); reuse it rather than
+    # re-deriving so the RESULT's `validated_base_sha` and the ANCHOR written
+    # to the DB can never disagree.
+    validated_base_sha = base_sha
 
     recorded: list[str] = []
     composite_note = (
@@ -903,6 +950,7 @@ def revalidate(
         composed=composed,
         recorded=recorded,
         worktree=None,
+        validated_base_sha=validated_base_sha,
     )
 
 
@@ -1072,6 +1120,97 @@ def revalidate_group(
         )
 
     return batch
+
+
+def recorded_validated_base_shas(
+    batch: BatchRevalidationResult,
+    candidates: list[RevalidationCandidate],
+) -> dict[str, str | None]:
+    """Map each RECORDED candidate to the base SHA the run that actually
+    cleared it validated against (#2829).
+
+    Only :data:`coord.serve_app._auto_revalidate_tick` — the unattended
+    caller — needs this: an attended ``coord merge --revalidate`` acts on
+    ``batch.recorded`` immediately, under the same lock the whole call was
+    already made under, so there is no gap for the base to move in. The
+    unattended tick runs the composite (and any per-entry fallback) with NO
+    lock held at all, so before it merges anything it must re-confirm, via
+    :func:`revalidated_base_still_current`, that each recorded id's base is
+    still what THIS mapping says was validated.
+
+    A clean composite validates every candidate against the SAME base
+    (``batch.composite.validated_base_sha``). A composite that fell back to
+    per-entry narrowing (#1715) took one run per candidate, each
+    conceivably (if rarely) against a slightly later ``git fetch`` — so
+    each survivor gets its OWN solo run's SHA instead. ``batch.per_entry``
+    is built by :func:`revalidate_group` iterating *candidates* in order,
+    appending exactly one entry per candidate whether it passed or failed
+    (never skipped, never reordered) — so zipping the two by position
+    recovers the correspondence without re-deriving the ``_label`` string
+    matching :func:`format_batch` uses for display.
+
+    Only recorded (merge-eligible) candidates appear in the result — a
+    candidate that never got a fresh verdict has nothing for a caller to
+    gate before merging.
+    """
+    recorded = set(batch.recorded)
+    result: dict[str, str | None] = {}
+    if not batch.fell_back:
+        for c in candidates:
+            if c.work_assignment_id in recorded:
+                result[c.work_assignment_id] = batch.composite.validated_base_sha
+        return result
+    for c, (_label, solo) in zip(candidates, batch.per_entry):
+        if solo.ok and c.work_assignment_id in recorded:
+            result[c.work_assignment_id] = solo.validated_base_sha
+    return result
+
+
+def revalidated_base_still_current(
+    config, repo_name: str, target_branch: str, validated_base_sha: str | None,
+) -> bool:
+    """True when *validated_base_sha* is still ``origin/<target_branch>``'s
+    HEAD — the base-SHA recheck an unattended caller must run immediately
+    before merging anything a lock-free composite just validated (#2829).
+
+    THE CORRECTNESS CRUX. :func:`coord.serve_app._auto_revalidate_tick` runs
+    the (potentially 30-minute) composite with `_merge_lock` released, so
+    another merge can move the base while it runs. A green composite is a
+    claim about the tree it was BUILT from, not about whatever
+    ``origin/<target_branch>`` happens to be by the time the suite finishes.
+    Skipping this check would trade the liveness bug (a sleeping fleet
+    wedged for 30+ minutes behind one composite) for a soundness bug
+    (merging a tree the suite never actually ran against) — which is worse,
+    because it fails silently instead of just being slow.
+
+    Fetches fresh (mirrors :func:`revalidate`'s own first step) rather than
+    trusting whatever the caller's board/queue snapshot says, since the
+    whole point is to catch a move that happened AFTER that snapshot was
+    taken. Fail-closed: a ``None`` SHA (nothing was ever validated — e.g. a
+    :data:`KIND_SETUP` result), a missing/unreachable local checkout, or a
+    failed fetch all return ``False``. "Cannot confirm the base is
+    unchanged" must never be treated as "confirmed unchanged" on a path
+    that is about to merge with nobody watching — the caller's response to
+    ``False`` is simply to skip merging this tick; the next tick's
+    :func:`coord.merge_queue.plan` will see the recorded verdict's anchor no
+    longer matches the (now different) base, call it stale again, and
+    ``_auto_revalidate_tick`` will re-revalidate it against the new base —
+    exactly the "discard the result and let the next tick retry" behaviour
+    the issue calls for, with no explicit revert needed.
+    """
+    if not validated_base_sha:
+        return False
+    repo_dir = local_repo_dir(config, repo_name)
+    if repo_dir is None or not repo_dir.exists():
+        return False
+    try:
+        fetched = _run(["git", "fetch", "origin", "--prune"], cwd=repo_dir)
+    except (subprocess.SubprocessError, OSError):
+        return False
+    if fetched.returncode != 0:
+        return False
+    current = _rev_parse(repo_dir, f"origin/{target_branch}")
+    return current is not None and current == validated_base_sha
 
 
 def compose_conflict_error(entry) -> str:
@@ -1268,7 +1407,9 @@ __all__ = [
     "is_baseline_red_failure",
     "is_infrastructure_failure",
     "local_repo_dir",
+    "recorded_validated_base_shas",
     "revalidate",
     "revalidate_group",
+    "revalidated_base_still_current",
     "revalidation_worktree_path",
 ]
