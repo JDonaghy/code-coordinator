@@ -1062,6 +1062,59 @@ def test_truncate_diff_text_matches_pr_diff_truncation(monkeypatch) -> None:
     assert via_pr_diff == via_helper
 
 
+def _diff_for(path: str, n_lines: int) -> str:
+    lines = [f"diff --git a/{path} b/{path}", f"--- a/{path}", f"+++ b/{path}"]
+    lines += [f"+line {i}" for i in range(n_lines)]
+    return "\n".join(lines) + "\n"
+
+
+def test_truncate_diff_text_cuts_on_file_boundary_not_mid_hunk() -> None:
+    """#2819: truncation must never hand the reviewer a partial hunk — the
+    cut lands on the last `diff --git` boundary that fits, so every file
+    kept in the output is complete."""
+    from coord import github_ops
+
+    diff = _diff_for("a.py", 20) + _diff_for("b.py", 20) + _diff_for("c.py", 2000)
+    out = github_ops.truncate_diff_text(diff, max_chars=1000)
+
+    # Both kept files are present in full (their own last line included);
+    # nothing stops mid-hunk.
+    assert "+line 19\ndiff --git a/b.py" in out
+    assert "+line 19\n... [diff truncated" in out
+    assert "diff --git a/c.py" not in out
+
+
+def test_truncate_diff_text_lists_omitted_files() -> None:
+    """#2819: a reviewer handed a truncated diff must be told which files
+    it did not see, so it can inspect them directly instead of silently
+    missing them."""
+    from coord import github_ops
+
+    diff = _diff_for("a.py", 20) + _diff_for("b.py", 20) + _diff_for("c.py", 2000)
+    out = github_ops.truncate_diff_text(diff, max_chars=1000)
+
+    assert "1 file(s) omitted" in out
+    assert "Files omitted by truncation" in out
+    assert "  - c.py" in out
+    # Only the dropped file is listed — the kept files aren't flagged as omitted.
+    assert "  - a.py" not in out
+    assert "  - b.py" not in out
+
+
+def test_truncate_diff_text_falls_back_to_char_slice_when_no_boundary_fits() -> None:
+    """#2819: when even the first file's own diff exceeds max_chars (or the
+    input has no `diff --git` boundaries at all), fall back to the old raw
+    character slice rather than emitting an empty string."""
+    from coord import github_ops
+
+    diff = _diff_for("huge.py", 5000)
+    out = github_ops.truncate_diff_text(diff, max_chars=1000)
+
+    assert len(out) > 1000  # head (1000 chars) + trailing note
+    assert out.startswith(diff[:1000])
+    assert "omitted" not in out  # no boundary found -> no file list to report
+
+
 def test_pr_diff_returns_none_on_gh_error(monkeypatch) -> None:
     """#612: pr_diff is best-effort — a gh failure yields None, not a raise."""
     from coord import github_ops

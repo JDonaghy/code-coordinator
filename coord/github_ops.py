@@ -2313,17 +2313,97 @@ def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
     return True
 
 
+def diff_file_paths(diff_text: str) -> list[str]:
+    """Return every file path touched by *diff_text*, deduped, order-preserving.
+
+    Scans unified-diff file-header lines (``diff --git a/X b/Y``, ``---
+    a/X``, ``+++ b/X``) — cheap, dependency-free (#944 sealing v1) ahead of a
+    real diff parser. Lives here (rather than :mod:`coord.review`, its
+    original home) because :func:`truncate_diff_text` needs it too (#2819)
+    and ``coord.review`` imports :mod:`coord.github_ops`, not the reverse —
+    :mod:`coord.review` re-uses this copy for its own sealed-path /
+    missing-test-coverage checks instead of keeping a second one.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in diff_text.splitlines():
+        candidates: list[str] = []
+        if line.startswith("diff --git "):
+            for part in line.split()[1:]:
+                if part.startswith("a/") or part.startswith("b/"):
+                    candidates.append(part[2:])
+        elif line.startswith("--- a/"):
+            candidates.append(line[len("--- a/"):])
+        elif line.startswith("+++ b/"):
+            candidates.append(line[len("+++ b/"):])
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                paths.append(c)
+    return paths
+
+
+_DIFF_FILE_BOUNDARY_RE = re.compile(r"^diff --git ", re.MULTILINE)
+
+
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:
-    """Truncate *diff* to *max_chars* with a trailing note, if it's over.
+    """Truncate *diff* to at most *max_chars*, cutting on a ``diff --git``
+    file boundary rather than mid-hunk, and naming the files that got cut.
 
     Factored out of :func:`pr_diff` (#1475) so callers that need the full,
     untruncated diff for content hashing (``compute_patch_id``) can still
     apply the same display truncation to a *separate* copy shown to a human
     reviewer or embedded in a briefing, without a second ``gh`` fetch.
+
+    #2819: the original version was a blind character slice — handed the
+    reviewer a diff that stopped mid-hunk, with no indication anything was
+    even cut, on any PR whose diff crossed *max_chars* (61% of a review
+    briefing at the flat 60k default). That's a silent coverage hole in a
+    gate that's supposed to be adversarial. This version instead:
+
+    1. Cuts at the last ``diff --git`` boundary that fits within
+       *max_chars* — every file kept in the output is complete, never a
+       partial hunk.
+    2. Appends the paths of every file that got dropped, so the reviewer
+       knows exactly what it did not see and can inspect those files
+       directly (e.g. ``git show``) instead of silently missing them.
+
+    Falls back to the old raw character slice — no boundary preference, no
+    file list — when no file boundary fits within *max_chars* at all (a
+    single file's own diff already exceeds the cap, or *diff* isn't a
+    unified diff to begin with). Cutting nothing at that point would just
+    emit an empty string, which is worse than the old behavior.
     """
-    if len(diff) > max_chars:
-        return diff[:max_chars] + f"\n... [diff truncated at {max_chars} chars] ..."
-    return diff
+    if len(diff) <= max_chars:
+        return diff
+
+    boundaries = [m.start() for m in _DIFF_FILE_BOUNDARY_RE.finditer(diff)]
+    cut_at: int | None = None
+    for b in boundaries:
+        if b == 0:
+            continue  # the first file's own boundary — cutting here keeps nothing
+        if b > max_chars:
+            break
+        cut_at = b
+
+    if cut_at is None:
+        head = diff[:max_chars]
+    else:
+        head = diff[:cut_at].rstrip("\n")
+
+    dropped = [p for p in diff_file_paths(diff) if p not in diff_file_paths(head)]
+
+    note = f"\n... [diff truncated at {max_chars} chars"
+    if dropped:
+        note += f"; {len(dropped)} file(s) omitted"
+    note += "] ..."
+    if dropped:
+        note += (
+            "\nFiles omitted by truncation — NOT reviewed above; inspect "
+            "these directly (e.g. `git show <head-sha> -- <path>`) before "
+            "approving:\n" + "\n".join(f"  - {p}" for p in dropped)
+        )
+    return head + note
 
 
 def pr_diff(repo_github: str, pr_number: int, *, max_chars: int | None = 60000) -> str | None:
