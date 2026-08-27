@@ -245,6 +245,36 @@ def lanes_for_host(host: str, health: dict | None) -> list[Lane]:
             )
         )
 
+    # ── coord-agent process — the agent's OWN running version (#2841) ────
+    # `version` is `coord.__version__`, imported once at process start and
+    # frozen for that process's whole life (`coord/agent_app.py`'s health
+    # handler: `data["version"] = __version__`). That is exactly what #1834
+    # means by "verify the running process, not the venv" — unlike
+    # `coord-agent spawns` above, which resolves a *fresh* `coord --version`
+    # subprocess through the service PATH and therefore reports the new
+    # version the instant a blue/green swap flips `~/.coord-venv`, whether or
+    # not the agent that would spawn it has itself restarted.
+    #
+    # That distinction is cosmetic almost everywhere, because the agent
+    # self-restarts on an idle swap (`_idle_restart_target`) and the two
+    # lanes reconverge within one poll cycle. It stops being cosmetic on the
+    # daemon host: `_idle_restart_target` deliberately returns `None` there
+    # (a self-restarted agent would out-rank the `coord-serve` sitting next
+    # to it — see that function's docstring), so the daemon host's agent is
+    # the one case where nothing but this lane ever reads a staged-but-
+    # unrestarted swap as behind. #2069 gave `coord-serve` a `process` lane
+    # for the identical reason; this is that fix one unit over, for
+    # `coord-agent`.
+    if health is not None and "version" in health:
+        lanes.append(
+            Lane(
+                host=host,
+                lane="coord-agent process",
+                version=health.get("version") or None,
+                process=True,
+            )
+        )
+
     return lanes
 
 

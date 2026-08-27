@@ -271,10 +271,21 @@ ALL_LANES: tuple[str, ...] = (LANE_PYTHON, LANE_UNITS, LANE_TUI)
 #: spawns`` (what it would hand subprocesses), and the one #2069's restart
 #: actually targets, so it needs its own exact entry rather than falling out
 #: of the ``" spawns"`` suffix rule below.
+#:
+#: ``coord-agent process`` (:func:`coord.release_verify.lanes_for_host`) is
+#: #2069 for ``coord-agent``: the agent's own frozen-at-start ``__version__``,
+#: as distinct from ``coord-agent spawns`` (a fresh subprocess re-resolving
+#: the venv on every poll, which flips the instant a swap lands whether or
+#: not the agent restarted). On the daemon host the agent can *never*
+#: self-restart (`agent_app.py`'s `_idle_restart_target` refuses there on
+#: purpose), so this is the only lane that still reads a staged-but-
+#: unrestarted swap as behind on that host — see the module docstring's
+#: "REACH MUST GROW TO MEET THE GATE" section.
 _VERIFY_LANE_EXACT: dict[str, str] = {
     "~/.coord-venv": LANE_PYTHON,
     "coord-tui": LANE_TUI,
     "coord-serve process": LANE_PYTHON,
+    "coord-agent process": LANE_PYTHON,
 }
 
 #: Units whose *live process* a python-lane roll actually replaces. ``POST

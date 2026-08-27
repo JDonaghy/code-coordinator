@@ -949,6 +949,16 @@ def test_coord_serve_process_is_in_reach_too():
     assert not rp.lane_is_out_of_reach("coord-serve process")
 
 
+def test_coord_agent_process_is_in_reach_too():
+    """#2841: #2069 for `coord-agent`. `coord-agent process` is the agent's
+    own frozen-at-start version (`lanes_for_host`), a different lane than
+    `coord-agent spawns` (a fresh subprocess that re-resolves the venv on
+    every poll and therefore flips the instant a swap lands, restarted or
+    not). Both must resolve to the python lane."""
+    assert rp.verify_lane_kind("coord-agent process") == rp.LANE_PYTHON
+    assert not rp.lane_is_out_of_reach("coord-agent process")
+
+
 def test_a_sibling_unit_finding_blocks_when_its_host_python_lane_rolled():
     """The asymmetry #2069 introduces: a host whose python lane this run
     actually rolled is now accountable for coord-serve too."""
