@@ -4464,15 +4464,42 @@ def _update_issue_labels_local(
 
     Returns ``True`` when a row was updated, ``False`` when no row matched (the
     issue isn't in the local cache yet — it'll be inserted on the next sync; not
-    an error here).  Does not touch ``state`` or ``synced_at`` — only ``labels``.
+    an error here) **or** when a lock outlasted the retry budget (#2846, see
+    below) — both self-heal on the next sync, so callers can't and shouldn't
+    tell them apart.  Does not touch ``state`` or ``synced_at`` — only ``labels``.
+
+    #2846: this is the seam both ``/issue-labels`` (this function called
+    directly) and ``_apply_issue_labels_local``'s ``/issue-label`` (the GitHub
+    write already landed there) route their cache-mirror write through — same
+    shape as the sibling mirrors #2689 guarded. ``retry_on_locked`` absorbs
+    transient contention (a concurrent writer elsewhere in the daemon, not a
+    real bug); if it's still locked after the retry budget, log loudly and
+    report "no row touched" rather than raising a 503 that would read as
+    "nothing happened" when the label change already happened upstream.
     """
-    conn = get_connection()
-    cursor = sql.execute(conn,
-        "UPDATE issues SET labels = ? WHERE repo_name = ? AND number = ?",
-        (json.dumps(sorted(set(labels))), repo_name, issue_number),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
+    def _write() -> int:
+        conn = get_connection()
+        cursor = sql.execute(conn,
+            "UPDATE issues SET labels = ? WHERE repo_name = ? AND number = ?",
+            (json.dumps(sorted(set(labels))), repo_name, issue_number),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    try:
+        rowcount = retry_on_locked(_write)
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2846: cache mirror for issue %s#%s label update hit a lock "
+            "that never cleared after retrying; the upstream label change "
+            "already happened, so not failing the call — the cache row "
+            "will catch up on the next sync: %s",
+            repo_name, issue_number, exc,
+        )
+        return False
+    return rowcount > 0
 
 
 def get_cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | None:
@@ -4558,24 +4585,12 @@ def _apply_issue_labels_local(
         slug, issue_number, add=add, remove=remove
     )
 
-    # #2689: same shape as `_create_issue_local`/`_edit_issue_content_local`
-    # — the GitHub label write above already landed and is irreversible, so
-    # a lock that outlasts the retry budget on the cache mirror must not
-    # fail the call.
-    try:
-        retry_on_locked(
-            lambda: _update_issue_labels_local(repo_name, issue_number, new_labels)
-        )
-    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
-        if not is_lock_contention_error(exc):
-            raise
-        _log.error(
-            "#2689: cache mirror for relabeled issue %s#%s hit a lock that "
-            "never cleared after retrying; the GitHub label change already "
-            "succeeded, so not failing the call — the cache row will catch "
-            "up on the next sync: %s",
-            repo_name, issue_number, exc,
-        )
+    # #2689 / #2846: the GitHub label write above already landed and is
+    # irreversible. The retry-then-log-and-swallow lock-contention guard now
+    # lives inside `_update_issue_labels_local` itself (shared with the
+    # `/issue-labels` plural endpoint's direct caller, which had the same gap
+    # unguarded) — so this call site no longer needs its own wrapper.
+    _update_issue_labels_local(repo_name, issue_number, new_labels)
     return new_labels, changed
 
 
@@ -5459,9 +5474,21 @@ def _record_issue_comment_capture_local(
     author: str | None = None,
     created_at: float | None = None,
 ) -> None:
+    """Best-effort durable mirror of a just-posted comment (#873).
+
+    #2846: the GitHub comment this mirrors has already posted — irreversibly
+    — by the time this runs (the daemon's own ``/issue-comment``, and every
+    remote caller via ``github_ops._capture_comment_write``, only reach here
+    after ``gh issue comment`` succeeded). Same shape as the sibling mirrors
+    #2689 guarded: ``retry_on_locked`` absorbs transient contention, and if
+    it's still locked after the retry budget, log loudly and return rather
+    than raising — a 503 out of the ``/issue-comments`` capture route would
+    read as "nothing happened" when the comment already exists on GitHub,
+    and the missing mirror row self-heals on the next backfill sync
+    (``sync_issue_comments``).
+    """
     from coord.comments import parse_coord_comment_marker  # noqa: PLC0415
 
-    conn = get_connection()
     now = time.time()
     ts = created_at if created_at is not None else now
     marker = parse_coord_comment_marker(body)
@@ -5470,51 +5497,67 @@ def _record_issue_comment_capture_local(
     machine = marker["machine"] if marker else None
     verdict = marker["verdict"] if marker else None
 
-    if gh_comment_id is not None:
-        # Idempotent upsert keyed on the natural key (the GitHub comment id)
-        # — capture-at-write and the backfill sync converge on the same row
-        # regardless of which wrote it first. COALESCE keeps a real author
-        # captured-at-write time even if a later call (e.g. a race with the
-        # backfill sync) supplies None.
-        sql.execute(conn,
-            """
-            INSERT INTO issue_comments (
-                gh_comment_id, repo_name, issue_number, author, created_at,
-                updated_at, body, coord_event, coord_assignment_id, machine, verdict
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (gh_comment_id) DO UPDATE SET
-                repo_name           = excluded.repo_name,
-                issue_number        = excluded.issue_number,
-                author              = COALESCE(excluded.author, issue_comments.author),
-                updated_at          = excluded.updated_at,
-                body                = excluded.body,
-                coord_event         = excluded.coord_event,
-                coord_assignment_id = excluded.coord_assignment_id,
-                machine             = excluded.machine,
-                verdict             = excluded.verdict
-            """,
-            (
-                gh_comment_id, repo_name, issue_number, author, ts, ts, body,
-                coord_event, coord_assignment_id, machine, verdict,
-            ),
+    def _write() -> None:
+        conn = get_connection()
+        if gh_comment_id is not None:
+            # Idempotent upsert keyed on the natural key (the GitHub comment
+            # id) — capture-at-write and the backfill sync converge on the
+            # same row regardless of which wrote it first. COALESCE keeps a
+            # real author captured-at-write time even if a later call (e.g.
+            # a race with the backfill sync) supplies None.
+            sql.execute(conn,
+                """
+                INSERT INTO issue_comments (
+                    gh_comment_id, repo_name, issue_number, author, created_at,
+                    updated_at, body, coord_event, coord_assignment_id, machine, verdict
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (gh_comment_id) DO UPDATE SET
+                    repo_name           = excluded.repo_name,
+                    issue_number        = excluded.issue_number,
+                    author              = COALESCE(excluded.author, issue_comments.author),
+                    updated_at          = excluded.updated_at,
+                    body                = excluded.body,
+                    coord_event         = excluded.coord_event,
+                    coord_assignment_id = excluded.coord_assignment_id,
+                    machine             = excluded.machine,
+                    verdict             = excluded.verdict
+                """,
+                (
+                    gh_comment_id, repo_name, issue_number, author, ts, ts, body,
+                    coord_event, coord_assignment_id, machine, verdict,
+                ),
+            )
+        else:
+            # gh didn't hand back a parseable comment id (should be rare —
+            # see github_ops.parse_comment_id) — durability still wins over
+            # dedup here; the row just can't be upserted against by a later
+            # sync.
+            sql.execute(conn,
+                """
+                INSERT INTO issue_comments (
+                    gh_comment_id, repo_name, issue_number, author, created_at,
+                    updated_at, body, coord_event, coord_assignment_id, machine, verdict
+                ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repo_name, issue_number, author, ts, ts, body,
+                    coord_event, coord_assignment_id, machine, verdict,
+                ),
+            )
+        conn.commit()
+
+    try:
+        retry_on_locked(_write)
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        if not is_lock_contention_error(exc):
+            raise
+        _log.error(
+            "#2846: durable comment-capture mirror for issue %s#%s hit a "
+            "lock that never cleared after retrying; the GitHub comment "
+            "already posted, so not failing the call — the mirror row will "
+            "catch up on the next backfill sync: %s",
+            repo_name, issue_number, exc,
         )
-    else:
-        # gh didn't hand back a parseable comment id (should be rare — see
-        # github_ops.parse_comment_id) — durability still wins over dedup
-        # here; the row just can't be upserted against by a later sync.
-        sql.execute(conn,
-            """
-            INSERT INTO issue_comments (
-                gh_comment_id, repo_name, issue_number, author, created_at,
-                updated_at, body, coord_event, coord_assignment_id, machine, verdict
-            ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                repo_name, issue_number, author, ts, ts, body,
-                coord_event, coord_assignment_id, machine, verdict,
-            ),
-        )
-    conn.commit()
 
 
 def sync_issue_comments(
@@ -6187,7 +6230,6 @@ def _enqueue_drive_queue_local(
     max_fix_rounds: int | None = None,
     no_acceptance: bool = False,
 ) -> int:
-    conn = get_connection()
     now = time.time()
     after_json = json.dumps([str(a) for a in (after or [])])
     # #1757: the gate's declared shape AND its starting run state, derived
@@ -6210,40 +6252,48 @@ def _enqueue_drive_queue_local(
     if max_fix_rounds is not None and int(max_fix_rounds) < 1:
         max_fix_rounds = None
     no_acceptance_int = 1 if no_acceptance else 0
-    existing = sql.execute(conn,
-        "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
-        (repo_name, issue_number),
-    ).fetchone()
-    if existing is not None:
-        # Already queued → update the operator-declared fields in place rather
-        # than creating a second row for the same issue.  Run state (attempts /
-        # state / last_reason) is deliberately left alone: that is the tick's
-        # column set, written via `update_drive_queue_entry`.  The gate is the
-        # exception, because `hold_state`/`hold_probes` are derived from the
-        # operator-declared `hold_after` and would otherwise survive their own
-        # declaration being withdrawn. `max_fix_rounds` (#2604) is fully
-        # replaced too, same as `machine`/`after` — see the public
-        # `enqueue_drive_queue`'s docstring.
-        sql.execute(conn,
-            "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
-            "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
-            "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
-            (
-                machine,
-                after_json,
-                hold_after_int,
-                hold_reason,
-                resume_when,
-                hold_state,
-                hold_scope,
-                max_fix_rounds,
-                no_acceptance_int,
-                existing["id"],
-            ),
-        )
-        conn.commit()
-        entry_id = int(existing["id"])
-    else:
+
+    # #2846: wrapped in retry_on_locked like every other write in this
+    # module — this upsert is idempotent by natural key (repo_name,
+    # issue_number), so re-running the whole closure on a retry is safe. A
+    # transient lock from a concurrent writer elsewhere in the daemon now
+    # resolves instead of 503ing the caller.
+    def _write() -> int:
+        conn = get_connection()
+        existing = sql.execute(conn,
+            "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
+            (repo_name, issue_number),
+        ).fetchone()
+        if existing is not None:
+            # Already queued → update the operator-declared fields in place
+            # rather than creating a second row for the same issue.  Run
+            # state (attempts / state / last_reason) is deliberately left
+            # alone: that is the tick's column set, written via
+            # `update_drive_queue_entry`.  The gate is the exception,
+            # because `hold_state`/`hold_probes` are derived from the
+            # operator-declared `hold_after` and would otherwise survive
+            # their own declaration being withdrawn. `max_fix_rounds`
+            # (#2604) is fully replaced too, same as `machine`/`after` — see
+            # the public `enqueue_drive_queue`'s docstring.
+            sql.execute(conn,
+                "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
+                "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
+                "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
+                (
+                    machine,
+                    after_json,
+                    hold_after_int,
+                    hold_reason,
+                    resume_when,
+                    hold_state,
+                    hold_scope,
+                    max_fix_rounds,
+                    no_acceptance_int,
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+            return int(existing["id"])
         tail = sql.execute(conn,
             "SELECT MAX(position) AS m FROM drive_queue"
         ).fetchone()
@@ -6273,7 +6323,9 @@ def _enqueue_drive_queue_local(
             pk_column="id",
         )
         conn.commit()
-        entry_id = int(new_id)
+        return int(new_id)
+
+    entry_id = retry_on_locked(_write)
     if position is not None:
         _move_drive_queue_entry_local(repo_name, issue_number, position)
     return entry_id
@@ -6301,16 +6353,23 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
 
 
 def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
-    conn = get_connection()
-    cur = sql.execute(conn,
-        "DELETE FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
-        (repo_name, issue_number),
-    )
-    removed = cur.rowcount > 0
-    if removed:
-        _renumber_drive_queue(conn)
-    conn.commit()
-    return removed
+    # #2846: wrapped in retry_on_locked like every other write in this
+    # module (DELETE-by-natural-key is idempotent, so extending the retry
+    # budget here is pure upside — a transient lock from a concurrent writer
+    # elsewhere in the daemon now resolves instead of 503ing the caller).
+    def _write() -> bool:
+        conn = get_connection()
+        cur = sql.execute(conn,
+            "DELETE FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
+            (repo_name, issue_number),
+        )
+        removed = cur.rowcount > 0
+        if removed:
+            _renumber_drive_queue(conn)
+        conn.commit()
+        return removed
+
+    return retry_on_locked(_write)
 
 
 def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> bool:
@@ -6365,15 +6424,23 @@ def _update_drive_queue_entry_local(
         # daemon's `/drive-queue` update handler call this same function),
         # so no caller can set one without the other.
         fields = {**fields, "reason_at": time.time()}
-    conn = get_connection()
-    assignments = ", ".join(f"{name} = ?" for name in fields)
-    cur = sql.execute(conn,
-        f"UPDATE drive_queue SET {assignments} "  # noqa: S608 — names whitelisted above
-        "WHERE repo_name = ? AND issue_number = ?",
-        (*fields.values(), repo_name, issue_number),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+
+    # #2846: wrapped in retry_on_locked like every other write in this
+    # module (UPDATE-by-natural-key is idempotent, so extending the retry
+    # budget here is pure upside — a transient lock from a concurrent writer
+    # elsewhere in the daemon now resolves instead of 503ing the caller).
+    def _write() -> bool:
+        conn = get_connection()
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        cur = sql.execute(conn,
+            f"UPDATE drive_queue SET {assignments} "  # noqa: S608 — names whitelisted above
+            "WHERE repo_name = ? AND issue_number = ?",
+            (*fields.values(), repo_name, issue_number),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    return retry_on_locked(_write)
 
 
 def move_drive_queue_entry(
@@ -6407,30 +6474,38 @@ def move_drive_queue_entry(
 def _move_drive_queue_entry_local(
     repo_name: str, issue_number: int, to_position: int
 ) -> bool:
-    conn = get_connection()
-    rows = sql.execute(conn,
-        "SELECT id, repo_name, issue_number FROM drive_queue ORDER BY position, id"
-    ).fetchall()
-    order = [int(r["id"]) for r in rows]
-    target = next(
-        (
-            int(r["id"])
-            for r in rows
-            if r["repo_name"] == repo_name and int(r["issue_number"]) == issue_number
-        ),
-        None,
-    )
-    if target is None:
-        return False
-    order.remove(target)
-    dest = max(0, min(int(to_position), len(order)))
-    order.insert(dest, target)
-    for index, row_id in enumerate(order):
-        sql.execute(conn,
-            "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row_id)
+    # #2846: wrapped in retry_on_locked like every other write in this
+    # module. Re-running this whole read-then-renumber closure on a retry is
+    # safe — it recomputes the target order fresh against the *current*
+    # queue each attempt, so a transient lock from a concurrent writer
+    # elsewhere in the daemon now resolves instead of 503ing the caller.
+    def _write() -> bool:
+        conn = get_connection()
+        rows = sql.execute(conn,
+            "SELECT id, repo_name, issue_number FROM drive_queue ORDER BY position, id"
+        ).fetchall()
+        order = [int(r["id"]) for r in rows]
+        target = next(
+            (
+                int(r["id"])
+                for r in rows
+                if r["repo_name"] == repo_name and int(r["issue_number"]) == issue_number
+            ),
+            None,
         )
-    conn.commit()
-    return True
+        if target is None:
+            return False
+        order.remove(target)
+        dest = max(0, min(int(to_position), len(order)))
+        order.insert(dest, target)
+        for index, row_id in enumerate(order):
+            sql.execute(conn,
+                "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row_id)
+            )
+        conn.commit()
+        return True
+
+    return retry_on_locked(_write)
 
 
 def get_drive_queue_entry(repo_name: str, issue_number: int) -> dict | None:
