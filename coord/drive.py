@@ -116,7 +116,11 @@ from coord.failure_class import (
     environmental_backoff_secs,
     plan_usage_limit_resume,
 )
-from coord.models import DELIVERABLE_ANALYSIS_LABEL, POLICY_REFUSAL_MARKER
+from coord.models import (
+    DELIVERABLE_ANALYSIS_LABEL,
+    MERGE_LANDED_MARKER,
+    POLICY_REFUSAL_MARKER,
+)
 from coord.self_health import self_freshness
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
@@ -1869,7 +1873,10 @@ def decide(
     if state.work_status == "merged" or state.merge_status == "MERGED":
         target = state.repo_default_branch or "main"
         if state.work_branch and verifier.verify_merged(state):
-            return _succeed(f"✓ MERGED — {state.work_branch} has landed on {target}")
+            return _succeed(
+                f"✓ MERGED — {state.work_branch} has landed on {target}\n"
+                f"   {MERGE_LANDED_MARKER}"
+            )
         base = opts.repo_path or f"~/src/{state.repo}"
         return _die(
             f"board says merged but {state.work_branch} has NOT landed on {target}\n"

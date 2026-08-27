@@ -3450,21 +3450,45 @@ def _fetch_live_prereq_terminal(
     BOUNDED THE SAME WAY ITS SIBLINGS ARE. Only deps named by an entry
     currently ``waiting`` or ``blocked`` with a non-empty ``after=``, and
     only those the board does NOT already resolve on its own
-    (``facts.landed``, ``facts.open``, ``facts.active_work``, or a hit in
-    this tick's own pre-reconcile ``states`` — i.e. genuinely still queued)
-    make it into a live call. A queue with no unresolved ``after=`` edge
-    costs nothing here, same as ``_fetch_live_blocked_gate`` costs nothing
-    with no ``blocked`` rows. ``states`` is approximated from *entries*'
-    pre-tick ``state`` field (cheap, no I/O) rather than threaded from
-    ``plan_tick``'s own in-progress reconcile — a false negative here (a dep
-    this approximation still calls a live-check target, when the tick's own
-    authoritative ``states`` would already have resolved it another way)
-    costs one harmless extra ``gh`` read, never a wrong verdict:
-    ``_resolve_prereqs`` only ever consults this mapping in its OWN final
-    branch, after its own ``states``/``facts`` checks have already returned.
-    A false positive (a dep this skips that the tick's real walk would have
-    reached the final branch for) simply leaves that one dep to the
-    pre-#2602 fallback for this tick — caught on the next one.
+    (``facts.landed``, ``facts.open``, ``facts.active_work``, or a
+    ``STATE_DONE`` hit in this tick's own pre-reconcile ``states`` — i.e.
+    already known landed) make it into a live call. A queue with no
+    unresolved ``after=`` edge costs nothing here, same as
+    ``_fetch_live_blocked_gate`` costs nothing with no ``blocked`` rows.
+    ``states`` is approximated from *entries*' pre-tick ``state`` field
+    (cheap, no I/O) rather than threaded from ``plan_tick``'s own
+    in-progress reconcile — a false negative here (a dep this approximation
+    still calls a live-check target, when the tick's own authoritative
+    ``states`` would already have resolved it another way) costs one
+    harmless extra ``gh`` read, never a wrong verdict: ``_resolve_prereqs``
+    only ever consults this mapping in its OWN final branch, after its own
+    ``states``/``facts`` checks have already returned. A false positive (a
+    dep this skips that the tick's real walk would have reached the final
+    branch for) simply leaves that one dep to the pre-#2602 fallback for
+    this tick — caught on the next one.
+
+    #2850 WIDENS THE BOUND, in two ways, both closing the same class of gap
+    the incident exposed (a pre-req stuck under a stale/bogus queue row, not
+    merely absent from the queue):
+
+    * a dep whose queue row IS present now still gets a live call as long as
+      that row isn't already ``STATE_DONE`` — before #2850 any dep present
+      in ``states`` at all (``running``, ``waiting``, ``blocked``, ...) was
+      excluded outright, on the (pre-#2850) assumption that "still queued"
+      meant the local row was trustworthy. A `running` row that outlived the
+      drive it named (the #2850 incident: a drive that exited 0 having
+      merged, requeued into a `running` row nothing else re-checks) broke
+      that assumption; ``coord.drive_queue._resolve_prereqs``'s matching
+      #2850 change is what actually consults this for those deps.
+    * every ``running`` entry's OWN key is also added as a target when it
+      has no live tmux session (``board.live_sessions``) and the board does
+      not yet show it landed — i.e. exactly the entries
+      ``coord.drive_queue._reconcile_running`` is about to run its
+      death/retry diagnosis on THIS tick. That function consults this same
+      mapping, keyed by its OWN ``entry.key``, right before it would
+      otherwise spend a requeue attempt — the "re-check before requeuing
+      anything" half of #2850, independent of whatever (if anything) the
+      drive's own exit reason said.
     """
     states = {e.key: e.state for e in entries}
     targets: set[str] = set()
@@ -3472,12 +3496,24 @@ def _fetch_live_prereq_terminal(
         if e.state not in (STATE_WAITING, STATE_BLOCKED) or not e.after:
             continue
         for dep in e.after:
-            if dep in targets or states.get(dep) is not None:
+            if dep in targets or states.get(dep) == STATE_DONE:
                 continue
             facts = board.facts(dep)
             if facts.landed or facts.open or facts.active_work:
                 continue
             targets.add(dep)
+    # #2850: a RUNNING entry about to be reconciled by `_reconcile_running`'s
+    # death/retry logic THIS tick (no live session, and the board's own
+    # cached facts don't show it landed) gets the identical live re-check —
+    # bounded to exactly the entries that would otherwise risk a requeue.
+    for e in entries:
+        if e.state != STATE_RUNNING or e.key in targets:
+            continue
+        if e.key in board.live_sessions:
+            continue
+        if board.facts(e.key).landed:
+            continue
+        targets.add(e.key)
     if not targets:
         return {}
 

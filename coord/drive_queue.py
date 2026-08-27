@@ -100,7 +100,7 @@ from coord.merge_queue import (
     is_ci_unreadable_reason,
     is_stale_smoke_reason,
 )
-from coord.models import is_policy_refusal_reason
+from coord.models import is_merge_landed_reason, is_policy_refusal_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
@@ -1818,17 +1818,26 @@ def _resolve_prereqs(
     _fetch_live_prereq_terminal``, the same positive-liveness test
     ``coord.overlap_predict``'s ``terminal_checker`` uses for the sibling
     ``[branch]`` half of #2602) confirms the issue is closed or its PR
-    merged — consulted ONLY in the final branch below, right before it would
-    otherwise declare *dep* unsatisfiable. This is the recovery half: the
-    cached ``board.facts(dep)`` this function checks first is a periodic
-    ``/board`` build, not a live read, and a pre-req that has JUST left the
-    queue (merged, issue closed) can outrun that cache — reading as "not
-    queued, not merged, not open" (:data:`_UNKNOWN_PREREQ_MARKER`) even
+    merged. This is the recovery half: the cached ``board.facts(dep)`` this
+    function checks first is a periodic ``/board`` build, not a live read,
+    and a pre-req that has JUST left the queue (merged, issue closed) can
+    outrun that cache — reading as "not queued, not merged, not open" even
     though the dep is, in fact, already done. Before this existed that
     verdict was unconditionally unsatisfiable and permanent
     (coord-portal#145/#149/#150, 2026-08-22): a dep absent here (no live
     check ran, or it ran and came back inconclusive) falls through to
     exactly that pre-#2602 behaviour — never a false "satisfied".
+
+    #2850 widens WHERE this is consulted: originally only the final branch
+    below (*dep* absent from the queue entirely) checked it. But a dep can
+    just as easily be PRESENT in the queue under a stale or outright bogus
+    row — the #2850 incident: a drive that exited 0 having merged got
+    requeued into a `running` row that never dies again on its own — and
+    that shape used to return "waiting"/"will never satisfy" straight out
+    of the ``dep_state is not None`` branch, never reaching this check at
+    all. So it is now ALSO consulted there, for every ``dep_state`` other
+    than ``STATE_DONE``: a pre-req that demonstrably landed must satisfy
+    the dependent whatever its own queue row happens to claim.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -1862,6 +1871,20 @@ def _resolve_prereqs(
                 # dependent resume on the tick right after its pre-req's row
                 # flips to `done`, instead of the tick after the cache
                 # independently rediscovers the same fact.
+                continue
+            if (live_prereq_terminal or {}).get(dep):
+                # #2850: *dep*'s OWN queue row says it is still in play
+                # (``running``, ``waiting``, ``blocked``, ...) — but a live
+                # re-check taken THIS tick confirms it is, in fact, already
+                # closed or merged. Before this, only a dep ABSENT from the
+                # queue entirely ever reached the #2602 recovery check below;
+                # a dep still SITTING in the queue under a stale/bogus row
+                # (the #2850 incident: a drive that exited 0 having merged,
+                # requeued into a bogus `running` row) short-circuited to
+                # "waiting"/"will never satisfy" here and shadowed the very
+                # recovery check meant to catch exactly this. A dependent
+                # must never be blocked by a pre-req that demonstrably
+                # landed, whatever its queue row claims.
                 continue
             if dep_state in (STATE_BLOCKED, STATE_FAILED):
                 return _Verdict(
@@ -2757,6 +2780,7 @@ def _reconcile_running(
     exit_reasons: Mapping[str, str] | None = None,
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
+    live_prereq_terminal: Mapping[str, bool] | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -2848,6 +2872,35 @@ def _reconcile_running(
     the default budget. Still finite, still ``exhausted`` → ``blocked`` with
     the same diagnosis-and-recovery instructions once ITS wider ceiling is
     also hit.
+
+    #2850 adds TWO more "already landed" signals, both checked with the SAME
+    priority as ``facts.landed`` above — right after it, before
+    ``facts.active_work`` — because both are confirmations of terminal
+    completion at least as strong as a cached board read, and a drive that
+    has genuinely landed must never be requeued regardless of what
+    ``active_work``/cross-host/grace-window evidence says next:
+
+    * ``own_reason`` matching :func:`coord.models.is_merge_landed_reason` —
+      the drive's OWN exit narrated a confirmed merge (``coord.drive.
+      decide``'s "terminal: merged" branch, gated on a LIVE
+      ``verifier.verify_merged`` call, not merely the board's cached
+      ``merge_status``). Before this, ``exit_code=0`` plus a "✓ MERGED —
+      … has landed" summary still fell all the way through to the generic
+      "no session, no active work, nothing landed" retry logic below — the
+      drive's own strongest evidence, sitting unread in ``own_reason``,
+      never consulted — and got requeued and relaunched into dead air.
+    * *live_prereq_terminal* (#2602's mechanism, reused): when the shell's
+      bounded live re-check (:func:`coord.commands.drive_queue.
+      _fetch_live_prereq_terminal`, widened by #2850 to also probe a
+      ``running`` entry's OWN key, not just other entries' ``after=``
+      pre-reqs) confirms THIS key is closed or merged, that outranks
+      ``own_reason`` even existing — it catches every OTHER shape of "this
+      entry's issue is actually done, but this run's own exit reason
+      either says nothing about it or predates it" (a crash, a reap, a
+      dead-end exit for an issue that merged out of band between the crash
+      and this tick). Re-checking before ANY requeue — not only the
+      literal MERGED-exit-text case — is what makes the class safe rather
+      than patching just the one reported instance.
     """
     facts = board.facts(entry.key)
 
@@ -2868,6 +2921,62 @@ def _reconcile_running(
                 updates={
                     "state": STATE_DONE,
                     "last_reason": f"done ({witness})",
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
+    # Resolved here — before `facts.active_work` and everything after it —
+    # so the #2850 merged-exit check just below can use it; every later
+    # branch that reads `own_reason` (gate_a/policy park, refused/dead_end,
+    # the retry/exhausted wording) is unaffected by hoisting this, since
+    # none of them run before this point.
+    own_reason = (exit_reasons or {}).get(entry.key)
+    if own_reason and is_merge_landed_reason(own_reason):
+        # #2850: the drive's own exit already confirmed — via a LIVE
+        # `verify_merged` check, not the board's cached `merge_status` —
+        # that this landed. Mark it done here, before anything below gets a
+        # chance to read the absent session / absent active-work as a death
+        # and requeue a launch that has nothing left to do.
+        reason = f"{own_reason} — confirmed merged (#2850), not a death"
+        return (
+            Reconcile(
+                entry.key,
+                "done",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_DONE,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
+    if (live_prereq_terminal or {}).get(entry.key):
+        # #2850 defence in depth: whatever THIS run's own exit reason says
+        # (or doesn't — a crash leaves none at all), a live re-check taken
+        # THIS tick confirms the issue is already closed or its PR merged.
+        # That is stronger evidence than an absent tmux session and absent
+        # board `active_work` could ever be on their own — mark done rather
+        # than let the death-diagnosis logic below spend an attempt
+        # relaunching a drive with nothing left to do.
+        reason = (
+            "drive finished — a live re-check this tick confirms the issue "
+            "is already closed or its PR merged (#2850), independent of "
+            "this run's own exit reason and the cached board"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "done",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_DONE,
+                    "last_reason": reason,
                     "session_name": None,
                 },
             ),
@@ -2916,7 +3025,10 @@ def _reconcile_running(
     # purely for stability — the two codes are mutually exclusive by
     # construction (`_drive_exit_summary` records exactly one), so the order
     # is never actually load-bearing.
-    own_reason = (exit_reasons or {}).get(entry.key)
+    #
+    # `own_reason` itself was already resolved above (#2850, before the
+    # `facts.active_work` check) so the merged-exit short-circuit could use
+    # it — reused here unchanged.
 
     # #2063 rides the SAME evidence as `refused` below but reaches the
     # OPPOSITE conclusion, so it is checked first. A Gate-A "no recorded
@@ -4121,6 +4233,7 @@ def plan_tick(
             exit_reasons=exit_reasons,
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
+            live_prereq_terminal=live_prereq_terminal,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:
