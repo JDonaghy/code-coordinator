@@ -1722,6 +1722,40 @@ def test_default_worker_command_uses_setting_sources_user_for_plan_type() -> Non
     assert "--bare" not in argv
 
 
+def test_default_worker_command_passes_strict_mcp_config() -> None:
+    """#2820: a worker must not load the operator's personal user-scope MCP
+    servers (Google Drive/Calendar/Gmail) — no worker can ever use them, and
+    their presence/absence made the tool surface non-deterministic.
+    `--setting-sources user` only gates settings.json, not `.mcp.json` / MCP
+    servers, so `--strict-mcp-config` is required as a separate flag."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    assert "--strict-mcp-config" in argv
+
+
+def test_default_worker_command_passes_strict_mcp_config_for_every_type() -> None:
+    """Same as above, for every spec.type — a plan/mock-author/smoke/review
+    leg has just as little use for the operator's Drive/Calendar/Gmail
+    tools as a work leg does."""
+    for spec_type in ("plan", "mock-author", "smoke", "review", "work"):
+        spec = AssignmentSpec(
+            repo_name="api",
+            repo_path="/tmp/repo",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            type=spec_type,
+        )
+        argv = default_worker_command(spec)
+        assert "--strict-mcp-config" in argv, f"missing for type={spec_type!r}"
+
+
 def test_default_worker_command_embeds_claude_md_for_work_type(tmp_path: Path) -> None:
     """#2462: added a CLAUDE.md embed into --system-prompt for work-shaped
     legs (originally to compensate for `--bare` disabling ambient

@@ -4525,11 +4525,14 @@ def _base_checkout_write_guard_tools(repo_path: str) -> list[str]:
 # dispatch on every machine started failing at turn 1 with "Not logged in"
 # within the hour it went live (misreported fleet-wide as generic
 # `api_error`). Reverted back to `--setting-sources user` to restore
-# dispatch immediately. The hooks/.mcp.json leak this was meant to close is
-# real and still open — re-closing it needs a fix that doesn't require
+# dispatch immediately. The hooks/.mcp.json leak this was meant to close was
+# real; #2820 closed the `.mcp.json`/MCP-server half of it via
+# `--strict-mcp-config` in `default_worker_command` (no OAuth side-effect —
+# it only strips MCP server definitions, not hooks). The hooks half is
+# still open — re-closing it needs a fix that doesn't require
 # `ANTHROPIC_API_KEY`/an `apiKeyHelper` (e.g. explicit `--settings '{}'`
-# plus verifying whether hooks/.mcp.json can be suppressed without full
-# `--bare`), tracked as a fresh follow-up rather than re-landing this as-is.
+# plus verifying whether hooks can be suppressed without full `--bare`),
+# tracked as a fresh follow-up rather than re-landing this as-is.
 _DENY_PATTERN_RE = re.compile(r"^(Edit|Write)\(//(.+)\)$")
 
 
@@ -4676,14 +4679,25 @@ def check_worktree_writable(
 def _claude_md_system_prompt_suffix(repo_path: str) -> str:
     """Return a system-prompt suffix embedding the target repo's CLAUDE.md.
 
-    #2462: worker dispatch below passes ``--bare``, which disables Claude
-    Code's own automatic CLAUDE.md auto-discovery (along with hooks,
-    ``.mcp.json``, and settings — see the ``--bare`` comment in
-    :func:`default_worker_command`). Nothing else in a work-shaped leg's
-    briefing embeds the target repo's actual CLAUDE.md text, so without this
-    a worker would silently lose every per-repo convention, testing rule,
-    and sealed-path note that isn't hardcoded into the repo-agnostic
-    ``WORKER_SYSTEM_PROMPT``.
+    Worker dispatch below passes ``--setting-sources user`` — **not**
+    ``--bare``, which #2462 tried and reverted same-day (see the long
+    comment in :func:`default_worker_command`). ``--setting-sources user``
+    suppresses Claude Code's own project-level CLAUDE.md auto-discovery
+    (along with project/local settings.json) just as thoroughly as
+    ``--bare`` would have, for this one mechanism. #2820 measured it
+    directly with four controlled probes: an empty dir and a real repo
+    checkout, both under ``--setting-sources user``, differ by only ~200
+    prompt-framing tokens (22,489 vs 22,686) — essentially no CLAUDE.md
+    content leaking through. The same repo under Claude Code's *default*
+    setting sources adds ~7,675 tokens (30,361) for the auto-discovered
+    file. So this function is **not** defense-in-depth alongside some
+    still-running ambient auto-discovery — it is the **only** mechanism
+    that delivers the target repo's CLAUDE.md to a work-shaped ``-p`` leg.
+    Nothing else in a work-shaped leg's briefing embeds the target repo's
+    actual CLAUDE.md text, so without this a worker would silently lose
+    every per-repo convention, testing rule, and sealed-path note that
+    isn't hardcoded into the repo-agnostic ``WORKER_SYSTEM_PROMPT`` — with
+    no error and no test failing to surface the loss.
 
     Mirrors :func:`coord.review.read_repo_claude_md`, which the review leg
     already uses for the same reason (a review must never run blind to
@@ -4723,8 +4737,10 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     """
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
-        # #2462: --bare drops CLAUDE.md auto-discovery; a plan leg still
-        # needs the target repo's conventions to plan against.
+        # `--setting-sources user` (below) drops CLAUDE.md auto-discovery; a
+        # plan leg still needs the target repo's conventions to plan
+        # against. See _claude_md_system_prompt_suffix for what the flag
+        # actually does and the measured numbers behind it.
         system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         allowed_tools = "Read,Bash"
     elif spec.type == "refinement":
@@ -4793,7 +4809,8 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # and deny list instead of the generic WORKER_SYSTEM_PROMPT.
         system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
-        # #2462: --bare drops CLAUDE.md auto-discovery.
+        # `--setting-sources user` (below) drops CLAUDE.md auto-discovery —
+        # see _claude_md_system_prompt_suffix.
         system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         allowed_tools = "Read,Edit,Write,Bash"
     elif spec.type == "smoke":
@@ -4846,10 +4863,11 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
-        # #2462: --bare drops CLAUDE.md auto-discovery for this catch-all
-        # branch too — it covers "work", "fix", "conflict-fix", and
-        # "test-author", every one of which edits code and needs the
-        # target repo's conventions. See _claude_md_system_prompt_suffix.
+        # `--setting-sources user` (below) drops CLAUDE.md auto-discovery
+        # for this catch-all branch too — it covers "work", "fix",
+        # "conflict-fix", and "test-author", every one of which edits code
+        # and needs the target repo's conventions. See
+        # _claude_md_system_prompt_suffix.
         system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         # #2169: `Monitor` is the sanctioned way to poll a backgrounded
         # long-running command in bounded steps (see the ONE-SHOT section of
@@ -4911,19 +4929,52 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # OAuth"). It went live and broke every worker dispatch fleet-wide
         # within the hour ("Not logged in · Please run /login", misreported
         # as generic `api_error`) — reverted back to `--setting-sources user`
-        # same-day. The hooks/.mcp.json leak `--bare` closed is real and
-        # still open; re-closing it needs an approach that doesn't require
-        # `ANTHROPIC_API_KEY`/an `apiKeyHelper`, tracked as a fresh
-        # follow-up rather than re-landing `--bare` as-is.
+        # same-day. The hooks/.mcp.json leak `--bare` would have closed was
+        # real; #2820 closed the `.mcp.json`/MCP-server half of it below
+        # with `--strict-mcp-config`, which has no OAuth side-effect (it
+        # only strips project/user-scope MCP server definitions, nothing
+        # else `--bare` touched). The hooks half is still open; re-closing
+        # it needs an approach that doesn't require `ANTHROPIC_API_KEY`/an
+        # `apiKeyHelper`, tracked as a fresh follow-up rather than
+        # re-landing `--bare` as-is.
         #
         # `_claude_md_system_prompt_suffix` (see the "plan", "mock-author",
         # and catch-all "else" branches above) explicitly embeds the target
-        # repo's CLAUDE.md into --system-prompt regardless — kept as
-        # defense-in-depth (the same double-load pattern
-        # coord.review.read_repo_claude_md already used for review legs)
-        # even though `--setting-sources user` alone still lets CLAUDE.md's
-        # own ambient auto-discovery run too.
+        # repo's CLAUDE.md into --system-prompt — this is NOT defense-in-
+        # depth alongside some still-running ambient auto-discovery.
+        # #2820 measured that `--setting-sources user` *suppresses* Claude
+        # Code's own project CLAUDE.md auto-discovery: a real repo checkout
+        # under `--setting-sources user` costs ~22,686 prompt tokens vs.
+        # ~30,361 under Claude Code's *default* setting sources — a
+        # ~7,675-token gap that is almost entirely the auto-discovered
+        # file. So `_claude_md_system_prompt_suffix` is the ONLY mechanism
+        # that delivers the target repo's CLAUDE.md to a work-shaped `-p`
+        # leg; treating it as redundant and dropping it would silently
+        # strip every per-repo convention, with no error and no test
+        # failing to surface the loss.
         "--setting-sources", "user",
+        # #2820: every `-p` leg otherwise also loads the OPERATOR's
+        # personal user-scope MCP servers — observed across the 120 most
+        # recent worker sessions as 20 Google Drive/Calendar tool defs plus
+        # a Gmail server on 111/120 legs, a smaller subset on 3 more, and 0
+        # on the remaining 6 (i.e. non-deterministic: the same dispatch
+        # shape gets a different tool surface depending on whether the
+        # operator's MCP servers happened to connect by the time the
+        # session started). No worker can ever use any of those tools.
+        # `--strict-mcp-config` ignores all project/user `.mcp.json`
+        # servers for this invocation (with no `--mcp-config` passed, that
+        # means none load) — `--setting-sources user` above does NOT cover
+        # this, it only gates settings.json. Measured cost of leaving this
+        # open is small — two controlled `claude -p` probes with the
+        # production flags went from 47 tools / 23,096 prompt tokens
+        # without this flag to 27 tools / 22,483 tokens with it, i.e.
+        # ~600 tokens, not the several-thousand a raw tool-count drop
+        # suggests (MCP tool schemas are deferred behind ToolSearch in
+        # current Claude Code, so an unused server costs a name, not a
+        # schema). Worth doing anyway: one flag, no OAuth side-effect, and
+        # it makes the worker tool surface deterministic — not worth doing
+        # as a cost measure on its own.
+        "--strict-mcp-config",
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
