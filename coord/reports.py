@@ -19,22 +19,30 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  Five entries: ``issue-activity``; ``drive-queue-status``
-   (#1805), a **live snapshot** of ``drive_queue`` (no window, no audit
-   trail, no clock beyond ``generated_at``) rather than a fold over history;
-   ``decisions`` (#2369), option-based cards folded from the SAME live
-   snapshot plus :func:`coord.state.list_drive_escalations` — "why is this
-   stuck, and what do I run" per root cause, with a downstream `after=`
-   cascade collapsed into its root's card rather than shown as N separate
-   problems; and ``usage`` (#1763), a cost/token fold over board assignment
-   rows that delegates every number to :mod:`coord.usage_rollup` priced with
-   the daemon's own loaded ``pricing:`` config — the report that replaced
-   coord-tui's ``panel:usage`` and its hardcoded pricing snapshot; and
+   validation.  Seven entries: ``issue-activity``; ``completed`` (#2454 /
+   #2472), one row per issue that FINISHED in a window rather than one row
+   per audit event, joined with each issue's lifetime legs/tokens/cost;
+   ``drive-queue-status`` (#1805), a **live snapshot** of ``drive_queue`` (no
+   window, no audit trail, no clock beyond ``generated_at``) rather than a
+   fold over history; ``decisions`` (#2369), option-based cards folded from
+   the SAME live snapshot plus :func:`coord.state.list_drive_escalations` —
+   "why is this stuck, and what do I run" per root cause, with a downstream
+   `after=` cascade collapsed into its root's card rather than shown as N
+   separate problems; ``usage`` (#1763), a cost/token fold over board
+   assignment rows that delegates every number to :mod:`coord.usage_rollup`
+   priced with the daemon's own loaded ``pricing:`` config — the report that
+   replaced coord-tui's ``panel:usage`` and its hardcoded pricing snapshot;
    ``queue-outcomes`` (#2270), the one number the morning report is for —
    *what fraction of the queue got over the line without a human* — folded
    from #2235's per-host block log rather than from the audit trail, and the
    only report here that refuses to answer at all when its input file is not
-   on this host.
+   on this host; and ``trend`` (#2826), the one **bucketed** fold — a row per
+   fixed-width time bucket rather than per issue or per episode, pairing
+   merge throughput with a trailing-window mean cost/legs per merged issue so
+   an empty bucket reads as a gap, never a false cost collapse to `$0`. It
+   reuses ``completed``'s own merged-issue rows rather than a second cost
+   calculator, and reuses its exact definition of "merged" so the two can
+   never silently disagree on what counts.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -95,6 +103,13 @@ __all__ = [
     "fold_queue_outcomes",
     "queue_outcomes_chart",
     "run_queue_outcomes",
+    "TREND_COLUMNS",
+    "TREND_COLUMN_META",
+    "TREND_RANGE_CHOICES",
+    "TREND_TRAILING_BUCKETS",
+    "resolve_trend_range",
+    "fold_trend",
+    "run_trend",
     "parse_duration",
     "result_to_csv",
     "csv_filename",
@@ -3077,6 +3092,280 @@ def run_completed(
     )
 
 
+# ── trend: time-bucketed merge throughput + cost efficiency (#2826) ────────
+#
+# One question: does throughput rise while cost per merged issue falls? None
+# of the six reports above can show it — they are all point-in-time
+# (`drive-queue-status`, `decisions`), per-issue (`issue-activity`,
+# `completed`, `usage`), or per-episode (`queue-outcomes`), never
+# per-time-bucket. This is the one BUCKETED fold: a row is a bucket, not an
+# issue, not a period-of-outcomes.
+#
+# "MERGED" here means exactly what `completed` means by ENDED (#2472): the
+# issue is closed, or its `merge_queue` row says `merged`; the timestamp a
+# bucket is chosen by is the merge timestamp, falling back to the last
+# assignment to finish. An issue with neither is placed in no bucket at all
+# — same drop, same reason, as `completed`. Keeping this identical to
+# `completed` matters more than usual here: a trend line whose denominator
+# quietly differs from the `completed` panel's row count would be worse than
+# no trend line.
+#
+# `cost_per_issue`/`legs_per_issue` are a TRAILING-WINDOW mean over the
+# trailing `TREND_TRAILING_BUCKETS` buckets (this one plus the previous
+# N-1), **not** a per-bucket mean. A bucket with zero merges has an
+# UNDEFINED mean cost, and the chart widget this report exists to feed takes
+# a plain evenly-spaced `Vec<f64>` with no way to express a gap — no NaN /
+# `is_finite` guard anywhere in quadraui's `primitives/chart.rs` or
+# `tui/chart.rs` — so an empty bucket emitted as `0.0` would draw a dramatic
+# cost collapse that never happened, which is exactly the graph the
+# hypothesis hopes to see, falsely. At `1d`'s hourly granularity most
+# buckets genuinely are empty, so this is not an edge case. Where even the
+# trailing window has zero merges, the column comes back `None` — never
+# `0.0` — and a note says how many buckets that hit. A CUMULATIVE mean was
+# considered and rejected: it is dominated by history and would hide exactly
+# the recent improvement this report exists to show.
+#
+# Cost/legs are not a second calculator: `fold_completed` above already
+# derives them, per issue, via `_completed_spend` -> `usage_rollup.rollup`
+# (lifetime spend, not windowed — see that function's own comment for why).
+# This fold reuses `fold_completed`'s own ROWS — fetched over a window
+# widened backward far enough to give the *earliest* reported bucket the
+# same trailing-window WIDTH every other bucket gets — rather than
+# re-deriving anything.
+
+TREND_RANGE_CHOICES = ("1d", "3d", "7d", "1m")
+
+#: range -> (bucket_seconds, point_count). Fixed point counts (~24-30 per
+#: range, per #2826) keep the x-axis readable at any pane width and keep a
+#: client from having to resample.
+_TREND_RANGES: dict[str, tuple[float, int]] = {
+    "1d": (3600.0, 24),  # hourly
+    "3d": (3 * 3600.0, 24),  # 3-hourly
+    "7d": (6 * 3600.0, 28),  # 6-hourly
+    "1m": (86400.0, 30),  # daily
+}
+
+#: What each range's bucket width is called in a note — kept as a table
+#: rather than derived from the seconds so the wording never has to handle
+#: an odd fraction of an hour.
+_TREND_RANGE_BUCKET_LABEL: dict[str, str] = {
+    "1d": "hourly",
+    "3d": "3-hourly",
+    "7d": "6-hourly",
+    "1m": "daily",
+}
+
+#: Width of the trailing window `cost_per_issue`/`legs_per_issue` average
+#: over, in BUCKETS rather than a fixed duration — a fixed duration would
+#: mean a different number of buckets contribute at every range, which is
+#: not what "~5 buckets" (#2826) means. 5 is wide enough that most windows
+#: contain at least one merge even at `1d`'s hourly granularity, without
+#: being so wide it smears away the recent-improvement signal the report
+#: exists to show.
+TREND_TRAILING_BUCKETS = 5
+
+TREND_COLUMNS = ["bucket_start", "merged", "cost_per_issue", "legs_per_issue"]
+
+# One entry per TREND_COLUMNS entry, same order (#1760). `cost_per_issue`
+# reuses the `money` kind `usage`/`completed` already declare;
+# `legs_per_issue` is a per-bucket MEAN, not a count, so it is `float`
+# rather than their `int` `legs` — an open-vocabulary `kind` (same rule
+# every other one here follows), so a client that predates it falls back to
+# plain stringification, which still reads fine for a number.
+TREND_COLUMN_META = [
+    ColumnMeta(id="bucket_start", label="Bucket", kind="timestamp"),
+    ColumnMeta(id="merged", label="Merged", kind="int", align="right", weight=0.6),
+    ColumnMeta(id="cost_per_issue", label="$/Issue", kind="money", align="right"),
+    ColumnMeta(
+        id="legs_per_issue", label="Legs/Issue", kind="float", align="right", weight=0.8
+    ),
+]
+
+
+def resolve_trend_range(value: str) -> tuple[float, int]:
+    """``(bucket_seconds, point_count)`` for a ``range`` preset.  Raises
+    :class:`ReportError` on an unknown value."""
+    try:
+        return _TREND_RANGES[value]
+    except KeyError:
+        raise ReportError(
+            f"invalid value for 'range': {value!r} — "
+            f"allowed values: {', '.join(TREND_RANGE_CHOICES)}"
+        ) from None
+
+
+def fold_trend(
+    issues: Iterable[Mapping[str, Any]],
+    assignments: Iterable[Mapping[str, Any]],
+    merge_queue: Iterable[Mapping[str, Any]],
+    window_end: float,
+    *,
+    range_: str = "7d",
+    repo: str = "",
+    generated_at: float | None = None,
+    pricing: Any = None,
+    extra_notes: Sequence[str] = (),
+) -> ReportResult:
+    """Bucket MERGED issues (see the #2826 section comment above for the
+    exact definition) into fixed-width buckets ending at ``window_end``, one
+    row per bucket.
+
+    **Pure** — no DB, no daemon, no clock beyond the explicit ``window_end``
+    (mirrors :func:`fold_completed`). Reuses :func:`fold_completed`'s own
+    fold over the SAME ``issues``/``assignments``/``merge_queue`` inputs,
+    fetched over a window widened backward by the trailing lookback, rather
+    than re-deriving which issues are "done" or what they cost.
+    ``generated_at`` defaults to ``window_end``, same convention as every
+    other fold here.
+
+    ``range_`` (not ``range``) — the report's own parameter IS named
+    ``range``, but shadowing the builtin in a function that needs to call
+    ``range()`` in the bucket loop below is a trap, not a style nit; see
+    :func:`run_trend`, which owns the ``range`` name at the wire boundary.
+    """
+    bucket_seconds, point_count = resolve_trend_range(range_)
+    window_end = float(window_end)
+    generated_at = window_end if generated_at is None else float(generated_at)
+    window_start = window_end - bucket_seconds * point_count
+    # Widen the fetch so the FIRST reported bucket's trailing window is the
+    # same width as every other bucket's — without this, bucket 0's
+    # "trailing window" would silently mean "everything before it", i.e. a
+    # narrower lookback than the rest of the series gets.
+    fetch_start = window_start - bucket_seconds * (TREND_TRAILING_BUCKETS - 1)
+
+    completed = fold_completed(
+        issues,
+        assignments,
+        merge_queue,
+        (fetch_start, window_end),
+        repo=repo,
+        generated_at=generated_at,
+        pricing=pricing,
+    )
+
+    bucket_starts = _period_bounds(window_start, window_end, bucket_seconds)
+    # bucket index -> [(cost_total, legs), ...] for issues merged in it.
+    # Indices below 0 are merges in the trailing lookback ONLY, ahead of the
+    # first reported bucket — they feed that bucket's trailing mean without
+    # ever being reported as a (nonexistent) bucket of their own. `_period_bounds`
+    # / `_period_index` (used by `queue-outcomes`) assume a single in-range
+    # index, so the assignment is inlined here rather than reused.
+    per_bucket: dict[int, list[tuple[float, float]]] = {}
+    for row in completed.rows:
+        ended = row.get("ended_at")
+        if ended is None:
+            continue
+        idx = int((float(ended) - window_start) // bucket_seconds)
+        idx = min(idx, point_count - 1)
+        per_bucket.setdefault(idx, []).append(
+            (float(row.get("cost_total") or 0.0), float(row.get("legs") or 0))
+        )
+
+    rows: list[dict[str, Any]] = []
+    empty_trailing = 0
+    for i, start in enumerate(bucket_starts):
+        merged_here = per_bucket.get(i, ())
+        trailing: list[tuple[float, float]] = []
+        for j in range(i - TREND_TRAILING_BUCKETS + 1, i + 1):
+            trailing.extend(per_bucket.get(j, ()))
+        if trailing:
+            cost_per_issue = round(
+                sum(c for c, _ in trailing) / len(trailing), _USAGE_COST_PLACES
+            )
+            legs_per_issue = round(sum(legs for _, legs in trailing) / len(trailing), 2)
+        else:
+            cost_per_issue = None
+            legs_per_issue = None
+            empty_trailing += 1
+        rows.append(
+            {
+                "bucket_start": start,
+                "merged": len(merged_here),
+                "cost_per_issue": cost_per_issue,
+                "legs_per_issue": legs_per_issue,
+            }
+        )
+
+    total_merged = sum(r["merged"] for r in rows)
+    bucket_label = _TREND_RANGE_BUCKET_LABEL[range_]
+
+    notes: list[str] = list(extra_notes) + list(completed.notes)
+    notes.append(
+        f"{total_merged} issue(s) merged across {point_count} {bucket_label} "
+        "buckets. `cost_per_issue`/`legs_per_issue` are a TRAILING mean over "
+        f"the {TREND_TRAILING_BUCKETS} most recent buckets (this one plus "
+        f"the previous {TREND_TRAILING_BUCKETS - 1}), not a per-bucket mean "
+        "— a bucket with zero merges has no defined mean cost of its own."
+    )
+    if empty_trailing:
+        notes.append(
+            f"{empty_trailing} of {point_count} bucket(s) show `null` for "
+            "cost_per_issue/legs_per_issue — even their trailing window saw "
+            "no merge at all. That is a real gap, not a zero cost; render it "
+            "as one rather than a dip to $0."
+        )
+    if range_ in ("1d", "3d"):
+        notes.append(
+            f"`{range_}` buckets are small (often a handful of merges each) "
+            "— expect a noisy line, not a smooth one. `7d`/`1m` are where a "
+            "real throughput-up/cost-down trend is actually testable."
+        )
+
+    return ReportResult(
+        report_id="trend",
+        generated_at=generated_at,
+        window=(window_start, window_end),
+        columns=list(TREND_COLUMNS),
+        column_meta=list(TREND_COLUMN_META),
+        rows=rows,
+        notes=notes,
+    )
+
+
+def run_trend(
+    *,
+    range: str = "7d",
+    until: str = "",
+    repo: str = "",
+    now: float | None = None,
+    source: Callable[[], tuple[
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+    ]] | None = None,
+    pricing: Any = None,
+) -> ReportResult:
+    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
+    seams (mirrors :func:`run_completed`); the report's own parameters are
+    ``range``/``until``/``repo``."""
+    generated_at = time.time() if now is None else float(now)
+    window_end = parse_timestamp(until) if until else generated_at
+    # Same source as `completed` — the merged-issue fold this report buckets
+    # is exactly `fold_completed`'s, over the same three tables.
+    source_fn = _default_completed_source if source is None else source
+    issues, assignments, merge_queue = source_fn()
+
+    # Same seam, same reason as `run_completed`/`run_usage`: the estimated
+    # half of `cost_per_issue` has to be priced off the fleet's OWN
+    # `pricing:` block, and a config that could not be loaded says so in a
+    # note instead of silently falling back (#1763).
+    extra_notes: list[str] = []
+    if pricing is None:
+        pricing, extra_notes = _load_pricing()
+
+    return fold_trend(
+        issues,
+        assignments,
+        merge_queue,
+        window_end,
+        range_=range,
+        repo=repo,
+        generated_at=generated_at,
+        pricing=pricing,
+        extra_notes=extra_notes,
+    )
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -3345,6 +3634,55 @@ QUEUE_OUTCOMES = ReportDef(
 )
 
 
+TREND = ReportDef(
+    id="trend",
+    title="Trend",
+    description=(
+        "Time-bucketed merge throughput + cost efficiency — one row per "
+        "bucket, not per issue: MERGED (issues that finished in that bucket, "
+        "the same ENDED definition `completed` uses) and a TRAILING-window "
+        "mean cost/legs per merged issue (~5 buckets), never a per-bucket "
+        "mean — an empty bucket's cost is undefined, not zero. Answers the "
+        "one question none of the other reports can: does throughput rise "
+        "while cost per merged issue falls? `1d`/`3d`/`7d`/`1m` trade bucket "
+        "width for range, always ~24-30 points so the x-axis stays readable."
+    ),
+    params=(
+        ReportParam(
+            id="range",
+            label="Range",
+            kind="choice",
+            choices=TREND_RANGE_CHOICES,
+            default="7d",
+            help=(
+                "1d=hourly, 3d=3-hourly, 7d=6-hourly, 1m=daily buckets — "
+                "~24-30 points either way."
+            ),
+        ),
+        # Same name, same semantics and the same validator as
+        # `queue-outcomes`'s `until` (#2270's rule: follow the existing
+        # convention). `since` is deliberately absent — `range` sets the
+        # span, and two ways to say it would let them disagree.
+        ReportParam(
+            id="until",
+            label="Window end",
+            kind="text",
+            default="",
+            help="Epoch seconds or ISO-8601. Empty means now.",
+            validate=_validate_until,
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_trend,
+)
+
+
 # ── CSV serialisation (#1765) ──────────────────────────────────────────────
 #
 # One serializer, server-side, for every surface: `coord report run --format
@@ -3524,6 +3862,7 @@ REPORTS: dict[str, ReportDef] = {
     DECISIONS.id: DECISIONS,
     USAGE.id: USAGE,
     QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
+    TREND.id: TREND,
 }
 
 
