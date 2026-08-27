@@ -3460,44 +3460,68 @@ def _decide_merge(
     # `--max-merge-attempts` budget (and then a drive-queue launch attempt)
     # retrying a merge that only more real time — never another retry —
     # could resolve. No number of retries makes a check that hasn't reported
-    # yet report sooner, so this never spends `counters.merge_attempts`,
-    # exactly like BLOCKED below.
+    # yet report sooner, so none of the four blocks below ever spends
+    # `counters.merge_attempts`, exactly like BLOCKED further down.
     #
-    # #2814: that guarantee used to be delivered as a BARE `_wait()` — no
-    # `coord merge` dispatch at all — trusting that *something else* would
-    # notice CI going green and refresh the board out from under it (the
-    # daemon's `_gate_refresher` tick, surfaced via `drive_state._merge_entry`
-    # 's #2808 `ci_rollup_all_clear` recovery). That holds on the HTTP
+    # #2814: that guarantee used to be delivered as a BARE `_wait()` for all
+    # four of these CI-outcome siblings — no `coord merge` dispatch at all —
+    # trusting that *something else* would notice CI changing state and
+    # refresh the board out from under it (the daemon's `_gate_refresher`
+    # tick, surfaced via `drive_state._merge_entry`'s #2808
+    # `ci_rollup_all_clear` recovery, or a live `coord merge`/auto-drain
+    # invocation elsewhere incrementing `ci_infra_reruns`/`ci_flaky_reruns`/
+    # `ci_unreadable_reruns` in `coord.merge_queue`). That holds on the HTTP
     # `/board` path, but `BoardFetcher._fetch_local` — the daemon-host
     # standalone path `coord drive` uses whenever no `board_service` is
     # configured, see its docstring — deliberately never computes a
     # `merge_plan` at all, so the #2808 recovery has no `ci_summary` to read;
     # the raw queue row's persisted `error` is the ONLY signal available, and
-    # per the paragraph above, the ONLY thing that ever rewrites it is a live
-    # `coord merge` attempt. Nothing was making one, so a standalone drive
-    # could park on a byte-identical "CI running: ..." line until the 240m
-    # deadline, hours after CI had actually gone green
-    # (claude-coordinator#2804/#2813, 2026-08-27) — `merge_queue.error`
-    # outliving the CI run it described.
+    # the ONLY thing that ever rewrites it (or advances any of the
+    # `ci_*_reruns` budgets) is a live `coord merge` attempt. Nothing else
+    # periodic makes one on this path — `serve_app._auto_drain_tick` only
+    # ever touches `PLAN_READY` entries, and `_gate_refresher` only feeds the
+    # HTTP path, not `_fetch_local` — so a standalone drive parked on ANY of
+    # these four reasons could park on a byte-identical line until the 240m
+    # deadline, hours after the real CI state had already moved on
+    # (claude-coordinator#2804/#2813, 2026-08-27, first observed for
+    # CI-pending; the identical gap equally afflicts CI-unreadable,
+    # CI-infra, and CI-flaky since none of them has any other trigger for
+    # its rerun either) — `merge_queue.error` outliving the CI run it
+    # described.
     #
-    # The fix: keep dispatching a real (non-dry-run) `coord merge --only
-    # <aid>` retry every poll while this reason holds. That is the only
-    # thing that rewrites the persisted `error` — `--dry-run` evaluates the
-    # same gates but its `save_queue()` call is skipped entirely
-    # (`coord/commands/merge.py`), so it would leave the DB row exactly as
-    # stale as the bare wait did. A CI-pending entry's gate evaluation is
-    # read-only up to and including the `continue` that skips it (no PR
-    # creation, no rebase, no `gh pr merge` — see `merge_queue.process`'s
-    # docstring), so retrying costs one `gh pr checks`-shaped round trip, not
-    # a mechanical operation, and is safe to repeat every poll. It stays
-    # budget-SAFE the same way the #2157 "already merged" wait below does:
-    # `counters.merge_attempts` is deliberately never incremented here, so an
-    # indefinitely-still-pending check can never exhaust
-    # `--max-merge-attempts` and die — only the outer `deadline_mins` bounds
-    # this, same as before. Once CI actually resolves, this SAME call either
-    # lands the merge outright or rewrites `error` to whatever it resolved
-    # to, both within one poll interval — see
-    # `test_checks_pending_retries_for_real_without_spending_an_attempt`.
+    # The fix: all four blocks below now keep dispatching a real (non-dry-run)
+    # `coord merge --only <aid>` retry every poll while their reason holds,
+    # instead of a bare `_wait()`. That is the only thing that rewrites the
+    # persisted `error` (or advances the relevant `ci_*_reruns` counter) —
+    # `--dry-run` evaluates the same gates but its `save_queue()` call is
+    # skipped entirely (`coord/commands/merge.py`), so it would leave the DB
+    # row exactly as stale as a bare wait did. Every one of these four
+    # entries' gate evaluation is read-only up to and including the
+    # `continue`/`return` that skips it (no PR creation, no rebase, no `gh pr
+    # merge` — see `merge_queue.process`'s docstring), so retrying costs one
+    # `gh pr checks`-shaped round trip (plus, for the infra/flaky/unreadable
+    # cases, whatever bounded rerun `process()` itself decides to trigger),
+    # not a mechanical operation, and is safe to repeat every poll. Each
+    # stays budget-SAFE the same way the #2157 "already merged" wait below
+    # does: `counters.merge_attempts` is deliberately never incremented in
+    # any of the four, so an indefinitely-pending/unreadable/rerunning check
+    # can never exhaust `--max-merge-attempts` and die — only the outer
+    # `deadline_mins` bounds this, same as before. Once the underlying CI
+    # state actually resolves, the SAME call either lands the merge outright
+    # or rewrites `error`/advances the rerun budget to whatever it resolved
+    # to, within one poll interval — see
+    # `test_checks_pending_retries_for_real_without_spending_an_attempt` and
+    # its #2347/#1892/#2252 siblings below.
+    #
+    # (Non-blocking, flagged in review: this does mean every poll for the
+    # whole time an entry sits in one of these four states now takes the
+    # host-wide `merge.lock` and makes a live GitHub round trip, where before
+    # three of the four made none at all. Each call is bounded and
+    # `on_error="warn"` degrades gracefully, but multiple sibling entries
+    # simultaneously parked on these reasons on one host will serialize
+    # through that same lock every 60s poll — worth watching under heavy
+    # concurrent-CI-pending load given #2809's rate-limit-backoff history,
+    # not a reason to leave three of the four gaps unplugged.)
     if is_ci_pending_reason(state.merge_reason):
         aid = state.merge_aid or state.work_aid
         return Action(
@@ -3522,15 +3546,28 @@ def _decide_merge(
     # already tracks a bounded count of consecutive fetch failures for this
     # (`coord.merge_queue.MAX_CI_UNREADABLE_RERUNS`) and keeps waiting
     # either way — there is no CI to rerun and no gate to re-test, only more
-    # real time (GitHub answering again). Retrying `coord merge` here would
-    # just re-observe the identical transport failure and spend an attempt
-    # for nothing.
+    # real time (GitHub answering again). #2814: on the standalone path
+    # nothing else ever makes that live attempt (see the module comment
+    # above), so this must dispatch the same real, attempt-exempt
+    # `coord merge --only` re-check as CI-pending, not a bare wait — each
+    # call either observes GitHub answering again (and rewrites `error`
+    # accordingly) or re-observes the identical transport failure for free.
     if is_ci_unreadable_reason(state.merge_reason):
-        return _wait(
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
             label=(
                 "MERGE: GitHub could not be reached to read CI status — "
-                f"waiting, not retrying (#2347): {state.merge_reason}"
-            )
+                f"re-checking, not spending an attempt (#2347/#2814): "
+                f"{state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking unreadable CI — re-checking next poll"
+            ),
+            serialize_merge=True,
         )
 
     # #1892: the sibling case — a CI verdict DID arrive, but every failing
@@ -3538,15 +3575,29 @@ def _decide_merge(
     # before checkout). `coord merge`'s own live attempt is already
     # auto-rerunning CI for this (see `coord.merge_queue.MAX_CI_INFRA_RERUNS`)
     # — retrying `coord merge` here would just re-observe the same in-flight
-    # rerun and spend an attempt for nothing. Same bare wait as the #1891
-    # case above, and for the identical reason: only more real time (here,
-    # the rerun landing) resolves it, never another `coord merge` retry.
+    # rerun and spend an attempt for nothing... but only if some live attempt
+    # is actually happening. #2814: on the standalone path nothing else makes
+    # one (see the module comment above), so `ci_infra_reruns` would never
+    # advance and this would park exactly like the CI-pending case used to.
+    # This now dispatches the same real, attempt-exempt `coord merge --only`
+    # re-check every poll — it either drives the rerun forward itself or
+    # observes one already in flight from elsewhere, for free either way.
     if is_ci_infra_reason(state.merge_reason):
-        return _wait(
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
             label=(
                 "MERGE: CI failed with no verdict about the code — "
-                f"auto-rerunning, not retrying (#1892): {state.merge_reason}"
-            )
+                f"auto-rerunning, not spending an attempt (#1892/#2814): "
+                f"{state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking CI infra failure — re-checking next poll"
+            ),
+            serialize_merge=True,
         )
 
     # #2252: the OTHER sibling case — a CI verdict DID arrive AND said
@@ -3554,20 +3605,30 @@ def _decide_merge(
     # has only observed it fail ONCE so far and is already re-running the
     # failed job(s) to rule out a flake (see
     # `coord.merge_queue.MAX_CI_FLAKY_RERUNS`) before spending a drive
-    # attempt on it. Retrying `coord merge` here would just re-observe the
-    # same in-flight re-run and spend an attempt for nothing — same bare
-    # wait as #1891/#1892 above, for the identical reason: only more real
-    # time (the re-run landing) resolves it, never another `coord merge`
-    # retry. Once the re-run's answer is in, this reason either clears
-    # (flake — merge proceeds, zero attempts spent) or reverts to the plain
-    # "checks failed" wording (confirmed real — spends the attempt exactly
-    # like today), so this wait is bounded by construction, never open-ended.
+    # attempt on it. #2814: same standalone-path gap as the other three —
+    # nothing else makes that live attempt on `BoardFetcher._fetch_local`, so
+    # this now dispatches the same real, attempt-exempt `coord merge --only`
+    # re-check every poll instead of a bare wait. Once the re-run's answer is
+    # in, this reason either clears (flake — merge proceeds, zero attempts
+    # spent) or reverts to the plain "checks failed" wording (confirmed real
+    # — spends the attempt exactly like today), so this stays bounded by
+    # construction, never open-ended.
     if is_ci_flaky_reason(state.merge_reason):
-        return _wait(
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
             label=(
                 "MERGE: CI failed — re-running once to rule out a flake, "
-                f"not retrying (#2252): {state.merge_reason}"
-            )
+                f"not spending an attempt (#2252/#2814): {state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking a possible CI flake — re-checking next "
+                "poll"
+            ),
+            serialize_merge=True,
         )
 
     status = state.merge_status
