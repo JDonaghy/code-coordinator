@@ -2635,6 +2635,18 @@ class TestUsageSurfacesCacheReadAndTurns:
         # (100 + 100 + 800 + 0) / 10 = 100.
         assert result.rows[0]["tok_per_turn"] == 100
 
+    def test_tokens_in_is_labelled_raw_in_not_tok_in(self) -> None:
+        """#2825: "Tok In" next to a full "Tok Out" reads as a matched pair —
+        it is not one, `tokens_in` is ~0.001% of real input. The column `id`
+        stays `tokens_in` (no historical number or saved sort changes), only
+        the display `label` moves."""
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        meta = {m.id: m for m in result.column_meta}
+        assert meta["tokens_in"].label == "Raw In"
+        assert meta["tokens_out"].label == "Tok Out"
+
     def test_totals_row_also_carries_the_new_columns(self) -> None:
         from coord.reports import fold_usage
 
@@ -4182,7 +4194,10 @@ class TestCompletedFold:
             "repo", "issue", "title", "started_at", "ended_at",
             # #2472's four, APPENDED — the client sorts by column index, so
             # #2454's five must keep the indices they had.
-            "legs", "tokens_in", "tokens_out", "cost_total",
+            # #2825's `cache_read`, appended after `tokens_out` (before
+            # `cost_total`, which shifts by one index — see the module
+            # comment).
+            "legs", "tokens_in", "tokens_out", "cache_read", "cost_total",
         ]
         assert [m.id for m in result.column_meta] == result.columns
 
@@ -4298,6 +4313,33 @@ class TestCompletedSpend:
         # captured cost so its 1M sonnet input tokens estimate to $3.00.
         assert row["cost_total"] == pytest.approx(5.0)
 
+    def test_cache_read_is_a_declared_column_not_just_a_row_key(self) -> None:
+        """#2825: `completed` showed a full `Tok Out` next to a `tokens_in`
+        that is ~0.001% of a leg's real input — the raw uncached count sitting
+        alone next to output read as "output dwarfs input", backwards by five
+        orders of magnitude. `cache_read` was already computed into every row
+        by `_usage_metrics`; this only had to become a declared column.
+        """
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 21, "title": "t", "state": "closed"}],
+            [{"repo_name": "myrepo", "issue_number": 21,
+              "dispatched_at": 10.0, "finished_at": 20.0, "model": "sonnet",
+              "input_tokens": 634, "output_tokens": 186_209,
+              "cache_read_tokens": 59_908_777}],
+            [],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        assert "cache_read" in result.columns
+        meta = {m.id: m for m in result.column_meta}
+        assert meta["cache_read"].label == "Cache Rd"
+        row = result.rows[0]
+        assert row["tokens_in"] == 634
+        assert row["tokens_out"] == 186_209
+        # The number that actually carries the input volume — orders of
+        # magnitude above `tokens_in`, exactly the #2825 scenario.
+        assert row["cache_read"] == 59_908_777
+
     def test_the_captured_estimated_split_ships_as_extra_row_keys(self) -> None:
         """One `Total $` COLUMN, but no information thrown away — a client
         that wants `usage`'s split can read it off the row."""
@@ -4384,7 +4426,7 @@ class TestCompletedSpend:
             if peer is None:
                 assert row["legs"] == 0, "only a no-leg issue may be absent from usage"
                 continue
-            for key in ("legs", "tokens_in", "tokens_out"):
+            for key in ("legs", "tokens_in", "tokens_out", "cache_read"):
                 assert row[key] == peer[key], f"{row['repo']}#{row['issue']} {key}"
             assert row["cost_total"] == pytest.approx(peer["cost_total"])
             checked += 1
@@ -4646,14 +4688,17 @@ class TestCompletedCatalogue:
         text = result_to_csv(_fold_completed())
         # The header row is the `column_meta` LABELS (the shared serializer's
         # rule), and the values stay raw epochs — not display strings.
-        # #2472's four labels are `usage`'s verbatim, so a spreadsheet built
-        # off one export lines up with the other.
-        assert "Repo,Issue,Title,Started,Ended,Legs,Tok In,Tok Out,Total $" in text
-        # myrepo#9 merged with no assignment: a real 0/0/0/0.0, not four
+        # #2472's four labels (plus #2825's `cache_read`) are `usage`'s
+        # verbatim, so a spreadsheet built off one export lines up with the
+        # other. `tokens_in` is labelled "Raw In", not "Tok In" (#2825) — it
+        # is not `Tok Out`'s pair, it's ~0.001% of a leg's real input.
+        assert "Repo,Issue,Title,Started,Ended,Legs,Raw In,Tok Out,Cache Rd,Total $" in text
+        # myrepo#9 merged with no assignment: a real 0/0/0/0/0.0, not five
         # empty cells.
-        assert 'myrepo,9,"Merged, still open",,400.0,0,0,0,0.0' in text
-        # myrepo#7's retry: 2 legs, $2.00 captured + $3.00 estimated.
-        assert "myrepo,7,Closed one,100.0,250.0,2,1000010,4,5.0" in text
+        assert 'myrepo,9,"Merged, still open",,400.0,0,0,0,0,0.0' in text
+        # myrepo#7's retry: 2 legs, $2.00 captured + $3.00 estimated, no
+        # cache_read_tokens in the fixture so that column reads 0.
+        assert "myrepo,7,Closed one,100.0,250.0,2,1000010,4,0,5.0" in text
 
 
 class TestRowIdentity:
