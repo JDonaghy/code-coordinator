@@ -7031,16 +7031,31 @@ def _enable_portal(path: Path) -> None:
     )
 
 
-def _run_tick_loop_briefly(app, *, settle: float = 0.3) -> None:
+def _run_tick_loop_briefly(
+    app, *, settle: float = 0.3, mid_run=None, pre_settle: float | None = None
+) -> None:
     """Start *app*'s lifespan (spawning ``_tick_loop`` for real) and let it
     run a few iterations against a real asyncio event loop, then tear down.
 
     Every interval this test doesn't care about is silenced via env vars set
     by the caller before this runs — this only sleeps long enough for the
     ~0.05s reconcile/portal intervals under test to fire several times.
+
+    *mid_run*, given, runs partway through the settle window (after
+    *pre_settle* seconds, default half of *settle*) while the lifespan is
+    still up — e.g. to assert on pre-edit state and then make an on-disk
+    config edit — so a caller that needs to interleave something mid-tick
+    doesn't have to hand-roll its own ``with TestClient(app): time.sleep(...)``
+    block.
     """
     with TestClient(app):
-        time.sleep(settle)
+        if mid_run is None:
+            time.sleep(settle)
+            return
+        pre = settle / 2 if pre_settle is None else pre_settle
+        time.sleep(pre)
+        mid_run()
+        time.sleep(settle - pre)
 
 
 def _quiet_all_other_tick_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7138,21 +7153,19 @@ def test_portal_sync_step_3d_is_entered_after_refresh_config_enables_it(
     monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
     _quiet_all_other_tick_intervals(monkeypatch)
 
-    app = build_app(SqliteStore(file_db), cfg)
-    with TestClient(app):
-        time.sleep(0.3)
+    def _enable_partway_through() -> None:
         assert not calls, (
             "Step 3d ran before portal.enabled was even turned on — "
             "the rest of this test's assertion would be meaningless"
         )
-
         # The #2824 trigger: enable the portal via an on-disk edit, exactly
         # like an operator turning the feature on against a running daemon —
         # _refresh_config() must pick this up on the daemon's own tick cadence.
         _enable_portal(valid_config_path)
         _bump_mtime(valid_config_path)
 
-        time.sleep(0.6)
+    app = build_app(SqliteStore(file_db), cfg)
+    _run_tick_loop_briefly(app, settle=0.9, pre_settle=0.3, mid_run=_enable_partway_through)
 
     assert calls, (
         "Step 3d (_portal_sync_tick) never fired after _refresh_config() "
@@ -7160,6 +7173,80 @@ def test_portal_sync_step_3d_is_entered_after_refresh_config_enables_it(
         "read (or a guard exception swallowed into 'disabled') would look "
         "exactly like this"
     )
+
+
+def test_serve_command_never_thin_clients_its_own_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, valid_config_path: Path, tmp_path: Path
+) -> None:
+    """#2824's ACTUAL root cause, found on review round 1: Step 3d's guard
+    was never broken — `coord serve`'s own bootstrap was. `serve()` loaded
+    its config via the shared `_load_config()`, which treats "a board_service
+    is configured" (a stray `~/.coord/client.toml` or `$COORD_SERVICE_URL`
+    left on the daemon host — plausible after a migration to a new primary)
+    as license to silently fetch and boot on *some other machine's*
+    coordinator.yml instead of the `--config` path the operator explicitly
+    passed. `_refresh_config()`'s mtime-guarded reload then kept re-reading
+    that same wrong file forever, with nothing to say so — exactly why a
+    real on-disk `portal.enabled: true` was never seen by the running
+    daemon while `coord.config.load()` on the identical path, standalone,
+    correctly reported it.
+
+    This must fail against the pre-fix `serve()` (which called bare
+    `_load_config(config_path)`): with `resolve_board_service()` mocked to
+    return a service, that call fetches and boots on the REMOTE config
+    below — a different repo, portal disabled — instead of the local one.
+    """
+    _enable_portal(valid_config_path)
+    local_cfg = load_config(valid_config_path)
+    assert local_cfg.portal.enabled is True
+    local_repo_name = local_cfg.repos[0].name
+
+    remote_path = tmp_path / "remote-coordinator.yml"
+    remote_path.write_text(
+        "repos:\n"
+        "  - name: REMOTE-WRONG-REPO\n"
+        "    github: acme/remote\n"
+        "machines:\n"
+        "  - name: remote-m\n"
+        "    host: remote.tailnet\n"
+        "    repos: [REMOTE-WRONG-REPO]\n"
+    )
+
+    monkeypatch.setattr(
+        coord_client, "resolve_board_service",
+        lambda *a, **k: coord_client.ServiceConfig("http://daemon:7435"),
+    )
+
+    def _fetch_remote_config_must_not_be_called(svc, **kw):  # noqa: ANN001
+        raise AssertionError(
+            "coord serve must never call fetch_remote_config — it MINTS the "
+            "board's config, it is not a client of another one (#2824)"
+        )
+
+    monkeypatch.setattr(
+        coord_client, "fetch_remote_config", _fetch_remote_config_must_not_be_called
+    )
+
+    captured: dict = {}
+
+    def _fake_build_app(store, cfg, *, token=None):  # noqa: ANN001, ARG001
+        captured["cfg"] = cfg
+        return object()  # never actually served — uvicorn.run is stubbed below
+
+    monkeypatch.setattr(serve_app_module, "build_app", _fake_build_app)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # noqa: ARG005
+
+    from click.testing import CliRunner
+
+    from coord.cli import main
+
+    result = CliRunner().invoke(main, ["serve", "--config", str(valid_config_path)])
+
+    assert result.exit_code == 0, result.output
+    cfg = captured["cfg"]
+    assert cfg.portal.enabled is True
+    assert cfg.repos[0].name == local_repo_name
+    assert cfg.repos[0].name != "REMOTE-WRONG-REPO"
 
 
 # ── #2246: auto-drain sweeps siblings the drain itself just broke ────────────

@@ -567,7 +567,20 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
         from coord.serve_app import build_app as build_serve_app
         from coord.serve_app import resolve_serve_token
 
-    cfg = _load_config(config_path)
+    # #2824: `allow_thin_client=False` — `coord serve` IS the daemon every
+    # thin client's `_load_config()` proxies to; it must always load the
+    # `--config` path directly off disk, never go through the "am I a thin
+    # client" board_service branch itself. A stray `~/.coord/client.toml` (or
+    # `$COORD_SERVICE_URL`) surviving on the daemon host — e.g. from before
+    # this machine became the primary — silently made the daemon boot on
+    # some OTHER host's coordinator.yml instead of the one just passed on the
+    # command line, with `_refresh_config()` then re-reading that same wrong
+    # file forever and no signal anything had gone sideways. See
+    # `_load_config`'s docstring in `coord/commands/_common.py` for the full
+    # chain (this was the actual root cause of #2824's dead portal-sync
+    # bridge: a real on-disk `portal.enabled: true` never reaching the
+    # running daemon).
+    cfg = _load_config(config_path, allow_thin_client=False)
     token = resolve_serve_token(token)
     store = SqliteStore(DB_PATH)
     app = build_serve_app(store, cfg, token=token)

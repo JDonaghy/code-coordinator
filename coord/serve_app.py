@@ -7924,25 +7924,43 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # precedent that a third-party outage must not affect
                 # dispatch or any verdict.
                 #
-                # #2824: the *guard* itself used to be evaluated bare, outside
-                # any try/except — `getattr(config.portal, "enabled", False)`
-                # silently downgrades any surprise (a `config.portal` that
-                # isn't the `PortalConfig` this was written against, a
-                # property that raises) into "disabled", and a raise from the
-                # `_time.monotonic() - last_portal_sync` arithmetic would have
-                # propagated straight out of this bare `asyncio.create_task`
-                # with no supervisor to restart it — either way, Step 3d stops
-                # forever with nothing in the journal to say so, which is
-                # exactly the "false guard is indistinguishable from a quiet
-                # successful pass" failure mode the heartbeat exists to catch.
-                # Read `config.portal.enabled` directly (it is always a
-                # `PortalConfig`, never absent — the dataclass default is
-                # `PortalConfig()`, not `None`) and evaluate the whole guard
-                # under the same try/except as the sync itself, so ANY
-                # exception here is loud (`log.warning`, "portal sync" in the
-                # message so it matches the same grep an operator already
-                # runs against the journal) instead of a silent, permanent
-                # skip.
+                # #2824 root cause (found on review round 1): this guard was
+                # never the problem. It was reliably evaluating `False`
+                # because the RUNNING DAEMON's own `config` was never the
+                # `--config` file the operator passed in the first place —
+                # `coord serve`'s bootstrap (`coord/commands/lifecycle.py`)
+                # went through the shared `_load_config()`, which treats "a
+                # board_service is configured" (a stray `~/.coord/client.toml`
+                # or `$COORD_SERVICE_URL` left on the daemon host) as reason
+                # to silently fetch and load *some other machine's*
+                # coordinator.yml instead — so `config.portal.enabled` here
+                # was reading a different file's (correctly `False`) value
+                # the whole time, while `coord.config.load()` on the real
+                # path, standalone, correctly reported `True`. Fixed at the
+                # source: `coord serve` now calls `_load_config(...,
+                # allow_thin_client=False)`, which never consults
+                # `resolve_board_service()` — the daemon mints the board's
+                # config, it does not consume another one. See that
+                # function's docstring in `coord/commands/_common.py`.
+                #
+                # The `try/except` below is retained as defense-in-depth, not
+                # as the fix: `config.portal.enabled` is always a real
+                # `PortalConfig` attribute read today and cannot raise, but a
+                # future refactor that makes `.portal` a property is exactly
+                # the kind of surprise the #1632/#1485 "a third party must
+                # never take down dispatch" precedent guards against, and
+                # "loud on any exception" is strictly better than "silent"
+                # for zero runtime cost.
+                #
+                # Belt-and-braces caveat for whoever debugs this class of bug
+                # next: a `False` guard result is NOT logged (that is the
+                # inherent shape of a boolean gate, not a bug) — a silently
+                # wrong `config` object *upstream* of this guard, like the one
+                # above, will not show up here no matter how this try/except
+                # is written. If Step 3d ever goes quiet again, check what
+                # `config` actually *is* (`_config_mtime`/`config.path` at the
+                # top of `_tick_loop`, and how the daemon was launched) before
+                # re-suspecting this expression.
                 try:
                     portal_due = (
                         portal_sync_interval > 0
