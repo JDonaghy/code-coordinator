@@ -2941,6 +2941,77 @@ def test_fetch_live_blocked_gate_suppresses_the_no_row_note_for_a_pre_dispatch_r
     assert unreadable == {}  # suppressed — not "unreadable", not "still shut"
 
 
+def test_fetch_live_blocked_gate_unreadable_causes_all_log_at_warning(
+    monkeypatch, coord_db, caplog,
+):
+    """#2806 review follow-up: this repo has ZERO `logging.basicConfig`/
+    `setLevel`/`addHandler`/`dictConfig` calls anywhere (see
+    `test_missing_test_coverage_nudge_reaches_stderr_with_zero_logging_config`
+    in `tests/test_review.py` for the subprocess-level proof), so the root
+    logger sits at Python's default WARNING floor with no handler attached
+    in production — a `log.info(...)` call is silently dropped and never
+    reaches `journalctl`. `_fetch_live_blocked_gate`'s docstring claims
+    every "gate unreadable" cause is "logged here, so `journalctl` names the
+    actual cause instead of silence" — this pins that claim by asserting
+    ALL of them log at WARNING (not just the two that always did), using
+    `caplog`'s DEFAULT level with no override, exactly like the `coord.review`
+    precedent this mirrors."""
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_blocked_gate
+    from coord.drive_queue import STATE_BLOCKED, QueueEntry, entry_key
+
+    # Entry A: no queue row, and the #2806 self-heal enqueue itself fails —
+    # exercises BOTH the self-heal-failure site and the resulting "no
+    # merge-queue row" site (the row is still absent afterward).
+    entry_a = QueueEntry(
+        repo=REPO, issue=601, position=1, state=STATE_BLOCKED,
+        last_reason="drive session died without landing the work, launched "
+        "90s ago (attempt 2/2) — giving up",
+    )
+    # Entry B: a queue row exists but has no PR number yet.
+    entry_b = QueueEntry(
+        repo=REPO, issue=602, position=2, state=STATE_BLOCKED,
+        last_reason="drive session died without landing the work, launched "
+        "90s ago (attempt 2/2) — giving up",
+    )
+
+    import types
+
+    row_b = types.SimpleNamespace(repo_name=REPO, issue_number=602, pr_number=None)
+
+    def fake_load_queue():
+        return [row_b]
+
+    def fake_enqueue_approved_work(cfg, board):
+        raise RuntimeError("db is locked")
+
+    monkeypatch.setattr(mq, "load_queue", fake_load_queue)
+    monkeypatch.setattr(mq, "enqueue_approved_work", fake_enqueue_approved_work)
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, unreadable = _fetch_live_blocked_gate([entry_a, entry_b], None)
+
+    assert overrides == {}
+    assert set(unreadable) == {
+        entry_key(REPO, 601), entry_key(REPO, 602),
+    }
+
+    sweep_records = [
+        rec for rec in caplog.records if "blocked-gate sweep (#2806)" in rec.message
+    ]
+    # One for the self-heal failure, one each for entry A's still-missing
+    # row and entry B's missing PR number.
+    assert len(sweep_records) == 3, caplog.text
+    assert all(rec.levelname == "WARNING" for rec in sweep_records), caplog.text
+
+
 # ── tick: the cross-host guard (#1870) ───────────────────────────────────────
 #
 # 2026-08-06: a drive launched by hand on `elitebook` was 47 minutes into a

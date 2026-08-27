@@ -1343,7 +1343,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted | merge_only
+    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
