@@ -126,12 +126,21 @@ def _serve_health(host: str) -> dict:
     }
 
 
-def _stub_verify(monkeypatch, *, daemon_version: str | None, daemon: str = "server"):
+def _stub_verify(monkeypatch, *, daemon_version: str | None, daemon: str = "server",
+                 extra_lanes=()):
     """Replace `coord.release_verify`'s fleet sweep with a canned daemon-host
-    python lane — same seam `tests/test_cli_release_propagate.py` uses."""
+    python lane — same seam `tests/test_cli_release_propagate.py` uses.
+
+    ``extra_lanes`` lets a test add other python-lane rows for the same
+    host (e.g. a `coord-agent process` lane, #2841) without duplicating this
+    whole stub — `_python_lane_versions` takes the OLDEST of everything
+    `verify_lane_kind` grades as `LANE_PYTHON`, so a stale extra lane here is
+    exactly how a test proves that oldest-wins reach.
+    """
     from coord import release_verify as rv
 
-    lanes = [rv.Lane(host=daemon, lane="~/.coord-venv", version=daemon_version)]
+    lanes = [rv.Lane(host=daemon, lane="~/.coord-venv", version=daemon_version),
+             *extra_lanes]
     machine_health = {daemon: _serve_health(daemon)}
     monkeypatch.setattr(rv, "gather",
                         lambda *a, **k: (machine_health, {}, None, daemon))
@@ -271,6 +280,59 @@ def test_a_needed_roll_with_no_marker_pending_sets_one_and_returns_immediately(
     assert record["status"] in rw.OK_STATUSES
     assert record["queue_stopped"] is None
     assert record["queue_restarted"] is None
+
+
+def test_a_staged_but_unrestarted_agent_reads_as_behind_not_up_to_date(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2841: the daemon host's `~/.coord-venv` swap can land — matching the
+    target — while its `coord-agent` process is still running the old
+    release, because the agent can NEVER self-restart on the daemon host
+    (`agent_app.py`'s `_idle_restart_target` returns `None` there on
+    purpose; only the ordered `/update` + `/restart-services` path this
+    command's sibling, `coord release propagate`, drives can move it).
+
+    Before the `coord-agent process` lane existed, `~/.coord-venv` was the
+    ONLY python lane this command could see for that host, so a staged-but-
+    unrestarted swap read as fully up to date — the exact false green #2069
+    closed for `coord-serve`. `_python_lane_versions`' oldest-wins rule must
+    now pick up the stale `coord-agent process` reading instead, so this run
+    sets a roll-pending marker rather than reporting `up-to-date`.
+
+    Pins the oldest-wins rule across all three python lanes at once — venv
+    and `coord-serve process` already on the target, `coord-agent process`
+    (this issue) the lone straggler — the shape the acceptance criteria
+    names explicitly."""
+    from coord import release_verify as rv
+
+    _stub_verify(
+        monkeypatch, daemon_version="0.5.31",
+        extra_lanes=[
+            rv.Lane(host="server", lane="coord-serve process", version="0.5.31"),
+            rv.Lane(host="server", lane="coord-agent process", version="0.5.30"),
+        ],
+    )
+    systemctl_calls = _stub_systemctl(monkeypatch)
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert systemctl_calls == []
+    assert prop_calls == []  # marker set, not fired synchronously
+
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"
+
+    record = _records(state_dir)[0]
+    # The oldest lane wins — the stale agent process, not the swapped venv.
+    assert record["daemon_version"] == "0.5.30"
+    assert record["status"] == rw.STATUS_ROLL_PENDING
+    assert not escalations
 
 
 def test_a_marker_pending_for_a_different_target_is_replaced(

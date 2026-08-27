@@ -68,9 +68,18 @@ def _result(check_id: str, *, subject: str | None = None, severity: str = "ok",
     return row
 
 
-def _health(*results: dict) -> dict:
-    """An agent `/health` body, shaped like coord/agent.py's."""
-    return {"version": RELEASED, "health": {"schema": 1, "results": list(results)}}
+def _health(*results: dict, version: str | None = RELEASED) -> dict:
+    """An agent `/health` body, shaped like coord/agent.py's.
+
+    ``version`` defaults to :data:`RELEASED` and feeds `lanes_for_host`'s
+    ``coord-agent process`` lane (#2841) — the agent's own frozen-at-start
+    version, distinct from whatever `agent_venv`/`spawned_coord` rows a test
+    also passes in. A test simulating a genuinely uniform fleet (every lane
+    agreeing on one version, stale or not) must pass a matching ``version``
+    here too, or this lane alone would manufacture skew that was never the
+    point of that test.
+    """
+    return {"version": version, "health": {"schema": 1, "results": list(results)}}
 
 
 def _agent_venv(version: str | None, *, editable: bool = False) -> dict:
@@ -839,9 +848,12 @@ def test_tui_binary_never_becomes_a_version_lane() -> None:
     )
     assert report.ok, rv.render(report)
     assert not any(lane.lane == "coord-tui" for lane in report.lanes)
-    # The only version lane present is agent_venv's — tui_binary contributed
-    # no entry to the skew map at all, not even an agreeing one.
-    assert report.versions == {RELEASED: ["~/.coord-venv (dellserver)"]}
+    # The version lanes present are agent_venv's and the agent's own
+    # self-reported process version (#2841) — tui_binary contributed no
+    # entry to the skew map at all, not even an agreeing one.
+    assert report.versions == {
+        RELEASED: ["coord-agent process (dellserver)", "~/.coord-venv (dellserver)"]
+    }
 
 
 def test_absent_cli_venv_is_not_a_lane() -> None:
@@ -1146,8 +1158,8 @@ def test_a_uniformly_stale_fleet_is_not_reported_clean() -> None:
     skew-only run must say so rather than render a clean bill of health."""
     report = rv.verify(
         machine_health={
-            "dellserver": _health(_agent_venv(STALE)),
-            "elitebook": _health(_agent_venv(STALE)),
+            "dellserver": _health(_agent_venv(STALE), version=STALE),
+            "elitebook": _health(_agent_venv(STALE), version=STALE),
         },
     )
     assert not report.ok, rv.render(report)

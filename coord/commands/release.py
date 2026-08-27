@@ -1337,16 +1337,17 @@ def _python_lane_versions(
     """``{host: the OLDEST version its python lane reports}`` (#2101).
 
     "Python lane" is whatever :func:`coord.release_propagate.verify_lane_kind`
-    grades as one — the venv itself plus the live `coord-serve` process —
-    rather than a second list that could drift from the one the roll and the
-    gate already use.
+    grades as one — the venv itself plus the live `coord-serve` and
+    `coord-agent` processes — rather than a second list that could drift
+    from the one the roll and the gate already use.
 
     Two deliberate readings:
 
     * the OLDEST readable version wins, because a host is as behind as its
-      most stale python lane. A venv that swapped while `coord-serve` still
-      runs the old generation is #2069's exact defect, and it must read as
-      "behind", not as "done";
+      most stale python lane. A venv that swapped while `coord-serve` (or,
+      on the daemon host, `coord-agent` — #2841) still runs the old
+      generation is #2069's exact defect, and it must read as "behind", not
+      as "done";
     * a host with an unreadable lane and no readable lane BEHIND the target is
       ``None`` — "no data", never "current" (#1834). `None` is what stops the
       host being cordoned on a guess *and* what stops an existing cordon being
