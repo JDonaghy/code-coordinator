@@ -14,6 +14,8 @@ from coord.commands._common import (
     _CONFIG_OPTION,
     _load_config,
     _resolve_repo_slug,
+    PIPELINE_TRACK_LABELS_ADD,
+    PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT,
 )
 
 
@@ -783,8 +785,8 @@ def track(repo: str, issue: int, config_path: Path) -> None:
     slug = _resolve_repo_slug(cfg, repo)
     _apply_label_change(
         repo, issue, config_path,
-        add={"coord", "status:ready"},
-        remove_if_present={"status:refining", "status:backlog"},
+        add=PIPELINE_TRACK_LABELS_ADD,
+        remove_if_present=PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT,
         success_message=(
             f"#{issue} ({slug}) sent to Pipeline (coord + status:ready)"
         ),

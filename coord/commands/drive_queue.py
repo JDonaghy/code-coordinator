@@ -40,7 +40,7 @@ from typing import Any, Mapping
 import click
 
 from coord.block_log import INTERVENTION_CATEGORIES, STALL_STATES
-from coord.commands._common import _CONFIG_OPTION
+from coord.commands._common import _CONFIG_OPTION, apply_pipeline_track_labels_best_effort
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
@@ -402,6 +402,18 @@ def drive_queue_add(
         max_fix_rounds=max_fix_rounds,
         no_acceptance=no_acceptance,
     )
+    # #2839: queueing a drive is a strictly STRONGER statement than "send to
+    # Pipeline" (`coord track`), so it must never leave the issue in a
+    # weaker label state — apply the same `coord` + `status:ready` labels
+    # `track` does. Best-effort/non-blocking (a GitHub outage warns and
+    # carries on; the board row above is already written and is the
+    # source of truth for queue membership) and skipped for an entry that is
+    # already `running` — #2821 was mid-drive with `coord` but no
+    # `status:*`, and re-adding `status:ready` to a running card would
+    # misrepresent it as not-yet-started. This is enqueue-time ONLY: never
+    # mirrored onto `coord drive-queue remove`, which must not untrack.
+    if previous is None or previous.state != STATE_RUNNING:
+        apply_pipeline_track_labels_best_effort(repo, issue, config_path)
     if auto_after:
         _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
@@ -1413,7 +1425,13 @@ def drive_queue_log_intervention(
 @click.argument("issue", type=int)
 @_CONFIG_OPTION
 def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
-    """Drop REPO ISSUE from the queue (positions are renumbered dense)."""
+    """Drop REPO ISSUE from the queue (positions are renumbered dense).
+
+    #2839: deliberately does NOT touch the `coord`/`status:*` labels `add`
+    applies — dropping out of the drive queue is not eviction from the
+    Pipeline. `coord untrack` stays the only way to evict a card; do not
+    "fix" this asymmetry by mirroring `add`'s label write here.
+    """
     from coord.state import dequeue_drive_queue, get_drive_queue_entry  # noqa: PLC0415
 
     # #2235 Phase 0: read the row BEFORE deleting it, because `remove` on a

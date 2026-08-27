@@ -163,6 +163,23 @@ def no_tmux(monkeypatch):
     monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
 
 
+@pytest.fixture(autouse=True)
+def _default_pipeline_labels(monkeypatch):
+    """#2839: `add` now also projects `coord`/`status:ready` onto the issue
+    via `coord.state.apply_issue_labels` — default that to an inert no-op
+    here. Without it, `add`'s real label write falls through to
+    `github_ops._gh` and, once a test also mocks `subprocess.run` (the
+    `launches` fixture below), lands in that SAME capture — `subprocess.run`
+    is one singleton module attribute — polluting the captured argv this
+    file asserts on with spurious `gh issue view`/`gh issue edit` entries.
+    See the identical fixture (and its longer rationale) in
+    `tests/test_cli_drive_queue.py`.
+    """
+    monkeypatch.setattr(
+        "coord.state.apply_issue_labels", lambda *a, **k: ([], False)
+    )
+
+
 @pytest.fixture
 def live_sessions(monkeypatch):
     def _set(*issues: int) -> None:
