@@ -484,7 +484,7 @@ PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT = {"status:refining", "status:backlog"}
 
 
 def apply_pipeline_track_labels_best_effort(
-    repo: str, issue: int, config_path: Path,
+    repo: str, issue: int,
 ) -> None:
     """Best-effort ``coord`` + ``status:ready`` label application (#2839).
 
@@ -501,18 +501,29 @@ def apply_pipeline_track_labels_best_effort(
     backend underneath it) tolerates already-present ``add`` labels and
     already-absent ``remove`` labels, so re-running this on an
     already-tracked issue is a silent no-op, not a duplicate write.
+
+    Deliberately does **not** resolve *repo*'s GitHub slug via
+    ``_load_config``/``cfg.repo`` (#2839 review): ``_load_config`` turns a
+    config-load failure — e.g. a thin client's ``fetch_remote_config``
+    round-trip to a momentarily-unreachable board daemon — into
+    ``sys.exit(2)``, and ``SystemExit`` is a ``BaseException``, not an
+    ``Exception``, so it would blow straight through the ``except
+    Exception`` below and kill the whole ``drive-queue add`` process after
+    the board row was already written. Passing ``repo_github=None`` instead
+    lets ``apply_issue_labels``/``_apply_issue_labels_local`` fall back to
+    ``repo_github or repo_name`` (``coord/state.py``) — the same slug
+    ``_load_config`` would have produced for a plain (non-slug) repo name —
+    without a second, uncachable network round-trip to the daemon on every
+    single ``add``.
     """
     from coord.state import apply_issue_labels  # noqa: PLC0415
 
     try:
-        cfg = _load_config(config_path)
-        repo_entry = cfg.repo(repo)
-        slug = repo_entry.github if repo_entry is not None else None
         apply_issue_labels(
             repo, issue,
             add=PIPELINE_TRACK_LABELS_ADD,
             remove=PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT,
-            repo_github=slug,
+            repo_github=None,
         )
     except Exception as exc:  # noqa: BLE001 — see docstring: must never block the enqueue
         log.warning(

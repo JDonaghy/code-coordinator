@@ -343,7 +343,13 @@ def test_add_applies_coord_and_status_ready_on_a_fresh_issue(cli, labels):
     assert call["issue_number"] == 1650
     assert call["add"] == {"coord", "status:ready"}
     assert call["remove"] == {"status:refining", "status:backlog"}
-    assert call["repo_github"] == "john/claude-coordinator"
+    # #2839 review: deliberately `None`, not a config-resolved slug — see
+    # `apply_pipeline_track_labels_best_effort`'s docstring. Passing `None`
+    # lets `apply_issue_labels`/`_apply_issue_labels_local` fall back to
+    # `repo_github or repo_name` on their own, without this best-effort
+    # helper making its own (uncachable, per-`add`) round trip to resolve a
+    # slug that's only needed for the fallback anyway.
+    assert call["repo_github"] is None
 
 
 def test_add_survives_a_failing_label_write(cli, monkeypatch):
@@ -357,6 +363,51 @@ def test_add_survives_a_failing_label_write(cli, monkeypatch):
     # The board row is the source of truth for queue membership — it must
     # land even though the label write (a projection of it) failed.
     assert queued(1650) is not None
+
+
+def test_apply_pipeline_track_labels_best_effort_never_calls_load_config(monkeypatch):
+    """#2839 review: `apply_pipeline_track_labels_best_effort` used to make
+    its own `_load_config` call to resolve a GitHub slug for the label write.
+    `_load_config` turns a config-load failure — e.g. a thin client's
+    `fetch_remote_config` timing out against a momentarily-unreachable board
+    daemon, or a briefly-unreadable local `coordinator.yml` — into
+    `click.echo(...); sys.exit(2)`, which raises `SystemExit`. `SystemExit`
+    is a `BaseException`, not an `Exception`, so it blows straight through
+    this function's `except Exception` and would kill the whole
+    `drive-queue add` process *after* the board row was already written —
+    contradicting the "non-blocking" contract in its own docstring.
+
+    The fix drops the `_load_config` call from this function entirely (it
+    passes `repo_github=None` and lets `apply_issue_labels`'s own
+    `repo_github or repo_name` fallback resolve the slug). Verify that
+    directly at the unit level: even with `_load_config` wired to always
+    raise `SystemExit`, calling this function does not raise, and the
+    underlying label write still goes through with `repo_github=None`.
+    """
+    from coord.commands import _common
+
+    def _boom_exit(*_a, **_k):
+        raise SystemExit(2)
+
+    monkeypatch.setattr(_common, "_load_config", _boom_exit)
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_apply_issue_labels(repo_name, issue_number, *, add, remove, repo_github=None):
+        calls.append(
+            {"repo_name": repo_name, "issue_number": issue_number, "repo_github": repo_github}
+        )
+        return (sorted(add), True)
+
+    monkeypatch.setattr("coord.state.apply_issue_labels", _fake_apply_issue_labels)
+
+    # Must not raise — a config-load failure at label time is best-effort.
+    _common.apply_pipeline_track_labels_best_effort(REPO, 1650)
+
+    assert len(calls) == 1
+    assert calls[0]["repo_name"] == REPO
+    assert calls[0]["issue_number"] == 1650
+    assert calls[0]["repo_github"] is None
 
 
 def test_add_does_not_relabel_an_already_running_entry(cli, labels):
