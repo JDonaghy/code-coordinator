@@ -1018,6 +1018,106 @@ def test_pick_machine_choice_paused_capable_machine_is_not_selected(monkeypatch)
     assert choice.name == ""
 
 
+# ── reachability filter (#2807) ──────────────────────────────────────────────
+
+
+def _health_row(machine: str, state: str, *, stale: bool = False) -> dict:
+    """A `payload["fleet_health"]["machine_health"]` row shaped the way
+    `coord.health.fleet_snapshot._machine_health_rows` actually produces
+    them — the minimal fields `coord.queue_diagnose._row_reachable` reads."""
+    return {"machine": machine, "state": state, "stale": stale}
+
+
+def test_pick_machine_never_picks_an_unreachable_machine_even_at_zero_load():
+    """The core #2807 bug: a dead machine runs nothing, so its load reads as
+    0 — the minimum — and used to sort FIRST, ahead of every busy-but-alive
+    peer. A machine the fleet-health poll confidently reports as unreachable
+    must never be a candidate, regardless of load."""
+    config = make_config(
+        machines=[
+            Machine(name="dead", host="dead", repos=[REPO]),
+            Machine(name="busy", host="busy", repos=[REPO]),
+        ]
+    )
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", machine_name="busy", status="running"),
+        ],
+        "fleet_health": {
+            "machine_health": [
+                _health_row("dead", "timeout"),
+                _health_row("busy", "online"),
+            ]
+        },
+    }
+    assert pick_machine(payload, REPO, config) == "busy"
+
+
+def test_pick_machine_refuses_rather_than_picking_the_only_host_when_it_is_dead():
+    """When the ONLY machine hosting the repo is confidently unreachable,
+    the auto-pick must refuse (empty string) exactly like the pre-existing
+    "the only host is paused" case — reachability is just another
+    disqualifying fact about a host, not a fallback-of-last-resort
+    exception. `coord.drive.preflight` turns this into the same "no
+    unpaused machine hosts {repo} — pass --machine" refusal an operator
+    already knows how to work around."""
+    config = make_config(
+        machines=[Machine(name="dead", host="dead", repos=[REPO])],
+    )
+    payload = {
+        "fleet_health": {"machine_health": [_health_row("dead", "timeout")]},
+    }
+    assert pick_machine(payload, REPO, config) == ""
+
+
+@pytest.mark.parametrize(
+    "row_or_absent",
+    [
+        None,  # no row at all for this machine — never polled
+        _health_row("idle-or-dead", "unknown"),
+        _health_row("idle-or-dead", "timeout", stale=True),
+    ],
+)
+def test_pick_machine_no_signal_or_stale_signal_stays_a_candidate(row_or_absent):
+    """Missing data, an explicit `unknown` state, or a stale reading are all
+    "no usable signal" — abstaining, not proof of death (mirrors
+    `coord.queue_diagnose._row_reachable`'s three-valued contract). None of
+    these should cost a machine its candidacy the way a fresh, confidently
+    non-online reading does."""
+    config = make_config(
+        machines=[Machine(name="idle-or-dead", host="idle-or-dead", repos=[REPO])],
+    )
+    health = {"machine_health": [row_or_absent]} if row_or_absent else {"machine_health": []}
+    payload = {"fleet_health": health}
+    assert pick_machine(payload, REPO, config) == "idle-or-dead"
+
+
+def test_pick_machine_choice_surfaces_an_unreadable_pause_set_without_refusing(monkeypatch):
+    """#2807: an unreadable pause set must not vanish into "nothing is
+    paused" with nobody the wiser. `pick_machine_choice` still fails open on
+    ROUTING (consistent with every other `paused_set()` reader's documented
+    fail-soft contract) but now reports the failure on `pause_read_error` so
+    the caller (`coord.drive`) can warn loudly instead of silently
+    re-enabling a paused machine."""
+
+    def _boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("coord.machine_pause.paused_set", _boom)
+    config = make_config(
+        machines=[Machine(name="precision", host="precision", repos=[REPO])],
+    )
+    choice = pick_machine_choice({}, REPO, config)
+    assert choice.name == "precision"
+    assert "permission denied" in choice.pause_read_error
+
+
+def test_pick_machine_choice_pause_read_error_is_empty_on_the_happy_path():
+    config = make_config()
+    choice = pick_machine_choice({}, REPO, config)
+    assert choice.pause_read_error == ""
+
+
 def test_pick_machine_repo_level_provider_also_filters_without_a_label():
     """The repo-level `Repo.provider` link (no `providers.labels` match
     needed) still narrows candidates — #1906 isn't only reachable via
@@ -1049,6 +1149,21 @@ def test_project_resolves_provider_before_picking_a_capable_machine():
     assert state.picked_machine_provider == "opencode"
     assert "opencode" in state.picked_machine_provider_reason
     assert state.picked_machine_no_capable is False
+
+
+def test_project_threads_the_pause_read_error_onto_issue_state(monkeypatch):
+    """#2807: `project()` (what `coord.drive.Driver.read_state()` actually
+    calls) must carry the pause-set failure through to `IssueState` so the
+    driver loop can warn — the field must not get lost between
+    `pick_machine_choice` and the dataclass the driver branches on."""
+
+    def _boom(*a, **k):
+        raise OSError("no such file or directory")
+
+    monkeypatch.setattr("coord.machine_pause.paused_set", _boom)
+    state = project({"assignments": []}, REPO, 1392, make_config())
+    assert "no such file or directory" in state.picked_machine_pause_error
+    assert state.picked_machine == "precision"  # still auto-picked (fail-open)
 
 
 def test_project_flags_no_capable_machine_distinctly_from_no_host():

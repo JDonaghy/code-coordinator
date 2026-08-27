@@ -4370,6 +4370,16 @@ class Driver:
             # the enforcement for it). Mirrors `coord assign --dry-run`'s
             # own "provider: ..." line (`describe_provider_choice`).
             self.log(f"  provider       : {state.picked_machine_provider_reason}")
+        if not self.opts.machine and state.picked_machine_pause_error:
+            # #2807: the pause set couldn't be read, so the auto-pick above
+            # fell back to treating it as "nothing is paused" (fail-open,
+            # matching every other `coord.machine_pause.paused_set()`
+            # reader) — surfaced loudly here rather than an operator's
+            # `coord pause` silently stopping enforcing.
+            self.warn(
+                "pause set unreadable, routing may include a paused "
+                f"machine: {state.picked_machine_pause_error}"
+            )
         self.log(f"  acceptance     : {oracle.reason}")
         self.log(
             f"  test command   : {state.repo_test_command or '<none configured>'} "

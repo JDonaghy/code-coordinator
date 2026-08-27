@@ -5005,6 +5005,46 @@ def test_driver_reports_the_distinct_no_capable_machine_error(driver_factory):
     assert exc.value.exit_code == EXIT_USAGE
 
 
+def test_driver_warns_loudly_when_the_pause_set_is_unreadable(driver_factory, capsys, monkeypatch):
+    """#2807: an unreadable pause set must not silently degrade to "nothing
+    is paused" with no trace anywhere. `pick_machine_choice` still fails
+    open (auto-picks "precision" — the sole host), but the driver's own
+    startup log must carry a loud warning about it, the same way it already
+    surfaces the #1906 provider provenance line."""
+
+    def _boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("coord.machine_pause.paused_set", _boom)
+    driver = driver_factory(
+        [board(status="running")],
+        opts=DriveOptions(machine="", poll=1.0, deadline_mins=0.5 / 60.0),
+    )
+    assert driver.run() == EXIT_DEADLINE
+    err = capsys.readouterr().err
+    assert "pause set unreadable" in err
+    assert "permission denied" in err
+
+
+def test_driver_stays_quiet_about_pause_reads_when_an_explicit_machine_is_given(
+    driver_factory, capsys, monkeypatch,
+):
+    """An explicit `--machine` bypasses the auto-pick entirely (#1906's own
+    `opts.machine` short-circuit) — the pause-read warning is only
+    meaningful for an auto-pick, so it must not fire here."""
+
+    def _boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("coord.machine_pause.paused_set", _boom)
+    driver = driver_factory(
+        [board(status="running")],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=0.5 / 60.0),
+    )
+    assert driver.run() == EXIT_DEADLINE
+    assert "pause set unreadable" not in capsys.readouterr().err
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # #1499: audit events at the driver's own boundaries
 # ═══════════════════════════════════════════════════════════════════════════

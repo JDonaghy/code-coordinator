@@ -154,6 +154,13 @@ class IssueState:
     # advertise `picked_machine_provider` — the distinct #1906 failure mode
     # `preflight()` reports separately, per #1711's own refusal shape.
     picked_machine_no_capable: bool = False
+    # #2807: non-empty when `pick_machine_choice` could not read the pause
+    # set (e.g. an unreadable `~/.coord/paused_machines.json`) and fell back
+    # to treating it as "nothing paused" — see `MachineChoice.pause_read_error`
+    # for why that fallback still happens. `Driver` warns on this so the
+    # fallback is loud, not a silent re-enable of routing to a paused
+    # machine.
+    picked_machine_pause_error: str = ""
 
     # ── #1453: oracle-loop JIT slice authoring ──────────────────────────
     # `milestone_number` is the issue's own GitHub milestone (the `ms-NN`
@@ -460,6 +467,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         picked_machine_provider=_machine_pick.provider_name,
         picked_machine_provider_reason=_machine_pick.provider_reason,
         picked_machine_no_capable=_machine_pick.no_capable_machine,
+        picked_machine_pause_error=_machine_pick.pause_read_error,
         milestone_number=milestone_number,
         milestone_tracking_issue=milestone_tracking_issue,
         issue_labels=tuple(issue_labels),
@@ -631,6 +639,55 @@ class MachineChoice:
     provider_name: str = ""
     provider_reason: str = ""
     no_capable_machine: bool = False
+    # #2807: non-empty when reading the pause set raised — *before*
+    # `pick_machine_choice` still fell back to treating it as "nothing is
+    # paused" (fail-open, consistent with `coord.machine_pause`'s documented
+    # fail-soft contract for every other reader). `name` above may still be
+    # populated in this case — a stale/unreadable pause file no longer
+    # blocks a pick, it just means the pick might include a machine an
+    # operator deliberately paused. The caller (`coord.drive`) surfaces this
+    # loudly instead of it disappearing into an empty `set()`.
+    pause_read_error: str = ""
+
+
+def _unreachable_machine_names(payload: dict) -> set[str]:
+    """Machine names the fleet-health poll confidently reports as NOT
+    answering (#2807).
+
+    Reads ``payload["fleet_health"]["machine_health"]`` — the same rows
+    ``coord.health.fleet_snapshot.FleetHealthRefresher`` computes from
+    ``coord.network.check_machine`` and the daemon publishes as a sibling
+    key on every ``/board`` response (#1630). Reuses
+    :func:`coord.queue_diagnose._row_reachable`'s three-valued reading
+    rather than re-deriving "is this machine up" a second, driftable way:
+    ``True``/``None`` (reachable, or no usable signal — never polled, stale,
+    or an unclassifiable state) leave a machine as a candidate; only a
+    confident ``False`` (a FRESH, recognised, non-online ``coord.network``
+    state — exactly elitebook's ``timeout`` in #2807) excludes it.
+
+    This is deliberately narrower than the "advisory-only" health block
+    (#1630's `test_health_never_influences_dispatch_routing_or_merge_ordering`
+    guard on `coord.milestone_dispatch.pick_machine` /
+    `coord.merge_queue.plan` / `coord.review.pick_reviewer_machine`, all of
+    which take a `coord.models.Board` with structurally no health field):
+    THIS function only ever excludes on basic reachability (can the machine
+    answer at all), never on severity (CRIT disk, toolchain skew, …) — a
+    degraded-but-answering machine is still a candidate, same as always.
+
+    Missing ``fleet_health`` altogether (no daemon running the #1630 poll
+    loop, or `coord drive`'s own standalone/local board read) reads as "no
+    signal for anyone" — an empty set, exactly like before this filter
+    existed.
+    """
+    from coord.queue_diagnose import _row_reachable  # noqa: PLC0415
+
+    rows = (payload.get("fleet_health") or {}).get("machine_health") or []
+    out: set[str] = set()
+    for row in rows:
+        name = row.get("machine")
+        if name and _row_reachable(row) is False:
+            out.add(name)
+    return out
 
 
 def pick_machine_choice(
@@ -640,11 +697,18 @@ def pick_machine_choice(
     *,
     issue_labels: list[str] | None = None,
 ) -> MachineChoice:
-    """Least-loaded unpaused **and capable** machine that hosts *repo*.
+    """Least-loaded unpaused, reachable, **and capable** machine that hosts
+    *repo*.
 
     Deliberately simple — this is not ``coord plan``'s brain (which costs an
     LLM call).  Load is counted from the board's non-terminal rows, so a
     machine already running two workers loses to an idle peer.
+
+    #2807: a machine the fleet-health poll confidently reports as
+    unreachable is excluded from candidacy before load is even considered —
+    see :func:`_unreachable_machine_names`. Without this, a dead machine's
+    load reads as 0 (it runs nothing), so it used to sort FIRST, ahead of
+    every busy-but-alive peer.
 
     #1906: *issue_labels* (``None`` skips provider resolution entirely,
     reproducing the pre-#1906 provider-blind pick byte-for-byte — every
@@ -663,12 +727,32 @@ def pick_machine_choice(
     but capability filtering still applies (repo/``providers.default`` can
     still name a non-implicit provider).
     """
+    pause_read_error = ""
     try:
         from coord.machine_pause import paused_set  # noqa: PLC0415
 
         paused = paused_set(config.machines)
-    except Exception:  # noqa: BLE001 — a missing pause file means nothing paused
+    except Exception as exc:  # noqa: BLE001 — #2807: still fails OPEN here,
+        # matching `coord.machine_pause`'s own documented fail-soft contract
+        # for every other reader (module docstring: "a transient network
+        # blip degrades to 'nothing is paused' rather than wedging the
+        # dispatcher") — this function does not get to invent a stricter
+        # rule than the rest of the fleet's dispatchers share. What it must
+        # not do is stay SILENT about it: `pause_read_error` carries the
+        # failure back to the caller (`coord.drive`), which warns loudly
+        # instead of an operator's pause silently evaporating with nobody
+        # the wiser.
         paused = set()
+        pause_read_error = f"{type(exc).__name__}: {exc}"
+
+    # #2807: exclude machines the fleet-health poll confidently reports as
+    # unreachable — independent of whether anyone remembered to `coord
+    # pause` them. Before this, a dead machine's load counted as 0 (it is
+    # running nothing), which made it sort FIRST — the deader the box, the
+    # more attractive it looked. See `_unreachable_machine_names` for what
+    # "confidently" means and why it stays narrower than the advisory-only
+    # health block.
+    unreachable = _unreachable_machine_names(payload)
 
     load: dict[str, int] = {}
     for a in payload.get("assignments") or []:
@@ -677,10 +761,13 @@ def pick_machine_choice(
             load[name] = load.get(name, 0) + 1
 
     hosts = [
-        m for m in config.machines if repo in (m.repos or []) and m.name not in paused
+        m for m in config.machines
+        if repo in (m.repos or [])
+        and m.name not in paused
+        and m.name not in unreachable
     ]
     if not hosts:
-        return MachineChoice()
+        return MachineChoice(pause_read_error=pause_read_error)
 
     candidates = hosts
     provider_name = ""
@@ -709,6 +796,7 @@ def pick_machine_choice(
                 provider_name=provider_name,
                 provider_reason=provider_reason,
                 no_capable_machine=True,
+                pause_read_error=pause_read_error,
             )
 
     candidates = sorted(candidates, key=lambda m: (load.get(m.name, 0), m.name))
@@ -716,6 +804,7 @@ def pick_machine_choice(
         name=candidates[0].name,
         provider_name=provider_name,
         provider_reason=provider_reason,
+        pause_read_error=pause_read_error,
     )
 
 
