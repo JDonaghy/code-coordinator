@@ -158,7 +158,9 @@ def _note_withheld_snapshot(config: Config, config_path: Path) -> None:
     )
 
 
-def _save_config_snapshot(config: Config, config_path: Path | None = None) -> None:
+def _save_config_snapshot(
+    config: Config, config_path: Path | None = None, *, allow_thin_client: bool = True
+) -> None:
     """Persist machine + pipeline metadata to the DB so dashboards can read it.
 
     Writes:
@@ -176,13 +178,22 @@ def _save_config_snapshot(config: Config, config_path: Path | None = None) -> No
     entirely — see the #2208 guard below. Callers that omit it (mainly
     direct unit tests exercising the write itself) get the pre-#2208
     behavior: always write.
+
+    *allow_thin_client* mirrors ``_load_config``'s flag (#2824) — pass
+    ``False`` for ``coord serve``'s own bootstrap so a stray
+    ``~/.coord/client.toml``/``$COORD_SERVICE_URL`` on the daemon host can't
+    also make the daemon skip writing its OWN machines/board_meta snapshot
+    (the same "am I a thin client" question, asked a second time here for
+    the DB write rather than the config read — a caller that already knows
+    it is the daemon for one must know it for the other).
     """
     # #584: a thin client (board_service configured) must not create/write a
     # local DB — the daemon/host owns the config snapshot.  On the host
     # board_service is unset, so the snapshot is written as before.
-    from coord.client import resolve_board_service
-    if resolve_board_service() is not None:
-        return
+    if allow_thin_client:
+        from coord.client import resolve_board_service
+        if resolve_board_service() is not None:
+            return
     # #2208: an explicit `--config <file>` pointed away from the fleet's real
     # config (a scratch fixture, a CI-only stub) must not be treated as a
     # request to redefine the shared `machines` table — that table is global
@@ -316,7 +327,7 @@ def _save_config_snapshot(config: Config, config_path: Path | None = None) -> No
                 pass
 
 
-def _load_config(path: Path | None) -> Config:
+def _load_config(path: Path | None, *, allow_thin_client: bool = True) -> Config:
     # Resolve the default location ($COORD_CONFIG → ~/.coord/coordinator.yml →
     # ./coordinator.yml) when no explicit --config was given, so `coord` works on
     # a machine without a repo checkout and isn't sensitive to the CWD.
@@ -333,27 +344,47 @@ def _load_config(path: Path | None) -> Config:
     # config on every command). On a machine with no client.toml/board_service
     # (svc is None — e.g. the daemon host), this is a no-op and local-file
     # resolution proceeds exactly as before (#584/#591).
+    #
+    # #2824: *allow_thin_client=False* opts a caller OUT of that branch
+    # entirely — never even calls ``resolve_board_service()``. This is for
+    # ``coord serve`` alone: the board daemon does not consume "the board's"
+    # config, it MINTS it (every other machine's ``GET /config`` reads come
+    # from THIS process's in-memory ``Config``). A leftover/stray
+    # ``~/.coord/client.toml`` or ``$COORD_SERVICE_URL`` on the daemon host
+    # (e.g. surviving a migration from an old primary) made `coord serve`
+    # silently proxy its own boot through `_load_config`'s thin-client branch
+    # and boot on *another machine's* ``coordinator.yml`` instead of the
+    # ``--config`` path the operator explicitly passed — the daemon then kept
+    # re-reading (`_refresh_config`'s mtime-guarded reload) that same wrong,
+    # remote-fetched file forever, with no signal anything was wrong: this is
+    # exactly how a real, on-disk ``portal.enabled: true`` was never seen by
+    # the running daemon while `coord.config.load()` on the same path,
+    # standalone, correctly reported it (the #2824 root cause). Every other
+    # caller of ``_load_config`` legitimately wants thin-client resolution
+    # (they ARE clients of the daemon's board) — this flag exists so ONLY
+    # `coord serve`'s own bootstrap can opt out.
     try:
-        from coord.client import resolve_board_service  # noqa: PLC0415
+        if allow_thin_client:
+            from coord.client import resolve_board_service  # noqa: PLC0415
 
-        svc = resolve_board_service()
-        if svc is not None:
-            from coord.client import fetch_remote_config  # noqa: PLC0415
+            svc = resolve_board_service()
+            if svc is not None:
+                from coord.client import fetch_remote_config  # noqa: PLC0415
 
-            try:
-                path = fetch_remote_config(svc)
-            except Exception as exc:  # noqa: BLE001 — do NOT fall through to
-                # load(path): path may point at a local file that happens to
-                # exist (the exact bypass this issue closes). Fail loudly
-                # instead of silently trusting whatever is on disk.
-                raise ConfigError(
-                    f"could not fetch config from {svc.url}: {exc}"
-                ) from exc
+                try:
+                    path = fetch_remote_config(svc)
+                except Exception as exc:  # noqa: BLE001 — do NOT fall through to
+                    # load(path): path may point at a local file that happens to
+                    # exist (the exact bypass this issue closes). Fail loudly
+                    # instead of silently trusting whatever is on disk.
+                    raise ConfigError(
+                        f"could not fetch config from {svc.url}: {exc}"
+                    ) from exc
         cfg = load(path)
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
-    _save_config_snapshot(cfg, path)
+    _save_config_snapshot(cfg, path, allow_thin_client=allow_thin_client)
     return cfg
 
 

@@ -228,6 +228,54 @@ class TestNoteWithheldSnapshotReadsThroughTheSeam:
         assert "worker-1" in err
 
 
+class TestAllowThinClientFlag:
+    """#2824: `allow_thin_client=False` (used by `coord serve`'s own
+    bootstrap — the daemon must never treat itself as a thin client of
+    another daemon) must also bypass `_save_config_snapshot`'s independent
+    `resolve_board_service()` check, not just `_load_config`'s config-fetch
+    branch. Without this, a stray `~/.coord/client.toml` on the daemon host
+    would leave the daemon correctly loading its OWN `--config` file (the
+    #2824 fix) but still silently skipping the machines/board_meta write —
+    the same "am I a thin client" question asked twice, answered
+    inconsistently.
+    """
+
+    def test_allow_thin_client_false_still_writes_with_board_service_configured(
+        self, coord_db, monkeypatch
+    ):
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        cfg = _build_config(run_cmd="./run.sh", require_plan=False, repo_path_tag="v1")
+
+        _save_config_snapshot(cfg, allow_thin_client=False)
+
+        rows = coord_db.execute("SELECT name FROM machines").fetchall()
+        assert [r["name"] for r in rows] == ["worker-1"]
+
+    def test_default_still_skips_write_with_board_service_configured(
+        self, coord_db, monkeypatch
+    ):
+        """Unchanged pre-#2824 behavior for every other caller (default
+        `allow_thin_client=True`) — a real thin client must still skip the
+        local write."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        cfg = _build_config(run_cmd="./run.sh", require_plan=False, repo_path_tag="v1")
+
+        _save_config_snapshot(cfg)
+
+        rows = coord_db.execute("SELECT name FROM machines").fetchall()
+        assert rows == []
+
+
 class TestPollUntilTerminal:
     """#2743 fix iteration 1: `coord wait` and `coord portal decompose-chat
     --wait` used to run two independent poll loops that had already drifted
