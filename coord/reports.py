@@ -1762,7 +1762,12 @@ _USAGE_COLUMN_META: dict[str, ColumnMeta] = {
     "repo": ColumnMeta(id="repo", label="Repo", kind="text", weight=1.5),
     "title": ColumnMeta(id="title", label="Title", kind="text", weight=4.0),
     "legs": ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
-    "tokens_in": ColumnMeta(id="tokens_in", label="Tok In", kind="int", align="right"),
+    # #2825: labelled "Raw In", not "Tok In" — sitting next to a full "Tok
+    # Out", "Tok In" reads as its matched pair, and it is not: this is raw
+    # UNCACHED input, ~0.001% of what a `work` leg actually sends (the other
+    # ~98% is `cache_read`, below). The column `id` stays `tokens_in` so no
+    # historical number or saved sort changes.
+    "tokens_in": ColumnMeta(id="tokens_in", label="Raw In", kind="int", align="right"),
     "tokens_out": ColumnMeta(id="tokens_out", label="Tok Out", kind="int", align="right"),
     # #2786: the column that carries the money — see module comment above.
     "cache_read": ColumnMeta(id="cache_read", label="Cache Rd", kind="int", align="right"),
@@ -2658,12 +2663,24 @@ COMPLETED_COLUMNS = [
     "title",
     "started_at",
     "ended_at",
-    # #2472's four. Appended, never interleaved: the client addresses columns
-    # by INDEX for sorting (`reports_sort_by_column`), so inserting one in the
-    # middle would silently re-point a saved sort at a different column.
+    # #2472's four, plus #2825's `cache_read`. #2472's own five (`repo`
+    # through `ended_at` above) keep the indices they had — the client
+    # addresses columns by INDEX for sorting (`reports_sort_by_column`), so
+    # THAT boundary is never interleaved. `cost_total` shifting from index 8
+    # to 9 here is accepted, not an oversight: it mirrors `usage`'s own
+    # precedent (#2786 inserted `cache_read`/`cache_create`/`turns` ahead of
+    # `cost_captured`/`cost_est`/`cost_total` there too), and grouping token
+    # counts together beats preserving one more index.
     "legs",
     "tokens_in",
     "tokens_out",
+    # #2825: `cache_read` was already on the wire as a row key (see
+    # `_completed_spend`) — ~98% of a `work` leg's input, sitting next to a
+    # `tokens_in` that is ~0.001% of it. Without this column, `Tok Out`
+    # (uncapped) next to `tokens_in` (raw uncached input) reads as "output
+    # dwarfs input", which is backwards by five orders of magnitude. Reuses
+    # `_USAGE_COLUMN_META`'s `cache_read` verbatim.
+    "cache_read",
     "cost_total",
 ]
 
@@ -2677,10 +2694,14 @@ COMPLETED_COLUMNS = [
 # also what `issue-activity` already does, and what `RowIdentity` reads.
 #
 # #2472's spend columns reuse `_USAGE_COLUMN_META`'s labels/kinds verbatim
-# (`Legs`, `Tok In`, `Tok Out`, `Total $`) rather than inventing near-synonyms:
-# an operator reading `completed` and `usage` side by side is looking at the
-# same numbers out of the same rollup, and two spellings of "Tok In" would
-# imply otherwise.
+# (`Legs`, `Raw In`, `Tok Out`, `Cache Rd`, `Total $`) rather than inventing
+# near-synonyms: an operator reading `completed` and `usage` side by side is
+# looking at the same numbers out of the same rollup, and two spellings of
+# the same column would imply otherwise.
+#
+# #2825: `tokens_in` is labelled "Raw In", not "Tok In" — see the comment on
+# `_USAGE_COLUMN_META["tokens_in"]` for why. Applied here too so the two
+# reports keep agreeing.
 #
 # ONE cost column, not `usage`'s `cost_captured`/`cost_est` split. `usage`
 # splits because it is the dedicated cost report, where "some legs have no
@@ -2689,7 +2710,9 @@ COMPLETED_COLUMNS = [
 # would push `title` off a narrow pane. Both halves still ship as extra ROW
 # keys (see `_completed_spend`) — the wire contract allows row keys beyond
 # `columns`, so a client that wants the split has it without another column,
-# and `usage` remains the report to visit for it on screen.
+# and `usage` remains the report to visit for it on screen. `cache_read` is
+# the one exception (#2825): it isn't a split of an existing column, it's the
+# ~98% of input spend that `tokens_in` alone cannot represent.
 COMPLETED_COLUMN_META = [
     ColumnMeta(id="repo", label="Repo", kind="text"),
     ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
@@ -2697,8 +2720,9 @@ COMPLETED_COLUMN_META = [
     ColumnMeta(id="started_at", label="Started", kind="timestamp"),
     ColumnMeta(id="ended_at", label="Ended", kind="timestamp"),
     ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
-    ColumnMeta(id="tokens_in", label="Tok In", kind="int", align="right"),
+    ColumnMeta(id="tokens_in", label="Raw In", kind="int", align="right"),
     ColumnMeta(id="tokens_out", label="Tok Out", kind="int", align="right"),
+    ColumnMeta(id="cache_read", label="Cache Rd", kind="int", align="right"),
     ColumnMeta(id="cost_total", label="Total $", kind="money", align="right"),
 ]
 
