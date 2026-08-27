@@ -97,6 +97,17 @@ def test_parity_work_type() -> None:
     _parity(spec)
 
 
+def test_parity_strict_mcp_config_present() -> None:
+    """#2820: both the legacy path and the provider seam must pass
+    `--strict-mcp-config` so a worker never loads the operator's personal
+    user-scope MCP servers."""
+    spec = _make_spec(type="work")
+    legacy = default_worker_command(spec)
+    provider_result = ClaudeProvider().build_command(spec)
+    assert "--strict-mcp-config" in legacy
+    assert "--strict-mcp-config" in provider_result
+
+
 def test_parity_work_with_model() -> None:
     """Work assignment with a model alias."""
     spec = _make_spec(type="work", model="sonnet")

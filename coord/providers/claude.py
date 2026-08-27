@@ -143,9 +143,11 @@ class ClaudeProvider(Provider):
         if system_prompt is None or allowed_tools is None:
             if spec.type == "plan":
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
-                # #2462: keep in sync with default_worker_command's identical
-                # branch — `--bare` below drops CLAUDE.md auto-discovery, so a
-                # plan leg needs the target repo's conventions embedded here.
+                # Keep in sync with default_worker_command's identical
+                # branch — `--setting-sources user` below drops CLAUDE.md
+                # auto-discovery, so a plan leg needs the target repo's
+                # conventions embedded here. See _claude_md_system_prompt_suffix
+                # for what the flag actually does and the measured numbers.
                 _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 _at = "Read,Bash"
             elif spec.type == "refinement":
@@ -177,8 +179,8 @@ class ClaudeProvider(Provider):
             elif spec.type == "mock-author":
                 _sp = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
                 _sp += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
-                # #2462: keep in sync with default_worker_command — `--bare`
-                # drops CLAUDE.md auto-discovery.
+                # Keep in sync with default_worker_command — `--setting-
+                # sources user` drops CLAUDE.md auto-discovery.
                 _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 _at = "Read,Edit,Write,Bash"
             elif spec.type == "smoke":
@@ -204,13 +206,14 @@ class ClaudeProvider(Provider):
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
-                # #2462: keep in sync with default_worker_command's identical
+                # Keep in sync with default_worker_command's identical
                 # catch-all branch — it covers "work", "fix", "conflict-fix"
                 # and "test-author", every one of which edits code and needs
-                # the target repo's CLAUDE.md conventions. Kept as
-                # defense-in-depth alongside CLAUDE.md's own ambient
-                # auto-discovery (unaffected by `--setting-sources user`,
-                # below) even after the `--bare` emergency revert.
+                # the target repo's CLAUDE.md conventions. This is NOT
+                # defense-in-depth: #2820 measured that `--setting-sources
+                # user` (below) *suppresses* CLAUDE.md's own project-level
+                # auto-discovery, so this is the only mechanism that
+                # delivers it. See _claude_md_system_prompt_suffix.
                 _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
@@ -240,7 +243,21 @@ class ClaudeProvider(Provider):
             # auth and this fleet authenticates headless dispatch via OAuth,
             # not ANTHROPIC_API_KEY — broke every dispatch fleet-wide within
             # the hour. See the longer comment in default_worker_command.
+            # #2820 closed the `.mcp.json` half of that leak separately,
+            # below, via `--strict-mcp-config` (no OAuth side-effect). The
+            # hooks half is still open.
             "--setting-sources", "user",
+            # #2820: without this, every `-p` leg also loads the OPERATOR's
+            # personal user-scope MCP servers (Google Drive/Calendar/Gmail —
+            # observed non-deterministically across 120 recent worker
+            # sessions) that no worker can ever use. `--setting-sources
+            # user` above only gates settings.json, not `.mcp.json`/MCP
+            # servers. Measured cost of this flag: 27 tools / 22,483 prompt
+            # tokens vs. 47 tools / 23,096 tokens without it — ~600 tokens,
+            # not the several-thousand a raw tool-count drop suggests (MCP
+            # tool schemas are deferred behind ToolSearch). See the longer
+            # comment in default_worker_command for the full measurement.
+            "--strict-mcp-config",
         ]
         if effective_model:
             argv.extend(["--model", effective_model])
