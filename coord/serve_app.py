@@ -7919,14 +7919,41 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # boundary (docs/EPHEMERAL_WORKERS.md), and it is worth more
                 # than the latency.
                 #
-                # `sync_tick` is documented never to raise; this try/except is
-                # the belt to that braces, on the #1632/#1485 precedent that a
-                # third-party outage must not affect dispatch or any verdict.
-                if (
-                    portal_sync_interval > 0
-                    and getattr(config.portal, "enabled", False)
-                    and _time.monotonic() - last_portal_sync >= portal_sync_interval
-                ):
+                # `sync_tick` is documented never to raise; the try/except
+                # below is the belt to that braces, on the #1632/#1485
+                # precedent that a third-party outage must not affect
+                # dispatch or any verdict.
+                #
+                # #2824: the *guard* itself used to be evaluated bare, outside
+                # any try/except — `getattr(config.portal, "enabled", False)`
+                # silently downgrades any surprise (a `config.portal` that
+                # isn't the `PortalConfig` this was written against, a
+                # property that raises) into "disabled", and a raise from the
+                # `_time.monotonic() - last_portal_sync` arithmetic would have
+                # propagated straight out of this bare `asyncio.create_task`
+                # with no supervisor to restart it — either way, Step 3d stops
+                # forever with nothing in the journal to say so, which is
+                # exactly the "false guard is indistinguishable from a quiet
+                # successful pass" failure mode the heartbeat exists to catch.
+                # Read `config.portal.enabled` directly (it is always a
+                # `PortalConfig`, never absent — the dataclass default is
+                # `PortalConfig()`, not `None`) and evaluate the whole guard
+                # under the same try/except as the sync itself, so ANY
+                # exception here is loud (`log.warning`, "portal sync" in the
+                # message so it matches the same grep an operator already
+                # runs against the journal) instead of a silent, permanent
+                # skip.
+                try:
+                    portal_due = (
+                        portal_sync_interval > 0
+                        and config.portal.enabled
+                        and _time.monotonic() - last_portal_sync
+                        >= portal_sync_interval
+                    )
+                except Exception:  # noqa: BLE001
+                    portal_due = False
+                    log.warning("portal sync guard failed", exc_info=True)
+                if portal_due:
                     last_portal_sync = _time.monotonic()
                     try:
                         portal_result = await run_in_threadpool(

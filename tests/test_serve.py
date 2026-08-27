@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from starlette.testclient import TestClient
 
 from coord import client as coord_client
 from coord import merge_queue as mq
+from coord import serve_app as serve_app_module
 from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
@@ -7001,6 +7003,163 @@ def test_wal_checkpoint_tick_honours_zero_interval(
     result = _wal_checkpoint_tick(cfg)
     assert result.get("skipped") is not True
     assert result.get("error") is not True
+
+
+# ── #2824: Step 3d (portal sync) must actually be ENTERED, not just "the
+# heartbeat looks fine" ────────────────────────────────────────────────────
+#
+# #2824's bug report: on a live daemon with portal.enabled=true and the
+# default 60s interval, Step 3d never ran — no heartbeat advance, no pull, and
+# NOTHING in the journal (not even a failure) since a false guard is
+# indistinguishable from a quiet successful pass. A test that only asserts
+# "the heartbeat advanced" against a stubbed clock would not have caught that
+# class of bug (a `_portal_sync_tick` stub can make the heartbeat "advance"
+# trivially without the guard ever running). These tests instead assert Step
+# 3d's own body — `_portal_sync_tick` — is actually CALLED, including in the
+# specific case #2824 flags as the likely trigger and that nothing else
+# covered: after `_refresh_config()` has reloaded the config at least once.
+
+def _enable_portal(path: Path) -> None:
+    """Append a fully-configured, enabled ``portal:`` block onto *path*."""
+    path.write_text(
+        path.read_text()
+        + "\nportal:\n"
+        "  enabled: true\n"
+        '  base_url: "https://intake.example.com"\n'
+        '  bridge_client_id: "cid"\n'
+        '  bridge_client_secret: "secret"\n'
+    )
+
+
+def _run_tick_loop_briefly(app, *, settle: float = 0.3) -> None:
+    """Start *app*'s lifespan (spawning ``_tick_loop`` for real) and let it
+    run a few iterations against a real asyncio event loop, then tear down.
+
+    Every interval this test doesn't care about is silenced via env vars set
+    by the caller before this runs — this only sleeps long enough for the
+    ~0.05s reconcile/portal intervals under test to fire several times.
+    """
+    with TestClient(app):
+        time.sleep(settle)
+
+
+def _quiet_all_other_tick_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero out every ``_tick_loop`` cadence Step 3d isn't testing.
+
+    Keeps the real ``_lifespan``/``_tick_loop`` machinery honest (this is not
+    a stub of the loop, just the *other* steps in it) while keeping the test
+    fast and free of unrelated side effects (gh calls, notifier fan-out, …).
+    """
+    for env_var in (
+        "COORD_NOTIFY_DRAIN_INTERVAL",
+        "COORD_HOUSEKEEPING_INTERVAL",
+        "COORD_RECONCILE_MERGES_INTERVAL",
+        "COORD_WORKTREE_CLEAN_INTERVAL",
+        "COORD_WAL_CHECKPOINT_INTERVAL",
+        "COORD_GATE_REFRESH_INTERVAL",
+        "COORD_HEALTH_POLL_INTERVAL",
+        "COORD_PHANTOM_HEAL_INTERVAL",
+        "COORD_NOTIFIER_INTERVAL",
+    ):
+        monkeypatch.setenv(env_var, "0")
+
+
+def _stub_portal_sync_tick(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Replace ``_portal_sync_tick`` with a spy and return its call log.
+
+    Stubbing the module-level function (not ``coord.portal_sync.sync_tick``)
+    keeps this test scoped to Step 3d's own guard/dispatch in
+    ``_tick_loop`` — whether the guard reaches into ``_portal_sync_tick`` at
+    all — rather than the sync bridge's internals, which #2824 explicitly
+    rules out as the culprit ("`coord/portal_sync.py` is NOT implicated").
+    """
+    calls: list = []
+
+    def _stub(config):  # noqa: ANN001
+        calls.append(config)
+
+        class _Result:
+            moved = False
+            errors: list = []
+            heartbeat_ok = True
+
+            def summary(self) -> str:
+                return "stub summary"
+
+        return _Result()
+
+    monkeypatch.setattr(serve_app_module, "_portal_sync_tick", _stub)
+    return calls
+
+
+def test_portal_sync_step_3d_is_entered_when_enabled_and_due(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Baseline: portal.enabled=true + interval elapsed → Step 3d actually runs.
+
+    Asserts entry into ``_portal_sync_tick`` itself (not just that some
+    "heartbeat" value moved), because a false guard and a quiet successful
+    pass look identical from the outside otherwise (#2824's whole point).
+    """
+    _enable_portal(valid_config_path)
+    cfg = load_config(valid_config_path)
+    assert cfg.portal.enabled is True
+
+    calls = _stub_portal_sync_tick(monkeypatch)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    _run_tick_loop_briefly(app)
+
+    assert calls, "Step 3d (_portal_sync_tick) was never entered"
+
+
+def test_portal_sync_step_3d_is_entered_after_refresh_config_enables_it(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2824's suspected trigger: Step 3d must fire once ``_refresh_config()``
+    has picked up an on-disk edit that flips ``portal.enabled`` on — not just
+    when the startup config already had it enabled.
+
+    Before this issue, no test covered ``_tick_loop`` reading `config.portal`
+    through an ACTUAL ``_refresh_config()`` reload (every existing config-
+    reload test exercised `_refresh_config`/`_reload_config_if_stale`
+    directly, never through a live `_tick_loop`), so a regression where the
+    guard's `config.portal` read stops tracking the refreshed object would
+    have shipped silently.
+    """
+    cfg = load_config(valid_config_path)
+    assert cfg.portal.enabled is False  # no portal: block yet
+
+    calls = _stub_portal_sync_tick(monkeypatch)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app):
+        time.sleep(0.3)
+        assert not calls, (
+            "Step 3d ran before portal.enabled was even turned on — "
+            "the rest of this test's assertion would be meaningless"
+        )
+
+        # The #2824 trigger: enable the portal via an on-disk edit, exactly
+        # like an operator turning the feature on against a running daemon —
+        # _refresh_config() must pick this up on the daemon's own tick cadence.
+        _enable_portal(valid_config_path)
+        _bump_mtime(valid_config_path)
+
+        time.sleep(0.6)
+
+    assert calls, (
+        "Step 3d (_portal_sync_tick) never fired after _refresh_config() "
+        "reloaded a config with portal.enabled newly true — a stale `config` "
+        "read (or a guard exception swallowed into 'disabled') would look "
+        "exactly like this"
+    )
 
 
 # ── #2246: auto-drain sweeps siblings the drain itself just broke ────────────
