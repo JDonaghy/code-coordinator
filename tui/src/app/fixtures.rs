@@ -141,7 +141,19 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         chat_transcript_cache_key: None,
         chat_last_activity: None,
         chat_spinner_throttle: 0,
-        paused_machines: read_paused_machines(),
+        // #2028: never call the real `read_paused_machines()` from a test
+        // fixture — it reads the LOCAL `~/.coord/paused_machines.json`
+        // unconditionally (mirrors `workspace` above: no real I/O). Before
+        // this, any host whose real pause file was non-empty (e.g. two
+        // long-destroyed ephemeral workers left paused on dellserver since
+        // 2026-08-04) failed `poll_paused_machines_replaces_snapshot_when_ready`
+        // and `..._reverts_an_operator_pause_..` (`app/tests.rs`) purely from
+        // ambient machine state — both tests assert `paused_machines.is_empty()`
+        // immediately after construction. Empty here matches what every
+        // caller of this fixture already expects; a test that wants a
+        // pre-populated set assigns `app.paused_machines` directly (see the
+        // tests further down this file).
+        paused_machines: std::collections::HashSet::new(),
         quiet_paused_machines: std::collections::HashSet::new(),
         cordoned_machines: std::collections::HashSet::new(),
         quiet_hours_windows: std::collections::HashMap::new(),

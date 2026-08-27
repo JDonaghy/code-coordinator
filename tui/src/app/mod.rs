@@ -9756,12 +9756,15 @@ fn today_yyyy_mm_dd() -> String {
 ///
 /// #1563: on a thin client (board service configured) this file is no
 /// longer authoritative — `coord pause` on such a client now writes
-/// straight to the daemon instead. `CoordApp::new`/`make_test_app` still
-/// call this directly for the *initial* synchronous `paused_machines`
-/// snapshot (mirroring `live_tmux_sessions`/`fleet_terminals`/
-/// `drive_sessions` further up this file, each seeded from a cheap local
-/// read before their background remote sweep is armed), but every
-/// *periodic* refresh after that goes through
+/// straight to the daemon instead. `CoordApp::new` still calls this
+/// directly for the *initial* synchronous `paused_machines` snapshot
+/// (mirroring `live_tmux_sessions`/`fleet_terminals`/`drive_sessions`
+/// further up this file, each seeded from a cheap local read before their
+/// background remote sweep is armed). `app::fixtures::make_test_app`
+/// deliberately does NOT call this (#2028) — a test fixture must never
+/// read ambient machine state, so it seeds `paused_machines` empty instead
+/// and lets individual tests assign it directly. Every *periodic* refresh
+/// after startup goes through
 /// [`data::fetch_paused_machines`] / [`data::spawn_paused_machines_fetch`]
 /// instead, which route to the daemon's `GET /pause` when a board service
 /// is configured and fall back to this function otherwise — so a
