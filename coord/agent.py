@@ -4918,7 +4918,11 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # (coord.providers.claude_pty.ClaudePtyProvider) intentionally keeps
         # the default sources so an operator's own `coord init`-configured
         # convenience allow-list still applies to a session they're
-        # attached to and watching.
+        # attached to and watching. #2821: that tradeoff also means the PTY
+        # path pays for CLAUDE.md via ambient auto-discovery (~7.7k tok)
+        # instead of the explicit `_claude_md_system_prompt_suffix` embed
+        # below (~5.2k tok) — a deliberately accepted, documented cost; see
+        # the argv comment in ClaudePtyProvider.build_command.
         #
         # #2462 tried `--bare` here (closes settings + hooks + .mcp.json +
         # CLAUDE.md auto-discovery at once, vs. this flag's settings.json-only

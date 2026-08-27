@@ -582,6 +582,37 @@ class ClaudePtyProvider(Provider):
         # --allowedTools / --permission-mode are still passed as a safety
         # hedge even though enforcement is unverified in the PTY path
         # (capabilities().enforces_deny_list == False).
+        #
+        # #2821: also deliberately NO `--setting-sources user` here, and no
+        # `_claude_md_system_prompt_suffix` embed — both of which
+        # `default_worker_command` (coord/agent.py) DOES use for the `-p`
+        # path. That's not an oversight; it was checked and rejected:
+        #
+        # 1. `--setting-sources user` would exclude the LOCAL settings
+        #    scope, which is exactly where `coord init` (coord/commands/
+        #    setup.py) writes the operator's own `.claude/settings.local.json`
+        #    convenience allow-list (`Bash(coord *)` etc) for the repo
+        #    they're interactively attached to. Restricting sources here
+        #    would silently drop that allow-list for a session the operator
+        #    is watching and expects to behave like their normal `claude`
+        #    session — see coord/agent.py:~4919's identical tradeoff
+        #    written up for the `-p` path (which deliberately keeps the
+        #    default sources reasoning in reverse: it EXCLUDES project/local
+        #    because a worker must NOT inherit host-local settings).
+        # 2. `--bare` would close the CLAUDE.md-ambient-discovery gap
+        #    without touching settings sources, but it also unconditionally
+        #    disables OAuth/keychain reads — this fleet authenticates via
+        #    `claude login`/OAuth, not `ANTHROPIC_API_KEY` (see #2462's
+        #    emergency revert in coord/agent.py for the fleet-wide outage
+        #    that caused). Not usable here either.
+        #
+        # Net effect, measured (#2821): this path pays ~7.7k ambient-
+        # discovery tokens for CLAUDE.md vs. ~5.2k for the `-p` path's
+        # explicit embed — a known, accepted cost of preserving the
+        # operator's own interactive settings on a human-attended session,
+        # not an accident. Revisit if Claude Code ever exposes a way to
+        # suppress CLAUDE.md auto-discovery independent of settings-sources
+        # and `--bare`'s OAuth side effect.
         argv: list[str] = [
             binary,
             "--system-prompt", system_prompt,
