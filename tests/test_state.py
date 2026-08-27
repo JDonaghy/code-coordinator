@@ -3374,6 +3374,51 @@ class TestDriveQueueLocalWritesRetryLockContention:
         # the enqueue test above for why this isn't an exact count.
         assert proxy.calls > 2
 
+    def test_enqueue_with_position_survives_move_retry_exhaustion(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """#2846 follow-up: `_enqueue_drive_queue_local(..., position=N)`
+        commits the row write (its own `retry_on_locked`-guarded
+        transaction) and only then calls `_move_drive_queue_entry_local` in
+        a *separate* transaction. If that second call's own retry budget is
+        exhausted by sustained contention, the enqueue must still report
+        success -- the row already landed durably, so a 503 here would be
+        the exact "already happened, told you it didn't" shape #2846 closed
+        for the cache-mirror sites. The position not landing self-heals on
+        the next explicit move/renumber."""
+        from coord import state
+        from coord.state import _enqueue_drive_queue_local, _get_drive_queue_entry_local
+
+        def _always_locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(state, "_move_drive_queue_entry_local", _always_locked)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            entry_id = _enqueue_drive_queue_local("api", 9, position=1)
+
+        assert isinstance(entry_id, int)  # must not raise
+        # The enqueue itself is durable even though the position move failed.
+        assert _get_drive_queue_entry_local("api", 9) is not None
+        assert any("2846" in rec.message for rec in caplog.records)
+
+    def test_enqueue_with_position_propagates_non_lock_move_errors(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A genuine (non-contention) error out of the move step is a real
+        bug, not transient contention -- it must still surface, not be
+        swallowed alongside the lock-contention case."""
+        from coord import state
+        from coord.state import _enqueue_drive_queue_local
+
+        def _boom(*args, **kwargs):
+            raise sqlite3.OperationalError("no such table: drive_queue")
+
+        monkeypatch.setattr(state, "_move_drive_queue_entry_local", _boom)
+
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            _enqueue_drive_queue_local("api", 9, position=1)
+
 
 class TestMilestoneLocalLockContention:
     """Same shape, for `_assign_issue_milestone_local` /
