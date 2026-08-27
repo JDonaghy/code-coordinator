@@ -2881,6 +2881,137 @@ def test_a_blocked_entry_with_the_2273_dispatch_failure_text_still_resumes_on_a_
     assert plan.launch is not None and plan.launch.issue == 2569
 
 
+# ── #2806: "could not read" vs "confirmed still shut" ──────────────────────
+#
+# vimcode#555 sat `blocked` across four ticks with its merge gate fully clear
+# because `_fetch_live_blocked_gate`'s probe came back with no key for it —
+# silently, and indistinguishably from a gate the sweep had genuinely
+# re-confirmed still shut (both used to collapse into `_reconcile_blocked`
+# returning `None`, no report, no write). `live_blocked_unreadable` is the
+# shell's way of saying WHICH of the two happened; these pin the split.
+
+
+def test_a_blocked_entry_the_probe_could_not_read_reports_distinctly():
+    """A present `live_blocked_unreadable` note — the shell's live probe was
+    attempted against this exact entry and still came back with no gate
+    reading — must produce its OWN outcome, distinct from both `resumed` and
+    silence, and must not touch `state`/`attempts` (no evidence means no
+    relaunch, only a distinct report)."""
+    entries = [_blocked_entry(555, position=1)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={
+            entry_key(REPO, 555): "no merge-queue row for this entry, even "
+            "after the self-heal enqueue attempt"
+        },
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "gate_unreadable"
+    assert "state" not in reconcile.updates
+    assert "could not be read" in reconcile.reason
+    assert "no merge-queue row" in reconcile.reason
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_with_no_unreadable_note_stays_exactly_silent():
+    """The pre-#2806 shape: no `live_blocked_gate` key AND no
+    `live_blocked_unreadable` note (the probe was never even attempted —
+    e.g. the whole fetch failed closed before reaching any entry) must
+    still render as it always has — nothing to report, nothing to write."""
+    entries = [_blocked_entry(555, position=1)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={}, live_blocked_unreadable={}
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_an_unreadable_note_never_overrides_a_confirmed_still_shut_reading():
+    """A `live_blocked_gate[key] is True` reading — CONFIRMED still shut —
+    must win even if `live_blocked_unreadable` also carries a (stale/
+    unrelated) note for the same key: confirmed evidence outranks "could not
+    read", which only ever applies when there is no reading at all."""
+    entries = [_blocked_entry(555, position=1)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 555): True},
+        live_blocked_unreadable={entry_key(REPO, 555): "stale note"},
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_pre_dispatch_reason_text_does_not_suppress_a_real_unreadable_note():
+    """#2635's own lesson, applied to #2806: `is_pre_dispatch_block_reason`'s
+    text match is per-RUN, not per-ENTRY, and can be wrong — a retry's own
+    launch can carry the #2273 marker purely because an earlier attempt's
+    work was still in flight, even though a real branch/PR exists. So the
+    PURE reconcile layer must not re-derive that suppression from the text
+    itself: it trusts whatever `live_blocked_unreadable` the shell handed
+    it. The shell (`coord.commands.drive_queue._fetch_live_blocked_gate`)
+    is where the #2589 pre-dispatch suppression actually lives now — it
+    only omits a key when it ALSO found no merge-queue row at all, never
+    on the text alone once real evidence (any queue row, even without a PR
+    yet) exists. A present key here therefore always means something worth
+    reporting."""
+    entries = [
+        _blocked_entry(
+            2569,
+            position=1,
+            last_reason=(
+                "drive exited for claude-coordinator#2569 (exit_code=3): "
+                "deadline of 240m exceeded (2/2 attempts) — giving up — no "
+                "assignment was ever created for this run (#2273): likely "
+                "an infrastructure/dispatch-layer failure, not a code defect"
+            ),
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={
+            entry_key(REPO, 2569): "merge-queue row has no PR number yet"
+        },
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "gate_unreadable"
+    assert plan.launch is None
+
+
+def test_a_permanently_refused_entry_never_reports_unreadable():
+    """#1844: a permanent guard refusal is excluded before `_blocked_gate_
+    reading` is even consulted — an unreadable note for it (which the shell
+    should never produce in the first place, since `_fetch_live_blocked_
+    gate` also excludes these) must still not surface a report."""
+    entries = [
+        _blocked_entry(
+            70,
+            position=1,
+            last_reason=(
+                "dispatch failed: ... (exit_code=5) — refused by a "
+                "pre-dispatch guard, which cannot change on retry (#1844); "
+                "blocking without spending an attempt"
+            ),
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 70): "entry_gate_status raised"},
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
 def test_a_permanently_refused_blocked_entry_is_never_resumed():
     """#1844: even a live gate reading of 'clear now' must not resume a
     permanent refusal — relaunching a deterministic guard refusal changes

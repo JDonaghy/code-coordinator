@@ -2764,6 +2764,183 @@ def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+# ── #2806: "could not read this gate" vs "read it, still shut" ──────────────
+#
+# vimcode#555 sat `blocked` across four ticks with its merge gate fully
+# clear because `_fetch_live_blocked_gate`'s probe came back with no
+# evidence for it — silently, and rendered identically to a gate the sweep
+# had genuinely re-confirmed still shut (both collapsed into the same
+# untouched row, no report, no write). This is the shell-level pin: once a
+# `blocked` entry has a real merge-queue row + PR (so #2230's sweep targets
+# it, unlike the #2589 pre-dispatch shape which never gets a PR at all), a
+# probe that raises must produce a DISTINCT, escalated report instead of
+# silence — and must still not resume the entry, since a failed probe is no
+# more evidence of "clear" than it is of "shut".
+
+
+def test_a_blocked_entrys_gate_probe_that_raises_reports_unreadable_not_still_shut(
+    cli, seed, launches, coord_db, monkeypatch,
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, backs off, relaunches
+    assert queued(1762)["state"] == "running"
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
+    assert result.exit_code == 0, result.output
+    assert queued(1762)["state"] == "blocked"
+
+    # A real merge-queue row with a PR — exactly the shape #2230's sweep
+    # targets (unlike #2589's pre-dispatch shape, which never gets one).
+    # Deliberately no `error` text (unlike `_seed_ci_pending_merge_row`): a
+    # CI-pending-shaped `error` would give the CHEAP board-only fallback
+    # (`facts.merge_ci_pending`) its own "confirmed still shut" reading,
+    # which correctly outranks "unreadable" — this test wants the live
+    # probe's raise to be the ONLY signal available.
+    coord_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, pr_number, enqueued_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (
+            "w1762", REPO, "john/claude-coordinator", "work-1762", "main",
+            1762, "issue 1762", 42, time.time(),
+        ),
+    )
+    coord_db.commit()
+
+    import coord.merge_queue as mq
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("gh api rate limited")
+
+    monkeypatch.setattr(mq, "entry_gate_status", _raise)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    entry = queued(1762)
+    # No evidence either way -> no guess, no resume, no relaunch.
+    assert entry["state"] == "blocked"
+    reason = entry["last_reason"] or ""
+    assert "could not be read" in reason
+    assert "entry_gate_status raised" in reason
+    assert "#2806" in reason
+    # Must not read like a confirmed-still-shut gate (`_reconcile_blocked`'s
+    # other wording) — the whole point is the two must not look alike.
+    assert "reads clear" not in reason
+
+    escalation = state._get_drive_escalation_local(REPO, 1762)
+    assert escalation is not None
+    assert "could not be read" in escalation["reason"]
+
+
+def _fake_cfg():
+    import types
+
+    return types.SimpleNamespace(
+        ci_store=types.SimpleNamespace(type="github", host=None, token_env=None)
+    )
+
+
+def test_fetch_live_blocked_gate_self_heals_a_target_with_no_queue_row_yet(
+    monkeypatch, coord_db,
+):
+    """#2806's actual root-cause fix: a `blocked` target with no
+    `coord.merge_queue` row yet — the vimcode#555 race, where the board
+    turned gate-clear before `enqueue_approved_work`'s own independent
+    schedule (the daemon's passive tick) had a chance to run — gets ONE
+    bounded self-heal `enqueue_approved_work` call THIS tick, mirroring
+    `coord merge --only`'s own #1845 fix for the identical race, before the
+    shell concedes there is nothing to read."""
+    import types
+
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_blocked_gate
+    from coord.drive_queue import STATE_BLOCKED, QueueEntry, entry_key
+
+    entry = QueueEntry(
+        repo=REPO, issue=555, position=1, state=STATE_BLOCKED,
+        last_reason="drive session died without landing the work, launched "
+        "90s ago (attempt 2/2) — giving up",
+    )
+
+    calls = {"enqueue": 0}
+    rows: list = []
+
+    def fake_load_queue():
+        return list(rows)
+
+    def fake_enqueue_approved_work(cfg, board):
+        calls["enqueue"] += 1
+        rows.append(
+            types.SimpleNamespace(repo_name=REPO, issue_number=555, pr_number=99)
+        )
+        return ["w555"]
+
+    def fake_entry_gate_status(q, board, cfg, ci_store, gh_ops):
+        return mq.PLAN_READY, None
+
+    monkeypatch.setattr(mq, "load_queue", fake_load_queue)
+    monkeypatch.setattr(mq, "enqueue_approved_work", fake_enqueue_approved_work)
+    monkeypatch.setattr(mq, "entry_gate_status", fake_entry_gate_status)
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, unreadable = _fetch_live_blocked_gate([entry], None)
+
+    assert calls["enqueue"] == 1
+    assert overrides == {entry_key(REPO, 555): False}  # PLAN_READY -> resumable
+    assert unreadable == {}
+
+
+def test_fetch_live_blocked_gate_suppresses_the_no_row_note_for_a_pre_dispatch_reason(
+    monkeypatch, coord_db,
+):
+    """#2589/#2635: when the self-heal above STILL finds no queue row — the
+    honest, expected, permanent answer for a genuine pre-dispatch failure
+    (no branch/PR was ever created) — the shell must not surface an
+    "unreadable" note for it: that entry has its own, more specific
+    terminal note already (`coord drive-queue list`'s #2589 rendering), and
+    "could not be read" would misleadingly imply a retry might help."""
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_blocked_gate
+    from coord.drive_queue import STATE_BLOCKED, QueueEntry
+
+    entry = QueueEntry(
+        repo=REPO, issue=2569, position=1, state=STATE_BLOCKED,
+        last_reason=(
+            "drive exited for claude-coordinator#2569 (exit_code=3): "
+            "deadline of 240m exceeded (2/2 attempts) — giving up — no "
+            "assignment was ever created for this run (#2273): likely an "
+            "infrastructure/dispatch-layer failure, not a code defect"
+        ),
+    )
+
+    monkeypatch.setattr(mq, "load_queue", lambda: [])
+    monkeypatch.setattr(mq, "enqueue_approved_work", lambda cfg, board: [])
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, unreadable = _fetch_live_blocked_gate([entry], None)
+
+    assert overrides == {}
+    assert unreadable == {}  # suppressed — not "unreadable", not "still shut"
+
+
 # ── tick: the cross-host guard (#1870) ───────────────────────────────────────
 #
 # 2026-08-06: a drive launched by hand on `elitebook` was 47 minutes into a
