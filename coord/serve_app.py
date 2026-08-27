@@ -1487,6 +1487,23 @@ def _auto_revalidate_tick(config: Config) -> "list":
     the liveness bug this function fixes for a soundness bug (merging a tree
     the suite never actually validated).
 
+    CALLER, AND WHY IT IS NOT A ``_tick_loop`` STEP (#2829 review round 1):
+    freeing ``_merge_lock`` above stops this composite from wedging an
+    *externally-driven* merge (a manual ``coord merge``, another request
+    handler) — but the composite still runs synchronously wherever it is
+    called from, for up to ``DEFAULT_TIMEOUT_SECONDS × (1 +
+    auto_revalidate_max_batch)`` (~2h worst case). Folding that call into
+    ``_tick_loop`` (the daemon's single sequential periodic coroutine, one
+    ``await asyncio.sleep(interval)`` per iteration) would delay every OTHER
+    step in that same loop body — including ``_auto_drain_tick``, i.e. every
+    OTHER repo's auto-drain — for as long as this one repo's composite ran,
+    indefinitely if it never went green. So this function is called from its
+    own ``asyncio.create_task``'d loop, ``_auto_revalidate_loop``, isolated
+    from ``_tick_loop`` exactly like ``_gate_refresh_loop`` /
+    ``_health_refresh_loop`` / ``_phantom_heal_loop`` are, and for the
+    identical reason. "Per tick" in the ceilings below means per iteration of
+    that loop, not of ``_tick_loop``.
+
     TWO CEILINGS, PER THE TRUST BAR:
 
     * **At most one composite per tick, never a burst** — enforced in code
@@ -1579,6 +1596,19 @@ def _auto_revalidate_tick(config: Config) -> "list":
 
     validated = rv.recorded_validated_base_shas(batch, group)
 
+    # Built OUTSIDE the lock, matching `_auto_drain_tick`'s own ordering
+    # (#2829 review round 1 nit) — a gh/network call has no business
+    # extending however briefly `_merge_lock` is held below. Fail-open (a
+    # transient gh error must not disable revalidation) just like
+    # `_auto_drain_tick`'s identical construction.
+    try:
+        ci_store = build_ci_store(
+            config.ci_store.type, host=config.ci_store.host,
+            token_env=config.ci_store.token_env,
+        )
+    except Exception:  # noqa: BLE001
+        ci_store = None
+
     # ── lock taken ONLY for the base-SHA recheck + the merge itself ─────────
     with _merge_lock:
         safe_ids = [
@@ -1603,13 +1633,6 @@ def _auto_revalidate_tick(config: Config) -> "list":
         # assignments table (not the merge-queue table), so a fresh board +
         # plan() is what actually sees them as no-longer-stale.
         fresh_board = build_board()
-        try:
-            ci_store = build_ci_store(
-                config.ci_store.type, host=config.ci_store.host,
-                token_env=config.ci_store.token_env,
-            )
-        except Exception:  # noqa: BLE001
-            ci_store = None
         merge_plan = mq.plan(fresh_board, config, ci_store=ci_store, gh_ops=github_ops)
         ready_aids = {
             pm.assignment_id for pm in merge_plan
@@ -7873,6 +7896,58 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except Exception:  # noqa: BLE001 — a tick must never crash the daemon
                     log.warning("phantom-row heal tick failed", exc_info=True)
 
+        # #2829 (review round 1): `_auto_revalidate_tick` runs a composite
+        # suite that can take up to `DEFAULT_TIMEOUT_SECONDS *
+        # (1 + merge.auto_revalidate_max_batch)` — up to ~2h in the worst
+        # case (a permanently-red composite, e.g. a `tui/**` repo before
+        # #2028 lands, on every attempt). It used to run inline inside
+        # `_tick_loop` ("Step 2b"), which correctly released `_merge_lock`
+        # for the run but was still just one more step in that coroutine's
+        # single sequential `while True` — so a slow/stuck composite for one
+        # repo delayed Step 3 auto-drain (every OTHER repo's drain) and every
+        # later housekeeping step, for the whole daemon, indefinitely if the
+        # composite never went green. Own loop/task instead, exactly like
+        # `_gate_refresh_loop` / `_health_refresh_loop` / `_phantom_heal_loop`
+        # above — each isolated from `_tick_loop` for the identical reason:
+        # a slow or fan-out-heavy periodic step must never hold up, or be
+        # held up by, the reconcile/enqueue/drain steps.
+        #
+        # Own cadence via COORD_AUTO_REVALIDATE_INTERVAL (default 30s,
+        # matching the historical Step 2b cadence) rather than reusing
+        # `interval` directly, so it can be tuned independently. The
+        # `merge.auto_revalidate` flag is checked INSIDE the loop (not at
+        # task-creation time) so a hand-edited coordinator.yml — picked up by
+        # `_tick_loop`'s own `_refresh_config()`, which mutates the same
+        # closed-over `config` this loop reads — takes effect on this loop's
+        # very next iteration without a daemon restart, same as every other
+        # `config.merge.*` / `config.milestone.*` gate in this file.
+        try:
+            auto_revalidate_interval = float(
+                os.environ.get("COORD_AUTO_REVALIDATE_INTERVAL", "30")
+            )
+        except ValueError:
+            auto_revalidate_interval = 30.0
+
+        async def _auto_revalidate_loop() -> None:
+            while True:
+                await asyncio.sleep(auto_revalidate_interval)
+                if not config.merge.auto_revalidate:
+                    continue
+                try:
+                    revalidate_events = await run_in_threadpool(
+                        _auto_revalidate_tick, config
+                    )
+                    for ev in revalidate_events:
+                        log.info(
+                            "auto-revalidate: %s %s #%d — %s",
+                            ev.kind,
+                            ev.entry.repo_name,
+                            ev.entry.issue_number,
+                            ev.message,
+                        )
+                except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                    log.warning("auto-revalidate tick failed", exc_info=True)
+
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             nonlocal last_notify_drain, last_notifier, last_portal_sync
@@ -8039,35 +8114,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         _audit_enqueued(enqueued)
                 except Exception:  # noqa: BLE001
                     log.warning("passive enqueue tick failed", exc_info=True)
-                # Step 2b: #2829 auto-revalidate stale-but-passed merge-queue
-                # entries. Runs AFTER enqueue (a freshly-enqueued entry is
-                # never itself revalidation-eligible on the same tick it was
-                # enqueued, but this ordering matches auto-drain's below) and
-                # BEFORE auto-drain, so an entry this step just cleared can
-                # merge as part of the SAME tick's drain when both flags are
-                # on, instead of waiting a full tick. Default-off
-                # (merge.auto_revalidate: false) — no behaviour change for
-                # users who haven't opted in. Independent try/except so a
-                # revalidation failure never silences the other tick steps;
-                # see `_auto_revalidate_tick`'s own docstring for why this is
-                # safe to run unattended (no worker dispatch, no tokens) and
-                # for the lock-hold restructure that makes it safe to run on
-                # a schedule at all.
-                if config.merge.auto_revalidate:
-                    try:
-                        revalidate_events = await run_in_threadpool(
-                            _auto_revalidate_tick, config
-                        )
-                        for ev in revalidate_events:
-                            log.info(
-                                "auto-revalidate: %s %s #%d — %s",
-                                ev.kind,
-                                ev.entry.repo_name,
-                                ev.entry.issue_number,
-                                ev.message,
-                            )
-                    except Exception:  # noqa: BLE001
-                        log.warning("auto-revalidate tick failed", exc_info=True)
+                # NOTE: #2829 auto-revalidate (`merge.auto_revalidate`) is
+                # NOT a step here. It used to be ("Step 2b", between enqueue
+                # and auto-drain below) but that wedged every OTHER repo's
+                # auto-drain — and every later step in this same loop body —
+                # behind one repo's composite for as long as it ran (up to
+                # ~2h worst case: DEFAULT_TIMEOUT_SECONDS × (1 +
+                # auto_revalidate_max_batch)), because this is a single
+                # sequential `while True` coroutine with steps run in series
+                # (review round 1, #2829). Freeing `_merge_lock` inside
+                # `_auto_revalidate_tick` fixed the lock-contention wedge but
+                # not this one — the composite still ran inline, in series,
+                # on the daemon's one and only tick coroutine. It now runs on
+                # its own `asyncio.create_task`'d loop, `_auto_revalidate_loop`
+                # below (mirroring `_gate_refresh_loop` /
+                # `_health_refresh_loop` / `_phantom_heal_loop`'s isolation
+                # for exactly the same reason), so a slow or permanently-red
+                # composite for one repo can never delay Step 3 auto-drain —
+                # or any other periodic housekeeping below — for any other
+                # repo.
                 # Step 3: #781 auto-drain READY merge-queue entries.
                 # Runs AFTER enqueue so freshly-approved work can be picked up
                 # in the same tick.  Default-off (merge.auto_drain: false) —
@@ -8427,10 +8492,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 if interval > 0 and phantom_heal_interval > 0
                 else None
             )
+            auto_revalidate_task = (
+                asyncio.create_task(_auto_revalidate_loop())
+                if interval > 0 and auto_revalidate_interval > 0
+                else None
+            )
             try:
                 yield
             finally:
-                for t in (task, gate_task, health_task, phantom_heal_task):
+                for t in (
+                    task, gate_task, health_task, phantom_heal_task,
+                    auto_revalidate_task,
+                ):
                     if t is not None:
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):

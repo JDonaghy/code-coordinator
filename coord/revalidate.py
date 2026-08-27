@@ -106,6 +106,19 @@ merge in the fleet for as long as a sleeping operator doesn't notice.
 :func:`revalidated_base_still_current` confirms the base the composite
 validated is still current. See that function's docstring for why the
 recheck is the correctness crux, not an optional extra.
+
+Acknowledged, not fixed (#2829 review round 1, non-blocking): with no lock
+held at all, this function's own ``git fetch``/``git worktree add`` against
+the shared, non-throwaway ``repo_dir`` (below) can now run at the same moment
+an attended ``coord merge --revalidate`` (still under ``_merge_lock`` for its
+whole duration) does the same thing against that identical checkout — an
+overlap that could never happen before this module had two independent
+unlocked callers. Git's own locking (``index.lock``, ref locks) generally
+turns a clash into a clean failure rather than corruption, and this class of
+unguarded concurrent local-checkout access already exists elsewhere in this
+codebase (``coord test`` via ``confirm_test.py``), so it is left unguarded
+here too — a repo-scoped mutex around the checkout is the fix if it ever
+bites in practice.
 """
 
 from __future__ import annotations

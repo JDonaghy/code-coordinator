@@ -6258,6 +6258,97 @@ def test_auto_revalidate_composite_runs_with_merge_lock_released(
     assert result["events"] == []
 
 
+def _enable_merge_auto(path: Path) -> None:
+    """Append a ``merge:`` block turning both ``auto_revalidate`` and
+    ``auto_drain`` on. ``VALID_CONFIG`` (the base fixture content) has no
+    ``merge:`` key, so appending is safe -- same trick as ``_enable_portal``
+    (defined further below in this file).
+    """
+    path.write_text(
+        path.read_text()
+        + "\nmerge:\n"
+        "  auto_revalidate: true\n"
+        "  auto_drain: true\n"
+    )
+
+
+def test_auto_revalidate_does_not_block_other_tick_loop_steps(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2829 review round 1 (blocking finding): a slow/stuck
+    ``_auto_revalidate_tick`` composite must not delay Step 3 auto-drain (or
+    any other periodic step) for every OTHER repo. Before this fix,
+    ``_auto_revalidate_tick`` ran INLINE inside ``_tick_loop`` -- correctly
+    with ``_merge_lock`` released, but still as one more `await
+    run_in_threadpool(...)` in that coroutine's single sequential `while
+    True` body, ahead of Step 3. A slow composite therefore delayed
+    ``_auto_drain_tick`` (and everything after it) regardless of the lock
+    fix.
+
+    Drives the REAL live ``_tick_loop`` + ``_auto_revalidate_loop`` machinery
+    (not a direct call to either tick function) via ``TestClient``'s
+    lifespan, stubs ``_auto_revalidate_tick`` to block indefinitely (a
+    stand-in for a composite that never goes green) and ``_auto_drain_tick``
+    as a call-counting spy, and asserts auto-drain still fires repeatedly on
+    its own fast cadence WHILE the revalidate stub is still stuck -- proving
+    the two no longer share a sequential await chain (#2829's
+    ``_auto_revalidate_loop`` restructure).
+    """
+    import threading
+
+    _enable_merge_auto(valid_config_path)
+    cfg = load_config(valid_config_path)
+    assert cfg.merge.auto_revalidate is True
+    assert cfg.merge.auto_drain is True
+
+    revalidate_entered = threading.Event()
+    release_revalidate = threading.Event()
+
+    def _blocking_revalidate(config):  # noqa: ANN001, ARG001
+        revalidate_entered.set()
+        # Stand-in for a composite that runs long past any single
+        # `_tick_loop` iteration (or never goes green at all) -- released
+        # explicitly below, well after this test has already proven the
+        # other tick steps did not wait on it.
+        release_revalidate.wait(timeout=5)
+        return []
+
+    drain_calls: list = []
+
+    def _drain_spy(config):  # noqa: ANN001
+        drain_calls.append(config)
+        return []
+
+    monkeypatch.setattr(serve_app_module, "_auto_revalidate_tick", _blocking_revalidate)
+    monkeypatch.setattr(serve_app_module, "_auto_drain_tick", _drain_spy)
+
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+    # Set AFTER _quiet_all_other_tick_intervals -- that helper zeroes this
+    # same env var by default (it's now a sibling loop cadence), and this
+    # test needs it actually running.
+    monkeypatch.setenv("COORD_AUTO_REVALIDATE_INTERVAL", "0.05")
+
+    app = build_app(SqliteStore(file_db), cfg)
+
+    def _check_while_still_blocked() -> None:
+        assert revalidate_entered.wait(timeout=2), (
+            "_auto_revalidate_loop never entered _auto_revalidate_tick"
+        )
+        assert len(drain_calls) >= 2, (
+            f"Step 3 auto-drain should have run repeatedly on its own "
+            f"~0.05s cadence while the revalidate stub was stuck blocking, "
+            f"got {len(drain_calls)} call(s) -- indicates auto-drain is "
+            f"still waiting behind the revalidate composite (#2829 review "
+            f"round 1)"
+        )
+        release_revalidate.set()
+
+    _run_tick_loop_briefly(
+        app, settle=0.6, mid_run=_check_while_still_blocked, pre_settle=0.4,
+    )
+
+
 # ── #1038: operational-tier audit hooks ──────────────────────────────────────
 
 
@@ -7197,6 +7288,7 @@ def _quiet_all_other_tick_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
         "COORD_HEALTH_POLL_INTERVAL",
         "COORD_PHANTOM_HEAL_INTERVAL",
         "COORD_NOTIFIER_INTERVAL",
+        "COORD_AUTO_REVALIDATE_INTERVAL",
     ):
         monkeypatch.setenv(env_var, "0")
 
