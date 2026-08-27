@@ -19,6 +19,7 @@ the server stack at import time. Keep it that way:
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sys
 import time
@@ -41,6 +42,8 @@ from coord.config import (
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from collections.abc import Iterator
+
+log = logging.getLogger(__name__)
 
 # Canonical constant in coord.brain.AGENT_PORT — duplicated here as a literal
 # so the CLI decorator default doesn't have to import the brain (and, through
@@ -468,6 +471,57 @@ def _apply_label_change(
         return
 
     click.echo(success_message)
+
+
+# #2839: Pipeline membership label set — shared by `coord track` (the
+# interactive "send to Pipeline" door, above) and `coord drive-queue add`
+# (the queueing door, `coord/commands/drive_queue.py`). Enqueueing a drive is
+# a strictly STRONGER statement than "send to Pipeline", so its label write
+# must never be weaker than `track`'s own — kept as one literal pair so the
+# two doors cannot drift apart.
+PIPELINE_TRACK_LABELS_ADD = {"coord", "status:ready"}
+PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT = {"status:refining", "status:backlog"}
+
+
+def apply_pipeline_track_labels_best_effort(
+    repo: str, issue: int, config_path: Path,
+) -> None:
+    """Best-effort ``coord`` + ``status:ready`` label application (#2839).
+
+    Non-blocking sibling of :func:`_apply_label_change` for a caller whose
+    own job is NOT "change labels" — today, only ``coord drive-queue add``.
+    Enqueuing a drive must succeed even when GitHub is unreachable: the board
+    row is the source of truth for queue membership, and this label is only
+    a best-effort projection of it onto the Pipeline. Every failure (a
+    missing repo, an unreachable daemon, a `gh` error) is logged and
+    swallowed here — never raised — so the caller's own success can never
+    turn on this call landing.
+
+    Idempotent by construction: ``apply_issue_labels`` (and the ``gh``
+    backend underneath it) tolerates already-present ``add`` labels and
+    already-absent ``remove`` labels, so re-running this on an
+    already-tracked issue is a silent no-op, not a duplicate write.
+    """
+    from coord.state import apply_issue_labels  # noqa: PLC0415
+
+    try:
+        cfg = _load_config(config_path)
+        repo_entry = cfg.repo(repo)
+        slug = repo_entry.github if repo_entry is not None else None
+        apply_issue_labels(
+            repo, issue,
+            add=PIPELINE_TRACK_LABELS_ADD,
+            remove=PIPELINE_TRACK_LABELS_REMOVE_IF_PRESENT,
+            repo_github=slug,
+        )
+    except Exception as exc:  # noqa: BLE001 — see docstring: must never block the enqueue
+        log.warning(
+            "drive-queue add: failed to apply Pipeline labels (coord + "
+            "status:ready) to %s#%s: %s — the queue row was still written; "
+            "the label is a projection, not the source of truth, so the "
+            "enqueue proceeds",
+            repo, issue, exc,
+        )
 
 
 @dataclass

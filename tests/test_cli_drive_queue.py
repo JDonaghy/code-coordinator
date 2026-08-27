@@ -38,6 +38,7 @@ from coord.drive_queue import (
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
     STATE_BLOCKED,
+    STATE_RUNNING,
     QueueEntry,
 )
 
@@ -128,6 +129,33 @@ def seed(coord_db):
 def no_tmux(monkeypatch):
     """No live drive sessions unless a test says otherwise."""
     monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _default_pipeline_labels(monkeypatch):
+    """#2839: `add` now also projects `coord`/`status:ready` onto the issue
+    via `coord.state.apply_issue_labels` — default that to an inert no-op for
+    every test in this file that doesn't care about it (the overwhelming
+    majority).
+
+    Without this, `add`'s real label write falls through to `github_ops._gh`
+    and, in any test that has ALSO mocked `subprocess.run` (the `launches`
+    fixture below, used to capture `coord drive --tmux` argvs across the
+    file), lands in that SAME capture — `subprocess.run` is one singleton
+    module attribute, so a mock installed for one caller is a mock for
+    every caller, `gh` included (see conftest's `_no_live_gh` docstring).
+    That polluted `launches` with spurious `gh issue view`/`gh issue edit`
+    entries for every test that calls `add` before asserting on `launches`.
+
+    The dedicated `labels` fixture (see the #2839 section below) requests
+    this same seam explicitly and, being function-scoped with no dependency
+    on this one, resolves after it — so its more specific mock simply
+    overrides this default for the handful of tests that actually assert on
+    the label call.
+    """
+    monkeypatch.setattr(
+        "coord.state.apply_issue_labels", lambda *a, **k: ([], False)
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -270,6 +298,75 @@ def test_add_refuses_a_malformed_after_entry(cli):
     assert result.exit_code != 0
     assert "malformed" in result.output
     assert state._list_drive_queue_local() == []
+
+
+# ── #2839: enqueueing projects `coord` + `status:ready` onto the issue ───────
+#
+# Pipeline membership IS the `coord` label (`coord untrack`'s own help text)
+# but `drive_queue_add` used to write only the board row — GitHub never heard
+# about it, so a queued issue could sit invisible in the Pipeline until an
+# operator ran `coord track` by hand. This mirrors `coord track`'s own label
+# write on every `add`: idempotent (asserted via `test_add_writes_a_row...`'s
+# sibling below re-running cleanly), non-blocking on a GitHub outage, and
+# never re-applied to an entry that is already running (#2821 was mid-drive
+# with `coord` but no `status:*` — forcing `status:ready` back onto it would
+# misrepresent it as not-yet-started).
+
+
+@pytest.fixture
+def labels(monkeypatch):
+    """Capture ``coord.state.apply_issue_labels`` calls instead of touching GitHub."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake(repo_name, issue_number, *, add, remove, repo_github=None):
+        calls.append(
+            {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "add": add,
+                "remove": remove,
+                "repo_github": repo_github,
+            }
+        )
+        return (sorted(add), True)
+
+    monkeypatch.setattr("coord.state.apply_issue_labels", _fake)
+    return calls
+
+
+def test_add_applies_coord_and_status_ready_on_a_fresh_issue(cli, labels):
+    result = cli("add", REPO, "1650")
+    assert result.exit_code == 0, result.output
+    assert len(labels) == 1
+    call = labels[0]
+    assert call["repo_name"] == REPO
+    assert call["issue_number"] == 1650
+    assert call["add"] == {"coord", "status:ready"}
+    assert call["remove"] == {"status:refining", "status:backlog"}
+    assert call["repo_github"] == "john/claude-coordinator"
+
+
+def test_add_survives_a_failing_label_write(cli, monkeypatch):
+    def _boom(*_a, **_k):
+        raise RuntimeError("gh unreachable")
+
+    monkeypatch.setattr("coord.state.apply_issue_labels", _boom)
+    result = cli("add", REPO, "1650")
+    assert result.exit_code == 0, result.output
+    assert f"{REPO}#1650" in result.output
+    # The board row is the source of truth for queue membership — it must
+    # land even though the label write (a projection of it) failed.
+    assert queued(1650) is not None
+
+
+def test_add_does_not_relabel_an_already_running_entry(cli, labels):
+    assert cli("add", REPO, "1650").exit_code == 0
+    labels.clear()
+    state.update_drive_queue_entry(REPO, 1650, state=STATE_RUNNING)
+
+    result = cli("add", REPO, "1650", "--machine", "dellserver")
+    assert result.exit_code == 0, result.output
+    assert labels == []
 
 
 # ── #2247: predicted file-overlap ordering ───────────────────────────────────
