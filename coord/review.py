@@ -1242,35 +1242,6 @@ def read_repo_claude_md(repo_path: Path) -> str | None:
         return None
 
 
-def _diff_file_paths(diff_text: str) -> list[str]:
-    """Return every file path touched by *diff_text*, deduped, order-preserving.
-
-    Scans unified-diff file-header lines (``diff --git a/X b/Y``, ``---
-    a/X``, ``+++ b/X``) — cheap, dependency-free (#944 sealing v1) ahead of a
-    real diff parser. Shared by :func:`_diff_touched_sealed_paths` (which
-    sealed prefixes) and :func:`_diff_paths_outside_sealed` (which actual
-    paths, #1175 — the test-author/mock-author inverse tamper check needs
-    the offending files, not just which prefixes matched).
-    """
-    paths: list[str] = []
-    seen: set[str] = set()
-    for line in diff_text.splitlines():
-        candidates: list[str] = []
-        if line.startswith("diff --git "):
-            for part in line.split()[1:]:
-                if part.startswith("a/") or part.startswith("b/"):
-                    candidates.append(part[2:])
-        elif line.startswith("--- a/"):
-            candidates.append(line[len("--- a/"):])
-        elif line.startswith("+++ b/"):
-            candidates.append(line[len("+++ b/"):])
-        for c in candidates:
-            if c not in seen:
-                seen.add(c)
-                paths.append(c)
-    return paths
-
-
 def _path_is_sealed(path: str, sealed: str) -> bool:
     """Does *path* fall under the sealed entry *sealed*?
 
@@ -1294,7 +1265,7 @@ def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[
     easy to test.
     """
     touched: set[str] = set()
-    for c in _diff_file_paths(diff_text):
+    for c in github_ops.diff_file_paths(diff_text):
         for sealed in sealed_paths:
             if _path_is_sealed(c, sealed):
                 touched.add(sealed)
@@ -1312,7 +1283,7 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     the ones inside it.
     """
     return sorted(
-        p for p in _diff_file_paths(diff_text)
+        p for p in github_ops.diff_file_paths(diff_text)
         if not any(_path_is_sealed(p, sealed) for sealed in sealed_paths)
     )
 
@@ -1328,7 +1299,7 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
 #
 # This is intentionally a coarse, path-only heuristic — no diff semantics, no
 # ``claude -p`` call, no LLM judgment, just the same cheap file-path
-# inspection ``_diff_file_paths``/``_diff_touched_sealed_paths`` already do
+# inspection ``github_ops.diff_file_paths``/``_diff_touched_sealed_paths`` already do
 # above. It is a NUDGE, not a gate: callers only ever log it, never act on it
 # to change dispatch behavior, so a false positive costs nothing (the
 # reviewer remains the sole authority and, per CLAUDE.md, already honors a
@@ -1395,9 +1366,10 @@ def diff_missing_test_coverage(diff_text: str | None) -> bool:
     """#2192: True when *diff_text* touches user-visible source and zero
     test files, the pattern behind 18.5% of #2132's blocking reviews.
 
-    Pure, free, deterministic path inspection — reuses :func:`_diff_file_paths`.
-    Returns False (never flags) when the diff is empty, touches no recognized
-    source file (docs-only/internal-tooling-only diffs — CLAUDE.md's
+    Pure, free, deterministic path inspection — reuses
+    :func:`coord.github_ops.diff_file_paths`. Returns False (never flags)
+    when the diff is empty, touches no recognized source file
+    (docs-only/internal-tooling-only diffs — CLAUDE.md's
     internal-only exemption), or already includes a test-file change.
 
     The CLAUDE.md exemption is honored only at the granularity a path-only
@@ -1413,7 +1385,7 @@ def diff_missing_test_coverage(diff_text: str | None) -> bool:
     """
     if not diff_text or not diff_text.strip():
         return False
-    paths = _diff_file_paths(diff_text)
+    paths = github_ops.diff_file_paths(diff_text)
     if not any(_is_user_visible_path(p) for p in paths):
         return False
     return not any(_is_test_path(p) for p in paths)
