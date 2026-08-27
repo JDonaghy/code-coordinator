@@ -37,6 +37,49 @@ from coord.agent import (
 from coord.health.models import CheckResult, Checkout, HealthContext, Severity
 from coord.health.registry import HealthReport
 
+# ── Timing budgets for the concurrency tests ──────────────────────────────
+#
+# The three tests below all assert the SAME shape: "operation X is not
+# queued behind an in-flight `graphify update .`". The only way to observe
+# that from outside is wall-clock — park a fake rebuild, race X against it,
+# and check X finished while the rebuild was still parked.
+#
+# That makes the assertions load-sensitive, and the original budgets were
+# too tight to survive it: `t2.join(timeout=2.0)` raced a `server.health()`
+# that shells out to git several times, so on a busy box (the Test stage
+# runs pytest under `xdist -n auto`, saturating every core) a perfectly
+# CORRECT non-blocking poller could still be mid-`git rev-parse` at the 2s
+# mark and trip `"second /health call blocked on the first poller's
+# rebuild"`. That is a false failure: it reports a concurrency bug when the
+# only fact established is that the machine was busy.
+#
+# The fix is not "wait longer" on its own — it is to widen the GAP the
+# assertion actually discriminates on, which is what these two constants
+# encode:
+#
+#   _NONBLOCKING_S  how long a supposedly-non-blocking operation may take
+#                   before we call it blocked. Generous: it absorbs
+#                   scheduler noise and slow git subprocesses.
+#   _REBUILD_HOLD_S how long the fake rebuild stays parked when nothing
+#                   releases it.
+#
+# INVARIANT: _NONBLOCKING_S < _REBUILD_HOLD_S, by a wide margin. This is
+# what keeps the tests HONEST rather than merely quiet. If the operation
+# really were serialized behind the rebuild, it would still be waiting when
+# _NONBLOCKING_S expires (the rebuild holds for far longer), so a real
+# regression still fails — it just takes longer to say so. Raising
+# _NONBLOCKING_S past _REBUILD_HOLD_S would silently turn every one of
+# these into a test that can no longer fail: the rebuild would let go on
+# its own first and the "non-blocking" operation would complete either way.
+_NONBLOCKING_S = 20.0
+_REBUILD_HOLD_S = 60.0
+
+# Waiting for the fake rebuild to START, and for a released thread to wind
+# down. Neither discriminates anything — they are runaway guards so a bug
+# hangs the suite for seconds instead of forever — so they only need to be
+# comfortably longer than the work itself.
+_STARTUP_S = 30.0
+
 
 def _init_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
@@ -335,7 +378,7 @@ def test_concurrent_health_polls_do_not_launch_duplicate_rebuilds(
             max_concurrent.append(in_flight)
         calls.append(repo_path)
         rebuild_started.set()
-        release_rebuild.wait(timeout=5.0)
+        release_rebuild.wait(timeout=_REBUILD_HOLD_S)
         with counter_lock:
             in_flight -= 1
         head = _git(repo_path, "rev-parse", "HEAD")
@@ -352,18 +395,21 @@ def test_concurrent_health_polls_do_not_launch_duplicate_rebuilds(
     t1 = threading.Thread(target=_poll)
     t1.start()
     try:
-        assert rebuild_started.wait(timeout=5.0), "fake rebuild never started"
+        assert rebuild_started.wait(timeout=_STARTUP_S), "fake rebuild never started"
 
         # A second poller landing while the first is still mid-rebuild must
         # not launch a second `graphify update .`, and must not block
-        # waiting for the first one to finish either.
+        # waiting for the first one to finish either. The first rebuild is
+        # still parked for _REBUILD_HOLD_S at this point, so a second
+        # poller that HAD queued behind it would still be alive when
+        # _NONBLOCKING_S expires — see the constants' comment.
         t2 = threading.Thread(target=_poll)
         t2.start()
-        t2.join(timeout=2.0)
+        t2.join(timeout=_NONBLOCKING_S)
         assert not t2.is_alive(), "second /health call blocked on the first poller's rebuild"
     finally:
         release_rebuild.set()
-        t1.join(timeout=5.0)
+        t1.join(timeout=_STARTUP_S)
 
     assert calls == [repo], "a second concurrent poller must not launch its own rebuild"
     assert max_concurrent == [1], "at most one graphify update . in flight at a time"
@@ -397,7 +443,7 @@ def test_assignment_lock_is_released_before_the_rebuild_subprocess_runs(
 
     def _fake_update(repo_path: Path):
         rebuild_started.set()
-        release_rebuild.wait(timeout=5.0)
+        release_rebuild.wait(timeout=_REBUILD_HOLD_S)
         return True, "ok"
 
     monkeypatch.setattr("coord.agent._graphify_update", _fake_update)
@@ -405,13 +451,13 @@ def test_assignment_lock_is_released_before_the_rebuild_subprocess_runs(
     t = threading.Thread(target=server.health, daemon=True)
     t.start()
     try:
-        assert rebuild_started.wait(timeout=5.0), "fake rebuild never started"
-        acquired = server._lock.acquire(timeout=2.0)
+        assert rebuild_started.wait(timeout=_STARTUP_S), "fake rebuild never started"
+        acquired = server._lock.acquire(timeout=_NONBLOCKING_S)
         assert acquired, "self-heal held the assignment lock across the rebuild subprocess"
         server._lock.release()
     finally:
         release_rebuild.set()
-        t.join(timeout=5.0)
+        t.join(timeout=_STARTUP_S)
 
 
 def test_dispatch_arriving_mid_rebuild_is_accepted_not_delayed(
@@ -426,7 +472,7 @@ def test_dispatch_arriving_mid_rebuild_is_accepted_not_delayed(
 
     def _fake_update(repo_path: Path):
         rebuild_started.set()
-        release_rebuild.wait(timeout=5.0)
+        release_rebuild.wait(timeout=_REBUILD_HOLD_S)
         head = _git(repo_path, "rev-parse", "HEAD")
         _write_graph(repo_path, built_sha=head)
         return True, "ok"
@@ -436,9 +482,9 @@ def test_dispatch_arriving_mid_rebuild_is_accepted_not_delayed(
     t = threading.Thread(target=server.health, daemon=True)
     t.start()
     try:
-        assert rebuild_started.wait(timeout=5.0), "fake rebuild never started"
+        assert rebuild_started.wait(timeout=_STARTUP_S), "fake rebuild never started"
         assignment = server.assign(_spec(repo))
         assert assignment.status in (PENDING, RUNNING)
     finally:
         release_rebuild.set()
-        t.join(timeout=5.0)
+        t.join(timeout=_STARTUP_S)
