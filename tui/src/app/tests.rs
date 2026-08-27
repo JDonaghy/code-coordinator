@@ -50898,6 +50898,294 @@ Milestone tracking issue.
         );
     }
 
+    // ── #2827: the Trend report — two stacked charts, one range selector ─
+    //
+    // `trend` (#2826) can't use the #2271 `ReportResult.chart` mechanism
+    // above (see `CoordApp::render_trend_charts`'s doc comment for why —
+    // one `y_range` can't honestly hold both a merge count and a dollar
+    // figure), so it is rendered by a dedicated, report-specific path.
+    // These tests exercise that path both at the pure-function level (the
+    // null-bucket rendering rule, which is exact and not worth screen-
+    // scraping for) and end-to-end through `TuiDriver` (rendering, and the
+    // range selector's rerun/rerender).
+
+    /// A catalogue carrying only `trend`, mirroring #2826's
+    /// `coord/reports.py` `TREND` `ReportDef` wire shape trimmed to what
+    /// the client reads (`range`'s four choices, plus `repo` so the form
+    /// isn't a single-field degenerate case).
+    fn trend_catalogue_json() -> &'static str {
+        r#"{
+                "reports": [
+                    {
+                        "id": "trend",
+                        "title": "Trend",
+                        "description": "Time-bucketed merge throughput + cost efficiency",
+                        "params": [
+                            {
+                                "id": "range", "label": "Range", "kind": "choice",
+                                "choices": ["1d", "3d", "7d", "1m"], "default": "7d",
+                                "help": "1d=hourly, 3d=3-hourly, 7d=6-hourly, 1m=daily",
+                                "free_form": false
+                            },
+                            {
+                                "id": "repo", "label": "Repo", "kind": "text",
+                                "choices": [], "default": "", "help": "", "free_form": false
+                            }
+                        ]
+                    }
+                ]
+            }"#
+    }
+
+    /// A `GET /report/trend` body. `rows_json` is the `rows` array
+    /// verbatim (#2826's `bucket_start`/`merged`/`cost_per_issue`/
+    /// `legs_per_issue` shape) and `note` lands in `notes`, so a driver
+    /// test can tell two delivered results apart on screen without trying
+    /// to read chart pixels.
+    fn trend_result_json(rows_json: &str, note: &str) -> String {
+        format!(
+            r#"{{
+                    "report_id": "trend",
+                    "generated_at": 1785000000.0,
+                    "window": [1784900000.0, 1785000000.0],
+                    "columns": ["bucket_start", "merged", "cost_per_issue", "legs_per_issue"],
+                    "rows": {rows_json},
+                    "notes": ["{note}"]
+                }}"#
+        )
+    }
+
+    /// Open the Reports panel on a seeded `trend` result and render one
+    /// frame — the `trend`-only counterpart of `reports_driver`.
+    fn trend_driver(
+        result_json: &str,
+        w: u16,
+        h: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_app_with_reports(
+            BoardData::default(),
+            trend_catalogue_json(),
+            Some(result_json),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), w, h);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        driver
+    }
+
+    /// The null-bucket rendering rule, exactly: a leading run of `null`
+    /// buckets (no prior reading exists) is backward-filled from the first
+    /// reading; a `null` bucket after that is forward-filled from the most
+    /// recent one. Never `0.0` — the one wrong answer the issue calls out.
+    #[test]
+    fn trend_cost_series_holds_the_value_across_null_buckets() {
+        let rows = r#"[
+                {"bucket_start": 1.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null},
+                {"bucket_start": 2.0, "merged": 1, "cost_per_issue": 10.0, "legs_per_issue": 1.0},
+                {"bucket_start": 3.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null},
+                {"bucket_start": 4.0, "merged": 2, "cost_per_issue": 20.0, "legs_per_issue": 1.5}
+            ]"#;
+        let result: crate::app::types::ReportResult =
+            serde_json::from_str(&trend_result_json(rows, "n")).expect("#2827: fixture parses");
+
+        let series =
+            CoordApp::trend_cost_series(&result).expect("#2827: at least one reading exists");
+        assert_eq!(
+            series.data,
+            vec![10.0, 10.0, 10.0, 20.0],
+            "#2827: bucket 0 (leading null) must hold bucket 1's reading \
+                 backward, and bucket 2 (a null after data has begun) must \
+                 hold bucket 1's reading forward — never 0.0"
+        );
+        assert!(
+            series.fill,
+            "#2827: chart B is a filled line — that's what makes a falling \
+                 trend read as a trend rather than a bare line"
+        );
+    }
+
+    /// No merge anywhere in the window or its trailing lookback means no
+    /// reading exists to hold — the chart must be dropped, not drawn from
+    /// a fabricated `0.0`.
+    #[test]
+    fn trend_cost_series_is_none_when_every_bucket_is_null() {
+        let rows = r#"[
+                {"bucket_start": 1.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null},
+                {"bucket_start": 2.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null}
+            ]"#;
+        let result: crate::app::types::ReportResult =
+            serde_json::from_str(&trend_result_json(rows, "n")).expect("#2827: fixture parses");
+        assert!(
+            CoordApp::trend_cost_series(&result).is_none(),
+            "#2827: no reading anywhere must mean no chart, not a \
+                 fabricated zero-cost one"
+        );
+    }
+
+    /// `merged` is always present (#2826's `fold_trend` never emits `null`
+    /// for it) — a genuinely empty bucket is a real `0`, not a gap.
+    #[test]
+    fn trend_merged_series_is_the_row_order_never_null() {
+        let rows = r#"[
+                {"bucket_start": 1.0, "merged": 3, "cost_per_issue": null, "legs_per_issue": null},
+                {"bucket_start": 2.0, "merged": 0, "cost_per_issue": 5.0, "legs_per_issue": 1.0}
+            ]"#;
+        let result: crate::app::types::ReportResult =
+            serde_json::from_str(&trend_result_json(rows, "n")).expect("#2827: fixture parses");
+        assert_eq!(
+            CoordApp::trend_merged_series(&result).data,
+            vec![3.0, 0.0],
+            "#2827: merged is a real per-bucket count, bar-chart-honest \
+                 zero included"
+        );
+    }
+
+    /// The full render path: two captioned charts, never the generic
+    /// `DataTable` (whose `Bucket` column header this report's rows would
+    /// otherwise trigger).
+    #[test]
+    fn trend_report_renders_two_stacked_charts_not_a_table() {
+        let rows = r#"[
+                {"bucket_start": 1.0, "merged": 2, "cost_per_issue": 12.5, "legs_per_issue": 1.0},
+                {"bucket_start": 2.0, "merged": 1, "cost_per_issue": 9.0, "legs_per_issue": 1.0},
+                {"bucket_start": 3.0, "merged": 4, "cost_per_issue": 7.25, "legs_per_issue": 1.2}
+            ]"#;
+        let driver = trend_driver(&trend_result_json(rows, "TESTNOTE-A"), 140, 40);
+        let screen = driver.screen();
+
+        // Not asserting on the `y_label`s ("Merged"/"$/Issue") here: the
+        // TUI rasteriser sizes that gutter off the *tick value* labels
+        // (`format_tick_value`), not off `y_label`'s own length
+        // (`primitives/chart.rs::layout`'s `y_label_width` /
+        // `tui/chart.rs::paint_axes`), so a short axis range clips a
+        // longer `y_label` mid-word — this is quadraui's own behaviour,
+        // not a bug this panel should paper over, but it does make
+        // `y_label` text unreliable to substring-match in a test. The
+        // captions (drawn as a plain, unclipped `ListView` row) are the
+        // reliable per-chart identifier instead.
+        for needle in ["Throughput", "Efficiency", "TESTNOTE-A"] {
+            assert!(
+                screen.contains(needle),
+                "#2827: {needle:?} must render:\n{screen}"
+            );
+        }
+        assert!(
+            driver.find("Bucket").is_none(),
+            "#2827: the trend report must never fall back to the generic \
+                 DataTable (its `Bucket` column header must not render):\n{screen}"
+        );
+
+        let (_, throughput_y) = driver.find("Throughput").expect("caption renders");
+        let (_, efficiency_y) = driver.find("Efficiency").expect("caption renders");
+        assert!(
+            efficiency_y > throughput_y,
+            "#2827: chart A (throughput) must sit above chart B \
+                 (efficiency):\n{screen}"
+        );
+    }
+
+    /// A `cost_per_issue` column that is `null` in every bucket must
+    /// degrade to a stated message, not a chart drawn from nothing — the
+    /// end-to-end counterpart of `trend_cost_series_is_none_when_every_bucket_is_null`.
+    #[test]
+    fn trend_all_null_cost_column_renders_a_fallback_message_not_a_chart() {
+        let rows = r#"[
+                {"bucket_start": 1.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null},
+                {"bucket_start": 2.0, "merged": 0, "cost_per_issue": null, "legs_per_issue": null}
+            ]"#;
+        let driver = trend_driver(&trend_result_json(rows, "TESTNOTE-B"), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("No cost data"),
+            "#2827: an all-null cost column must say so, never render a \
+                 fabricated zero-cost chart:\n{screen}"
+        );
+        assert!(
+            screen.contains("Throughput"),
+            "#2827: chart A must still render even when chart B \
+                 degrades:\n{screen}"
+        );
+    }
+
+    /// Switching the shared range selector, then clicking Run, re-requests
+    /// (`Running trend…` in flight) — the same generic Run flow
+    /// `reports_run_click_marks_the_report_in_flight` pins for
+    /// `issue-activity`, exercised here for `trend`. There is deliberately
+    /// only ONE selector driving both charts: it is the catalogue's
+    /// ordinary `range` `SegmentedControl` (rendered by the fully generic
+    /// `reports_param_form`), nothing new added for this panel.
+    #[test]
+    fn trend_switching_the_range_selector_then_run_reruns() {
+        let app = make_app_with_reports(BoardData::default(), trend_catalogue_json(), None);
+        let mut driver =
+            quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        // Real geometry-based click routing (not a hand-built field id) —
+        // the black-box path a user actually drives.
+        let (sx, sy) = driver
+            .find("1d")
+            .unwrap_or_else(|| panic!("range option not rendered:\n{}", driver.screen()));
+        driver.click(sx, sy);
+        driver.render();
+
+        let (rx, ry) = driver
+            .find("Run")
+            .unwrap_or_else(|| panic!("Run button not rendered:\n{}", driver.screen()));
+        driver.click(rx, ry);
+        driver.render();
+        assert!(
+            driver.screen().contains("Running trend"),
+            "#2827: clicking Run after switching the range selector must \
+                 re-request:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Once a re-run's result lands, it replaces the previous one on
+    /// screen — both charts included, via the same `reports_run_rx`
+    /// delivery path `reports_completed_run_populates_the_main_panel_grid`
+    /// pins for `issue-activity`'s table. (Delivered through the fixture's
+    /// pre-armed channel rather than a real Run click — a real click here
+    /// would spawn a second, never-completing background fetch under
+    /// `cfg(test)`'s "no board service" and swap out the channel `pending`
+    /// is bound to, same as every other Reports test that uses this
+    /// fixture instead of clicking Run live.)
+    #[test]
+    fn trend_delivered_rerun_replaces_the_previous_charts() {
+        let rows_a = r#"[{"bucket_start": 1.0, "merged": 1, "cost_per_issue": 5.0, "legs_per_issue": 1.0}]"#;
+        let rows_b = r#"[{"bucket_start": 1.0, "merged": 9, "cost_per_issue": 50.0, "legs_per_issue": 2.0}]"#;
+
+        let (app, pending) = make_app_with_reports_awaiting_run(
+            BoardData::default(),
+            trend_catalogue_json(),
+            &trend_result_json(rows_a, "TESTNOTE-A"),
+        );
+        let mut driver =
+            quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(
+            driver.screen().contains("TESTNOTE-A"),
+            "sanity: the seeded result must render first:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            pending.deliver(&trend_result_json(rows_b, "TESTNOTE-B")),
+            "#2827: fixture must parse and send"
+        );
+        reports_idle_tick(&mut driver);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TESTNOTE-B") && !screen.contains("TESTNOTE-A"),
+            "#2827: the re-run's result must replace the old one on \
+                 screen, both charts included:\n{screen}"
+        );
+    }
 
     // ── #1866 (Q-1): the Queue panel ────────────────────────────────────
     //
