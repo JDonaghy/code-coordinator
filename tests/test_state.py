@@ -3170,7 +3170,209 @@ class TestApplyIssueLabelsLocalLockContention:
             )
 
         assert (new_labels, changed) == (["bug", "coord"], True)
-        assert any("2689" in rec.message for rec in caplog.records)
+        # #2846: the guard moved into `_update_issue_labels_local` itself
+        # (shared with the `/issue-labels` plural endpoint's direct caller),
+        # so the log line it emits on exhaustion now cites #2846.
+        assert any("2846" in rec.message for rec in caplog.records)
+
+
+class TestUpdateIssueLabelsLocalDirectCallLockContention:
+    """#2846: unlike `_apply_issue_labels_local` (`/issue-label`, already
+    guarded by #2689), the `/issue-labels` plural endpoint calls
+    `_update_issue_labels_local` DIRECTLY — its own frame had no guard at
+    all before #2846. The GitHub label change it mirrors already happened
+    (by the caller's own contract, see `update_issue_labels`'s docstring),
+    so a lock outlasting the retry budget must not raise past this
+    function either, exercised here with no `_apply_issue_labels_local` in
+    the call stack at all."""
+
+    def test_retries_transient_contention_then_returns_true(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _update_issue_labels_local
+
+        coord_db.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+            "synced_at) VALUES ('api', 9, 't', 'b', 'open', '[]', 0)"
+        )
+        coord_db.commit()
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        updated = _update_issue_labels_local("api", 9, ["bug", "coord"])
+
+        assert updated is True
+        assert proxy.calls == 3
+
+    def test_returns_false_without_raising_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _update_issue_labels_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            updated = _update_issue_labels_local("api", 9, ["bug"])
+
+        assert updated is False
+        assert any("2846" in rec.message for rec in caplog.records)
+
+
+class TestRecordIssueCommentCaptureLocalLockContention:
+    """#2846: `_record_issue_comment_capture_local` is reached two ways —
+    directly from the daemon's own `/issue-comment` route (via
+    `_comment_on_issue_local` -> `github_ops.post_issue_comment`), and
+    cross-module from ANY caller of `github_ops.post_issue_comment`
+    (`_capture_comment_write`'s fail-open wrapper previously swallowed a
+    lock immediately, with zero retry — this both retries first, matching
+    every neighbouring mirror write, and covers the direct-HTTP-capture
+    path via `/issue-comments`'s `capture` action, which had no fail-open
+    net at all). The GitHub comment this mirrors has already posted by the
+    time this runs."""
+
+    def test_retries_transient_contention_then_writes_row(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _record_issue_comment_capture_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        _record_issue_comment_capture_local(
+            repo_name="api",
+            issue_number=9,
+            body="a comment",
+            gh_comment_id=555,
+            author="bot",
+        )
+
+        assert proxy.calls == 3
+        row = coord_db.execute(
+            "SELECT body FROM issue_comments WHERE gh_comment_id = 555"
+        ).fetchone()
+        assert row["body"] == "a comment"
+
+    def test_swallows_without_raising_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from coord.state import _record_issue_comment_capture_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with caplog.at_level("ERROR", logger="coord.state"):
+            _record_issue_comment_capture_local(
+                repo_name="api", issue_number=9, body="a comment", gh_comment_id=556,
+            )
+
+        assert any("2846" in rec.message for rec in caplog.records)
+        row = coord_db.execute(
+            "SELECT body FROM issue_comments WHERE gh_comment_id = 556"
+        ).fetchone()
+        assert row is None, "the row never landed -- exhaustion must not raise, not fake success"
+
+
+class TestDriveQueueLocalWritesRetryLockContention:
+    """#2846: the four `/drive-queue` local writers issued bare `sql.execute`
+    calls with zero retry, unlike every neighbouring write in this module —
+    a transient `database is locked` collision (a concurrent tick or a
+    second operator action landing at the same moment) used to propagate
+    straight out as a 503.
+
+    Unlike the cache-mirror sites above, these writes are the primary
+    record (there is no separate "it already happened on GitHub" fact to
+    protect) and are idempotent by natural key (upsert-by-`(repo_name,
+    issue_number)`, delete-by-key, update-by-key) — so extending the retry
+    budget via `retry_on_locked` is pure upside, and a genuinely exhausted
+    retry budget still surfaces a real error rather than fabricating
+    success for a write that did not happen."""
+
+    def test_enqueue_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        entry_id = _enqueue_drive_queue_local("api", 9)
+
+        assert isinstance(entry_id, int)
+        # enqueue issues more than one statement per attempt (a lookup then
+        # an insert/update), so the exact count depends on how many of that
+        # attempt's statements land before the injected failure -- what
+        # matters is that it retried at all rather than raising on the
+        # first collision.
+        assert proxy.calls > 2
+
+    def test_enqueue_propagates_once_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        proxy = _FlakyConnProxy(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            _enqueue_drive_queue_local("api", 9)
+
+    def test_dequeue_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _dequeue_drive_queue_local, _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 9)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        removed = _dequeue_drive_queue_local("api", 9)
+
+        assert removed is True
+        # dequeue issues more than one statement per attempt when a row is
+        # actually removed (the delete, then a renumber pass) -- see the
+        # enqueue test above for why this isn't an exact count.
+        assert proxy.calls > 2
+
+    def test_update_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _enqueue_drive_queue_local, _update_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 9)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        updated = _update_drive_queue_entry_local("api", 9, state="running")
+
+        assert updated is True
+        assert proxy.calls == 3
+
+    def test_move_retries_transient_contention_then_succeeds(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import _enqueue_drive_queue_local, _move_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 9)
+        _enqueue_drive_queue_local("api", 10)
+        proxy = _FlakyConnProxy(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: proxy)
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        moved = _move_drive_queue_entry_local("api", 10, 0)
+
+        assert moved is True
+        # move issues one statement per queue row being renumbered -- see
+        # the enqueue test above for why this isn't an exact count.
+        assert proxy.calls > 2
 
 
 class TestMilestoneLocalLockContention:
