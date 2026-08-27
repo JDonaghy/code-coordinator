@@ -1349,12 +1349,41 @@ class MergeConfig:
     oldest entry in a file-overlapping cluster of approved (PENDING) queue
     entries must have been waiting before the warning fires. ``0`` disables
     the warning entirely. Default ``24.0``.
+
+    ``auto_revalidate`` (#2829) lets the daemon's own tick resolve a
+    stale-but-``passed`` verdict the same way an operator does by hand with
+    ``coord merge --revalidate``: compose the candidate(s) onto the current
+    base, run the suite once, merge on green. **Default-off**, and a
+    strictly larger grant than ``auto_drain`` — it *starts test runs*, not
+    just merges pre-approved ones — so it gets its own sibling trust bar
+    (tracked in ``docs/MERGE_AUTO_DRAIN_TRUST_BAR.md``) rather than riding
+    in on ``auto_drain``'s track record. See
+    :func:`coord.serve_app._auto_revalidate_tick` for the lock-hold
+    restructure this required: the composite runs OUTSIDE ``_merge_lock``
+    and the lock is taken only to re-check the base hasn't moved and then
+    merge, so an unattended composite (up to
+    ``coord.revalidate.DEFAULT_TIMEOUT_SECONDS`` × ``1 +
+    auto_revalidate_max_batch`` worst case) never wedges the whole fleet's
+    merge lane the way running it inside the lock would.
+
+    ``auto_revalidate_max_batch`` caps how many candidates one unattended
+    composite may validate together — deliberately well under
+    :data:`coord.revalidate.MAX_REVALIDATION_BATCH` (10), since a RED
+    composite's 1+N solo-run fallback is what actually holds the lock once
+    the merge step runs, and that cost must stay small when nobody is
+    watching it happen. Default ``3``. Combined with the "at most one
+    composite per tick, never a burst" rule ``_auto_revalidate_tick``
+    enforces in code (not a config knob — there is nothing to tune), this
+    is the per-tick ceiling the trust bar calls for, analogous to
+    ``auto_drain``'s ``max_per_tick``.
     """
 
     auto_drain: bool = False
     max_per_tick: int = 0
     auto_reap_merged: bool = True
     sibling_overlap_aging_hours: float = 24.0
+    auto_revalidate: bool = False
+    auto_revalidate_max_batch: int = 3
 
 
 @dataclass
@@ -3672,6 +3701,18 @@ def _parse_merge(raw: Any) -> MergeConfig:
                 "merge.sibling_overlap_aging_hours must be a non-negative number"
             )
         cfg.sibling_overlap_aging_hours = float(value)
+    if "auto_revalidate" in raw:
+        value = raw["auto_revalidate"]
+        if not isinstance(value, bool):
+            raise ConfigError("merge.auto_revalidate must be a boolean")
+        cfg.auto_revalidate = value
+    if "auto_revalidate_max_batch" in raw:
+        value = raw["auto_revalidate_max_batch"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(
+                "merge.auto_revalidate_max_batch must be a positive integer"
+            )
+        cfg.auto_revalidate_max_batch = value
     return cfg
 
 

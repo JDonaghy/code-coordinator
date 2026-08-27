@@ -1831,3 +1831,49 @@ def test_merge_sibling_overlap_aging_hours_rejects_non_number() -> None:
         ConfigError, match="sibling_overlap_aging_hours must be a non-negative number"
     ):
         _parse_merge({"sibling_overlap_aging_hours": "lots"})
+
+
+# ── #2829: merge.auto_revalidate ────────────────────────────────────────────
+
+def test_merge_auto_revalidate_defaults() -> None:
+    """An absent merge: block (or one that omits auto_revalidate) means the
+    daemon never starts a suite run on its own -- byte-identical to today."""
+    cfg = _parse_merge(None)
+    assert cfg.auto_revalidate is False
+    assert cfg.auto_revalidate_max_batch == 3
+
+
+def test_merge_auto_revalidate_parses_true() -> None:
+    assert _parse_merge({"auto_revalidate": True}).auto_revalidate is True
+    assert _parse_merge({"auto_revalidate": False}).auto_revalidate is False
+
+
+def test_merge_auto_revalidate_rejects_non_bool() -> None:
+    with pytest.raises(ConfigError, match="merge.auto_revalidate must be a boolean"):
+        _parse_merge({"auto_revalidate": "true"})
+
+
+def test_merge_auto_revalidate_max_batch_parses() -> None:
+    assert _parse_merge({"auto_revalidate_max_batch": 1}).auto_revalidate_max_batch == 1
+    assert _parse_merge({"auto_revalidate_max_batch": 5}).auto_revalidate_max_batch == 5
+
+
+def test_merge_auto_revalidate_max_batch_rejects_non_positive() -> None:
+    with pytest.raises(
+        ConfigError, match="auto_revalidate_max_batch must be a positive integer"
+    ):
+        _parse_merge({"auto_revalidate_max_batch": 0})
+
+
+def test_merge_auto_revalidate_max_batch_rejects_bool() -> None:
+    with pytest.raises(
+        ConfigError, match="auto_revalidate_max_batch must be a positive integer"
+    ):
+        _parse_merge({"auto_revalidate_max_batch": True})
+
+
+def test_merge_auto_revalidate_max_batch_rejects_non_int() -> None:
+    with pytest.raises(
+        ConfigError, match="auto_revalidate_max_batch must be a positive integer"
+    ):
+        _parse_merge({"auto_revalidate_max_batch": "lots"})
