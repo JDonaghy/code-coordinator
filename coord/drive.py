@@ -3125,9 +3125,12 @@ def _effective_merge_gate_reason(
       through the bounded retry below). A re-test does not rebase a branch,
       and diverting to one is the same stall this issue is about, inverted.
     - a CI reason (#1891/#1892/#2252/#2347) — `merge_reason` already carries
-      a live, recognised signal whose only resolution is more real time.
-      These bare waits sit right after the divergence check and must keep
-      winning.
+      a live, recognised signal whose only resolution is more real time
+      (#1891/#2814's own arm now spends that time on a real, budget-exempt
+      `coord merge --only` re-check rather than a bare wait — see that
+      branch's docstring — but the "board's own reading wins over the
+      diagnostic fallback" contract here is unchanged). These CI-reason
+      checks sit right after the divergence check and must keep winning.
 
     The bool is the caller's warning label: a diagnostic-derived reason is a
     SNAPSHOT of the last real attempt, refreshed by nothing but another
@@ -3457,14 +3460,59 @@ def _decide_merge(
     # `--max-merge-attempts` budget (and then a drive-queue launch attempt)
     # retrying a merge that only more real time — never another retry —
     # could resolve. No number of retries makes a check that hasn't reported
-    # yet report sooner, so this is a bare wait, exactly like BLOCKED below,
-    # and it never spends `counters.merge_attempts`.
+    # yet report sooner, so this never spends `counters.merge_attempts`,
+    # exactly like BLOCKED below.
+    #
+    # #2814: that guarantee used to be delivered as a BARE `_wait()` — no
+    # `coord merge` dispatch at all — trusting that *something else* would
+    # notice CI going green and refresh the board out from under it (the
+    # daemon's `_gate_refresher` tick, surfaced via `drive_state._merge_entry`
+    # 's #2808 `ci_rollup_all_clear` recovery). That holds on the HTTP
+    # `/board` path, but `BoardFetcher._fetch_local` — the daemon-host
+    # standalone path `coord drive` uses whenever no `board_service` is
+    # configured, see its docstring — deliberately never computes a
+    # `merge_plan` at all, so the #2808 recovery has no `ci_summary` to read;
+    # the raw queue row's persisted `error` is the ONLY signal available, and
+    # per the paragraph above, the ONLY thing that ever rewrites it is a live
+    # `coord merge` attempt. Nothing was making one, so a standalone drive
+    # could park on a byte-identical "CI running: ..." line until the 240m
+    # deadline, hours after CI had actually gone green
+    # (claude-coordinator#2804/#2813, 2026-08-27) — `merge_queue.error`
+    # outliving the CI run it described.
+    #
+    # The fix: keep dispatching a real (non-dry-run) `coord merge --only
+    # <aid>` retry every poll while this reason holds. That is the only
+    # thing that rewrites the persisted `error` — `--dry-run` evaluates the
+    # same gates but its `save_queue()` call is skipped entirely
+    # (`coord/commands/merge.py`), so it would leave the DB row exactly as
+    # stale as the bare wait did. A CI-pending entry's gate evaluation is
+    # read-only up to and including the `continue` that skips it (no PR
+    # creation, no rebase, no `gh pr merge` — see `merge_queue.process`'s
+    # docstring), so retrying costs one `gh pr checks`-shaped round trip, not
+    # a mechanical operation, and is safe to repeat every poll. It stays
+    # budget-SAFE the same way the #2157 "already merged" wait below does:
+    # `counters.merge_attempts` is deliberately never incremented here, so an
+    # indefinitely-still-pending check can never exhaust
+    # `--max-merge-attempts` and die — only the outer `deadline_mins` bounds
+    # this, same as before. Once CI actually resolves, this SAME call either
+    # lands the merge outright or rewrites `error` to whatever it resolved
+    # to, both within one poll interval — see
+    # `test_checks_pending_retries_for_real_without_spending_an_attempt`.
     if is_ci_pending_reason(state.merge_reason):
-        return _wait(
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
             label=(
-                "MERGE: CI checks have not reported yet — waiting, not "
-                f"retrying (#1891): {state.merge_reason}"
-            )
+                "MERGE: CI checks have not reported yet — re-checking, not "
+                f"spending an attempt (#1891/#2814): {state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking pending CI — re-checking next poll"
+            ),
+            serialize_merge=True,
         )
 
     # #2347: the sibling case checked right after #1891 — the check-list
@@ -4659,14 +4707,15 @@ class Driver:
                     action.command, serialize_merge=action.serialize_merge
                 )
                 if action.serialize_merge:
-                    # #2078: `serialize_merge` is set on exactly one Action —
-                    # `_decide_merge`'s bounded `coord merge --only <aid>`
-                    # retry — so this is the merge attempt's own diagnostic,
-                    # captured for `_decide_merge` to read back (via
-                    # `counters.last_merge_diagnostic`) on the NEXT poll: to
-                    # avoid a blind retry once a real gate block is already
-                    # known, and to name it in the give-up message instead of
-                    # the board's empty fields.
+                    # #2078: `serialize_merge` marks a real `coord merge
+                    # --only <aid>` attempt — `_decide_merge`'s bounded
+                    # bottom-of-function retry, and (#2814) its budget-exempt
+                    # CI-pending re-check — so this is the merge attempt's
+                    # own diagnostic, captured for `_decide_merge` to read
+                    # back (via `counters.last_merge_diagnostic`) on the NEXT
+                    # poll: to avoid a blind retry once a real gate block is
+                    # already known, and to name it in the give-up message
+                    # instead of the board's empty fields.
                     #
                     # #2079: `_decide_merge` now has two callers — the work
                     # row and the oracle JIT slice — with one budget each, so

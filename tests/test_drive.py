@@ -3450,37 +3450,57 @@ def test_a_blocked_merge_waits_and_reports_the_gate():
 # the board can show for the exact same still-pending checks, depending on
 # whether `_gate_refresher`'s periodic snapshot caught up with a live `coord
 # merge` attempt's own fresher read. See `coord.merge_queue.CI_PENDING_PREFIX`.
+#
+# #2814: budget-safe no longer means inert. The wait used to be a bare
+# `_wait()` that made no `coord merge` call at all — fine on the HTTP
+# `/board` path (the daemon's own `_gate_refresher` tick keeps the board
+# fresh underneath it), but `BoardFetcher._fetch_local`'s standalone
+# daemon-host path never computes a `merge_plan`, so nothing was ever
+# rewriting the persisted `error` once CI actually resolved — a drive could
+# park on a byte-identical line for the full 240m deadline, hours after CI
+# went green. It is now a real, `--only`-scoped `coord merge` RUN action
+# every poll, still exempt from `counters.merge_attempts` (see below), so it
+# stays budget-safe while actually re-observing CI each time.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
-def test_checks_pending_waits_regardless_of_which_status_the_board_shows(status):
+def test_checks_pending_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
     """The board can legitimately show any of these for the SAME still-pending
-    checks (see the module comment above) — every one of them must wait, not
-    retry, as long as `merge_reason` names the pending checks."""
+    checks (see the module comment above) — every one of them dispatches the
+    same real, attempt-exempt `coord merge --only` re-check, as long as
+    `merge_reason` names the pending checks."""
     action = step(
         approved_work(
             merge_status=status,
             merge_reason="CI running: build, lint",
         )
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
     assert "CI running: build, lint" in action.label
-    assert "not retrying" in action.label
+    assert "not spending an attempt" in action.label
 
 
-def test_checks_pending_never_spends_an_attempt_across_several_polls():
-    """Acceptance (#1891): `merge_attempts` does not increase across several
-    polls while checks remain pending — the exact accounting bug the GitHub
-    Actions outage of 2026-08-06 hit: three attempts, then `_die()`, for an
-    entry whose checks were merely starved of runners, not failing."""
+def test_checks_pending_retries_for_real_without_spending_an_attempt():
+    """Acceptance (#1891/#2814): `merge_attempts` does not increase across
+    several polls while checks remain pending — the exact accounting bug the
+    GitHub Actions outage of 2026-08-06 hit: three attempts, then `_die()`,
+    for an entry whose checks were merely starved of runners, not failing —
+    but each poll still dispatches a real `coord merge --only` RUN (#2814),
+    so the persisted `error` (and, once CI resolves, the merge itself) keeps
+    getting refreshed instead of freezing on a stale snapshot."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
     s = approved_work(merge_status="", merge_reason="CI running: build")
 
     for _ in range(5):
         action = step(s, opts, counters=counters)
-        assert action.kind == WAIT
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
         assert counters.merge_attempts == 0
 
 
@@ -3552,8 +3572,10 @@ def test_ci_infra_failure_waits_regardless_of_which_status_the_board_shows(statu
 
 def test_ci_infra_failure_never_spends_an_attempt_across_several_polls():
     """Acceptance (#1892): a PR whose failures are ALL verdictless does not
-    consume a drive merge attempt, mirroring
-    test_checks_pending_never_spends_an_attempt_across_several_polls."""
+    consume a drive merge attempt — unlike #2814's is_ci_pending_reason
+    fix, this stays a bare `_wait()` (no re-check dispatch): `coord merge`'s
+    own live attempt already auto-reruns CI for this case, so there is no
+    standalone-path gap to plug (see the #1892 module comment above)."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
     s = approved_work(
@@ -4332,10 +4354,12 @@ def test_the_empty_status_enqueue_blocked_path_is_unchanged_by_2229():
 
 
 def test_a_live_ci_wait_still_wins_over_a_captured_gate_line():
-    """#1891/#1892's bare waits sit right after the divergence check and must
-    keep winning: `merge_reason` carries a live, recognised signal whose only
-    resolution is more real time. A snapshot from an older attempt must not
-    divert the drive into a re-test while CI is still reporting."""
+    """#1891/#1892's CI-reason checks sit right after the divergence check
+    and must keep winning: `merge_reason` carries a live, recognised signal
+    whose only resolution is more real time. A snapshot from an older
+    attempt must not divert the drive into a re-test while CI is still
+    reporting — #2814's attempt-exempt `coord merge --only` re-check (not a
+    stale-smoke re-test dispatch) is the correct arm to fire instead."""
     counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
     action = step(
         approved_work(
@@ -4344,7 +4368,8 @@ def test_a_live_ci_wait_still_wins_over_a_captured_gate_line():
         ),
         counters=counters,
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command[0] == "merge"
     assert counters.fix_rounds == 0
     assert counters.merge_attempts == 0
 
