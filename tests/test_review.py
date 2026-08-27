@@ -330,6 +330,64 @@ def test_briefing_includes_claude_md_and_checklist() -> None:
     assert "running on the same machine as the worker" not in briefing
 
 
+def test_briefing_fetches_claude_md_by_sha_instead_of_embedding() -> None:
+    """#2818: when a review_head_sha is available, the briefing points the
+    reviewer at `git show <sha>:CLAUDE.md` instead of embedding the full
+    text — killing the unclamped second copy that used to sit in every
+    review briefing's immutable prefix.
+    """
+    big_claude_md = "# CLAUDE.md\n" + ("Do not use raw SQL.\n" * 1000)
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="Login is broken on Firefox.",
+        branch="issue-7-fix-login",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True),
+        repo_claude_md=big_claude_md,
+        review_head_sha="deadbeef1234",
+    )
+    assert "git show deadbeef1234:CLAUDE.md" in briefing
+    # The full text must NOT be embedded — that's the whole point of #2818.
+    assert "Do not use raw SQL." not in briefing
+    assert len(briefing) < len(big_claude_md)
+
+
+def test_briefing_falls_back_to_clamped_embed_without_sha() -> None:
+    """#2818 fallback: when no review_head_sha is available (SHA fetch
+    failed), the briefing still embeds CLAUDE.md directly — clamped to
+    MAX_CLAUDE_MD_CHARS instead of the old unbounded embed.
+    """
+    from coord.refine_chat import MAX_CLAUDE_MD_CHARS
+
+    big_claude_md = "# CLAUDE.md\n" + ("Do not use raw SQL.\n" * 1000)
+    assert len(big_claude_md) > MAX_CLAUDE_MD_CHARS
+
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="Login is broken on Firefox.",
+        branch="issue-7-fix-login",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True),
+        repo_claude_md=big_claude_md,
+        review_head_sha=None,
+    )
+    assert "git show" not in briefing
+    assert "…[truncated]" in briefing
+    assert "Do not use raw SQL." in briefing  # head of the file survives
+
+
 def test_briefing_warns_when_same_machine() -> None:
     briefing = build_review_briefing(
         pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
@@ -1704,6 +1762,38 @@ def test_dispatch_review_captures_branch_sha(
     assert result.review_head_sha == "deadbeef1234", (
         "review_head_sha must be captured from branch tip at dispatch time"
     )
+
+
+def test_dispatch_review_threads_branch_sha_into_claude_md_instruction(
+    two_machine_config: Config,
+) -> None:
+    """#2818: dispatch_review's own captured review_head_sha must reach the
+    dispatched briefing's CLAUDE.md section, not just the returned
+    Assignment — this is the end-to-end path that kills the unclamped
+    second copy of CLAUDE.md sitting in the immutable prefix.
+    """
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "sha-review-2"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 9, "url": "https://github.com/acme/api/pull/9", "existed": True,
+        },
+        claude_md_reader=lambda p: "# CLAUDE.md\nDo not use raw SQL.",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "deadbeef1234",
+        diff_fetcher=lambda repo, num, **kw: None,
+    )
+
+    assert result is not None
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert "git show deadbeef1234:CLAUDE.md" in payload["briefing"]
+    assert "Do not use raw SQL." not in payload["briefing"]
 
 
 def test_dispatch_review_tolerates_sha_fetch_failure(

@@ -46,6 +46,7 @@ from coord.models import (
     Machine,
     trust_issue_closed_for,
 )
+from coord.refine_chat import MAX_CLAUDE_MD_CHARS
 
 log = logging.getLogger(__name__)
 
@@ -1217,17 +1218,20 @@ def _ranked_reviewer_candidates(
 def read_repo_claude_md(repo_path: Path) -> str | None:
     """Return the contents of CLAUDE.md at the repo root, or None.
 
-    The coordinator runs on the machine that dispatches; the reviewer runs on
-    its own machine and will re-read CLAUDE.md there. We embed the content
-    here so the briefing is self-contained — if the reviewer's checkout is
-    behind, the worker's diff still gets reviewed against the rules the
-    coordinator thought were current.
+    #2818: the review briefing no longer embeds this verbatim — see
+    :func:`build_review_briefing`'s ``review_head_sha`` handling, which
+    points the reviewer at ``git show <sha>:CLAUDE.md`` instead so the
+    briefing stays cheap *and* pinned to the exact commit under review. This
+    reader now only feeds the existence check (does this repo even have a
+    CLAUDE.md?) and the fallback clamped-embed path for when no SHA is
+    available.
 
     Public (no leading underscore) because #2462 reuses it from
     :mod:`coord.agent` — since worker dispatch switched to ``--bare``,
     Claude Code's own CLAUDE.md auto-discovery no longer runs for
     work-shaped legs, so ``default_worker_command`` embeds this the same
-    defensive way the review briefing already did.
+    defensive way the review briefing used to (that call site is unaffected
+    by #2818 — a work leg has no ``review_head_sha`` equivalent to pin to).
     """
     candidate = repo_path / "CLAUDE.md"
     if not candidate.exists():
@@ -1429,6 +1433,7 @@ def build_review_briefing(
     same_as_worker: bool,
     reviews_cfg: ReviewsConfig,
     repo_claude_md: str | None,
+    review_head_sha: str | None = None,
     default_branch: str = "main",
     review_iteration: int = 0,
     diff_text: str | None = None,
@@ -1473,6 +1478,24 @@ def build_review_briefing(
     DETECTED" banner is prepended instead of a soft reminder — this is the
     "reviewer flags any diff that touches tests/acceptance/**"
     tamper-detection policy.
+
+    *repo_claude_md* (#2818) is only used as an existence probe now — the
+    briefing no longer embeds it verbatim. When *review_head_sha* is given
+    (the normal case: it's captured once per review dispatch before this is
+    called), the CLAUDE.md section instead tells the reviewer to run
+    ``git show <review_head_sha>:CLAUDE.md`` in its own worktree — the
+    reviewer already has ``Read``/``Bash`` and sits in a checkout of this
+    repo, so fetching by SHA costs one cheap tool call instead of ~6.4k
+    tokens of immutable-prefix text repeated on every turn of every review
+    round. It is also *more* correct than the old embed: it pins to the
+    exact commit under review rather than to whatever the coordinator's own
+    checkout happened to hold at dispatch time. When *review_head_sha* is
+    unavailable (SHA fetch failed — see the fail-safe ``try/except`` around
+    ``branch_sha_fetcher`` in :func:`dispatch_review`), this falls back to
+    embedding *repo_claude_md* directly, clamped to
+    :data:`coord.refine_chat.MAX_CLAUDE_MD_CHARS` the same way
+    ``refine_chat``/``test_chat`` already do — cheaper than the old
+    unclamped embed, and a functioning fallback beats no rules at all.
 
     *sealed_entrypoints* (#1552) is the subset of *sealed_paths* that are
     driver entry points rather than the sealed tree itself. They get a
@@ -1528,7 +1551,29 @@ def build_review_briefing(
     if repo_claude_md:
         lines.append("## Project rules (from CLAUDE.md)")
         lines.append("")
-        lines.append(repo_claude_md.strip())
+        if review_head_sha:
+            # #2818: fetch by SHA instead of embedding — cheaper (no 6.4k+
+            # char copy sitting in the immutable prefix, re-paid every turn
+            # and every re-review round) and more correct (pinned to the
+            # exact commit under review, not to the coordinator's own
+            # checkout at dispatch time).
+            lines.append(
+                f"Run `git show {review_head_sha}:CLAUDE.md` in this "
+                "worktree and read the output before reviewing — those are "
+                "the project rules pinned to the exact commit under review. "
+                "(If that command errors, CLAUDE.md doesn't exist at this "
+                "commit — proceed with no repo-specific rules.)"
+            )
+        else:
+            # Fallback: the branch-head SHA fetch failed (see
+            # dispatch_review's fail-safe try/except), so there's nothing to
+            # pin a `git show` to. Embed the coordinator's own on-disk copy
+            # instead, clamped the same way refine_chat/test_chat already
+            # do for the same reason — an unclamped embed is exactly #2818.
+            clamped = repo_claude_md.strip()
+            if len(clamped) > MAX_CLAUDE_MD_CHARS:
+                clamped = clamped[:MAX_CLAUDE_MD_CHARS] + "\n…[truncated]"
+            lines.append(clamped)
         lines.append("")
 
     lines.append("## Review checklist")
@@ -2367,6 +2412,7 @@ def dispatch_review(
             review_provider=review_provider_name,
             reviews_cfg=config.reviews,
             repo_claude_md=claude_md,
+            review_head_sha=review_head_sha,
             default_branch=base_branch,
             # #476: a fix worker carries review_iteration > 0; its re-review is
             # scoped to the fix delta rather than re-reviewing the whole PR.
