@@ -4845,12 +4845,31 @@ def _dispatch_headless(
                     f"  dependency {f.repo_name}: {f.state}"
                     + (f" ({f.error})" if f.error else ""),
                 )
+            # #2804: never pull a build dep's single shared checkout out
+            # from under some OTHER assignment on this machine that may be
+            # building against it right now (see
+            # `coord.freshness.repo_busy_elsewhere`'s docstring — this is
+            # the same guard `coord approve` applies).
+            busy = {
+                f.repo_name
+                for f in needs
+                if f.kind == _fresh.BUILD
+                and _fresh.repo_busy_elsewhere(f.repo_name, proposal.machine_name, cfg, board)
+            }
+            if busy:
+                click.echo(
+                    f"  not pulling (in use by a concurrent assignment on "
+                    f"{proposal.machine_name}, #2804): {sorted(busy)}"
+                )
             if not no_pull:
-                pull_repos = [f.repo_name for f in needs if f.state == _fresh.STALE]
+                pull_repos = [
+                    f.repo_name for f in needs
+                    if f.state == _fresh.STALE and f.repo_name not in busy
+                ]
                 if pull_repos:
                     click.echo(f"  will pull on agent before worker: {pull_repos}")
             else:
-                addendum = _fresh.format_briefing_addendum(freshness)
+                addendum = _fresh.format_briefing_addendum(freshness, busy=busy)
                 if addendum:
                     proposal.briefing = (proposal.briefing or "") + addendum
 

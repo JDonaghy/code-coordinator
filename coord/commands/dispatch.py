@@ -433,6 +433,15 @@ def approve(
                 )
                 click.echo(format_chunks_summary(chunks))
 
+    # #2804: repos this SAME batch has already dispatched to a given
+    # machine, keyed by machine_name. `board` (read once, above) only knows
+    # about assignments from a PRIOR `coord approve`/`coord assign` — two
+    # proposals in THIS batch that land on the same machine and share a
+    # build dependency (e.g. both vimcode and coord-tui pulling quadraui)
+    # would otherwise never see each other. Populated as each proposal
+    # below is actually dispatched (not on `dry_run`/`continue`).
+    dispatched_this_batch: dict[str, set[str]] = {}
+
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         # Resolve model so the dispatched record and board reflect what ran.
@@ -614,14 +623,43 @@ def approve(
                         + (f" ({f.error})" if f.error else ""),
                         err=True,
                     )
+                # #2804: never pull a build dep's single shared checkout out
+                # from under some OTHER assignment on the same machine that
+                # may be building against it right now — that race is
+                # exactly what turned a correct vimcode#555 branch into a
+                # phantom red. `busy` names every such repo; both the
+                # auto-pull list and the briefing's pull instruction skip it.
+                busy = {
+                    f.repo_name
+                    for f in needs
+                    if f.kind == fresh.BUILD
+                    and fresh.repo_busy_elsewhere(
+                        f.repo_name,
+                        p.machine_name,
+                        cfg,
+                        board,
+                        also_running=dispatched_this_batch.get(p.machine_name, ()),
+                    )
+                }
+                if busy:
+                    click.echo(
+                        f"     not pulling (in use by a concurrent assignment "
+                        f"on {p.machine_name}, #2804): {sorted(busy)}",
+                        err=True,
+                    )
                 if auto_pull:
-                    pull_repos = [f.repo_name for f in needs if f.state == fresh.STALE]
+                    pull_repos = [
+                        f.repo_name for f in needs
+                        if f.state == fresh.STALE and f.repo_name not in busy
+                    ]
                     if pull_repos:
                         click.echo(f"     will pull on agent before worker: {pull_repos}")
                 else:
-                    addendum = fresh.format_briefing_addendum(freshness)
+                    addendum = fresh.format_briefing_addendum(freshness, busy=busy)
                     if addendum:
                         p.briefing = (p.briefing or "") + addendum
+
+        dispatched_this_batch.setdefault(p.machine_name, set()).add(p.repo_name)
 
         def _on_retry(attempt, max_r, state, reason, wait):
             click.echo(

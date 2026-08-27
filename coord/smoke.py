@@ -92,10 +92,26 @@ Your only job: pull the branch, run the smoke command, report pass/fail.
 Rules:
 - Do NOT edit source files. Do NOT push commits. You only validate.
 - You MAY perform test-environment SETUP the smoke command needs — creating
-  a venv, `pip install`-ing dev deps, symlinking a sibling checkout for a
-  path dependency (e.g. coord-tui's quadraui link), writing build artifacts.
-  None of that touches the branch's source; it is exactly what the smoke
-  command itself does when run locally, so do it without asking.
+  a venv, `pip install`-ing dev deps, writing build artifacts. None of that
+  touches the branch's source; it is exactly what the smoke command itself
+  does when run locally, so do it without asking.
+- A repo with a quadraui sibling PATH dependency (e.g. vimcode's
+  `quadraui-pin.txt`, #638/#625) needs a `quadraui` checkout next to yours —
+  but `~/src/quadraui` (and any `.../quadraui` symlink you find already in
+  place) is ONE mutable checkout SHARED by every concurrent assignment on
+  this machine (#2804). NEVER `git checkout`/`switch`/`pull` inside it and
+  NEVER repoint a shared `quadraui` symlink — another assignment may be
+  relying on it at a different rev *right now*, and moving it out from
+  under that assignment is exactly the scheduling-dependent phantom
+  red/green #2804 exists to stop. Give yourself a PRIVATE, disposable
+  checkout instead: `git -C ~/src/quadraui worktree add --detach <a path
+  inside YOUR OWN worktree, e.g. ./quadraui-sibling> <the exact pinned
+  rev>`, then point your build's sibling reference at that private path.
+  `git worktree add` never touches `~/src/quadraui`'s own HEAD or working
+  tree, so it's safe no matter what else is running concurrently — remove
+  it with `git -C ~/src/quadraui worktree remove <path>` when you're done,
+  but if you can't, it dies with your worktree; either way, never leave
+  `~/src/quadraui` itself checked out anywhere but its own branch.
 - Do NOT run `gh` commands. The coordinator owns GitHub interactions.
 - You MAY run git, build commands, and test commands.
 - THE VERDICT IS THE LINE YOU PRINT, NOT YOUR EXIT CODE (#2244). Print \

@@ -87,14 +87,12 @@ def _run(
     """Drive the runner with a daemon-shaped (scrubbed) environment."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    quadraui = tmp_path / "quadraui-src"
-    quadraui.mkdir(exist_ok=True)
+    # #2804: the Rust arm no longer symlinks a `quadraui` sibling at all —
+    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so a
+    # `QUADRAUI_SRC` checkout is not part of this environment anymore.
     env = {
         "PATH": SCRUBBED_PATH,
         "HOME": str(home),
-        # The path dep the Rust arm symlinks in; a bare dir is enough because
-        # the fake cargo never reads it.
-        "QUADRAUI_SRC": str(quadraui),
         "COORD_TEST_CARGO_TARGET": str(tmp_path / "cargo-target"),
         "TMPDIR": str(tmp_path),
     }
@@ -132,6 +130,31 @@ def test_cargo_off_path_is_still_found_at_cargo_home(
     # environment surprise a five-second investigation.
     assert str(cargo) in result.stdout
     assert "TOOLCHAIN MISSING" not in result.stdout
+
+
+def test_no_quadraui_sibling_symlink_created(rust_repo: Path, tmp_path: Path) -> None:
+    """#2804: the Rust arm must not create (or need) a shared quadraui
+    sibling anymore.
+
+    Before this fix the runner symlinked `$(dirname "$WT")/quadraui` ->
+    `$QUADRAUI_SRC` on every Rust-routed run — ONE location shared by every
+    worktree ever tested on this machine, silently repointed by whichever
+    run happened second. `tui/Cargo.toml` has pinned quadraui to a git rev
+    since #1973, so a normal build never touches `~/src/quadraui` at all;
+    asserting PASS with no quadraui checkout anywhere in the environment,
+    and no `quadraui` path appearing next to the worktree, proves the
+    runner no longer depends on or creates that shared state.
+    """
+    home = tmp_path / "home"
+    _fake_cargo(home / ".cargo" / "bin" / "cargo")
+
+    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS(rust)" in result.stdout
+    sibling = rust_repo.parent / "quadraui"
+    assert not sibling.exists(), "runner must not create a shared quadraui sibling (#2804)"
+    assert "linking" not in result.stdout.lower()
 
 
 def test_cargo_home_env_var_is_honoured(rust_repo: Path, tmp_path: Path) -> None:

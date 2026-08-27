@@ -17,7 +17,11 @@ quadraui feature without touching the pin at all.
 `tui/Cargo.toml` has `quadraui = { git = "https://github.com/JDonaghy/quadraui",
 rev = "<sha>" }`. `cargo build`/`cargo test` from `tui/` fetch quadraui
 straight from GitHub at that pinned rev and never touch `~/src/quadraui` — the
-local checkout's branch is irrelevant to a normal build.
+local checkout's branch is irrelevant to a normal build. (#2804:
+`scripts/coord-test-runner.sh`'s Test-stage runner used to symlink a
+`quadraui` sibling next to every worktree it tested, ONE location shared by
+every concurrent run on the machine — that symlink is gone; it was leftover
+from before this git-rev pin and was never needed by it.)
 
 ## Bumping the pin (deliberate, reviewable, its own coord-tui commit)
 
