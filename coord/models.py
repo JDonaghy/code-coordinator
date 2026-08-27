@@ -550,6 +550,31 @@ def is_policy_refusal_reason(text: str | None) -> bool:
     return bool(text) and POLICY_REFUSAL_MARKER in text
 
 
+# #2850: the machine-readable tag `coord.drive.decide` embeds in its
+# `_succeed()` message when the "terminal: merged" branch's own LIVE check
+# (`MergeVerifier.verify_merged`) confirms the issue has genuinely landed —
+# not merely that the board's cached `merge_status` claims so.
+#
+# Text-marker matching (not a dedicated exit code) mirrors
+# `POLICY_REFUSAL_MARKER` immediately above: `EXIT_OK` is shared by every
+# clean drive exit — this one, a `deliverable:analysis` 0-commit stop, and a
+# `--no-merge` "review approved, stopping here" — so the exit code alone
+# cannot distinguish "confirmed merged" from "stopped short of merging on
+# purpose". `coord/drive_queue.py`'s `_reconcile_running` recognises this
+# straight out of the drive's own `drive_exited` audit summary (`own_reason`)
+# and marks the queue entry `done` instead of requeuing a launch that has
+# nothing left to do — closing the #2850 failure mode: a drive that exits 0
+# having MERGED got requeued and relaunched into dead air, with the bogus
+# `running` row shadowing #2602's own live re-check for every dependent
+# chained `--after` it.
+MERGE_LANDED_MARKER = "[drive-merged #2850]"
+
+
+def is_merge_landed_reason(text: str | None) -> bool:
+    """Whether *text* is a #2850 confirmed-merge drive-exit reason."""
+    return bool(text) and MERGE_LANDED_MARKER in text
+
+
 @dataclass
 class Assignment:
     machine_name: str

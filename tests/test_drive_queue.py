@@ -49,6 +49,7 @@ from coord.drive_queue import (
     render_plan,
     validate_enqueue,
 )
+from coord.models import MERGE_LANDED_MARKER
 
 REPO = "claude-coordinator"
 
@@ -2736,6 +2737,178 @@ def test_a_policy_refusal_still_reconciles_to_done_if_it_lands_by_hand():
     reconcile = plan.reconciles[0]
     assert reconcile.outcome == "done"
     assert reconcile.updates["state"] == STATE_DONE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2850: a drive that exits 0 having MERGED must reconcile straight to
+# `done`, never `retry` — before this fix, `own_reason` carried the drive's
+# own "✓ MERGED — … has landed" text but `_reconcile_running` never read it
+# for anything but the gate_a/policy/refused/dead_end special cases, so a
+# confirmed-landed drive fell all the way through to the generic "no
+# session, no active work, nothing landed" death diagnosis and got
+# requeued — the reported vimcode#536 incident. Two independent recoveries,
+# reproduced separately: `own_reason` naming a confirmed merge (#2850 fix 1),
+# and a live re-check confirming landed independent of `own_reason` (#2850
+# fix 2) — and, on the DEPENDENT side, a pre-req's queue row no longer
+# shadowing that same live re-check just because it is present and not yet
+# `done` (#2850 fix 3).
+# ═══════════════════════════════════════════════════════════════════════════
+
+MERGED_OWN_REASON = (
+    "drive exited for claude-coordinator#1650 (exit_code=0): ✓ MERGED — "
+    f"issue-1650-example has landed on develop\n   {MERGE_LANDED_MARKER}"
+)
+
+
+def test_an_own_reason_confirming_merge_reconciles_to_done_not_retry():
+    """#2850 fix 1, the literal reported shape: exit_code=0, `own_reason`
+    narrates a confirmed merge — must mark `done` on the FIRST tick that
+    observes it, not spend a retry attempt requeuing a launch with nothing
+    left to do."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): MERGED_OWN_REASON},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+    assert "attempts" not in reconcile.updates  # never spent
+    assert plan.blocked == ()
+    assert plan.launch is None
+
+
+def test_a_merge_landed_own_reason_wins_even_deep_into_the_attempt_budget():
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): MERGED_OWN_REASON},
+    )
+    assert plan.reconciles[0].outcome == "done"  # not "exhausted"
+    assert plan.blocked == ()
+
+
+def test_an_own_reason_that_merely_mentions_merge_without_the_marker_still_retries():
+    """The marker, not the human-readable "MERGED" text, is what decides
+    this — a reason that talks ABOUT a merge (e.g. a merge-gate failure
+    diagnosis) without #2850's `MERGE_LANDED_MARKER` must not be
+    misread as a confirmed landing."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): merge "
+        "attempted 3 times without landing."
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_a_live_recheck_marks_a_dead_running_entry_done_with_no_own_reason_at_all():
+    """#2850 fix 2: `live_prereq_terminal` is now ALSO consulted for a
+    `running` entry's OWN key, independent of whatever (if anything) its
+    `own_reason` says — a crash that left no exit reason at all, or an exit
+    reason unrelated to landing, must still be caught if a live re-check
+    this tick confirms the issue already closed or merged."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_prereq_terminal={entry_key(REPO, 1650): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+    assert plan.blocked == ()
+
+
+def test_a_dependent_is_released_when_its_queued_but_not_done_prereq_has_live_landed():
+    """#2850 fix 3: `_resolve_prereqs`'s `dep_state is not None` branch used
+    to return "waiting on {dep} (queued, {dep_state})" unconditionally for
+    any state short of `done` — never consulting `live_prereq_terminal`,
+    unlike its own final branch for a dep absent from the queue altogether
+    (#2602). A pre-req sitting in the queue under ANY other state must
+    release its dependent the moment a live re-check confirms it actually
+    landed. Position 0 goes to the DEPENDENT (not the pre-req) so a passing
+    assertion on ``plan.launch`` is unambiguous — `plan_tick` launches at
+    most one entry per tick, position order first, so a `STATE_WAITING`
+    pre-req sitting at an earlier position would otherwise win the single
+    launch slot on its own unrelated eligibility and mask the very thing
+    under test."""
+    entries = [
+        entry(1654, position=0, after=(entry_key(REPO, 1650),)),
+        entry(1650, position=1, state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        live_prereq_terminal={entry_key(REPO, 1650): True},
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 1654
+
+
+def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running():
+    """The exact reported incident, reproduced end to end: a pre-req sits in
+    a bogus `running` row (a drive that exited 0 having merged, requeued —
+    the shape #2850 fixes 1/2 now prevent, but this pins the DEPENDENT side
+    even if some other cause ever leaves a pre-req wrongly `running` again).
+    A live re-check confirming the pre-req landed must release the
+    dependent on THIS tick, whatever the pre-req's own row still claims —
+    and the pre-req's own bogus `running` row is corrected in the SAME
+    tick, not requeued into yet another relaunch."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1, after=(entry_key(REPO, 1650),)),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        live_prereq_terminal={entry_key(REPO, 1650): True},
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 1654
+    prereq_reconcile = next(
+        r for r in plan.reconciles if r.key == entry_key(REPO, 1650)
+    )
+    assert prereq_reconcile.outcome == "done"
+
+
+def test_a_dependent_is_released_when_its_prereq_is_blocked_but_live_landed():
+    """Fix 3 pinned in ISOLATION from fix 2: a `blocked` pre-req never goes
+    through `_reconcile_running`'s step-1 walk at all (that loop only
+    touches `STATE_RUNNING` rows), so `states[dep]` stays `STATE_BLOCKED`
+    for the whole tick — the ONLY thing that can release the dependent here
+    is `_resolve_prereqs` itself consulting `live_prereq_terminal`. Before
+    #2850 this branch (`dep_state in (STATE_BLOCKED, STATE_FAILED)`)
+    returned "it will never satisfy" unconditionally, matching #2055's own
+    rationale for re-checking a `blocked` pre-req's OWN row — a human can
+    merge a blocked issue's work out of band just as easily as a running
+    one's."""
+    entries = [
+        entry(1654, position=0, after=(entry_key(REPO, 1650),)),
+        entry(1650, position=1, state=STATE_BLOCKED, attempts=2),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        live_prereq_terminal={entry_key(REPO, 1650): True},
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 1654
 
 
 # ── #2055: `blocked`/`failed` re-checked against the board too ─────────────

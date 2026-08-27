@@ -1338,6 +1338,56 @@ def test_a_blocked_entry_resumes_and_launches_once_a_live_recheck_confirms_its_p
     assert len(launches) == 1, launches
 
 
+def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running(
+    cli, seed, launches, monkeypatch,
+):
+    """#2850 end-to-end: the reported vimcode#536/#673 incident shape. The
+    pre-req (1650) sits in the queue under a BOGUS `running` row — exactly
+    what a drive that exited 0 having merged and then got requeued anyway
+    looks like — while the cached board's `issues` row for it still reads
+    "open" (the sync that would flip it hasn't caught up yet). Before this
+    fix, `_resolve_prereqs` read `states[dep] == "running"` and returned
+    "waiting on ... (queued, running)" unconditionally — the `running` row
+    shadowed the SAME live re-check that already resolves a pre-req merely
+    ABSENT from the queue (`test_a_blocked_entry_resumes_...` above) — so
+    the dependent (1654) sat blocked for as long as the bogus row
+    persisted. A live `github_ops.work_is_terminal` re-check taken THIS
+    tick must release the dependent regardless of what the pre-req's own
+    queue row claims."""
+    seed(issues={1650: "open", 1654: "open"})
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654", "--after", "1650")
+
+    # Simulate the bogus post-merge `running` row directly — a drive that
+    # exited 0 having merged and was requeued, exactly the #2850 symptom
+    # fixes 1/2 (in `coord.drive_queue`) now prevent from ever happening;
+    # this test pins the DEPENDENT side even if some other cause ever
+    # leaves a pre-req wrongly `running` again.
+    state._update_drive_queue_entry_local(REPO, 1650, state="running", attempts=1)
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "work_is_terminal",
+        lambda repo_github, issue_number, branch, **_kw: (
+            repo_github == "john/claude-coordinator" and issue_number == 1650
+        ),
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    dependent = queued(1654)
+    assert dependent["state"] == "running"  # launched, not blocked/deferred
+    assert len(launches) == 1, launches
+
+    # #2850 fix 1/2: the pre-req's own bogus `running` row is ALSO
+    # corrected in the SAME tick — reconciled to `done`, not left standing
+    # to requeue yet another dead-air relaunch.
+    prereq = queued(1650)
+    assert prereq["state"] == "done"
+
+
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
     """A `blocked` entry that never declared any `after=` at all keeps
     rendering exactly as it always has — no board dependency, no remedy
@@ -1988,6 +2038,53 @@ def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
     assert refusal in entry["last_reason"]
     assert "coord acceptance author" in entry["last_reason"]
     assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
+def test_a_confirmed_merge_exit_marks_done_and_never_relaunches(
+    cli, seed, launches,
+):
+    """#2850, end-to-end: the reported vimcode#536 incident. A drive that
+    exits 0 having genuinely MERGED (its own `drive_exited` audit summary
+    carries `coord.models.MERGE_LANDED_MARKER`, exactly what
+    `coord.drive.decide`'s "terminal: merged" branch now writes) must mark
+    the queue entry `done` on the very first tick that observes it — NOT
+    fall through to the generic death diagnosis and requeue a second launch
+    for work that is already finished. Before this fix the tick's own log
+    read `exit_code=0: ✓ MERGED … has landed` and STILL requeued it
+    "(attempt 1/2)" and relaunched — a bogus `running` row that then
+    shadowed every `--after` dependent chained onto it.
+    """
+    from coord.audit import record_audit
+    from coord.models import MERGE_LANDED_MARKER
+
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    assert len(launches) == 1, launches
+
+    merged_reason = (
+        "drive exited for claude-coordinator#1762 (exit_code=0): ✓ MERGED "
+        f"— issue-1762-example has landed on develop\n   {MERGE_LANDED_MARKER}"
+    )
+    launched_at = queued(1762)["launched_at"]
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=merged_reason, repo=REPO, issue=1762,
+        ts=launched_at + 5,
+        details={"exit_code": 0, "reason": merged_reason},
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "done" in result.output.lower()
+    # NOT the retry path: no second launch was ever spawned for this issue.
+    assert len(launches) == 1, launches
+
+    entry = queued(1762)
+    assert entry["state"] == "done"
+    assert entry["attempts"] == 0  # never spent — this was never a death
+    assert MERGE_LANDED_MARKER in (entry["last_reason"] or "")
 
 
 # ── #1891: `parked` — a missing CI verdict must not consume merge budget ────
