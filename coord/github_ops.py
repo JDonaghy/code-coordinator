@@ -2368,11 +2368,19 @@ def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:
        knows exactly what it did not see and can inspect those files
        directly (e.g. ``git show``) instead of silently missing them.
 
-    Falls back to the old raw character slice — no boundary preference, no
-    file list — when no file boundary fits within *max_chars* at all (a
-    single file's own diff already exceeds the cap, or *diff* isn't a
-    unified diff to begin with). Cutting nothing at that point would just
-    emit an empty string, which is worse than the old behavior.
+    Falls back to the old raw character slice — no boundary preference — when
+    no file boundary fits within *max_chars* at all (a single file's own
+    diff already exceeds the cap, or *diff* isn't a unified diff to begin
+    with). Cutting nothing at that point would just emit an empty string,
+    which is worse than the old behavior. #2819 follow-up: that fallback
+    slice lands *inside* the first file's own diff (the loop below only
+    leaves ``cut_at`` unset when the second file's boundary already exceeds
+    *max_chars*, i.e. before any second file exists in the output) — so
+    that file's header rides into ``head`` looking complete while its body
+    is silently cut mid-hunk. Left unflagged, a reviewer who checks the
+    omitted-files list and finds their file *not* on it would reasonably
+    (and wrongly) conclude it was shown in full. That file is now always
+    called out as truncated, separately from the fully-omitted list.
     """
     if len(diff) <= max_chars:
         return diff
@@ -2388,15 +2396,33 @@ def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:
 
     if cut_at is None:
         head = diff[:max_chars]
+        # The cut point falls inside the first file's own diff (see the
+        # docstring above) — flag that file as incomplete rather than
+        # letting it silently pass as "not omitted, so fully shown".
+        all_paths = diff_file_paths(diff)
+        incomplete = all_paths[0] if all_paths else None
     else:
         head = diff[:cut_at].rstrip("\n")
+        incomplete = None
 
     dropped = [p for p in diff_file_paths(diff) if p not in diff_file_paths(head)]
 
     note = f"\n... [diff truncated at {max_chars} chars"
+    tallies = []
+    if incomplete:
+        tallies.append(f"1 file cut off mid-diff ({incomplete})")
     if dropped:
-        note += f"; {len(dropped)} file(s) omitted"
+        tallies.append(f"{len(dropped)} file(s) omitted")
+    if tallies:
+        note += "; " + "; ".join(tallies)
     note += "] ..."
+    if incomplete:
+        note += (
+            f"\nFile truncated mid-diff — the shown portion of `{incomplete}` "
+            "is INCOMPLETE, not fully reviewed above; inspect the rest "
+            f"directly (e.g. `git show <head-sha> -- {incomplete}`) before "
+            "approving."
+        )
     if dropped:
         note += (
             "\nFiles omitted by truncation — NOT reviewed above; inspect "

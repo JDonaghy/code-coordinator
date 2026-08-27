@@ -1115,6 +1115,31 @@ def test_truncate_diff_text_falls_back_to_char_slice_when_no_boundary_fits() -> 
     assert "omitted" not in out  # no boundary found -> no file list to report
 
 
+def test_truncate_diff_text_flags_huge_first_file_as_incomplete() -> None:
+    """#2819 follow-up: when the *first* file's own diff already exceeds
+    max_chars, the char-slice fallback used to let it ride into `head`
+    looking complete (its header made it in, so it never appeared on the
+    "omitted" list) while its body was silently cut mid-hunk. A reviewer
+    trusting the omitted-files list would wrongly conclude the huge first
+    file was shown in full. It must now be called out explicitly, distinct
+    from files that were dropped entirely."""
+    from coord import github_ops
+
+    diff = _diff_for("huge.py", 5000) + _diff_for("small.py", 5)
+    out = github_ops.truncate_diff_text(diff, max_chars=1000)
+
+    # The huge first file is cut off mid-hunk, not omitted entirely — it
+    # must be flagged as incomplete rather than silently passing review.
+    assert "huge.py" in out
+    assert "cut off mid-diff" in out
+    assert "INCOMPLETE" in out
+    # The trailing file is genuinely never shown at all — still on the
+    # separate "omitted" list.
+    assert "1 file(s) omitted" in out
+    assert "Files omitted by truncation" in out
+    assert "  - small.py" in out
+
+
 def test_pr_diff_returns_none_on_gh_error(monkeypatch) -> None:
     """#612: pr_diff is best-effort — a gh failure yields None, not a raise."""
     from coord import github_ops
@@ -1981,7 +2006,12 @@ def test_dispatch_review_patch_id_hashes_untruncated_diff(
     # display-truncated copy, so a huge diff still can't blow the briefing.
     assert client.calls, "expected a dispatch POST"
     _, payload = client.calls[0]
-    assert "[diff truncated at 60000 chars]" in payload["briefing"]
+    # #2819 follow-up: f.py is the *only* file and it alone exceeds the cap,
+    # so the char-slice fallback fires and the note now also flags f.py
+    # itself as cut off mid-diff (not just "truncated at N chars") — the
+    # exact fix this test's own issue asked for.
+    assert "[diff truncated at 60000 chars" in payload["briefing"]
+    assert "cut off mid-diff (f.py)" in payload["briefing"]
     assert len(payload["briefing"]) < len(big_diff)
 
 
