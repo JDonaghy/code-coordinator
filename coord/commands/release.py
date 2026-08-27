@@ -1926,7 +1926,7 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     with ``payload["ok"]=False`` and still be recorded here as a green
     lane — exactly the "unconfirmed success" defect #2096 exists to catch.
     """
-    from coord.deploy_units import ACTION_FAILED  # noqa: PLC0415
+    from coord.deploy_units import ACTION_FAILED, ACTION_MASKED  # noqa: PLC0415
 
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/deploy-units", {}, timeout=30.0
@@ -1954,6 +1954,7 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     units = body.get("units") or []
     changed = [u.get("name") for u in units if u.get("action") == "updated"]
     new = [u.get("name") for u in units if u.get("action") == "new"]
+    masked = sorted(u.get("name") for u in units if u.get("action") == ACTION_MASKED)
     failed_units = {
         (u.get("name") or "?"): (u.get("detail") or "?")
         for u in units if u.get("action") == ACTION_FAILED
@@ -1962,6 +1963,16 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     parts.append(f"{len(changed)} unit(s) refreshed" if changed else "units already current")
     if body.get("reloaded"):
         parts.append("daemon-reload ok")
+    if masked:
+        # #2812: an operator-masked unit's content is deliberately left
+        # untouched — see `coord.deploy_units.install_units`'s `_is_masked`
+        # guard. Reported here, not folded into a `✓` silently, so "which
+        # units did this run leave masked" is legible without grepping
+        # journal timestamps the way the #2124 carve-outs already are.
+        parts.append(
+            f"{len(masked)} unit(s) left masked, not refreshed (operator "
+            f"mask, #2812): {', '.join(map(str, masked))}"
+        )
     if new:
         parts.append(
             f"{len(new)} packaged unit(s) NOT installed here ({', '.join(sorted(map(str, new)))}) "
@@ -2002,16 +2013,26 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     # already running. Reporting "left stopped as-is" for the latter names
     # a state (stopped) this call never confirmed — the #2124 review's
     # reporting-accuracy fix.
+    held_masked = []
     held_stopped = []
     held_other = []
     for name, r in timers.items():
         if not (isinstance(r, dict) and r.get("ok") and not r.get("changed")):
             continue
-        match = re.search(r"ActiveState=(\w+)", r.get("detail") or "")
+        detail = r.get("detail") or ""
+        if detail.startswith("masked ("):
+            # #2812: `enable_timers`'s own masked branch — checked before
+            # the `ActiveState=` regex below, or a masked (always-inactive)
+            # timer would fall into `held_stopped` and get mislabeled
+            # "already enabled" for a timer that was never enabled at all.
+            held_masked.append(name)
+            continue
+        match = re.search(r"ActiveState=(\w+)", detail)
         if match and match.group(1) == "inactive":
             held_stopped.append(name)
         else:
             held_other.append(name)
+    held_masked.sort()
     held_stopped.sort()
     held_other.sort()
     failed_timers = {
@@ -2020,6 +2041,13 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     }
     if started:
         parts.append(f"enabled timer(s): {', '.join(started)}")
+    if held_masked:
+        # An operator's mask, respected rather than fought (#2812) — the
+        # units-lane equivalent of `held_stopped` below, one signal
+        # stronger.
+        parts.append(
+            f"left masked as-is (operator mask, #2812): {', '.join(held_masked)}"
+        )
     if held_stopped:
         # Confirmed inactive (ActiveState=inactive) and deliberately left
         # alone — the #2124 fix in one word: a timer an operator stopped is

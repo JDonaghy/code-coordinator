@@ -24,6 +24,7 @@ Nothing here needs systemd, a fleet, or root.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,61 @@ def test_the_previous_unit_is_backed_up(reference, installed):
     assert backup.exists()
     assert backup.name == "coord-serve.service.pre-0.4.111.bak"
     assert backup.read_text() == "[Service]\nExecStart=old\n"
+
+
+# ── masked units are left alone, not silently unmasked (#2812) ───────────
+#
+# `systemctl --user mask <unit>` replaces the unit's own file with a symlink
+# to `/dev/null` — the mask IS the file's content. Before this fix,
+# `install_units` read through that symlink (empty text), saw it didn't
+# match the packaged content, and happily `os.replace()`-d real unit text
+# over the mask — silently un-masking `coord-release-window.timer`, which
+# had been masked on purpose to stop it re-arming a #2607 roll-pending
+# marker. Three propagate runs in one afternoon each undid a by-hand
+# re-mask.
+
+
+def test_a_masked_unit_is_left_alone_not_overwritten(reference, installed):
+    (installed / "coord-serve.service").unlink()
+    (installed / "coord-serve.service").symlink_to("/dev/null")
+
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+
+    outcome = _by_name(report)["coord-serve.service"]
+    assert outcome.action == du.ACTION_MASKED
+    assert "masked" in outcome.detail
+    # The symlink itself must survive byte-for-byte — no backup, no write.
+    target = installed / "coord-serve.service"
+    assert target.is_symlink()
+    assert os.readlink(target) == "/dev/null"
+    assert not list(installed.glob("*.bak"))
+
+
+def test_a_masked_unit_does_not_make_the_report_unhealthy(reference, installed):
+    (installed / "coord-serve.service").unlink()
+    (installed / "coord-serve.service").symlink_to("/dev/null")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    assert report.ok
+    assert not report.changed
+
+
+def test_a_masked_timer_is_excluded_from_enable_timers_candidates(reference, installed):
+    """The install-side guard alone is enough to keep `enable_timers` from
+    ever trying to touch a masked timer — `ACTION_MASKED` is not one of
+    `enable_timers`'s `_PRESENT_ACTIONS`, so a masked `.timer` never even
+    reaches its candidate list, let alone a live `systemctl show`."""
+    (installed / "coord-serve.timer").symlink_to("/dev/null")
+
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    assert _by_name(report)["coord-serve.timer"].action == du.ACTION_MASKED
+
+    fake = _FakeRun()
+    result = du.enable_timers(report, runner=fake)
+    assert result == {}
+    assert fake.calls == []
 
 
 # ── dry run ──────────────────────────────────────────────────────────────
@@ -339,18 +395,50 @@ def test_enable_timers_still_enables_a_never_enabled_timer(reference, installed)
     assert ["systemctl", "--user", "enable", "--now", "coord-serve.timer"] in fake.calls
 
 
-def test_enable_timers_treats_a_masked_timer_as_never_enabled(reference, installed):
-    """`masked` is one of the states `enable --now` must still be tried
-    against (systemd itself refuses and reports the failure) — it must not
-    be misread as "already enabled" just because it is not `disabled`."""
+def test_enable_timers_leaves_a_masked_timer_masked(reference, installed):
+    """#2812: `coord-release-window.timer` was masked deliberately (four
+    `/dev/null` symlinks, dated and documented against #2607) and a
+    propagate run re-enabled it anyway — three times in one afternoon. A
+    live `masked` state must never reach `enable --now`: systemd refuses
+    it, but attempting it reports the refusal as a per-deploy failure
+    instead of respecting a signal stronger than the plain-`disabled`
+    #2082 case (contrast `test_enable_timers_still_enables_a_never_enabled_
+    timer` above, which must still fire for a unit nobody ever masked)."""
     (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
     report = du.install_units(target_dir=installed, reference_dir=reference,
                               machine_name="dellserver", port=7433)
     fake = _FakeSystemd({
         "coord-serve.timer": {"UnitFileState": "masked", "ActiveState": "inactive"},
     })
-    du.enable_timers(report, runner=fake)
-    assert ["systemctl", "--user", "enable", "--now", "coord-serve.timer"] in fake.calls
+
+    result = du.enable_timers(report, runner=fake)
+
+    ok, changed, detail = result["coord-serve.timer"]
+    assert ok
+    assert not changed
+    assert "masked" in detail
+    assert fake.states["coord-serve.timer"]["UnitFileState"] == "masked"
+    assert all(argv[2] != "enable" for argv in fake.calls)
+
+
+def test_enable_timers_leaves_a_masked_runtime_timer_masked(reference, installed):
+    """`masked-runtime` (`systemctl --user mask --runtime`) is the same
+    operator signal as a persistent mask — must not fall through to the
+    #2082 enable branch just because its `UnitFileState` spelling differs.
+    """
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeSystemd({
+        "coord-serve.timer": {"UnitFileState": "masked-runtime", "ActiveState": "inactive"},
+    })
+
+    result = du.enable_timers(report, runner=fake)
+
+    ok, changed, _detail = result["coord-serve.timer"]
+    assert ok
+    assert not changed
+    assert all(argv[2] != "enable" for argv in fake.calls)
 
 
 def test_enable_timers_skips_a_unit_this_host_does_not_run(reference, installed):

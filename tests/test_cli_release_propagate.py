@@ -1898,6 +1898,57 @@ def test_roll_units_holding_a_running_timer_is_not_reported_as_stopped(monkeypat
     assert "already enabled (unchanged): coord-agent.timer" in detail
 
 
+def test_roll_units_names_a_masked_unit_left_alone(monkeypatch):
+    """#2812: `install_units` reports a masked unit as its own action rather
+    than silently overwriting it — `_roll_units` must surface that as a
+    named finding, not fold it into "units already current" the way a
+    plain unchanged unit is."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True,
+            "units": [
+                {"name": "coord-release-window.service", "action": "masked",
+                 "detail": "masked by an operator — left masked, content "
+                           "not refreshed (#2812)"},
+            ],
+            "reloaded": False, "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "left masked, not refreshed" in detail
+    assert "coord-release-window.service" in detail
+
+
+def test_roll_units_names_a_masked_timer_left_alone(monkeypatch):
+    """The timer-enablement half of #2812: `enable_timers`'s own masked
+    branch must be named distinctly, not folded into "already enabled" —
+    it was never enabled, that is the whole point of the mask."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-release-window.timer": {
+                    "ok": True, "changed": False,
+                    "detail": "masked (ActiveState=inactive) — left masked, "
+                              "not overriding an operator's explicit mask "
+                              "(#2812)",
+                },
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "left masked as-is (operator mask, #2812)" in detail
+    assert "coord-release-window.timer" in detail
+    # Must not be misreported under either #2124 bucket.
+    assert "left stopped as-is" not in detail
+    assert "already enabled (unchanged)" not in detail
+    assert "enabled timer(s)" not in detail
+
+
 def test_roll_units_fails_the_lane_on_a_failed_unit_install(monkeypatch):
     """#2124 review: before this fix, `_roll_units`'s `ok` was derived only
     from `failed_timers`, so a unit whose install itself failed

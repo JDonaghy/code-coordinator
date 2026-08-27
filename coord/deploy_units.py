@@ -16,7 +16,7 @@ Python lane would have shipped the flag and none of the behaviour.
 
 So this module applies what ``unit_drift`` reports.
 
-THREE SAFETY PROPERTIES, ALL DELIBERATE
+FOUR SAFETY PROPERTIES, ALL DELIBERATE
 ---------------------------------------
 1. **Refresh only units this host already runs.** Which services a host runs
    is a *topology* decision (``coordinator.yml``), not a release decision. A
@@ -37,6 +37,17 @@ THREE SAFETY PROPERTIES, ALL DELIBERATE
    ``<name>.pre-<version>.bak`` next to the unit first, so the rollback for
    this lane is a file copy the operator can see and `diff`, not a re-run of
    an install script whose inputs have moved on.
+
+4. **A masked unit is never touched (#2812).** ``systemctl --user mask``
+   replaces a unit's own file with a symlink to ``/dev/null`` — the mask
+   itself IS that file's content, unlike ``disable`` (which lives elsewhere,
+   under ``wants/``, and leaves the unit's file alone). A content refresh
+   that does not know this reads empty text through the symlink, sees it
+   doesn't match the packaged content, and overwrites the mask — exactly how
+   `coord-release-window.timer`, masked on purpose against #2607, got
+   silently re-armed three times in one afternoon. :func:`_is_masked` checks
+   before every write; a masked unit is reported (:data:`ACTION_MASKED`) and
+   left completely alone, not backed up, not read through, not enabled.
 
 The write itself is atomic per file (temp file + ``os.replace``), so a unit
 is never observed half-written by a ``daemon-reload`` racing this.
@@ -87,6 +98,10 @@ ACTION_UPDATED = "updated"
 ACTION_NEW = "new"
 ACTION_SKIPPED = "skipped"
 ACTION_FAILED = "failed"
+#: An operator masked this unit (``systemctl --user mask``, a symlink to
+#: ``/dev/null``) — content is left untouched, not overwritten (#2812). See
+#: :func:`_is_masked`.
+ACTION_MASKED = "masked"
 
 
 @dataclass(frozen=True)
@@ -196,6 +211,29 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _is_masked(path: Path) -> bool:
+    """Is *path* a systemd mask symlink (#2812)?
+
+    ``systemctl --user mask <unit>`` replaces the unit's own file with a
+    symlink to ``/dev/null`` — the mask *is* the file's content, unlike
+    ``disable`` (which only removes symlinks elsewhere, under ``wants/``,
+    and leaves the unit's own file alone). That is exactly why a blind
+    "refresh this file's bytes" used to defeat a mask silently: reading
+    through the symlink returns empty text, which never equals the
+    packaged content, so the old code treated it as drifted and happily
+    ``os.replace()``-d real unit content over the ``/dev/null`` symlink —
+    unmasking `coord-release-window.timer` as a side effect of a routine
+    content refresh, three times in one afternoon.
+
+    Filesystem-only, no ``systemctl`` call needed — matching this module's
+    "pure filesystem operation" design (see the module docstring).
+    """
+    try:
+        return path.is_symlink() and os.readlink(path) == os.devnull
+    except OSError:
+        return False
+
+
 def install_units(
     *,
     target_dir: Path | None = None,
@@ -238,6 +276,27 @@ def install_units(
                     "packaged but not installed on this host — a release does "
                     "not decide which services a host runs; install and enable "
                     "it by hand if this host should have it",
+                )
+            )
+            continue
+
+        if _is_masked(installed):
+            # An operator's explicit "never run this" (#2812) — stronger
+            # than the #2124 stopped-timer carve-out below, and content
+            # cannot be refreshed here without destroying the very mask
+            # that makes it a signal at all (see `_is_masked`). Leave the
+            # symlink exactly as it is: no backup, no write, no read
+            # through it. Reported as its own action so `enable_timers`
+            # (which only ever sees units in `_PRESENT_ACTIONS`) never gets
+            # a chance to try re-enabling it either.
+            report.units.append(
+                UnitOutcome(
+                    source.name,
+                    ACTION_MASKED,
+                    "masked by an operator (systemctl --user mask) — left "
+                    "masked, content not refreshed (#2812); "
+                    "`systemctl --user unmask " + source.name + "` if this "
+                    "unit should run again, then re-run propagate",
                 )
             )
             continue
@@ -330,6 +389,15 @@ def daemon_reload(*, runner=None, timeout: float = 30.0) -> tuple[bool, str]:
 #: deliberately excluded.
 _PRESENT_ACTIONS = frozenset({ACTION_UNCHANGED, ACTION_UPDATED})
 
+#: ``UnitFileState`` values that mean "an operator explicitly told systemd
+#: never to run this on its own until they say otherwise" (#2812) — strictly
+#: stronger than the plain ``disabled``/``linked`` #2082 was about (nobody
+#: ever *decided* a freshly-installed timer shouldn't run; it simply never
+#: got its first ``enable``). Masking is systemd's own documented mechanism
+#: for exactly the "block automation from re-enabling it" case, respected
+#: here the same way #2124 respects an operator's ``stop``.
+_MASKED_STATES = frozenset({"masked", "masked-runtime"})
+
 
 def enable_timers(
     report: InstallReport, *, runner=None, timeout: float = 30.0,
@@ -372,10 +440,24 @@ def enable_timers(
     :data:`_INACTIVE_STATES` is left completely alone, whatever its
     ``ActiveState`` — that is the acceptance case "a timer stopped by an
     operator is still down after a deploy". A timer that *is* in one of
-    those states (never enabled at all, or masked) is the actual #2082
-    defect and gets ``enable --now`` exactly as before — there is no
-    operator intent to preserve for a timer that has never run, and leaving
-    it disabled is the invisible-self-heals-never failure #2082 closed.
+    those states (never enabled at all) is the actual #2082 defect and gets
+    ``enable --now`` exactly as before — there is no operator intent to
+    preserve for a timer that has never run, and leaving it disabled is the
+    invisible-self-heals-never failure #2082 closed.
+
+    ``masked``/``masked-runtime`` (:data:`_MASKED_STATES`) is carved back out
+    of that #2082 branch (#2812): unlike plain ``disabled`` — which nobody
+    *decided*, it just never got its first ``enable`` — masking is always a
+    deliberate operator act, and ``install_units`` already refuses to touch
+    a masked unit's content for the identical reason (see
+    :func:`_is_masked`). Reaching a live ``masked`` state here at all means
+    either that guard didn't apply (this call was handed a report built some
+    other way) or systemd's state changed between calls; either way,
+    ``enable`` would simply be refused by systemd — attempting it anyway and
+    reporting the refusal as a per-deploy failure is not "protecting" the
+    mask, it is spamming an ``ok=False`` for a state that is exactly what
+    the operator asked for. So this function does not even try: no
+    subprocess call, so it can never be what silently un-masks the unit.
 
     State is queried once, in a single batched ``systemctl --user show``
     (:func:`coord.health.checks.timer_active._timer_states` — the same
@@ -424,7 +506,25 @@ def enable_timers(
             )
             continue
 
-        # Never enabled at all — disabled/linked/masked, or unreadable (no
+        if file_state in _MASKED_STATES:
+            # An operator's explicit "never run this" (#2812) — strictly
+            # stronger than the plain-disabled #2082 case below, and
+            # `enable` is refused by systemd on a masked unit anyway. Not
+            # attempting it (rather than trying and reporting the refusal
+            # as a failure) is what actually respects the mask — see the
+            # docstring above.
+            active = fields.get("ActiveState") or "unknown"
+            out[name] = (
+                True,
+                False,
+                f"masked (ActiveState={active}) — left masked, not "
+                "overriding an operator's explicit mask (#2812); unmask by "
+                "hand (`systemctl --user unmask <unit>`) if this unit "
+                "should run again",
+            )
+            continue
+
+        # Never enabled at all — disabled/linked, or unreadable (no
         # systemd, or the batched query above failed and this unit simply
         # has no entry). This is the actual #2082 defect: no operator ever
         # ran `stop` on a timer that was never running, so forcing a start
