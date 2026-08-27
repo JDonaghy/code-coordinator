@@ -42,6 +42,13 @@ from coord.drive_queue import (
     QueueEntry,
 )
 
+#: The genuine `coord.state.apply_issue_labels`, captured at import time —
+#: before `_default_pipeline_labels` (autouse) replaces the module attribute
+#: with an inert no-op. A test that needs the REAL seam chain
+#: (state -> `_apply_issue_labels_local` -> `github_ops`) monkeypatches this
+#: back in; see `test_add_labels_gh_with_the_resolved_slug_...`.
+_REAL_APPLY_ISSUE_LABELS = state.apply_issue_labels
+
 REPO = "claude-coordinator"
 # A SECOND repo, so #1972's per-repo capacity has something to be per-repo
 # about: the whole point is that a quadraui entry can ride alongside an
@@ -343,13 +350,14 @@ def test_add_applies_coord_and_status_ready_on_a_fresh_issue(cli, labels):
     assert call["issue_number"] == 1650
     assert call["add"] == {"coord", "status:ready"}
     assert call["remove"] == {"status:refining", "status:backlog"}
-    # #2839 review: deliberately `None`, not a config-resolved slug — see
-    # `apply_pipeline_track_labels_best_effort`'s docstring. Passing `None`
-    # lets `apply_issue_labels`/`_apply_issue_labels_local` fall back to
-    # `repo_github or repo_name` on their own, without this best-effort
-    # helper making its own (uncachable, per-`add`) round trip to resolve a
-    # slug that's only needed for the fallback anyway.
-    assert call["repo_github"] is None
+    # #2839 review: the RESOLVED GitHub slug, not the bare coordinator.yml
+    # `name:`. The two diverge in `_CONFIG_YAML` above exactly as they do in
+    # this repo's own `coordinator.example.yml` (`name: code-coordinator` vs
+    # `github: JDonaghy/claude-coordinator`), and `gh issue edit --repo`
+    # requires `[HOST/]OWNER/REPO` — handing it `claude-coordinator` errors
+    # out, so the label would never land for precisely the repos #2839 was
+    # filed about.
+    assert call["repo_github"] == "john/claude-coordinator"
 
 
 def test_add_survives_a_failing_label_write(cli, monkeypatch):
@@ -365,24 +373,52 @@ def test_add_survives_a_failing_label_write(cli, monkeypatch):
     assert queued(1650) is not None
 
 
-def test_apply_pipeline_track_labels_best_effort_never_calls_load_config(monkeypatch):
-    """#2839 review: `apply_pipeline_track_labels_best_effort` used to make
-    its own `_load_config` call to resolve a GitHub slug for the label write.
-    `_load_config` turns a config-load failure — e.g. a thin client's
-    `fetch_remote_config` timing out against a momentarily-unreachable board
-    daemon, or a briefly-unreadable local `coordinator.yml` — into
-    `click.echo(...); sys.exit(2)`, which raises `SystemExit`. `SystemExit`
-    is a `BaseException`, not an `Exception`, so it blows straight through
-    this function's `except Exception` and would kill the whole
-    `drive-queue add` process *after* the board row was already written —
-    contradicting the "non-blocking" contract in its own docstring.
+def test_add_labels_gh_with_the_resolved_slug_not_the_local_repo_name(cli, monkeypatch):
+    """#2839 review (blocking): the slug that actually reaches the forge.
 
-    The fix drops the `_load_config` call from this function entirely (it
-    passes `repo_github=None` and lets `apply_issue_labels`'s own
-    `repo_github or repo_name` fallback resolve the slug). Verify that
-    directly at the unit level: even with `_load_config` wired to always
-    raise `SystemExit`, calling this function does not raise, and the
-    underlying label write still goes through with `repo_github=None`.
+    The `labels` fixture above stubs `coord.state.apply_issue_labels`, so it
+    can only see what the CLI *asked* for — it cannot catch a `repo_github`
+    that is wrong by the time `gh` runs. This test un-stubs that seam and
+    lets the real `apply_issue_labels` ->
+    `_apply_issue_labels_local` -> `github_ops.change_issue_labels` chain run,
+    stubbing only the last hop (which shells out to
+    `gh issue edit --repo <slug>`, and `gh` rejects anything that is not
+    `[HOST/]OWNER/REPO`).
+
+    `_CONFIG_YAML` deliberately diverges `name: claude-coordinator` from
+    `github: john/claude-coordinator`, the same way this repo's own
+    `coordinator.example.yml` does. If `add` ever regresses to passing
+    `repo_github=None`, `_apply_issue_labels_local`'s `repo_github or
+    repo_name` fallback hands `gh` the bare local name, `gh` errors, and the
+    best-effort helper silently swallows it — the #2839 label never lands,
+    only now without a traceback.
+    """
+    seen: list[str] = []
+
+    def _fake_change_issue_labels(slug, issue_number, *, add, remove):
+        seen.append(slug)
+        return (sorted(add), True)
+
+    monkeypatch.setattr("coord.state.apply_issue_labels", _REAL_APPLY_ISSUE_LABELS)
+    monkeypatch.setattr(
+        "coord.github_ops.change_issue_labels", _fake_change_issue_labels
+    )
+
+    result = cli("add", REPO, "1650")
+    assert result.exit_code == 0, result.output
+    assert seen == ["john/claude-coordinator"]
+
+
+def test_add_survives_a_config_that_will_not_load(cli, monkeypatch, labels):
+    """#2839 review (iteration 1): a config-load failure must not kill `add`.
+
+    `_load_config` reports a `ConfigError` — a thin client's
+    `fetch_remote_config` timing out against a momentarily-unreachable board
+    daemon, a briefly-unreadable `coordinator.yml` — as `click.echo(...)` +
+    `sys.exit(2)`, i.e. `SystemExit`, which is a `BaseException` and so
+    escapes a bare `except Exception`. The enqueue must still succeed (the
+    board row is the source of truth), and the label write must still be
+    attempted, degraded to an unresolved slug rather than skipped.
     """
     from coord.commands import _common
 
@@ -391,23 +427,39 @@ def test_apply_pipeline_track_labels_best_effort_never_calls_load_config(monkeyp
 
     monkeypatch.setattr(_common, "_load_config", _boom_exit)
 
-    calls: list[dict[str, Any]] = []
+    result = cli("add", REPO, "1650")
+    assert result.exit_code == 0, result.output
+    assert queued(1650) is not None
+    assert len(labels) == 1
+    assert labels[0]["add"] == {"coord", "status:ready"}
+    # No config to resolve `name:` -> `github:` with, and `claude-coordinator`
+    # is not itself a slug, so this degrades to the `repo_name` fallback
+    # rather than inventing one.
+    assert labels[0]["repo_github"] is None
 
-    def _fake_apply_issue_labels(repo_name, issue_number, *, add, remove, repo_github=None):
-        calls.append(
-            {"repo_name": repo_name, "issue_number": issue_number, "repo_github": repo_github}
-        )
-        return (sorted(add), True)
 
-    monkeypatch.setattr("coord.state.apply_issue_labels", _fake_apply_issue_labels)
+@pytest.mark.parametrize(
+    ("repo_arg", "expected"),
+    [
+        # Known local name -> its `github:` slug, even when the two diverge.
+        (REPO, "john/claude-coordinator"),
+        # Unknown to coordinator.yml but already a slug: usable as-is (the
+        # same fallback `_resolve_repo_slug` validates).
+        ("someone/untracked-repo", "someone/untracked-repo"),
+        # Unknown AND not a slug: unresolvable, so say so instead of guessing.
+        ("typo-repo", None),
+    ],
+)
+def test_resolve_repo_slug_best_effort(config_file: Path, repo_arg, expected):
+    """The non-fatal sibling of `_resolve_repo_slug` never calls `sys.exit`."""
+    from coord.commands._common import _load_config, resolve_repo_slug_best_effort
 
-    # Must not raise — a config-load failure at label time is best-effort.
-    _common.apply_pipeline_track_labels_best_effort(REPO, 1650)
-
-    assert len(calls) == 1
-    assert calls[0]["repo_name"] == REPO
-    assert calls[0]["issue_number"] == 1650
-    assert calls[0]["repo_github"] is None
+    cfg = _load_config(config_file)
+    assert resolve_repo_slug_best_effort(cfg, repo_arg) == expected
+    # `config=None` (the fail-open path) degrades, it does not explode.
+    assert resolve_repo_slug_best_effort(None, repo_arg) == (
+        repo_arg if "/" in repo_arg else None
+    )
 
 
 def test_add_does_not_relabel_an_already_running_entry(cli, labels):

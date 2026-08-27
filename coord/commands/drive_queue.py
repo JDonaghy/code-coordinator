@@ -35,7 +35,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import click
 
@@ -104,6 +104,9 @@ from coord.overlap_predict import (
     predictions_from_audit,
     tally,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -335,12 +338,18 @@ def drive_queue_add(
     existing_entries = entries_from_rows(list_drive_queue())
     if max_fix_rounds is not None and max_fix_rounds < 1:
         raise click.ClickException("--max-fix-rounds must be a positive integer")
+    # #2839: reused below for the Pipeline label write's slug resolution, so
+    # that best-effort projection costs no SECOND config load (a `GET /config`
+    # round trip to the board daemon on a thin client). `None` on the
+    # documented fail-open path — an unloadable config never blocks an
+    # enqueue, and never blocks the label write either.
+    cfg: Config | None = None
     try:
         after = parse_after_spec(after_specs, repo)
         # #2603: reuses `--after`'s own `N` / `REPO#N` parsing — a rejected
         # edge is named the same way an operator would name a real one.
         reject_after = set(parse_after_spec(reject_after_specs, repo))
-        validate_config_repo(config_path, repo)
+        cfg = validate_config_repo(config_path, repo)
         validate_hold_flags(hold_after, hold_reason, resume_when, hold_scope)
         validate_enqueue(existing_entries, repo, issue, after)
     except QueueError as exc:
@@ -405,15 +414,18 @@ def drive_queue_add(
     # #2839: queueing a drive is a strictly STRONGER statement than "send to
     # Pipeline" (`coord track`), so it must never leave the issue in a
     # weaker label state — apply the same `coord` + `status:ready` labels
-    # `track` does. Best-effort/non-blocking (a GitHub outage warns and
-    # carries on; the board row above is already written and is the
+    # `track` does, resolved through the SAME `cfg` already loaded above
+    # (coordinator.yml's `name:` is routinely not the GitHub slug, so the
+    # forge needs the resolved `github:` value, not `repo`). Best-effort/
+    # non-blocking (a GitHub outage warns and carries on; the board row above
+    # is already written and is the
     # source of truth for queue membership) and skipped for an entry that is
     # already `running` — #2821 was mid-drive with `coord` but no
     # `status:*`, and re-adding `status:ready` to a running card would
     # misrepresent it as not-yet-started. This is enqueue-time ONLY: never
     # mirrored onto `coord drive-queue remove`, which must not untrack.
     if previous is None or previous.state != STATE_RUNNING:
-        apply_pipeline_track_labels_best_effort(repo, issue)
+        apply_pipeline_track_labels_best_effort(repo, issue, config=cfg)
     if auto_after:
         _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
@@ -725,7 +737,12 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
         from coord.commands._common import _load_config  # noqa: PLC0415
 
         repo_cfg = _load_config(config_path).repo(repo)
-    except Exception:  # noqa: BLE001 — a config that won't load means no prediction
+    except (Exception, SystemExit):  # noqa: BLE001 — a config that won't load
+        # means no prediction. `SystemExit` is listed for the same reason as in
+        # `validate_config_repo` (#2839 review): `_load_config` reports a
+        # `ConfigError` as `click.echo` + `sys.exit(2)`, a `BaseException`, so
+        # `except Exception` alone would abort `drive-queue add` here instead
+        # of degrading to "no overlap prediction" as documented.
         return None
     if repo_cfg is None:
         return None
@@ -890,7 +907,7 @@ def validate_hold_flags(
         )
 
 
-def validate_config_repo(config_path: Path, repo: str) -> None:
+def validate_config_repo(config_path: Path, repo: str) -> Config | None:
     """Refuse a repo coordinator.yml has never heard of.
 
     `coord drive <repo> <issue>` would fail at preflight anyway
@@ -898,16 +915,29 @@ def validate_config_repo(config_path: Path, repo: str) -> None:
     ``add`` time turns a mysterious tick-time block into an immediate typo
     report.  Fail-OPEN on a config that won't load at all: a thin client whose
     config cache is momentarily unreadable must still be able to queue work.
+
+    Returns the loaded ``Config`` (``None`` when it could not be loaded, i.e.
+    the fail-open path) so the caller does not have to load it a SECOND time
+    — on a thin client each load is a `GET /config` round trip to the board
+    daemon, and #2839's best-effort label write needs the same config only to
+    resolve `repo`'s GitHub slug.
+
+    ``SystemExit`` is caught alongside ``Exception`` deliberately (#2839
+    review): ``_load_config`` reports a ``ConfigError`` as ``click.echo`` +
+    ``sys.exit(2)``, which is a ``BaseException`` — so a bare ``except
+    Exception`` here would NOT fail open at all, it would abort `add` with
+    exit code 2, the exact opposite of this function's documented posture.
     """
     try:
         from coord.commands._common import _load_config  # noqa: PLC0415
 
         config = _load_config(config_path)
-    except Exception:  # noqa: BLE001 — see the fail-open note above
-        return
+    except (Exception, SystemExit):  # noqa: BLE001 — see the fail-open note above
+        return None
     if config.repo(repo) is None:
         known = ", ".join(sorted(r.name for r in config.repos)) or "(none)"
         raise QueueError(f"repo {repo!r} is not in coordinator.yml (known: {known})")
+    return config
 
 
 # ── list ─────────────────────────────────────────────────────────────────────
