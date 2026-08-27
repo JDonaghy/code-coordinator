@@ -3548,14 +3548,22 @@ def test_a_genuinely_failed_check_reported_as_blocked_still_just_waits_like_befo
 # ═══════════════════════════════════════════════════════════════════════════
 # #1892: the sibling case — a CI verdict DID arrive, but every failing check
 # carried no verdict about the code (never assigned a runner, or died before
-# checkout). `coord merge`'s own live attempt auto-reruns CI for this case
-# instead; the drive must wait for that rerun, not retry `coord merge`
-# itself or burn its merge-attempt budget on a no-op observation.
+# checkout). `coord merge`'s own live attempt auto-reruns CI for this case;
+# the drive must not retry `coord merge` in a way that spends its
+# merge-attempt budget on a no-op observation.
+#
+# #2814: on `BoardFetcher._fetch_local` (the standalone `coord drive` path)
+# nothing periodic ever makes that "own live attempt" — see the #2814 module
+# comment above `_decide_merge`'s CI-reason block — so this now dispatches
+# the same real, attempt-exempt `coord merge --only` re-check every poll
+# instead of a bare `_wait()`, exactly like #1891/#2347/#2252.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
-def test_ci_infra_failure_waits_regardless_of_which_status_the_board_shows(status):
+def test_ci_infra_failure_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
     action = step(
         approved_work(
             merge_status=status,
@@ -3565,17 +3573,21 @@ def test_ci_infra_failure_waits_regardless_of_which_status_the_board_shows(statu
             ),
         )
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
     assert "auto-rerunning" in action.label
-    assert "not retrying" in action.label
+    assert "not spending an attempt" in action.label
 
 
-def test_ci_infra_failure_never_spends_an_attempt_across_several_polls():
-    """Acceptance (#1892): a PR whose failures are ALL verdictless does not
-    consume a drive merge attempt — unlike #2814's is_ci_pending_reason
-    fix, this stays a bare `_wait()` (no re-check dispatch): `coord merge`'s
-    own live attempt already auto-reruns CI for this case, so there is no
-    standalone-path gap to plug (see the #1892 module comment above)."""
+def test_ci_infra_failure_retries_for_real_without_spending_an_attempt():
+    """Acceptance (#1892/#2814): a PR whose failures are ALL verdictless does
+    not consume a drive merge attempt across several polls, but — unlike the
+    old bare `_wait()` — each poll still dispatches a real `coord merge
+    --only` RUN, so `ci_infra_reruns` (and the persisted `error`) keep
+    advancing on the standalone path instead of freezing on a stale
+    snapshot (see the #2814 module comment above `_decide_merge`'s CI-reason
+    block)."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
     s = approved_work(
@@ -3585,7 +3597,8 @@ def test_ci_infra_failure_never_spends_an_attempt_across_several_polls():
 
     for _ in range(5):
         action = step(s, opts, counters=counters)
-        assert action.kind == WAIT
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
         assert counters.merge_attempts == 0
 
 
@@ -3625,13 +3638,21 @@ def test_a_genuinely_failed_check_is_not_read_as_ci_infra():
 # genuine "still running" one. `coord merge`'s own live attempt tracks a
 # bounded count of consecutive fetch failures for this and keeps waiting
 # either way — there is no CI to rerun and no gate to re-test, only more real
-# time (GitHub answering again). The drive must wait, not retry `coord
-# merge` itself or burn its merge-attempt budget on a no-op observation.
+# time (GitHub answering again). The drive must not retry `coord merge` in a
+# way that spends its merge-attempt budget on a no-op observation.
+#
+# #2814: same standalone-path gap as #1891/#1892/#2252 — nothing periodic
+# makes that "own live attempt" on `BoardFetcher._fetch_local` (see the
+# #2814 module comment above `_decide_merge`'s CI-reason block), so this now
+# dispatches the same real, attempt-exempt `coord merge --only` re-check
+# every poll instead of a bare `_wait()`.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
-def test_ci_unreadable_waits_regardless_of_which_status_the_board_shows(status):
+def test_ci_unreadable_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
     action = step(
         approved_work(
             merge_status=status,
@@ -3642,15 +3663,20 @@ def test_ci_unreadable_waits_regardless_of_which_status_the_board_shows(status):
             ),
         )
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
     assert "GitHub could not be reached" in action.label
-    assert "not retrying" in action.label
+    assert "not spending an attempt" in action.label
 
 
-def test_ci_unreadable_never_spends_an_attempt_across_several_polls():
-    """Acceptance (#2347): a PR whose CI status could not be read from
-    GitHub does not consume a drive merge attempt, mirroring the identical
-    #1891/#1892 guarantees above."""
+def test_ci_unreadable_retries_for_real_without_spending_an_attempt():
+    """Acceptance (#2347/#2814): a PR whose CI status could not be read from
+    GitHub does not consume a drive merge attempt across several polls, but
+    each poll still dispatches a real `coord merge --only` RUN — mirroring
+    the identical #1891/#1892/#2252 guarantees, so `ci_unreadable_reruns`
+    (and the persisted `error`) keep advancing instead of freezing on a
+    stale snapshot on the standalone path."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
     s = approved_work(
@@ -3664,7 +3690,8 @@ def test_ci_unreadable_never_spends_an_attempt_across_several_polls():
 
     for _ in range(5):
         action = step(s, opts, counters=counters)
-        assert action.kind == WAIT
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
         assert counters.merge_attempts == 0
 
 
@@ -3764,13 +3791,22 @@ def test_merge_gate_kind_recognises_unknown_branch_head_as_its_own_kind():
 # #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
 # real about the code, but `coord merge`'s own live attempt has only
 # observed it fail ONCE so far and is already re-running the failed job(s)
-# to rule out a flake before spending a drive attempt. The drive must wait
-# for that re-run, not retry `coord merge` itself.
+# to rule out a flake before spending a drive attempt. The drive must not
+# retry `coord merge` in a way that spends its merge-attempt budget on a
+# no-op observation.
+#
+# #2814: same standalone-path gap as #1891/#1892/#2347 — nothing periodic
+# makes that "own live attempt" on `BoardFetcher._fetch_local` (see the
+# #2814 module comment above `_decide_merge`'s CI-reason block), so this now
+# dispatches the same real, attempt-exempt `coord merge --only` re-check
+# every poll instead of a bare `_wait()`.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
-def test_ci_flaky_recheck_waits_regardless_of_which_status_the_board_shows(status):
+def test_ci_flaky_recheck_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
     action = step(
         approved_work(
             merge_status=status,
@@ -3780,15 +3816,20 @@ def test_ci_flaky_recheck_waits_regardless_of_which_status_the_board_shows(statu
             ),
         )
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
     assert "rule out a flake" in action.label
-    assert "not retrying" in action.label
+    assert "not spending an attempt" in action.label
 
 
-def test_ci_flaky_recheck_never_spends_an_attempt_across_several_polls():
-    """Acceptance (#2252): a PR whose one re-check is still pending an
-    answer does not consume a drive merge attempt, mirroring the identical
-    #1891/#1892 guarantees above."""
+def test_ci_flaky_recheck_retries_for_real_without_spending_an_attempt():
+    """Acceptance (#2252/#2814): a PR whose one re-check is still pending an
+    answer does not consume a drive merge attempt across several polls, but
+    each poll still dispatches a real `coord merge --only` RUN — mirroring
+    the identical #1891/#1892/#2347 guarantees, so `ci_flaky_reruns` (and
+    the persisted `error`) keep advancing instead of freezing on a stale
+    snapshot on the standalone path."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
     s = approved_work(
@@ -3798,7 +3839,8 @@ def test_ci_flaky_recheck_never_spends_an_attempt_across_several_polls():
 
     for _ in range(5):
         action = step(s, opts, counters=counters)
-        assert action.kind == WAIT
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
         assert counters.merge_attempts == 0
 
 
@@ -4375,7 +4417,8 @@ def test_a_live_ci_wait_still_wins_over_a_captured_gate_line():
 
 
 def test_a_live_ci_unreadable_wait_still_wins_over_a_captured_gate_line():
-    """#2347's bare wait gets the SAME treatment as #1891/#1892 above: a
+    """#2347's re-check (#2814: now a real attempt-exempt `coord merge
+    --only`, not a bare wait) gets the SAME treatment as #1891/#1892 above: a
     snapshot from an older attempt must not divert the drive into a re-test
     while GitHub itself could not be reached to read CI status."""
     counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
@@ -4386,7 +4429,7 @@ def test_a_live_ci_unreadable_wait_still_wins_over_a_captured_gate_line():
         ),
         counters=counters,
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
     assert counters.fix_rounds == 0
     assert counters.merge_attempts == 0
 
