@@ -1003,9 +1003,11 @@ impl CoordApp {
             }
         }
 
-        // #2497: Poll the in-flight full-issue-body detail fetch into the
-        // cache (the /board wire drops a closed issue's body to 0 chars;
-        // the Board/Pipeline Issue tab hydrates the full body from
+        // #2497/#1939: Poll the in-flight full-issue-body detail fetch into
+        // the cache (the /board wire drops a closed issue's body to 0 chars,
+        // and an open non-epic issue's body to its machine-parsed residue;
+        // the Board/Pipeline Issue tab and the Drive/Merge Queue tab's
+        // issue-detail pane all hydrate the full body from
         // GET /issue/{repo}/{number}).
         if let Some((key, rx)) = &self.issue_fetch_rx {
             match rx.try_recv() {
@@ -1028,8 +1030,9 @@ impl CoordApp {
                 }
             }
         }
-        // #2497: Arm a fetch when the Board or Pipeline Issue tab shows an
-        // issue whose body was wire-truncated and not yet hydrated (the
+        // #2497/#1939: Arm a fetch when the Board Issue tab, the Pipeline
+        // Issue tab, or the Drive/Merge Queue tab's issue-detail pane shows
+        // an issue whose body was wire-truncated and not yet hydrated (the
         // target helper handles tab/view gating + cache hits + failure
         // back-off).
         if self.issue_fetch_rx.is_none() {
