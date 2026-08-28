@@ -20,10 +20,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from coord import db as coord_db
 from coord import sql
 from coord import store_migrate
+from coord.commands.store_migrate import migrate_to_postgres
 from tests.backends import scratch_database
 
 
@@ -177,6 +179,64 @@ class TestAuditReferentialIntegrity:
             conn.close()
 
 
+class TestTopologicalImportOrder:
+    def test_no_edges_preserves_alphabetical_order(self) -> None:
+        tables = ["b", "a", "c"]
+        assert store_migrate._topological_import_order(tables, []) == ["a", "b", "c"]
+
+    def test_referenced_table_sorts_before_referencing_table(self) -> None:
+        """The exact regression this exists for: split_chunks sorts before
+        split_proposals alphabetically, but split_chunks.split_proposal_id
+        references split_proposals.id, so split_proposals must import
+        first."""
+        tables = ["split_chunks", "split_proposals"]
+        edges = [("split_chunks", "split_proposal_id", "split_proposals", "id")]
+        assert store_migrate._topological_import_order(tables, edges) == [
+            "split_proposals",
+            "split_chunks",
+        ]
+
+    def test_unrelated_tables_keep_split_proposals_before_split_chunks(self) -> None:
+        """Kahn's algorithm places every table with no *unplaced* dependency
+        in one alphabetically-sorted batch per round, so a table with zero
+        dependencies (``zzz_last``) can land in an earlier round than
+        ``split_chunks`` even though ``zzz_last`` sorts after it -- what
+        matters for #828's fix is only that ``split_proposals`` precedes
+        ``split_chunks``, which every table in *tables* is free to interleave
+        around."""
+        tables = ["assignments", "split_chunks", "split_proposals", "zzz_last"]
+        edges = [("split_chunks", "split_proposal_id", "split_proposals", "id")]
+        order = store_migrate._topological_import_order(tables, edges)
+        assert set(order) == set(tables)
+        assert order.index("split_proposals") < order.index("split_chunks")
+
+    def test_edge_referencing_table_outside_the_import_set_is_ignored(self) -> None:
+        tables = ["split_chunks"]
+        edges = [("split_chunks", "split_proposal_id", "split_proposals", "id")]
+        assert store_migrate._topological_import_order(tables, edges) == ["split_chunks"]
+
+
+class TestFormatViolations:
+    def _violations(self, n: int) -> list[store_migrate.TypeAffinityViolation]:
+        return [
+            store_migrate.TypeAffinityViolation("t", "c", i, "x", "INTEGER")
+            for i in range(n)
+        ]
+
+    def test_under_the_cap_lists_every_violation_with_no_truncation_note(self) -> None:
+        text = store_migrate._format_violations(self._violations(3))
+        lines = text.splitlines()
+        assert len(lines) == 3
+        assert "more" not in text
+
+    def test_over_the_cap_truncates_and_reports_remaining_count(self) -> None:
+        violations = self._violations(store_migrate._MAX_LISTED_VIOLATIONS + 5)
+        text = store_migrate._format_violations(violations)
+        lines = text.splitlines()
+        assert len(lines) == store_migrate._MAX_LISTED_VIOLATIONS + 1
+        assert lines[-1] == "  ... and 5 more"
+
+
 class TestRunImport:
     def _seed_source(self, tmp_path: Path) -> Path:
         conn = _open_source(tmp_path)
@@ -305,3 +365,154 @@ class TestRunImport:
     def test_source_not_found_raises_import_aborted(self, tmp_path: Path) -> None:
         with pytest.raises(store_migrate.ImportAborted, match="not found"):
             store_migrate.run_import(sqlite_path=tmp_path / "nope.db")
+
+    def test_import_respects_fk_dependency_order_for_split_workflow(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for the exact ordering bug: discover_tables' plain
+        alphabetical order sorts split_chunks before split_proposals, but
+        split_chunks.split_proposal_id references split_proposals.id. A
+        target that enforces that FK (Postgres always does; SQLite only
+        when a connection turned PRAGMA foreign_keys on) must therefore see
+        split_proposals' rows land first, or the import fails mid-way.
+
+        tests/backends.py's scratch_database deliberately leaves FK
+        enforcement off for its SQLite branch (so as not to change default
+        suite behavior) -- turned on explicitly here so this test actually
+        exercises the ordering fix rather than passing vacuously.
+        """
+        conn = _open_source(tmp_path)
+        try:
+            cur = conn.execute(
+                "INSERT INTO split_proposals (repo_name, issue_number, issue_title) "
+                "VALUES (?, ?, ?)",
+                ("r1", 1, "t1"),
+            )
+            proposal_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO split_chunks (split_proposal_id, title, scope) "
+                "VALUES (?, ?, ?)",
+                (proposal_id, "chunk", "scope"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with scratch_database(tmp_path, "target.db") as target_conn:
+            sql.execute(target_conn, "PRAGMA foreign_keys=ON")
+            report = store_migrate.run_import(
+                sqlite_path=tmp_path / "source.db", target_connector=lambda: target_conn
+            )
+            assert report.ok
+            by_table = {t.table: t for t in report.tables}
+            assert by_table["split_proposals"].target_rows == 1
+            assert by_table["split_chunks"].target_rows == 1
+
+
+class TestMigrateToPostgresCli:
+    """``coord migrate-to-postgres`` -- the CLI wrapper around ``run_import``.
+
+    ``--dry-run`` is used throughout: it never opens the target (see
+    ``run_import``'s docstring), so these tests need no reachable Postgres
+    server or installed driver, matching the rest of this file's default
+    (SQLite-only) posture -- while still exercising the exact code path
+    (the ``--dsn`` echo) the DSN-leak finding was about, since that line
+    prints unconditionally whenever a --dsn was given, dry run or not.
+    """
+
+    def _seed_source(self, tmp_path: Path) -> Path:
+        conn = coord_db._open(tmp_path / "source.db")
+        conn.close()
+        return tmp_path / "source.db"
+
+    def test_dsn_uri_form_is_redacted_not_echoed_raw(self, tmp_path: Path) -> None:
+        source_path = self._seed_source(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(source_path),
+                "--dsn",
+                "postgresql://coorduser:s3cr3tpw@dbhost.example:5432/coord",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "s3cr3tpw" not in result.output
+        assert "coorduser" not in result.output
+        assert "dbhost.example" in result.output
+
+    def test_dsn_keyword_value_form_is_redacted_not_echoed_raw(
+        self, tmp_path: Path
+    ) -> None:
+        source_path = self._seed_source(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(source_path),
+                "--dsn",
+                "host=dbhost.example port=5432 dbname=coord user=coorduser "
+                "password=s3cr3tpw",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "s3cr3tpw" not in result.output
+        assert "coorduser" not in result.output
+        assert "dbhost.example" in result.output
+
+    def test_dry_run_reports_source_row_counts(self, tmp_path: Path) -> None:
+        conn = coord_db._open(tmp_path / "source.db")
+        try:
+            conn.execute(
+                "INSERT INTO machines (name, host) VALUES (?, ?)", ("m1", "m1.local")
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://u:p@host/db",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "machines" in result.output
+        assert "Audits passed" in result.output
+
+    def test_type_affinity_violation_aborts_with_click_exception(
+        self, tmp_path: Path
+    ) -> None:
+        conn = coord_db._open(tmp_path / "source.db")
+        try:
+            conn.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title) VALUES (?, ?, ?, ?, ?)",
+                ("a1", "m1", "r1", "not-a-number", "t1"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://u:p@host/db",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "type-affinity" in result.output
