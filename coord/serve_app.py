@@ -873,10 +873,24 @@ def _sync_issues_tick(config: Config) -> int:
 
     Returns the total number of open issues synced across all repos.
     Extracted as a module-level function so tests can call it directly.
+
+    #2858: every repo's attempt/success is stamped into
+    ``coord.issues_sync_status`` — the staleness clock
+    ``coord.health.checks.issues_sync_staleness`` reports on, and the
+    starvation-floor signal below. A repo that
+    ``coord.issues_sync_status.is_starved`` says has gone too long without a
+    successful sync is fetched with ``force_through_backoff=True``: this is
+    the ONLY consumer entitled to set that flag, because it is the one whose
+    own fixed 300s cadence made it the loser of #2858's incident — a shared
+    backoff re-armed by faster pollers (live merge-gate polls, ``coord
+    notify``, reconcile) every ~80s outbid this tick's every single 300s
+    sample for 39 minutes straight, even though a direct ``gh`` call
+    succeeded in under a second the whole time. See
+    ``coord.github_ops._gh``'s docstring for exactly what the flag changes.
     """
     import logging  # noqa: PLC0415
 
-    from coord import github_ops  # noqa: PLC0415
+    from coord import github_ops, issues_sync_status  # noqa: PLC0415
     from coord.state import _upsert_open_issues_local  # noqa: PLC0415
 
     # Use the private _upsert_open_issues_local (underscore-prefixed) rather
@@ -887,13 +901,21 @@ def _sync_issues_tick(config: Config) -> int:
     log = logging.getLogger("coord.serve")
     total = 0
     for repo in config.repos:
+        starved = issues_sync_status.is_starved(repo.name)
+        issues_sync_status.record_attempt(repo.name)
         try:
-            issues = github_ops.get_open_issues(repo.github)
+            issues = github_ops.get_open_issues(
+                repo.github, force_through_backoff=starved
+            )
             _upsert_open_issues_local(repo.name, issues)
             total += len(issues)
-        except Exception:  # noqa: BLE001
+            issues_sync_status.record_success(repo.name)
+        except Exception as exc:  # noqa: BLE001
+            issues_sync_status.record_failure(repo.name, str(exc))
             log.warning(
-                "issues-sync tick: repo %s failed", repo.name, exc_info=True
+                "issues-sync tick: repo %s failed%s", repo.name,
+                " (starvation-floor bypass already attempted)" if starved else "",
+                exc_info=True,
             )
     log.debug("issues-sync tick: %d open issues across %d repos", total, len(config.repos))
     return total

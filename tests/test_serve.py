@@ -5172,8 +5172,9 @@ def test_sync_issues_tick_marks_issues_closed(
     rw_db.commit()
 
     # GitHub now returns an empty open-issue list (issue 42 was closed).
+    # #2858: _sync_issues_tick always calls with force_through_backoff= now.
     monkeypatch.setattr(
-        github_ops, "get_open_issues", lambda repo: []
+        github_ops, "get_open_issues", lambda repo, **kwargs: []
     )
 
     cfg = load_config(valid_config_path)
@@ -5189,6 +5190,149 @@ def test_sync_issues_tick_marks_issues_closed(
     assert row is not None and row["state"] == "closed", (
         f"Issue should be 'closed' after sync; got: {row['state'] if row else None}"
     )
+
+
+def test_sync_issues_tick_records_status_per_repo(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2858: every repo's attempt gets stamped into
+    ``coord.issues_sync_status`` — a success advances ``last_success_at``, a
+    failure leaves it alone but records the error and still advances
+    ``last_attempt_at``. This is the staleness clock
+    ``coord.health.checks.issues_sync_staleness`` and the starvation-floor
+    bypass both read.
+    """
+    from coord import github_ops, issues_sync_status
+    from coord.serve_app import _sync_issues_tick
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+
+    def fake_get_open_issues(repo, **kwargs):
+        if repo == "acme/api":
+            raise github_ops.GhError("gh boom")
+        return []
+
+    monkeypatch.setattr(github_ops, "get_open_issues", fake_get_open_issues)
+
+    before = time.time()
+    cfg = load_config(valid_config_path)
+    _sync_issues_tick(cfg)
+    after = time.time()
+
+    api_status = issues_sync_status.status_for("api")
+    assert api_status.last_success_at is None
+    assert api_status.last_attempt_at is not None
+    assert before <= api_status.last_attempt_at <= after
+    assert api_status.last_error and "gh boom" in api_status.last_error
+
+    shared_status = issues_sync_status.status_for("shared")
+    assert shared_status.last_success_at is not None
+    assert before <= shared_status.last_success_at <= after
+    assert shared_status.last_error is None
+
+
+def test_sync_issues_tick_forces_through_backoff_when_starved(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2858 acceptance: a repo that has not synced successfully in longer
+    than ``coord.issues_sync_status.STARVATION_FLOOR_S`` gets
+    ``force_through_backoff=True`` on its next fetch — the mechanism that
+    lets this tick's slow, fixed 300s cadence escape a shared ``gh`` backoff
+    latch continuously re-armed by faster pollers (#2858's incident: 66
+    consecutive skip failures over 90 minutes). A repo that synced
+    recently does not set the flag — only a genuinely-starved repo is
+    entitled to bypass the shared damping.
+    """
+    from coord import github_ops, issues_sync_status
+    from coord.serve_app import _sync_issues_tick
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+
+    now = time.time()
+    # "api" hasn't synced successfully in longer than the starvation floor.
+    issues_sync_status.record_success(
+        "api", now=now - issues_sync_status.STARVATION_FLOOR_S - 1.0
+    )
+    # "shared" synced just now — not starved.
+    issues_sync_status.record_success("shared", now=now)
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_get_open_issues(repo, *, force_through_backoff=False):
+        calls.append((repo, force_through_backoff))
+        return []
+
+    monkeypatch.setattr(github_ops, "get_open_issues", fake_get_open_issues)
+
+    cfg = load_config(valid_config_path)
+    _sync_issues_tick(cfg)
+
+    by_repo = dict(calls)
+    assert by_repo == {"acme/api": True, "acme/shared": False}
+
+
+def test_sync_issues_tick_completes_despite_continuously_rearmed_latch(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2858 acceptance: ``_sync_issues_tick`` completes at least once per M
+    minutes even under a shared ``gh`` backoff latch that keeps getting
+    re-armed faster than this tick's own cadence.
+
+    End-to-end through the REAL ``coord.github_ops._gh`` (not a stubbed
+    ``get_open_issues``): a genuinely active backoff is seeded via
+    ``coord.github_throttle.record`` — deep enough that an ordinary call
+    would skip the network call entirely and raise, standing in for "every
+    plain sample this tick has taken so far landed mid an actively re-armed
+    window". Once this repo is starved past the floor, the tick's
+    ``force_through_backoff=True`` gets a REAL attempt through despite that
+    active window, and it succeeds — exactly the 2026-08-27 incident's own
+    observation that a direct ``gh`` call succeeded in under a second the
+    whole time the shared latch said otherwise.
+    """
+    from unittest.mock import MagicMock
+
+    from coord import github_throttle, issues_sync_status
+    from coord.serve_app import _sync_issues_tick
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+
+    now = time.time()
+    issues_sync_status.record_success(
+        "api", now=now - issues_sync_status.STARVATION_FLOOR_S - 1.0
+    )
+    issues_sync_status.record_success("shared", now=now)
+
+    github_throttle.record(
+        reason="secondary_rate_limit", status=403,
+        request_id="orig-request-id", retry_after_s=600.0,
+    )
+
+    monkeypatch.setattr("coord.github_ops.time.sleep", lambda *_: None)
+    monkeypatch.setattr(
+        "coord.github_ops.subprocess.run",
+        lambda *a, **k: MagicMock(returncode=0, stdout="[]", stderr=""),
+    )
+
+    cfg = load_config(valid_config_path)
+    total = _sync_issues_tick(cfg)
+
+    assert total == 0  # both repos returned an empty issue list
+    # The starved repo ("api") got a real, successful attempt through the
+    # still-active backoff. The fresh repo ("shared") was skipped by the
+    # ordinary damping (still deep inside the same window) and stayed
+    # exactly where it was.
+    assert issues_sync_status.status_for("api").last_success_at is not None
+    assert issues_sync_status.status_for("api").last_success_at > now
+    assert issues_sync_status.status_for("shared").last_success_at == now
 
 
 # ── #1220: _clean_worktrees_tick — fleet-wide orphaned-worktree sweep ────────

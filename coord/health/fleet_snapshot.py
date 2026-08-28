@@ -328,6 +328,24 @@ class FleetHealthRefresher:
         daemon_host["phantom_running"] = self._phantom_running_rows(machines)
         daemon_host["board_latency_ms"] = self._board_latency_ms
         daemon_host["board_payload_bytes"] = self._board_payload_bytes
+        # #2858: per-repo issues-sync staleness — a small local JSON read
+        # (coord.issues_sync_status), same "daemon-host-local fact" shape as
+        # the two lines above. `coord.health.checks.issues_sync_staleness`
+        # is the consumer; best-effort so a corrupt/missing state file
+        # degrades to "no data" rather than breaking this whole tick.
+        try:
+            from coord import issues_sync_status  # noqa: PLC0415
+
+            daemon_host["issues_sync_status"] = {
+                repo_name: {
+                    "last_success_at": row.last_success_at,
+                    "last_attempt_at": row.last_attempt_at,
+                    "last_error": row.last_error,
+                }
+                for repo_name, row in issues_sync_status.all_status().items()
+            }
+        except Exception:  # noqa: BLE001 — see docstring
+            daemon_host["issues_sync_status"] = {}
 
         # ── 3. run the fleet-scope registry over the assembled snapshot ────
         by_name = {row["machine"]: {

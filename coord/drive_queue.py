@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
+from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
     PLAN_READY,
     ci_rollup_all_clear,
@@ -961,6 +962,12 @@ class IssueFacts:
 
     known: bool = False
     issue_state: str = ""  # "open" / "closed" / "" when the board has no row
+    # #2858: how long ago the `issues` cache row behind `issue_state` was
+    # last refreshed by `coord.serve_app._sync_issues_tick` — `None` when
+    # the board carried no `synced_at` for this issue at all (no issues row,
+    # or a payload built before #2858). Populated by `build_board_view`;
+    # see `issue_cache_stale` for the ONE thing this changes.
+    issue_synced_at: float | None = None
     merged: bool = False  # a work-like assignment with status == 'merged'
     active_work: bool = False  # a NON-terminal work-like assignment
     # #1891: this issue's CURRENT merge-queue entry is refused for nothing
@@ -1042,6 +1049,32 @@ class IssueFacts:
         return self.merged or self.closed
 
 
+def _issue_cache_stale(facts: IssueFacts, now: float | None) -> bool:
+    """True when *facts*' ``issue_synced_at`` is old enough (#2858) that a
+    NEGATIVE ``landed`` reading — the board's ``issues`` cache still says
+    "open" — should not be trusted as current, because the cache that fact
+    came from may simply not have caught up with a merge/close yet (a
+    starved :func:`coord.serve_app._sync_issues_tick`).
+
+    ``now=None`` — the same "no clock, no age" convention every other
+    staleness check in this module uses (see :func:`_park_reading_age`) —
+    and a ``facts.issue_synced_at`` of ``None`` (no ``issues`` row at all, or
+    a board payload built before #2858) both read as "not stale": the safe
+    default is trusting the cache exactly as every caller did before this
+    field existed, so every pre-#2858 board fixture / pure-logic call site is
+    unaffected.
+
+    Deliberately has NO bearing on a POSITIVE ``landed`` reading — once
+    ``landed`` is ``True`` it is always trustworthy (see its own docstring:
+    nothing ever un-lands an issue). This is only ever consulted where a
+    negative reading is about to be treated as definitive enough to spend a
+    retry/exhausted attempt on — see ``_reconcile_running``'s one call site.
+    """
+    if now is None or facts.issue_synced_at is None:
+        return False
+    return (now - facts.issue_synced_at) >= ISSUE_CACHE_STALE_CEILING_S
+
+
 @dataclass(frozen=True)
 class BoardView:
     """The whole board reduced to per-issue facts plus live drive sessions."""
@@ -1107,6 +1140,13 @@ def build_board_view(
             continue
         entry = slot(entry_key(repo, int(number)))
         entry["issue_state"] = str(row.get("state") or "").lower()
+        # #2858: carried alongside `issue_state` so a stale cache read can be
+        # told apart from a fresh one — see `_issue_cache_stale`. `BoardIssue.
+        # synced_at` is already on the wire (coord/board_schema.py); this is
+        # the first consumer that reads it off a `/board` `issues` row.
+        synced_at = row.get("synced_at")
+        if isinstance(synced_at, (int, float)):
+            entry["issue_synced_at"] = float(synced_at)
 
     # #1891: `merge_ci_pending` — mirrors `drive_state._merge_entry`'s OWN
     # reason resolution exactly (live `merge_plan` reason, falling back to
@@ -3214,6 +3254,46 @@ def _reconcile_running(
             f"{facts.merge_ci_pending_reason or 'CI checks have not reported yet'}"
             f"{launched} — parking without spending an attempt; the queue "
             "resumes it automatically once they do, no operator needed (#1891)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
+    # #2858: the board's `issues` cache row behind `facts.landed`'s negative
+    # half (`facts.closed`) can itself be stale — `coord.serve_app.
+    # _sync_issues_tick` runs on a slow (300s default) cadence and can be
+    # starved for tens of minutes by a shared `gh` rate-limit backoff
+    # (:mod:`coord.github_throttle`) that faster pollers keep re-arming. Every
+    # POSITIVE witness this function has (`facts.landed`, `own_reason`,
+    # `live_prereq_terminal`) was already checked above and would have
+    # returned `done` — reaching here means none of them confirmed a landing,
+    # which is NOT the same as a fresh, trustworthy "still open". Spending a
+    # retry/exhausted attempt on a false negative reproduces #2850's own
+    # shape (a landed issue's queue entry gets churned instead of settling)
+    # through a different door — the stale cache, not the requeue logic
+    # #2850 fixed. Park instead: no attempt spent, re-checked every tick
+    # exactly like the `merge_ci_pending` park just above, and it resolves
+    # itself the moment the cache catches up (or a later tick's live re-check
+    # succeeds).
+    if _issue_cache_stale(facts, now):
+        # `_issue_cache_stale` only returns True when both are set — see its
+        # docstring — so this subtraction is safe without another None guard.
+        age = now - facts.issue_synced_at
+        reason = (
+            f"issue cache is stale ({age / 60:.0f}m old) — cannot confirm "
+            f"this issue is still open, so not spending an attempt on it "
+            f"(#2858); parking until the next tick sees a fresher read"
         )
         return (
             Reconcile(
