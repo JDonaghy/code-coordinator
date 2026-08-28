@@ -21,15 +21,25 @@ from coord.db import (
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(autouse=True)
-def isolated_conn():
-    """Each test in this file uses an in-memory DB via the coord_db fixture pattern."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    _ensure_schema(conn)
-    override_connection(conn)
-    yield conn
-    close()
+@pytest.fixture
+def isolated_conn(coord_db):
+    """The autouse ``coord_db`` connection, under this file's historical name.
+
+    #2884 bucket B: this used to be its own ``autouse`` fixture doing
+    ``sqlite3.connect(":memory:")`` + ``_ensure_schema`` + ``override_
+    connection`` — a verbatim re-implementation of conftest's autouse
+    ``coord_db``, which every test in this file was already getting anyway.
+    Aliasing rather than renaming keeps the ~130 ``isolated_conn`` parameters
+    below untouched while making the connection follow ``COORD_TEST_BACKEND``
+    like the rest of the suite.
+
+    (Many of the tests it feeds are legitimately SQLite-specific — they probe
+    ``sqlite_master``, WAL, ``busy_timeout``, ``PRAGMA table_info`` — and are
+    *expected* to fail on a non-SQLite backend. That is a failure in a test
+    body, which is the point: #2884 delivers the failure list, #829 acts on
+    it.)
+    """
+    return coord_db
 
 
 # ── Schema creation ────────────────────────────────────────────────────────────

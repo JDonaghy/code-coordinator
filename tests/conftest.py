@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -75,6 +74,23 @@ def _resolve_posix_bash() -> str:
 #: launch it via this constant instead of the bare string ``"bash"``, so the
 #: subprocess is never the WSL launcher on a Windows runner.
 POSIX_BASH = _resolve_posix_bash()
+
+
+def pytest_configure(config):
+    """#2884: validate ``COORD_TEST_BACKEND`` once, before anything is collected.
+
+    The backend is consumed by an *autouse* fixture, so a bad selection (typo,
+    missing ``psycopg``, unreachable server) would otherwise surface as one
+    fixture ERROR per test — thousands of identical tracebacks burying the
+    thing a second-backend run exists to produce, namely the list of genuine
+    assertion failures. See :func:`tests.backends.preflight`.
+
+    A no-op on the default SQLite path: it neither imports a driver nor opens
+    a socket, so a plain ``pytest`` is unaffected.
+    """
+    from tests.backends import preflight
+
+    preflight()
 
 
 @pytest.fixture(autouse=True)
@@ -796,26 +812,51 @@ def _no_dispatch_target_validation(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def coord_db():
-    """Isolated in-memory SQLite database, active for every test automatically.
+    """Isolated database on the active backend, active for every test automatically.
 
     Overrides the module-level singleton in coord.db so that all state
     functions (save_board, load_board, record_dispatched, etc.) operate on a
-    fresh :memory: database rather than the real ``~/.coord/coord.db``.
+    fresh, private database rather than the real ``~/.coord/coord.db``.
 
     autouse=True means no test needs to request this fixture explicitly —
     every test gets a clean DB and can never leak rows into the real database.
     Tests that need the connection object (e.g. to inspect raw rows) can still
     declare ``coord_db`` in their parameter list to receive it.
+
+    #2884: *which* backend that is comes from ``COORD_TEST_BACKEND``
+    (``sqlite`` by default, ``postgres`` opt-in) via
+    :func:`tests.backends.open_session`.  This is the whole suite's backend
+    switch — because this fixture is autouse and routes through
+    ``db.override_connection()``, all 393 test files follow it for free.
+
+    Deliberately **not** a ``pytest.fixture(params=...)``: parametrising here
+    would double the runtime of the entire suite for every developer, on
+    every run, forever.  The env var keeps the default path byte-identical to
+    the pre-#2884 behaviour (``sqlite3.connect(":memory:")`` +
+    ``sqlite3.Row``) and makes the second backend something CI opts into.
+
+    The schema still comes from ``coord.db._ensure_schema()`` on whatever
+    connection the harness opened — it infers its dialect from the connection
+    object (#2724), so this fixture is the first consumer of #827's
+    "does Postgres get the same migration path" decision rather than a
+    second, divergent copy of the schema.
     """
     from coord import db
     from coord.db import _ensure_schema
+    from tests.backends import open_session
 
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    _ensure_schema(conn)
-    db.override_connection(conn)
-    yield conn
-    db.close()
+    session = open_session()
+    _ensure_schema(session.conn)
+    db.override_connection(session.conn)
+    try:
+        yield session.conn
+    finally:
+        # session.close() first: on Postgres it has to DROP the private
+        # schema, which needs a usable connection. db.close() afterwards
+        # resets coord.db's singleton back to None (and closing an
+        # already-closed connection is a no-op on both drivers).
+        session.close()
+        db.close()
 
 
 # Every module-attribute name that coord.db / coord.state / coord.config /
