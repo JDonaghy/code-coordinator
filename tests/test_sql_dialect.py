@@ -75,7 +75,16 @@ _FakePostgresConnection.__module__ = "psycopg"
 
 
 class _FakePostgres2Connection(_FakeConnection):
-    pass
+    """Also spies on ``set_session`` — psycopg2's read-only knob, unlike
+    psycopg3's plain settable ``.read_only`` attribute (see
+    ``apply_connection_setup``'s read_only branch, #827)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_session_calls: list[dict] = []
+
+    def set_session(self, **kwargs):
+        self.set_session_calls.append(kwargs)
 
 
 _FakePostgres2Connection.__module__ = "psycopg2"
@@ -114,6 +123,65 @@ def test_detect_dialect_postgres_psycopg2():
 def test_detect_dialect_unknown_raises():
     with pytest.raises(sql.UnsupportedDialectError):
         sql.detect_dialect(_FakeUnknownConnection())
+
+
+# ── connect() — the connection factory (#827) ───────────────────────────────
+
+
+def test_connect_sqlite_writer_opens_a_normal_readwrite_connection(tmp_path):
+    db_path = tmp_path / "writer.db"
+    conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=db_path)
+    try:
+        assert isinstance(conn, sqlite3.Connection)
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO t (id) VALUES (1)")
+        conn.commit()
+        assert conn.execute("SELECT id FROM t").fetchone() == (1,)
+    finally:
+        conn.close()
+    assert db_path.exists()
+
+
+def test_connect_sqlite_read_only_opens_mode_ro_and_rejects_writes(tmp_path):
+    db_path = tmp_path / "ro.db"
+    writer = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=db_path)
+    writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    writer.execute("INSERT INTO t (id) VALUES (1)")
+    writer.commit()
+    writer.close()
+
+    conn = sql.connect(
+        backend=sql.DIALECT_SQLITE, sqlite_path=db_path, read_only=True, check_same_thread=False
+    )
+    try:
+        assert conn.execute("SELECT id FROM t").fetchone() == (1,)
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t (id) VALUES (2)")
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_requires_sqlite_path():
+    with pytest.raises(ValueError):
+        sql.connect(backend=sql.DIALECT_SQLITE)
+
+
+def test_connect_postgres_requires_dsn():
+    with pytest.raises(ValueError):
+        sql.connect(backend=sql.DIALECT_POSTGRES)
+
+
+def test_connect_postgres_without_psycopg_raises_import_error():
+    """psycopg is not installed in this repo (see the module docstring) --
+    the honest failure mode for `backend="postgres"` with no driver present,
+    matching `row_factory_for`/`driver_error`'s posture for the same gap."""
+    with pytest.raises(ImportError):
+        sql.connect(backend=sql.DIALECT_POSTGRES, dsn="postgresql://user@host/db")
+
+
+def test_connect_unknown_backend_raises():
+    with pytest.raises(sql.UnsupportedDialectError):
+        sql.connect(backend="mysql", sqlite_path="ignored")
 
 
 # ── translation: identity for sqlite ────────────────────────────────────────
@@ -528,9 +596,36 @@ def test_apply_connection_setup_read_only_survives_a_true_mode_ro_connection(tmp
         conn.close()
 
 
-def test_apply_connection_setup_postgres_read_only_is_still_a_noop():
+def test_apply_connection_setup_postgres_writer_is_still_a_noop():
+    """*read_only=False* (a writer connection) has no connect-time pragma to
+    set for Postgres, unlike SQLite's journal_mode/foreign_keys -- unchanged
+    by #827."""
     conn = _FakePostgresConnection()
-    sql.apply_connection_setup(conn, read_only=True)  # must not raise
+    sql.apply_connection_setup(conn)  # read_only=False (default)
+    assert conn.cur.executed == []
+    assert not hasattr(conn, "read_only")
+
+
+def test_apply_connection_setup_postgres_read_only_sets_psycopg3_read_only_attribute():
+    """#827: unlike #2766 (a true no-op -- "there is no live read-only
+    connection factory yet for the seam to branch on"), a Postgres
+    connection factory (``sql.connect``) now exists, so this sets psycopg3's
+    settable ``.read_only`` property instead of doing nothing. No SQL is
+    sent through the cursor (unlike SQLite's PRAGMA) -- psycopg3 applies the
+    property to transactions opened after it's set, not via a statement."""
+    conn = _FakePostgresConnection()
+    sql.apply_connection_setup(conn, read_only=True)
+    assert conn.read_only is True
+    assert conn.cur.executed == []
+
+
+def test_apply_connection_setup_postgres_read_only_uses_set_session_for_psycopg2():
+    """psycopg2 has no ``.read_only`` attribute -- its read-only knob is
+    ``conn.set_session(readonly=True)`` (#827)."""
+    conn = _FakePostgres2Connection()
+    sql.apply_connection_setup(conn, read_only=True)
+    assert conn.set_session_calls == [{"readonly": True}]
+    assert not hasattr(conn, "read_only")
     assert conn.cur.executed == []
 
 
@@ -774,6 +869,47 @@ def test_no_raw_driver_execute_call_outside_the_dialect_seam():
         "raw DB-API execute-family call(s) bypassing the coord.sql dialect "
         "seam (#2768/#1948) — route these through coord.sql.execute()/"
         "executemany()/executescript() instead:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no raw driver `.connect()` outside the seam (#827) ─
+#
+# #827's acceptance bullet: "db.py and dao.py obtain connections through one
+# dialect-aware factory; neither names sqlite3.connect directly." The two
+# call sites that used to do that (coord/db.py's `_open`, coord/dao.py's
+# `SqliteStore._connect`) now route through `coord.sql.connect` -- this is
+# the `connect`-call sibling of #2768's `execute`-call ratchet above, so a
+# regression (a new module importing sqlite3/psycopg/psycopg2 directly and
+# calling `.connect()` on it) is caught the same way: an AST walk, not a
+# grep, so a docstring/comment merely mentioning "sqlite3.connect" can't
+# trip it and a real call site can't dodge it by reformatting.
+
+_CONNECT_DRIVER_MODULES = {"sqlite3", "psycopg", "psycopg2"}
+
+
+def test_no_raw_driver_connect_call_outside_the_dialect_seam():
+    """No ``sqlite3.connect()``/``psycopg.connect()``/``psycopg2.connect()``
+    call anywhere in ``coord/**`` reaches a driver directly — every
+    connection must be opened through ``coord.sql.connect()`` (#827).
+
+    Deliberately introducing e.g. ``sqlite3.connect(":memory:")`` in any
+    ``coord/`` module outside ``coord/sql.py`` makes this red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        _src, tree = _parse(path)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "connect":
+                continue
+            value = node.func.value
+            if isinstance(value, ast.Name) and value.id in _CONNECT_DRIVER_MODULES:
+                violations.append(f"{rel}:{node.lineno}: {value.id}.connect(...)")
+    assert not violations, (
+        "raw driver .connect() call(s) bypassing the coord.sql dialect seam "
+        "connection factory (#827) — route these through coord.sql.connect() "
+        "instead:\n" + "\n".join(violations)
     )
 
 

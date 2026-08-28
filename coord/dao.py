@@ -32,16 +32,22 @@ the coordinator process is writing in WAL mode.
 #2766: every statement this module runs routes through ``coord.sql`` (the
 dialect seam, #2719/#1948) rather than calling ``conn.execute()`` directly —
 paramstyle translation, the row factory, and connection setup are the seam's
-job now, not hand-rolled here. Two decisions worth recording (see the PR):
-the ``mode=ro`` URI itself stays in this module's ``_connect()`` rather than
-moving into the seam, because ``SqliteStore`` is *already* the class that
-names its concrete backend — there is no live Postgres connection factory
-yet for the seam to branch on, so a second implementation (e.g.
-``PostgresStore``) would own its own connection factory rather than this one
-growing a dialect branch ahead of that backend existing. The read-only
-``PRAGMA query_only=ON`` (no Postgres connect-time equivalent — see
-``sql.apply_connection_setup``'s ``read_only`` flag) and ``busy_timeout``
-both now come from that one seam call instead of two bare PRAGMAs.
+job now, not hand-rolled here. The read-only ``PRAGMA query_only=ON`` (no
+Postgres connect-time equivalent — see ``sql.apply_connection_setup``'s
+``read_only`` flag) and ``busy_timeout`` both come from that one seam call
+instead of two bare PRAGMAs.
+
+#827 (superseding the #2766 decision note that used to live here): the
+``mode=ro`` URI itself has now moved into ``coord.sql.connect`` too. #2766
+kept it in this module's ``_connect()`` because "there is no live Postgres
+connection factory yet for the seam to branch on" — #827 is that factory, so
+the premise no longer holds, and ``SqliteStore._connect`` now calls
+``sql.connect(backend=sql.DIALECT_SQLITE, ...)`` like every other connection
+opener in the tree rather than naming ``sqlite3.connect`` directly (enforced
+by ``tests/test_sql_dialect.py``'s connect-call ratchet, the sibling of
+#2768's execute-call one). ``SqliteStore`` still owns *which* backend it
+opens — nothing here forces a future ``PostgresStore`` to share this class —
+it just no longer owns the driver call that does it.
 
 All SQLite idioms (JSON-encoded TEXT columns, the ``mode=ro`` URI) that
 remain are encapsulated here: read methods return plain Python dicts with
@@ -285,13 +291,16 @@ class SqliteStore:
 
     # ── connection ────────────────────────────────────────────────────────────
     def _connect(self) -> sqlite3.Connection:
-        # #2766: the `mode=ro` URI is a SQLite-only spelling of "open
-        # read-only" and stays here rather than in the seam — see the module
-        # docstring's decision note. Everything downstream of "how do I get
-        # a connection" (row factory, connection-setup pragmas) routes
-        # through `coord.sql`.
-        uri = f"file:{self._path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        # #827: the `mode=ro` URI construction now lives in `sql.connect` —
+        # see the module docstring's updated decision note. This is a fresh
+        # connection per call (cheap for SQLite, thread-safe under the
+        # daemon's request handling), matching `check_same_thread=False`.
+        conn = sql.connect(
+            backend=sql.DIALECT_SQLITE,
+            sqlite_path=self._path,
+            read_only=True,
+            check_same_thread=False,
+        )
         sql.apply_row_factory(conn)
         # #2159: without a busy_timeout SQLite fails a locked read INSTANTLY
         # (the default is 0ms) instead of waiting out a writer's momentary

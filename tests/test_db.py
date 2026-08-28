@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
 from coord import db as db_mod
+from coord import sql
 from coord.db import (
     _ensure_schema,
     override_connection,
@@ -1076,6 +1078,191 @@ class TestOverrideConnection:
         assert db_mod._conn is None
         # Restore
         _ensure_schema(sqlite3.connect(":memory:"))
+
+
+# ── _resolve_store_target (#827) ─────────────────────────────────────────────
+
+_VALID_REPOS_MACHINES_YAML = (
+    "repos:\n  - name: a\n    github: x/a\n"
+    "machines:\n  - name: m\n    host: h\n    repos: [a]\n"
+)
+
+
+class TestResolveStoreTarget:
+    """coordinator.yml's `store:` block (#827), resolved via
+    `db_mod._resolve_store_target` -- see that function's docstring for why
+    it fails open to SQLite on any config problem."""
+
+    def test_defaults_to_sqlite_when_no_config_resolvable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "does-not-exist.yml"))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_SQLITE
+        assert target.dsn is None
+
+    def test_defaults_to_sqlite_when_store_block_absent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_VALID_REPOS_MACHINES_YAML)
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_SQLITE
+        assert target.dsn is None
+
+    def test_defaults_to_sqlite_when_store_backend_is_explicit_sqlite(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_VALID_REPOS_MACHINES_YAML + "store:\n  backend: sqlite\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_SQLITE
+
+    def test_resolves_postgres_backend_and_dsn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            _VALID_REPOS_MACHINES_YAML
+            + "store:\n  backend: postgres\n  dsn: postgresql://user@host/db\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_POSTGRES
+        assert target.dsn == "postgresql://user@host/db"
+
+    def test_defaults_to_sqlite_on_a_malformed_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A config that fails to parse for a reason unrelated to `store:`
+        (e.g. a bad `repos:` entry) must not surface as a storage-backend
+        failure -- it fails open to SQLite exactly like a missing file."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text("repos: not-a-list\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_SQLITE
+
+
+# ── get_connection() Postgres per-thread routing (#827) ─────────────────────
+
+
+class _FakePgConn:
+    """Cheap stand-in for a psycopg connection -- just enough for
+    `get_connection()`'s caching/threading contract to exercise `.close()`.
+    psycopg is not installed in this repo (see coord/sql.py's module
+    docstring); `_open_postgres`'s own migration plumbing already routes
+    through coord.sql's dialect-neutral seam, covered by
+    tests/test_sql_dialect.py's fake-postgres-connection tests -- what's
+    under test here is get_connection()'s routing, not the SQL it runs once
+    connected, so `_open_postgres` itself is monkeypatched out below."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestGetConnectionPostgresPerThread:
+    """#827: when the configured backend is postgres, get_connection() opens
+    ONE CONNECTION PER THREAD instead of sharing the SQLite singleton across
+    threads -- see coord/db.py's module docstring, "Connection-sharing
+    model"."""
+
+    def _route_to_fake_postgres(self, monkeypatch: pytest.MonkeyPatch) -> list[_FakePgConn]:
+        opened: list[_FakePgConn] = []
+
+        def _fake_open_postgres(dsn: str) -> _FakePgConn:
+            conn = _FakePgConn(dsn)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(
+            db_mod,
+            "_resolve_store_target",
+            lambda: db_mod._StoreTarget(
+                backend=sql.DIALECT_POSTGRES, dsn="postgresql://user@host/db"
+            ),
+        )
+        monkeypatch.setattr(db_mod, "_open_postgres", _fake_open_postgres)
+        return opened
+
+    def test_same_thread_reuses_the_same_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close()  # undo the isolated_conn fixture's override for this test
+        opened = self._route_to_fake_postgres(monkeypatch)
+        try:
+            first = db_mod.get_connection()
+            second = db_mod.get_connection()
+            assert first is second
+            assert len(opened) == 1
+        finally:
+            close()
+
+    def test_different_threads_get_different_connections(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close()
+        opened = self._route_to_fake_postgres(monkeypatch)
+        results: dict[str, object] = {}
+
+        def _grab() -> None:
+            results["other"] = db_mod.get_connection()
+
+        try:
+            main_conn = db_mod.get_connection()
+            t = threading.Thread(target=_grab)
+            t.start()
+            t.join()
+            assert results["other"] is not main_conn
+            assert len(opened) == 2
+        finally:
+            close()
+            # The spawned thread's connection is invisible to this thread's
+            # close() (see close()'s docstring) -- clean it up directly so it
+            # doesn't leak into another test.
+            other = results.get("other")
+            if isinstance(other, _FakePgConn):
+                other.close()
+
+    def test_override_connection_wins_over_postgres_routing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close()
+        opened = self._route_to_fake_postgres(monkeypatch)
+        override_conn = sqlite3.connect(":memory:")
+        override_connection(override_conn)
+        try:
+            assert db_mod.get_connection() is override_conn
+            assert opened == []  # postgres routing never even consulted
+        finally:
+            close()
+
+    def test_close_closes_this_threads_postgres_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close()
+        self._route_to_fake_postgres(monkeypatch)
+        conn = db_mod.get_connection()
+        assert isinstance(conn, _FakePgConn)
+        close()
+        assert conn.closed is True
+        assert getattr(db_mod._pg_thread_local, "conn", None) is None
+
+
+class TestOpenPostgresPytestGuard:
+    def test_open_postgres_refuses_under_pytest(self) -> None:
+        """Mirrors #1960's SQLite guard: no test should ever reach a real
+        Postgres connect call -- `PYTEST_CURRENT_TEST` is always set during a
+        pytest run, so this fires before `sql.connect` (and therefore before
+        any `import psycopg`) is ever reached."""
+        with pytest.raises(db_mod.ProductionDatabaseGuardError):
+            db_mod._open_postgres("postgresql://user@host/db")
 
 
 # ── JSON migration ────────────────────────────────────────────────────────────

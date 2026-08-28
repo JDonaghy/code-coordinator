@@ -22,6 +22,7 @@ from coord.liveness_auditor import (
 )
 from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
 from coord.platform_paths import default_coord_dir
+from coord.sql import DIALECT_POSTGRES, DIALECT_SQLITE
 
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
@@ -1463,6 +1464,48 @@ class CiStoreConfig:
 
 
 @dataclass
+class StoreConfig:
+    """``store:`` block (#827) — which database backend ``coord.db``/
+    ``coord.dao`` open their connections against, via ``coord.sql``'s
+    dialect-aware connection factory (``coord.sql.connect``).
+
+    Absent block == ``backend: sqlite`` == today's behaviour, byte-for-byte:
+    ``coord.db`` resolves its own on-disk path (``DB_PATH`` —
+    ``~/.coord/coord.db`` by default, see ``coord/platform_paths.py``)
+    completely independently of this config, so leaving this block out (or
+    writing it with ``backend: sqlite`` explicitly) changes nothing about
+    where an existing deployment's data lives or how it's opened.
+
+    ``dsn`` is required, and only consulted, when ``backend: postgres`` — a
+    libpq-style connection string (e.g.
+    ``"postgresql://user:pass@host:5432/dbname"``) passed straight to
+    ``psycopg`` (an optional dependency not declared anywhere in
+    ``pyproject.toml`` — see ``coord/sql.py``'s ``row_factory_for`` — so a
+    deployment that never sets ``backend: postgres`` never needs it
+    installed).
+
+    This is deliberately a **server-side-only** choice
+    (``docs/STORE_SERVICE.md`` §4 — "Why a server-side feature flag is the
+    wrong mechanism" carves out exactly this one exception): which storage
+    engine is live is a deployment property, not something an individual
+    client negotiates per request, so every machine pointed at the same
+    ``coord serve`` daemon's database must set the same ``store:`` block (or
+    none). Nothing in this repo currently cross-checks that across machines
+    (#829 territory).
+
+    Setting this block chooses the connection target only — it says nothing
+    about whether the schema has actually been migrated to Postgres (#828)
+    or whether any machine in the fleet is pointed at one yet (#829).
+    ``backend: postgres`` with no real server behind ``dsn`` just makes every
+    DB open fail loudly at connect time, the same as a bad DSN always would;
+    this block does not make Postgres "live" by itself.
+    """
+
+    backend: str = DIALECT_SQLITE
+    dsn: str | None = None
+
+
+@dataclass
 class AuditConfig:
     """``audit:`` block (#1036/#1038) — the append-only ``audit_log``
     table's tunables.
@@ -2123,6 +2166,8 @@ class Config:
     # #2131 — absent block == no ceiling == today's behaviour.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
+    # #827 — absent block == backend="sqlite" == today's behaviour untouched.
+    store: StoreConfig = field(default_factory=StoreConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
     # #2583 — absent block == min_releases_behind=1 == today's behaviour
     # (any delta at all rolls, subject to quiescence/cordon as before).
@@ -2206,6 +2251,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     usage_gate = _parse_usage_gate(raw.get("usage_gate"))
     budget = _parse_budget(raw.get("budget"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
+    store = _parse_store(raw.get("store"))
     merge = _parse_merge(raw.get("merge"))
     propagation = _parse_propagation(raw.get("propagation"))
     milestone = _parse_milestone(raw.get("milestone"))
@@ -2229,6 +2275,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         usage_gate=usage_gate,
         budget=budget,
         ci_store=ci_store,
+        store=store,
         merge=merge,
         propagation=propagation,
         milestone=milestone,
@@ -3664,6 +3711,30 @@ def _parse_ci_store(raw: Any) -> CiStoreConfig:
         if not isinstance(value, str) or not value:
             raise ConfigError("ci_store.token_env must be a non-empty string")
         cfg.token_env = value
+    return cfg
+
+
+def _parse_store(raw: Any) -> StoreConfig:
+    if raw is None:
+        return StoreConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'store' must be a mapping")
+
+    cfg = StoreConfig()
+    if "backend" in raw:
+        value = raw["backend"]
+        if not isinstance(value, str) or value not in (DIALECT_SQLITE, DIALECT_POSTGRES):
+            raise ConfigError(
+                f"store.backend must be one of: {DIALECT_SQLITE}, {DIALECT_POSTGRES}"
+            )
+        cfg.backend = value
+    if "dsn" in raw:
+        value = raw["dsn"]
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ConfigError("store.dsn must be a non-empty string (or omitted)")
+        cfg.dsn = value
+    if cfg.backend == DIALECT_POSTGRES and not cfg.dsn:
+        raise ConfigError("store.dsn is required when store.backend is 'postgres'")
     return cfg
 
 
