@@ -3754,6 +3754,18 @@ pub struct CoordApp {
     /// epic again.  Set by the poll handler in `settings_ui.rs`; cleared on
     /// dismiss (Esc / Enter / outside-click).
     gate_a_error_dialog: Option<String>,
+    /// #2863: full body of the "Decomposition session dispatch failed"
+    /// modal, or `None` when it isn't showing.  Same problem and same
+    /// solution as `gate_a_error_dialog` directly above: a failed `coord
+    /// portal decompose-chat` is most often the multi-sentence thin-client
+    /// refusal, which names its own fix and is unreadable clipped to the
+    /// ~40-col toast box.  Kept as its OWN field rather than folded into
+    /// `gate_a_error_dialog` so each modal keeps its own accurate title —
+    /// they only ever share dismissal plumbing, never content.  Set by the
+    /// poll handler in `settings_ui.rs` via
+    /// [`CoordApp::fail_pending_decomposition_chat`]; cleared on dismiss
+    /// (Esc / Enter / outside-click).
+    decompose_chat_error_dialog: Option<String>,
 }
 
 /// #1094 fix: which axis of the Audit `DataTable`'s scrollbars a
@@ -4277,6 +4289,8 @@ impl CoordApp {
             pty_panic_dialog: None,
             // #1059: no pending Gate A dispatch-failure dialog on startup.
             gate_a_error_dialog: None,
+            // #2863: no pending decomposition-dispatch failure on startup.
+            decompose_chat_error_dialog: None,
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have

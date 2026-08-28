@@ -2234,7 +2234,11 @@ impl CoordApp {
         // Higher priority than the artifact-pull dialog below (mirrors the
         // pty_panic ordering): Esc / Enter dismiss, other keys are swallowed
         // so the full failure reason stays readable.
-        if self.gate_a_error_dialog.is_some() {
+        // #2863: the decomposition-dispatch failure dialog shares this
+        // intercept — same modal shape, same dismiss keys, same reason for
+        // swallowing everything else (the full wrapped reason must stay
+        // readable rather than vanish on a stray Tab / arrow key).
+        if self.gate_a_error_dialog.is_some() || self.decompose_chat_error_dialog.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 let dismiss = matches!(
                     key,
@@ -2242,6 +2246,7 @@ impl CoordApp {
                 );
                 if dismiss {
                     self.gate_a_error_dialog = None;
+                    self.decompose_chat_error_dialog = None;
                     *self.dialog_layout.borrow_mut() = None;
                 }
                 return Reaction::Redraw;
@@ -2321,7 +2326,11 @@ impl CoordApp {
         // read the full (word-wrapped) failure reason without accidentally
         // dismissing on Tab / arrow keys.  Same shape as the pty_panic block
         // above.
-        if self.gate_a_error_dialog.is_some() {
+        // #2863: the decomposition-dispatch failure dialog shares this
+        // intercept — same modal shape, same dismiss keys, same reason for
+        // swallowing everything else (the full wrapped reason must stay
+        // readable rather than vanish on a stray Tab / arrow key).
+        if self.gate_a_error_dialog.is_some() || self.decompose_chat_error_dialog.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 let dismiss = matches!(
                     key,
@@ -2329,6 +2338,7 @@ impl CoordApp {
                 );
                 if dismiss {
                     self.gate_a_error_dialog = None;
+                    self.decompose_chat_error_dialog = None;
                     *self.dialog_layout.borrow_mut() = None;
                 }
                 return Reaction::Redraw;

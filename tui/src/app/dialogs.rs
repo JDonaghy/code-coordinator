@@ -6,6 +6,10 @@
 //! explicit imports because their dependency surface is small and stable.
 #[allow(unused_imports)]
 use super::*;
+// #2863: the attended intake item's label, referenced both by the menu
+// builder (`approved.rs`) and by the dispatch-failure modal below, which
+// points the operator at it as the local-only alternative.
+use super::approved::APPROVED_ATTENDED_INTAKE_ITEM;
 
 // ─── Right-click context menu (#259) ─────────────────────────────────────────
 
@@ -3198,6 +3202,43 @@ impl CoordApp {
             });
         }
 
+        // ── #2863: decomposition-dispatch failure modal ─────────────────────
+        // Same class of problem the Gate A modal above solves, same solution:
+        // `coord portal decompose-chat`'s commonest failure is the
+        // thin-client refusal ("must run on the daemon host…"), a
+        // multi-sentence message that names its own fix and survives the
+        // ~40-col toast box only as `Error: coord portal decompose-chat mus…`.
+        // This is the ONE error surface for that dispatch — the generic
+        // command-failed toast is suppressed, the optimistic "chat ready"
+        // toast retracted and the 30 s bind-timeout toast disarmed, all by
+        // `fail_pending_decomposition_chat` before this is raised.
+        if let Some(ref reason) = self.decompose_chat_error_dialog {
+            let body = format!(
+                "{}\n\nNo session was started and nothing is in flight — this \
+                 is a clean pre-dispatch failure, not a stuck session.  Fix \
+                 the cause above and pull the row again, or use \"{}\" on the \
+                 same row to hold the intake conversation on this machine \
+                 instead.",
+                reason, APPROVED_ATTENDED_INTAKE_ITEM,
+            );
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:decompose-chat-error"),
+                title: StyledText::plain("Decomposition session dispatch failed"),
+                body: vec![StyledText::plain(body)],
+                buttons: vec![DialogButton {
+                    id: WidgetId::new("close"),
+                    label: "Esc / Enter  Dismiss".into(),
+                    is_default: true,
+                    is_cancel: true,
+                    tint: None,
+                }],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Artifact-pull result (#532) ─────────────────────────────────────
         // Info dialog shown after `coord pull-artifact` completes, and
         // re-openable at any time by pressing `a` on the same pipeline row.
@@ -3450,6 +3491,9 @@ impl CoordApp {
         } else if self.gate_a_error_dialog.is_some() {
             // #1059: dismiss the Gate A dispatch-failure dialog.
             self.gate_a_error_dialog = None;
+        } else if self.decompose_chat_error_dialog.is_some() {
+            // #2863: dismiss the decomposition-dispatch failure dialog.
+            self.decompose_chat_error_dialog = None;
         }
         *self.dialog_layout.borrow_mut() = None;
     }
@@ -4176,6 +4220,12 @@ impl CoordApp {
         // ── #1059: Gate A dispatch-failure notification ─────────────────────
         if self.gate_a_error_dialog.is_some() && id == "close" {
             self.gate_a_error_dialog = None;
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        // ── #2863: decomposition-dispatch failure notification ──────────────
+        if self.decompose_chat_error_dialog.is_some() && id == "close" {
+            self.decompose_chat_error_dialog = None;
             *self.dialog_layout.borrow_mut() = None;
         }
     }
@@ -5187,6 +5237,122 @@ impl CoordApp {
             "chat ready — type to start.",
             ToastSeverity::Info,
         );
+    }
+
+    /// #2863: "Open attended intake session…" — the `--interactive` (#2750)
+    /// counterpart of the headless dispatch above.
+    ///
+    /// `coord portal decompose-chat <id> --interactive` takes over a TTY (it
+    /// tmux-attaches a real `claude` on this machine), so it can NOT go
+    /// through `command_runner.spawn_queued` like its headless sibling — a
+    /// non-TTY subprocess would strand the conversation. It is typed into
+    /// the embedded terminal instead, exactly the way
+    /// [`Self::launch_milestone_chat_session`] (#1029) launches the closest
+    /// analogue in this crate: bookmark the origin view, switch to
+    /// Terminal, feed the launch line as literal keystrokes, let the
+    /// terminal itself be the truth.
+    ///
+    /// No TUI-side reattach branch: the CLI already checks
+    /// `tmux_session_running` for the submission's session and attaches to
+    /// the live one rather than starting a duplicate
+    /// (`coord/commands/portal.py`). Duplicating that decision here could
+    /// only ever disagree with it.
+    pub(crate) fn launch_attended_intake_session(&mut self, submission_id: &str) {
+        // #1029 bug B's bookmark rule: capture the origin *before* the view
+        // switch (which clears `terminal_return_view`) and re-apply it
+        // *after*, so Esc returns the operator where they came from.
+        let bookmark_origin =
+            (self.active_view != SidebarView::Terminal).then_some(self.active_view);
+
+        let cfg_path = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let launch_line = build_attended_intake_launch_cmd(cfg_path.as_deref(), submission_id);
+
+        // #955: a selected Terminal-tree leaf takes over the main pane —
+        // clear the selection so the bare-shell pane this writes into is
+        // actually visible.
+        self.terminal_tree_selected = None;
+        self.switch_active_view(SidebarView::Terminal);
+        self.terminal_return_view = bookmark_origin;
+
+        if let Some(ref mut sess) = self.terminal_session {
+            sess.send_str(&launch_line);
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let shell = quadraui::terminal_engine::default_shell();
+            match quadraui::terminal_engine::TerminalSession::spawn(80, 24, &shell, &cwd, 10_000) {
+                Ok(mut sess) => {
+                    sess.send_str(&launch_line);
+                    self.terminal_session = Some(sess);
+                    self.terminal_spawn_error = None;
+                }
+                Err(e) => {
+                    self.terminal_spawn_error = Some(e.to_string());
+                    self.push_toast(
+                        "Intake session",
+                        &format!("Failed to spawn terminal: {}", e),
+                        ToastSeverity::Error,
+                    );
+                    return;
+                }
+            }
+        }
+        self.terminal_focused = true;
+        self.push_toast(
+            "Intake session",
+            &format!("Launching attended intake session for {submission_id} …"),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// #2863: a `coord portal decompose-chat <id>` dispatch came back
+    /// non-zero — collapse the three contradictory notifications the
+    /// operator used to get (optimistic "chat ready", a 40-col-truncated
+    /// "Command failed", then a 30 s "timed out") into ONE coherent error
+    /// surface.
+    ///
+    /// Three things happen together, and they only make sense together:
+    ///
+    /// 1. **Retract the optimistic toasts.** Contract §4d pins the "chat
+    ///    ready — type to start" toast as firing *immediately on dispatch*,
+    ///    before the exit code exists — that stays (the sealed slice only
+    ///    ever exercises the success path, since `CommandRunner`'s
+    ///    `no_spawn` branch synthesizes exit 0). But once we KNOW it was
+    ///    wrong, leaving it on screen contradicting an error toast beside it
+    ///    is worse than either alone, so both "Decomposition chat" toasts
+    ///    are dropped here.
+    /// 2. **Disarm `pending_decomposition_chat`,** which suppresses the
+    ///    `REFINEMENT_BIND_TIMEOUT` "Decomposition chat timed out" toast 30 s
+    ///    later. No assignment is ever going to appear for a dispatch that
+    ///    failed; that toast would only restate the same failure in a way
+    ///    that reads like a *second*, different problem.
+    /// 3. **Raise the full-text modal,** #1059's Gate-A precedent. The
+    ///    thin-client refusal this fires on most often is multi-sentence and
+    ///    names its own fix; at ~40 toast cols it truncates to something
+    ///    like `Error: coord portal decompose-chat mus…`, which is
+    ///    actionable to nobody.
+    ///
+    /// The generic "Command failed" toast is suppressed by the caller
+    /// (`settings_ui.rs`) for the same reason it is for Gate A — this is the
+    /// one and only notification.
+    pub(crate) fn fail_pending_decomposition_chat(&mut self, submission_id: &str, reason: &str) {
+        // Scoped to THIS submission's pair of §4d toasts: the id-prefixed
+        // sentence, and the id-less restatement the dispatcher pushes
+        // alongside it so the phrase always fits the 40-col box. Anything
+        // else titled "Decomposition chat" belongs to a different
+        // submission and is not ours to retract.
+        self.toasts.retain(|(item, _, _)| {
+            item.title != "Decomposition chat"
+                || !(item.body.contains(submission_id)
+                    || item.body == "chat ready — type to start.")
+        });
+        self.pending_decomposition_chat = None;
+        self.decompose_chat_error_dialog = Some(format!(
+            "Dispatching a decomposition session for {submission_id} failed:\n\n{reason}"
+        ));
     }
 
     /// Called each tick while `pending_decomposition_chat` is armed. Looks
@@ -6860,6 +7026,18 @@ impl CoordApp {
                 }
                 true
             }
+            // #2863: "Open attended intake session…" — the `--interactive`
+            // (#2750) sibling of the arm above. Same gating posture: the
+            // menu already greys it (`attended_intake_blocked_reason`) when
+            // this machine can't host it, and a disabled item never reaches
+            // this leaf dispatch, so no re-check here.
+            "open-attended-intake-session" => {
+                if let ContextMenuTarget::ApprovedRow { submission_id } = target {
+                    let sid = submission_id.clone();
+                    self.launch_attended_intake_session(&sid);
+                }
+                true
+            }
             // #1755 (DQ-3): Pipeline-row enqueue items. `drive-queue-add-on:
             // <machine>` is the submenu variant — the machine name rides in
             // the action id (the `start-*-on:` precedent) because
@@ -8069,6 +8247,61 @@ pub(crate) fn hit_tab_index_from_labels(
         cursor = end;
     }
     None
+}
+
+/// #2863: build the single-line shell command that launches the ATTENDED
+/// (`--interactive`, #2750) intake session for `submission_id`.
+///
+/// Deliberately the sealed contract's own argv (§4c: `coord portal
+/// decompose-chat <submission_id>`) plus the one flag — not a
+/// `coord assign --interactive …` flavour like the `InteractiveLaunchMode`
+/// builders in `sessions.rs`, because #2750 put `--interactive` on the
+/// portal verb itself ("`coord portal decompose-chat` … takes only
+/// --machine, so there is no per-dispatch way to ask for anything else").
+///
+/// `--config` is injected the same way every other interactive launcher in
+/// this crate does it (`portal decompose-chat` carries `_CONFIG_OPTION`).
+/// The returned line is a single physical line; the trailing `\r` is the
+/// submit key, not a line break.
+pub(crate) fn build_attended_intake_launch_cmd(
+    config_path: Option<&str>,
+    submission_id: &str,
+) -> String {
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+        _ => String::new(),
+    };
+    format!(
+        "coord portal decompose-chat {}{} --interactive\r",
+        cfg,
+        shell_quote_arg(submission_id),
+    )
+}
+
+/// #2863: true when `label` is a headless `coord portal decompose-chat
+/// <submission_id>` dispatch — i.e. the command
+/// [`CoordApp::dispatch_approved_pull_into_decomposition`] spawned, matched
+/// back to its completed `CommandResult` in `run_periodic_work`.
+///
+/// Matched on the raw label (`spawn_queued` records `"coord " +
+/// argv.join(" ")`), so it never fires on an unrelated `portal` subcommand.
+/// The attended launcher above is NOT matched and cannot be: it never goes
+/// through `command_runner` at all — it is typed into the embedded terminal,
+/// where its own stderr is already on screen, unwrapped and in full.
+pub(crate) fn is_decompose_chat_dispatch_label(label: &str) -> bool {
+    label.contains("portal decompose-chat ")
+}
+
+/// #2863: recover the `<submission_id>` positional from such a label, for
+/// the failure dialog's headline. `None` when the label has no trailing
+/// argument (shouldn't happen — `is_decompose_chat_dispatch_label` requires
+/// the trailing space — but this must not panic on a malformed label).
+pub(crate) fn decompose_chat_label_submission_id(label: &str) -> Option<String> {
+    label
+        .split_whitespace()
+        .skip_while(|t| *t != "decompose-chat")
+        .nth(1)
+        .map(str::to_string)
 }
 
 /// Union of an optional rect and a required rect.  Used to compute the

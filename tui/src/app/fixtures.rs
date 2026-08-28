@@ -432,6 +432,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pty_panic_dialog: None,
         // #1059: no pending Gate A dispatch-failure dialog in test helpers.
         gate_a_error_dialog: None,
+        // #2863: no pending decomposition-dispatch failure in test helpers.
+        decompose_chat_error_dialog: None,
     }
 }
 
