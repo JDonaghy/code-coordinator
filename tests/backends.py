@@ -245,6 +245,28 @@ def _open_postgres() -> BackendSession:
     return BackendSession(BACKEND_POSTGRES, conn, teardown=_teardown)
 
 
+def open_named_session(backend: str) -> BackendSession:
+    """Open an isolated database on *backend*, ignoring ``COORD_TEST_BACKEND``.
+
+    :func:`open_session` is the autouse fixture's entry point and asks the
+    environment which backend the *whole run* targets.  A caller that needs
+    **two backends at once** — the #2885 write-path parity harness, which
+    replays one workload against each and diffs the result — cannot express
+    that through an env var, so this is the by-name form.  Everything else
+    (schema-per-test on Postgres, ``:memory:`` on SQLite, teardown) is
+    identical; :func:`open_session` is now a thin wrapper over it, so there
+    is exactly one place that knows how to open each backend.
+    """
+    if backend == BACKEND_SQLITE:
+        return _open_sqlite()
+    if backend == BACKEND_POSTGRES:
+        return _open_postgres()
+    raise UnknownTestBackendError(
+        f"{backend!r} is not a known test backend. "
+        f"Valid values: {', '.join(_BACKENDS)}."
+    )
+
+
 def open_session() -> BackendSession:
     """Open one test's isolated database on the active backend.
 
@@ -253,12 +275,7 @@ def open_session() -> BackendSession:
     whatever schema posture ``coord/db.py`` settles on (#827 item 3) rather
     than growing a second, divergent copy of it here.
     """
-    backend = active_backend()
-    if backend == BACKEND_SQLITE:
-        return _open_sqlite()
-    if backend == BACKEND_POSTGRES:
-        return _open_postgres()
-    raise UnknownTestBackendError(backend)  # pragma: no cover - active_backend guards
+    return open_named_session(active_backend())
 
 
 def preflight() -> None:
@@ -304,6 +321,29 @@ def preflight() -> None:
             "empty database (the harness creates and drops one schema per "
             "test inside it, so the role needs CREATE on that database)."
         ) from exc
+
+
+def postgres_available() -> str | None:
+    """``None`` when a Postgres backend can be opened right now, else *why not*.
+
+    :func:`preflight` answers the same question for the whole run and raises
+    ``pytest.UsageError`` — correct there, because the operator explicitly
+    asked for Postgres.  A caller that wants the second backend only *if it
+    happens to be there* (the #2885 parity harness's ``sqlite`` vs
+    ``postgres`` comparison, which must stay skippable on a laptop with no
+    server) needs the non-raising form, and it must not be a second copy of
+    the import/connect probe — so both go through the same helpers.
+    """
+    try:
+        psycopg = _import_psycopg()
+    except ImportError as exc:
+        return str(exc)
+    dsn = postgres_dsn()
+    try:
+        psycopg.connect(dsn).close()
+    except Exception as exc:  # noqa: BLE001 -- any connect failure is the same answer
+        return f"cannot connect to {dsn!r}: {exc}"
+    return None
 
 
 @contextlib.contextmanager
