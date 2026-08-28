@@ -2307,13 +2307,23 @@ def _board_response_schema(components: dict) -> dict:
     # onto bounded rows *after* the DTO projection. They are wire-only (no DB
     # column backs them), so they are not — and should not be — DTO fields;
     # but they ARE on the wire, and since #1939 made issue-body bounding
-    # unconditional every open non-epic issue carries them. Declare them off
-    # board_wire's own field table so the published schema stays a superset
-    # of what /board emits (asserted by
+    # unconditional EVERY open non-epic issue carries them, where before they
+    # fired rarely enough that nothing noticed the spec omitted them.
+    # Declared off board_wire's own field table so the published schema stays
+    # a superset of what /board emits (asserted by
     # tests/test_board_schema.py::test_board_dtos_and_projection_cannot_drift).
+    #
+    # Only `issues` is published here, not board_wire's whole
+    # BOUNDED_TEXT_FIELDS table. `assignments`' four remaining flag pairs
+    # (test_reason/smoke_test_reason/failure_reason/test_plan — review_findings
+    # is already hand-declared on the Rust side) are the same pre-existing
+    # omission, but they are not what #1939 changed, and declaring them makes
+    # `scripts/codegen.py --rust` emit eight new `Assignment` fields, which
+    # forces ~380 lines of struct-literal churn across 48 fixture sites for a
+    # diff about /board byte size. Left for its own change.
     from coord.board_wire import BOUNDED_TEXT_FIELDS  # noqa: PLC0415
 
-    for _table, _fields in BOUNDED_TEXT_FIELDS.items():
+    for _table, _fields in ((t, BOUNDED_TEXT_FIELDS[t]) for t in ("issues",)):
         _props = components[board_schema.BOARD_PROJECTIONS[_table].__name__]["properties"]
         for _field in _fields:
             _props[f"{_field}_truncated"] = {
