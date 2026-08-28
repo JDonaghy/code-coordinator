@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
+import logging
+import logging.config
 import os
 import sqlite3
 import time
@@ -7293,7 +7296,14 @@ def _quiet_all_other_tick_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(env_var, "0")
 
 
-def _stub_portal_sync_tick(monkeypatch: pytest.MonkeyPatch) -> list:
+def _stub_portal_sync_tick(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    moved: bool = False,
+    errors: tuple[str, ...] = (),
+    heartbeat_ok: bool = True,
+    summary: str = "stub summary",
+) -> list:
     """Replace ``_portal_sync_tick`` with a spy and return its call log.
 
     Stubbing the module-level function (not ``coord.portal_sync.sync_tick``)
@@ -7301,21 +7311,27 @@ def _stub_portal_sync_tick(monkeypatch: pytest.MonkeyPatch) -> list:
     ``_tick_loop`` — whether the guard reaches into ``_portal_sync_tick`` at
     all — rather than the sync bridge's internals, which #2824 explicitly
     rules out as the culprit ("`coord/portal_sync.py` is NOT implicated").
+
+    The keyword arguments shape the ``SyncResult``-alike the stub hands back,
+    so #2862's tests can drive Step 3d's *reporting* branches (a clean pass
+    vs. a pass whose heartbeat failed) without reaching into the bridge
+    either.  Defaults reproduce the pre-#2862 stub exactly.
     """
     calls: list = []
+    result_errors = list(errors)
 
     def _stub(config):  # noqa: ANN001
         calls.append(config)
 
         class _Result:
-            moved = False
-            errors: list = []
-            heartbeat_ok = True
+            pass
 
-            def summary(self) -> str:
-                return "stub summary"
-
-        return _Result()
+        result = _Result()
+        result.moved = moved
+        result.errors = result_errors
+        result.heartbeat_ok = heartbeat_ok
+        result.summary = lambda: summary
+        return result
 
     monkeypatch.setattr(serve_app_module, "_portal_sync_tick", _stub)
     return calls
@@ -7386,6 +7402,352 @@ def test_portal_sync_step_3d_is_entered_after_refresh_config_enables_it(
         "reloaded a config with portal.enabled newly true — a stale `config` "
         "read (or a guard exception swallowed into 'disabled') would look "
         "exactly like this"
+    )
+
+
+# ── #2862: Step 3d went quiet a SECOND time, with #2824's cause ruled out ───
+#
+# The daemon on dellserver had #2824's fix live, no `~/.coord/client.toml`, the
+# right `--config` on argv and `portal.enabled: true` in that exact file — and
+# `portal_sync_state.last_heartbeat_at` still only ever moved when a human ran
+# `coord portal sync` by hand.  The debugging note at Step 3d asked whoever hit
+# this next to check what `config` actually *is*; that check came back clean.
+#
+# The answer was that the question could not be answered from the journal at
+# all: `coord serve` configures logging nowhere, and `uvicorn.run(
+# log_level="info")` configures only the `uvicorn*` loggers, so the root logger
+# stays handler-less at WARNING and every `log.info(...)` in `_tick_loop` — Step
+# 3d's per-pass summary included — is dropped before it is formatted.  "Zero
+# portal-related lines in the journal since the daemon started" was true whether
+# the bridge ran or not, so it was never evidence of anything.
+#
+# The tests below pin the three halves of the fix: the logging setup itself, the
+# gate announcing its own state, and every pass emitting exactly one line at a
+# level that matches whether it worked.
+
+
+@contextlib.contextmanager
+def _isolated_coord_logger():
+    """Restore the process-wide ``coord`` logger after a test configures it.
+
+    ``configure_daemon_logging`` mutates global ``logging`` state on purpose
+    (that IS the deliverable), so a test that calls it must put the logger
+    back or it leaks a stderr handler into every later test in the session.
+    """
+    log = logging.getLogger(serve_app_module.DAEMON_LOG_LOGGER)
+    saved_handlers, saved_level = list(log.handlers), log.level
+    saved_propagate = log.propagate
+    try:
+        yield log
+    finally:
+        log.handlers[:] = saved_handlers
+        log.setLevel(saved_level)
+        log.propagate = saved_propagate
+
+
+def test_daemon_logging_makes_coord_info_records_reach_a_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2862's root cause, asserted directly: before this, `coord.serve` INFO
+    records were discarded by `isEnabledFor(INFO) == False` and the root logger
+    had no handler to receive them even if they had not been.
+
+    Also asserts the fix survives ``uvicorn.run``'s own ``dictConfig`` call,
+    which happens *after* ours and is the reason this is easy to get wrong.
+    """
+    monkeypatch.delenv(serve_app_module.DAEMON_LOG_LEVEL_ENV, raising=False)
+    with _isolated_coord_logger() as coord_log:
+        # Baseline: the pre-#2862 world. Nothing configured, root at WARNING.
+        coord_log.handlers[:] = []
+        coord_log.setLevel(logging.NOTSET)
+        assert not logging.getLogger("coord.serve").isEnabledFor(logging.INFO), (
+            "the premise of this test — that an unconfigured `coord.serve` "
+            "drops INFO — no longer holds; #2862's diagnosis needs revisiting"
+        )
+
+        serve_app_module.configure_daemon_logging()
+
+        # uvicorn.run() does this to the logging system right after we run.
+        from uvicorn.config import LOGGING_CONFIG  # noqa: PLC0415
+
+        logging.config.dictConfig(LOGGING_CONFIG)
+
+        assert logging.getLogger("coord.serve").isEnabledFor(logging.INFO)
+        installed = [
+            h
+            for h in coord_log.handlers
+            if getattr(h, "name", None) == serve_app_module.DAEMON_LOG_HANDLER_NAME
+        ]
+        assert len(installed) == 1, (
+            "uvicorn's dictConfig removed (or duplicated) the daemon handler"
+        )
+
+
+def test_daemon_logging_is_idempotent_and_survives_a_bad_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo'd ``COORD_LOG_LEVEL`` in a systemd EnvironmentFile must not stop
+    the daemon booting, and repeat calls must not stack duplicate handlers
+    (which would print every journal line twice)."""
+    with _isolated_coord_logger() as coord_log:
+        coord_log.handlers[:] = []
+        monkeypatch.setenv(serve_app_module.DAEMON_LOG_LEVEL_ENV, "not-a-level")
+        serve_app_module.configure_daemon_logging()
+        assert coord_log.level == logging.INFO
+
+        monkeypatch.setenv(serve_app_module.DAEMON_LOG_LEVEL_ENV, "WARNING")
+        serve_app_module.configure_daemon_logging()
+        serve_app_module.configure_daemon_logging()
+        assert coord_log.level == logging.WARNING
+        assert (
+            len(
+                [
+                    h
+                    for h in coord_log.handlers
+                    if getattr(h, "name", None)
+                    == serve_app_module.DAEMON_LOG_HANDLER_NAME
+                ]
+            )
+            == 1
+        )
+
+
+def test_step_3d_keeps_firing_after_coordinator_yml_is_rewritten_under_it(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2862 acceptance: rewriting ``coordinator.yml`` under a running daemon
+    must not silently disable Step 3d.
+
+    The live config file WAS rewritten on disk in the window the issue reports
+    (unrelated repo-genesis work), so a reload definitely happened — making
+    "the reload swapped in a `config` whose portal is off" the leading suspect
+    before the logging cause was found.  The existing #2824 test only covers
+    off → on; this covers the on → rewrite → still-on direction, and asserts
+    the daemon really did reload (a fresh `Config` object reaches Step 3d)
+    rather than trivially passing because nothing changed.
+    """
+    _enable_portal(valid_config_path)
+    cfg = load_config(valid_config_path)
+    assert cfg.portal.enabled is True
+
+    calls = _stub_portal_sync_tick(monkeypatch)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    before: list = []
+
+    def _rewrite_config_mid_run() -> None:
+        assert calls, "Step 3d never fired even before the rewrite"
+        before.extend(calls)
+        # A byte-identical round-trip rewrite — what `coord repo add` does to
+        # this file — not an edit that touches the `portal:` block at all.
+        valid_config_path.write_text(valid_config_path.read_text())
+        _bump_mtime(valid_config_path)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    _run_tick_loop_briefly(
+        app, settle=1.5, pre_settle=0.5, mid_run=_rewrite_config_mid_run
+    )
+
+    after = calls[len(before):]
+    assert after, (
+        "Step 3d stopped firing once coordinator.yml was rewritten under the "
+        "running daemon — exactly the #2862 symptom"
+    )
+    assert all(c.portal.enabled for c in after), (
+        "the reloaded config Step 3d ran against has portal.enabled false, "
+        "even though the on-disk file still says true"
+    )
+    assert any(c is not before[-1] for c in after), (
+        "no reloaded Config object ever reached Step 3d — the daemon never "
+        "picked the rewrite up, so this test proved nothing about reloads"
+    )
+
+
+def test_step_3d_announces_itself_when_the_gate_is_off(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A `False` boolean gate is silent by design — so #2862 makes the gate log
+    its own state.  Announced once on change, NOT once per 30 s tick.
+    """
+    cfg = load_config(valid_config_path)
+    assert cfg.portal.enabled is False  # no portal: block in the fixture
+
+    calls = _stub_portal_sync_tick(monkeypatch)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    with caplog.at_level(logging.INFO, logger="coord.serve"):
+        _run_tick_loop_briefly(app, settle=0.4)
+
+    assert not calls, "Step 3d ran with portal.enabled false"
+    disabled = [
+        r.getMessage() for r in caplog.records if "Step 3d DISABLED" in r.getMessage()
+    ]
+    assert disabled, (
+        "the disabled gate said nothing — which is precisely how #2824 and "
+        "#2862 both cost a full debugging round"
+    )
+    assert len(disabled) == 1, (
+        f"the gate re-announced itself on every tick ({len(disabled)}x) — that "
+        "is a log flood, not instrumentation"
+    )
+    assert "portal.enabled is false" in disabled[0]
+    assert str(valid_config_path) in disabled[0], (
+        "the DISABLED line must name the config file the daemon is actually "
+        "running on — that identification is what #2824 turned on"
+    )
+
+
+def test_step_3d_logs_one_line_per_pass_when_it_is_healthy(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The healthy steady state — a pass that heartbeats and moves nothing —
+    must be visible, since its *absence* is the whole of #2824 and #2862."""
+    _enable_portal(valid_config_path)
+    cfg = load_config(valid_config_path)
+
+    _stub_portal_sync_tick(monkeypatch, summary="pulled=0 pushed=0 heartbeat=ok")
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    with caplog.at_level(logging.INFO, logger="coord.serve"):
+        _run_tick_loop_briefly(app, settle=0.4)
+
+    assert any(
+        "Step 3d ENABLED" in r.getMessage() for r in caplog.records
+    ), "the daemon never said the bridge was on"
+    passes = [
+        r for r in caplog.records if "heartbeat=ok" in r.getMessage()
+    ]
+    assert passes, "a healthy portal-sync pass logged nothing at all"
+    assert all(r.levelno == logging.INFO for r in passes), (
+        "a healthy pass should be INFO — WARNING is reserved for a pass that "
+        "actually failed, or the level stops meaning anything"
+    )
+
+
+def test_a_failed_heartbeat_pass_is_reported_at_warning(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pre-#2862 code could never report this.
+
+    ``coord.portal_sync.sync_tick`` appends to ``SyncResult.errors`` whenever
+    the heartbeat raises, so ``errors`` is non-empty for every real heartbeat
+    failure — which meant the ``if ... or portal_result.errors: log.info(...)``
+    branch always won and the ``elif not portal_result.heartbeat_ok:
+    log.warning(...)`` written for exactly this case was unreachable.  Combined
+    with INFO being discarded (see the logging tests above), the single most
+    important thing Step 3d can say — *the portal is showing a status nothing
+    is refreshing* — was structurally unable to reach the journal.
+    """
+    _enable_portal(valid_config_path)
+    cfg = load_config(valid_config_path)
+
+    _stub_portal_sync_tick(
+        monkeypatch,
+        errors=("heartbeat: 401 Unauthorized",),
+        heartbeat_ok=False,
+        summary="pulled=0 pushed=0 heartbeat=FAILED errors=1",
+    )
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    with caplog.at_level(logging.INFO, logger="coord.serve"):
+        _run_tick_loop_briefly(app, settle=0.4)
+
+    failed = [r for r in caplog.records if "heartbeat=FAILED" in r.getMessage()]
+    assert failed, "a failing portal-sync pass logged nothing at all"
+    assert all(r.levelno >= logging.WARNING for r in failed), (
+        "a failed heartbeat was reported below WARNING — under the daemon's "
+        "real (unconfigured-root) logging that is indistinguishable from "
+        "silence, which is #2862"
+    )
+
+
+def test_the_tick_loop_names_the_config_it_is_running_on_at_startup(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Step 3d's debugging note tells the next person to "check what `config`
+    actually *is* ... and how the daemon was launched".  #2862 makes the daemon
+    answer that itself, once, at startup — the check that took an ssh session
+    and a walk through ``/proc/<mainpid>/environ`` last time."""
+    _enable_portal(valid_config_path)
+    cfg = load_config(valid_config_path)
+
+    _stub_portal_sync_tick(monkeypatch)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0.05")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    app = build_app(SqliteStore(file_db), cfg)
+    with caplog.at_level(logging.INFO, logger="coord.serve"):
+        _run_tick_loop_briefly(app, settle=0.2)
+
+    startup = [
+        r.getMessage() for r in caplog.records if "tick loop starting" in r.getMessage()
+    ]
+    assert startup, "the daemon never said which config its tick loop is using"
+    assert str(valid_config_path) in startup[0]
+    assert "portal.enabled=True" in startup[0]
+
+
+def test_a_dead_tick_loop_says_so_instead_of_just_going_quiet(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2862 suspect 3 — "the tick loop itself stalled" — was listed as the
+    thing to rule out FIRST and there was no way to do it from the journal.
+
+    ``_tick_loop`` is a bare ``asyncio.create_task`` with no supervisor: an
+    exception out of its ``while True`` stops every cadence in it (reconcile,
+    notify-drain, auto-drain, milestone, portal sync) for the life of the
+    process, and asyncio's own "exception was never retrieved" warning only
+    fires when the task is garbage-collected — which, for a task held alive by
+    the lifespan's frame, means at process exit if ever.  So it must announce
+    its own death.
+    """
+    def _boom(*_a, **_kw):
+        raise RuntimeError("simulated tick-loop death")
+
+    # The one unguarded call at the top of every tick-loop iteration.
+    monkeypatch.setattr(serve_app_module, "_reload_config_if_stale", _boom)
+    monkeypatch.setenv("COORD_RECONCILE_INTERVAL", "0.05")
+    monkeypatch.setenv("COORD_PORTAL_SYNC_INTERVAL", "0")
+    _quiet_all_other_tick_intervals(monkeypatch)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with caplog.at_level(logging.ERROR, logger="coord.serve"):
+        # The lifespan's shutdown re-awaits the (already failed) task, so the
+        # simulated death surfaces again on teardown. Pre-existing behaviour
+        # and harmless — the process is on its way out by then — but this test
+        # drives teardown explicitly, so swallow it here.
+        with contextlib.suppress(RuntimeError):
+            _run_tick_loop_briefly(app, settle=0.3)
+
+    dead = [r for r in caplog.records if "STOPPED" in r.getMessage()]
+    assert dead, (
+        "the tick loop died and the daemon said nothing — indistinguishable "
+        "from 'every step in it is somehow a no-op', which is how #2862 got "
+        "diagnosed three layers down in a frozen DB column"
+    )
+    assert "'tick'" in dead[0].getMessage(), (
+        "the ERROR line must name WHICH loop died — there are five"
+    )
+    assert dead[0].exc_info is not None, (
+        "no traceback attached, so the operator still can't tell why"
     )
 
 

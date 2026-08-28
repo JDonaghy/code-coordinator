@@ -565,7 +565,17 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
         from coord.dao import SqliteStore
         from coord.db import DB_PATH
         from coord.serve_app import build_app as build_serve_app
-        from coord.serve_app import resolve_serve_token
+        from coord.serve_app import configure_daemon_logging, resolve_serve_token
+
+    # #2862: turn the daemon's own logging on BEFORE anything else runs.
+    # Without this the root logger has no handler and sits at WARNING, and
+    # `uvicorn.run(log_level="info")` below does not change that (it only
+    # configures the `uvicorn*` loggers) — so every `log.info(...)` in
+    # `serve_app._tick_loop`, including the customer-portal bridge's per-pass
+    # summary, was discarded before it was formatted. That is what made "Step
+    # 3d is quiet" unfalsifiable from the journal in #2824 and again in #2862.
+    # Level via $COORD_LOG_LEVEL (default INFO).
+    configure_daemon_logging()
 
     # #2824: `allow_thin_client=False` — `coord serve` IS the daemon every
     # thin client's `_load_config()` proxies to; it must always load the
