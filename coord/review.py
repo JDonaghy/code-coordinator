@@ -1090,6 +1090,104 @@ class ReviewerChoice:
     rationale: str
 
 
+# #697: how far past a row's OWN needs-attention threshold a `pending`/
+# `running` row must sit before reviewer selection stops counting its machine
+# as busy.  One hour of margin on top of a threshold that is itself measured
+# in tens of minutes: comfortably longer than any reap path needs
+# (`coord.reconcile._reconcile_no_agent_record` on the daemon's 30s tick,
+# `coord.diagnose.sweep_dead_running_rows` on `coord-notify.timer`'s 5min
+# cadence), so a row still counted busy here is one every reaper has already
+# had many chances at.
+STALE_BUSY_BUFFER_SECONDS = 3600.0
+
+# The same horizon for rows whose type has NO wall-clock threshold at all —
+# `PipelineConfig.attention_threshold_for` returns `inf` for the attended
+# chat/troubleshoot/audit family (#1133).  Those are exactly the rows #697
+# observed at 51h and 70h, so "never expires" is not an option here; a flat,
+# deliberately generous day is.  A human really attending a chat session for
+# a full day is far rarer than a tmux session that died without being reaped.
+STALE_BUSY_INTERACTIVE_SECONDS = 24 * 3600.0
+
+
+def _is_stale_busy_row(a: Assignment, config: Config, now: float) -> bool:
+    """True when *a* is too old to still be believed as occupying its machine (#697).
+
+    Reviewer selection's ``busy`` set used to count **every** ``pending``/
+    ``running`` board row, which is how a zombie row broke dispatch in #697:
+    rows whose worker had been dead for hours-to-days kept inflating the set,
+    so real machines looked occupied and selection was pushed onto whatever
+    candidate happened to look "free" — on #669 that was an *offline* machine,
+    and the review could not be dispatched at all.
+
+    This is deliberately **not** a liveness probe, and deliberately **not** a
+    reap.  The reapers (``coord.reconcile._reconcile_no_agent_record``,
+    ``coord.interactive.reap_stale_interactive_sessions``,
+    ``coord.diagnose.sweep_dead_running_rows``) own the "is it actually dead?"
+    question, they answer it with a positive disproof or a real tmux/agent
+    probe, and they are the only things allowed to write a terminal status.
+    Guessing from age alone would be #1870's mistake if it gated a *write*.
+
+    Here it gates only a *ranking*, where being wrong is cheap and
+    self-correcting in both directions:
+
+    * Wrong about a genuinely-live row → its machine is ranked as idle and may
+      receive the review.  That is the SAME outcome fallback 1
+      ("different machine, currently busy — review will queue") already
+      produces on a one-other-machine fleet, and a genuinely-saturated agent
+      answers with a rejection that ``_ranked_reviewer_candidates`` already
+      falls through on (#904).
+    * Wrong about a dead row (age not yet reached) → status quo ante: the
+      machine stays "busy" and merely ranks lower.
+
+    A row with no ``dispatched_at`` is never stale — there is nothing to
+    compute an age from, and this path never guesses, mirroring
+    ``sweep_dead_running_rows``.
+    """
+    dispatched_at = getattr(a, "dispatched_at", None)
+    if not dispatched_at:
+        return False
+    try:
+        dispatched = float(dispatched_at)
+    except (TypeError, ValueError):
+        return False
+
+    threshold = config.pipeline.attention_threshold_for(
+        a.type or "work",
+        provider_name=a.provider_name,
+        review_of_assignment_id=a.review_of_assignment_id,
+    )
+    if threshold == float("inf"):
+        horizon = STALE_BUSY_INTERACTIVE_SECONDS
+    else:
+        horizon = threshold + STALE_BUSY_BUFFER_SECONDS
+    return (now - dispatched) > horizon
+
+
+def busy_machine_names(
+    board: Board,
+    config: Config,
+    *,
+    now: float | None = None,
+) -> set[str]:
+    """Machines with at least one *believable* in-flight row (#697).
+
+    The shared ``busy`` set for :func:`pick_reviewer_machine` and
+    :func:`_ranked_reviewer_candidates` — a ``pending``/``running`` row whose
+    age is past :func:`_is_stale_busy_row`'s horizon is presumed dead and no
+    longer holds its machine down.  See that function for why an age-only
+    heuristic is the right instrument *for a ranking* and the wrong one for a
+    reap.
+    """
+    if now is None:
+        now = time.time()
+    return {
+        a.machine_name
+        for a in board.active
+        if a.status in ("pending", "running")
+        and not _is_stale_busy_row(a, config, now)
+    }
+
+
 def pick_reviewer_machine(
     worker_machine_name: str,
     repo_name: str,
@@ -1111,6 +1209,11 @@ def pick_reviewer_machine(
     cordon blocked the review, the unreviewable entry stayed `running`, the
     running entry deferred the roll, and the deferred roll left the cordon
     up. Explicit pauses and quiet hours still apply.
+
+    #697: the ``busy`` set is :func:`busy_machine_names`, which drops
+    ``pending``/``running`` rows too old to still be believed — a zombie row
+    used to make a real machine look occupied indefinitely and push selection
+    onto an offline "free" candidate.
     """
     from coord.machine_pause import follow_on_paused_set
     paused = follow_on_paused_set(config.machines)
@@ -1121,7 +1224,7 @@ def pick_reviewer_machine(
     if not candidates:
         return None
 
-    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+    busy = busy_machine_names(board, config)
 
     different = [
         m for m in candidates
@@ -1191,6 +1294,9 @@ def _ranked_reviewer_candidates(
     literal "no eligible reviewer machine configured for repo
     'claude-coordinator'" that a cordoned fleet answered every review
     dispatch with for 70 minutes.
+
+    #697: shares :func:`busy_machine_names` with ``pick_reviewer_machine``, so
+    tier 1 vs tier 2 here is decided on *believable* in-flight rows only.
     """
     from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
 
@@ -1202,7 +1308,7 @@ def _ranked_reviewer_candidates(
     if not candidates:
         return []
 
-    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+    busy = busy_machine_names(board, config)
 
     result: list[tuple[Machine, bool]] = []
     for m in candidates:
