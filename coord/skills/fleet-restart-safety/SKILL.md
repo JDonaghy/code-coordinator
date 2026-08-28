@@ -1,3 +1,9 @@
+---
+name: fleet-restart-safety
+description: "Use before restarting coord-agent/coord-serve or editing coordinator.yml on a live fleet — the two restarts kill different things (headless workers vs. interactive finalize) and neither warns you the way you'd expect."
+trigger: About to restart coord-agent (incl. `coord agent update`) or coord-serve, or edit coordinator.yml/coordinator.remote.yml on a live fleet.
+---
+
 # fleet-restart-safety skill
 
 **Trigger:** About to restart `coord-agent` (including `coord agent update`)

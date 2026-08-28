@@ -1,3 +1,9 @@
+---
+name: portal-followup
+description: "Use when investigating a customer-portal signoff/event that hasn't shown up, or troubleshooting `coord portal` state — gets a straight answer out of outbox/events/sync instead of confusing local-machine state with the bridge's own."
+trigger: Investigating a stuck customer-portal signoff/event, or any `coord portal` state troubleshooting.
+---
+
 # portal-followup skill
 
 **Trigger:** Investigating a customer-portal signoff/event that "hasn't shown up"

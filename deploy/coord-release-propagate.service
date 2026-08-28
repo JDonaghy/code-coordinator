@@ -64,17 +64,38 @@
 #
 # MIN-RELEASES-BEHIND GATE (#2583) — OFF BY DEFAULT, NOT SET HERE
 # -----------------------------------------------------------------
-# `coord release propagate` (and `coord release nightly-window`, below)
-# support holding a run below a configurable delta —
-# `propagation.min_releases_behind` in coordinator.yml, or `--min-behind` on
-# either command — instead of attempting a roll on ANY delta at all (today's
-# default, `min_releases_behind=1`, unchanged unless configured). This
-# `ExecStart=` deliberately does NOT pass `--min-behind`: the threshold is
-# meant to be set (or left alone) via coordinator.yml so both this timer and
-# `coord-release-window.service` read the SAME value, and — per
-# `docs/AGENT_OPERATIONS.md`'s "Auto-roll threshold gate" section — must NOT
-# be raised above 1 on a fleet that has not first taken one manual roll onto
-# a fixed propagation lane. Below the threshold, this unit's own run reports
+# `coord release propagate` (and `coord release nightly-window`, its sibling
+# in `coord-release-window.service`) support holding a run below a
+# configurable delta — `propagation.min_releases_behind` in coordinator.yml,
+# or `--min-behind` on either command — instead of attempting a roll on ANY
+# delta at all (the default, `min_releases_behind=1`, unchanged unless
+# configured). This `ExecStart=` deliberately does NOT pass `--min-behind`:
+# THIS timer reads `propagation.min_releases_behind` straight from
+# coordinator.yml, un-overridden, and that is intentional — see #2866's
+# split:
+#
+#   | Trigger                          | Threshold | Role                  |
+#   |-----------------------------------|-----------|----------------------|
+#   | coord-release-propagate.timer     | 5 (config)| opportunistic — must  |
+#   | (this unit, every 20 min)         |           | not cordon/drain the  |
+#   |                                    |           | fleet every ~45 min,  |
+#   |                                    |           | auto-release.yml's    |
+#   |                                    |           | measured cadence      |
+#   |                                    |           | (12 releases on       |
+#   |                                    |           | 2026-08-27)           |
+#   | coord-release-window.timer        | 1 (fixed  | the guarantee — one   |
+#   | (daily)                           | via       | painless roll a day,  |
+#   |                                    | --min-behind)| whatever accumulated|
+#
+# `coordinator.yml` is a SHARED value read by both commands — raising it
+# here to spare this 20-minute cadence from over-eager rolls would ALSO
+# raise `coord-release-window.service`'s threshold if that unit read the
+# same unqualified default, which is exactly why THAT unit pins
+# `--min-behind 1` explicitly on its own `ExecStart=` rather than relying on
+# this shared config value. Per `docs/AGENT_OPERATIONS.md`'s "Auto-roll
+# threshold gate" section, `propagation.min_releases_behind` must NOT be
+# raised above 1 on a fleet that has not first taken one manual roll onto a
+# fixed propagation lane. Below the threshold, this unit's own run reports
 # `holding: N behind, threshold M` and exits 0, exactly like an ordinary
 # deferral — no cordon, no host touched.
 

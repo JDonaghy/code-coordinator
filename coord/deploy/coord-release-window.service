@@ -126,20 +126,53 @@
 #
 # MIN-RELEASES-BEHIND GATE (#2583) — OFF BY DEFAULT, NOT SET HERE
 # -----------------------------------------------------------------
-# This unit is the PREFERRED vehicle for the #2583 threshold: it is the one
-# place `coord release nightly-window` itself decides whether the daemon
-# host needs a roll at all, so a `propagation.min_releases_behind` set in
-# coordinator.yml (or a `--min-behind` appended to `ExecStart=` below) holds
-# it there — no roll-pending marker set, no `coord release propagate`
-# subprocess spawned — until the daemon is genuinely that many releases
-# behind PyPI's latest. Left unset here on purpose: `min_releases_behind=1`
-# (any delta at all, today's behaviour) is the safe default until an
-# operator deliberately raises it — see `docs/AGENT_OPERATIONS.md`'s
-# "Auto-roll threshold gate" section for why the CURRENT fleet must take one
-# manual roll first, onto a fixed propagation lane, before this is ever
-# turned up. A held run reports `holding: N behind, threshold M` in its own
-# journal (`coord release window-history`) and exits 0, same as a normal
-# `roll-pending`/`up-to-date` outcome.
+# #2866: `--min-behind 1` is set EXPLICITLY on `ExecStart=` below — this is
+# the packaged default now, not "left unset" as an earlier revision of this
+# comment said. The two release timers want DIFFERENT thresholds, and
+# `propagation.min_releases_behind` in coordinator.yml is shared by both
+# `coord release propagate` (step 3a) and `coord release nightly-window`
+# (step 2b) — raising it to spare the 20-minute propagate cadence from
+# cordoning/draining the fleet on every delta would ALSO raise it here,
+# which defeats the entire point of this unit (a guaranteed daily roll,
+# whatever accumulated):
+#
+#   | Trigger                          | Threshold | Role                  |
+#   |-----------------------------------|-----------|----------------------|
+#   | coord-release-propagate.timer     | 5 (config)| opportunistic — must  |
+#   | (every 20 min)                    |           | not cordon/drain the  |
+#   |                                    |           | fleet every ~45 min,  |
+#   |                                    |           | auto-release.yml's    |
+#   |                                    |           | measured cadence      |
+#   |                                    |           | (12 releases on       |
+#   |                                    |           | 2026-08-27)           |
+#   | coord-release-window.timer        | 1 (here)  | the guarantee — one   |
+#   | (daily)                           |           | painless roll a day,  |
+#   |                                    |           | whatever accumulated  |
+#
+# Measured on dellserver at 1 release behind: without `--min-behind` this
+# unit inherited the shared config's `min_releases_behind=5` and reported
+# `holding: 1 behind, threshold 5` — the daily guarantee was silently
+# count-based instead of time-based. `--min-behind` on `ExecStart=` always
+# wins over `propagation.min_releases_behind` (see `coord release
+# nightly-window --help`), so this unit's threshold stays 1 regardless of
+# what the shared config sets for the propagate timer. See
+# `docs/AGENT_OPERATIONS.md`'s "Auto-roll threshold gate" section for why a
+# threshold above 1 requires one manual roll first onto a fixed propagation
+# lane — that requirement is about `propagation.min_releases_behind`
+# (the propagate timer's knob), not this unit's hardcoded 1. A held run
+# reports `holding: N behind, threshold M` in its own journal (`coord
+# release window-history`) and exits 0, same as a normal `roll-pending`/
+# `up-to-date` outcome.
+#
+# The dellserver drop-in this superseded
+# (`~/.config/systemd/user/coord-release-window.service.d/override.conf`,
+# added as the interim fix before this landed) can now be deleted — this
+# `ExecStart=` reproduces it exactly, so removing the drop-in changes
+# nothing. `coord agent update` rewrites this unit file on every roll but
+# never touches a drop-in, which is why that override survived every roll
+# since it was added but would NOT have survived a from-scratch rebuild of
+# this host — the whole reason this is now the packaged default instead of
+# operator-local state.
 
 [Unit]
 Description=Release window: set/fire the #2587 roll-pending marker on the daemon host
@@ -153,7 +186,11 @@ Type=oneshot
 # it shells out to when firing an already-pending marker. A fleet that is
 # still busy is reported and left for the drive-queue tick to keep
 # watching, never overridden.
-ExecStart=%h/.local/bin/coord release nightly-window --config %h/.coord/coordinator.yml
+# #2866: --min-behind 1 is the daily guarantee's own threshold, deliberately
+# independent of `propagation.min_releases_behind` (which the 20-minute
+# coord-release-propagate.service alone should govern) — see the
+# MIN-RELEASES-BEHIND GATE comment above for the full split.
+ExecStart=%h/.local/bin/coord release nightly-window --config %h/.coord/coordinator.yml --min-behind 1
 # Bounded by the SAME ceiling coord-release-propagate.service uses: the
 # "marker already pending -> attempt a fire" branch shells out to `coord
 # release propagate` with its own 1800s subprocess timeout

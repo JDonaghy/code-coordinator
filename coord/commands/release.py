@@ -3146,7 +3146,29 @@ def release_nightly_window(
     existing = read_roll_pending()
 
     if dry_run:
-        if existing is not None:
+        # #2866: a marker naming a STALE target (not equal to the freshly
+        # resolved `record.target_version` — PyPI's "latest" moved, or the
+        # daemon reached/passed it some other way since the marker was set)
+        # must never be echoed back as "would attempt ... --target <stale>".
+        # This is the exact 2026-08-28 incident: a `propagate`-set marker
+        # for v0.5.254 survived on disk after the daemon had already
+        # reached v0.5.258 by other means, and `nightly-window --dry-run`
+        # read it back and printed a proposal to roll BACKWARDS to
+        # v0.5.254 — cleared by hand with `coord drive-queue cancel-roll`
+        # at the time. In reality a NON-dry-run run never fires a stale
+        # target either (section 3 below replaces it with
+        # `record.target_version` instead, whenever it differs) — this
+        # branch only makes the --dry-run description match that real
+        # behaviour instead of quoting the stale value as if it would run.
+        if existing is not None and existing.target_version != record.target_version:
+            click.echo(
+                f"a roll is pending for a stale target ({existing.describe()}) — "
+                f"would replace it with v{record.target_version} ({daemon_name} "
+                f"currently reports v{record.daemon_version or '?'}) rather than "
+                "ever firing the stale value (#2866); its original set_at/"
+                "deferrals would be preserved (#2607)"
+            )
+        elif existing is not None:
             click.echo(
                 f"a roll is already pending ({existing.describe()}) — would "
                 f"attempt `coord release propagate --daemon-host {daemon_name} "

@@ -1,3 +1,9 @@
+---
+name: merge-stuck-triage
+description: "Use when a story won't merge — the TUI Go does nothing, `coord merge` skips it, or the queue box stays grey/pending — walks the merge gates in the order they actually block instead of guessing."
+trigger: A story won't merge, or an operator asks why something isn't merging.
+---
+
 # merge-stuck-triage skill
 
 **Trigger:** A story won't merge — the TUI "Go" does nothing, `coord merge` skips

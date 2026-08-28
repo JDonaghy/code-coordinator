@@ -2,15 +2,31 @@
 # (Type=oneshot) once a night. See that unit's header for the full
 # rationale (#2112, rewritten #2587).
 #
-# 03:00 local, inside the 22:00-08:00 quiet hours already used for
-# notifications (see coord-notify's own schedule) — an operator is least
-# likely to be mid-drive at 03:00. #2587: this firing itself is now fast
-# (resolve the target, set-or-fire the roll-pending marker, return) — there
-# is no multi-hour drain to leave room for any more. The ACTUAL roll may
-# still land well after 03:00 if the fleet stays busy; that is fine and by
-# design, since it fires the instant `coord drive-queue tick` sees the
-# fleet's own next inter-drive gap rather than waiting for THIS timer's
-# next fire, and never stops any timer to get there.
+# 10:00 America/Chicago — #2866: this is what the fleet actually runs
+# (dellserver carried it as an untracked
+# `coord-release-window.timer.d/override.conf` drop-in from 2026-08-26
+# until this became the packaged default), replacing the earlier packaged
+# 03:00 UTC. Named with an explicit zone rather than a bare local wall-clock
+# time specifically so a DST transition cannot drift the fire time by an
+# hour twice a year — `systemd.time(7)`'s `OnCalendar=` resolves a
+# zone-qualified spec against that zone's own clock, DST included. Still
+# inside a low-drive-activity part of the day; the exact hour matters far
+# less than picking ONE the operator can reason about, since #2587 already
+# means a late/early firing costs nothing (see below). #2587: this firing
+# itself is now fast (resolve the target, set-or-fire the roll-pending
+# marker, return) — there is no multi-hour drain to leave room for any
+# more. The ACTUAL roll may still land well after this fires if the fleet
+# stays busy; that is fine and by design, since it fires the instant `coord
+# drive-queue tick` sees the fleet's own next inter-drive gap rather than
+# waiting for THIS timer's next fire, and never stops any timer to get
+# there.
+#
+# The dellserver drop-in this superseded can now be deleted — this
+# `OnCalendar=` reproduces it exactly (same zone-qualified spec), so
+# removing the drop-in changes nothing. A from-scratch rebuild of that host
+# would otherwise have silently reverted to 03:00 UTC with no warning,
+# which is the whole reason this moved from operator-local override to
+# packaged default.
 #
 # RandomizedDelaySec is small and exists only to avoid firing at the exact
 # same wall-clock instant `coord-drive-queue.timer`'s own OnCalendar-free
@@ -30,7 +46,7 @@
 Description=Nightly release window on the daemon host (#2112, #2587)
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+OnCalendar=*-*-* 10:00:00 America/Chicago
 RandomizedDelaySec=5min
 AccuracySec=1min
 Persistent=true

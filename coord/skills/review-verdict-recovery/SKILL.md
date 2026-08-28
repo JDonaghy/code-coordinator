@@ -1,3 +1,9 @@
+---
+name: review-verdict-recovery
+description: "Use when `coord gates` shows review : ERROR (not BLOCKED), or a headless review completed with no parseable verdict — recovers the verdict already sitting in the transcript instead of burning a full re-review cycle."
+trigger: "`coord gates <repo> <issue>` shows review : ERROR, or a review reached END_REVIEW with review_verdict=None on the board."
+---
+
 # review-verdict-recovery skill
 
 **Trigger:** `coord gates <repo> <issue>` shows `review : ERROR` (not

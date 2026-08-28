@@ -1,3 +1,9 @@
+---
+name: coord-dispatch-verbs
+description: "Use before running a `coord` CLI command to enqueue, dispatch, stage, or otherwise move a GitHub issue through the coordinator — disambiguates ~70 top-level commands with similarly-named pairs that silently do the wrong thing instead of erroring."
+trigger: About to run a `coord` command to move an issue forward, especially when unsure of the exact subcommand, or a command exited 0 but the expected effect didn't happen.
+---
+
 # coord-dispatch-verbs skill
 
 **Trigger:** About to run a `coord` command to enqueue, dispatch, stage, or

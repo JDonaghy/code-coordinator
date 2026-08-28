@@ -1,3 +1,9 @@
+---
+name: tui-quadraui-workflow
+description: "Use when working on tui/ (coord-tui) and the task needs the pinned quadraui git rev in tui/Cargo.toml bumped, or needs building against an unmerged quadraui branch/PR without touching the pin."
+trigger: Working on tui/ and the task needs the quadraui pin bumped, or building against an unmerged quadraui branch/PR.
+---
+
 # tui-quadraui-workflow skill
 
 **Trigger:** Working on `tui/` (coord-tui) and the task needs the `quadraui`
