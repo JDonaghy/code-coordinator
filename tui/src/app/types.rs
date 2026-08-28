@@ -725,44 +725,51 @@ impl BoardDriveQueueEntry {
     }
 }
 
-/// #584: serde deserializer for `Assignment::test_plan` on the remote
-/// (`coord serve` /board) read path.  The wire shape is the decoded JSON
-/// OBJECT `{"steps":[{kind,cmd,label,check},...], ...}` — NOT an array — so
-/// we read it as an `Option<serde_json::Value>` and reuse the same
-/// `.get("steps").as_array()` extraction as [`parse_test_plan_steps`].
-/// Returns `None` on any shape mismatch (mirrors the SQLite path's tolerant
-/// degradation to the "Preparing plan…" placeholder).
+/// Pull the `steps` array out of a decoded `test_plan` blob
+/// (`{"steps": [{kind, cmd, label, check}, ...], "blockers": [...]}`) and
+/// project it into [`TestPlanStep`]s.
+///
+/// `None` on any shape mismatch — callers degrade to the "Preparing plan…"
+/// placeholder rather than erroring.
+///
+/// #2895: this used to exist twice — here for the `/board` wire and as
+/// `data::parse_test_plan_steps` for the SQLite TEXT column coord-tui read
+/// itself. The SQLite path is gone, so there is one extraction again.
+pub(crate) fn test_plan_steps_from_value(val: &serde_json::Value) -> Option<Vec<TestPlanStep>> {
+    let steps = val.get("steps")?.as_array()?;
+    Some(
+        steps
+            .iter()
+            .filter_map(|s| {
+                let kind = s.get("kind")?.as_str()?.to_string();
+                Some(TestPlanStep {
+                    kind,
+                    cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    label: s
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    check: s
+                        .get("check")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// #584: serde deserializer for `Assignment::test_plan` on the `coord serve`
+/// /board read path.  The wire shape is the decoded JSON OBJECT
+/// `{"steps":[...], ...}` — NOT an array — so we read it as an
+/// `Option<serde_json::Value>` and hand it to [`test_plan_steps_from_value`].
 pub(crate) fn deserialize_test_plan<'de, D>(deserializer: D) -> Result<Option<Vec<TestPlanStep>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
     let val = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(val) = val else {
-        return Ok(None);
-    };
-    let Some(steps) = val.get("steps").and_then(|s| s.as_array()) else {
-        return Ok(None);
-    };
-    let result: Vec<TestPlanStep> = steps
-        .iter()
-        .filter_map(|s| {
-            let kind = s.get("kind")?.as_str()?.to_string();
-            Some(TestPlanStep {
-                kind,
-                cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                label: s
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                check: s
-                    .get("check")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            })
-        })
-        .collect();
-    Ok(Some(result))
+    Ok(val.and_then(|v| test_plan_steps_from_value(&v)))
 }
 
 /// #259: identifies what kind of sidebar row a context menu was opened
@@ -2276,10 +2283,20 @@ pub struct BoardData {
     /// the marker file from) and on daemons older than #2608.
     pub(crate) roll_pending: Option<RollPending>,
     /// #2532: mirrors `BoardPayload::approved_submissions` — portal
-    /// submissions ready for decomposition. Empty on the local-SQLite-mode
-    /// read path (no daemon to compute the server-resolved `repos`) and on
-    /// daemons older than #2532.
+    /// submissions ready for decomposition. Empty on daemons older than #2532.
     pub(crate) approved_submissions: Vec<ApprovedSubmission>,
+    /// #2895: a **hard, permanent** board-load error — today the single case
+    /// "no board service is configured at all", which is now fatal to reading
+    /// a board (coord-tui no longer opens `coord.db` itself). `None` on every
+    /// healthy load.
+    ///
+    /// Deliberately NOT set for transient failures (daemon down, timeout,
+    /// bad JSON): those keep returning a bare `BoardData::default()` so
+    /// `apply_pending_data`'s #620 degraded-tick guard still recognises them
+    /// and preserves the last good board. A `Some` here means the opposite —
+    /// there is nothing to retry into, so the tick is applied and the message
+    /// is pinned in the status bar until the operator fixes the config.
+    pub(crate) load_error: Option<String>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

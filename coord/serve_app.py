@@ -3629,6 +3629,73 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/issue-upsert": {
+            "post": {
+                "summary": "Upsert ONE issue row into the shared issue cache (#2895)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue": {"type": "object"},
+                                },
+                                "required": ["repo_name", "issue"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/purge": {
+            "post": {
+                "summary": (
+                    "Count (dry_run) or delete old done/failed assignments and "
+                    "old closed issues (#2895)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "older_than_secs": {"type": "number"},
+                                    "dry_run": {"type": "boolean"},
+                                },
+                                "required": ["older_than_secs"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Rows deleted (or, with dry_run, matched)",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "assignments": {"type": "integer"},
+                                        "issues": {"type": "integer"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Bad older_than_secs"},
+                },
+            }
+        },
         "/issue-edit": {
             "post": {
                 "summary": "Edit an issue's title/body through the tracker seam",
@@ -6558,6 +6625,70 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_issue_upsert(request: Request) -> Response:
+        # #2895: upsert ONE issue row into the shared issue cache. The TUI's
+        # `gh issue view` refresh used to write this straight into coord.db
+        # over its own rusqlite connection; now that coord-tui is
+        # daemon-required, it POSTs here. Unlike /issues-sync this does not
+        # mark the repo's other issues closed — it refreshes one row.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        issue = body.get("issue")
+        if not isinstance(issue, dict) or "number" not in issue:
+            return JSONResponse(
+                {"error": "missing field: issue.number"}, status_code=400
+            )
+        try:
+            state._upsert_issue_local(body["repo_name"], issue)
+        except (KeyError, TypeError, ValueError) as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-upsert write failed", "detail": str(e)},
+                status_code=503,
+            )
+        _bust_board_cache()
+        return JSONResponse({"ok": True})
+
+    async def post_purge(request: Request) -> Response:
+        # #2895: count (dry_run) or delete old done/failed assignments and old
+        # closed issues. The TUI's Settings purge action drove this through a
+        # read-write rusqlite connection to coord.db, behind the daemon's back
+        # while `coord serve` held the same file open; it is a daemon call now.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            older_than_secs = float(body["older_than_secs"])
+        except (KeyError, TypeError, ValueError) as e:
+            return JSONResponse(
+                {"error": f"bad older_than_secs: {e}"}, status_code=400
+            )
+        if older_than_secs < 0:
+            return JSONResponse(
+                {"error": "older_than_secs must be >= 0"}, status_code=400
+            )
+        dry_run = bool(body.get("dry_run", False))
+        try:
+            if dry_run:
+                assignments, issues = state._count_purgeable_local(older_than_secs)
+            else:
+                assignments, issues = state._purge_done_assignments_local(
+                    older_than_secs
+                )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "purge failed", "detail": str(e)}, status_code=503
+            )
+        if not dry_run:
+            _bust_board_cache()
+        return JSONResponse({"assignments": assignments, "issues": issues})
+
     async def post_issue_edit(request: Request) -> Response:
         # Edit an issue's title/body through the tracker seam (the backend write
         # — GitHub via gh today — runs HERE on the daemon, not the client, so the
@@ -8826,6 +8957,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issue-label", post_issue_label, methods=["POST"]),
         Route("/issue-create", post_issue_create, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
+        # #2895: single-row issue upsert + purge, the two write paths coord-tui
+        # used to perform against coord.db directly.
+        Route("/issue-upsert", post_issue_upsert, methods=["POST"]),
+        Route("/purge", post_purge, methods=["POST"]),
         Route("/issue-edit", post_issue_edit, methods=["POST"]),
         Route("/issue-milestone", post_issue_milestone, methods=["POST"]),
         Route(

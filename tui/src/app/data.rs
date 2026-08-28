@@ -1,12 +1,27 @@
 //! Async fetch/parse free-function layer extracted from `app/mod.rs` (#743).
 //!
-//! Network I/O, SQLite reads, subprocess spawns, parse helpers.  No quadraui
-//! rendering types appear here.
+//! Network I/O, subprocess spawns, parse helpers.  No quadraui rendering types
+//! appear here — and, since #2895, no database access either: every board read
+//! and write goes through the `coord serve` daemon over HTTP.
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use rusqlite::{Connection, OpenFlags};
 use super::types::*;
+
+/// #2895: shown when `resolve_board_service()` finds nothing — no
+/// `COORD_SERVICE_URL`, no `board_service` in `~/.coord/client.toml`, and no
+/// `~/.coord/serve_token` marking this box as the daemon host.  coord-tui has
+/// no local-database fallback any more, so this is fatal to loading a board;
+/// it is pinned in the status bar (see `CoordApp::status_bar`) rather than
+/// left to look like an empty board.
+pub(crate) const NO_BOARD_SERVICE_ERROR: &str =
+    "no board service configured — set board_service in ~/.coord/client.toml";
+
+/// Port `coord serve` listens on (see CLAUDE.md's "Conventions": agent 7433,
+/// dashboard 7434, board daemon 7435).  Only used for the #2895 daemon-host
+/// auto-detection in [`resolve_board_service`]; every other caller gets a full
+/// URL from config.
+pub(crate) const DAEMON_PORT: u16 = 7435;
 
 /// Messages sent from the background SSE watch thread to the main thread.
 pub(crate) enum SseWatchMsg {
@@ -457,39 +472,6 @@ pub(crate) fn sanitize_branch(branch: &str) -> String {
         }
     }
     result.trim_matches('-').to_string()
-}
-
-/// #349: Parse the JSON blob from `assignments.test_plan` into a Vec of
-/// [`TestPlanStep`]s.  Returns `None` on any parse failure so callers
-/// degrade gracefully to the "Preparing plan…" placeholder.
-///
-/// The expected JSON shape is:
-/// ```json
-/// {"steps": [{"kind": "run"|"pull"|"verify", "cmd": "…", "label": "…", "check": "…"}],
-///  "blockers": ["…"]}
-/// ```
-pub(crate) fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
-    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let steps = val.get("steps")?.as_array()?;
-    let result: Vec<TestPlanStep> = steps
-        .iter()
-        .filter_map(|s| {
-            let kind = s.get("kind")?.as_str()?.to_string();
-            Some(TestPlanStep {
-                kind,
-                cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                label: s
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                check: s
-                    .get("check")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            })
-        })
-        .collect();
-    Some(result)
 }
 
 /// #349: Read the current HEAD SHA for a git branch by examining the local
@@ -1467,468 +1449,27 @@ pub(crate) fn compute_staging_local(
     result
 }
 
+/// #2895: the ONLY board read path — coord-tui is daemon-required.
+///
+/// Before this, a missing `board_service` fell through to opening
+/// `~/.coord/coord.db` read-only and hand-rolling the board projection SQL
+/// (raw column list and all) in Rust.  That path could not follow the store
+/// service onto Postgres (#2894 Phase D), it was invisible to `coord/sql.py`'s
+/// dialect seam and to #2768's ratchet (both AST walks over *Python*), and on
+/// the daemon host it also read/wrote a file `coord serve` held open in WAL
+/// mode, behind the daemon's back.
+///
+/// So it is gone.  No service resolves ⇒ a named, actionable error — NOT a
+/// silently blank board, which is precisely what the old path produced when
+/// its read-only SQLite open returned `Err`.
 pub(crate) fn load_data() -> BoardData {
-    // #584: when a board service is configured (env or ~/.coord/client.toml),
-    // fetch the read-only board projection over HTTP from the `coord serve`
-    // daemon instead of opening coord.db directly.  When NO service is
-    // configured this falls through to the byte-identical SQLite path below.
-    if let Some((url, token)) = resolve_board_service() {
-        return load_data_remote(&url, token.as_deref());
+    match resolve_board_service() {
+        Some((url, token)) => load_data_remote(&url, token.as_deref()),
+        None => BoardData {
+            load_error: Some(NO_BOARD_SERVICE_ERROR.to_string()),
+            ..BoardData::default()
+        },
     }
-
-    let dir = coord_dir();
-    let db_path = dir.join("coord.db");
-
-    // Open the DB read-only; return empty data if the DB doesn't exist yet.
-    let conn = match Connection::open_with_flags(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(_) => return BoardData::default(),
-    };
-
-    // ── Query assignments ──────────────────────────────────────────────────
-    // dispatched_at and finished_at are stored as REAL (Unix float seconds).
-    let mut assignments: Vec<Assignment> = {
-        let mut stmt = match conn.prepare(
-            "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
-             status, branch, model, type, dispatched_at, finished_at, exit_code, \
-             test_state, review_verdict, review_of_assignment_id, cost_usd, \
-             smoke_tests, review_findings, test_plan, test_plan_branch_head, \
-             COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
-             COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0), \
-             COALESCE(is_interactive, 0), failure_reason, \
-             COALESCE(review_iteration, 0), \
-             acceptance_state, acceptance_reason, acceptance_sha, \
-             acceptance_total, acceptance_passed, \
-             test_reason, review_state, pr_url, \
-             audit_goals_json, audit_bottom_line, audit_run_number, \
-             for_issue_number, driven_by, dispatched_by_assignment_id \
-             FROM assignments ORDER BY dispatched_at DESC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return BoardData::default(),
-        };
-        let rows = match stmt.query_map([], |row| {
-            Ok(Assignment {
-                id: row.get::<_, String>(0)?,
-                machine: row.get::<_, String>(1)?,
-                repo: row.get::<_, String>(2)?,
-                issue_number: row.get::<_, i64>(3)? as u64,
-                issue_title: row.get::<_, String>(4)?,
-                status: row.get::<_, String>(5)?,
-                branch: row.get::<_, Option<String>>(6)?,
-                model: row.get::<_, Option<String>>(7)?,
-                assignment_type: row.get::<_, Option<String>>(8)?,
-                dispatched_at: row.get::<_, Option<f64>>(9)?,
-                finished_at: row.get::<_, Option<f64>>(10)?,
-                exit_code: row.get::<_, Option<i32>>(11)?,
-                test_state: row.get::<_, Option<String>>(12)?,
-                review_verdict: row.get::<_, Option<String>>(13)?,
-                review_of_assignment_id: row.get::<_, Option<String>>(14)?,
-                cost_usd: row.get::<_, Option<f64>>(15)?,
-                smoke_tests: row
-                    .get::<_, Option<String>>(16)?
-                    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
-                review_findings: row.get::<_, Option<String>>(17)?,
-                // #349: parse test_plan JSON blob into Vec<TestPlanStep>.
-                // Silently returns None on parse failure so older rows (no
-                // column or malformed JSON) degrade to the "Preparing plan…"
-                // placeholder rather than crashing.
-                test_plan: row
-                    .get::<_, Option<String>>(18)?
-                    .and_then(|raw| parse_test_plan_steps(&raw)),
-                test_plan_branch_head: row.get::<_, Option<String>>(19)?,
-                // #546: token counts.  COALESCE(col, 0) in the SQL converts
-                // any NULL values to 0 for existing columns.  If the columns
-                // don't exist yet (pre-migration DB), the whole query fails
-                // and BoardData::default() is returned — acceptable graceful
-                // degradation since the Python coordinator always runs
-                // migrations before workers produce any data to show.
-                input_tokens: row.get::<_, i64>(20)?,
-                output_tokens: row.get::<_, i64>(21)?,
-                cache_creation_tokens: row.get::<_, i64>(22)?,
-                cache_read_tokens: row.get::<_, i64>(23)?,
-                // #546: is_interactive distinguishes Max-subscription sessions from
-                // old automated rows that also have cost_usd=NULL + zero tokens.
-                is_interactive: row.get::<_, i64>(24)? != 0,
-                // #1337: the local-SQLite path reads the DB directly — the
-                // wire-bounding policy applies only to the daemon's /board
-                // payload, so findings here are always complete.
-                review_findings_truncated: false,
-                review_findings_len: None,
-                // #618: short launch-failure reason; NULL for successful launches.
-                // unwrap_or(None) absorbs a row.get() type-conversion error (e.g.
-                // unexpected NULL type); a missing column causes conn.prepare() to
-                // fail before any row is fetched, not here.
-                failure_reason: row.get::<_, Option<String>>(25).unwrap_or(None),
-                // #803: fix-round counter for model escalation on the interactive
-                // --fix-of path.  COALESCE handles the pre-migration NULL case.
-                review_iteration: row.get::<_, i64>(26)?,
-                // #932/#944: the Acceptance-gate verdict, reported/gated
-                // separately from test_state.
-                acceptance_state: row.get::<_, Option<String>>(27)?,
-                acceptance_reason: row.get::<_, Option<String>>(28)?,
-                acceptance_sha: row.get::<_, Option<String>>(29)?,
-                acceptance_total: row.get::<_, Option<i64>>(30)?,
-                acceptance_passed: row.get::<_, Option<i64>>(31)?,
-                // #876: board-sourced summary fields.  These columns may not
-                // exist in pre-migration DBs, so we use unwrap_or(None) so an
-                // older DB doesn't blank the board.
-                test_reason: row.get::<_, Option<String>>(32).unwrap_or(None),
-                review_state: row.get::<_, Option<String>>(33).unwrap_or(None),
-                pr_url: row.get::<_, Option<String>>(34).unwrap_or(None),
-                // #886 Phase 2: Milestone Outcome Audit columns. unwrap_or(None)
-                // for the same graceful-degradation reason as pr_url above.
-                audit_goals_json: row.get::<_, Option<String>>(35).unwrap_or(None),
-                audit_bottom_line: row.get::<_, Option<String>>(36).unwrap_or(None),
-                audit_run_number: row.get::<_, Option<i64>>(37).unwrap_or(None),
-                // #1084: JIT test-author per-member-issue correlation.
-                // unwrap_or(None) for the same graceful-degradation reason
-                // as the audit columns above.
-                for_issue_number: row
-                    .get::<_, Option<i64>>(38)
-                    .unwrap_or(None)
-                    .map(|n| n as u64),
-                // #1499: durable drive provenance. unwrap_or(None) for the
-                // same graceful-degradation reason as the columns above.
-                driven_by: row.get::<_, Option<String>>(39).unwrap_or(None),
-                // #2417: calling-worker provenance. unwrap_or(None) for the
-                // same graceful-degradation reason as the columns above.
-                dispatched_by_assignment_id: row
-                    .get::<_, Option<String>>(40)
-                    .unwrap_or(None),
-                // #1941: not read by the local-SQLite path — this branch predates
-                // these `coord.board_schema` columns and none of them are queried
-                // above. `#[allow(dead_code)]` on each in `generated.rs` covers the
-                // same gap on the daemon-backed `/board` path via `#[serde(default)]`.
-                repo_github: None,
-                files_allowed: None,
-                files_forbidden: None,
-                smoke_test: None,
-                smoke_test_reason: None,
-                review_target: None,
-                required_gates: None,
-                plan: None,
-                unreachable_count: None,
-                review_posted_at: None,
-                uat_state: None,
-                uat_reason: None,
-                claude_session_id: None,
-                provider_name: None,
-                review_head_sha: None,
-                completion_summary: None,
-                review_verdict_original: None,
-                review_verdict_override_reason: None,
-                review_patch_id: None,
-                test_head_sha: None,
-                test_patch_id: None,
-                test_base_sha: None,
-                review_scoped: None,
-                review_scope_base_sha: None,
-                test_toolchain: None,
-                verdict_source: None,
-                verdict_source_reason: None,
-                stop_reason: None,
-                num_turns: None,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return BoardData::default(),
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    // Sort: running first, then failed, then done (most recent first within groups).
-    assignments.sort_by(|a, b| {
-        let rank = |s: &str| match s {
-            "running" => 0u8,
-            "failed" => 1,
-            "done" => 2,
-            _ => 3,
-        };
-        rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
-            b.dispatched_at
-                .partial_cmp(&a.dispatched_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-
-    // ── Query machines (name = nickname, host = Tailscale FQDN, repos = JSON array) ─
-    let machine_rows: Vec<(String, String, Vec<String>)> = {
-        let mut stmt = match conn.prepare("SELECT name, host, repos FROM machines") {
-            Ok(s) => s,
-            Err(_) => {
-                return BoardData {
-                    assignments,
-                    ..BoardData::default()
-                }
-            }
-        };
-        let rows = match stmt.query_map([], |row| {
-            let repos_json: String = row
-                .get::<_, Option<String>>(2)?
-                .unwrap_or_else(|| "[]".to_string());
-            let repos: Vec<String> = serde_json::from_str(&repos_json).unwrap_or_default();
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, repos))
-        }) {
-            Ok(r) => r,
-            Err(_) => {
-                return BoardData {
-                    assignments,
-                    ..BoardData::default()
-                }
-            }
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    // ── Query merge_queue ──────────────────────────────────────────────────
-    // Join to assignments to resolve issue_number (merge_queue may not have it).
-    // A missing table (rare) degrades to an empty queue rather than dropping the
-    // rest of the board — the assembly tail still runs (#584 shared with remote).
-    let merge_queue: Vec<MergeQueueEntry> = {
-        let stmt = conn.prepare(
-            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
-             mq.repo_github, mq.target_branch, mq.error, a.branch, mq.last_attempt \
-             FROM merge_queue mq \
-             LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
-        );
-        match stmt {
-            Ok(mut stmt) => stmt
-                .query_map([], |row| {
-                    Ok(MergeQueueEntry {
-                        assignment_id: row.get::<_, String>(0)?,
-                        issue_number: row.get::<_, Option<i64>>(1)?.map(|n| n as u64),
-                        state: row.get::<_, String>(2)?,
-                        pr_number: row.get::<_, Option<i64>>(3)?,
-                        pr_url: row.get::<_, Option<String>>(4)?,
-                        repo_github: row.get::<_, String>(5)?,
-                        target_branch: row.get::<_, Option<String>>(6)?,
-                        error: row.get::<_, Option<String>>(7)?,
-                        // branch from assignments — used for branch-level dedup
-                        // in compute_staging_local (#778).
-                        branch: row.get::<_, Option<String>>(8)?,
-                        // milestone_title is filled in by the client-side join
-                        // in assemble_board_data after open_issues are loaded.
-                        milestone_title: None,
-                        // #913: merge time — see field doc on MergeQueueEntry.
-                        last_attempt: row.get::<_, Option<f64>>(9)?,
-                        // #1941: not read by the local-SQLite path — this SELECT
-                        // predates these `coord.board_schema` columns.
-                        id: None,
-                        repo_name: String::new(),
-                        issue_title: String::new(),
-                        size: None,
-                        enqueued_at: None,
-                        assignment_type: None,
-                        required_gates: None,
-                        ci_infra_reruns: 0,
-                        ci_stale_reruns: 0,
-                        ci_flaky_reruns: 0,
-                        ci_flaky_pending: String::new(),
-                        ci_unreadable_reruns: 0,
-                        ci_fix_dispatches: 0,
-                    })
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // ── Query proposals ───────────────────────────────────────────────────
-    let proposals: Vec<Proposal> = {
-        let stmt = conn.prepare(
-            "SELECT id, machine_name, repo_name, issue_number, issue_title, \
-             rationale, type FROM proposals ORDER BY id",
-        );
-        match stmt {
-            Ok(mut stmt) => stmt
-                .query_map([], |row| {
-                    Ok(Proposal {
-                        id: row.get::<_, i64>(0)?,
-                        machine: row.get::<_, String>(1)?,
-                        repo: row.get::<_, String>(2)?,
-                        issue_number: row.get::<_, i64>(3)? as u64,
-                        issue_title: row.get::<_, String>(4)?,
-                        rationale: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                        proposal_type: row
-                            .get::<_, Option<String>>(6)?
-                            .unwrap_or_else(|| "work".into()),
-                        // #1941: not read by the local-SQLite path — this SELECT
-                        // predates these `coord.board_schema` columns.
-                        files_likely: None,
-                        briefing: None,
-                        model: None,
-                        required_gates: None,
-                    })
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // ── Query synced issues (both open and closed) ─────────────────────────
-    // Loaded eagerly so the Board Issue tab can show bodies for issues in
-    // any lifecycle group, including closed ones in Completed. Only the
-    // "open" entries are injected as Pending rows downstream.
-    let open_issues: Vec<OpenIssue> = {
-        let stmt = conn.prepare(
-            "SELECT repo_name, number, title, body, labels, state, \
-             milestone_number, milestone_title FROM issues \
-             ORDER BY repo_name, number",
-        );
-        match stmt {
-            Ok(mut stmt) => stmt
-                .query_map([], |row| {
-                    let labels_raw: String = row.get(4).unwrap_or_default();
-                    let labels: Vec<String> =
-                        serde_json::from_str(&labels_raw).unwrap_or_default();
-                    Ok(OpenIssue {
-                        repo_name: row.get::<_, String>(0)?,
-                        number: row.get::<_, i64>(1)? as u64,
-                        title: row.get::<_, String>(2)?,
-                        body: row.get::<_, String>(3).unwrap_or_default(),
-                        labels,
-                        state: row
-                            .get::<_, String>(5)
-                            .unwrap_or_else(|_| "open".to_string()),
-                        milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
-                        milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
-                        body_truncated: false,
-                        body_len: None,
-                        // #1941: fields added to the generated wire DTO; not exercised by this test.
-                        synced_at: None,
-                    })
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // ── Query board_meta for pipeline config ───────────────────────────────
-    let (
-        pipeline_default_gates,
-        pipeline_tracked_labels,
-        pipeline_repos,
-        pipeline_require_plan,
-        pipeline_repo_run_cmds,
-        pipeline_repo_paths,
-        pipeline_models,
-        pipeline_acceptance_routes,
-    ) = load_pipeline_meta(&conn);
-
-    // ── Query cached structured plans ──────────────────────────────────────
-    // Populated by `coord notify` parsing the plan worker's log into the
-    // `plans` table.  The TUI renders these directly in the Plan stage
-    // content panel — without this the panel falls back to dumping the
-    // raw stream-json log (unreadable).
-    let plans: std::collections::HashMap<String, PlanData> = {
-        let mut out = std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT assignment_id, plan_data FROM plans") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                let aid: String = row.get(0)?;
-                let raw: String = row.get(1)?;
-                Ok((aid, raw))
-            }) {
-                for r in rows.flatten() {
-                    let (aid, raw) = r;
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        out.insert(aid, parse_plan_data(&v));
-                    }
-                }
-            }
-        }
-        out
-    };
-
-    // #778: compute staging entries (approved/done work not yet in queue)
-    // locally from already-loaded assignments + merge_queue so the staging
-    // section works even without a coord serve daemon running.
-    let merge_staging = compute_staging_local(
-        &assignments,
-        &merge_queue,
-        &pipeline_default_gates,
-    );
-
-    assemble_board_data(
-        assignments,
-        machine_rows,
-        open_issues,
-        merge_queue,
-        // Local SQLite path has no merge_plan; it is only available from the
-        // remote /board endpoint (coord serve, #776).  Pass empty here.
-        Vec::new(),
-        proposals,
-        plans,
-        pipeline_default_gates,
-        pipeline_tracked_labels,
-        pipeline_repos,
-        pipeline_repo_run_cmds,
-        pipeline_repo_paths,
-        pipeline_acceptance_routes,
-        pipeline_require_plan,
-        merge_staging,
-        pipeline_models,
-        // #550: local SQLite path has no daemon to compute the server-side
-        // stage projection; `pipeline.rs`'s local functions it mirrors
-        // remain authoritative on this path. Pass empty here.
-        Vec::new(),
-        // #795: local SQLite path has no daemon to compute the work-order
-        // frontier. Pass empty; Pipeline cards show no rank/frontier badges.
-        Vec::new(),
-        // #1195/#1197: local SQLite path has no daemon to compute per-epic
-        // children either. Pass empty; the Pipeline tree renders epics as
-        // ordinary flat leaves on this path, same as before #1197.
-        Vec::new(),
-        // #975: local SQLite path has no daemon to compute the plan roster.
-        // Pass empty; the Plans panel renders a "no plans yet" placeholder.
-        Vec::new(),
-        // #976: local SQLite path has no daemon at all, so plan_roster is
-        // never "supported" here — the Plans panel must show its
-        // not-connected-to-a-daemon message rather than treating the empty
-        // Vec above as a genuinely empty roster.
-        false,
-        // #978: local SQLite path has no daemon to read GOAL.md from —
-        // `GoalHeader::default()` (available: false) leaves the Plans panel
-        // with no pinned header, exactly as before this field existed.
-        GoalHeader::default(),
-        // #1037/#1039: local SQLite path has no daemon computing the
-        // 15-minute audit-recency window; the Audit panel's sidebar badge
-        // simply shows nothing (0) on this path, same posture as
-        // plan_roster_supported above.
-        0,
-        // #1505: local SQLite path has no daemon to compute driver-
-        // escalation records either (they're a raw table dump but still
-        // server-side only, same posture as merge_plan above). Pass empty;
-        // the Pipeline row/menu simply show no escalation on this path.
-        Vec::new(),
-        // #1631 (H-4): local SQLite path has no daemon-in-process to poll
-        // agent /health or run the fleet-scope registry either — same
-        // posture as merge_plan/escalations above. Pass the empty default;
-        // the status-bar indicator renders "FLEET: OK" (zero units, not a
-        // fabricated warning) and the detail overlay is empty on this path.
-        FleetHealthBlock::default(),
-        // #1753/#1755 (DQ-3): the `drive_queue` table lives in the daemon
-        // host's DB and reaches a client only through `/board` — same
-        // posture as `escalations` above. Pass empty; the status-bar
-        // segment renders "QUEUE: empty" (which is the truth for this
-        // client, and never a fabricated alert) on this path.
-        Vec::new(),
-        // #2608: local SQLite path has no daemon to read the machine-local
-        // roll-pending marker from either — same posture as `drive_queue`
-        // above. `None`; the Queue panel renders no roll banner on this path.
-        None,
-        // #2532: the `approved_submissions` join (portal submission →
-        // #2531's project↔repo mapping) is server-side only, same posture
-        // as `drive_queue` above. Pass empty; the Approved panel renders
-        // its "0 ready to pull" empty state on this path.
-        Vec::new(),
-    )
 }
 
 /// #584: run the machine reachability/health probes and assemble the final
@@ -2116,6 +1657,10 @@ pub(crate) fn assemble_board_data(
         drive_queue,
         roll_pending,
         approved_submissions,
+        // #2895: reaching `assemble_board_data` at all means a board was
+        // successfully fetched — the hard "no board service" error is raised
+        // by `load_data`, upstream of here.
+        load_error: None,
     }
 }
 
@@ -2173,12 +1718,29 @@ impl Drop for TestBoardServiceGuard {
     }
 }
 
-/// #584: resolve the configured board service URL + optional bearer token.
+/// #584: resolve the board service URL + optional bearer token.
 ///
-/// Precedence: environment (`COORD_SERVICE_URL` + `COORD_TOKEN`) wins over the
-/// `~/.coord/client.toml` file (TOML keys `board_service` and optional `token`).
-/// Returns `None` when no URL is found anywhere — the caller then falls back to
-/// the local SQLite read path (byte-identical to today, no regression).
+/// Precedence, highest first:
+///
+/// 1. environment — `COORD_SERVICE_URL` + `COORD_TOKEN`;
+/// 2. `~/.coord/client.toml` — TOML keys `board_service` and optional `token`;
+/// 3. **#2895, the daemon host** — `~/.coord/serve_token` exists, so
+///    `coord serve` runs here: use `http://127.0.0.1:{DAEMON_PORT}` with that
+///    token.
+///
+/// Rung 3 exists because #2895 deleted the local-SQLite fallback, and the
+/// daemon host is exactly the machine that had no `client.toml` (it did not
+/// need one — the local DB *was* canonical). Auto-detecting keeps it working
+/// with zero config while staying scoped to this process: it does NOT make
+/// the host's Python side think it is a thin client, which dropping a
+/// `client.toml` there would (`_thin_client_local_board_guard`'s #615
+/// warnings, `daemon_reroute_target` bouncing `coord merge`/`diagnose`/
+/// `housekeeping` over HTTP to its own daemon). And because the resolved URL
+/// is loopback, [`is_remote_board_service`] still reports `false` there, so
+/// the TUI keeps auto-running the host-side `coord notify`/`coord sync`.
+///
+/// Returns `None` only when all three come up empty — a hard error now, see
+/// [`NO_BOARD_SERVICE_ERROR`].
 ///
 /// Any trailing `/` is stripped from the URL so callers can append `/board`.
 pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
@@ -2232,9 +1794,31 @@ pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
         }
     }
 
-    // Then ~/.coord/client.toml.
-    let path = coord_dir().join("client.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
+    // Then ~/.coord/client.toml.  A missing/unparsable file, or one with no
+    // usable `board_service`, falls through to the daemon-host rung below
+    // rather than short-circuiting to None (#2895).
+    if let Some(found) = board_service_from_client_toml() {
+        return Some(found);
+    }
+
+    // #2895: finally, the daemon host itself — `coord serve` writes
+    // `~/.coord/serve_token`, so its presence is the marker for "the board
+    // daemon lives on this machine".  See this function's doc comment for why
+    // this is preferable to shipping a `client.toml` here.
+    let token = std::fs::read_to_string(coord_dir().join("serve_token"))
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())?;
+    Some((format!("http://127.0.0.1:{DAEMON_PORT}"), Some(token)))
+}
+
+/// Rung 2 of [`resolve_board_service`]: `~/.coord/client.toml`'s
+/// `board_service` (+ optional `token`).  Split out so a missing file, a
+/// parse failure, or an empty/absent key all return `None` *to the caller*
+/// (which then tries the daemon-host rung) instead of `?`-returning out of
+/// `resolve_board_service` entirely.
+fn board_service_from_client_toml() -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(coord_dir().join("client.toml")).ok()?;
     let parsed: toml::Value = toml::from_str(&text).ok()?;
     let url = parsed.get("board_service")?.as_str()?.trim();
     if url.is_empty() {
@@ -2248,16 +1832,50 @@ pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
     Some((url.trim_end_matches('/').to_string(), token))
 }
 
-/// #584: true when this coord-tui is a thin client of a remote `coord serve`
-/// daemon (board fetched over HTTP).  Cached for the process lifetime — the
-/// bootstrap (env / client.toml) doesn't change within a session.  Thin clients
-/// must NOT auto-run host-side control commands (`coord notify`, `coord sync`):
-/// they'd shell out locally against the wrong/absent DB and only produce error
-/// toasts.  Routing these through the daemon is the write-path story (#590).
+/// #584: true when the board service is on **another machine**, i.e. this
+/// coord-tui is a genuine thin client.  Cached for the process lifetime — the
+/// bootstrap (env / client.toml / daemon-host marker) doesn't change within a
+/// session.  Thin clients must NOT auto-run host-side control commands
+/// (`coord notify`, `coord sync`): they'd shell out locally against the
+/// wrong/absent DB and only produce error toasts.  Routing these through the
+/// daemon is the write-path story (#590).
+///
+/// #2895: "board service configured" and "thin client" used to be the same
+/// predicate, which stopped being true once [`resolve_board_service`] started
+/// auto-detecting the daemon host — a box that talks HTTP to its own loopback
+/// daemon is still the host, and `coord notify`/`coord sync` are still
+/// supposed to run there.  So the loopback case reports `false`.
 pub(crate) fn is_remote_board_service() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| resolve_board_service().is_some())
+    *CACHE.get_or_init(|| {
+        resolve_board_service()
+            .map(|(url, _)| !url_is_loopback(&url))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether *url*'s host is a loopback address — i.e. the board daemon it
+/// points at runs on this same machine.  See [`is_remote_board_service`].
+pub(crate) fn url_is_loopback(url: &str) -> bool {
+    // Strip scheme, then path, then port, then IPv6 brackets.
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop userinfo if present (`user:pass@host:port`).
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(end) = hostport.find(']') {
+        // Bracketed IPv6 literal: `[::1]` / `[::1]:7435`.
+        hostport[..end].trim_start_matches('[')
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    // Parse as an IP so the whole 127.0.0.0/8 range (and `::1`) is covered
+    // without a prefix match — `127.0.0.1.example.com` is a hostname on some
+    // OTHER machine, and `starts_with("127.")` happily called it loopback.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    host.eq_ignore_ascii_case("localhost")
 }
 
 /// #1012: shared JSON-POST-and-parse call to the board daemon, factored out
@@ -2518,9 +2136,19 @@ fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) ->
 }
 
 /// #584: parse the pipeline_* keys out of a `board_meta` map fetched over the
-/// /board wire.  Mirrors [`load_pipeline_meta`] (the SQLite reader) field for
-/// field, including the documented fallbacks, so the remote path fills the
-/// `BoardData.pipeline_*` fields identically to the local path.
+/// /board wire.
+///
+/// Returns `(default_gates, tracked_labels, repos, require_plan,
+/// repo_run_cmds, repo_paths, pipeline_models, acceptance_routes)` with the
+/// documented fallbacks when a key is missing or unparseable: gates default
+/// to `["review", "merge"]`, tracked labels to `["coord"]`, and everything
+/// else to empty/`false`/`None`.  Repos are `(coord_name, github_slug)`
+/// pairs.
+///
+/// #2895: this used to have a SQLite twin (`load_pipeline_meta`) reading the
+/// same keys straight out of `board_meta` for coord-tui's local-DB path.
+/// That path is gone, so this is the only reader and there is no longer a
+/// pair of parsers to keep field-for-field in sync.
 pub(crate) fn parse_pipeline_meta_from_map(
     meta: &std::collections::HashMap<String, String>,
 ) -> (
@@ -2551,8 +2179,7 @@ pub(crate) fn parse_pipeline_meta_from_map(
     }
 
     // #1151: repo_name -> list of route `match` globs (only present for
-    // repos with a routed acceptance driver, #1125). Mirrors
-    // `load_pipeline_meta`'s `read_map_of_lists` (the SQLite reader).
+    // repos with a routed acceptance driver, #1125).
     fn read_map_of_lists(
         meta: &std::collections::HashMap<String, String>,
         key: &str,
@@ -3382,11 +3009,11 @@ pub(crate) fn spawn_issue_fetch(
                             milestone_number,
                             milestone_title,
                         };
-                        // Best-effort upsert into the local DB. Failures (DB
-                        // locked, schema missing, etc.) are non-fatal — the
-                        // in-memory cache still serves the body for the rest
-                        // of the session.
-                        let _ = upsert_issue_db(&repo_name, &issue);
+                        // Best-effort upsert into the shared issue cache via
+                        // the daemon. Failures (daemon down, 5xx, etc.) are
+                        // non-fatal — the in-memory cache still serves the
+                        // body for the rest of the session.
+                        let _ = upsert_issue_remote(&repo_name, &issue);
                         Ok(issue)
                     }
                     Err(e) => Err(format!("gh json parse failed: {}", e)),
@@ -3484,42 +3111,32 @@ pub(crate) fn spawn_pr_fetch(
 }
 
 
-/// Upsert a freshly-fetched issue into the local `issues` table. Mirrors the
-/// `upsert_open_issues` Python helper but for a single row, using the same
-/// connection-with-busy-timeout pattern as the other TUI writers (purge,
-/// test-verdict). Single-statement transaction, safe under concurrent
-/// coord/TUI writers per SQLite WAL semantics.
-pub(crate) fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()> {
-    let conn = open_purge_conn()?;
-    let labels_json = serde_json::to_string(&issue.labels).unwrap_or_else(|_| "[]".to_string());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    conn.execute(
-        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at, \
-         milestone_number, milestone_title) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-         ON CONFLICT(repo_name, number) DO UPDATE SET \
-            title = excluded.title, \
-            body = excluded.body, \
-            state = excluded.state, \
-            labels = excluded.labels, \
-            synced_at = excluded.synced_at, \
-            milestone_number = excluded.milestone_number, \
-            milestone_title = excluded.milestone_title",
-        rusqlite::params![
-            repo_name,
-            issue.number as i64,
-            issue.title,
-            issue.body,
-            issue.state,
-            labels_json,
-            now,
-            issue.milestone_number,
-            issue.milestone_title
-        ],
-    )?;
+/// Upsert a freshly-fetched issue into the shared `issues` cache.
+///
+/// #2895: this used to open its own read-write `rusqlite` connection to
+/// `~/.coord/coord.db`. It now POSTs to the daemon's `/issue-upsert` route
+/// (`coord.state._upsert_issue_local` behind it), so the row lands in
+/// whichever engine the daemon owns — and, on the daemon host, no longer
+/// races `coord serve` on the same file.
+///
+/// Mirrors the request/response shape of [`record_test_verdict_remote`]
+/// (#590): the caller has already resolved the service, or there is nothing
+/// to write to.
+pub(crate) fn upsert_issue_remote(repo_name: &str, issue: &FetchedIssue) -> Result<(), String> {
+    let (url, token) = resolve_board_service().ok_or(NO_BOARD_SERVICE_ERROR)?;
+    let body = serde_json::json!({
+        "repo_name": repo_name,
+        "issue": {
+            "number": issue.number,
+            "title": issue.title,
+            "body": issue.body,
+            "state": issue.state,
+            "labels": issue.labels,
+            "milestone_number": issue.milestone_number,
+            "milestone_title": issue.milestone_title,
+        },
+    });
+    post_daemon_json(&url, token.as_deref(), "/issue-upsert", &body)?;
     Ok(())
 }
 
@@ -3664,135 +3281,6 @@ pub(crate) fn make_local_sse_state(_assignment_id: &str) -> WatchSseState {
         line_times: Vec::new(),
         current_turn: 0,
     }
-}
-
-/// Read pipeline-related entries from the `board_meta` table.
-///
-/// Returns ``(default_gates, tracked_labels, repos, require_plan,
-/// repo_run_cmds, repo_paths)`` with the documented fallbacks when the keys
-/// are missing or unparseable: gates default to ``["review", "merge"]``,
-/// tracked labels to ``["coord"]``, repos to an empty list, require_plan to
-/// ``false``, repo_run_cmds to an empty map, and repo_paths to an empty map.
-/// Repos are returned as ``(coord_name, github_slug)`` pairs preserving
-/// insertion order.
-pub(crate) fn load_pipeline_meta(
-    conn: &Connection,
-) -> (
-    Vec<String>,
-    Vec<String>,
-    Vec<(String, String)>,
-    bool,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-    Option<PipelineModels>,
-    std::collections::HashMap<String, Vec<String>>,
-) {
-    fn read_key(conn: &Connection, key: &str) -> Option<String> {
-        conn.query_row(
-            "SELECT value FROM board_meta WHERE key = ?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    }
-
-    fn read_map(conn: &Connection, key: &str) -> std::collections::HashMap<String, String> {
-        read_key(conn, key)
-            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|val| match val {
-                serde_json::Value::Object(map) => Some(
-                    map.into_iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    // #1151: repo_name -> list of route `match` globs (only present for
-    // repos with a routed acceptance driver, #1125).
-    fn read_map_of_lists(
-        conn: &Connection,
-        key: &str,
-    ) -> std::collections::HashMap<String, Vec<String>> {
-        read_key(conn, key)
-            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|val| match val {
-                serde_json::Value::Object(map) => Some(
-                    map.into_iter()
-                        .filter_map(|(k, v)| {
-                            let list = v.as_array()?;
-                            let strs: Vec<String> = list
-                                .iter()
-                                .filter_map(|e| e.as_str().map(str::to_string))
-                                .collect();
-                            Some((k, strs))
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    let default_gates: Vec<String> = read_key(conn, "pipeline_default_gates")
-        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
-        .unwrap_or_else(|| vec!["review".to_string(), "merge".to_string()]);
-
-    let tracked_labels: Vec<String> = read_key(conn, "pipeline_tracked_labels")
-        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
-        .unwrap_or_else(|| vec!["coord".to_string()]);
-
-    let repos: Vec<(String, String)> = read_key(conn, "pipeline_repos")
-        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-        .and_then(|val| match val {
-            serde_json::Value::Object(map) => Some(
-                map.into_iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    let require_plan: bool = read_key(conn, "pipeline_require_plan")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    // #296: repo_name → run_cmd map from coordinator.yml.
-    let repo_run_cmds = read_map(conn, "pipeline_repo_run_cmds");
-
-    // #349: repo_name → local checkout path on this machine.
-    let repo_paths = read_map(conn, "pipeline_repo_paths");
-
-    // #803: model config snapshot for interactive --fix-of escalation.
-    let pipeline_models: Option<PipelineModels> = read_key(conn, "pipeline_models")
-        .and_then(|v| serde_json::from_str::<PipelineModels>(&v).ok());
-
-    // #1151: repo_name → route match globs, for repos with a routed
-    // acceptance driver.
-    let acceptance_routes = read_map_of_lists(conn, "pipeline_acceptance_routes");
-
-    (
-        default_gates,
-        tracked_labels,
-        repos,
-        require_plan,
-        repo_run_cmds,
-        repo_paths,
-        pipeline_models,
-        acceptance_routes,
-    )
-}
-
-/// Open a writer connection with a 5s busy timeout so a brief lock from
-/// the coordinator doesn't make purge silently no-op.
-pub(crate) fn open_purge_conn() -> rusqlite::Result<Connection> {
-    let db_path = coord_dir().join("coord.db");
-    let conn = Connection::open(&db_path)?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
-    Ok(conn)
 }
 
 #[cfg(test)]

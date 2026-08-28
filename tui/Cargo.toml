@@ -55,7 +55,6 @@ test-support = []
 # `.cargo/config.toml` `paths` override — see
 # `tui/cargo-config-local-quadraui.toml.example`).
 quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "d6ae247c007721284dc895d4fbf42b5f4a5ba47f", features = ["tui", "terminal"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

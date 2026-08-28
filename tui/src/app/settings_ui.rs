@@ -1913,134 +1913,67 @@ pub(crate) fn settings_label(text: &str) -> FormField {
 
 // ─── Purge helper ─────────────────────────────────────────────────────────────
 
-/// Open a short-lived read-write connection to `coord.db` and delete:
-///
-/// * `assignments` rows where `status IN ('done', 'failed')` and
-///   `finished_at < now - older_than_secs`
-/// * `issues` rows where `state = 'closed'` and
-///   `synced_at < now - older_than_secs`
-///
-/// Returns the total number of rows deleted across both tables.
-///
-/// A separate read-write connection is used because the main data-load
-/// connection is opened with `SQLITE_OPEN_READ_ONLY`.  SQLite WAL mode
-/// serialises concurrent writers, so this is safe.
-/// Compute the cutoff timestamp for purge predicates.
-pub(crate) fn purge_cutoff(older_than_secs: f64) -> f64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    now - older_than_secs
-}
-
-/// Count rows that would be deleted by [`purge_done_assignments_conn`].
-/// Inner helper that takes an explicit connection so tests can run against
-/// an in-memory DB without touching the real coord.db.
-pub(crate) fn count_purgeable_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
-    let a: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM assignments \
-         WHERE status IN ('done', 'failed') \
-         AND finished_at IS NOT NULL \
-         AND finished_at < ?1",
-        rusqlite::params![cutoff],
-        |r| r.get(0),
-    )?;
-    let i: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM issues \
-         WHERE state = 'closed' \
-         AND synced_at IS NOT NULL \
-         AND synced_at < ?1",
-        rusqlite::params![cutoff],
-        |r| r.get(0),
-    )?;
-    Ok((a as usize, i as usize))
-}
-
-/// Delete old `done`/`failed` assignments and old closed issues.
-/// Inner helper — see [`count_purgeable_conn`].
-pub(crate) fn purge_done_assignments_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
-    let assignments_deleted = conn.execute(
-        "DELETE FROM assignments \
-         WHERE status IN ('done', 'failed') \
-         AND finished_at IS NOT NULL \
-         AND finished_at < ?1",
-        rusqlite::params![cutoff],
-    )?;
-    let issues_deleted = conn.execute(
-        "DELETE FROM issues \
-         WHERE state = 'closed' \
-         AND synced_at IS NOT NULL \
-         AND synced_at < ?1",
-        rusqlite::params![cutoff],
-    )?;
-    Ok((assignments_deleted, issues_deleted))
-}
-
-/// Count rows that would be deleted by [`purge_done_assignments_db`].
+/// #2895: count the rows a purge older than *older_than_secs* would delete,
+/// without deleting them — `POST /purge` with `dry_run: true`.
 ///
 /// Returns `(assignments, closed_issues)` so the confirmation prompt and the
 /// completion toast show matching numbers — the user is never surprised by
 /// a "47 rows removed" toast after confirming "Purge 3 rows".
-pub(crate) fn count_purgeable_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
-    let conn = open_purge_conn()?;
-    count_purgeable_conn(&conn, purge_cutoff(older_than_secs))
+///
+/// This (and [`purge_done_assignments_remote`] below) used to open a
+/// read-write `rusqlite` connection to `~/.coord/coord.db`. On the daemon
+/// host that meant the TUI mutating the board behind `coord serve`'s back
+/// while it held the same file in WAL mode; everywhere else it meant a second
+/// SQL dialect, in a second language, that #2894 Phase D's Postgres swap
+/// could not follow. Both are daemon calls now.
+pub(crate) fn count_purgeable_remote(older_than_secs: f64) -> Result<(usize, usize), String> {
+    purge_request(older_than_secs, true)
 }
 
-/// Delete old `done`/`failed` assignments and old closed issues.
-/// Returns `(assignments_deleted, issues_deleted)`; errors propagate to the
-/// caller for a visible error toast (silent `.unwrap_or(0)` previously hid
-/// SQLITE_BUSY).
-pub(crate) fn purge_done_assignments_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
-    let conn = open_purge_conn()?;
-    purge_done_assignments_conn(&conn, purge_cutoff(older_than_secs))
+/// #2895: delete old `done`/`failed` assignments and old closed issues —
+/// `POST /purge` with `dry_run: false`. Returns
+/// `(assignments_deleted, issues_deleted)`; errors propagate to the caller
+/// for a visible error toast rather than a silent `.unwrap_or(0)`.
+pub(crate) fn purge_done_assignments_remote(
+    older_than_secs: f64,
+) -> Result<(usize, usize), String> {
+    purge_request(older_than_secs, false)
+}
+
+/// Shared body of the two functions above — the only difference is `dry_run`,
+/// and the daemon decides the cutoff from `older_than_secs` so the count and
+/// the delete can never disagree about "now".
+fn purge_request(older_than_secs: f64, dry_run: bool) -> Result<(usize, usize), String> {
+    let (url, token) = resolve_board_service().ok_or(NO_BOARD_SERVICE_ERROR)?;
+    let body = serde_json::json!({
+        "older_than_secs": older_than_secs,
+        "dry_run": dry_run,
+    });
+    let resp = post_daemon_json(&url, token.as_deref(), "/purge", &body)?;
+    let count = |key: &str| -> usize {
+        resp.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize
+    };
+    Ok((count("assignments"), count("issues")))
 }
 
 /// #200: Record a Test gate verdict on the given work assignment id.
 /// `verdict` is "passed" | "failed" | "skipped". `reason` is only stored for
 /// failures (ignored otherwise).
 ///
-/// Also mirrors `smoke_test` / `smoke_test_reason` so `coord fix` can see the
-/// verdict — `coord fix` guards on `smoke_test == "fail"` (cli.py:4285-4291).
-/// Without this mirror, a report+fix dispatched from the TUI would immediately
-/// exit-1 with "smoke_test is None, expected 'fail'".  Mirrors the same logic
-/// as `coord test --fail/--pass` (cli.py:3308-3312).
+/// #590 Phase 2: POST the verdict to the daemon. Derives the legacy
+/// `smoke_test` / `smoke_test_reason` mirror the same way `coord test
+/// --pass/--fail` does, so `coord fix`'s `smoke_test == "fail"` guard sees
+/// it. Built on the shared [`post_daemon_json`] helper (#1012).
 ///
-/// Inner function accepts an explicit connection so tests can run against an
-/// in-memory DB without touching the real coord.db.
-pub(crate) fn record_test_verdict_conn(
-    conn: &Connection,
-    assignment_id: &str,
-    verdict: &str,
-    reason: Option<&str>,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE assignments SET test_state = ?1, test_reason = ?2 WHERE assignment_id = ?3",
-        rusqlite::params![verdict, reason, assignment_id],
-    )?;
-    // Mirror smoke_test for "passed" and "failed" verdicts only (same as CLI).
-    if matches!(verdict, "failed" | "passed") {
-        let smoke_val: &str = if verdict == "failed" { "fail" } else { "pass" };
-        let smoke_reason: Option<&str> = if verdict == "failed" { reason } else { None };
-        conn.execute(
-            "UPDATE assignments SET smoke_test = ?1, smoke_test_reason = ?2 \
-             WHERE assignment_id = ?3",
-            rusqlite::params![smoke_val, smoke_reason, assignment_id],
-        )?;
-    }
-    Ok(())
-}
-
-/// #590 Phase 2: POST the verdict to the daemon when a board service is set
-/// (the thin client's local coord.db is the wrong DB). Mirrors the smoke_test
-/// derivation in [`record_test_verdict_conn`] so the daemon writes the same
-/// columns. Built on the shared [`post_daemon_json`] helper (#1012).
+/// #2895: this is now the ONLY verdict writer — the `rusqlite` twin that ran
+/// when no board service was configured is gone along with the rest of
+/// coord-tui's embedded SQLite.
 pub(crate) fn record_test_verdict_remote(
     assignment_id: &str,
     verdict: &str,
     reason: Option<&str>,
 ) -> Result<(), String> {
-    let (url, token) = resolve_board_service().ok_or("no board service configured")?;
+    let (url, token) = resolve_board_service().ok_or(NO_BOARD_SERVICE_ERROR)?;
     let (smoke_test, smoke_reason): (Option<&str>, Option<&str>) = match verdict {
         "failed" => (Some("fail"), reason),
         "passed" => (Some("pass"), None),
@@ -2142,19 +2075,3 @@ pub(crate) fn apply_issue_labels_remote(
     Ok((labels, changed))
 }
 
-pub(crate) fn record_test_verdict_db(
-    assignment_id: &str,
-    verdict: &str,
-    reason: Option<&str>,
-) -> rusqlite::Result<()> {
-    if is_remote_board_service() {
-        return record_test_verdict_remote(assignment_id, verdict, reason).map_err(|e| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e,
-            )))
-        });
-    }
-    let conn = open_purge_conn()?;
-    record_test_verdict_conn(&conn, assignment_id, verdict, reason)
-}

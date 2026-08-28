@@ -8079,3 +8079,231 @@ def test_auto_drain_leaves_a_clean_sibling_alone(
     rows = {x.assignment_id: x for x in mq.load_queue()}
     assert rows["work-sib"].state == mq.PENDING
     assert rows["work-sib"].error is None
+
+
+# ── #2895: coord-tui's ex-SQLite writers as daemon routes ─────────────────────
+#
+# `POST /purge` and `POST /issue-upsert` replace the read-write rusqlite
+# connection coord-tui used to open against ~/.coord/coord.db (Settings →
+# purge, and the `gh issue view` cache refresh). The SQL predicates asserted
+# here were previously asserted in Rust, in `tui/src/app/tests.rs`, against an
+# in-memory SQLite fixture — they now live on this side of the seam, where
+# `coord/sql.py`'s dialect layer can carry them onto Postgres (#2894 Phase D).
+
+def _seed_purge_rows(conn) -> None:
+    """Two purgeable assignments, one too fresh, one running; plus issues."""
+    for aid, status, finished_at in [
+        ("old-done", "done", 100.0),
+        ("old-failed", "failed", 100.0),
+        ("fresh-done", "done", 500.0),
+        ("running", "running", 100.0),
+        ("no-finish", "done", None),
+    ]:
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, status, finished_at) VALUES (?,?,?,?,?,?,?)",
+            (aid, "laptop", "api", 1, "t", status, finished_at),
+        )
+    for number, state_, synced_at in [
+        (1, "closed", 100.0),
+        (2, "closed", 200.0),
+        (3, "closed", 500.0),   # too fresh
+        (4, "open", 100.0),     # open: never purged
+        (5, "closed", None),    # no synced_at: never purged
+    ]:
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, state, labels, synced_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("api", number, "t", state_, "[]", synced_at),
+        )
+    conn.commit()
+
+
+def _purge(cli, *, older_than_secs: float, dry_run: bool):
+    return cli.post(
+        "/purge", json={"older_than_secs": older_than_secs, "dry_run": dry_run}
+    )
+
+
+def test_serve_purge_dry_run_counts_without_deleting(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    _seed_purge_rows(rw_db)
+    # Freeze "now" so the cutoff lands at 300.0 with older_than_secs=200.
+    monkeypatch.setattr("coord.state.time.time", lambda: 500.0)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = _purge(cli, older_than_secs=200.0, dry_run=True)
+    assert resp.status_code == 200
+    # done+failed older than the cutoff only: running excluded, fresh excluded,
+    # NULL finished_at excluded.  Issues: closed and old only.
+    assert resp.json() == {"assignments": 2, "issues": 2}
+    # Nothing actually deleted.
+    assert rw_db.execute("SELECT COUNT(*) c FROM assignments").fetchone()["c"] == 5
+    assert rw_db.execute("SELECT COUNT(*) c FROM issues").fetchone()["c"] == 5
+
+
+def test_serve_purge_deletes_exactly_what_the_dry_run_counted(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """The prompt and the toast must never disagree.
+
+    The TUI shows the dry-run number in its confirmation prompt and the delete
+    number in the completion toast; a drift between the two predicates is the
+    "confirmed Purge 3 rows, got 47 removed" bug this guards.
+    """
+    _seed_purge_rows(rw_db)
+    monkeypatch.setattr("coord.state.time.time", lambda: 500.0)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        counted = _purge(cli, older_than_secs=200.0, dry_run=True).json()
+        deleted = _purge(cli, older_than_secs=200.0, dry_run=False).json()
+    assert counted == deleted == {"assignments": 2, "issues": 2}
+    remaining = {
+        r["assignment_id"]
+        for r in rw_db.execute("SELECT assignment_id FROM assignments").fetchall()
+    }
+    assert remaining == {"fresh-done", "running", "no-finish"}
+    remaining_issues = {
+        r["number"] for r in rw_db.execute("SELECT number FROM issues").fetchall()
+    }
+    assert remaining_issues == {3, 4, 5}
+
+
+def test_serve_purge_rejects_bad_older_than_secs(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        assert cli.post("/purge", json={}).status_code == 400
+        assert cli.post("/purge", json={"older_than_secs": "soon"}).status_code == 400
+        assert cli.post("/purge", json={"older_than_secs": -1}).status_code == 400
+
+
+def test_serve_issue_upsert_inserts_then_updates_one_row(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    issue = {
+        "number": 42,
+        "title": "first title",
+        "body": "first body",
+        "state": "open",
+        "labels": ["coord"],
+        "milestone_number": 3,
+        "milestone_title": "ms-3",
+    }
+    with TestClient(app) as cli:
+        assert cli.post(
+            "/issue-upsert", json={"repo_name": "api", "issue": issue}
+        ).status_code == 200
+        row = rw_db.execute(
+            "SELECT title, body, state, labels, milestone_title FROM issues "
+            "WHERE repo_name='api' AND number=42"
+        ).fetchone()
+        assert row["title"] == "first title"
+        assert row["state"] == "open"
+        assert json.loads(row["labels"]) == ["coord"]
+        assert row["milestone_title"] == "ms-3"
+
+        # Second POST for the same (repo, number) updates in place.
+        issue["title"] = "second title"
+        issue["state"] = "closed"
+        assert cli.post(
+            "/issue-upsert", json={"repo_name": "api", "issue": issue}
+        ).status_code == 200
+    rows = rw_db.execute(
+        "SELECT title, state FROM issues WHERE repo_name='api' AND number=42"
+    ).fetchall()
+    assert len(rows) == 1, "upsert must not duplicate the row"
+    assert rows[0]["title"] == "second title" and rows[0]["state"] == "closed"
+
+
+def test_serve_issue_upsert_does_not_close_sibling_issues(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """Unlike /issues-sync, a single-row upsert is a refresh, not a sync.
+
+    /issues-sync marks every other issue in the repo closed before upserting
+    the fetched set.  The TUI's `gh issue view` refresh fetches exactly ONE
+    issue, so routing it through that endpoint would have closed the entire
+    rest of the board's backlog.
+    """
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels, synced_at) "
+        "VALUES ('api', 7, 'sibling', 'open', '[]', 1.0)"
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        assert cli.post(
+            "/issue-upsert",
+            json={"repo_name": "api", "issue": {"number": 42, "title": "new"}},
+        ).status_code == 200
+    sibling = rw_db.execute("SELECT state FROM issues WHERE number=7").fetchone()
+    assert sibling["state"] == "open", "the sibling must be untouched"
+
+
+def test_serve_issue_upsert_rejects_missing_number(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        assert cli.post("/issue-upsert", json={"repo_name": "api"}).status_code == 400
+        assert cli.post(
+            "/issue-upsert", json={"repo_name": "api", "issue": {"title": "x"}}
+        ).status_code == 400
+
+
+def test_purge_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    _seed_purge_rows(coord_db)
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: list = []
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.append((path, payload))
+        or {"assignments": 9, "issues": 4},
+    )
+    assert state.count_purgeable(600.0) == (9, 4)
+    assert state.purge_done_assignments_split(600.0) == (9, 4)
+    assert [p for p, _ in captured] == ["/purge", "/purge"]
+    assert captured[0][1]["dry_run"] is True
+    assert captured[1][1]["dry_run"] is False
+    # Routed → the thin client's own (wrong) DB is left completely alone.
+    assert coord_db.execute("SELECT COUNT(*) c FROM assignments").fetchone()["c"] == 5
+
+
+def test_upsert_issue_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+    state.upsert_issue("api", {"number": 42, "title": "t"})
+    assert captured["path"] == "/issue-upsert"
+    assert captured["payload"]["issue"]["number"] == 42
+    assert coord_db.execute("SELECT COUNT(*) c FROM issues").fetchone()["c"] == 0
+
+
+def test_upsert_issue_local_accepts_github_and_plain_label_shapes(coord_db):
+    from coord import state
+
+    state._upsert_issue_local("api", {"number": 1, "labels": [{"name": "coord"}]})
+    state._upsert_issue_local("api", {"number": 2, "labels": ["coord"]})
+    rows = {
+        r["number"]: json.loads(r["labels"])
+        for r in coord_db.execute("SELECT number, labels FROM issues").fetchall()
+    }
+    assert rows == {1: ["coord"], 2: ["coord"]}

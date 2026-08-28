@@ -4168,7 +4168,7 @@ impl CoordApp {
             match id {
                 "yes" => {
                     let secs = self.purge_days as f64 * 86_400.0;
-                    match purge_done_assignments_db(secs) {
+                    match purge_done_assignments_remote(secs) {
                         Ok((a, i)) => self.push_toast(
                             "Purge complete",
                             &format!(
