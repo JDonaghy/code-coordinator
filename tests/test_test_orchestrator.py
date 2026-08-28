@@ -635,6 +635,29 @@ class TestLocalMachine:
         monkeypatch.setattr("socket.gethostname", lambda: "nowhere")
         assert local_machine(self._config()) is None
 
+    def test_matches_by_machine_name_case_insensitively(self, monkeypatch) -> None:
+        # #2860: OS hostnames commonly carry capitals (e.g. an Ubuntu install
+        # named "john-HP-EliteBook-830-G7-Notebook-PC") while coordinator.yml
+        # conventionally lowercases `name`/`host` -- the match must not care.
+        monkeypatch.setattr("socket.gethostname", lambda: "LAPTOP")
+        cfg = self._config()
+        machine = local_machine(cfg)
+        assert machine is not None
+        assert machine.name == "laptop"
+
+    def test_matches_by_host_prefix_case_insensitively_with_fqdn(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "SERVER.Tail.TS.Net")
+        cfg = self._config()
+        machine = local_machine(cfg)
+        assert machine is not None
+        assert machine.name == "server"
+
+    def test_unlisted_hostname_still_returns_none(self, monkeypatch) -> None:
+        # A genuinely unrecognized hostname must keep failing closed even
+        # after casefolding both sides.
+        monkeypatch.setattr("socket.gethostname", lambda: "SOME-OTHER-BOX")
+        assert local_machine(self._config()) is None
+
     def test_find_local_repo_path_still_prefers_matching_machine(self, monkeypatch) -> None:
         # Regression: local_machine() extraction must not change
         # find_local_repo_path's existing preference behavior.

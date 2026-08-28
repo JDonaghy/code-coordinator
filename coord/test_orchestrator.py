@@ -293,9 +293,12 @@ def local_machine(config: Config) -> Machine | None:
     don't have to re-derive the match. Returns ``None`` when this host isn't
     a recognized machine in ``coordinator.yml``.
     """
-    local_hostname = socket.gethostname().split(".")[0]
+    local_hostname = socket.gethostname().split(".")[0].lower()
     for machine in config.machines:
-        if machine.name == local_hostname or machine.host.split(".")[0] == local_hostname:
+        if (
+            machine.name.lower() == local_hostname
+            or machine.host.split(".")[0].lower() == local_hostname
+        ):
             return machine
     return None
 
