@@ -1,3 +1,9 @@
+---
+name: update-issue
+description: "Synthesizes what was agreed in a 'Chat about issue' conversation and writes it back to the GitHub issue body, so the next worker or human picks up a refined, accurate scope instead of the original text."
+trigger: /update-issue
+---
+
 # /update-issue skill
 
 **Trigger:** Operator types `/update-issue` during a "Chat about issue" session.

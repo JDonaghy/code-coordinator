@@ -602,6 +602,68 @@ def test_a_dry_run_with_an_existing_marker_describes_the_fire_attempt(
     assert pending.target_version == "0.5.31"  # untouched by --dry-run
 
 
+# ── #2866: a stale marker must never be proposed as a fire target ────────
+
+
+def test_a_dry_run_drops_a_marker_the_daemon_already_passed(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The 2026-08-28 incident, reproduced: a marker set for an OLDER
+    version survives (TTL not yet lapsed) after the daemon reached a newer
+    version some other way (a human ran `coord release propagate` by hand).
+    Firing it would roll the daemon BACKWARDS — this must never be
+    proposed, TTL or not."""
+    _stub_verify(monkeypatch, daemon_version="0.5.258")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(
+        _pending(target_version="0.5.254", set_at=1000.0, reason="propagate")
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.259", "--daemon-host", "server", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert prop_calls == []
+    assert "--target 0.5.254" not in result.output
+    assert "would replace it with v0.5.259" in result.output
+    assert "stale target" in result.output
+    # --dry-run still touches no state — the stale marker survives on disk
+    # for the NEXT (non-dry-run) invocation to actually replace.
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.254"
+
+
+def test_a_non_dry_run_replaces_a_marker_the_daemon_already_passed(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """Same incident shape, but for real: the stale/backwards-pointing
+    marker must be replaced with the freshly resolved (necessarily-ahead)
+    target rather than ever reaching `_run_propagate` with the old one."""
+    _stub_verify(monkeypatch, daemon_version="0.5.258")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(
+        _pending(target_version="0.5.254", set_at=1000.0, reason="propagate")
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.259", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert prop_calls == []  # never fired against the stale/backwards target
+
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.259"  # replaced, not 0.5.254
+    assert not escalations
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLL_PENDING
+
+
 # ── ensure-queue-running: the legacy escape hatch, unchanged by #2587 ────
 
 

@@ -1,3 +1,9 @@
+---
+name: pipeline-limbo-triage
+description: "Use when an issue sits in the Pipeline with no dispatch or visible activity — explains that Board vs Pipeline membership is label-driven, not assignment-driven, and gives the one-command fix."
+trigger: An issue shows up in the Pipeline but nobody dispatched it, or a Pipeline card looks stuck.
+---
+
 # pipeline-limbo-triage skill
 
 **Trigger:** An issue shows up in the Pipeline but nobody dispatched it, a

@@ -1,3 +1,9 @@
+---
+name: drive-queue-preflight
+description: "Use before queuing more than ~2 issues on one repo with `coord drive-queue add`, setting up an overnight/unattended run, or seeing a QUEUE: STALLED/BLOCKED status-bar alert — gives the real cost model and the read-the-alert table."
+trigger: About to `coord drive-queue add` deep on one repo, or looking at a QUEUE: STALLED/BLOCKED alert.
+---
+
 # drive-queue-preflight skill
 
 **Trigger:** About to `coord drive-queue add` more than ~2 issues on one repo,
