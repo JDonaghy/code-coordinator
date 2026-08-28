@@ -96,6 +96,17 @@ server = [
     # Agent-side process/host metrics behind GET /metrics (coord/agent_app.py).
     "psutil>=5.9",
 ]
+# #2886: the Postgres driver for `coord/sql.py`'s dialect seam (#2719+).
+# Optional and NEVER folded into `server`/`all`/`dev` below — every existing
+# deployment runs SQLite and must keep working without ever pulling this in;
+# adding it to a shared extra would make it a fleet-wide install change for
+# zero benefit to anyone still on SQLite. `pip install 'code-coordinator[postgres]'`
+# is the only way to get it. `coord/sql.py`'s Postgres call sites
+# (`connect`/`row_factory_for`/`driver_error`) guard the import through
+# `_import_psycopg()`, which names this extra in its error message rather
+# than surfacing a bare `ModuleNotFoundError`; `tests/backends.py` does the
+# same for the test suite's own `COORD_TEST_BACKEND=postgres` opt-in.
+postgres = ["psycopg[binary]>=3.1"]
 # Convenience alias: "give me everything a full node runs".
 all = ["code-coordinator[server]"]
 dev = [

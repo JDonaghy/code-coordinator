@@ -1,13 +1,44 @@
-"""SQLite connection management and schema for coordinator state.
+"""Connection management and schema for coordinator state.
 
-Single DB at ~/.coord/coord.db with WAL mode.  All coordinator state lives
-here: assignments, proposals, merge queue, sessions, etc.
+Single database — SQLite at ``~/.coord/coord.db`` with WAL mode by default,
+or Postgres when ``coordinator.yml``'s ``store:`` block opts in (#827; see
+:class:`coord.config.StoreConfig`). All coordinator state lives here:
+assignments, proposals, merge queue, sessions, etc. Every connection this
+module opens goes through :func:`coord.sql.connect`, the one dialect-aware
+factory (#827) — this module names no driver's ``.connect()`` directly.
 
 Usage
 -----
-- Production code: ``get_connection()`` returns the singleton connection.
+- Production code: ``get_connection()`` returns this process's connection.
 - Tests: call ``override_connection(sqlite3.connect(":memory:"))`` then
   ``close()`` in teardown (the ``coord_db`` fixture in conftest.py does this).
+
+Connection-sharing model (#827)
+--------------------------------
+SQLite (today's default, and the only backend most deployments will ever
+configure): one connection for the whole process, opened with
+``check_same_thread=False`` — unchanged from before this issue. SQLite (with
+WAL mode + the ``busy_timeout`` this module sets via
+``sql.apply_connection_setup``) tolerates being handed directly to multiple
+threads.
+
+Postgres: a driver connection is not safe to use concurrently from multiple
+threads the same way, so instead of one process-wide singleton, each THREAD
+gets its own lazily-opened connection, cached in thread-local storage (see
+``_pg_thread_local`` below) — ``coord serve``'s worker-thread-per-request
+model then never hands one live connection to two threads at once. This is
+the "explicit per-thread" option #827 names as an alternative to a pool: no
+new dependency (``psycopg_pool`` is a separate package from ``psycopg``
+itself), and every existing ``get_connection()`` caller is unaffected by the
+choice — they get *a* connection back either way and never inspect its
+identity. A true multi-connection pool is deferred until #829's cutover
+measures whether the daemon's threading actually needs one under real load;
+today this module is "mergeable and inert with no Postgres anywhere in the
+deployment" (#827's own framing), so there is no live traffic to measure yet.
+``override_connection()`` always wins, on every thread, regardless of
+backend — this is what lets ``tests/conftest.py``'s autouse ``coord_db``
+fixture keep injecting one in-memory SQLite connection without any test
+needing to know this function branches on the configured backend at all.
 """
 
 from __future__ import annotations
@@ -17,15 +48,23 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from coord import __version__ as _coord_version
 from coord import sql
 from coord.platform_paths import default_coord_dir
 
-_conn: sqlite3.Connection | None = None
+_conn: Any | None = None
+
+# #827: per-thread cache of this process's Postgres connection, when the
+# configured backend is postgres — see the module docstring's
+# "Connection-sharing model" section. Unused (empty) for the SQLite-only
+# fleet this ships into; only ever populated by get_connection() below.
+_pg_thread_local = threading.local()
 
 
 def __getattr__(name: str) -> Path:
@@ -84,17 +123,158 @@ class ProductionDatabaseGuardError(RuntimeError):
     """
 
 
-def get_connection() -> sqlite3.Connection:
-    """Return the module-level singleton connection, opening it on first call."""
+@dataclass(frozen=True)
+class _StoreTarget:
+    """Which backend/DSN :func:`get_connection` should open (#827)."""
+
+    backend: str
+    dsn: str | None = None
+
+
+def _resolve_store_target() -> _StoreTarget:
+    """Resolve ``coordinator.yml``'s ``store:`` block (#827).
+
+    Two different failure shapes get two deliberately different outcomes
+    (#827 review, blocking finding 2 — see that finding for the full
+    incident this replaced):
+
+    - **No config resolvable at all**, or a config that exists but fails for
+      a reason that has nothing to do with an explicit ``store:`` block
+      (bad YAML, a bad ``repos:``/``machines:`` entry, ...) fails OPEN to
+      SQLite — a fresh worktree, a bare test invocation, or an agent that
+      hasn't been handed a ``coordinator.yml`` yet must never be unable to
+      open its local database. This mirrors ``coord.audit._cached_config``'s
+      fail-open shape for the same reason.
+    - **An explicit ``store:`` block that fails to validate** (a typo'd
+      ``backend``, ``backend: postgres`` with no ``dsn``, ...) fails LOUD —
+      whatever :func:`coord.config._parse_store` raises propagates
+      unchanged. A deployment that intentionally opted into Postgres and
+      then typo'd or broke that block must find out immediately; silently
+      falling back to an empty local SQLite file with no error is exactly
+      the split-brain this config seam exists to prevent — a broken/missing
+      config must never be how a caller discovers it's talking to the wrong
+      database, in *either* direction.
+
+    Deliberately does NOT run the full :func:`coord.config.load` /
+    :func:`coord.config.parse_mapping` validation pipeline — it reads only
+    the raw ``store:`` mapping out of the YAML directly, so a config problem
+    completely unrelated to storage can never masquerade as, or suppress, a
+    storage-backend decision; only ``store:``'s own shape is ever
+    load-bearing here.
+
+    Called at most once per process: only from :func:`get_connection`'s
+    first-open path (for SQLite) or its first-open-on-this-thread path (for
+    Postgres) — never on every call, since ``_conn``/the thread-local cache
+    short-circuits every call after that. A YAML read+parse is real I/O, but
+    "once per process" (or "once per thread", under Postgres) is not the
+    hot-loop cost ``coord.audit``'s own caching comment warns about (~2,900
+    writes/hour) — so unlike that module, this intentionally does not cache
+    across calls; there is nothing to amortize.
+    """
+    import yaml  # noqa: PLC0415
+
+    from coord.config import resolve_config_path  # noqa: PLC0415
+
+    try:
+        path = resolve_config_path()
+        raw = yaml.safe_load(path.read_text()) if path.exists() else None
+    except Exception:
+        return _StoreTarget(backend=sql.DIALECT_SQLITE)
+
+    if not isinstance(raw, dict) or "store" not in raw:
+        return _StoreTarget(backend=sql.DIALECT_SQLITE)
+
+    from coord.config import _parse_store  # noqa: PLC0415
+
+    # A malformed `store:` block raises ConfigError here -- deliberately NOT
+    # caught. See the docstring above: this is the one config problem that
+    # must fail loud rather than fail open.
+    store = _parse_store(raw["store"])
+    if store.backend != sql.DIALECT_POSTGRES:
+        return _StoreTarget(backend=sql.DIALECT_SQLITE)
+    return _StoreTarget(backend=sql.DIALECT_POSTGRES, dsn=store.dsn)
+
+
+def get_connection() -> Any:
+    """Return this process's connection, opening it on first call.
+
+    See the module docstring's "Connection-sharing model" section: SQLite
+    returns the process-wide singleton (unchanged); Postgres returns this
+    THREAD's lazily-opened connection. ``override_connection()`` always wins
+    over either, regardless of which thread calls this.
+    """
     global _conn
-    if _conn is None:
-        _conn = _open(sys.modules[__name__].DB_PATH)
+    if _conn is not None:
+        return _conn
+    target = _resolve_store_target()
+    if target.backend == sql.DIALECT_POSTGRES:
+        conn = getattr(_pg_thread_local, "conn", None)
+        if conn is None:
+            conn = _open_postgres(target.dsn)
+            _pg_thread_local.conn = conn
+        return conn
+    _conn = _open(sys.modules[__name__].DB_PATH)
     return _conn
+
+
+def _migrate_if_needed(conn: Any, *, is_production: bool, target_desc: str) -> None:
+    """Shared by :func:`_open` (SQLite) and :func:`_open_postgres` (#827):
+    the schema-version gate, the #2752 non-release-build guard, and — when a
+    write is actually needed — the migration functions themselves.
+
+    Every one of those functions (``_ensure_schema`` down to
+    ``_backfill_orphaned_review_verdicts``) already routes through
+    ``coord.sql``'s dialect seam (#1948/#2724/#2782/#2784), so nothing here
+    is SQLite-specific — this is #827 problem 3's "does Postgres get the
+    same migration path" answered by construction rather than by comment:
+    there is only one migration implementation, used by both backends.
+
+    *target_desc* is a human-readable phrase for the guard's error message
+    (e.g. ``"the production coordinator database at /path/to/coord.db"``) —
+    deliberately never the raw DSN for a Postgres target, since a DSN can
+    carry a password and this exception's message can end up in a log or a
+    GitHub comment (agent failure reports post their stdout/stderr).
+
+    #2598: this whole block is gated on a cheap read-only version check — a
+    database already at ``_DB_SCHEMA_VERSION`` does none of this work, so a
+    read-only command (``coord status``) issues no write at all just to open
+    a connection it only ever intended to read from.
+    """
+    if _read_schema_version(conn) < _DB_SCHEMA_VERSION:
+        # #2752: this is the schema *write* path (_ensure_schema and, inside
+        # it, _set_schema_version) — the only place a process permanently
+        # stamps how caught-up the database is. A non-release build reaching
+        # here would advance schema_version to whatever _DB_SCHEMA_VERSION
+        # *that branch* declares, and every later open by the actually-
+        # released code (same or lower version number) reads
+        # `_read_schema_version(conn) < _DB_SCHEMA_VERSION` as False and
+        # skips this block forever -- permanently missing any migration the
+        # release adds under that version number. Reads are unaffected: an
+        # already-caught-up database never reaches this branch at all.
+        if is_production and not _is_release_build(_coord_version):
+            raise ProductionDatabaseGuardError(
+                f"Refusing to write schema changes to {target_desc} from a "
+                f"non-release build (coord.__version__={_coord_version!r} is "
+                "not a clean X.Y.Z release tag). Stamping schema_version "
+                "forward from unreleased code -- a worktree, an editable "
+                "install, a branch that bumped _DB_SCHEMA_VERSION -- "
+                "permanently skips any migration the released code later "
+                "adds under that same version number; see #2752 (and the "
+                "incidents it names, #2675/#2709). Fix: point COORD_DIR at a "
+                "scratch directory (e.g. `COORD_DIR=/tmp/coord-dev coord "
+                "...`) instead of touching the live production database "
+                "from unreleased code."
+            )
+        _ensure_schema(conn)
+        _maybe_migrate_json(conn)
+        _migrate_gate_order(conn)
+        _backfill_orphaned_review_verdicts(conn)
 
 
 def _open(path: Path) -> sqlite3.Connection:
     db_path = sys.modules[__name__].DB_PATH
-    if path == db_path and os.environ.get("PYTEST_CURRENT_TEST"):
+    is_production = path == db_path
+    if is_production and os.environ.get("PYTEST_CURRENT_TEST"):
         raise ProductionDatabaseGuardError(
             f"Refusing to open the production coordinator database at "
             f"{path} while running under pytest "
@@ -106,49 +286,78 @@ def _open(path: Path) -> sqlite3.Connection:
             "or pass an explicit isolated path instead of coord.db.DB_PATH."
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=path, check_same_thread=False)
     sql.apply_connection_setup(conn)
     sql.apply_row_factory(conn)
-    # #2598: _ensure_schema/_maybe_migrate_json/_migrate_gate_order/
-    # _backfill_orphaned_review_verdicts are convergent one-time operations,
-    # not per-open invariants — but every one of them ran unconditionally on
-    # every process's DB open, so a read-only command (`coord status`) began
-    # a write transaction (and, for the unconstrained schema_version table,
-    # left a junk row behind — 45,708 of them observed in the field) purely
-    # to open a connection it only ever intended to read from. Gate the
-    # whole block on a cheap read-only version check: a database already at
-    # _DB_SCHEMA_VERSION does none of this work, so opening it issues no
-    # write at all. See _read_schema_version's docstring for why this read
-    # is correct against both the pre-#2598 and post-#2598 table shapes.
-    if _read_schema_version(conn) < _DB_SCHEMA_VERSION:
-        # #2752: this is the schema *write* path (_ensure_schema and, inside
-        # it, _set_schema_version) — the only place a process permanently
-        # stamps how caught-up ~/.coord/coord.db is. A non-release build
-        # reaching here would advance schema_version to whatever
-        # _DB_SCHEMA_VERSION *that branch* declares, and every later open by
-        # the actually-released code (same or lower version number) reads
-        # `_read_schema_version(conn) < _DB_SCHEMA_VERSION` as False and
-        # skips this block forever -- permanently missing any migration the
-        # release adds under that version number. Reads are unaffected: an
-        # already-caught-up database never reaches this branch at all.
-        if path == db_path and not _is_release_build(_coord_version):
-            raise ProductionDatabaseGuardError(
-                "Refusing to write schema changes to the production "
-                f"coordinator database at {path} from a non-release build "
-                f"(coord.__version__={_coord_version!r} is not a clean "
-                "X.Y.Z release tag). Stamping schema_version forward from "
-                "unreleased code -- a worktree, an editable install, a "
-                "branch that bumped _DB_SCHEMA_VERSION -- permanently skips "
-                "any migration the released code later adds under that same "
-                "version number; see #2752 (and the incidents it names, "
-                "#2675/#2709). Fix: point COORD_DIR at a scratch directory "
-                "(e.g. `COORD_DIR=/tmp/coord-dev coord ...`) instead of "
-                "touching the live ~/.coord/coord.db from unreleased code."
-            )
-        _ensure_schema(conn)
-        _maybe_migrate_json(conn)
-        _migrate_gate_order(conn)
-        _backfill_orphaned_review_verdicts(conn)
+    _migrate_if_needed(
+        conn,
+        is_production=is_production,
+        target_desc=f"the production coordinator database at {path}",
+    )
+    return conn
+
+
+def refuse_postgres_under_pytest(target_desc: str) -> None:
+    """Raise :class:`ProductionDatabaseGuardError` if called during a pytest
+    run (#1960's SQLite analogue, widened to Postgres by #827).
+
+    Shared by :func:`_open_postgres` (this module's write-path opener) and
+    ``coord.dao.SqliteStore._connect`` (the daemon's read path) — both are
+    "the one place a real Postgres connection gets opened" for their
+    respective sides, and neither should ever reach a live Postgres server
+    from a test: no test's ``coordinator.yml`` should set
+    ``store.backend: postgres``, but if one somehow does (a leaked ambient
+    config, a copy-pasted fixture), this fails loud instead of a test suite
+    silently trying to open a real socket -- or hanging on one.
+    """
+    marker = os.environ.get("PYTEST_CURRENT_TEST")
+    if not marker:
+        return
+    raise ProductionDatabaseGuardError(
+        f"Refusing to open {target_desc} while running under pytest "
+        f"(PYTEST_CURRENT_TEST={marker!r}). No test should ever resolve "
+        "`store.backend: postgres` from coordinator.yml -- see #1960, the "
+        "SQLite analogue of this guard. Fix: rely on the autouse `coord_db` "
+        "fixture (it overrides the connection before this is ever reached "
+        "for the write path), or don't set store.backend in a test "
+        "environment's config."
+    )
+
+
+def _open_postgres(dsn: str) -> Any:
+    """Open (and, if needed, migrate) the configured Postgres connection —
+    the Postgres analogue of :func:`_open` (#827).
+
+    There is exactly one configured DSN (``coordinator.yml``'s
+    ``store.dsn``), so opening it always means opening THE production store
+    -- unlike ``_open``, there is no "arbitrary path a test/caller passed in"
+    case to distinguish, hence no *is_production* parameter here.
+
+    #827 review, non-blocking concern: the per-THREAD connection cache
+    :func:`get_connection` builds this into means ``_migrate_if_needed``
+    (below) can run concurrently from more than one thread on first connect
+    against a fresh Postgres database -- the old process-wide SQLite
+    singleton naturally serialized this, a per-thread cache does not. Two
+    request-handler threads racing to open the first connection could both
+    observe ``schema_version < _DB_SCHEMA_VERSION`` and both attempt the
+    migration DDL at once. Not exercised today (no Postgres is live
+    anywhere per this issue's own "mergeable and inert" scope), and the
+    migration functions themselves are written to be idempotent/order-
+    tolerant on SQLite already, but this has never been proven safe under
+    genuine Postgres concurrency -- left as a flagged gap for #829's
+    cutover to either measure (maybe never actually races in practice) or
+    close (e.g. a Postgres advisory lock around this call) before real
+    traffic depends on it.
+    """
+    refuse_postgres_under_pytest("the configured production Postgres store")
+    conn = sql.connect(backend=sql.DIALECT_POSTGRES, dsn=dsn)
+    sql.apply_connection_setup(conn)
+    sql.apply_row_factory(conn)
+    _migrate_if_needed(
+        conn,
+        is_production=True,
+        target_desc="the configured production Postgres store (coordinator.yml's store.dsn)",
+    )
     return conn
 
 
@@ -169,18 +378,39 @@ def _is_release_build(version: str) -> bool:
     return _RELEASE_VERSION_RE.fullmatch(version) is not None
 
 
-def override_connection(conn: sqlite3.Connection) -> None:
-    """Replace the singleton connection.  Used in tests to inject :memory: DBs."""
+def override_connection(conn: Any) -> None:
+    """Replace the singleton connection.  Used in tests to inject :memory: DBs.
+
+    Wins over both connection-sharing models #827 introduced: once set,
+    :func:`get_connection` returns *conn* unconditionally, on every thread,
+    whether the configured backend is SQLite or Postgres — the per-thread
+    Postgres cache is never even consulted while an override is active.
+    """
     global _conn
     _conn = conn
 
 
 def close() -> None:
-    """Close the singleton connection and reset it to None."""
+    """Close this process's connection(s) and reset the singleton(s) to None.
+
+    SQLite: closes and clears the process-wide ``_conn`` singleton (or
+    whatever :func:`override_connection` last injected), exactly as before
+    #827. Postgres: additionally closes and clears THIS THREAD's connection
+    out of the per-thread cache :func:`get_connection` populates — the only
+    one this call has any business touching; a multi-threaded Postgres
+    deployment closing every thread's connection is each thread's own
+    responsibility (or the OS reclaiming the socket on process exit either
+    way). This function has only ever promised to reset the connection(s)
+    *this* call can see.
+    """
     global _conn
     if _conn is not None:
         _conn.close()
         _conn = None
+    pg_conn = getattr(_pg_thread_local, "conn", None)
+    if pg_conn is not None:
+        pg_conn.close()
+        _pg_thread_local.conn = None
 
 
 _T = TypeVar("_T")

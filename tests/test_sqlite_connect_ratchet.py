@@ -116,7 +116,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
 
     # ── A: legitimately SQLite-specific ───────────────────────────────────
     "test_db.py": Classification(
-        37, (BUCKET_A,),
+        38, (BUCKET_A,),
         "The canonical bucket-A file: it tests coord/db.py's SQLite "
         "connection machinery itself — pre-migration CREATE TABLEs read back "
         "with PRAGMA table_info, busy_timeout contention across two "
@@ -124,7 +124,19 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "path + ProductionDatabaseGuardError, schema_version collapse. A "
         "portable rewrite would assert nothing. The file's autouse "
         "`isolated_conn` was the one bucket-B member here and is now an alias "
-        "for coord_db.",
+        "for coord_db. "
+        "+1 for #827's TestGetConnectionPostgresPerThread::"
+        "test_override_connection_wins_over_postgres_routing: it routes "
+        "get_connection() at a fake Postgres and then asserts "
+        "override_connection() still wins and the routing is never even "
+        "consulted, so the override has to be a *distinct sentinel object* "
+        "the test constructs itself. The autouse coord_db conn is exactly "
+        "what is already installed as the override, so reusing it would make "
+        "the identity assertion vacuous, and scratch_database() would hand "
+        "back a connection on the active backend — under "
+        "COORD_TEST_BACKEND=postgres that is the very thing this test proves "
+        "is bypassed. A bare sqlite3 sentinel, matching the neighbouring "
+        "TestOverrideConnection cases, is the point.",
     ),
     "test_sql_dialect.py": Classification(
         7, (BUCKET_A,),
@@ -265,11 +277,20 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "file that SqliteStore opens by path for the read side.",
     ),
     "test_dao.py": Classification(
-        2, (BUCKET_C,),
+        3, (BUCKET_C,),
         "coord/dao.py's own tests: a read_db fixture and a hand-rolled "
         "pre-migration DB, both opened by SqliteStore *by path*. SqliteStore "
         "is the SQLite arm of the store seam, so its tests own a SQLite "
-        "connection by definition.",
+        "connection by definition. "
+        "+1 for #827's TestConnectDialectRouting::"
+        "test_connect_routes_to_postgres_when_store_configured, where the "
+        "site is the return value of a `_fake_sql_connect` stub that "
+        "monkeypatches sql.connect itself: the assertion is on the kwargs "
+        "dao.py passed (backend=postgres, dsn=...), and the stub still has "
+        "to hand back some closable connection object. Neither coord_db nor "
+        "scratch_database() fits — the whole point is that no real driver is "
+        "reached, so a throwaway :memory: handle is the cheapest correct "
+        "stand-in.",
     ),
     "test_serve_app_board_trim.py": Classification(
         1, (BUCKET_C,),

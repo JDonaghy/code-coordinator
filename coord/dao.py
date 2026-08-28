@@ -32,16 +32,33 @@ the coordinator process is writing in WAL mode.
 #2766: every statement this module runs routes through ``coord.sql`` (the
 dialect seam, #2719/#1948) rather than calling ``conn.execute()`` directly —
 paramstyle translation, the row factory, and connection setup are the seam's
-job now, not hand-rolled here. Two decisions worth recording (see the PR):
-the ``mode=ro`` URI itself stays in this module's ``_connect()`` rather than
-moving into the seam, because ``SqliteStore`` is *already* the class that
-names its concrete backend — there is no live Postgres connection factory
-yet for the seam to branch on, so a second implementation (e.g.
-``PostgresStore``) would own its own connection factory rather than this one
-growing a dialect branch ahead of that backend existing. The read-only
-``PRAGMA query_only=ON`` (no Postgres connect-time equivalent — see
-``sql.apply_connection_setup``'s ``read_only`` flag) and ``busy_timeout``
-both now come from that one seam call instead of two bare PRAGMAs.
+job now, not hand-rolled here. The read-only ``PRAGMA query_only=ON`` (no
+Postgres connect-time equivalent — see ``sql.apply_connection_setup``'s
+``read_only`` flag) and ``busy_timeout`` both come from that one seam call
+instead of two bare PRAGMAs.
+
+#827 (superseding the #2766 decision note that used to live here): the
+``mode=ro`` URI itself has now moved into ``coord.sql.connect`` too. #2766
+kept it in this module's ``_connect()`` because "there is no live Postgres
+connection factory yet for the seam to branch on" — #827 is that factory, so
+the premise no longer holds, and ``SqliteStore._connect`` now calls
+``sql.connect(backend=..., ...)`` like every other connection opener in the
+tree rather than naming ``sqlite3.connect`` directly (enforced by
+``tests/test_sql_dialect.py``'s connect-call ratchet, the sibling of #2768's
+execute-call one).
+
+**Which backend** ``_connect()`` opens is resolved through
+``coord.db._resolve_store_target()`` — the identical decision
+``coord.db.get_connection()``'s write path makes — rather than this class
+hardcoding SQLite (#827 review fix: an earlier version of this PR left this
+class's name doing double duty as its behavior, so ``store.backend:
+postgres`` silently split-brained the daemon's read path from its write
+path — see the issue's blocking-finding history). ``SqliteStore`` still owns
+*which* backend it opens — nothing here forces a future ``PostgresStore`` to
+share this class, and this class is not renamed because nothing about its
+read contract or its "never migrates" invariant changes — it just no longer
+assumes the answer is always SQLite, matching ``coord.db``'s write path one
+config read away.
 
 All SQLite idioms (JSON-encoded TEXT columns, the ``mode=ro`` URI) that
 remain are encapsulated here: read methods return plain Python dicts with
@@ -67,6 +84,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from coord import board_schema, sql
+from coord import db as db_mod
 from coord.db import DB_PATH
 
 # Bump when the /board payload shape changes incompatibly.  Clients may branch
@@ -272,26 +290,56 @@ def _decode_row(table: str, row: board_schema.RowLike, *, full: bool = False) ->
 
 
 class SqliteStore:
-    """Read-only SQLite-backed :class:`CoordStore`.
+    """Read-only :class:`CoordStore`, SQLite by default, Postgres when
+    ``coordinator.yml``'s ``store: backend: postgres`` opts in (#827 — see
+    :func:`_connect` and the module docstring's "Which backend" note; the
+    class keeps its pre-#827 name since its read contract and its "never
+    migrates the DB" invariant are unchanged either way).
 
-    Opens a fresh ``mode=ro`` connection per call (cheap for SQLite, thread-safe
-    under the daemon's request handling, and never migrates the DB).
-    ``board_projection`` opens a single connection so the whole payload is one
-    consistent snapshot.
+    Opens a fresh connection per call (cheap for SQLite, thread-safe under
+    the daemon's request handling; a Postgres deployment gets the same
+    "fresh connection per call" for now — #829 decides whether that needs
+    pooling under real load) and never migrates the DB. ``board_projection``
+    opens a single connection so the whole payload is one consistent
+    snapshot.
     """
 
     def __init__(self, db_path: Path | str | None = None) -> None:
         self._path = Path(db_path) if db_path is not None else DB_PATH
 
     # ── connection ────────────────────────────────────────────────────────────
-    def _connect(self) -> sqlite3.Connection:
-        # #2766: the `mode=ro` URI is a SQLite-only spelling of "open
-        # read-only" and stays here rather than in the seam — see the module
-        # docstring's decision note. Everything downstream of "how do I get
-        # a connection" (row factory, connection-setup pragmas) routes
-        # through `coord.sql`.
-        uri = f"file:{self._path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    def _connect(self) -> Any:
+        # #827 (review fix): which backend to open is resolved through the
+        # SAME dialect decision `coord.db.get_connection()`'s write path
+        # uses -- `coord.db._resolve_store_target()` -- rather than this
+        # class hardcoding SQLite. `SqliteStore` still owns *which* backend
+        # it opens (there is no separate `PostgresStore`); it just no longer
+        # assumes the answer is always SQLite. `self._path` (an explicit or
+        # default on-disk path) is only meaningful for the SQLite branch --
+        # a Postgres deployment has no path, only `store.dsn`.
+        target = db_mod._resolve_store_target()
+        if target.backend == sql.DIALECT_POSTGRES:
+            # #1960's SQLite write-path guard has a Postgres analogue for
+            # exactly this read path -- see `coord.db.refuse_postgres_under_pytest`.
+            db_mod.refuse_postgres_under_pytest(
+                "the configured production Postgres store (dao read path)"
+            )
+            conn = sql.connect(backend=sql.DIALECT_POSTGRES, dsn=target.dsn)
+        else:
+            # #827: the `mode=ro` URI construction now lives in `sql.connect`
+            # — see the module docstring's updated decision note. This is a
+            # fresh connection per call (cheap for SQLite, thread-safe under
+            # the daemon's request handling), matching
+            # `check_same_thread=False`. #829 measures whether a Postgres
+            # deployment needs anything more than "fresh connection per
+            # call" too -- this issue only needs the read path to be
+            # *capable* of reaching Postgres, not tuned for it yet.
+            conn = sql.connect(
+                backend=sql.DIALECT_SQLITE,
+                sqlite_path=self._path,
+                read_only=True,
+                check_same_thread=False,
+            )
         sql.apply_row_factory(conn)
         # #2159: without a busy_timeout SQLite fails a locked read INSTANTLY
         # (the default is 0ms) instead of waiting out a writer's momentary
@@ -299,8 +347,9 @@ class SqliteStore:
         # client's `coord drive-queue tick`, `coord notify`, and the web
         # dashboard, so it is also the connection most exposed to lock
         # contention scaling with the fleet. `read_only=True` also sets
-        # `PRAGMA query_only=ON` instead of the writer's WAL/foreign_keys
-        # pragmas (a `mode=ro` connection can't write the WAL toggle) — see
+        # `PRAGMA query_only=ON` (SQLite) / the read-only session/transaction
+        # flag (Postgres) instead of the writer's WAL/foreign_keys pragmas
+        # (a `mode=ro` SQLite connection can't write the WAL toggle) — see
         # `sql.apply_connection_setup`.
         sql.apply_connection_setup(conn, read_only=True)
         return conn

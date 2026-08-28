@@ -12,8 +12,10 @@ from coord.config import (
     PipelineConfig,
     ProviderDef,
     ProvidersConfig,
+    StoreConfig,
     _parse_concurrency,
     _parse_merge,
+    _parse_store,
     load,
 )
 
@@ -1877,3 +1879,82 @@ def test_merge_auto_revalidate_max_batch_rejects_non_int() -> None:
         ConfigError, match="auto_revalidate_max_batch must be a positive integer"
     ):
         _parse_merge({"auto_revalidate_max_batch": "lots"})
+
+
+# ── #827: store.backend / store.dsn ──────────────────────────────────────────
+
+
+def test_store_defaults_to_sqlite_with_no_dsn() -> None:
+    """Absent `store:` block == today's behaviour, byte-for-byte: SQLite,
+    with `coord.db` resolving its own default path independently."""
+    cfg = _parse_store(None)
+    assert cfg == StoreConfig(backend="sqlite", dsn=None)
+
+
+def test_store_explicit_sqlite_backend_needs_no_dsn() -> None:
+    cfg = _parse_store({"backend": "sqlite"})
+    assert cfg.backend == "sqlite"
+    assert cfg.dsn is None
+
+
+def test_store_postgres_backend_with_dsn_parses() -> None:
+    cfg = _parse_store({"backend": "postgres", "dsn": "postgresql://user:pw@host:5432/db"})
+    assert cfg.backend == "postgres"
+    assert cfg.dsn == "postgresql://user:pw@host:5432/db"
+
+
+def test_store_postgres_backend_without_dsn_rejected() -> None:
+    with pytest.raises(ConfigError, match="store.dsn is required when store.backend is 'postgres'"):
+        _parse_store({"backend": "postgres"})
+
+
+def test_store_rejects_unknown_backend() -> None:
+    with pytest.raises(ConfigError, match="store.backend must be one of"):
+        _parse_store({"backend": "mysql"})
+
+
+def test_store_rejects_non_string_backend() -> None:
+    with pytest.raises(ConfigError, match="store.backend must be one of"):
+        _parse_store({"backend": 1})
+
+
+def test_store_rejects_empty_dsn() -> None:
+    with pytest.raises(ConfigError, match="store.dsn must be a non-empty string"):
+        _parse_store({"backend": "postgres", "dsn": ""})
+
+
+def test_store_rejects_non_string_dsn() -> None:
+    with pytest.raises(ConfigError, match="store.dsn must be a non-empty string"):
+        _parse_store({"backend": "postgres", "dsn": 123})
+
+
+def test_store_rejects_non_mapping() -> None:
+    with pytest.raises(ConfigError, match="'store' must be a mapping"):
+        _parse_store(["backend", "postgres"])
+
+
+def test_store_dsn_ignored_when_backend_is_sqlite() -> None:
+    """`dsn` is only consulted when `backend: postgres` (see StoreConfig's
+    docstring) -- setting it alongside `backend: sqlite` is accepted, not an
+    error, and simply carried through unused."""
+    cfg = _parse_store({"backend": "sqlite", "dsn": "postgresql://unused@host/db"})
+    assert cfg.backend == "sqlite"
+    assert cfg.dsn == "postgresql://unused@host/db"
+
+
+def test_full_config_wires_store_block_through(tmp_path: Path) -> None:
+    """End-to-end: `store:` in a real coordinator.yml reaches `Config.store`
+    via `load()`, not just the `_parse_store` unit."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        "repos:\n  - name: a\n    github: x/a\n"
+        "machines:\n  - name: m\n    host: h\n    repos: [a]\n"
+        "store:\n  backend: postgres\n  dsn: postgresql://user@host/db\n"
+    )
+    cfg = load(config_path)
+    assert cfg.store == StoreConfig(backend="postgres", dsn="postgresql://user@host/db")
+
+
+def test_full_config_defaults_store_when_block_absent(valid_config_path: Path) -> None:
+    cfg = load(valid_config_path)
+    assert cfg.store == StoreConfig()

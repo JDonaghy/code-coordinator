@@ -4,25 +4,39 @@ This module is a pure addition: nothing in the tree calls ``coord.sql`` yet
 (that's Phase C slices 2-7 of #1948), so these tests exercise it directly
 rather than through any existing call site.
 
-Real ``psycopg``/``psycopg2`` are not installed (this repo has no Postgres
-dependency yet — see ``pyproject.toml``), so the Postgres path is exercised
-two ways: (1) dialect detection and SQL/param translation, which need only a
-*fake* connection class whose ``__module__`` claims to be ``psycopg``, spied
-to capture exactly what would have reached a real driver; and (2)
-``row_factory_for``, which asserts the honest failure mode (``ImportError``)
-when the optional dependency genuinely isn't there.
+``psycopg`` is an optional dependency (the ``postgres`` extra, #2886) — most
+runs of this suite still don't have it installed, so the Postgres path is
+exercised two ways: (1) dialect detection and SQL/param translation, which
+need only a *fake* connection class whose ``__module__`` claims to be
+``psycopg``, spied to capture exactly what would have reached a real driver
+(this needs no driver and no server — it is the bulk of this file, and it
+still runs on every machine, every time); and (2), in the
+"round trip against a real server" section near the bottom, actual
+``psycopg`` + an actual Postgres 16 connection — the CI ``postgres`` job in
+``.github/workflows/test.yml`` provides both. Those tests skip cleanly (not
+error) when ``psycopg`` isn't installed or no server is reachable, via the
+``pg_conn``/``real_postgres`` fixtures below, so a developer with neither
+sees skips, not failures — proving #2886's whole point: every Postgres
+branch coord.sql has ever emitted a fake-connection assertion for now also
+has at least one assertion that it is *accepted* by a real server, not just
+*shaped like* what one would accept.
 """
 
 from __future__ import annotations
 
 import ast
+import os
 import re
 import sqlite3
+import sys
+import uuid
 from pathlib import Path
+from typing import Any, Iterator
 
 import pytest
 
 from coord import sql
+from tests.backends import DSN_ENV_VAR, postgres_dsn
 
 
 # ── fake Postgres-shaped connection (no real psycopg needed) ────────────────
@@ -75,7 +89,16 @@ _FakePostgresConnection.__module__ = "psycopg"
 
 
 class _FakePostgres2Connection(_FakeConnection):
-    pass
+    """Also spies on ``set_session`` — psycopg2's read-only knob, unlike
+    psycopg3's plain settable ``.read_only`` attribute (see
+    ``apply_connection_setup``'s read_only branch, #827)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_session_calls: list[dict] = []
+
+    def set_session(self, **kwargs):
+        self.set_session_calls.append(kwargs)
 
 
 _FakePostgres2Connection.__module__ = "psycopg2"
@@ -114,6 +137,74 @@ def test_detect_dialect_postgres_psycopg2():
 def test_detect_dialect_unknown_raises():
     with pytest.raises(sql.UnsupportedDialectError):
         sql.detect_dialect(_FakeUnknownConnection())
+
+
+# ── connect() — the connection factory (#827) ───────────────────────────────
+
+
+def test_connect_sqlite_writer_opens_a_normal_readwrite_connection(tmp_path):
+    db_path = tmp_path / "writer.db"
+    conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=db_path)
+    try:
+        assert isinstance(conn, sqlite3.Connection)
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO t (id) VALUES (1)")
+        conn.commit()
+        assert conn.execute("SELECT id FROM t").fetchone() == (1,)
+    finally:
+        conn.close()
+    assert db_path.exists()
+
+
+def test_connect_sqlite_read_only_opens_mode_ro_and_rejects_writes(tmp_path):
+    db_path = tmp_path / "ro.db"
+    writer = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=db_path)
+    writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    writer.execute("INSERT INTO t (id) VALUES (1)")
+    writer.commit()
+    writer.close()
+
+    conn = sql.connect(
+        backend=sql.DIALECT_SQLITE, sqlite_path=db_path, read_only=True, check_same_thread=False
+    )
+    try:
+        assert conn.execute("SELECT id FROM t").fetchone() == (1,)
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t (id) VALUES (2)")
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_requires_sqlite_path():
+    with pytest.raises(ValueError):
+        sql.connect(backend=sql.DIALECT_SQLITE)
+
+
+def test_connect_postgres_requires_dsn():
+    with pytest.raises(ValueError):
+        sql.connect(backend=sql.DIALECT_POSTGRES)
+
+
+def test_connect_postgres_without_psycopg_raises_import_error(monkeypatch):
+    """``psycopg`` is an optional dependency (the ``postgres`` extra,
+    #2886) -- the honest failure mode for `backend="postgres"` with no
+    driver present, matching `row_factory_for`/`driver_error`'s posture for
+    the same gap.
+
+    ``sys.modules["psycopg"] = None`` forces ``import psycopg`` to raise
+    ``ImportError`` deterministically -- same technique
+    ``tests/test_backend_selection.py`` uses -- so this passes identically
+    whether or not the CI job running it happens to have the `[postgres]`
+    extra installed (the ``postgres`` job in .github/workflows/test.yml
+    does, everything else doesn't)."""
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    with pytest.raises(ImportError):
+        sql.connect(backend=sql.DIALECT_POSTGRES, dsn="postgresql://user@host/db")
+
+
+def test_connect_unknown_backend_raises():
+    with pytest.raises(sql.UnsupportedDialectError):
+        sql.connect(backend="mysql", sqlite_path="ignored")
 
 
 # ── translation: identity for sqlite ────────────────────────────────────────
@@ -415,7 +506,10 @@ def test_row_factory_for_sqlite_is_sqlite_row():
     assert sql.row_factory_for(sql.DIALECT_SQLITE) is sqlite3.Row
 
 
-def test_row_factory_for_postgres_without_psycopg_raises_import_error():
+def test_row_factory_for_postgres_without_psycopg_raises_import_error(monkeypatch):
+    """See ``test_connect_postgres_without_psycopg_raises_import_error`` for
+    why this forces the absence rather than assuming it (#2886)."""
+    monkeypatch.setitem(sys.modules, "psycopg", None)
     with pytest.raises(ImportError):
         sql.row_factory_for(sql.DIALECT_POSTGRES)
 
@@ -528,9 +622,36 @@ def test_apply_connection_setup_read_only_survives_a_true_mode_ro_connection(tmp
         conn.close()
 
 
-def test_apply_connection_setup_postgres_read_only_is_still_a_noop():
+def test_apply_connection_setup_postgres_writer_is_still_a_noop():
+    """*read_only=False* (a writer connection) has no connect-time pragma to
+    set for Postgres, unlike SQLite's journal_mode/foreign_keys -- unchanged
+    by #827."""
     conn = _FakePostgresConnection()
-    sql.apply_connection_setup(conn, read_only=True)  # must not raise
+    sql.apply_connection_setup(conn)  # read_only=False (default)
+    assert conn.cur.executed == []
+    assert not hasattr(conn, "read_only")
+
+
+def test_apply_connection_setup_postgres_read_only_sets_psycopg3_read_only_attribute():
+    """#827: unlike #2766 (a true no-op -- "there is no live read-only
+    connection factory yet for the seam to branch on"), a Postgres
+    connection factory (``sql.connect``) now exists, so this sets psycopg3's
+    settable ``.read_only`` property instead of doing nothing. No SQL is
+    sent through the cursor (unlike SQLite's PRAGMA) -- psycopg3 applies the
+    property to transactions opened after it's set, not via a statement."""
+    conn = _FakePostgresConnection()
+    sql.apply_connection_setup(conn, read_only=True)
+    assert conn.read_only is True
+    assert conn.cur.executed == []
+
+
+def test_apply_connection_setup_postgres_read_only_uses_set_session_for_psycopg2():
+    """psycopg2 has no ``.read_only`` attribute -- its read-only knob is
+    ``conn.set_session(readonly=True)`` (#827)."""
+    conn = _FakePostgres2Connection()
+    sql.apply_connection_setup(conn, read_only=True)
+    assert conn.set_session_calls == [{"readonly": True}]
+    assert not hasattr(conn, "read_only")
     assert conn.cur.executed == []
 
 
@@ -546,7 +667,10 @@ def test_driver_error_catches_a_real_sqlite_operational_error(memdb):
         memdb.execute("SELECT * FROM no_such_table")
 
 
-def test_driver_error_postgres_without_psycopg_raises_import_error():
+def test_driver_error_postgres_without_psycopg_raises_import_error(monkeypatch):
+    """See ``test_connect_postgres_without_psycopg_raises_import_error`` for
+    why this forces the absence rather than assuming it (#2886)."""
+    monkeypatch.setitem(sys.modules, "psycopg", None)
     conn = _FakePostgresConnection()
     with pytest.raises(ImportError):
         sql.driver_error(conn)
@@ -562,12 +686,16 @@ def test_driver_error_unknown_dialect_raises():
 # Unlike driver_error(conn), this needs no connection -- it's for the ~18
 # call sites wrapping a retry_on_locked(...) call (or another write with no
 # connection in scope) that used to hardcode `except sqlite3.OperationalError:`,
-# going silently inert under Postgres. psycopg is not installed in this repo
-# (see the module docstring), so degrading to (sqlite3.Error,) rather than
-# raising ImportError is the case actually under test here.
+# going silently inert under Postgres. psycopg is an optional dependency
+# (#2886) that most runs of this suite don't have installed, so degrading to
+# (sqlite3.Error,) rather than raising ImportError is the case actually
+# under test here -- forced deterministically below rather than assumed, so
+# this test still passes in the one CI job that DOES have the `[postgres]`
+# extra installed (`postgres` in .github/workflows/test.yml).
 
 
-def test_driver_errors_degrades_to_sqlite_only_when_psycopg_absent():
+def test_driver_errors_degrades_to_sqlite_only_when_psycopg_absent(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psycopg", None)
     assert sql.driver_errors() == (sqlite3.Error,)
 
 
@@ -653,6 +781,187 @@ def test_is_lock_contention_error_false_for_unrelated_exception_with_no_sqlstate
     from coord.db import is_lock_contention_error
 
     assert is_lock_contention_error(ValueError("not a DB error at all")) is False
+
+
+# ── round trip against a real server (#2886) ────────────────────────────────
+#
+# Everything above proves what SQL text/params coord.sql *would* send to a
+# real driver, using a fake connection whose __module__ merely claims to be
+# "psycopg" (see the module docstring). None of it proves Postgres *accepts*
+# that text -- coord/sql.py has spoken Postgres since #2719 and none of its
+# Postgres branches had ever executed against a real server before this
+# section existed. These tests fill that gap for the branches #2886 calls
+# out by name: execute/executemany translation, upsert, insert_ignore,
+# insert_returning_id's RETURNING path, table_columns against
+# information_schema, apply_row_factory's dict_row, and
+# autoincrement_pk_ddl's identity-column DDL actually creating a table.
+#
+# `psycopg` is an optional dependency (the `postgres` extra) and most runs of
+# this suite have neither it nor a reachable server -- both the driver import
+# and the connection attempt below skip cleanly (pytest.importorskip /
+# pytest.skip) rather than raising, so `pytest tests/test_sql_dialect.py`
+# with no Postgres anywhere behaves exactly as it did before this section
+# existed: skips, not errors, and NOT gated on `COORD_TEST_BACKEND` (these
+# tests must skip cleanly under the suite's default, unset backend too, not
+# just under an explicit non-`postgres` selection). CI's `postgres` job in
+# .github/workflows/test.yml provides both, and reuses tests/backends.py's
+# `COORD_TEST_POSTGRES_DSN` (#2884) so a developer or CI run only ever needs
+# to set the one env var to make both that harness and these targeted tests
+# exercise the same server.
+
+
+def _require_psycopg() -> Any:
+    return pytest.importorskip(
+        "psycopg",
+        reason="psycopg not installed -- pip install 'code-coordinator[postgres]'",
+    )
+
+
+@pytest.fixture
+def pg_conn() -> Iterator[Any]:
+    """A real ``psycopg`` connection, opened through :func:`sql.connect` (the
+    #827 connection factory, so that factory itself is exercised for real
+    too) -- in its own private schema, dropped on teardown.
+
+    Schema-per-test, the same isolation strategy ``tests/backends.py`` uses
+    for the whole suite's own Postgres opt-in (#2884) -- a small,
+    self-contained copy rather than reaching into that module's private
+    ``_open_postgres`` helper, because this fixture has a different
+    contract: it must skip cleanly under the suite's *default*
+    ``COORD_TEST_BACKEND`` (unset, i.e. SQLite), not just under an explicit
+    ``postgres`` selection -- see the section header above.
+
+    Row factory is left at psycopg's default (tuple rows) -- matching
+    ``sqlite3``'s own default, which the ``memdb`` fixture above relies on
+    -- so a test that cares about ``dict_row`` calls
+    :func:`sql.apply_row_factory` itself, the same way
+    ``test_apply_row_factory_makes_rows_dict_accessible`` does for SQLite.
+    """
+    _require_psycopg()
+    dsn = postgres_dsn()
+    try:
+        conn = sql.connect(backend=sql.DIALECT_POSTGRES, dsn=dsn)
+    except Exception as exc:  # noqa: BLE001 -- any connect failure is a skip, not a failure
+        pytest.skip(f"Postgres not reachable at {dsn!r} ({DSN_ENV_VAR}): {exc}")
+    schema = f"coord_sql_dialect_test_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA "{schema}"')
+        # search_path is a session setting, so every later statement on this
+        # connection resolves unqualified table names into the private
+        # schema without any test needing to know it exists.
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO public")
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        conn.commit()
+        conn.close()
+
+
+def test_detect_dialect_real_postgres_connection(pg_conn):
+    assert sql.detect_dialect(pg_conn) == sql.DIALECT_POSTGRES
+
+
+def test_connect_postgres_round_trip_opens_a_working_connection(pg_conn):
+    """:func:`sql.connect` itself (#827), not just its ``ImportError`` guard
+    (already covered above) -- ``pg_conn`` opened through it; this proves
+    the result is a live, usable connection."""
+    cur = sql.execute(pg_conn, "SELECT 1")
+    assert cur.fetchone() == (1,)
+
+
+def test_execute_and_executemany_round_trip_against_real_postgres(pg_conn):
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    sql.execute(pg_conn, "INSERT INTO t (id, a, b) VALUES (?, ?, ?)", (1, "x", "y"))
+    sql.executemany(
+        pg_conn,
+        "INSERT INTO t (id, a, b) VALUES (?, ?, ?)",
+        [(2, "p", "q"), (3, "r", "s")],
+    )
+    pg_conn.commit()
+    cur = sql.execute(pg_conn, "SELECT id, a, b FROM t ORDER BY id")
+    assert cur.fetchall() == [(1, "x", "y"), (2, "p", "q"), (3, "r", "s")]
+
+
+def test_execute_preserves_literal_question_mark_against_real_postgres(pg_conn):
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    sql.execute(pg_conn, "INSERT INTO t (id, a, b) VALUES (?, ?, ?)", (1, "why?", "z"))
+    pg_conn.commit()
+    cur = sql.execute(pg_conn, "SELECT a FROM t WHERE b = ? AND a = 'why?'", ("z",))
+    assert cur.fetchone() == ("why?",)
+
+
+def test_upsert_round_trips_against_real_postgres(pg_conn):
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    pg_conn.commit()
+    sql.upsert(pg_conn, "t", ["id", "a", "b"], (1, "first", "y"), conflict_columns=["id"])
+    pg_conn.commit()
+    sql.upsert(pg_conn, "t", ["id", "a", "b"], (1, "second", "z"), conflict_columns=["id"])
+    pg_conn.commit()
+    cur = sql.execute(pg_conn, "SELECT a, b FROM t WHERE id = ?", (1,))
+    assert cur.fetchone() == ("second", "z")
+    assert sql.execute(pg_conn, "SELECT COUNT(*) FROM t").fetchone() == (1,)
+
+
+def test_insert_ignore_round_trips_against_real_postgres(pg_conn):
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+    pg_conn.commit()
+    sql.insert_ignore(pg_conn, "t", ["id", "a"], (1, "first"))
+    pg_conn.commit()
+    sql.insert_ignore(pg_conn, "t", ["id", "a"], (1, "second"))
+    pg_conn.commit()
+    cur = sql.execute(pg_conn, "SELECT a FROM t WHERE id = ?", (1,))
+    assert cur.fetchone() == ("first",)
+
+
+def test_insert_returning_id_round_trips_against_real_postgres(pg_conn):
+    ddl = sql.autoincrement_pk_ddl(sql.DIALECT_POSTGRES)
+    sql.execute(pg_conn, f"CREATE TABLE t (id {ddl}, a TEXT)")
+    pg_conn.commit()
+    new_id = sql.insert_returning_id(pg_conn, "INSERT INTO t (a) VALUES (?)", ("x",))
+    pg_conn.commit()
+    assert isinstance(new_id, int)
+    cur = sql.execute(pg_conn, "SELECT a FROM t WHERE id = ?", (new_id,))
+    assert cur.fetchone() == ("x",)
+
+
+def test_table_columns_round_trips_against_real_information_schema(pg_conn):
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    pg_conn.commit()
+    columns = sql.table_columns(pg_conn, "t")
+    assert [name for name, _type in columns] == ["id", "a", "b"]
+
+
+def test_table_columns_round_trips_empty_for_missing_table_against_real_postgres(pg_conn):
+    assert sql.table_columns(pg_conn, "no_such_table") == []
+
+
+def test_apply_row_factory_dict_row_round_trips_against_real_postgres(pg_conn):
+    sql.apply_row_factory(pg_conn)
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    sql.execute(pg_conn, "INSERT INTO t (id, a, b) VALUES (?, ?, ?)", (1, "x", "y"))
+    pg_conn.commit()
+    row = sql.execute(pg_conn, "SELECT a, b FROM t WHERE id = ?", (1,)).fetchone()
+    assert row["a"] == "x"
+    assert row["b"] == "y"
+
+
+def test_autoincrement_pk_ddl_round_trips_against_real_postgres(pg_conn):
+    """The identity-column DDL fragment actually creating a table and
+    actually generating monotonic ids -- this branch is pure DDL text with
+    no dedicated round trip other than using it exactly as coord/db.py
+    does: substituted into a CREATE TABLE and then inserted through."""
+    ddl = sql.autoincrement_pk_ddl(sql.DIALECT_POSTGRES)
+    sql.execute(pg_conn, f"CREATE TABLE t (id {ddl}, a TEXT)")
+    pg_conn.commit()
+    first = sql.insert_returning_id(pg_conn, "INSERT INTO t (a) VALUES (?)", ("x",))
+    second = sql.insert_returning_id(pg_conn, "INSERT INTO t (a) VALUES (?)", ("y",))
+    pg_conn.commit()
+    assert second == first + 1
 
 
 # ── the ratchet: no raw `?` reaches a driver outside the seam (#2768, #1948) ─
@@ -774,6 +1083,47 @@ def test_no_raw_driver_execute_call_outside_the_dialect_seam():
         "raw DB-API execute-family call(s) bypassing the coord.sql dialect "
         "seam (#2768/#1948) — route these through coord.sql.execute()/"
         "executemany()/executescript() instead:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no raw driver `.connect()` outside the seam (#827) ─
+#
+# #827's acceptance bullet: "db.py and dao.py obtain connections through one
+# dialect-aware factory; neither names sqlite3.connect directly." The two
+# call sites that used to do that (coord/db.py's `_open`, coord/dao.py's
+# `SqliteStore._connect`) now route through `coord.sql.connect` -- this is
+# the `connect`-call sibling of #2768's `execute`-call ratchet above, so a
+# regression (a new module importing sqlite3/psycopg/psycopg2 directly and
+# calling `.connect()` on it) is caught the same way: an AST walk, not a
+# grep, so a docstring/comment merely mentioning "sqlite3.connect" can't
+# trip it and a real call site can't dodge it by reformatting.
+
+_CONNECT_DRIVER_MODULES = {"sqlite3", "psycopg", "psycopg2"}
+
+
+def test_no_raw_driver_connect_call_outside_the_dialect_seam():
+    """No ``sqlite3.connect()``/``psycopg.connect()``/``psycopg2.connect()``
+    call anywhere in ``coord/**`` reaches a driver directly — every
+    connection must be opened through ``coord.sql.connect()`` (#827).
+
+    Deliberately introducing e.g. ``sqlite3.connect(":memory:")`` in any
+    ``coord/`` module outside ``coord/sql.py`` makes this red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        _src, tree = _parse(path)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "connect":
+                continue
+            value = node.func.value
+            if isinstance(value, ast.Name) and value.id in _CONNECT_DRIVER_MODULES:
+                violations.append(f"{rel}:{node.lineno}: {value.id}.connect(...)")
+    assert not violations, (
+        "raw driver .connect() call(s) bypassing the coord.sql dialect seam "
+        "connection factory (#827) — route these through coord.sql.connect() "
+        "instead:\n" + "\n".join(violations)
     )
 
 

@@ -46,6 +46,7 @@ text for the same intent.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 # ── dialects ──────────────────────────────────────────────────────────────
@@ -68,6 +69,43 @@ _DRIVER_DIALECTS: dict[str, str] = {
 
 class UnsupportedDialectError(ValueError):
     """Raised when a connection's driver module maps to no known dialect."""
+
+
+#: What to tell a caller who hit a Postgres codepath without the extra
+#: installed -- mirrors ``coord.commands._common.SERVER_EXTRA_INSTALL_HINT``'s
+#: shape for the ``[server]`` extra.
+POSTGRES_EXTRA_INSTALL_HINT = "pip install 'code-coordinator[postgres]'"
+
+
+def _import_psycopg() -> Any:
+    """Import ``psycopg``, translating its absence into an actionable message
+    (#2886).
+
+    ``psycopg`` is an optional dependency -- the ``postgres`` extra -- never a
+    base or ``[dev]`` one (see ``pyproject.toml``'s ``[project.optional-
+    dependencies]``): every existing SQLite deployment must keep working
+    without ever pulling it in. Hitting this on an install that never asked
+    for Postgres is therefore the expected, common case, not a bug -- so
+    every Postgres call site in this module that needs the driver
+    (:func:`connect`, :func:`row_factory_for`, :func:`driver_error`) routes
+    its import through here rather than a bare ``import psycopg``, so the
+    failure names the extra to install instead of surfacing a raw
+    ``ModuleNotFoundError: No module named 'psycopg'`` traceback.
+
+    :func:`driver_errors` deliberately does NOT route through here -- it
+    degrades silently to ``(sqlite3.Error,)`` when psycopg is absent (that is
+    its whole contract), so it keeps its own bare ``import psycopg`` inside a
+    caught ``try/except ImportError`` rather than raising through this
+    helper's message just to swallow it unread.
+    """
+    try:
+        import psycopg  # noqa: PLC0415 -- optional dep, see docstring
+    except ImportError as exc:  # ModuleNotFoundError is a subclass
+        raise ModuleNotFoundError(
+            "the Postgres backend needs the `psycopg` driver, which is not "
+            f"installed. Install it with: {POSTGRES_EXTRA_INSTALL_HINT}"
+        ) from exc
+    return psycopg
 
 
 def detect_dialect(conn: Any) -> str:
@@ -94,6 +132,72 @@ def detect_dialect(conn: Any) -> str:
             f"{conn!r} -- coord.sql only knows about: "
             f"{sorted(set(_DRIVER_DIALECTS))}"
         ) from None
+
+
+# ── connection factory (#827) ────────────────────────────────────────────
+
+
+def connect(
+    *,
+    backend: str,
+    sqlite_path: str | Path | None = None,
+    dsn: str | None = None,
+    read_only: bool = False,
+    check_same_thread: bool = True,
+) -> Any:
+    """Open a new DB-API connection for *backend* -- the ONE place in this
+    tree a raw driver ``.connect()`` call may appear outside a caller's own
+    test fixtures (#827; enforced by
+    ``tests/test_sql_dialect.py::test_no_raw_driver_connect_call_outside_the_dialect_seam``,
+    the ``connect``-call sibling of #2768's ``execute``-call ratchet).
+
+    Callers pick a backend explicitly rather than this function inferring
+    one from *which of sqlite_path/dsn was given* -- ``backend`` is always
+    the thing a caller already resolved from ``coordinator.yml``'s
+    ``store:`` block (see ``coord.db._resolve_store_target``), and an
+    explicit mismatch (``backend="postgres"`` with no ``dsn``) is a caller
+    bug worth a loud ``ValueError`` rather than a guess.
+
+    **SQLite** (``sqlite_path`` required): plain ``sqlite3.connect(str(path),
+    check_same_thread=...)`` for a writer, or -- when *read_only* is set --
+    the ``file:...?mode=ro`` URI form. This absorbs both call sites that used
+    to open sqlite3 connections directly: ``coord/db.py``'s read/write
+    singleton (``_open``, always ``check_same_thread=False`` -- see that
+    module's connection-sharing docstring on :func:`coord.db.get_connection`)
+    and ``coord/dao.py``'s ``SqliteStore`` read-only reader (``read_only=True``,
+    also ``check_same_thread=False`` -- a fresh connection per call, safe from
+    any thread). The ``mode=ro`` URI itself moved here from ``coord/dao.py``
+    now that a real second backend's connection factory exists to make this a
+    genuine dialect branch rather than a one-backend module growing dialect
+    awareness ahead of needing it -- see that module's docstring for the
+    superseded #2766 decision note.
+
+    **Postgres** (``dsn`` required): ``psycopg.connect(dsn)``. ``psycopg`` is
+    an optional dependency (see :func:`_import_psycopg`) imported
+    function-locally, so calling this with ``backend=DIALECT_POSTGRES`` before
+    psycopg is installed raises ``ImportError``/``ModuleNotFoundError`` rather
+    than breaking import of this module for everyone else. *read_only* has no
+    effect here -- unlike SQLite there is no connect-time spelling of
+    "read-only" for Postgres; that half is :func:`apply_connection_setup`'s
+    job, called separately by every caller right after ``connect()`` returns
+    (exactly as it already was for SQLite's pragmas).
+    """
+    if backend == DIALECT_SQLITE:
+        if not sqlite_path:
+            raise ValueError("sql.connect(backend='sqlite') requires sqlite_path")
+        import sqlite3
+
+        if read_only:
+            uri = f"file:{sqlite_path}?mode=ro"
+            return sqlite3.connect(uri, uri=True, check_same_thread=check_same_thread)
+        return sqlite3.connect(str(sqlite_path), check_same_thread=check_same_thread)
+    if backend == DIALECT_POSTGRES:
+        if not dsn:
+            raise ValueError("sql.connect(backend='postgres') requires dsn")
+        psycopg = _import_psycopg()
+
+        return psycopg.connect(dsn)
+    raise UnsupportedDialectError(backend)
 
 
 # ── paramstyle translation ───────────────────────────────────────────────
@@ -281,19 +385,20 @@ def row_factory_for(dialect: str) -> Any:
 
     ``sqlite3.Row`` is returned directly (it's a base-dependency import,
     already used throughout this tree).  ``psycopg.rows.dict_row`` is
-    imported function-locally -- ``psycopg`` is not a base or even a
-    ``server``-extra dependency yet (see ``pyproject.toml``'s ``[project]
-    dependencies`` comment on why third-party imports the base client
-    doesn't need stay function-local) -- so calling this with
-    :data:`DIALECT_POSTGRES` before a Postgres backend is actually installed
-    raises ``ImportError``/``ModuleNotFoundError`` rather than breaking
-    import of this module for everyone else.
+    imported function-locally -- ``psycopg`` is an optional dependency (the
+    ``postgres`` extra, #2886), never a base or ``[dev]`` one (see
+    ``pyproject.toml``'s ``[project.optional-dependencies]``) -- so calling
+    this with :data:`DIALECT_POSTGRES` before the extra is installed raises
+    ``ImportError``/``ModuleNotFoundError``, naming the extra to install
+    (see :func:`_import_psycopg`), rather than breaking import of this
+    module for everyone else.
     """
     if dialect == DIALECT_SQLITE:
         import sqlite3
 
         return sqlite3.Row
     if dialect == DIALECT_POSTGRES:
+        _import_psycopg()  # translate a missing psycopg into an actionable message
         from psycopg.rows import dict_row  # noqa: PLC0415 -- optional dep, see docstring
 
         return dict_row
@@ -403,22 +508,36 @@ def apply_connection_setup(conn: Any, *, read_only: bool = False) -> None:
     pragma). Postgres: no-op, so this is safe to call unconditionally right
     after ``connect()`` regardless of which backend is live.
 
-    *read_only* (#2766): set by a caller whose connection is opened purely
-    for reads -- e.g. ``coord/dao.py``'s ``SqliteStore``, which owns a
-    ``mode=ro`` connection pointed at the daemon's live, WAL-mode database.
-    SQLite: skips ``journal_mode``/``foreign_keys`` (a ``mode=ro`` connection
-    cannot write the WAL toggle -- attempting to costs an "attempt to write
-    a readonly database" error -- and referential integrity is the writer's
-    concern, not a read-only reader's) and instead sets ``PRAGMA
-    query_only=ON``, a belt-and-suspenders guard against an accidental write
-    ever reaching a connection meant to never issue one. ``busy_timeout`` is
-    still set either way, so a read-only reader waits out a writer's
-    momentary lock hold exactly as long as the writer connection itself
-    would. Postgres: no-op regardless of *read_only* -- there is no
-    read-only connection factory live yet for this seam to branch on, so
-    the read-only intent has no effect here until one exists (a future
-    Postgres bring-up would express it as ``SET SESSION CHARACTERISTICS AS
-    TRANSACTION READ ONLY`` or a read-only role, not a connect-time pragma).
+    *read_only* (#2766, widened to Postgres by #827): set by a caller whose
+    connection is opened purely for reads -- e.g. ``coord/dao.py``'s
+    ``SqliteStore``, which owns a ``mode=ro`` connection pointed at the
+    daemon's live, WAL-mode database. SQLite: skips
+    ``journal_mode``/``foreign_keys`` (a ``mode=ro`` connection cannot write
+    the WAL toggle -- attempting to costs an "attempt to write a readonly
+    database" error -- and referential integrity is the writer's concern,
+    not a read-only reader's) and instead sets ``PRAGMA query_only=ON``, a
+    belt-and-suspenders guard against an accidental write ever reaching a
+    connection meant to never issue one. ``busy_timeout`` is still set
+    either way, so a read-only reader waits out a writer's momentary lock
+    hold exactly as long as the writer connection itself would.
+
+    Postgres: until #827, this was a documented no-op -- "there is no
+    read-only connection factory live yet for this seam to branch on". Now
+    that :func:`connect` is that factory, *read_only* sets the
+    session/transaction read-only characteristic instead of doing nothing.
+    ``psycopg2`` exposes this as ``conn.set_session(readonly=True)``;
+    ``psycopg`` (v3) instead exposes a plain settable ``.read_only``
+    property that takes effect for transactions opened after it's set --
+    since every caller sets this immediately after ``connect()`` returns and
+    before running any statement, that's always "the whole session". Checked
+    via ``hasattr(conn, "set_session")`` rather than re-detecting which
+    psycopg generation is live: both driver generations' connection objects
+    already reach this function, and probing for the method they'd actually
+    call is simpler than importing either driver just to ``isinstance``
+    against its class. *read_only=False* (the default, i.e. a writer
+    connection) is still a complete no-op for Postgres -- there is no
+    connect-time pragma to set the way SQLite's ``journal_mode``/
+    ``foreign_keys`` are.
     """
     dialect = detect_dialect(conn)
     if dialect == DIALECT_SQLITE:
@@ -428,7 +547,14 @@ def apply_connection_setup(conn: Any, *, read_only: bool = False) -> None:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-    elif dialect != DIALECT_POSTGRES:
+    elif dialect == DIALECT_POSTGRES:
+        if read_only:
+            set_session = getattr(conn, "set_session", None)
+            if set_session is not None:
+                set_session(readonly=True)  # psycopg2
+            else:
+                conn.read_only = True  # psycopg3
+    else:
         raise UnsupportedDialectError(dialect)
 
 
@@ -527,7 +653,7 @@ def driver_error(conn: Any) -> type[BaseException]:
 
         return sqlite3.Error
     if dialect == DIALECT_POSTGRES:
-        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+        psycopg = _import_psycopg()
 
         return psycopg.Error
     raise UnsupportedDialectError(dialect)
@@ -549,13 +675,15 @@ def driver_errors() -> tuple[type[BaseException], ...]:
     instead of a retried write.
 
     ``sqlite3`` is a stdlib module -- always present, always included.
-    ``psycopg`` is not a declared dependency (see :func:`row_factory_for`),
-    so its absence is the normal case today, not an error: this degrades to
-    ``(sqlite3.Error,)`` rather than raising ``ImportError``, the same
-    "absence is normal" posture :func:`row_factory_for` takes for a
-    *known* dialect with no live connection to detect it from -- except
-    here there is no dialect to detect at all, so degrading silently (not
-    even function-local, deferred-import-style) is correct: a caller doing
+    ``psycopg`` is an optional dependency, not a base or ``[dev]`` one (see
+    :func:`_import_psycopg`), so its absence is the normal case today, not an
+    error: this degrades to ``(sqlite3.Error,)`` rather than raising
+    ``ImportError`` -- unlike every other Postgres call site in this module,
+    this one does NOT route through :func:`_import_psycopg` and its
+    actionable message, precisely because the message would just be
+    swallowed unread by the ``except ImportError`` below; there is no dialect
+    to detect at all here, so degrading silently (not even
+    function-local, deferred-import-style) is correct: a caller doing
     ``except sql.driver_errors():`` on a SQLite-only install must keep
     behaving exactly as ``except sqlite3.OperationalError:`` always did.
 
@@ -568,7 +696,7 @@ def driver_errors() -> tuple[type[BaseException], ...]:
 
     errors: list[type[BaseException]] = [sqlite3.Error]
     try:
-        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+        import psycopg  # noqa: PLC0415 -- optional dep, absence degrades silently, see docstring
     except ImportError:
         pass
     else:

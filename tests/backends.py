@@ -151,22 +151,20 @@ def _next_schema_name() -> str:
 def _import_psycopg() -> Any:
     """Import ``psycopg`` with an actionable message when it isn't installed.
 
-    ``psycopg`` is deliberately **not** a declared dependency of this project
-    yet — adding it (and a Postgres service to CI) is #2886, filed alongside
-    #2884 precisely so this harness could land first without touching the
-    dependency set.  Selecting the Postgres backend without it is therefore a
-    normal, expected state that deserves a real explanation rather than a
-    bare ``ModuleNotFoundError`` traceback out of a fixture.
+    ``psycopg`` is an optional dependency — the ``postgres`` extra (#2886) —
+    never a base or ``[dev]`` one, so a plain ``pip install -e ".[dev]"``
+    does not pull it in.  Selecting the Postgres backend without it is
+    therefore a normal, expected state that deserves a real explanation
+    rather than a bare ``ModuleNotFoundError`` traceback out of a fixture.
     """
     try:
         import psycopg  # noqa: PLC0415 -- optional dep, see docstring
     except ImportError as exc:  # ModuleNotFoundError is a subclass
         raise ModuleNotFoundError(
             f"{BACKEND_ENV_VAR}={BACKEND_POSTGRES} was requested but the "
-            "`psycopg` driver is not installed. It is not a declared "
-            "dependency of this project yet (#2886 adds it, along with a "
-            "Postgres service in CI). Install it into your venv with "
-            "`pip install 'psycopg[binary]'` and point "
+            "`psycopg` driver is not installed. It is an optional "
+            "dependency (the `postgres` extra, #2886) — install it with "
+            "`pip install 'code-coordinator[postgres]'` and point "
             f"{DSN_ENV_VAR} at a reachable server "
             f"(default: {DEFAULT_POSTGRES_DSN})."
         ) from exc
