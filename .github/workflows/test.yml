@@ -320,3 +320,61 @@ jobs:
   # the half of that check this repo can still make (the generator runs and
   # covers every schema; the coord-web byte-comparison itself is that repo's
   # own CI, per the paragraph above).
+
+  # #2886: a real Postgres 16 service, so `coord/sql.py`'s Postgres branches
+  # (paramstyle translation, upsert idioms, `information_schema`
+  # introspection, `RETURNING`, `dict_row`) — spoken since #2719 but never
+  # once executed against a real server — actually run against one, and so
+  # `COORD_TEST_BACKEND=postgres` (#2884's test-suite backend switch) means
+  # something in CI for the first time.
+  #
+  # SEPARATE JOB, not a `services:` block bolted onto `test` above, for two
+  # reasons: (1) the SQLite lane must stay exactly as fast and exactly as
+  # reliable as it is today — a Postgres service, even an unused one, is
+  # more CI surface for that job to depend on for zero benefit to the
+  # SQLite path; (2) `continue-on-error: true` below softens THIS job's
+  # conclusion without touching `test`'s at all. Running the whole suite
+  # (`coord_db` is autouse — see tests/conftest.py — so every one of ~400
+  # test files follows `COORD_TEST_BACKEND` for free) against a backend
+  # nothing has ever run it against is expected to be red for real,
+  # unrelated-to-this-PR reasons at first (coord/db.py's `_ensure_schema`
+  # and friends were written and only ever exercised against SQLite) — the
+  # harness-portability issue's deliverable is exactly that failure list.
+  # `continue-on-error: true` keeps this job's signal visible (its own
+  # conclusion is still pass/fail on the Checks tab) without blocking merges
+  # on it. Flip it off once that failure list is closed out.
+  #
+  # `psycopg` is an optional extra (`postgres`, this issue) — never a base
+  # or `[dev]` dependency (see `pyproject.toml`) — so installing it is this
+  # job's own opt-in `pip install -e ".[dev,postgres]"`, not a change to
+  # what every other job's `pip install -e ".[dev]"` pulls in.
+  postgres:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      COORD_TEST_BACKEND: postgres
+      # The default image's bootstrap database is named after POSTGRES_USER
+      # (postgres) since no POSTGRES_DB was set above — matches
+      # tests/backends.py's schema-per-test isolation, which needs CREATE on
+      # an existing database, not a database of its own.
+      COORD_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,postgres]"
+      # #2180: same split as the `test` job above — the sealed acceptance
+      # suite is gated separately through the #2164 CI wrapper, not swept
+      # into this job's ordinary pytest run.
+      - run: pytest --ignore=tests/acceptance
