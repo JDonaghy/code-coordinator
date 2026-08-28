@@ -415,6 +415,11 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("save_queue", "get_connection"),
         ("drop_entry", "get_connection"),
         ("_load_milestones_for_queue", "get_connection"),
+        # #1107 Part 3: unions merge_queue with merge_queue_archive so the
+        # "already merged" dedup in enqueue_approved_work/staging_items still
+        # works after housekeeping.sweep() archives a row. Same daemon-side
+        # merge-queue-table seam as the others above.
+        ("merged_issue_keys", "get_connection"),
     },
     # coord/issue_store.py — raw get_connection calls for the issue-store
     # seam; these write notifications/results into the DB and are called from

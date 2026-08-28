@@ -56,6 +56,27 @@ def _ins_merge_queue(conn: sqlite3.Connection, aid: str, issue: int, repo: str =
     )
 
 
+def _ins_merge_queue_entry(
+    conn: sqlite3.Connection,
+    aid: str,
+    issue: int,
+    *,
+    state: str,
+    last_attempt: float | None = None,
+    enqueued_at: float | None = None,
+    repo: str = "r",
+) -> None:
+    """Like ``_ins_merge_queue`` but with an explicit terminal ``state`` +
+    timestamps, for #1107 Part 3 archival tests."""
+    conn.execute(
+        "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, branch, "
+        "target_branch, issue_number, issue_title, state, last_attempt, "
+        "enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (aid, repo, "gh/r", f"issue-{issue}", "main", issue, f"#{issue}",
+         state, last_attempt, enqueued_at),
+    )
+
+
 # ── pure keep-set helper ──────────────────────────────────────────────────────
 
 def test_compute_keep_ids_rules():
@@ -266,3 +287,82 @@ def test_housekeeping_never_archives_referenced(coord_db, monkeypatch):
     res = housekeeping.sweep()
     assert res["archived_assignments"] == 0
     assert conn.execute("SELECT COUNT(*) FROM assignments").fetchone()[0] == 1
+
+
+# ── #1107 Part 3: merge_queue archival ─────────────────────────────────────
+
+def test_housekeeping_archives_old_merged_queue_entries(coord_db, monkeypatch):
+    """Stale MERGED merge_queue rows move to merge_queue_archive; pending /
+    recent / non-merged rows are left in the live table untouched."""
+    monkeypatch.setenv("COORD_ARCHIVE_RETENTION_DAYS", "30")
+    from coord import housekeeping
+
+    conn = coord_db
+    _ins_merge_queue_entry(conn, "old_merged", 1, state="merged", last_attempt=OLD)
+    _ins_merge_queue_entry(conn, "recent_merged", 2, state="merged", last_attempt=RECENT)
+    _ins_merge_queue_entry(conn, "old_pending", 3, state="pending", enqueued_at=OLD)
+    conn.commit()
+
+    dry = housekeeping.sweep(dry_run=True)
+    assert dry["archived_merge_queue"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM merge_queue").fetchone()[0] == 3
+
+    res = housekeeping.sweep()
+    assert res["archived_merge_queue"] == 1
+    live = {r[0] for r in conn.execute("SELECT assignment_id FROM merge_queue")}
+    arch = {r[0] for r in conn.execute("SELECT assignment_id FROM merge_queue_archive")}
+    assert live == {"recent_merged", "old_pending"}
+    assert arch == {"old_merged"}
+    # conservation: nothing lost
+    assert len(live) + len(arch) == 3
+
+
+def test_housekeeping_merge_queue_archive_falls_back_to_enqueued_at(coord_db, monkeypatch):
+    """A MERGED row with no last_attempt (legacy/hand-seeded) still ages out
+    using enqueued_at."""
+    monkeypatch.setenv("COORD_ARCHIVE_RETENTION_DAYS", "30")
+    from coord import housekeeping
+
+    conn = coord_db
+    _ins_merge_queue_entry(conn, "old_merged_no_attempt", 1, state="merged", enqueued_at=OLD)
+    conn.commit()
+
+    res = housekeeping.sweep()
+    assert res["archived_merge_queue"] == 1
+    arch = {r[0] for r in conn.execute("SELECT assignment_id FROM merge_queue_archive")}
+    assert arch == {"old_merged_no_attempt"}
+
+
+def test_merged_issue_keys_survives_archival(coord_db, monkeypatch):
+    """coord.merge_queue.merged_issue_keys() must keep returning an archived
+    entry's (repo, issue) — enqueue_approved_work/staging_items dedup on this
+    to avoid re-surfacing an issue whose winning PR already merged."""
+    monkeypatch.setenv("COORD_ARCHIVE_RETENTION_DAYS", "30")
+    from coord import housekeeping, merge_queue
+
+    conn = coord_db
+    _ins_merge_queue_entry(conn, "old_merged", 42, state="merged", last_attempt=OLD, repo="r")
+    conn.commit()
+
+    # Before archival: visible via the live table.
+    assert ("r", 42) in merge_queue.merged_issue_keys()
+
+    housekeeping.sweep()
+    # merge_queue no longer holds the row...
+    assert conn.execute("SELECT COUNT(*) FROM merge_queue").fetchone()[0] == 0
+    # ...but the dedup lookup still sees it via merge_queue_archive.
+    assert ("r", 42) in merge_queue.merged_issue_keys()
+
+
+def test_merged_issue_keys_defensive_when_archive_table_absent(coord_db):
+    """Before any sweep has ever run, merge_queue_archive doesn't exist yet —
+    merged_issue_keys() must not raise."""
+    from coord import merge_queue
+
+    conn = coord_db
+    _ins_merge_queue_entry(conn, "a", 1, state="merged", last_attempt=OLD)
+    conn.commit()
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='merge_queue_archive'"
+    ).fetchone() is None
+    assert ("r", 1) in merge_queue.merged_issue_keys()

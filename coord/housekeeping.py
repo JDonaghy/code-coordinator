@@ -21,6 +21,18 @@ Two guarantees make the sweep safe:
 The sweep runs automatically on a low-cadence daemon tick and on demand via
 ``coord housekeeping`` (which routes through the daemon — the canonical DB lives
 there).
+
+#1107 Part 3: the same sweep also archives ``merge_queue`` rows in the
+``MERGED`` terminal state once they're older than the retention window, into
+``merge_queue_archive`` — mirroring the move-not-delete pattern above.
+``merge_queue`` has no natural "close" event of its own (unlike assignments,
+which age out via ``TERMINAL_STATUSES``), so without this a MERGED row lives
+forever: 192 such rows had accumulated by 2026-07-12 and 61 more by
+2026-07-30, both requiring a manual one-off ``DELETE``/``coord merge --drop``
+declog. ``coord.merge_queue.merged_issue_keys()`` unions the live table with
+the archive so the "already merged, don't re-enqueue" dedup in
+``enqueue_approved_work``/``staging_items`` keeps working after a row ages
+out.
 """
 
 from __future__ import annotations
@@ -48,6 +60,9 @@ _ASSIGNMENTS = "assignments"
 _ASSIGNMENTS_ARCHIVE = "assignments_archive"
 _NOTIFICATIONS = "notifications"
 _NOTIFICATIONS_ARCHIVE = "notifications_archive"
+_MERGE_QUEUE = "merge_queue"
+_MERGE_QUEUE_ARCHIVE = "merge_queue_archive"
+_MERGE_QUEUE_MERGED_STATE = "merged"
 _BATCH = 400  # keep IN(...) clauses well under SQLite's 999-variable limit
 
 
@@ -124,20 +139,26 @@ def _move_rows(
 
 
 def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
-    """Archive stale terminal assignments + their notifications.
+    """Archive stale terminal assignments + their notifications + merged
+    merge_queue entries.
 
     Returns ``{"archived_assignments": N, "archived_notifications": M,
-    "dry_run": bool, "retention_days": D}``.  ``archived_*`` are the counts that
-    were (or, for ``dry_run``, would be) moved.  A no-op returns zeros.
+    "archived_merge_queue": K, "dry_run": bool, "retention_days": D}``.
+    ``archived_*`` are the counts that were (or, for ``dry_run``, would be)
+    moved.  A no-op returns zeros.
 
     Conservative by construction: nothing active, recent (within the archive
     window), queued-for-merge, latest-of-an-open-issue, or review-linked to any
-    such row is ever moved.
+    such row is ever moved. Merge queue entries are archived only once they
+    are in the terminal ``MERGED`` state (#1107 Part 3) — non-terminal /
+    conflicted entries are left for ``prune_stale_queue_entries`` or manual
+    ``coord merge --drop``.
     """
     cutoff = _archive_cutoff(now)
     result = {
         "archived_assignments": 0,
         "archived_notifications": 0,
+        "archived_merge_queue": 0,
         "dry_run": dry_run,
         "retention_days": _archive_retention_days(),
     }
@@ -151,13 +172,19 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
             conn, f"SELECT {_KEEP_INDEX_COLUMNS} FROM {_ASSIGNMENTS}"  # noqa: S608
         ).fetchall()
     ]
-    mq_ids = {
+    mq_rows = sql.execute(
+        conn,
+        "SELECT assignment_id, state, last_attempt, enqueued_at "  # noqa: S608
+        f"FROM {_MERGE_QUEUE}",
+    ).fetchall()
+    mq_ids = {r["assignment_id"] for r in mq_rows if r["assignment_id"]}
+    mq_merged_ids = [
         r["assignment_id"]
-        for r in sql.execute(
-            conn, f"SELECT assignment_id FROM merge_queue"  # noqa: S608
-        ).fetchall()
+        for r in mq_rows
         if r["assignment_id"]
-    }
+        and (r["state"] or "").lower() == _MERGE_QUEUE_MERGED_STATE
+        and (r["last_attempt"] or r["enqueued_at"] or 0) < cutoff
+    ]
     open_keys = {
         (r["repo_name"], r["number"])
         for r in sql.execute(
@@ -194,7 +221,8 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
 
     result["archived_assignments"] = len(candidates)
     result["archived_notifications"] = len(notif_ids)
-    if dry_run or (not candidates and not notif_ids):
+    result["archived_merge_queue"] = len(mq_merged_ids)
+    if dry_run or (not candidates and not notif_ids and not mq_merged_ids):
         return result
 
     with conn:
@@ -205,5 +233,9 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
         if candidates:
             _move_rows(
                 conn, _ASSIGNMENTS, _ASSIGNMENTS_ARCHIVE, "assignment_id", candidates
+            )
+        if mq_merged_ids:
+            _move_rows(
+                conn, _MERGE_QUEUE, _MERGE_QUEUE_ARCHIVE, "assignment_id", mq_merged_ids
             )
     return result

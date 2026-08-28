@@ -598,7 +598,8 @@ def _audit_housekeeping_sweep(swept: dict) -> None:
         summary=(
             f"housekeeping: archived {swept.get('archived_assignments', 0)} "
             f"assignment(s), {swept.get('archived_notifications', 0)} "
-            "notification(s)"
+            f"notification(s), {swept.get('archived_merge_queue', 0)} "
+            "merge_queue entry(ies)"
         ),
         details=swept,
     )
@@ -8352,14 +8353,17 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
                         os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
                         swept = await run_in_threadpool(_hk.sweep)
-                        if swept.get("archived_assignments") or swept.get(
-                            "archived_notifications"
+                        if (
+                            swept.get("archived_assignments")
+                            or swept.get("archived_notifications")
+                            or swept.get("archived_merge_queue")
                         ):
                             log.info(
                                 "housekeeping: archived %d assignment(s), "
-                                "%d notification(s)",
+                                "%d notification(s), %d merge_queue entry(ies)",
                                 swept["archived_assignments"],
                                 swept["archived_notifications"],
+                                swept.get("archived_merge_queue", 0),
                             )
                             _audit_housekeeping_sweep(swept)
                     except Exception:  # noqa: BLE001
