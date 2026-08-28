@@ -53,12 +53,18 @@ nothing else.** #1337 gave ``issues.body`` a *document* cap high enough that
 it truncates no real issue (p99 ≈ 9 KB against a 16 KB cap), and #1791 then
 dropped the body of *closed* issues outright.  What was left — every **open,
 non-epic** body, shipped whole on every uncached poll — was still 1.44 MB of
-a 1.69 MB issue-body payload measured on the live board, for a field no
-collection view renders: the TUI's Board / Pipeline Issue tabs have hydrated
-the full body from ``GET /issue/{repo}/{number}`` since #2497.  So the body
-now leaves the collection wire for open issues too, and :func:`bound_issue_row`
-keeps only the machine-parsed *residue* a client cannot re-fetch in time —
-see :data:`ALLOWED_GLOB_MARKER`.
+a 1.69 MB issue-body payload measured on the live board, for a field that is
+display material, not something a collection *view* renders directly: the
+TUI reads it lazily, on demand, through several panes that share the same
+``issue_detail_cache`` / ``GET /issue/{repo}/{number}`` hydration path (the
+Board and Pipeline Issue tabs since #2497; the Drive/Merge Queue tab's
+issue-detail pane and the "Chat about issue" briefing as of this fix) rather
+than each parsing the wire body eagerly. Do not assume the Board/Pipeline
+tabs are the only consumers when touching this policy again — check every
+Rust call site of ``OpenIssue.body`` / ``PipelineIssue.body`` first. So the
+body now leaves the collection wire for open issues too, and
+:func:`bound_issue_row` keeps only the machine-parsed *residue* a client
+cannot re-fetch in time — see :data:`ALLOWED_GLOB_MARKER`.
 """
 
 from __future__ import annotations
@@ -265,12 +271,15 @@ def bound_issue_row(row: dict) -> None:
     reads its body once it's closed.
 
     **Open (non-epic) issues keep only the machine-parsed residue** (#1939).
-    The rest of an open body is display material, and both Issue tabs have
-    hydrated it lazily from ``GET /issue/{repo}/{number}`` since #2497 — so
-    shipping it inline was 1.44 MB per uncached poll, per client, for text
-    nothing renders until a user opens one issue.  ``body_truncated`` +
-    ``body_len`` are stamped exactly as for a closed issue, which is what
-    arms that hydration (``pipeline.rs::issue_body_fetch_target``).
+    The rest of an open body is display material, and every Rust consumer of
+    the synced row (the Board/Pipeline Issue tabs since #2497; the
+    Drive/Merge Queue tab's issue-detail pane and the "Chat about issue"
+    briefing as of this fix) hydrates it lazily from
+    ``GET /issue/{repo}/{number}`` instead — so shipping it inline was
+    1.44 MB per uncached poll, per client, for text nothing renders until a
+    user opens one issue.  ``body_truncated`` + ``body_len`` are stamped
+    exactly as for a closed issue, which is what arms that hydration
+    (``pipeline.rs::issue_body_fetch_target``).
     """
     if _is_tracking_issue(row):
         return

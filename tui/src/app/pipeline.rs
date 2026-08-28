@@ -7964,18 +7964,24 @@ impl CoordApp {
     }
 
     /// #2497: the `(repo, issue_number)` cache key of the issue currently
-    /// shown on the Board or Pipeline **Issue tab** when its body was
-    /// bounded on the `/board` wire (`body_truncated`) and no usable cache
-    /// entry exists yet — i.e. the Issue tab wants a full-body detail fetch
-    /// armed. Mirrors [`Self::findings_fetch_target`] (#1337) for
-    /// `issues.body` instead of `assignments.review_findings`, keyed on
-    /// `(repo, issue_number)` alone (unlike findings, an issue body has no
-    /// per-fetch `len` to fold into the key — see `issue_detail_cache`'s
-    /// doc comment).
+    /// shown on the Board Issue tab, the Pipeline Issue tab, or the Drive/
+    /// Merge Queue tab's issue-detail pane when its body was bounded on the
+    /// `/board` wire (`body_truncated`) and no usable cache entry exists yet
+    /// — i.e. the pane wants a full-body detail fetch armed. Mirrors
+    /// [`Self::findings_fetch_target`] (#1337) for `issues.body` instead of
+    /// `assignments.review_findings`, keyed on `(repo, issue_number)` alone
+    /// (unlike findings, an issue body has no per-fetch `len` to fold into
+    /// the key — see `issue_detail_cache`'s doc comment).
     ///
-    /// `None` when neither Issue tab is the active view/tab, nothing is
-    /// selected, the body arrived whole, hydration already succeeded, or a
-    /// recent failed attempt is still backing off.
+    /// #1939: the Queue arm was added when `/board` started truncating
+    /// **open** (not just closed) non-epic bodies too —
+    /// `queue_issue_body_list`'s fast path (`drive_queue.rs`) reads the same
+    /// `data.open_issues` row `board_issue_body_list` does, so it needs the
+    /// same hydration arm or it can never recover the real text.
+    ///
+    /// `None` when none of the three panes is the active view/tab, nothing
+    /// is selected, the body arrived whole, hydration already succeeded, or
+    /// a recent failed attempt is still backing off.
     pub(crate) fn issue_body_fetch_target(&self) -> Option<(String, u64)> {
         let (repo, number, truncated, len) = match self.active_view {
             SidebarView::Board if self.board_detail_tab == BoardDetailTab::Issue => {
@@ -7997,6 +8003,21 @@ impl CoordApp {
                 let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
                 let repo = issue.coord_repo.clone()?;
                 (repo, issue.number, issue.body_truncated, issue.body_len)
+            }
+            SidebarView::MergeQueue => {
+                let row = self.queue_selected_row()?;
+                let number = u64::try_from(row.issue_number).ok()?;
+                let oi = self
+                    .data
+                    .open_issues
+                    .iter()
+                    .find(|oi| oi.repo_name == row.repo_name && oi.number == number)?;
+                (
+                    oi.repo_name.clone(),
+                    oi.number,
+                    oi.body_truncated,
+                    oi.body_len,
+                )
             }
             _ => return None,
         };

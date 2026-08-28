@@ -1358,15 +1358,44 @@ impl CoordApp {
     /// troubleshooter gets (assignments / merge_queue / CI / stage statuses).
     /// The session fetches the discussion itself (`gh issue view --comments`)
     /// when useful, and may edit the issue via `coord issue edit` / `coord ready`.
+    ///
+    /// #1939: `p.body` is a verbatim copy of `OpenIssue.body`
+    /// (`mod.rs:5523/5592`), which the `/board` wire now truncates to a
+    /// machine-parsed residue for any open, non-epic issue
+    /// (`board_wire.bound_issue_row`). A diagnostic session's briefing —
+    /// described below as "the current data we have on this issue" — must
+    /// not silently ship that placeholder instead of the real description,
+    /// so this recovers the full text the same way the Board/Pipeline Issue
+    /// tabs do (`issue_detail_cache`, #2497), falling back to a one-shot
+    /// BLOCKING `GET /issue/{repo}/{number}` when no hydrated cache entry
+    /// exists yet — launching an interactive session already spawns a PTY
+    /// and writes a temp file, so the extra latency here is an acceptable
+    /// one-time cost for a briefing that must be correct, not a per-frame
+    /// render path where blocking would be a regression.
     pub(crate) fn chat_briefing(&self, coord_repo: &str, issue_num: u64) -> String {
         let issue = self.pipeline_issues.iter().find(|p| {
             p.number == issue_num
                 && p.coord_repo.as_deref().map(|r| r == coord_repo).unwrap_or(false)
         });
         let title = issue.map(|p| p.title.as_str()).unwrap_or("(title not available)");
-        let body = issue
+        let raw_body = issue
             .map(|p| p.body.as_str())
-            .filter(|b| !b.trim().is_empty())
+            .filter(|b| !b.trim().is_empty());
+        let truncated = issue.map(|p| p.body_truncated).unwrap_or(false);
+        let hydrated_body: Option<String> = if truncated {
+            self.issue_detail_cache
+                .get(&(coord_repo.to_string(), issue_num))
+                .and_then(|e| e.full.clone())
+                .or_else(|| {
+                    let (url, token) = resolve_board_service()?;
+                    fetch_issue_body_blocking(&url, token.as_deref(), coord_repo, issue_num)
+                })
+        } else {
+            None
+        };
+        let body = hydrated_body
+            .as_deref()
+            .or(raw_body)
             .unwrap_or("(no body recorded)");
         let board = self.troubleshoot_briefing(coord_repo, issue_num);
         format!(

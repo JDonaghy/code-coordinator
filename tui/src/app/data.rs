@@ -2689,25 +2689,40 @@ pub(crate) fn spawn_issue_detail_fetch(
 ) -> std::sync::mpsc::Receiver<Option<String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(5))
-            .build();
-        let mut req = agent.get(&format!("{base_url}/issue/{repo_name}/{number}"));
-        if let Some(t) = token {
-            req = req.set("Authorization", &format!("Bearer {t}"));
-        }
-        let out = match req.call() {
-            Ok(resp) => resp
-                .into_string()
-                .ok()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-                .and_then(|v| v.get("body").and_then(|f| f.as_str()).map(|s| s.to_string())),
-            Err(_) => None,
-        };
+        let out = fetch_issue_body_blocking(&base_url, token.as_deref(), &repo_name, number);
         let _ = tx.send(out);
     });
     rx
+}
+
+/// #1939: the synchronous core of [`spawn_issue_detail_fetch`], factored out
+/// so a one-shot caller that isn't on the render-tick poll loop (e.g.
+/// [`super::sessions::CoordApp::chat_briefing`]'s Chat-session briefing) can
+/// block on the same `GET /issue/{repo}/{number}` request inline instead of
+/// arming a receiver nothing will ever drain. `None` on any HTTP/parse
+/// failure, same as the async path.
+pub(crate) fn fetch_issue_body_blocking(
+    base_url: &str,
+    token: Option<&str>,
+    repo_name: &str,
+    number: u64,
+) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let mut req = agent.get(&format!("{base_url}/issue/{repo_name}/{number}"));
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    match req.call() {
+        Ok(resp) => resp
+            .into_string()
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .and_then(|v| v.get("body").and_then(|f| f.as_str()).map(|s| s.to_string())),
+        Err(_) => None,
+    }
 }
 
 /// #584: fetch the read-only board projection from the `coord serve` daemon

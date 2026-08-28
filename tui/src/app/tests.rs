@@ -20823,6 +20823,85 @@
     }
 
     #[test]
+    fn chat_briefing_prefers_hydrated_full_body_when_truncated() {
+        // #1939: `p.body` is a verbatim copy of `OpenIssue.body`, which the
+        // /board wire now truncates for any open, non-epic issue. A
+        // diagnostic session's briefing — "the current data we have on this
+        // issue" — must recover the real text from `issue_detail_cache`
+        // when it's already hydrated (e.g. the operator viewed the Board
+        // Issue tab earlier this session), the same #2497 cache the Board/
+        // Pipeline tabs read, rather than silently shipping the truncation
+        // placeholder.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].body_truncated = true;
+        app.pipeline_issues[0].body_len = Some(9999);
+        app.pipeline_issues[0].body =
+            "PREVIEW ONLY… [truncated on the /board wire — full text: detail endpoint]"
+                .to_string();
+        app.issue_detail_cache.insert(
+            ("api".to_string(), 42),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some("FULL BODY the chat session needs to diagnose this".to_string()),
+            },
+        );
+
+        let briefing = app.chat_briefing("api", 42);
+        assert!(
+            briefing.contains("FULL BODY the chat session needs to diagnose this"),
+            "expected hydrated full body in the briefing; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
+        assert!(
+            !briefing.contains("PREVIEW ONLY"),
+            "the truncation preview must not leak into the briefing once \
+             hydrated; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
+    }
+
+    #[test]
+    fn chat_briefing_falls_back_to_a_blocking_fetch_when_not_yet_hydrated() {
+        // #1939: when the body is wire-truncated and NOT already hydrated
+        // (no earlier Board/Pipeline Issue tab visit populated
+        // `issue_detail_cache` this session), the briefing must not just
+        // ship the placeholder — it performs a one-shot blocking
+        // `GET /issue/{repo}/{number}` against the daemon, same endpoint
+        // the async #2497 hydration path uses, since launching an
+        // interactive session already takes a beat.
+        let mock = MockBoardService::start(r#"{"body": "FULL BODY VIA BLOCKING MOCK FETCH"}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].body_truncated = true;
+        app.pipeline_issues[0].body_len = Some(9999);
+        app.pipeline_issues[0].body =
+            "PREVIEW ONLY… [truncated on the /board wire — full text: detail endpoint]"
+                .to_string();
+
+        let briefing = app.chat_briefing("api", 42);
+        assert!(
+            briefing.contains("FULL BODY VIA BLOCKING MOCK FETCH"),
+            "expected the blocking fallback fetch's body in the briefing; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
+        assert!(
+            !briefing.contains("PREVIEW ONLY"),
+            "the truncation preview must not leak into the briefing once \
+             the blocking fetch succeeds; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
+
+        let requests = mock.requests();
+        assert!(
+            requests.iter().any(|r| r.starts_with("GET /issue/api/42")),
+            "chat_briefing must GET /issue/{{repo}}/{{number}} when no cache \
+             entry exists yet; got {:?}",
+            requests
+        );
+    }
+
+    #[test]
     fn troubleshoot_briefing_includes_coord_diagnose_as_first_step() {
         // #676: `coord diagnose` must appear as the first step in the
         // troubleshoot briefing so the session doesn't improvise its own
@@ -52672,6 +52751,108 @@ Milestone tracking issue.
             "#1867: a background fetch may be triggered at most once per \
              issue, never once per frame"
         );
+    }
+
+    #[test]
+    fn queue_issue_body_list_renders_preview_before_hydration_for_open_issue() {
+        // #1939: `/board` now truncates an OPEN (non-epic) issue's body too
+        // (previously only closed ones), and `queue_issue_body_list`'s fast
+        // path unconditionally trusted `data.open_issues` — this must show
+        // the daemon's truncation notice, exactly the #2497 pattern the
+        // Board/Pipeline Issue tabs already follow, rather than assuming a
+        // synced row always carries the full text.
+        let mut data = BoardData::default();
+        data.pipeline_repos = vec![("myrepo".to_string(), "example-org/myrepo".to_string())];
+        let mut oi = open_issue(
+            "myrepo",
+            701,
+            "T701",
+            "\n… [truncated on the /board wire — full text: detail endpoint]",
+        );
+        oi.body_truncated = true;
+        oi.body_len = Some(9999);
+        data.open_issues.push(oi);
+        let mut app = make_app_with_drive_queue(data, queue_fixture_json());
+
+        let rendered = list_text(&app.queue_issue_body_list());
+        assert!(
+            rendered.contains("truncated on the /board wire"),
+            "the daemon's truncation notice must render before hydration:\n{rendered}"
+        );
+        // No stray `gh`-based fetch: the synced row is present, so only the
+        // #2497 hydration path (armed below) should ever fire for it.
+        assert!(
+            app.pending_issue_fetches.borrow().is_empty(),
+            "a synced-but-truncated row must not fall through to the \
+             `gh issue view` fallback fetch"
+        );
+
+        // And the periodic-work arming helper (`issue_body_fetch_target`)
+        // targets exactly this issue once the Queue tab is the active view.
+        app.active_view = SidebarView::MergeQueue;
+        assert_eq!(
+            app.issue_body_fetch_target(),
+            Some(("myrepo".to_string(), 701)),
+        );
+    }
+
+    #[test]
+    fn queue_issue_body_list_prefers_hydrated_full_body() {
+        // #1939: once the background detail fetch (GET
+        // /issue/{repo}/{number}) has hydrated the full body into
+        // `issue_detail_cache` — the same cache Board/Pipeline populate —
+        // the Queue tab's detail pane must render that instead of the
+        // wire's truncation notice.
+        let mut data = BoardData::default();
+        data.pipeline_repos = vec![("myrepo".to_string(), "example-org/myrepo".to_string())];
+        let mut oi = open_issue(
+            "myrepo",
+            701,
+            "T701",
+            "PREVIEW ONLY… [truncated on the /board wire — full text: detail endpoint]",
+        );
+        oi.body_truncated = true;
+        oi.body_len = Some(9999);
+        data.open_issues.push(oi);
+        let mut app = make_app_with_drive_queue(data, queue_fixture_json());
+        app.issue_detail_cache.insert(
+            ("myrepo".to_string(), 701),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some("FULL BODY hydrated via the Queue tab's own arm".to_string()),
+            },
+        );
+
+        let rendered = list_text(&app.queue_issue_body_list());
+        assert!(
+            rendered.contains("FULL BODY hydrated via the Queue tab's own arm"),
+            "expected hydrated full body:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("PREVIEW ONLY"),
+            "preview must be replaced once hydrated:\n{rendered}"
+        );
+
+        // Hydrated → nothing left to fetch.
+        app.active_view = SidebarView::MergeQueue;
+        assert_eq!(app.issue_body_fetch_target(), None);
+    }
+
+    #[test]
+    fn issue_body_fetch_target_ignores_queue_selection_off_the_merge_queue_view() {
+        // The arming helper must not leak a Queue-tab target while some
+        // OTHER view is active — mirrors
+        // `issue_body_fetch_target_none_when_not_truncated_or_hydrated`'s
+        // tab-gating assertion for Board/Pipeline.
+        let mut data = BoardData::default();
+        data.pipeline_repos = vec![("myrepo".to_string(), "example-org/myrepo".to_string())];
+        let mut oi = open_issue("myrepo", 701, "T701", "truncated notice");
+        oi.body_truncated = true;
+        oi.body_len = Some(9999);
+        data.open_issues.push(oi);
+        let mut app = make_app_with_drive_queue(data, queue_fixture_json());
+        app.active_view = SidebarView::Board;
+        assert_eq!(app.issue_body_fetch_target(), None);
     }
 
     #[test]

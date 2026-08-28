@@ -1626,15 +1626,23 @@ impl CoordApp {
     /// layered lookup as `board_issue_body_list` (`render.rs:1754`) — this
     /// exists so a fetch stays a last resort, not the common path:
     ///
-    /// 1. Synced row in `data.open_issues` — fast path, no I/O. `/board`
-    ///    ships the full `issues` table, so this is the overwhelming case.
-    /// 2. In-memory `fetched_issues_cache`, populated by a prior background
+    /// 1. Synced row in `data.open_issues` — fast path, no I/O. **#1939:**
+    ///    `/board` now truncates an open (non-epic) issue's body to its
+    ///    machine-parsed residue, same as it has long done for closed
+    ///    issues, so this step now mirrors `board_issue_body_list`'s
+    ///    `body_truncated` check instead of assuming the synced row always
+    ///    carries the full text.
+    /// 2. `issue_detail_cache`, hydrated by the `GET /issue/{repo}/{number}`
+    ///    background fetch `issue_body_fetch_target` arms for this tab too
+    ///    (#1939) — consulted only when step 1's row is `body_truncated`.
+    /// 3. In-memory `fetched_issues_cache`, populated by a prior background
     ///    `gh issue view` for this session (shared with Board/Pipeline — one
-    ///    fetch of an issue serves every panel that shows it).
-    /// 3. An in-flight background fetch — show a "Fetching…" placeholder and
+    ///    fetch of an issue serves every panel that shows it). Only reached
+    ///    when the issue has no synced row at all.
+    /// 4. An in-flight background fetch — show a "Fetching…" placeholder and
     ///    let the next render pick up the result.
-    /// 4. No data yet — spawn `gh issue view` in the background (at most
-    ///    once per issue: step 3's in-flight check makes every subsequent
+    /// 5. No data yet — spawn `gh issue view` in the background (at most
+    ///    once per issue: step 4's in-flight check makes every subsequent
     ///    frame a no-op fetch-wise until it resolves) and show a placeholder.
     pub(crate) fn queue_issue_body_list(&self) -> ListView {
         // #1867: use the pane width stashed at draw time for word-wrapping.
@@ -1673,8 +1681,26 @@ impl CoordApp {
             .iter()
             .find(|oi| oi.repo_name == repo && oi.number == number)
         {
+            // #1939: the /board wire now truncates an open (non-epic)
+            // issue's body too (previously only closed ones) — mirror
+            // `board_issue_body_list`'s hydration check so this pane
+            // doesn't regress to showing the truncation notice forever.
+            // `issue_body_fetch_target` arms the same
+            // GET /issue/{repo}/{number} fetch for the Queue tab.
+            let hydrated: Option<&str> = if oi.body_truncated {
+                self.issue_detail_cache
+                    .get(&key)
+                    .and_then(|e| e.full.as_deref())
+            } else {
+                None
+            };
             return issue_body_list(
-                Some((oi.number, oi.title.as_str(), oi.body.as_str(), &oi.labels[..])),
+                Some((
+                    oi.number,
+                    oi.title.as_str(),
+                    hydrated.unwrap_or(oi.body.as_str()),
+                    &oi.labels[..],
+                )),
                 self.queue_detail_scroll,
                 "queue-issue-body",
                 wrap_width,
