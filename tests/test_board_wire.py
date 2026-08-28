@@ -18,6 +18,7 @@ flag so a client can tell it received a trimmed board.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -142,15 +143,104 @@ def test_bound_issue_row_drops_closed_issue_body() -> None:
     assert len(row["body"]) < 200  # notice text only — no prefix survives
 
 
-def test_bound_issue_row_open_issue_keeps_document_cap() -> None:
-    """Unchanged #1337 behaviour: OPEN non-epic issues keep the DOCUMENT_CHARS
-    prefix, not a hard drop — coord-tui's client-side parses need it."""
-    from coord.board_wire import DOCUMENT_CHARS
-
-    row = {"state": "open", "labels": ["bug"], "body": "x" * (DOCUMENT_CHARS + 500)}
+def test_bound_issue_row_drops_open_non_epic_issue_body() -> None:
+    """#1939: an OPEN non-epic body is display material the Issue tabs
+    hydrate lazily (#2497), so it leaves the collection wire too — the
+    #1337 DOCUMENT_CHARS prefix truncated no real issue (p99 ≈ 9 KB against
+    a 16 KB cap) and therefore saved nothing."""
+    body = "x" * 9000
+    row = {"state": "open", "labels": ["bug"], "body": body}
     bound_issue_row(row)
     assert row["body_truncated"] is True
-    assert len(row["body"]) > DOCUMENT_CHARS  # prefix + notice, not dropped to ~0
+    assert row["body_len"] == 9000
+    assert len(row["body"]) < 200  # notice text only
+    assert "x" * 100 not in row["body"]
+
+
+def test_bound_issue_row_open_body_keeps_the_allowed_globs_line() -> None:
+    """#1939: `acceptance_for_path_arg` parses `**Allowed:**` out of an open
+    issue's body SYNCHRONOUSLY while handling a Pipeline right-click
+    dispatch — there is no user action it could wait for a detail fetch
+    behind — so those lines survive the cut while the prose does not."""
+    body = (
+        "Some long prose that nothing parses.\n" * 200
+        + "## Files\n"
+        + "- **Allowed:** `coord/board_wire.py`, `tests/test_board_wire.py`\n"
+        + "- **Forbidden:** docs/README.\n"
+        + "More prose.\n" * 200
+    )
+    row = {"state": "open", "labels": ["bug"], "body": body}
+    bound_issue_row(row)
+
+    assert row["body_truncated"] is True
+    assert row["body_len"] == len(body)
+    assert "**Allowed:** `coord/board_wire.py`, `tests/test_board_wire.py`" in row["body"]
+    assert "Some long prose" not in row["body"]
+    assert "Forbidden" not in row["body"]
+    assert len(row["body"]) < len(body) // 10
+
+
+def test_bound_issue_row_open_body_of_only_globs_is_left_alone() -> None:
+    """Additive-only rule: when the residue isn't actually smaller than the
+    original, nothing is cut and no flag is stamped — an old client sees an
+    unchanged shape, same as the width caps."""
+    body = "- **Allowed:** `coord/**`\n"
+    row = {"state": "open", "labels": ["bug"], "body": body}
+    bound_issue_row(row)
+    assert row["body"] == body
+    assert "body_truncated" not in row
+
+
+def test_bound_issue_row_short_open_body_still_dropped() -> None:
+    """A *short* open body is still not free: 490 open non-epic issues at a
+    ~2.9 KB mean were 1.44 MB per uncached poll, per client. The cut is
+    unconditional, not size-gated."""
+    body = "a short but entirely unrendered issue description\n" * 5
+    row = {"state": "open", "labels": ["bug"], "body": body}
+    bound_issue_row(row)
+    assert row["body_truncated"] is True
+    assert "unrendered" not in row["body"]
+
+
+def test_bound_issue_row_empty_open_body_untouched() -> None:
+    row = {"state": "open", "labels": ["bug"], "body": ""}
+    bound_issue_row(row)
+    assert row["body"] == ""
+    assert "body_truncated" not in row
+
+
+def test_bound_issue_row_open_epic_body_still_inline() -> None:
+    """#1939 must not reach the Milestone DAG: `milestone_dag.rs` parses
+    `## Work order` client-side out of the epic body with NO extra
+    round-trip, so epics stay exempt (48 open epics, 0.24 MB — bounded)."""
+    body = "## Work order\n" + "x" * 20000 + "\n- [ ] #4243 {after: #4242}\n"
+    row = {"state": "open", "labels": ["epic", "coord"], "body": body}
+    bound_issue_row(row)
+    assert row["body"] == body
+    assert "body_truncated" not in row
+
+
+def test_allowed_glob_marker_matches_the_rust_parser() -> None:
+    """Cross-language guard (#1939), same posture as coord/board_bool_guard.py:
+    `ALLOWED_GLOB_MARKER` decides what survives the body cut on the *server*,
+    but the consumer that needs it is `parse_allowed_globs_from_issue_body`
+    in the Rust TUI. If someone renames the marker on one side only, the
+    residue silently stops carrying what the client parses — so assert the
+    two spellings are still the same string.
+    """
+    from coord.board_wire import ALLOWED_GLOB_MARKER
+
+    src = Path(__file__).resolve().parents[1] / "tui" / "src" / "app" / "pipeline.rs"
+    if not src.exists():  # pragma: no cover — coord installed without the TUI tree
+        pytest.skip("tui/src/app/pipeline.rs not present in this checkout")
+    text = src.read_text(encoding="utf-8")
+    marker = re.search(r'const MARKER: &str = "([^"]+)";', text)
+    assert marker is not None, (
+        "parse_allowed_globs_from_issue_body's MARKER const is gone or was "
+        "reshaped — re-check what the Rust side parses before trusting "
+        "_machine_readable_residue"
+    )
+    assert marker.group(1) == ALLOWED_GLOB_MARKER
 
 
 def test_bound_issue_row_closed_epic_still_exempt() -> None:

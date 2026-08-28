@@ -975,16 +975,17 @@ def test_board_wire_bounds_assignment_text_fields(app_client: TestClient) -> Non
 
 
 def test_board_wire_bounds_issue_bodies(app_client: TestClient) -> None:
-    """Issue bodies get the high document cap (semantic parses — work orders,
-    ## Files globs — must survive for every real body; today p99 ≈ 9 KB)."""
-    from coord.board_wire import DOCUMENT_CHARS
+    """#1939: an open non-epic body leaves the collection wire entirely — it
+    is 1.44 MB of display material the Issue tabs hydrate lazily (#2497) —
+    and is flagged so a client knows to fetch the detail read."""
+    from coord.board_wire import TRUNCATION_NOTICE
 
     board = app_client.get("/board").json()
     issue = next(i for i in board["issues"] if i["number"] == 42)
-    # 9 KB body is under the document cap: served whole, no flag.
-    assert issue["body"] == "B" * 9000
-    assert "body_truncated" not in issue
-    assert DOCUMENT_CHARS >= 16384
+    # 9 KB body: no longer served on the collection wire at all.
+    assert issue["body"] == TRUNCATION_NOTICE
+    assert issue["body_truncated"] is True
+    assert issue["body_len"] == 9000
 
 
 def test_board_wire_short_fields_untouched(
