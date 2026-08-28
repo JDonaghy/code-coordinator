@@ -1490,6 +1490,98 @@ def test_fetch_tops_up_issues_and_milestone_work_orders_when_standalone(
     assert state.milestone_tracking_issue == 1120
 
 
+def test_fetch_local_issue_rows_carries_title_so_project_resolves_issue_title(
+    monkeypatch, tmp_path, coord_db
+):
+    """#2881: ``_local_issue_rows()``'s SELECT dropped ``title`` even though
+    :func:`project` has read ``oi.get("title")`` off this exact payload since
+    #2871 — so on the daemon host (the ONLY host that runs `coord
+    drive-queue tick`, i.e. every real dispatch) ``issue_title`` resolved to
+    ``""`` for every issue, and ``coord.drive._refused_policy_is_stale``
+    (keyed on ``issue_title``) hit its "uncertain ⇒ still blocking" guard
+    unconditionally — the retarget-bypass it exists to provide could never
+    fire in production.
+
+    Drives the REAL local-DB payload path end to end — ``BoardFetcher.fetch()``
+    → ``_local_issue_rows()`` → :func:`project` — against the ``coord_db``
+    fixture's real schema-migrated ``:memory:`` DB, exactly like #2040's own
+    top-up test above. A hand-built ``IssueState`` (what #2871's own tests
+    did) cannot catch this: the bug is entirely in what the SELECT carries,
+    not in how ``project()`` reads it once it has a title. This fails the
+    instant ``title`` is dropped from that SELECT again.
+    """
+    monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr("coord.board_service.read_board", lambda: "BOARD")
+    monkeypatch.setattr("coord.client.serialize_board", lambda b: {"from": b})
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels, body) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            REPO, 916, "Composed regression test for the rebase-bounce flow",
+            "open", "[]", "",
+        ),
+    )
+    coord_db.commit()
+
+    payload = BoardFetcher(cache_dir=tmp_path).fetch()
+    state = project(payload, REPO, 916, make_config())
+
+    assert state.issue_title == "Composed regression test for the rebase-bounce flow"
+
+
+def test_fetch_local_issue_rows_and_http_board_expose_the_same_issue_keys(
+    tmp_path, coord_db
+):
+    """#2881: silent divergence between the HTTP ``/board`` ``issues``
+    projection (``coord.dao.SqliteStore`` → ``board_schema.BoardIssue``) and
+    this daemon-host standalone path (``_local_issue_rows``) has now caused
+    three separate bugs (#2040, #2182, #2881) — a consumer starts reading a
+    new field, the HTTP path (backed by the declared DTO) carries it, and the
+    local-DB top-up silently doesn't, because nothing keeps the two SELECTs
+    in sync. Rather than wait for the next consumer to discover the next
+    gap, assert the two ``issues`` row shapes expose the same key set
+    directly — against a REAL on-disk schema-migrated DB for the HTTP side
+    (mirrors ``tests/test_dao.py``'s ``read_db`` fixture) and the real
+    ``coord_db`` fixture for the local side. This fails the instant one
+    drifts from the other, regardless of which field it is.
+    """
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.drive_state import _local_issue_rows
+
+    db_path = tmp_path / "coord.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels, body) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (REPO, 1, "t", "open", "[]", ""),
+    )
+    conn.commit()
+    conn.close()
+    http_rows = SqliteStore(db_path).list_issues()
+    assert len(http_rows) == 1
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels, body) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (REPO, 1, "t", "open", "[]", ""),
+    )
+    coord_db.commit()
+    local_rows = _local_issue_rows()
+    assert len(local_rows) == 1
+
+    assert set(local_rows[0]) == set(http_rows[0]), (
+        "_local_issue_rows() and SqliteStore.list_issues() (the /board HTTP "
+        "path) must expose the same issues-row keys — one side carrying a "
+        "field the other doesn't is exactly the #2040/#2182/#2881 shape "
+        "(a consumer added on one side silently sees None/empty on the "
+        "daemon-host path)"
+    )
+
+
 def test_fetch_local_issue_rows_fail_soft_on_an_unreadable_table(monkeypatch, tmp_path):
     """Mirrors ``coord.commands.drive_queue._local_issue_rows``'s fail-soft
     posture: an unreadable ``issues``/``merge_queue`` table degrades the

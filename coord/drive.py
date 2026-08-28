@@ -94,7 +94,7 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, NamedTuple, Protocol, Sequence
 
 from coord.filelock import FileLock, LockBusy, notify_lock_path
 from coord.drive_state import (
@@ -628,9 +628,34 @@ def _format_age(seconds: float) -> str:
     return f"{seconds / 86400:.1f}d"
 
 
+class RefusedPolicyStaleness(NamedTuple):
+    """The verdict :func:`_refused_policy_staleness` reaches, plus WHY —
+    #2881: collapsing "no title resolved" and "title unchanged" to the same
+    ``False`` (as the original #2871 boolean-only version did) is what let
+    the #2881 bug (``title`` missing from the daemon-host payload,
+    ``coord/drive_state.py``'s ``_local_issue_rows``) hide for a whole
+    release: every real drive landed in ``uncertain`` silently, read
+    identically to a confidently-checked ``unchanged``, and the operator-
+    facing message could not tell the two apart either.
+    """
+
+    is_stale: bool
+    uncertain: bool
+    detail: str
+
+
 def _refused_policy_is_stale(state: IssueState) -> bool:
     """True when a terminal ``refused_policy`` work row no longer describes
-    the issue as it stands now (#2871).
+    the issue as it stands now (#2871). Thin bool wrapper around
+    :func:`_refused_policy_staleness` — see that function for the reasoning
+    and for the ``uncertain``/``detail`` distinction #2881 added.
+    """
+    return _refused_policy_staleness(state).is_stale
+
+
+def _refused_policy_staleness(state: IssueState) -> RefusedPolicyStaleness:
+    """Does a terminal ``refused_policy`` work row still describe the issue
+    as it stands now (#2871), and how confident is that answer (#2881)?
 
     A worker refuses pre-dispatch work exactly once, correctly, for the ask
     it was shown — the refusal says nothing about a DIFFERENT ask on the same
@@ -639,16 +664,50 @@ def _refused_policy_is_stale(state: IssueState) -> bool:
     ``issue-{N}-{slugify(title)}`` at dispatch time, see
     ``coord.agent``'s ``branch_name`` construction) no longer matches what a
     fresh dispatch would name — that mismatch is the signal a retarget
-    happened. Conservative on every uncertainty (no branch recorded, no
-    title resolved): returns ``False`` — i.e. still treated as blocking —
-    rather than risk waving a genuinely-unresolved refusal through.
+    happened.
+
+    Conservative on every uncertainty (no branch recorded, no title
+    resolved): ``is_stale=False`` — i.e. still treated as blocking — rather
+    than risk waving a genuinely-unresolved refusal through. #2881: those two
+    uncertain cases are NOT the same situation as a confidently-resolved
+    "title unchanged", so ``uncertain=True`` and a specific ``detail`` come
+    back for the caller to surface — a die()/audit message that confidently
+    tells the operator "retarget the issue" is actively wrong when the code
+    could not even check, e.g. because the daemon-host board payload dropped
+    ``title`` again.
     """
-    if not state.work_branch or not state.issue_title:
-        return False
+    if not state.work_branch:
+        return RefusedPolicyStaleness(
+            is_stale=False,
+            uncertain=True,
+            detail=(
+                "no branch was recorded on the refused_policy row, so "
+                "whether the issue was retargeted since could not be checked"
+            ),
+        )
+    if not state.issue_title:
+        return RefusedPolicyStaleness(
+            is_stale=False,
+            uncertain=True,
+            detail=(
+                "the issue's current title did not resolve from this "
+                "drive's board payload, so whether it was retargeted since "
+                "could not be checked (#2881 — if this fires in production, "
+                "suspect the daemon-host local-DB payload again)"
+            ),
+        )
     from coord.agent import _slugify  # noqa: PLC0415
 
     expected_branch = f"issue-{state.issue}-{_slugify(state.issue_title)}"
-    return state.work_branch != expected_branch
+    if state.work_branch != expected_branch:
+        return RefusedPolicyStaleness(
+            is_stale=True, uncertain=False, detail="retargeted since the refusal",
+        )
+    return RefusedPolicyStaleness(
+        is_stale=False,
+        uncertain=False,
+        detail="the issue's title is unchanged since the refusal",
+    )
 
 
 # ── oracle-loop JIT slice authoring (#1453) ─────────────────────────────────
@@ -2104,7 +2163,8 @@ def decide(
             else None
         )
         age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
-        if _refused_policy_is_stale(state):
+        staleness = _refused_policy_staleness(state)
+        if staleness.is_stale:
             bypass_summary = (
                 f"pre-dispatch: bypassing stale refused_policy assignment "
                 f"{state.work_aid} ({age} old) on issue {state.repo}#{state.issue} "
@@ -2141,17 +2201,38 @@ def decide(
         # this exit as a transient death — the same "cannot change on retry"
         # principle #1844 already applies pre-dispatch, applied here
         # post-dispatch.
+        #
+        # #2881: `staleness.uncertain` distinguishes "checked, and the title
+        # really is unchanged" from "could not check at all" — the original
+        # #2871 message collapsed both to the same confident "retarget the
+        # issue, the next drive will see it" prose, which is actively wrong
+        # advice in the uncertain case (the operator may have ALREADY
+        # retargeted, and the driver simply couldn't tell).
+        if staleness.uncertain:
+            remedy = (
+                "Needs the coordinator: do the work directly. Retargeting "
+                "(rewriting the issue's title) SHOULD make the next `coord "
+                f"drive` dispatch fresh work automatically (#2871), but "
+                f"{staleness.detail} — so THIS run could not confirm that "
+                "either way. If a retarget was already tried and this is "
+                "still blocking, that's worth investigating on its own "
+                "(#2881) rather than assuming the retarget silently failed."
+            )
+        else:
+            remedy = (
+                "Needs the coordinator: do the work directly, OR retarget "
+                "the issue (rewrite its title so the deliverable matches "
+                "what should actually be dispatched) — the next `coord "
+                "drive` detects the retarget and dispatches fresh work "
+                f"automatically (#2871), so `coord drive-queue remove "
+                f"{state.repo} {state.issue}` + `add` then genuinely clears "
+                "this once the issue is retargeted."
+            )
         return _die(
             f"pre-dispatch refusal on assignment {state.work_aid} "
             f"(refused_policy, {age} old) — work refused on a standing "
             "repo-rule prohibition rather than doing the dispatched work; "
-            "the worker did the CORRECT thing (#2234). Needs the "
-            "coordinator: do the work directly, OR retarget the issue "
-            "(rewrite its title so the deliverable matches what should "
-            "actually be dispatched) — the next `coord drive` detects the "
-            "retarget and dispatches fresh work automatically (#2871), so "
-            f"`coord drive-queue remove {state.repo} {state.issue}` + `add` "
-            "then genuinely clears this once the issue is retargeted.\n"
+            f"the worker did the CORRECT thing (#2234). {remedy}\n"
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}\n"
             f"   {POLICY_REFUSAL_MARKER}"
