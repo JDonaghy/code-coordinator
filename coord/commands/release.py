@@ -653,9 +653,21 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
     return out
 
 
-def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
+def _ensure_roll_pending_marker(
+    target_version: str, *, reason: str, dry_run: bool = False
+) -> None:
     """#2587: make sure a roll-pending marker exists for *target_version*,
     without resetting an already-live one's clock.
+
+    #2869: ``dry_run=True`` is the ONE seam every call site must go through —
+    it never touches disk, only echoing what it *would* have written, in the
+    same "would ..." register as ``_fire_pending_roll``'s and
+    ``_apply_cordons``'s own dry-run wording. A caller-side ``if dry_run:``
+    guard around the call site was tried first and is exactly what let this
+    bug happen: the marker write is the one state mutation on the #2587
+    defer branch that never got that guard. Folding the check in here means
+    a future second call site inherits the guard for free instead of having
+    to remember to add its own.
 
     Called from the one place `coord release propagate` itself hits the
     #2112 daemon-busy deadlock it cannot roll through on its own (the
@@ -692,8 +704,22 @@ def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
     if existing is not None and existing.target_version == target_version:
         return
     if existing is not None:
+        if dry_run:
+            click.echo(
+                f"--dry-run: would replace the pending roll-pending marker "
+                f"({existing.describe()}) with v{target_version} (reason="
+                f"{reason!r}), preserving its original set_at/deferrals (#2607)"
+            )
+            return
         write_roll_pending(
             _dataclasses.replace(existing, target_version=target_version, reason=reason)
+        )
+        return
+    if dry_run:
+        click.echo(
+            f"--dry-run: would set a roll-pending marker for v{target_version} "
+            f"(reason={reason!r}) — the drive-queue tick would then hold "
+            "capacity at 0 until the queue drains"
         )
         return
     write_roll_pending(
@@ -1097,7 +1123,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # too, so a plain periodic `coord-release-propagate.timer` run also
         # arms the drive-queue tick's own inter-drive-gap trigger instead of
         # requiring an operator to separately reach for `nightly-window`.
-        _ensure_roll_pending_marker(record.target_version, reason="propagate")
+        _ensure_roll_pending_marker(record.target_version, reason="propagate", dry_run=dry_run)
         _finish(rp.STATUS_DEFERRED, 0)
 
     still_busy = busy_hosts - set(current)
