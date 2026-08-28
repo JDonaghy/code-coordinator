@@ -71,6 +71,43 @@ class UnsupportedDialectError(ValueError):
     """Raised when a connection's driver module maps to no known dialect."""
 
 
+#: What to tell a caller who hit a Postgres codepath without the extra
+#: installed -- mirrors ``coord.commands._common.SERVER_EXTRA_INSTALL_HINT``'s
+#: shape for the ``[server]`` extra.
+POSTGRES_EXTRA_INSTALL_HINT = "pip install 'code-coordinator[postgres]'"
+
+
+def _import_psycopg() -> Any:
+    """Import ``psycopg``, translating its absence into an actionable message
+    (#2886).
+
+    ``psycopg`` is an optional dependency -- the ``postgres`` extra -- never a
+    base or ``[dev]`` one (see ``pyproject.toml``'s ``[project.optional-
+    dependencies]``): every existing SQLite deployment must keep working
+    without ever pulling it in. Hitting this on an install that never asked
+    for Postgres is therefore the expected, common case, not a bug -- so
+    every Postgres call site in this module that needs the driver
+    (:func:`connect`, :func:`row_factory_for`, :func:`driver_error`) routes
+    its import through here rather than a bare ``import psycopg``, so the
+    failure names the extra to install instead of surfacing a raw
+    ``ModuleNotFoundError: No module named 'psycopg'`` traceback.
+
+    :func:`driver_errors` deliberately does NOT route through here -- it
+    degrades silently to ``(sqlite3.Error,)`` when psycopg is absent (that is
+    its whole contract), so it keeps its own bare ``import psycopg`` inside a
+    caught ``try/except ImportError`` rather than raising through this
+    helper's message just to swallow it unread.
+    """
+    try:
+        import psycopg  # noqa: PLC0415 -- optional dep, see docstring
+    except ImportError as exc:  # ModuleNotFoundError is a subclass
+        raise ModuleNotFoundError(
+            "the Postgres backend needs the `psycopg` driver, which is not "
+            f"installed. Install it with: {POSTGRES_EXTRA_INSTALL_HINT}"
+        ) from exc
+    return psycopg
+
+
 def detect_dialect(conn: Any) -> str:
     """Identify *conn*'s SQL dialect from its concrete connection type.
 
@@ -136,7 +173,7 @@ def connect(
     superseded #2766 decision note.
 
     **Postgres** (``dsn`` required): ``psycopg.connect(dsn)``. ``psycopg`` is
-    an optional dependency (see :func:`row_factory_for`) imported
+    an optional dependency (see :func:`_import_psycopg`) imported
     function-locally, so calling this with ``backend=DIALECT_POSTGRES`` before
     psycopg is installed raises ``ImportError``/``ModuleNotFoundError`` rather
     than breaking import of this module for everyone else. *read_only* has no
@@ -157,7 +194,7 @@ def connect(
     if backend == DIALECT_POSTGRES:
         if not dsn:
             raise ValueError("sql.connect(backend='postgres') requires dsn")
-        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+        psycopg = _import_psycopg()
 
         return psycopg.connect(dsn)
     raise UnsupportedDialectError(backend)
@@ -348,19 +385,20 @@ def row_factory_for(dialect: str) -> Any:
 
     ``sqlite3.Row`` is returned directly (it's a base-dependency import,
     already used throughout this tree).  ``psycopg.rows.dict_row`` is
-    imported function-locally -- ``psycopg`` is not a base or even a
-    ``server``-extra dependency yet (see ``pyproject.toml``'s ``[project]
-    dependencies`` comment on why third-party imports the base client
-    doesn't need stay function-local) -- so calling this with
-    :data:`DIALECT_POSTGRES` before a Postgres backend is actually installed
-    raises ``ImportError``/``ModuleNotFoundError`` rather than breaking
-    import of this module for everyone else.
+    imported function-locally -- ``psycopg`` is an optional dependency (the
+    ``postgres`` extra, #2886), never a base or ``[dev]`` one (see
+    ``pyproject.toml``'s ``[project.optional-dependencies]``) -- so calling
+    this with :data:`DIALECT_POSTGRES` before the extra is installed raises
+    ``ImportError``/``ModuleNotFoundError``, naming the extra to install
+    (see :func:`_import_psycopg`), rather than breaking import of this
+    module for everyone else.
     """
     if dialect == DIALECT_SQLITE:
         import sqlite3
 
         return sqlite3.Row
     if dialect == DIALECT_POSTGRES:
+        _import_psycopg()  # translate a missing psycopg into an actionable message
         from psycopg.rows import dict_row  # noqa: PLC0415 -- optional dep, see docstring
 
         return dict_row
@@ -615,7 +653,7 @@ def driver_error(conn: Any) -> type[BaseException]:
 
         return sqlite3.Error
     if dialect == DIALECT_POSTGRES:
-        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+        psycopg = _import_psycopg()
 
         return psycopg.Error
     raise UnsupportedDialectError(dialect)
@@ -637,13 +675,15 @@ def driver_errors() -> tuple[type[BaseException], ...]:
     instead of a retried write.
 
     ``sqlite3`` is a stdlib module -- always present, always included.
-    ``psycopg`` is not a declared dependency (see :func:`row_factory_for`),
-    so its absence is the normal case today, not an error: this degrades to
-    ``(sqlite3.Error,)`` rather than raising ``ImportError``, the same
-    "absence is normal" posture :func:`row_factory_for` takes for a
-    *known* dialect with no live connection to detect it from -- except
-    here there is no dialect to detect at all, so degrading silently (not
-    even function-local, deferred-import-style) is correct: a caller doing
+    ``psycopg`` is an optional dependency, not a base or ``[dev]`` one (see
+    :func:`_import_psycopg`), so its absence is the normal case today, not an
+    error: this degrades to ``(sqlite3.Error,)`` rather than raising
+    ``ImportError`` -- unlike every other Postgres call site in this module,
+    this one does NOT route through :func:`_import_psycopg` and its
+    actionable message, precisely because the message would just be
+    swallowed unread by the ``except ImportError`` below; there is no dialect
+    to detect at all here, so degrading silently (not even
+    function-local, deferred-import-style) is correct: a caller doing
     ``except sql.driver_errors():`` on a SQLite-only install must keep
     behaving exactly as ``except sqlite3.OperationalError:`` always did.
 
@@ -656,7 +696,7 @@ def driver_errors() -> tuple[type[BaseException], ...]:
 
     errors: list[type[BaseException]] = [sqlite3.Error]
     try:
-        import psycopg  # noqa: PLC0415 -- optional dep, see row_factory_for
+        import psycopg  # noqa: PLC0415 -- optional dep, absence degrades silently, see docstring
     except ImportError:
         pass
     else:
