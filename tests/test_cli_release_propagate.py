@@ -459,6 +459,42 @@ def test_a_busy_daemon_host_defers_the_whole_run(
     assert pending.reason == "propagate"
 
 
+def test_a_busy_daemon_dry_run_defers_without_writing_the_marker(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2869: `--dry-run` promises to "print the window verdict and the roll
+    plan; change nothing" — but the daemon-busy defer branch above called
+    `_ensure_roll_pending_marker` unconditionally, so a purely read-only
+    `coord release propagate --dry-run` against a busy daemon armed the
+    REAL #2587 roll-pending marker, freezing the whole drive queue (capacity
+    forced to 0) even though nothing was supposed to change. This asserts
+    the marker file stays absent and the output names what would have been
+    set instead, matching `_fire_pending_roll`'s and `_apply_cordons`'s
+    existing dry-run wording conventions."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "server", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda *a, **k: pytest.fail("a busy daemon must roll nothing, anywhere"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert dq_cmd.read_roll_pending() is None, (
+        "--dry-run must never write the real #2587 roll-pending marker"
+    )
+    assert "would set a roll-pending marker" in result.output
+    assert "0.4.111" in result.output
+
+
 def test_a_second_busy_daemon_deferral_does_not_re_arm_the_marker(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
