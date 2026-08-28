@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
 from click.testing import CliRunner
 
 from coord.cli import main
@@ -281,3 +282,35 @@ class TestInstallSkillsErrors:
         assert result.exit_code != 0
         out = output_and_stderr(result)
         assert "error" in out.lower()
+
+
+class TestBundledSkillFrontmatter:
+    """Every bundled `coord/skills/*/SKILL.md`'s YAML frontmatter must parse.
+
+    A broken frontmatter block (e.g. an unquoted `trigger:` value containing
+    a bare colon) silently breaks that skill's discoverability/invocation as
+    a `/slash-command` in the harness that parses it, without failing
+    `coord install-skills` itself — the copy/sync mechanism doesn't care
+    whether the frontmatter is valid YAML. Catch it here instead (#2866).
+    """
+
+    def _bundled_skill_md_paths(self) -> list[Path]:
+        skills_root = Path(__file__).resolve().parent.parent / "coord" / "skills"
+        paths = sorted(skills_root.glob("*/SKILL.md"))
+        assert paths, f"expected at least one bundled skill under {skills_root}"
+        return paths
+
+    def test_frontmatter_parses_as_yaml(self) -> None:
+        for skill_md in self._bundled_skill_md_paths():
+            text = skill_md.read_text(encoding="utf-8")
+            assert text.startswith("---\n"), (
+                f"{skill_md} does not start with a YAML frontmatter block"
+            )
+            end = text.find("\n---", 3)
+            assert end != -1, f"{skill_md} has an unterminated frontmatter block"
+            frontmatter = text[3:end]
+            try:
+                parsed = yaml.safe_load(frontmatter)
+            except yaml.YAMLError as exc:
+                raise AssertionError(f"{skill_md} frontmatter is not valid YAML: {exc}") from exc
+            assert isinstance(parsed, dict), f"{skill_md} frontmatter must parse to a mapping"
