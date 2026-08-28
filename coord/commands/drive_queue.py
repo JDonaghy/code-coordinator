@@ -53,6 +53,7 @@ from coord.drive_queue import (
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
+    ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS,
     ROLL_PENDING_DEFAULT_MAX_DEFERRALS,
     ROLL_PENDING_DEFAULT_TTL_SECONDS,
     STATE_BLOCKED,
@@ -66,6 +67,7 @@ from coord.drive_queue import (
     ProbeResult,
     QueueEntry,
     QueueError,
+    RollLedger,
     RollPending,
     TickPlan,
     add_preflight_notice,
@@ -1628,10 +1630,22 @@ def drive_queue_cancel_roll(output_json: bool) -> None:
     Does NOT change the target: the next `coord release propagate`/
     `nightly-window` run re-arms a marker from scratch if the fleet is still
     behind. This only stops the CURRENT wait.
+
+    #2889: also resets the roll LEDGER (`RollLedger`) — the cumulative
+    frozen-time bookkeeping a fresh marker's own arm now checks — so an
+    operator clearing a stuck marker also clears whatever run-up of
+    cumulative frozen time and fresh-arm history led to it, exactly the
+    "operator intervenes" escape hatch item 1's cumulative bound requires.
+    Reset unconditionally, even when there is no LIVE marker to cancel: a
+    ledger can be `escalated` (refusing every fresh arm) with nothing
+    currently pending — its last marker already expired and cleared on its
+    own — and that state needs the SAME override.
     """
     from coord.machine_pause import clear_cordon, cordons as read_cordons  # noqa: PLC0415
 
     pending = read_roll_pending()
+    ledger = read_roll_ledger()
+    ledger_had_history = ledger.marker_count > 0 or ledger.cumulative_frozen_seconds > 0
     cleared_cordons: list[str] = []
     if pending is not None:
         try:
@@ -1647,6 +1661,8 @@ def drive_queue_cancel_roll(output_json: bool) -> None:
             except Exception:  # noqa: BLE001 — best-effort; never block the marker clear on this
                 pass
         clear_roll_pending()
+    if ledger_had_history:
+        reset_roll_ledger()
 
     if output_json:
         click.echo(
@@ -1654,29 +1670,45 @@ def drive_queue_cancel_roll(output_json: bool) -> None:
                 {
                     "cancelled": pending.to_dict() if pending is not None else None,
                     "cleared_cordons": sorted(cleared_cordons),
+                    "ledger_reset": ledger.to_dict() if ledger_had_history else None,
                 },
                 sort_keys=True,
             )
         )
         return
 
-    if pending is None:
+    if pending is None and not ledger_had_history:
         click.echo("no roll-pending marker to cancel — the queue is not held for a roll")
         return
-    click.echo(
-        f"cancelled {pending.describe()} — the drive-queue tick resumes "
-        "launching immediately"
-    )
+    if pending is not None:
+        click.echo(
+            f"cancelled {pending.describe()} — the drive-queue tick resumes "
+            "launching immediately"
+        )
+    else:
+        click.echo(
+            "no roll-pending marker to cancel, but the roll ledger had "
+            f"{ledger.cumulative_frozen_seconds:.0f}s cumulative frozen time "
+            f"across {ledger.marker_count} marker generation(s)"
+        )
     if cleared_cordons:
         click.echo(
             "also cleared cordon(s) still open for this target: "
             + ", ".join(sorted(cleared_cordons))
         )
-    click.echo(
-        "note: this only stops the current wait — the next `coord release "
-        "propagate`/`nightly-window` run re-arms a fresh marker if the "
-        "fleet is still behind"
-    )
+    if ledger_had_history:
+        click.echo(
+            "also reset the #2889 roll ledger "
+            f"({ledger.cumulative_frozen_seconds:.0f}s cumulative frozen time / "
+            f"{ledger.marker_count} marker generation(s)) — a fresh arm is no "
+            "longer refused for having run up that history"
+        )
+    if pending is not None:
+        click.echo(
+            "note: this only stops the current wait — the next `coord release "
+            "propagate`/`nightly-window` run re-arms a fresh marker if the "
+            "fleet is still behind"
+        )
 
 
 # ── block-log (#2235 Phase 0) ────────────────────────────────────────────────
@@ -2587,6 +2619,136 @@ def clear_roll_pending() -> None:
         pass
 
 
+# ── #2889: the roll ledger — memory that survives a marker's own clear ──────
+
+_ROLL_LEDGER_FILENAME = "roll_pending_ledger.json"
+
+
+def roll_pending_ledger_path() -> Path:
+    """Absolute path to the #2889 roll ledger.
+
+    ``$COORD_ROLL_PENDING_LEDGER_STATE`` overrides it — same test-isolation
+    seam as :func:`roll_pending_path`; never let a test write the operator's
+    real ``~/.coord/roll_pending_ledger.json``.
+    """
+    import os  # noqa: PLC0415
+
+    from coord.platform_paths import default_coord_dir  # noqa: PLC0415
+
+    override = os.environ.get("COORD_ROLL_PENDING_LEDGER_STATE")
+    if override:
+        return Path(override).expanduser()
+    return default_coord_dir() / _ROLL_LEDGER_FILENAME
+
+
+def read_roll_ledger() -> RollLedger:
+    """The current ledger — never ``None``: an absent/corrupt/hand-edited
+    file reads as a fresh, empty ``RollLedger()``, the same fail-soft
+    posture :func:`read_roll_pending` takes on its own file, and for the
+    same reason — a ledger this cannot make sense of must never wedge future
+    arms forever.
+    """
+    path = roll_pending_ledger_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return RollLedger()
+    if not raw.strip():
+        return RollLedger()
+    try:
+        data = _json.loads(raw)
+    except ValueError:
+        return RollLedger()
+    if not isinstance(data, dict):
+        return RollLedger()
+    return RollLedger.from_dict(data)
+
+
+def write_roll_ledger(ledger: RollLedger) -> None:
+    """Persist *ledger*, overwriting whatever was there before. Same atomic
+    tempfile-then-rename pattern as :func:`write_roll_pending`."""
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    path = roll_pending_ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _json.dumps(ledger.to_dict(), sort_keys=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".roll-ledger.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def reset_roll_ledger() -> None:
+    """Drop the ledger — a CONFIRMED roll or explicit operator intervention
+    (`coord drive-queue cancel-roll`) both mean "clean slate": whatever ran
+    up the cumulative bound is over. A no-op when there was nothing to
+    reset."""
+    path = roll_pending_ledger_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+#: #2889's own escalation key — deliberately distinct from
+#: `ROLL_PENDING_ALERT_STAGE` (a single expired marker) so the two can
+#: coexist as separate rows: a marker expiring is routine (bounded by design,
+#: #2587's whole point); the LEDGER crossing its cumulative bound is the
+#: escalation that means "this has now failed to roll unattended several
+#: times in a row — an operator needs to look, not just wait for the next
+#: gap."
+ROLL_LEDGER_ALERT_REPO = "(roll-pending)"
+ROLL_LEDGER_ALERT_ISSUE = 0
+ROLL_LEDGER_ALERT_STAGE = "roll-ledger-escalated"
+
+
+def _escalate_roll_ledger(ledger: RollLedger, *, now: float) -> None:
+    """Surface a ledger that just crossed its cumulative bound (#2889 item
+    1's "escalate loudly") — mirrors `_escalate_roll_pending_expired` one
+    level up: that one is routine (a single marker hit ITS OWN bound, exactly
+    as designed); this one means the SAME target has now failed to roll
+    unattended across `ledger.marker_count` separate marker generations, and
+    arming a fresh one is refused until `coord drive-queue cancel-roll`
+    clears this ledger.
+    """
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    reason = (
+        f"roll-pending ledger escalated: {ledger.cumulative_frozen_seconds:.0f}s "
+        f"cumulative frozen time across {ledger.marker_count} marker "
+        "generation(s), none of them confirming a roll — refusing to arm a "
+        "fresh marker until `coord drive-queue cancel-roll` clears this "
+        "ledger (#2889: a per-marker TTL bounds one marker; this bounds the "
+        "RATE of fresh ones that follow)"
+    )
+    click.echo(f"warning: {reason}", err=True)
+    try:
+        record_drive_escalation(
+            ROLL_LEDGER_ALERT_REPO,
+            ROLL_LEDGER_ALERT_ISSUE,
+            stage=ROLL_LEDGER_ALERT_STAGE,
+            reason=reason,
+            gate_readings=(
+                f"cumulative_frozen_seconds={ledger.cumulative_frozen_seconds:.0f} | "
+                f"bound={ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS:.0f} | "
+                f"marker_count={ledger.marker_count}"
+            ),
+            proposed_command="coord drive-queue cancel-roll",
+        )
+    except Exception as exc:  # noqa: BLE001 — the stderr line above is the
+        # floor; an escalation table that cannot be written must not take
+        # the message down with it.
+        click.echo(f"  (could not record the roll-ledger escalation: {exc})", err=True)
+
+
 def _roll_pending_may_fire(*, occupied: int, now: float, queue_rows) -> tuple[bool, str]:
     """Is it worth attempting to fire a pending roll THIS tick? (#2870 part 2)
 
@@ -2664,12 +2826,25 @@ def _fire_pending_roll(*, dry_run: bool = False) -> tuple[bool, str]:
     Returns ``(fired, detail)``, never raises — a `systemctl` this host
     cannot run (no systemd, PATH issue, unit not installed) must be a
     deferral the marker survives to retry next tick, not a crashed tick.
+
+    #2889 item 4: ``--setenv=COORD_ROLL_INVOKER=drive-queue-tick`` tags THIS
+    specific start with a caller identity `coord release nightly-window`
+    (the spawned unit's `ExecStart=`) reads back and journals as
+    `WindowRecord.invoked_by` — overriding the unit file's own static
+    `Environment=` default for just this one invocation (systemd layers a
+    transient `--setenv=` on top of a unit's static `Environment=`), so
+    "what invoked this run" is answerable from `coord release
+    window-history` instead of requiring a live reproduction.
     """
     if dry_run:
         return True, "--dry-run: would run `systemctl --user start --no-block coord-release-window.service`"
     try:
         proc = subprocess.run(  # noqa: S603, S607 — fixed argv, no shell
-            ["systemctl", "--user", "start", "--no-block", "coord-release-window.service"],
+            [
+                "systemctl", "--user", "start", "--no-block",
+                "--setenv=COORD_ROLL_INVOKER=drive-queue-tick",
+                "coord-release-window.service",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -4483,10 +4658,22 @@ def drive_queue_tick(
         # is dropped right here, loudly (`_escalate_roll_pending_expired`),
         # and this tick proceeds exactly as if no marker had ever been set —
         # the #2587 "never hold the queue down indefinitely" requirement.
+        # #2889: before it is dropped, its lived duration is folded into the
+        # roll LEDGER (`RollLedger`, `roll_pending_ledger.json`) — memory
+        # that survives THIS clear, unlike the marker itself, so a fresh arm
+        # right after this one cannot dodge the cumulative bound the way a
+        # brand new `RollPending` dodges a single marker's own TTL. Crossing
+        # that bound is its own, separate, louder escalation.
         now = time.time()
         roll_pending = read_roll_pending()
         if roll_pending is not None and roll_pending.expired(now):
             _escalate_roll_pending_expired(roll_pending, now=now)
+            ledger = read_roll_ledger()
+            was_escalated = ledger.escalated
+            ledger = ledger.record_expiry(roll_pending, now=now)
+            write_roll_ledger(ledger)
+            if ledger.escalated and not was_escalated:
+                _escalate_roll_ledger(ledger, now=now)
             clear_roll_pending()
             roll_pending = None
         if roll_pending is not None:

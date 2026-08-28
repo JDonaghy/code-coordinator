@@ -282,6 +282,55 @@ def test_a_needed_roll_with_no_marker_pending_sets_one_and_returns_immediately(
     assert record["queue_restarted"] is None
 
 
+def test_a_provably_busy_queue_declines_the_fresh_arm_outright(
+    valid_config_path, state_dir, escalations, monkeypatch,
+):
+    """#2889 item 2 — this command's OWN fresh-arm site (distinct from
+    `coord release propagate`'s, which routes through
+    `_ensure_roll_pending_marker`): a genuine `drive_queue` row provably
+    occupying the daemon host declines the arm outright — a marker cannot
+    roll any faster than the tick's own reconciliation already will, so
+    freezing capacity for one now would only spend TTL learning that for
+    free. Routine (OK-tier, no escalation): the queue keeps launching
+    normally, and a LATER run of this same nightly timer re-checks."""
+    from coord.drive_queue import STATE_RUNNING
+
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    systemctl_calls = _stub_systemctl(monkeypatch)
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: (
+            {
+                "drive_queue": [
+                    {"repo_name": "api", "issue_number": 7,
+                     "state": STATE_RUNNING, "launch_host": "server"},
+                ],
+                "assignments": [], "issues": [],
+            },
+            None,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert systemctl_calls == []
+    assert prop_calls == []
+    assert dq_cmd.read_roll_pending() is None, (
+        "a provably busy queue must decline the fresh arm outright — no "
+        "marker, no capacity-0 freeze"
+    )
+    assert not escalations  # routine, not an escalation
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ARM_DEFERRED
+    assert record["status"] in rw.OK_STATUSES
+
+
 def test_a_staged_but_unrestarted_agent_reads_as_behind_not_up_to_date(
     valid_config_path, state_dir, no_network, escalations, monkeypatch
 ):

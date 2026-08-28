@@ -653,12 +653,95 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
     return out
 
 
+def _queue_provably_busy(quiescence, daemon_name: str | None) -> bool:
+    """#2889 item 2: does *quiescence* name a genuine `drive_queue` row (not
+    some OTHER busy reason — an interactive session, a paused machine, an
+    in-flight confirmation) actively occupying *daemon_name* right now?
+
+    Deliberately narrower than "the daemon is busy" (`daemon_name in
+    busy_hosts`, this module's existing arm TRIGGER — see
+    `_ensure_roll_pending_marker`'s call site): a genuine drive-queue entry
+    is the one busy reason a freshly-armed marker cannot do anything about
+    faster than `coord drive-queue tick`'s own reconciliation already will
+    on its normal ~3-minute cadence — arming one anyway just spends up to a
+    full TTL (#2587's own hour-long bound) learning that for free, exactly
+    the "10 fresh arms, 49 ticks refused to launch" pathology #2889 reports.
+    A busy signal of any OTHER kind (`Quiescence.busy`'s `kind` field —
+    `coord.release_propagate.assess_quiescence`'s own vocabulary:
+    "confirmation/notify drain running", "live RUNNING assignment", a paused
+    machine) is exactly the case a marker's capacity-0 freeze DOES help:
+    nothing NEW should launch onto the daemon host while it clears, and
+    nothing here can predict when it will on its own.
+
+    Unattributable signals (``b.host is None`` — `Quiescence.fleet_wide_busy`)
+    are included: an unreadable board or an unattributed drive-queue row
+    means "busy somewhere unknown", which must be read as busy everywhere,
+    the same rule `Quiescence.rollable_hosts` already applies.
+    """
+    return any(
+        b.kind == "drive-queue entry running" and (b.host is None or b.host == daemon_name)
+        for b in quiescence.busy
+    )
+
+
+def _fresh_arm_refusal_reason(ledger, *, now: float, queue_provably_busy: bool) -> str:
+    """Empty string when a FRESH `RollPending` arm (no existing marker at
+    all) may proceed; otherwise the reason it must not, in priority order —
+    escalated ledger, then the rate limit, then a provably busy queue.
+
+    Shared by `_ensure_roll_pending_marker` and `release_nightly_window`'s
+    own arm site (#2587 section 3) so the three #2889 checks can never drift
+    between the two places a fresh marker gets armed — #2096's "two
+    surfaces, one function" rule, one level up from `_drain`'s own reuse of
+    `release_propagate.assess_quiescence` for the identical reason.
+
+    Pure — takes a `coord.drive_queue.RollLedger` and the caller's own
+    already-computed *queue_provably_busy* rather than reading a clock or a
+    board itself, so it stays trivially testable and every call site decides
+    for itself how loud to be about the result (only the ESCALATED reason is
+    meant to also trigger a recorded escalation — see both callers).
+    """
+    if ledger.escalated:
+        return (
+            f"the #2889 roll ledger has escalated "
+            f"({ledger.cumulative_frozen_seconds:.0f}s cumulative frozen time across "
+            f"{ledger.marker_count} marker generation(s)) — run `coord drive-queue "
+            "cancel-roll` to clear it before arming again"
+        )
+    wait = ledger.seconds_until_next_arm(now)
+    if wait > 0:
+        return (
+            f"under the #2889 rate limit ({wait:.0f}s remaining since the last "
+            "fresh arm)"
+        )
+    if queue_provably_busy:
+        return (
+            "a genuine drive-queue entry is actively occupying the daemon host "
+            "right now (#2889 item 2) — a fresh marker cannot roll any faster "
+            "than the tick's own reconciliation already will"
+        )
+    return ""
+
+
 def _ensure_roll_pending_marker(
     target_version: str, *, reason: str, min_releases_behind: int | None = None,
-    dry_run: bool = False,
-) -> None:
+    dry_run: bool = False, queue_provably_busy: bool = False,
+) -> bool:
     """#2587: make sure a roll-pending marker exists for *target_version*,
     without resetting an already-live one's clock.
+
+    #2889: returns whether a marker is live as a result of this call
+    (existing/updated/freshly armed) — ``False`` only for a REFUSED fresh
+    arm (see the three checks below). Every existing call site predates this
+    return value and simply ignores it — a refused arm is already, on its
+    own, an ordinary deferral from the caller's point of view, exactly like
+    a still-busy fleet. *queue_provably_busy* (see
+    :func:`_queue_provably_busy`) only ever affects a FRESH arm (no existing
+    marker at all): a re-arm of an already-live marker (same OR different
+    target) is a continuation of a campaign already in progress and proceeds
+    regardless — refusing THAT would just reintroduce #2607's own bug by a
+    different door, since a marker that cannot be kept current would then
+    fire against a target it no longer names.
 
     #2870: *min_releases_behind* is the effective `propagation.
     min_releases_behind`/`--min-behind` threshold THIS run resolved and
@@ -710,12 +793,17 @@ def _ensure_roll_pending_marker(
     import dataclasses as _dataclasses  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
-    from coord.commands.drive_queue import read_roll_pending, write_roll_pending  # noqa: PLC0415
+    from coord.commands.drive_queue import (  # noqa: PLC0415
+        _escalate_roll_ledger,
+        read_roll_ledger,
+        read_roll_pending,
+        write_roll_pending,
+    )
     from coord.drive_queue import RollPending  # noqa: PLC0415
 
     existing = read_roll_pending()
     if existing is not None and existing.target_version == target_version:
-        return
+        return True
     if existing is not None:
         if dry_run:
             click.echo(
@@ -723,27 +811,56 @@ def _ensure_roll_pending_marker(
                 f"({existing.describe()}) with v{target_version} (reason="
                 f"{reason!r}), preserving its original set_at/deferrals (#2607)"
             )
-            return
+            return True
         write_roll_pending(
             _dataclasses.replace(
                 existing, target_version=target_version, reason=reason,
                 min_releases_behind=min_releases_behind,
             )
         )
-        return
+        return True
+
+    # #2889: a genuinely FRESH arm — no existing marker at all — is the one
+    # case the RATE of markers can run away (#2889's own report: ten fresh
+    # arms in ~15 hours, each one individually well-behaved).
+    now = _time.time()
+    ledger = read_roll_ledger()
+    refusal = _fresh_arm_refusal_reason(
+        ledger, now=now, queue_provably_busy=queue_provably_busy,
+    )
+    if refusal:
+        message = f"declining to arm a roll-pending marker for v{target_version} — {refusal}"
+        if dry_run:
+            click.echo(f"--dry-run: would refuse to arm — {refusal}")
+            return False
+        click.echo(message, err=True)
+        if ledger.escalated:
+            # Re-recorded on every refused attempt, same "quiet re-record
+            # keeps the escalation fresh" posture the #2572 self-cordon
+            # escalation already documents — cheap (an upsert) and means an
+            # operator checking `coord drive-queue status` mid-day sees this
+            # is still live, not a one-time blip from hours ago.
+            _escalate_roll_ledger(ledger, now=now)
+        return False
+
     if dry_run:
         click.echo(
             f"--dry-run: would set a roll-pending marker for v{target_version} "
             f"(reason={reason!r}) — the drive-queue tick would then hold "
             "capacity at 0 until the queue drains"
         )
-        return
+        return True
     write_roll_pending(
         RollPending(
-            target_version=target_version, set_at=_time.time(), reason=reason,
+            target_version=target_version, set_at=now, reason=reason,
             min_releases_behind=min_releases_behind,
         )
     )
+    # Nothing to write to the ledger here — only an EXPIRY moves its
+    # rate-limit clock (`RollLedger.record_expiry`), never an arm. See that
+    # method's own docstring for why measuring from the arm, not the clear,
+    # would let the exact re-arm-right-after-TTL-expiry case through.
+    return True
 
 
 @release_group.command(
@@ -1146,9 +1263,15 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # (resolved above, 3a) onto the marker, so whatever discharges it is
         # gated at the threshold that armed it, not a threshold re-resolved
         # from scratch later.
+        # #2889 item 2: `quiescence` was already computed above (3) — reuse
+        # it rather than re-fetching the board, to tell a genuine
+        # drive-queue occupancy apart from the OTHER busy reasons that put
+        # the daemon in `busy_hosts` (see `_queue_provably_busy`'s
+        # docstring). Only affects a genuinely FRESH arm.
         _ensure_roll_pending_marker(
             record.target_version, reason="propagate",
             min_releases_behind=effective_min_behind, dry_run=dry_run,
+            queue_provably_busy=_queue_provably_busy(quiescence, daemon_name),
         )
         _finish(rp.STATUS_DEFERRED, 0)
 
@@ -3088,7 +3211,9 @@ def release_nightly_window(
     from coord.commands._common import _load_config  # noqa: PLC0415
     from coord.commands.drive_queue import (  # noqa: PLC0415
         clear_roll_pending,
+        read_roll_ledger,
         read_roll_pending,
+        reset_roll_ledger,
         write_roll_pending,
     )
     from coord.drive_queue import RollPending  # noqa: PLC0415
@@ -3100,8 +3225,20 @@ def release_nightly_window(
 
     config = _load_config(config_path)
     state_dir = _state_dir()
+    # #2889 item 4: "what invoked this?" straight from the journal —
+    # `$COORD_ROLL_INVOKER` is set on the process environment by whichever
+    # trigger started `coord-release-window.service`: the unit's own static
+    # `Environment=` default (its timer, or a human running `systemctl
+    # --user start` by hand — systemd cannot tell those two apart, see the
+    # unit's own "INVOKER" section) or `_fire_pending_roll`'s explicit
+    # `--setenv=` override when the drive-queue tick is the one firing it.
+    # Empty for a bare CLI invocation outside the unit (a test, an
+    # operator's own shell) — nothing set the env var at all.
+    import os as _os  # noqa: PLC0415
+
     record = rw.WindowRecord(
-        started_at=time.time(), dry_run=dry_run, queue_timer=queue_timer
+        started_at=time.time(), dry_run=dry_run, queue_timer=queue_timer,
+        invoked_by=_os.environ.get("COORD_ROLL_INVOKER", ""),
     )
 
     def _finish(status: str, exit_code: int = 0) -> None:
@@ -3185,6 +3322,11 @@ def release_nightly_window(
     if not rw.needs_roll(record.daemon_version, record.target_version):
         if read_roll_pending() is not None:
             clear_roll_pending()
+            # #2889: the goal is reached without needing the marker at all —
+            # a clean slate, same as a CONFIRMED roll below. Whatever
+            # cumulative frozen time/fresh-arm history the ledger carried is
+            # over; a FUTURE delta starts counting fresh.
+            reset_roll_ledger()
         _finish(rw.STATUS_UP_TO_DATE, 0)
 
     # ── 2b. #2583 min-releases-behind gate ────────────────────────────────
@@ -3296,6 +3438,11 @@ def release_nightly_window(
             rp.STATUS_VERIFIED, rp.STATUS_UP_TO_DATE, rp.STATUS_ROLLED,
         ):
             clear_roll_pending()
+            # #2889: a CONFIRMED roll (or a race that found it already
+            # current) is the clean-slate outcome — reset the ledger so a
+            # FUTURE delta starts counting fresh rather than inheriting
+            # whatever run-up this campaign accumulated on its way here.
+            reset_roll_ledger()
             status = (
                 rw.STATUS_UP_TO_DATE if prop_status == rp.STATUS_UP_TO_DATE
                 else rw.STATUS_ROLLED
@@ -3381,14 +3528,56 @@ def release_nightly_window(
             )
         )
     else:
+        # #2889: a genuinely FRESH arm — no existing marker for this
+        # campaign at all — is the one case the RATE of markers can run
+        # away. Same three checks `_ensure_roll_pending_marker` applies to
+        # `coord release propagate`'s own arm site (#2096: one function, not
+        # two definitions that could drift) — `_queue_provably_busy` needs
+        # its own board read here since this command does not otherwise
+        # compute a `Quiescence` (unlike `release_propagate`, which already
+        # has one to reuse).
+        arm_now = time.time()
+        ledger = read_roll_ledger()
+        board, board_error = _fetch_board()
+        if board_error:
+            # Cannot prove the queue non-empty either way — the #2889 item 2
+            # check contributes nothing this run; the ledger's own
+            # escalation/rate-limit checks still apply regardless.
+            queue_provably_busy = False
+        else:
+            quiescence = rp.assess_quiescence(
+                queue_entries=board.get("drive_queue") or [],
+                assignments=board.get("assignments") or [],
+                issues=board.get("issues") or [],
+                now=arm_now,
+            )
+            queue_provably_busy = _queue_provably_busy(quiescence, daemon_name)
+        refusal = _fresh_arm_refusal_reason(
+            ledger, now=arm_now, queue_provably_busy=queue_provably_busy,
+        )
+        if refusal:
+            record.error = (
+                f"declined to arm a roll-pending marker for v{record.target_version} "
+                f"— {refusal}"
+            )
+            click.echo(f"note: {record.error}")
+            if ledger.escalated:
+                from coord.commands.drive_queue import _escalate_roll_ledger  # noqa: PLC0415
+
+                _escalate_roll_ledger(ledger, now=arm_now)
+                _escalate_window(record, reason=record.error)
+                _finish(rw.STATUS_LEDGER_ESCALATED, 1)
+            _finish(rw.STATUS_ARM_DEFERRED, 0)
         write_roll_pending(
             RollPending(
                 target_version=record.target_version,
-                set_at=time.time(),
+                set_at=arm_now,
                 reason="nightly-window",
                 min_releases_behind=effective_min_behind,
             )
         )
+        # Nothing to write to the ledger here — only an EXPIRY moves its
+        # rate-limit clock (`RollLedger.record_expiry`), never an arm.
     click.echo(
         f"roll pending: v{record.target_version} — the drive-queue tick will "
         f"fire `coord release propagate` at the next inter-drive gap "

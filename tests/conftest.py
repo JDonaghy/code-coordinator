@@ -765,6 +765,26 @@ def _no_real_roll_pending_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_roll_pending_ledger_store(monkeypatch, tmp_path):
+    """#2889: never let a test write the OPERATOR'S real
+    ``~/.coord/roll_pending_ledger.json``.
+
+    Same hazard as ``_no_real_roll_pending_store`` immediately above, one
+    file over — this one is what a fresh `RollPending` arm checks BEFORE
+    writing (`coord.commands.release._ensure_roll_pending_marker`/
+    `release_nightly_window`'s own arm site), so a leaked test write would
+    either fabricate a real cumulative-frozen-time/rate-limit history out of
+    nothing (spuriously refusing a real fleet's next arm) or mask one
+    (silently clearing an operator's real escalated ledger).
+    ``coord.commands.drive_queue.roll_pending_ledger_path`` reads
+    ``$COORD_ROLL_PENDING_LEDGER_STATE`` first for exactly this redirect.
+    """
+    monkeypatch.setenv(
+        "COORD_ROLL_PENDING_LEDGER_STATE", str(tmp_path / "roll-pending-ledger-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_self_cordon_state(monkeypatch, tmp_path):
     """#2572: never let a test write the OPERATOR'S real
     ``~/.coord/self_cordon_escalation.json``.
