@@ -337,6 +337,39 @@ def test_patch_issue_with_no_mutations_is_a_200_noop(cli, rw_db, gh_calls):
     assert _issue_row(rw_db, REST_ISSUE) == before
 
 
+def test_patch_issue_labels_replace_on_unseeded_row_matches_the_rpc_route(
+    cli, rw_db, gh_calls
+):
+    """``/issue-labels`` reports ``updated: False`` when the cache-replace UPDATE
+    touches no row (the issue isn't cached yet — #2846 self-heals on the next
+    sync). The PATCH must surface the same "nothing happened" signal instead of
+    claiming success just because the call didn't raise."""
+    rpc_resp = cli.post(
+        "/issue-labels",
+        json={"repo_name": "api", "issue_number": RPC_ISSUE, "labels": ["ready"]},
+    )
+    assert rpc_resp.status_code == 200, rpc_resp.text
+    assert rpc_resp.json() == {"updated": False}
+
+    rest_resp = cli.patch(f"/issue/api/{REST_ISSUE}", json={"labels": ["ready"]})
+    assert rest_resp.status_code == 200, rest_resp.text
+    assert rest_resp.json() == {
+        "updated": False,
+        "applied": [],
+        "labels": None,
+        "labels_changed": None,
+    }
+    assert gh_calls == []
+    # No row was inserted by either route — the mutation is a true no-op.
+    assert (
+        rw_db.execute(
+            "SELECT COUNT(*) FROM issues WHERE repo_name='api' AND number IN (?, ?)",
+            (RPC_ISSUE, REST_ISSUE),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 # ── PATCH /issue: refusals ───────────────────────────────────────────────────
 
 

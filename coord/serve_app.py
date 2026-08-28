@@ -7615,9 +7615,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 )
                 applied.append("content")
             if body.get("labels") is not None:
-                state._update_issue_labels_local(repo_name, number, body["labels"])
-                labels_out = list(body["labels"])
-                applied.append("labels")
+                labels_updated = state._update_issue_labels_local(
+                    repo_name, number, body["labels"]
+                )
+                if labels_updated:
+                    labels_out = sorted(set(body["labels"]))
+                    applied.append("labels")
             elif body.get("add_labels") or body.get("remove_labels"):
                 labels_out, labels_changed = state._apply_issue_labels_local(
                     repo_name,
