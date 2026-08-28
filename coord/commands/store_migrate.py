@@ -11,6 +11,7 @@ from pathlib import Path
 import click
 
 from coord import db as coord_db
+from coord import sql
 from coord.store_migrate import ImportAborted, run_import
 
 
@@ -59,7 +60,13 @@ def migrate_to_postgres(
         dsn = target.dsn
 
     click.echo(f"Source: {source_path}")
-    click.echo(f"Target DSN: {dsn if dsn else '(dry-run -- target is never opened)'}")
+    # Never echo the raw DSN -- it routinely embeds a password
+    # (`store.dsn`'s plain-string shape, coord/config.py), and this command's
+    # stdout is exactly the kind of text that can end up in a log or a
+    # GitHub comment (coord.db._migrate_if_needed's docstring states the
+    # policy this follows). sql.redact_dsn() prints host/dbname only.
+    target_line = sql.redact_dsn(dsn) if dsn else "(dry-run -- target is never opened)"
+    click.echo(f"Target: {target_line}")
 
     try:
         report = run_import(sqlite_path=source_path, dsn=dsn or "", force=force, dry_run=dry_run)
