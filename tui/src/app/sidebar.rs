@@ -495,8 +495,18 @@ impl CoordApp {
                     && self.board_selection_in_completed_group()
                 {
                     let secs = self.purge_days as f64 * 86_400.0;
-                    let counts = count_purgeable_db(secs).unwrap_or((0, 0));
-                    self.pending_purge = Some(counts);
+                    // #2895: the count comes from the daemon now, so it can
+                    // fail (daemon down / no board service). Surface that
+                    // instead of opening a "Purge 0 rows?" prompt that would
+                    // silently do nothing.
+                    match count_purgeable_remote(secs) {
+                        Ok(counts) => self.pending_purge = Some(counts),
+                        Err(e) => self.push_toast(
+                            "Purge unavailable",
+                            &e,
+                            ToastSeverity::Error,
+                        ),
+                    }
                 } else {
                     self.push_toast(
                         "Purge only runs on the Completed group",

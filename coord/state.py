@@ -5315,6 +5315,65 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     _upsert_open_issues_local(repo_name, issues)
 
 
+def upsert_issue(repo_name: str, issue: dict) -> None:
+    """Upsert ONE issue row — routes to the daemon when ``board_service`` is set.
+
+    #2895: the single-row sibling of :func:`upsert_open_issues`.  The TUI
+    fetches one issue at a time (``gh issue view``) when the operator opens an
+    issue that isn't in the cache yet, and used to write it into ``coord.db``
+    through its own rusqlite connection.  It now POSTs here instead, so the
+    row lands in whichever engine the daemon owns.
+
+    Unlike :func:`upsert_open_issues` this does **not** mark the repo's other
+    issues closed — it is a targeted refresh of one row, not a sync.
+    ``issue`` needs ``number``; ``title``/``body``/``state``/``labels``/
+    ``milestone_number``/``milestone_title`` are optional.  ``labels`` accepts
+    either GitHub's ``[{"name": ...}]`` shape or a plain list of strings (what
+    the TUI sends).
+    """
+    svc = _board_service()
+    resp = _route_write(svc, "/issue-upsert", {"repo_name": repo_name, "issue": issue})
+    if resp is not None:
+        return
+    _upsert_issue_local(repo_name, issue)
+
+
+def _upsert_issue_local(repo_name: str, issue: dict) -> None:
+    """Backend adapter for :func:`upsert_issue` — writes the local DB."""
+    raw_labels = issue.get("labels") or []
+    labels = json.dumps(
+        [lbl["name"] if isinstance(lbl, dict) else str(lbl) for lbl in raw_labels]
+    )
+    conn = get_connection()
+    sql.execute(conn,
+        """
+        INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at,
+                            milestone_number, milestone_title)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (repo_name, number) DO UPDATE SET
+            title            = excluded.title,
+            body             = excluded.body,
+            state            = excluded.state,
+            labels           = excluded.labels,
+            synced_at        = excluded.synced_at,
+            milestone_number = excluded.milestone_number,
+            milestone_title  = excluded.milestone_title
+        """,
+        (
+            repo_name,
+            int(issue["number"]),
+            issue.get("title", "") or "",
+            issue.get("body", "") or "",
+            (issue.get("state") or "open").lower(),
+            labels,
+            time.time(),
+            issue.get("milestone_number"),
+            issue.get("milestone_title"),
+        ),
+    )
+    conn.commit()
+
+
 def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
     """Persist open issues for a repo into the local issues table.
 
@@ -6769,24 +6828,74 @@ def issue_context_block(repo_name: str, issue_number: int) -> str:
 
 # ── Purge ──────────────────────────────────────────────────────────────────────
 
-def purge_done_assignments(older_than_days: float = 7.0) -> int:
-    """Delete old done/failed assignments and closed issues from the database.
+def count_purgeable(older_than_secs: float) -> tuple[int, int]:
+    """``(assignments, closed_issues)`` :func:`purge_done_assignments_split` would delete.
+
+    Routes to the daemon's ``POST /purge`` (``dry_run=True``) when
+    ``board_service`` is set, else counts against the local DB.  #2895: the
+    TUI's purge confirmation prompt reads this over HTTP — it no longer opens
+    ``coord.db`` itself — so the number it shows and the number it deletes
+    come from the same engine.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/purge", {"older_than_secs": older_than_secs, "dry_run": True}
+    )
+    if resp is not None:
+        return int(resp.get("assignments", 0)), int(resp.get("issues", 0))
+    return _count_purgeable_local(older_than_secs)
+
+
+def _count_purgeable_local(older_than_secs: float) -> tuple[int, int]:
+    """Backend adapter for :func:`count_purgeable` — counts, deletes nothing."""
+    cutoff = time.time() - older_than_secs
+    conn = get_connection()
+    assignments = sql.execute(conn,
+        "SELECT COUNT(*) FROM assignments "
+        "WHERE status IN ('done', 'failed') "
+        "AND finished_at IS NOT NULL "
+        "AND finished_at < ?",
+        (cutoff,),
+    ).fetchone()[0]
+    issues = sql.execute(conn,
+        "SELECT COUNT(*) FROM issues "
+        "WHERE state = 'closed' "
+        "AND synced_at IS NOT NULL "
+        "AND synced_at < ?",
+        (cutoff,),
+    ).fetchone()[0]
+    return int(assignments), int(issues)
+
+
+def purge_done_assignments_split(older_than_secs: float) -> tuple[int, int]:
+    """Delete old done/failed assignments + closed issues; return per-table counts.
+
+    Routes to the daemon's ``POST /purge`` when ``board_service`` is set, else
+    deletes from the local DB.  The per-table split (rather than
+    :func:`purge_done_assignments`'s single total) is what the TUI's purge
+    toast reports, so it matches the confirmation prompt fed by
+    :func:`count_purgeable`.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/purge", {"older_than_secs": older_than_secs, "dry_run": False}
+    )
+    if resp is not None:
+        return int(resp.get("assignments", 0)), int(resp.get("issues", 0))
+    return _purge_done_assignments_local(older_than_secs)
+
+
+def _purge_done_assignments_local(older_than_secs: float) -> tuple[int, int]:
+    """Backend adapter for :func:`purge_done_assignments_split`.
 
     Removes from two tables:
 
     * ``assignments`` — rows where ``status IN ('done', 'failed')`` and
-      ``finished_at < now - older_than_days * 86400``.
+      ``finished_at < now - older_than_secs``.
     * ``issues`` — rows where ``state = 'closed'`` and
-      ``synced_at < now - older_than_days * 86400``.
-
-    Returns the total number of rows deleted across both tables.
-
-    This is the Python-side equivalent of the TUI's 'P' purge action, which
-    performs the same DELETE directly via a short-lived Rust rusqlite
-    connection.  Exposed here so a future ``coord purge`` CLI command or
-    maintenance hook can call it without duplicating the SQL.
+      ``synced_at < now - older_than_secs``.
     """
-    cutoff = time.time() - older_than_days * 86_400
+    cutoff = time.time() - older_than_secs
     conn = get_connection()
     deleted_assignments = sql.execute(conn,
         "DELETE FROM assignments "
@@ -6809,4 +6918,16 @@ def purge_done_assignments(older_than_days: float = 7.0) -> int:
         "(SELECT repo_name, number FROM issues WHERE state = 'open')"
     )
     conn.commit()
-    return deleted_assignments + deleted_issues
+    return int(deleted_assignments), int(deleted_issues)
+
+
+def purge_done_assignments(older_than_days: float = 7.0) -> int:
+    """Total rows deleted by a purge older than *older_than_days* days.
+
+    Thin day-denominated wrapper over :func:`purge_done_assignments_split`
+    (which is seconds-denominated because that is the unit the TUI's Settings
+    retention field uses).  Kept so a future ``coord purge`` CLI command or
+    maintenance hook has the simple "how many rows went away" shape.
+    """
+    assignments, issues = purge_done_assignments_split(older_than_days * 86_400)
+    return assignments + issues

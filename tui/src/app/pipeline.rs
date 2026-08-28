@@ -7754,7 +7754,7 @@ impl CoordApp {
             );
             return false;
         };
-        match record_test_verdict_db(&work_id, verdict, reason) {
+        match record_test_verdict_remote(&work_id, verdict, reason) {
             Ok(()) => {
                 let verb = match verdict {
                     "passed" => "PASSED",

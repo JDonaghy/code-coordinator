@@ -37,7 +37,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
 
 use quadraui::compose::app_shell::{AppShellEvent, AppShellLayout, PanelDefinition};
 use quadraui::compose::form_controller::{FormController, FormControllerEvent};
@@ -5648,13 +5647,24 @@ impl CoordApp {
                 // from coordinator.yml and never legitimately drop to zero on a
                 // configured board, making the all-three-empty check a reliable
                 // proxy for the default sentinel.)
+                //
+                // #2895: `data.load_error` is the one empty tick that is NOT
+                // degraded — it means "there is no board service to retry
+                // into", a permanent config fault with a named remedy. Such a
+                // tick must be applied so `status_bar` can pin the message;
+                // treating it as degraded would instead show the transient
+                // "refresh failed" warning on a loop, forever. Conversely a
+                // board whose only content IS that error counts as `have_data`
+                // — otherwise the very next empty tick would silently clear
+                // the message and leave a blank board with no explanation.
                 let incoming_empty = data.machines.is_empty()
                     && data.open_issues.is_empty()
                     && data.assignments.is_empty();
                 let have_data = !self.data.machines.is_empty()
                     || !self.data.open_issues.is_empty()
-                    || !self.data.assignments.is_empty();
-                if incoming_empty && have_data {
+                    || !self.data.assignments.is_empty()
+                    || self.data.load_error.is_some();
+                if incoming_empty && have_data && data.load_error.is_none() {
                     // Consume the receiver but do NOT replace self.data; leave
                     // refreshed_at alone so the "Xs ago" indicator keeps aging
                     // (honest: this tick didn't land).  The next healthy tick
@@ -9255,6 +9265,22 @@ impl CoordApp {
                 action_id: None,
             },
         ];
+        // #2895: a hard board-load fault (today: no board service configured
+        // anywhere — see `NO_BOARD_SERVICE_ERROR`). Pushed FIRST, ahead of
+        // every advisory badge, because the board behind it is empty and
+        // every other segment is describing that emptiness rather than
+        // explaining it. Unlike `fetch_error` further down it does NOT
+        // self-clear after 10s: nothing the running process does will fix it,
+        // so it stays until the operator does.
+        if let Some(msg) = &self.data.load_error {
+            left.push(StatusBarSegment {
+                text: format!(" ⚠ {} ", msg),
+                fg: Color::rgb(255, 235, 235),
+                bg: Color::rgb(140, 25, 25),
+                bold: true,
+                action_id: None,
+            });
+        }
         // #1631 (H-4): the always-visible fleet-health indicator — present
         // in every view's status bar regardless of severity ("OK states its
         // OK-ness rather than printing nothing"), colour-coded by

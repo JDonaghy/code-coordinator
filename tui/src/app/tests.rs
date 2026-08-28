@@ -16075,14 +16075,13 @@
     }
 
     #[test]
-    fn pipeline_loader_defaults_when_no_meta() {
-        // Sanity: load_pipeline_meta returns documented defaults when the
-        // DB is missing the keys (or the table is empty).
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
+    fn pipeline_meta_defaults_when_no_keys() {
+        // #2895: this used to assert on `load_pipeline_meta`, the SQLite
+        // `board_meta` reader coord-tui's local-DB path used. That reader is
+        // gone; `parse_pipeline_meta_from_map` (the /board wire parser) is
+        // now the only one, and it owns the documented fallbacks.
         let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models, acceptance_routes) =
-            load_pipeline_meta(&conn);
+            parse_pipeline_meta_from_map(&std::collections::HashMap::new());
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
@@ -16099,22 +16098,27 @@
     }
 
     #[test]
-    fn pipeline_loader_reads_persisted_values() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO board_meta VALUES \
-              ('pipeline_default_gates', '[\"plan\",\"work\",\"smoke\"]'), \
-              ('pipeline_tracked_labels', '[\"hotfix\",\"feature\"]'), \
-              ('pipeline_repos', '{\"api\":\"acme/api\"}'), \
-              ('pipeline_repo_run_cmds', '{\"api\":\"cargo run --example gtk_panel\"}'), \
-              ('pipeline_repo_paths', '{\"api\":\"/home/user/src/api\"}'), \
-              ('pipeline_acceptance_routes', '{\"api\":[\"coord/**\",\"tui/**\"]}'), \
-              ('pipeline_require_plan', '1');",
-        )
-        .unwrap();
+    fn pipeline_meta_reads_persisted_values() {
+        let meta: std::collections::HashMap<String, String> = [
+            ("pipeline_default_gates", r#"["plan","work","smoke"]"#),
+            ("pipeline_tracked_labels", r#"["hotfix","feature"]"#),
+            ("pipeline_repos", r#"{"api":"acme/api"}"#),
+            (
+                "pipeline_repo_run_cmds",
+                r#"{"api":"cargo run --example gtk_panel"}"#,
+            ),
+            ("pipeline_repo_paths", r#"{"api":"/home/user/src/api"}"#),
+            (
+                "pipeline_acceptance_routes",
+                r#"{"api":["coord/**","tui/**"]}"#,
+            ),
+            ("pipeline_require_plan", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models, acceptance_routes) =
-            load_pipeline_meta(&conn);
+            parse_pipeline_meta_from_map(&meta);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
@@ -16136,210 +16140,235 @@
         );
     }
 
-    // ── Purge helpers ─────────────────────────────────────────────────────────
+    // ── #2895: daemon-required — the "no board service" error is visible ──────
 
-    /// Build an in-memory DB with the columns the purge predicates read.
-    /// Only the columns referenced by the SQL need to exist; this keeps the
-    /// fixture small and decoupled from the production schema migrations.
-    fn make_purge_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE assignments (
-                assignment_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                finished_at REAL
-             );
-             CREATE TABLE issues (
-                number INTEGER PRIMARY KEY,
-                state TEXT NOT NULL,
-                synced_at REAL
-             );",
-        )
-        .unwrap();
-        conn
-    }
-
-    fn insert_assignment(conn: &Connection, id: &str, status: &str, finished_at: Option<f64>) {
-        conn.execute(
-            "INSERT INTO assignments (assignment_id, status, finished_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, status, finished_at],
-        )
-        .unwrap();
-    }
-
-    fn insert_issue(conn: &Connection, number: i64, state: &str, synced_at: Option<f64>) {
-        conn.execute(
-            "INSERT INTO issues (number, state, synced_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![number, state, synced_at],
-        )
-        .unwrap();
-    }
-
-    // ── count_purgeable_conn ──────────────────────────────────────────────────
-
+    /// Black-box (TuiDriver): with no board service configured anywhere,
+    /// coord-tui must render a NAMED, actionable error naming the file to
+    /// edit — not a silently blank board, which is exactly what the deleted
+    /// SQLite path produced when its read-only open of coord.db failed.
     #[test]
-    fn count_purgeable_counts_done_rows_older_than_cutoff() {
-        let conn = make_purge_db();
-        insert_assignment(&conn, "old", "done", Some(100.0)); // older than cutoff
-        insert_assignment(&conn, "new", "done", Some(500.0)); // newer than cutoff
-        let (a, i) = count_purgeable_conn(&conn, 300.0).unwrap();
-        assert_eq!(a, 1);
-        assert_eq!(i, 0);
-    }
+    fn no_board_service_error_is_named_on_screen() {
+        use quadraui::tui::testing::driver_with_shell;
 
-    #[test]
-    fn count_purgeable_excludes_running_and_pending() {
-        let conn = make_purge_db();
-        insert_assignment(&conn, "r", "running", Some(0.0));
-        insert_assignment(&conn, "p", "pending", Some(0.0));
-        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
-        assert_eq!(a, 0);
-    }
+        let app = make_test_app(BoardData {
+            load_error: Some(NO_BOARD_SERVICE_ERROR.to_string()),
+            ..BoardData::default()
+        });
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
 
-    #[test]
-    fn count_purgeable_includes_old_failed_rows() {
-        let conn = make_purge_db();
-        insert_assignment(&conn, "f", "failed", Some(100.0));
-        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
-        assert_eq!(a, 1);
-    }
-
-    #[test]
-    fn count_purgeable_excludes_rows_with_no_finished_at() {
-        let conn = make_purge_db();
-        insert_assignment(&conn, "d", "done", None);
-        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
-        assert_eq!(a, 0);
-    }
-
-    #[test]
-    fn count_purgeable_counts_closed_issues_older_than_cutoff() {
-        let conn = make_purge_db();
-        insert_issue(&conn, 1, "closed", Some(100.0)); // purgeable
-        insert_issue(&conn, 2, "closed", Some(500.0)); // too fresh
-        insert_issue(&conn, 3, "open", Some(50.0)); // open: never purged
-        insert_issue(&conn, 4, "closed", None); // no synced_at: never purged
-        let (_, i) = count_purgeable_conn(&conn, 300.0).unwrap();
-        assert_eq!(i, 1);
-    }
-
-    // ── count vs delete symmetry ─────────────────────────────────────────────
-
-    #[test]
-    fn count_matches_delete_for_mixed_data() {
-        // The reviewer's bug #2: prompt showed one number, toast showed another
-        // because count_purgeable saw assignments-only and the SQL also deleted
-        // issues. This test guards against future drift between the two helpers.
-        let conn = make_purge_db();
-        insert_assignment(&conn, "a1", "done", Some(100.0));
-        insert_assignment(&conn, "a2", "failed", Some(100.0));
-        insert_assignment(&conn, "a3", "done", Some(500.0)); // too fresh
-        insert_issue(&conn, 1, "closed", Some(100.0));
-        insert_issue(&conn, 2, "closed", Some(200.0));
-        insert_issue(&conn, 3, "open", Some(100.0));
-
-        let counted = count_purgeable_conn(&conn, 300.0).unwrap();
-        let deleted = purge_done_assignments_conn(&conn, 300.0).unwrap();
-        assert_eq!(counted, deleted, "count and delete must agree exactly");
-        assert_eq!(counted, (2, 2));
-    }
-
-    // ── record_test_verdict_conn ──────────────────────────────────────────────
-
-    /// Build an in-memory DB with the columns `record_test_verdict_conn` writes.
-    fn make_verdict_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE assignments (
-                assignment_id      TEXT PRIMARY KEY,
-                test_state         TEXT,
-                test_reason        TEXT,
-                smoke_test         TEXT,
-                smoke_test_reason  TEXT
-             );",
-        )
-        .unwrap();
-        conn
-    }
-
-    fn insert_verdict_row(conn: &Connection, id: &str) {
-        conn.execute(
-            "INSERT INTO assignments (assignment_id) VALUES (?1)",
-            rusqlite::params![id],
-        )
-        .unwrap();
-    }
-
-    fn read_verdict(
-        conn: &Connection,
-        id: &str,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
-        conn.query_row(
-            "SELECT test_state, test_reason, smoke_test, smoke_test_reason \
-             FROM assignments WHERE assignment_id = ?1",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    // #296 Blocker 2: record_test_verdict_conn must mirror smoke_test so that
-    // `coord fix` (which guards on smoke_test == "fail") can proceed after a
-    // report+fix action from the TUI.
-    fn record_test_verdict_conn_sets_smoke_test_on_failure() {
-        let conn = make_verdict_db();
-        insert_verdict_row(&conn, "w1");
-        record_test_verdict_conn(&conn, "w1", "failed", Some("scroll broken")).unwrap();
-        let (test_state, test_reason, smoke_test, smoke_reason) = read_verdict(&conn, "w1");
-        assert_eq!(
-            test_state.as_deref(),
-            Some("failed"),
-            "test_state must be 'failed'"
+        assert!(
+            driver.screen_contains("no board service configured"),
+            "the operator must be told WHY the board is empty:\n{}",
+            driver.screen(),
         );
-        assert_eq!(
-            test_reason.as_deref(),
-            Some("scroll broken"),
-            "test_reason must be stored"
+        assert!(
+            driver.screen_contains("~/.coord/client.toml"),
+            "the error must name the file to edit:\n{}",
+            driver.screen(),
         );
-        assert_eq!(
-            smoke_test.as_deref(),
-            Some("fail"),
-            "smoke_test must be mirrored to 'fail' so coord fix can dispatch",
+    }
+
+    /// The error is a permanent config fault, so it must NOT be cleared by
+    /// the empty refresh ticks that follow it — #620's degraded-tick guard
+    /// preserves the last good board, and a board whose only content is this
+    /// message counts as "good" for that purpose. Without this, the message
+    /// flashed once and the operator was left with a blank board.
+    #[test]
+    fn no_board_service_error_survives_refresh_ticks() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            load_error: Some(NO_BOARD_SERVICE_ERROR.to_string()),
+            ..BoardData::default()
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // `r` refreshes; under test `start_data_load` resolves immediately
+        // with an empty payload, which is the exact tick that used to wipe it.
+        for _ in 0..3 {
+            driver.type_char('r');
+        }
+        assert!(
+            driver.screen_contains("no board service configured"),
+            "the config error must survive empty refresh ticks:\n{}",
+            driver.screen(),
         );
+    }
+
+    /// A healthy board must NOT carry the error — the guard above must not
+    /// have made the message sticky in the ordinary case.
+    #[test]
+    fn healthy_board_shows_no_load_error() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_assignments(vec![make_assignment_typed(
+            "running", 10, "repo-a", Some("work"),
+        )]);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        assert!(
+            !driver.screen_contains("no board service configured"),
+            "a populated board must not show the config error:\n{}",
+            driver.screen(),
+        );
+    }
+
+    // ── #2895: the daemon host resolves its own loopback daemon ───────────────
+
+    /// `is_remote_board_service()` gates the host-side control commands the
+    /// TUI auto-runs (`coord notify`, `coord sync`). Once
+    /// `resolve_board_service` started auto-detecting the daemon host,
+    /// "a board service is configured" stopped meaning "I am a thin client"
+    /// — a box talking HTTP to its OWN daemon is still the host, and must
+    /// keep running those commands. That distinction is `url_is_loopback`.
+    #[test]
+    fn loopback_daemon_urls_are_not_remote() {
+        for url in [
+            "http://127.0.0.1:7435",
+            "http://127.0.0.1",
+            "http://127.5.6.7:7435",
+            "http://localhost:7435",
+            "http://LOCALHOST:7435",
+            "http://[::1]:7435",
+            "http://[::1]",
+            "http://127.0.0.1:7435/",
+        ] {
+            assert!(
+                url_is_loopback(url),
+                "{url} points at this machine's own daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_daemon_urls_are_remote() {
+        for url in [
+            "http://dellserver:7435",
+            "http://100.64.1.2:7435",
+            "https://board.example.com",
+            // #2895 review-guard: a hostname that merely *contains* a
+            // loopback-looking substring is still another machine.
+            "http://localhost.example.com:7435",
+            "http://127.0.0.1.example.com:7435",
+        ] {
+            assert!(
+                !url_is_loopback(url),
+                "{url} points at another machine"
+            );
+        }
+    }
+
+    // ── #2895: purge / verdict / issue-upsert are daemon calls ────────────────
+    //
+    // These three writers used to open a read-write `rusqlite` connection to
+    // `~/.coord/coord.db` — on the daemon host, mutating the board behind
+    // `coord serve`'s back while it held the same file in WAL mode. The SQL
+    // correctness they asserted now lives on the Python side
+    // (`tests/test_tui_daemon_writes_2895.py`, against `coord/state.py`'s
+    // dialect seam); what is left to prove HERE is that each TUI action makes
+    // the right daemon call and reads its answer back.
+
+    #[test]
+    fn count_purgeable_posts_to_daemon_purge_endpoint() {
+        let mock = MockBoardService::start(r#"{"assignments": 2, "issues": 3}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let counts = count_purgeable_remote(7.0 * 86_400.0)
+            .expect("count_purgeable_remote must succeed against a live daemon");
         assert_eq!(
-            smoke_reason.as_deref(),
-            Some("scroll broken"),
-            "smoke_test_reason must match"
+            counts,
+            (2, 3),
+            "both row counts must come back from the daemon's response"
+        );
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "expected one request, got {requests:?}");
+        assert!(
+            requests[0].starts_with("POST /purge"),
+            "count must go to POST /purge; got {:?}",
+            requests[0]
         );
     }
 
     #[test]
-    fn record_test_verdict_conn_sets_smoke_test_pass_on_passed() {
-        let conn = make_verdict_db();
-        insert_verdict_row(&conn, "w2");
-        record_test_verdict_conn(&conn, "w2", "passed", None).unwrap();
-        let (test_state, _test_reason, smoke_test, smoke_reason) = read_verdict(&conn, "w2");
-        assert_eq!(test_state.as_deref(), Some("passed"));
-        assert_eq!(smoke_test.as_deref(), Some("pass"));
-        assert_eq!(smoke_reason, None, "no smoke_test_reason for a pass");
+    fn purge_done_assignments_posts_to_daemon_purge_endpoint() {
+        let mock = MockBoardService::start(r#"{"assignments": 5, "issues": 0}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let deleted = purge_done_assignments_remote(7.0 * 86_400.0)
+            .expect("purge_done_assignments_remote must succeed against a live daemon");
+        assert_eq!(deleted, (5, 0));
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "expected one request, got {requests:?}");
+        assert!(
+            requests[0].starts_with("POST /purge"),
+            "delete must go to POST /purge; got {:?}",
+            requests[0]
+        );
     }
 
     #[test]
-    fn record_test_verdict_conn_skipped_does_not_set_smoke_test() {
-        let conn = make_verdict_db();
-        insert_verdict_row(&conn, "w3");
-        record_test_verdict_conn(&conn, "w3", "skipped", None).unwrap();
-        let (test_state, _test_reason, smoke_test, _smoke_reason) = read_verdict(&conn, "w3");
-        assert_eq!(test_state.as_deref(), Some("skipped"));
-        assert_eq!(
-            smoke_test, None,
-            "smoke_test must not be set for skipped verdict"
+    fn purge_counts_default_to_zero_when_daemon_omits_them() {
+        // An older daemon that answers /purge without the two keys must read
+        // as "nothing matched", not panic or wrongly report success counts.
+        let mock = MockBoardService::start(r#"{"ok": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+        assert_eq!(count_purgeable_remote(1.0).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn purge_without_board_service_names_the_config_file() {
+        // No mock, no guard → `resolve_board_service()` is None under test.
+        // The error the operator sees must be the actionable one, not a bare
+        // network failure.
+        let err = count_purgeable_remote(1.0).expect_err("no service must be an error");
+        assert_eq!(err, NO_BOARD_SERVICE_ERROR);
+        assert!(
+            err.contains("~/.coord/client.toml"),
+            "the error must name the file to edit; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn record_test_verdict_posts_to_daemon_test_verdict_endpoint() {
+        let mock = MockBoardService::start(r#"{"ok": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        record_test_verdict_remote("w1", "failed", Some("scroll broken"))
+            .expect("verdict must be accepted by a live daemon");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "expected one request, got {requests:?}");
+        assert!(
+            requests[0].starts_with("POST /test-verdict"),
+            "verdict must go to POST /test-verdict; got {:?}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn upsert_issue_posts_to_daemon_issue_upsert_endpoint() {
+        let mock = MockBoardService::start(r#"{"ok": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let issue = FetchedIssue {
+            number: 42,
+            title: "a title".to_string(),
+            body: "a body".to_string(),
+            labels: vec!["coord".to_string()],
+            state: "open".to_string(),
+            milestone_number: None,
+            milestone_title: None,
+        };
+        upsert_issue_remote("repo-a", &issue)
+            .expect("upsert must be accepted by a live daemon");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "expected one request, got {requests:?}");
+        assert!(
+            requests[0].starts_with("POST /issue-upsert"),
+            "upsert must go to POST /issue-upsert; got {:?}",
+            requests[0]
         );
     }
 
@@ -26932,6 +26961,17 @@
     }
 
     // ── #349: Test-plan helpers ───────────────────────────────────────────────
+
+    /// #2895: `data::parse_test_plan_steps` (the SQLite TEXT-column parser)
+    /// is gone with the rest of coord-tui's embedded SQLite.  Its extraction
+    /// survives as `types::test_plan_steps_from_value`, shared with the
+    /// `/board` wire deserializer — so these cases keep asserting on the same
+    /// behaviour, one decode step earlier.
+    fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| test_plan_steps_from_value(&v))
+    }
 
     /// Parsing a well-formed test_plan JSON blob returns the expected steps.
     #[test]

@@ -614,6 +614,9 @@ fn board_data_from_payload(payload: BoardPayload) -> BoardData {
         drive_queue: payload.drive_queue,
         roll_pending: payload.roll_pending,
         approved_submissions: payload.approved_submissions,
+        // #2895: a fixture built from a board payload is by definition a
+        // successful load.
+        load_error: None,
     }
 }
 
