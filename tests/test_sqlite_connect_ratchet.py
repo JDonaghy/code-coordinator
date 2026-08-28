@@ -210,6 +210,14 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "so it must not be the fixture conn. The other is the SQLite backend "
         "adapter's own file DB, i.e. the contract's SQLite arm.",
     ),
+    "test_serve_rest_routes.py": Classification(
+        2, (BUCKET_C,),
+        "#1944's resource-route equivalence sweep, and the same daemon pair as "
+        "test_serve.py: a thread-safe rw_db override for the write side "
+        "(TestClient runs handlers on a worker thread the autouse connection "
+        "cannot serve) plus a separate on-disk file_db that the serve app's "
+        "SqliteStore opens by path for the read side.",
+    ),
     "test_review_verdict_relay.py": Classification(
         2, (BUCKET_C,),
         "The standard daemon pair: a thread-safe rw_db override for the write "
