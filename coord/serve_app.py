@@ -139,7 +139,6 @@ def configure_daemon_logging(level: str | None = None) -> "logging.Logger":
     call it freely.  Returns the configured logger.
     """
     import logging  # noqa: PLC0415
-    import logging.handlers  # noqa: PLC0415,F401 — ensure the module is fully loaded
 
     raw = level or os.environ.get(DAEMON_LOG_LEVEL_ENV) or DEFAULT_DAEMON_LOG_LEVEL
     resolved = logging.getLevelName(str(raw).strip().upper())
