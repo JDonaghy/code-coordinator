@@ -993,11 +993,33 @@ def _local_issue_rows() -> list[dict]:
     ``coord.db.get_connection()`` singleton
     ``coord.commands.drive_queue._local_issue_rows`` already uses for its own
     (narrower — ``repo_name, number, state`` only) top-up of the same
-    standalone-payload gap; this one additionally selects ``milestone_number``
-    / ``milestone_title`` / ``labels`` / ``body`` — what :func:`project`'s
-    oracle-loop resolution and :func:`coord.milestone_order.
-    milestone_work_order_membership` need that the narrower query doesn't
-    carry.
+    standalone-payload gap; this one additionally selects ``title`` /
+    ``milestone_number`` / ``milestone_title`` / ``labels`` / ``body`` /
+    ``synced_at`` — what :func:`project`'s oracle-loop resolution,
+    :func:`coord.milestone_order.milestone_work_order_membership`, and
+    ``coord.drive_queue.build_board_view``'s ``#2858`` staleness check need
+    that the narrower query doesn't carry.
+
+    #2881: ``title`` was missing from this SELECT even though :func:`project`
+    has read ``oi.get("title")`` since #2871 — so on every daemon-host drive
+    (the ONLY host that runs `coord drive-queue tick`, i.e. every real
+    dispatch) ``issue_title`` resolved to ``""`` for every issue, and
+    ``_refused_policy_is_stale`` in ``coord/drive.py`` hit its
+    "uncertain ⇒ still blocking" guard unconditionally — the retarget-bypass
+    it exists to provide could never fire in production. The HTTP `/board`
+    path (`coord.dao.SqliteStore` → `board_schema.BoardIssue`, which DOES
+    declare ``title``) was never broken; nothing that dispatches drives goes
+    through it. Auditing this SELECT against ``BoardIssue`` (#2881's other
+    ask, "the two projections drift and the hooks cannot prevent it")
+    surfaced the identical gap one field over: ``synced_at`` was ALSO
+    missing, silently defeating ``build_board_view``'s ``#2858``
+    fresh-vs-stale-cache read the same way on the same daemon host — fixed
+    here alongside ``title`` rather than filed as a follow-up, since it is
+    the same SELECT and the same root cause. See
+    :func:`coord.drive._refused_policy_is_stale` and
+    ``tests/test_drive_state.py::test_fetch_local_issue_rows_and_http_board_expose_the_same_issue_keys``,
+    which guards this SELECT and the HTTP shape against drifting apart
+    again.
 
     Deliberately queries ``get_connection()`` rather than
     ``coord.dao.SqliteStore`` — see :meth:`BoardFetcher._fetch_local`'s
@@ -1014,8 +1036,8 @@ def _local_issue_rows() -> list[dict]:
     try:
         rows = sql.execute(
             get_connection(),
-            "SELECT repo_name, number, state, milestone_number, milestone_title, "
-            "labels, body FROM issues",
+            "SELECT repo_name, number, title, state, milestone_number, "
+            "milestone_title, labels, body, synced_at FROM issues",
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []

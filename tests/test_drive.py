@@ -1905,6 +1905,42 @@ def test_refused_policy_is_not_bypassed_when_the_title_is_unchanged():
     assert action.audit_event is None
 
 
+def test_refused_policy_still_blocking_distinguishes_uncertain_from_confident():
+    """#2881: the original #2871 message collapsed "title didn't resolve
+    from the board payload" and "title resolved but is unchanged" into the
+    identical confident "retarget the issue, the next drive will see it"
+    prose — which is exactly why the #2881 payload bug (``title`` missing
+    from the daemon-host ``_local_issue_rows()`` SELECT) went unnoticed for a
+    release cycle: every real drive silently landed in the uncertain case and
+    nothing in the operator-facing text said so. The uncertain case (no
+    branch recorded, or no title resolved) must say the driver could not
+    confirm either way; the confident case (title resolved, branch
+    unchanged) keeps the original #2871 remedy verbatim.
+    """
+    uncertain = step(
+        state(work_aid="w1", work_status="refused_policy", work_finished_at=1000.0)
+    )
+    assert uncertain.is_exit
+    assert "could not confirm" in uncertain.message.lower()
+    assert "the next `coord drive` detects the retarget" not in uncertain.message
+
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "Exactly the title this branch was named from"
+    confident = step(
+        state(
+            work_aid="w1",
+            work_status="refused_policy",
+            work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+            issue_title=title,
+            work_finished_at=1000.0,
+        )
+    )
+    assert confident.is_exit
+    assert "could not confirm" not in confident.message.lower()
+    assert "the next `coord drive` detects the retarget" in confident.message
+
+
 def test_an_unknown_terminal_status_refuses_to_guess():
     """No terminal status may fall through to a bare wait (PR #1386)."""
     action = step(state(work_aid="w1", work_status="wat"))
