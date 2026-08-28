@@ -682,6 +682,54 @@ class TestRollPendingSelfClears:
         assert second.set_at == first.set_at
 
 
+class TestRollLedgerBoundsFreshArms:
+    """#2889: the follow-up to `TestRollPendingSelfClears` above. A marker
+    that reaches its own TTL and self-clears is not the end of the story —
+    nothing bounded how often a FRESH marker (a brand new `set_at`, brand
+    new `deferrals`) could follow it, and #2889's own incident saw the
+    queue re-frozen ten times in ~15 hours, 49 ticks refused to launch,
+    each individual marker perfectly well-behaved by its own bound. This is
+    the issue's own acceptance list, bullet 1, driven through the REAL tick:
+    "arm a marker ... let it expire, and assert a SECOND marker for the
+    same target is refused (or rate-limited) rather than armed fresh."
+    """
+
+    def test_a_fresh_re_arm_right_after_expiry_is_refused_and_the_queue_keeps_launching(
+        self, cli, seed, launches, monkeypatch,
+    ):
+        from coord.commands import release as release_cmd
+
+        seed(issues={1650: "open"})
+        cli("add", REPO, "1650")
+        monkeypatch.setattr(time, "time", lambda: NOW)
+        armed = release_cmd._ensure_roll_pending_marker("9.9.9", reason="propagate")
+        assert armed is True
+
+        # Force the marker past its own TTL — the SAME self-clear
+        # `TestRollPendingSelfClears` exercises above: the tick escalates it
+        # loudly, clears it, AND launches the queued entry in this SAME
+        # tick (never "cleared, but wait one more interval").
+        monkeypatch.setattr(
+            time, "time", lambda: NOW + ROLL_PENDING_DEFAULT_TTL_SECONDS + 60.0,
+        )
+        result = cli("tick")
+        assert result.exit_code == 0, result.output
+        assert dq_cmd.read_roll_pending() is None  # self-cleared
+        assert queued(1650)["state"] == "running"  # the queue kept launching
+
+        # A SECOND, FRESH arm attempted immediately after — real wall-clock
+        # time has not moved since the expiry above — must be REFUSED, not
+        # armed fresh: the exact "ten fresh arms in 15h" pathology #2889
+        # reports. Fails against unfixed `main`: no rate limit exists there,
+        # so this would just succeed and write a new marker.
+        refused = release_cmd._ensure_roll_pending_marker("9.9.9", reason="propagate")
+        assert refused is False, "a fresh re-arm right after expiry must be rate-limited"
+        assert dq_cmd.read_roll_pending() is None, (
+            "a refused arm must write nothing at all — the queue is never "
+            "re-frozen for a marker that was declined"
+        )
+
+
 # ── 4. `coord release nightly-window` -> `coord drive-queue tick` ─────────
 
 

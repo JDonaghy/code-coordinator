@@ -30,6 +30,30 @@ This file covers the two halves of the fix:
 3. `TestSurfacedInStatusAndDoctor` — scope item 3: `coord status` and
    `coord doctor` name the marker (and the cancel command) where an operator
    already looks, not just in `coord drive-queue status`.
+
+#2889 is the follow-up: #2607's fix (above) is verified working in
+production, but it only bounds ONE marker's own re-arms — nothing bounded
+how often a FRESH marker (a brand new one, following a PRIOR marker that
+reached its own TTL/deferral bound and was cleared) could be armed. Ten of
+those in ~15 hours froze the queue for 49 ticks, each individual marker
+perfectly well-behaved. This file's remaining classes cover that gap —
+`RollLedger`, the memory that survives a marker's own clear:
+
+4. `TestRollLedgerRateLimit` — item 3: a fresh arm within
+   `ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS` of the last one is refused, not
+   armed — the black-box shape #2889's own acceptance list asks for ("arm a
+   marker, let it expire, assert a SECOND marker for the same target is
+   refused/rate-limited rather than armed fresh").
+5. `TestRollLedgerCumulativeEscalation` — item 1: cumulative frozen time
+   across DISTINCT marker generations (never deferrals of one) crosses
+   `ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS` and every further fresh arm is
+   refused until `coord drive-queue cancel-roll` clears the ledger.
+6. `TestQueueProvablyBusyRefusal` — item 2: a fresh arm is declined when a
+   genuine `drive_queue` row is provably occupying the daemon host, even
+   though the daemon itself reads busy (the arm's own trigger condition).
+7. `TestInvokedByRecorded` — item 4: `coord release nightly-window` reads
+   `$COORD_ROLL_INVOKER` and journals it as `invoked_by`, so "what started
+   this unit" is answerable from `coord release window-history` alone.
 """
 
 from __future__ import annotations
@@ -42,7 +66,13 @@ from coord import machine_pause
 from coord.cli import main
 from coord.commands import drive_queue as dq_cmd
 from coord.commands import release as release_cmd
-from coord.drive_queue import RollPending
+from coord.drive_queue import (
+    ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS,
+    ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS,
+    ROLL_PENDING_DEFAULT_TTL_SECONDS,
+    RollLedger,
+    RollPending,
+)
 
 
 def _pending(**overrides) -> RollPending:
@@ -180,7 +210,9 @@ class TestCancelRoll:
         import json
 
         payload = json.loads(result.output)
-        assert payload == {"cancelled": None, "cleared_cordons": []}
+        assert payload == {
+            "cancelled": None, "cleared_cordons": [], "ledger_reset": None,
+        }
 
 
 class TestTickResumesAfterCancel:
@@ -259,3 +291,250 @@ class TestSurfacedInStatusAndDoctor:
 
         assert "roll pending: v0.5.236" in result.output
         assert "coord drive-queue cancel-roll" in result.output
+
+
+# ── #2889: bound the RATE of fresh markers, not just one marker's own life ──
+
+
+class TestRollLedgerRateLimit:
+    """Item 3 — and the issue's own acceptance list, bullet 1: "arm a
+    marker ... let it expire, and assert a SECOND marker for the same
+    target is refused (or rate-limited) rather than armed fresh." None of
+    this exists on unfixed `main`: `_ensure_roll_pending_marker` always
+    returns `None` there and always writes a fresh marker with no refusal
+    of any kind — every assertion below fails against it.
+
+    The rate limit's clock is the marker's own CLEAR, not its arm — see
+    `RollLedger.record_expiry`'s docstring for why measuring from the arm
+    would let the exact "re-arm right after natural TTL expiry" case sail
+    through (by the time a full-TTL marker clears, 3600s has already
+    elapsed — more than the 900s rate limit on its own). `_expire_a_marker`
+    below simulates exactly what the tick's own capacity-0 branch does:
+    fold the live marker's duration into the ledger, THEN clear it.
+    """
+
+    @staticmethod
+    def _expire_a_marker(*, now: float) -> None:
+        pending = dq_cmd.read_roll_pending()
+        assert pending is not None, "nothing to expire"
+        ledger = dq_cmd.read_roll_ledger().record_expiry(pending, now=now)
+        dq_cmd.write_roll_ledger(ledger)
+        dq_cmd.clear_roll_pending()
+
+    def test_a_second_fresh_arm_right_after_expiry_is_refused(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 10_000.0)
+        armed = release_cmd._ensure_roll_pending_marker("0.5.235", reason="propagate")
+        assert armed is True
+
+        expiry = 10_000.0 + ROLL_PENDING_DEFAULT_TTL_SECONDS + 60.0
+        monkeypatch.setattr(time, "time", lambda: expiry)
+        self._expire_a_marker(now=expiry)
+
+        refused = release_cmd._ensure_roll_pending_marker("0.5.236", reason="propagate")
+
+        assert refused is False
+        assert dq_cmd.read_roll_pending() is None, (
+            "a rate-limited fresh arm must not write a marker at all — the "
+            "queue keeps launching normally"
+        )
+
+    def test_a_fresh_arm_after_the_interval_elapses_proceeds(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 10_000.0)
+        release_cmd._ensure_roll_pending_marker("0.5.235", reason="propagate")
+        expiry = 10_000.0 + ROLL_PENDING_DEFAULT_TTL_SECONDS + 60.0
+        monkeypatch.setattr(time, "time", lambda: expiry)
+        self._expire_a_marker(now=expiry)
+
+        monkeypatch.setattr(
+            time, "time", lambda: expiry + ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS + 1.0,
+        )
+
+        armed = release_cmd._ensure_roll_pending_marker("0.5.236", reason="propagate")
+
+        assert armed is True
+        pending = dq_cmd.read_roll_pending()
+        assert pending is not None
+        assert pending.target_version == "0.5.236"
+
+    def test_a_refusal_never_bumps_the_rate_limit_clock(self, monkeypatch):
+        """A refused attempt spends nothing — only an EXPIRY moves
+        `last_expired_at`, so a caller retrying every few seconds while
+        rate-limited does not somehow push its own unblock time later."""
+        monkeypatch.setattr(time, "time", lambda: 10_000.0)
+        release_cmd._ensure_roll_pending_marker("0.5.235", reason="propagate")
+        expiry = 10_000.0 + ROLL_PENDING_DEFAULT_TTL_SECONDS + 60.0
+        monkeypatch.setattr(time, "time", lambda: expiry)
+        self._expire_a_marker(now=expiry)
+
+        monkeypatch.setattr(time, "time", lambda: expiry + 100.0)
+        release_cmd._ensure_roll_pending_marker("0.5.236", reason="propagate")  # refused
+        monkeypatch.setattr(time, "time", lambda: expiry + 200.0)
+        release_cmd._ensure_roll_pending_marker("0.5.237", reason="propagate")  # refused
+
+        monkeypatch.setattr(
+            time, "time", lambda: expiry + ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS + 1.0,
+        )
+        armed = release_cmd._ensure_roll_pending_marker("0.5.238", reason="propagate")
+        assert armed is True  # unblocked from the EXPIRY's clock, not pushed later
+
+
+class TestRollLedgerCumulativeEscalation:
+    """Item 1 — acceptance bullet 2: cumulative frozen time across DISTINCT
+    marker generations (never deferrals of one already-live marker — that
+    half is #2607's, and stays green) crosses the bound and refuses every
+    further fresh arm until an operator intervenes. Fails against unfixed
+    `main`: there is no `RollLedger`, no escalation, and no refusal — a
+    fresh arm always just succeeds.
+    """
+
+    def test_escalates_only_after_the_bound_is_crossed_by_distinct_markers(self):
+        """Pure arithmetic on `RollLedger` itself — the exact shape the
+        issue's acceptance calls for: N *distinct* markers, not N deferrals
+        of one. Four markers, each contributing a quarter of the bound,
+        cross it on the fourth; three alone do not."""
+        ledger = RollLedger()
+        now = 0.0
+        chunk = ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS / 4
+        for _ in range(3):
+            pending = RollPending(target_version="x", set_at=now)
+            now += chunk
+            ledger = ledger.record_expiry(pending, now=now)
+        assert ledger.marker_count == 3
+        assert not ledger.escalated, "three quarters of the bound must not escalate yet"
+
+        pending = RollPending(target_version="x", set_at=now)
+        now += chunk
+        ledger = ledger.record_expiry(pending, now=now)
+
+        assert ledger.marker_count == 4
+        assert ledger.escalated
+
+    def test_an_escalated_ledger_refuses_every_fresh_arm(self, monkeypatch):
+        """The integration half: once the ledger reads `escalated`,
+        `_ensure_roll_pending_marker`'s one FRESH-arm branch must refuse,
+        whatever target is asked for — not just the one that ran up the
+        history."""
+        monkeypatch.setattr(time, "time", lambda: 50_000.0)
+        dq_cmd.write_roll_ledger(
+            RollLedger(
+                cumulative_frozen_seconds=ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS,
+                marker_count=4,
+                last_expired_at=0.0,
+            )
+        )
+
+        refused = release_cmd._ensure_roll_pending_marker("9.9.9", reason="propagate")
+
+        assert refused is False
+        assert dq_cmd.read_roll_pending() is None
+
+    def test_cancel_roll_clears_an_escalated_ledger_with_no_live_marker(self):
+        """The operator escape hatch item 1 requires: "refuse ... until an
+        operator intervenes." `coord drive-queue cancel-roll` is that
+        intervention — and must work even when the marker that ran up the
+        ledger already expired and cleared on its own, leaving only the
+        ledger's escalation behind."""
+        dq_cmd.write_roll_ledger(
+            RollLedger(
+                cumulative_frozen_seconds=ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS + 1.0,
+                marker_count=5,
+            )
+        )
+        assert dq_cmd.read_roll_pending() is None  # nothing LIVE to cancel
+
+        result = CliRunner().invoke(main, ["drive-queue", "cancel-roll"])
+
+        assert result.exit_code == 0, result.output
+        assert "roll ledger" in result.output
+        ledger = dq_cmd.read_roll_ledger()
+        assert not ledger.escalated
+        assert ledger.cumulative_frozen_seconds == 0.0
+        assert ledger.marker_count == 0
+
+
+class TestQueueProvablyBusyRefusal:
+    """Item 2: a FRESH arm is declined when a genuine `drive_queue` row is
+    provably occupying the daemon host right now — even though the daemon
+    itself reading busy is the arm site's own TRIGGER condition. Fails
+    against unfixed `main`: `_ensure_roll_pending_marker` has no
+    `queue_provably_busy` parameter at all, and always arms."""
+
+    def test_a_provably_busy_queue_declines_a_fresh_arm(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 10_000.0)
+
+        refused = release_cmd._ensure_roll_pending_marker(
+            "0.5.235", reason="propagate", queue_provably_busy=True,
+        )
+
+        assert refused is False
+        assert dq_cmd.read_roll_pending() is None, (
+            "declining to arm must not write a marker — the queue keeps "
+            "launching normally rather than being frozen for a marker that "
+            "cannot roll any faster than the tick's own reconciliation will"
+        )
+
+    def test_a_re_arm_of_an_existing_marker_ignores_queue_provably_busy(self, monkeypatch):
+        """#2889 item 2 only ever gates a FRESH arm — a re-arm of an
+        already-live marker (a continuation of a campaign in progress) must
+        proceed regardless, or it would reintroduce #2607's own bug by a
+        different door (a marker that cannot be kept current fires against
+        a target it no longer names)."""
+        dq_cmd.write_roll_pending(_pending(target_version="0.5.235", set_at=1000.0))
+        monkeypatch.setattr(time, "time", lambda: 10_000.0)
+
+        armed = release_cmd._ensure_roll_pending_marker(
+            "0.5.236", reason="propagate", queue_provably_busy=True,
+        )
+
+        assert armed is True
+        pending = dq_cmd.read_roll_pending()
+        assert pending is not None
+        assert pending.target_version == "0.5.236"
+        assert pending.set_at == 1000.0  # #2607's own preservation, untouched
+
+
+class TestInvokedByRecorded:
+    """Item 4: `coord release nightly-window` reads `$COORD_ROLL_INVOKER`
+    off its own process environment and journals it as
+    `WindowRecord.invoked_by`, so "what started this unit" is answerable
+    from `coord release window-history` — no live reproduction required.
+    Fails against unfixed `main`: `WindowRecord` has no `invoked_by` field,
+    and nothing reads the env var."""
+
+    def test_the_env_var_is_read_back_in_the_journal(
+        self, valid_config_path, monkeypatch, tmp_path,
+    ):
+        import coord.release_verify as rv
+        import coord.release_window as rw
+        from coord.commands import release as release_cmd_mod
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(release_cmd_mod, "_state_dir", lambda: state_dir)
+        monkeypatch.setattr(
+            rv, "gather",
+            lambda *a, **k: (
+                {"server": {"version": "0.5.31", "health": {"schema": 1, "results": []}}},
+                {}, None, "server",
+            ),
+        )
+        monkeypatch.setattr(
+            rv, "verify",
+            lambda **kwargs: rv.VerifyReport(
+                expected=kwargs.get("expected"),
+                lanes=[rv.Lane(host="server", lane="~/.coord-venv", version="0.5.31")],
+                findings=[],
+            ),
+        )
+        monkeypatch.setenv("COORD_ROLL_INVOKER", "drive-queue-tick")
+
+        result = CliRunner().invoke(
+            main,
+            ["release", "nightly-window", "--config", str(valid_config_path),
+             "--target", "0.5.31", "--daemon-host", "server"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "invoked by: drive-queue-tick" in result.output
+        records = rw.read_records(state_dir)
+        assert records[-1]["invoked_by"] == "drive-queue-tick"

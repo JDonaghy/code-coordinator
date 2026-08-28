@@ -86,7 +86,7 @@ a replacement for it.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
@@ -1667,6 +1667,122 @@ def _as_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# ── #2889: bound the RATE of fresh roll-pending markers ─────────────────────
+#
+# `RollPending.expired` bounds one marker's own lifetime, and #2607 made a
+# RE-ARM of that SAME live marker preserve `set_at`/`deferrals` — so re-arming
+# it for a moved target cannot dodge that bound. Neither one bounds what
+# happens AFTER a marker actually reaches its bound and gets cleared (the
+# tick's own expiry branch in `coord.commands.drive_queue`): the very next
+# arm attempt (`coord.commands.release._ensure_roll_pending_marker` /
+# `release nightly-window`'s own arm site) starts a BRAND NEW marker — a
+# fresh `set_at`, `deferrals` back to 0 — with no memory of the last one.
+# 2026-08-28: ten of those in ~15 hours, 49 ticks refused to launch, each
+# individual marker perfectly well-behaved by its own TTL/deferral bound.
+#
+# `RollLedger` is the memory that survives a marker's own clear. Mirrors
+# `RollPending`'s own split: this dataclass stays pure (no clock read, no
+# I/O) — `coord.commands.drive_queue.read_roll_ledger`/`write_roll_ledger`/
+# `reset_roll_ledger` own persistence, same as `roll_pending.json` one level
+# up.
+#: Past this much CUMULATIVE frozen time — summed across every marker
+#: generation that expired unconfirmed since the ledger was last reset — stop
+#: arming fresh markers outright and escalate loudly instead. 4x the single
+#: marker TTL default: roughly "this has now failed to roll on its own four
+#: separate times", clearly past "one unlucky busy night" and into "something
+#: about this target cannot roll itself; an operator must look."
+ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS = 4 * ROLL_PENDING_DEFAULT_TTL_SECONDS
+#: Minimum spacing between two FRESH markers (never between re-arms of an
+#: already-live one — see `RollPending`'s own set_at-preservation, which
+#: already covers that case). 15 minutes turns the observed "10 fresh arms
+#: in 15h" pathology into at most one every 15 minutes even in the
+#: worst case where every other guard (the cumulative bound, #2889 item 2's
+#: queue-provably-busy refusal) somehow keeps missing.
+ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS = 900.0
+
+
+@dataclass(frozen=True)
+class RollLedger:
+    """#2889: cumulative bookkeeping for fresh `RollPending` markers, keyed
+    to nothing but "the current roll campaign" — it persists across a
+    marker's own clear (expiry) and is reset only on a CONFIRMED roll or
+    explicit operator intervention (`coord drive-queue cancel-roll`). See
+    the module comment just above for why this exists alongside
+    `RollPending.expired`, not instead of it.
+    """
+
+    #: Sum of ``now - set_at`` for every marker generation that reached its
+    #: OWN bound (TTL or deferral ceiling) without ever confirming a roll,
+    #: accumulated since this ledger was last reset. A marker that WAS
+    #: confirmed rolled never contributes here — see `reset_roll_ledger`.
+    cumulative_frozen_seconds: float = 0.0
+    #: How many DISTINCT fresh markers (never a re-arm of a still-live one)
+    #: have expired unconfirmed since the ledger was last reset.
+    marker_count: int = 0
+    #: `time.time()` when the MOST RECENT marker generation reached its own
+    #: bound and was cleared unconfirmed (`record_expiry`) — what
+    #: `seconds_until_next_arm` measures against. Deliberately the CLEAR
+    #: time, not the ARM time a first draft of this ledger used: a marker
+    #: that lives out its own full TTL (3600s default) before expiring has,
+    #: by the time it clears, already outlasted any reasonable rate-limit
+    #: window measured from when it was ARMED — measuring from set_at would
+    #: let the very re-arm this bound exists to catch (one right after
+    #: natural TTL expiry) sail through every time. Never touched by an arm
+    #: (successful or refused) — only an expiry moves this clock.
+    last_expired_at: float = 0.0
+
+    @property
+    def escalated(self) -> bool:
+        """Past the cumulative bound — refuse every further fresh arm until
+        an operator clears this ledger (`coord drive-queue cancel-roll`)."""
+        return self.cumulative_frozen_seconds >= ROLL_LEDGER_CUMULATIVE_BOUND_SECONDS
+
+    def seconds_until_next_arm(self, now: float) -> float:
+        """How much longer the rate limit holds, or ``0.0`` once it has
+        cleared — never negative, so a caller can test ``<= 0`` with no
+        separate "already elapsed" branch. ``last_expired_at <= 0`` (no
+        marker has ever expired unconfirmed yet, or a ledger from before
+        this field existed) reads as "no wait" — a ledger with no expiry
+        history has nothing to be too close to."""
+        if self.last_expired_at <= 0:
+            return 0.0
+        remaining = ROLL_LEDGER_MIN_ARM_INTERVAL_SECONDS - (now - self.last_expired_at)
+        return max(0.0, remaining)
+
+    def record_expiry(self, pending: "RollPending", *, now: float) -> "RollLedger":
+        """New ledger folding in *pending*'s lived duration and bumping the
+        rate-limit clock — called once, right before a marker that reached
+        its own bound unconfirmed is cleared (never for one that rolled —
+        that path resets instead, via `coord.commands.drive_queue.
+        reset_roll_ledger`)."""
+        return replace(
+            self,
+            cumulative_frozen_seconds=(
+                self.cumulative_frozen_seconds + max(0.0, now - pending.set_at)
+            ),
+            marker_count=self.marker_count + 1,
+            last_expired_at=now,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "cumulative_frozen_seconds": self.cumulative_frozen_seconds,
+            "marker_count": self.marker_count,
+            "last_expired_at": self.last_expired_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RollLedger":
+        """Tolerant parse, same posture as `RollPending.from_dict`: a ledger
+        this cannot make sense of must read as "no history yet", never as a
+        reason to wedge future arms forever over a hand-edited/corrupt file."""
+        return cls(
+            cumulative_frozen_seconds=_as_float(data.get("cumulative_frozen_seconds"), 0.0),
+            marker_count=_as_int_default(data.get("marker_count"), 0),
+            last_expired_at=_as_float(data.get("last_expired_at"), 0.0),
+        )
 
 
 @dataclass(frozen=True)

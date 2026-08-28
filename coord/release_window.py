@@ -173,17 +173,41 @@ STATUS_ROLL_PENDING = "roll-pending"
 #: marker at all, so it is a GOOD outcome, same tier as
 #: :data:`STATUS_ROLL_PENDING`.
 STATUS_HOLDING = "holding"
+#: #2889 items 1-3: a FRESH `RollPending` arm (no existing marker for this
+#: campaign at all) was deliberately declined this run — rate-limited, or a
+#: genuine drive-queue entry is provably occupying the daemon host right now
+#: (see `coord.commands.release._fresh_arm_refusal_reason`). A GOOD outcome,
+#: same tier as :data:`STATUS_ROLL_PENDING`/:data:`STATUS_HOLDING`: the
+#: queue keeps launching normally, and a LATER run (the next nightly/
+#: periodic timer firing, or the drive-queue tick's own inter-drive-gap
+#: watch once something else eventually arms a marker) tries again — never
+#: silent, `record.error` names the specific reason declined.
+STATUS_ARM_DEFERRED = "arm-deferred"
+#: #2889 item 1: the roll LEDGER (`coord.drive_queue.RollLedger`) has
+#: crossed its cumulative frozen-time bound — this target has now failed to
+#: roll unattended across several separate marker generations, not just one
+#: unlucky busy night. Deliberately LOUD (unlike
+#: :data:`STATUS_ARM_DEFERRED` just above): every further fresh arm is
+#: refused until an operator runs `coord drive-queue cancel-roll`, so a
+#: skipped night here really is "supposed to happen and did not" — trap 3.
+STATUS_LEDGER_ESCALATED = "ledger-escalated"
 
 #: Statuses meaning "this window did what it was for, or correctly had
 #: nothing to do" — everything else is a night propagation was supposed to
 #: happen and did not (trap 3: loud, not silent).
 OK_STATUSES = frozenset(
-    {STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN, STATUS_ROLL_PENDING, STATUS_HOLDING}
+    {
+        STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN, STATUS_ROLL_PENDING,
+        STATUS_HOLDING, STATUS_ARM_DEFERRED,
+    }
 )
 
 #: The inverse of OK_STATUSES, spelled out for readability at call sites.
 LOUD_STATUSES = frozenset(
-    {STATUS_DRAIN_TIMEOUT, STATUS_PROPAGATE_DEFERRED, STATUS_PROPAGATE_FAILED, STATUS_ERROR}
+    {
+        STATUS_DRAIN_TIMEOUT, STATUS_PROPAGATE_DEFERRED, STATUS_PROPAGATE_FAILED,
+        STATUS_ERROR, STATUS_LEDGER_ESCALATED,
+    }
 )
 
 
@@ -262,6 +286,21 @@ class WindowRecord:
     finished_at: float | None = None
     error: str | None = None
     dry_run: bool = False
+    #: #2889 item 4: what started THIS run's `coord-release-window.service`
+    #: invocation, when it can be known — ``"timer-or-manual"`` (the unit's
+    #: own static default `Environment=`, covering both its
+    #: `coord-release-window.timer` trigger and a human running `systemctl
+    #: --user start` by hand — systemd does not record a `systemctl start`'s
+    #: calling process, so these two cannot be told apart from inside the
+    #: unit) or ``"drive-queue-tick"`` (the OTHER known trigger —
+    #: `coord.commands.drive_queue._fire_pending_roll`'s own
+    #: `--setenv=COORD_ROLL_INVOKER=drive-queue-tick`, which overrides the
+    #: unit's static default for that one invocation). Empty when this run
+    #: was not started via the packaged unit at all (a bare CLI invocation,
+    #: e.g. in a test or an operator's own shell) and so the env var was
+    #: never set. See `coord/deploy/coord-release-window.service`'s
+    #: "INVOKER" section for the full mechanism and its honest limits.
+    invoked_by: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -366,6 +405,8 @@ _STATUS_MARK = {
     STATUS_ERROR: "✗",
     STATUS_ROLL_PENDING: "…",
     STATUS_HOLDING: "⊖",
+    STATUS_ARM_DEFERRED: "⏳",
+    STATUS_LEDGER_ESCALATED: "‼",
 }
 
 
@@ -385,6 +426,10 @@ def render_record(record: WindowRecord | Mapping[str, Any]) -> list[str]:
             f"    daemon host: {data['daemon_host']} "
             f"(was v{data.get('daemon_version') or '?'})"
         )
+    # #2889 item 4: "what invoked this?" answerable straight from the
+    # journal, no live reproduction required.
+    if data.get("invoked_by"):
+        lines.append(f"    invoked by: {data['invoked_by']}")
     # #2583: a held run must read as "deliberately holding at N behind",
     # never as a silent no-op indistinguishable from a dead timer.
     if status == STATUS_HOLDING:

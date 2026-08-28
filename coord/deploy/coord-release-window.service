@@ -173,6 +173,36 @@
 # since it was added but would NOT have survived a from-scratch rebuild of
 # this host — the whole reason this is now the packaged default instead of
 # operator-local state.
+#
+# INVOKER (#2889 item 4) — ANSWERS "WHAT STARTED THIS?", HONESTLY BOUNDED
+# --------------------------------------------------------------------------
+# 2026-08-28's #2889 report found this unit starting ~10 times with BOTH
+# release timers masked, and could rule out every trigger this codebase
+# actually controls (`coord-release-window.timer` masked, the tick's own
+# `_fire_pending_roll` only fires when a marker already exists, the watchdog
+# only restarts `failed` units, no cron entry) without ever identifying the
+# real cause — because `systemd` does not record a `systemctl start`'s
+# CALLING process anywhere this unit (or its journal) can read.
+#
+# `$COORD_ROLL_INVOKER`, read by `coord release nightly-window` itself and
+# journalled as `WindowRecord.invoked_by` (`coord release window-history`),
+# is the closest honest answer available without deeper systemd
+# instrumentation:
+#   * `Environment=` below sets the STATIC default, "timer-or-manual" —
+#     covers BOTH this unit's own `.timer` firing it AND a human running
+#     `systemctl --user start coord-release-window.service` by hand; those
+#     two genuinely cannot be told apart from inside the unit.
+#   * `coord.commands.drive_queue._fire_pending_roll` (the tick's own
+#     trigger — see "TWO TRIGGERS" above) overrides it with
+#     `--setenv=COORD_ROLL_INVOKER=drive-queue-tick` on that ONE start
+#     request — a transient per-invocation override, layered on top of this
+#     unit's static default by systemd itself, never touching this file.
+# A future THIRD trigger (the open question #2889 could not close) will
+# show up as "timer-or-manual" here too, same as a human running it by
+# hand — this narrows the search space (it did NOT come from the tick) but
+# does not, on its own, distinguish the timer from a person. If that
+# distinction becomes necessary, `coord-release-window.timer`'s own unit can
+# set a THIRD value via its own `Environment=`/`--setenv=` the same way.
 
 [Unit]
 Description=Release window: set/fire the #2587 roll-pending marker on the daemon host
@@ -181,6 +211,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# #2889 item 4: the static default this run's `$COORD_ROLL_INVOKER` reads
+# back as `WindowRecord.invoked_by` unless `_fire_pending_roll`'s own
+# `--setenv=` overrides it for that one invocation — see the "INVOKER"
+# section above for the full mechanism and its honest limits.
+Environment=COORD_ROLL_INVOKER=timer-or-manual
 # No --force, ever (trap 1) — coord/commands/release.py's
 # release_nightly_window never passes it to the `coord release propagate`
 # it shells out to when firing an already-pending marker. A fleet that is

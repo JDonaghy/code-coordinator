@@ -64,6 +64,10 @@ def test_ok_statuses_are_exactly_the_happy_and_correctly_inert_ones():
         # GOOD, correctly-inert outcome — not a night propagation failed to
         # happen, but one that deliberately declined to.
         rw.STATUS_HOLDING,
+        # #2889: declining a FRESH arm (rate-limited, or a genuine
+        # drive-queue entry provably occupying the daemon host) is the SAME
+        # shape — the queue keeps launching, a later run tries again.
+        rw.STATUS_ARM_DEFERRED,
     }
 
 
@@ -76,6 +80,12 @@ def test_loud_statuses_are_everything_else():
         rw.STATUS_PROPAGATE_DEFERRED,
         rw.STATUS_PROPAGATE_FAILED,
         rw.STATUS_ERROR,
+        # #2889: the roll ledger crossing its cumulative bound means this
+        # target has now failed to roll unattended across SEVERAL marker
+        # generations, not just one busy night — an operator must
+        # intervene (`coord drive-queue cancel-roll`), same "supposed to
+        # happen and did not" tier as a genuine propagate failure.
+        rw.STATUS_LEDGER_ESCALATED,
     }
     assert not (rw.OK_STATUSES & rw.LOUD_STATUSES)
 
