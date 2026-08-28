@@ -587,6 +587,14 @@ class Action:
     # the work row's own last attempt reported, or `_decide_merge` would
     # diagnose one PR using the other PR's gates.
     merge_scope: str = "work"
+    # #2871: an explicit ``(event_type, summary, details)`` for `Driver._loop`
+    # to write via `_record_drive_audit`, independent of whatever this Action
+    # otherwise does (WAIT/RUN/EXIT). `decide()` stays a pure function of its
+    # inputs — it hands back *what happened*, never writes the audit log
+    # itself — while still letting a poll that neither dispatches nor exits
+    # (e.g. bypassing a stale pre-dispatch refusal) leave a durable trail
+    # instead of only a run-log line nobody queries later.
+    audit_event: tuple[str, str, dict[str, Any]] | None = None
 
     @property
     def is_exit(self) -> bool:
@@ -603,6 +611,44 @@ def _succeed(message: str) -> Action:
 
 def _die(message: str, exit_code: int = EXIT_TERMINAL_FAILURE) -> Action:
     return Action(kind=EXIT, message=message, exit_code=exit_code)
+
+
+def _format_age(seconds: float) -> str:
+    """Coarse human age ('38m', '15h', '1.2d') for a pre-dispatch audit note.
+
+    Deliberately not the CLI's full relative-time renderer — this is one
+    field inside an audit `summary`/`details`, not a UI surface, so a small
+    self-contained formatter is enough (#2871).
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def _refused_policy_is_stale(state: IssueState) -> bool:
+    """True when a terminal ``refused_policy`` work row no longer describes
+    the issue as it stands now (#2871).
+
+    A worker refuses pre-dispatch work exactly once, correctly, for the ask
+    it was shown — the refusal says nothing about a DIFFERENT ask on the same
+    issue number. If the issue was retargeted (title rewritten) after that
+    row finished, the branch it would have produced (workers name branches
+    ``issue-{N}-{slugify(title)}`` at dispatch time, see
+    ``coord.agent``'s ``branch_name`` construction) no longer matches what a
+    fresh dispatch would name — that mismatch is the signal a retarget
+    happened. Conservative on every uncertainty (no branch recorded, no
+    title resolved): returns ``False`` — i.e. still treated as blocking —
+    rather than risk waving a genuinely-unresolved refusal through.
+    """
+    if not state.work_branch or not state.issue_title:
+        return False
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    expected_branch = f"issue-{state.issue}-{_slugify(state.issue_title)}"
+    return state.work_branch != expected_branch
 
 
 # ── oracle-loop JIT slice authoring (#1453) ─────────────────────────────────
@@ -2036,8 +2082,58 @@ def decide(
         # deliverable was a doc edit, which CLAUDE.md itself tells a worker
         # to refuse and stop rather than attempt). Unlike an ADVISORY 0-commit
         # exit, retrying changes nothing — the rule this worker cited is not
-        # going anywhere — so this is a `_die()` exactly like every other
-        # terminal branch here, but the message embeds
+        # going anywhere — UNLESS the issue itself has since changed.
+        #
+        # #2871: a refusal is a verdict on the ASK the worker was shown, not
+        # a standing veto on the issue NUMBER forever. `coord/claim.py`'s
+        # `find_work_claim` never even sees this row (it's terminal, so it
+        # lives in `board.completed`) — the reason a stale refusal blocks
+        # every later drive is entirely HERE: `work_aid`/`work_status` above
+        # are the latest work-like row for this issue regardless of how old
+        # or how differently-scoped it is, so a fresh `coord drive` launch
+        # reads the fossil row as "this run's" state before ever reaching
+        # `_dispatch_work_stage`. If the issue was retargeted (title
+        # rewritten) after this row finished, `_refused_policy_is_stale`
+        # detects it — the old refusal no longer describes what a fresh
+        # dispatch would even be asked to do — and this bypasses the veto
+        # instead of dying again on the SAME prose a fresh worker never
+        # produced this run (CC#916).
+        age_seconds = (
+            time.time() - state.work_finished_at
+            if state.work_finished_at is not None
+            else None
+        )
+        age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
+        if _refused_policy_is_stale(state):
+            bypass_summary = (
+                f"pre-dispatch: bypassing stale refused_policy assignment "
+                f"{state.work_aid} ({age} old) on issue {state.repo}#{state.issue} "
+                f"— retargeted since (branch {state.work_branch!r} no longer "
+                "matches the issue's current title); dispatching fresh work (#2871)"
+            )
+            dispatch = _dispatch_work_stage(
+                state, opts, counters, machine, oracle, gate_checker, verifier
+            )
+            return replace(
+                dispatch,
+                audit_event=(
+                    "refused_policy_stale",
+                    bypass_summary,
+                    {
+                        "stale_assignment_id": state.work_aid,
+                        "stale_branch": state.work_branch,
+                        "age_seconds": age_seconds,
+                    },
+                ),
+            )
+        # Still genuinely blocking: `_die()` exactly like every other
+        # terminal branch here, but the message now says explicitly that
+        # THIS run refused pre-dispatch on an OLD row (naming it and its
+        # age) rather than reading as a fresh worker refusing again — and
+        # names the remedy that actually clears it (#2871: retargeting is
+        # what makes the branch above fire on the next drive; `coord
+        # drive-queue remove`+`add` alone does nothing, since the queue row
+        # was never what was blocking). The message still embeds
         # `POLICY_REFUSAL_MARKER`: `coord/drive_queue.py`'s
         # `_reconcile_running` recognises that marker in this run's own
         # `drive_exited` audit summary and parks the queue entry
@@ -2046,12 +2142,16 @@ def decide(
         # principle #1844 already applies pre-dispatch, applied here
         # post-dispatch.
         return _die(
-            f"work {state.work_aid} refused on a standing repo-rule "
-            "prohibition rather than doing the dispatched work — the worker "
-            "did the CORRECT thing (#2234). Needs the coordinator: do the "
-            "work directly (or re-scope the issue so its deliverable isn't "
-            f"coordinator-only), then `coord drive-queue remove {state.repo} "
-            f"{state.issue}` once handled.\n"
+            f"pre-dispatch refusal on assignment {state.work_aid} "
+            f"(refused_policy, {age} old) — work refused on a standing "
+            "repo-rule prohibition rather than doing the dispatched work; "
+            "the worker did the CORRECT thing (#2234). Needs the "
+            "coordinator: do the work directly, OR retarget the issue "
+            "(rewrite its title so the deliverable matches what should "
+            "actually be dispatched) — the next `coord drive` detects the "
+            "retarget and dispatches fresh work automatically (#2871), so "
+            f"`coord drive-queue remove {state.repo} {state.issue}` + `add` "
+            "then genuinely clears this once the issue is retargeted.\n"
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}\n"
             f"   {POLICY_REFUSAL_MARKER}"
@@ -4679,6 +4779,15 @@ class Driver:
             )
             for warning in action.warnings:
                 self.warn(warning)
+
+            # #2871: `decide()` stays a pure function of its inputs — it
+            # cannot write the audit log itself — so an Action that carries
+            # its own audit note (e.g. bypassing a stale pre-dispatch
+            # refusal) gets recorded here, the one place this loop already
+            # writes durable `drive_*` audit rows.
+            if action.audit_event is not None:
+                event_type, summary, details = action.audit_event
+                self._record_drive_audit(event_type, summary, details=details)
 
             # #2443: self-heal — see `_self_heal_drift_message`. Tracked off
             # the Action's own `label`, NOT `fingerprint` above: a WAIT can
