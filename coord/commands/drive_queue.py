@@ -2587,6 +2587,68 @@ def clear_roll_pending() -> None:
         pass
 
 
+def _roll_pending_may_fire(*, occupied: int, now: float, queue_rows) -> tuple[bool, str]:
+    """Is it worth attempting to fire a pending roll THIS tick? (#2870 part 2)
+
+    #2587's original rule was ``occupied == 0`` — this tick's own
+    reconciliation (`_reconcile_running`'s ``occupies`` verdict) found
+    literally nothing left running. That rule never learned #2854: `coord
+    release propagate`'s own quiescence check
+    (:func:`coord.release_propagate.assess_quiescence`) treats a `running`
+    drive-queue row with no LIVE assignment right now, past its settle
+    window, as genuinely idle — the row just hasn't reached a terminal state
+    yet (nothing has reconciled it to ``done``). This tick's own ``occupied``
+    count has no such reading: a between-legs row launched on a different
+    host reads ``unknown`` here (#1870 — this tick's local tmux check proves
+    nothing about a row launched elsewhere) and stays charged, forever,
+    against an ``occupied == 0`` bar it can never clear. The 2026-08-28
+    incident this closes: `coord release propagate`, run directly, reported
+    ``quiescent — nothing in flight`` (between-legs, past the settle window)
+    for the SAME row this tick's own ``occupied`` reading was still counting
+    — so the tick never even ATTEMPTED the roll `coord release propagate`
+    would have accepted.
+
+    ``occupied == 0`` stays the cheap fast path — no extra board read. Only
+    when it is nonzero does this re-derive the SAME between-legs/settle-
+    window reading `coord release propagate` itself makes, from a fresh
+    board fetch. This is an ADVISORY re-check, not the authoritative one:
+    firing merely hands off to `coord-release-window.service`, which invokes
+    `coord release propagate` for real (never `--force`) and simply defers
+    again — costing nothing — if this read turns out to have been too
+    optimistic. So there is no harm in checking, and every reason to: the
+    alternative is a marker that can sit past its own between-legs row
+    forever with `coord drive-queue status` reporting `alert: (none)` the
+    whole time, because from the queue's own point of view nothing is wrong
+    — it is waiting on a roll, exactly as designed.
+
+    *queue_rows* are the SAME raw `drive_queue` rows this tick already read
+    (`coord.state.list_drive_queue()`) — reused rather than re-fetched, and
+    passed straight through as `assess_quiescence`'s ``queue_entries``: that
+    function reads the raw ``state``/``repo_name``/``issue_number`` columns,
+    not `QueueEntry` or `BoardView`'s reduced shapes.
+
+    A board this cannot read degrades to "no, don't fire" (never raises) —
+    the tick's own fail-closed abort already covers a board it cannot read
+    for reconciliation; a re-check that itself cannot read the board must
+    not provoke a fire it cannot justify.
+    """
+    if occupied == 0:
+        return True, ""
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    try:
+        payload = _fetch_board_payload()
+    except Exception:  # noqa: BLE001 — see docstring: fail closed, never raise
+        return False, ""
+    quiescence = rp.assess_quiescence(
+        queue_entries=queue_rows,
+        assignments=payload.get("assignments") or [],
+        issues=payload.get("issues") or [],
+        now=now,
+    )
+    return quiescence.quiescent, quiescence.reason
+
+
 def _fire_pending_roll(*, dry_run: bool = False) -> tuple[bool, str]:
     """Best-effort ``systemctl --user start --no-block
     coord-release-window.service`` (#2587 design point 3).
@@ -2954,16 +3016,22 @@ def _escalate_persistent_self_cordon(
     _write_self_cordon_state(state)
 
 
-def _fetch_board_view() -> BoardView:
-    """Board + live drive sessions, typed.
+def _fetch_board_payload() -> dict:
+    """The raw ``/board`` payload (+ standalone top-ups), untyped.
 
-    Raises whatever the fetch raised — the caller turns that into a fail-closed
-    abort.  ``list_drive_sessions()`` is deliberately NOT allowed to fail the
-    tick: it returns ``[]`` when tmux is unavailable, and the board's
-    ``active_work`` signal still holds the capacity line in that case.
+    Split out of :func:`_fetch_board_view` (#2870) so a caller that needs the
+    RAW ``assignments``/``issues`` rows — not `BoardView`'s already-reduced
+    per-issue facts — has one place to get them. :func:`coord.
+    release_propagate.assess_quiescence` is exactly such a caller (#2870's
+    between-legs settle-window re-check for the roll-pending fire condition,
+    see :func:`_roll_pending_may_fire`): it reads raw assignment rows
+    (``machine_name``/``dispatched_at``/``finished_at``) `BoardView` never
+    carries at all.
+
+    Raises whatever the fetch raised — same fail-closed contract as before
+    this split.
     """
     from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
-    from coord.drive import list_drive_sessions  # noqa: PLC0415
     from coord.drive_state import BoardFetcher  # noqa: PLC0415
 
     payload = BoardFetcher().fetch()
@@ -2986,6 +3054,20 @@ def _fetch_board_view() -> BoardView:
             top_up["merge_queue"] = _local_merge_queue_rows()
         if top_up:
             payload = {**payload, **top_up}
+    return payload
+
+
+def _fetch_board_view() -> BoardView:
+    """Board + live drive sessions, typed.
+
+    Raises whatever the fetch raised — the caller turns that into a fail-closed
+    abort.  ``list_drive_sessions()`` is deliberately NOT allowed to fail the
+    tick: it returns ``[]`` when tmux is unavailable, and the board's
+    ``active_work`` signal still holds the capacity line in that case.
+    """
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+
+    payload = _fetch_board_payload()
     return build_board_view(payload, list_drive_sessions())
 
 
@@ -4382,7 +4464,12 @@ def drive_queue_tick(
                 f"could not read the board — aborting without launching anything: {exc}"
             ) from None
 
-        entries = entries_from_rows(list_drive_queue())
+        # #2870: the raw rows are kept alongside the typed `entries` — see
+        # `_roll_pending_may_fire`'s `queue_rows` parameter, which needs the
+        # untyped `state`/`repo_name`/`issue_number` shape
+        # `coord.release_propagate.assess_quiescence` reads, not `QueueEntry`.
+        raw_queue_rows = list_drive_queue()
+        entries = entries_from_rows(raw_queue_rows)
 
         # #2587: is a fleet roll queued for the next inter-drive gap? Read
         # BEFORE `effective_capacity` is resolved — a live, unexpired marker
@@ -4563,7 +4650,24 @@ def drive_queue_tick(
         # `--dry-run`'s "mutate nothing" contract for every other write in
         # this function.
         if roll_pending is not None:
-            if plan.occupied == 0:
+            # #2870: `plan.occupied == 0` alone is the pre-#2854 reading —
+            # a between-legs row with no live assignment right now, past
+            # its settle window, can sit `occupied` here (e.g. #1870's
+            # `unknown` verdict for a row launched on another host)
+            # forever, even though `coord release propagate` itself would
+            # already call the fleet quiescent for that exact row. See
+            # `_roll_pending_may_fire`'s own docstring for the full
+            # mechanism and the incident this closes.
+            fire_ready, fire_note = _roll_pending_may_fire(
+                occupied=plan.occupied, now=now, queue_rows=raw_queue_rows
+            )
+            if fire_ready:
+                if plan.occupied and fire_note:
+                    click.echo(
+                        f"(queue still shows {plan.occupied} occupying a slot, "
+                        f"but #2854's settle-window reading calls it quiescent — "
+                        f"{fire_note} — attempting the roll anyway)"
+                    )
                 fired, detail = _fire_pending_roll()
                 if fired:
                     # #2587 review: this must NOT clear the marker. `fired`

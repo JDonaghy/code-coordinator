@@ -487,3 +487,59 @@ def test_window_at_threshold_sets_the_marker_exactly_as_before(
     assert record["status"] == rw.STATUS_ROLL_PENDING
     assert record["releases_behind"] == 10
     assert record["min_releases_behind"] == 10
+    # #2870: the marker itself carries the threshold it was armed at.
+    assert pending.min_releases_behind == 10
+
+
+def test_2870_a_marker_armed_below_the_fleet_default_still_discharges_at_its_own_threshold(
+    tmp_path, state_dir, no_network, monkeypatch
+):
+    """#2870's own regression test: `nightly-window --min-behind 1` against a
+    fleet configured `min_releases_behind: 5` must not produce a marker that
+    can never clear. Before the fix, the marker carried no threshold at all,
+    so every discharge attempt (this command's own belt-and-braces `coord
+    release propagate` call, and every re-entry the drive-queue tick fires
+    via `coord-release-window.service`) re-resolved the fleet default (5)
+    and held forever at "N behind, threshold 5" — exactly the 2026-08-28
+    incident (`v0.5.259`/`v0.5.260`, held ~40 minutes with two machines
+    idle, `alert: (none)` throughout)."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(VALID_CONFIG + "\npropagation:\n  min_releases_behind: 5\n")
+
+    # ── night 1: armed at --min-behind 1, well below the fleet default.
+    _stub_behind(monkeypatch, behind=1)
+    _stub_window_verify(monkeypatch, daemon_version="0.4.100")
+    arm = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(config_path),
+         "--target", "0.4.111", "--daemon-host", "server", "--min-behind", "1"],
+    )
+    assert arm.exit_code == 0, arm.output
+    armed = dq_cmd.read_roll_pending()
+    assert armed is not None
+    assert armed.min_releases_behind == 1  # NOT the fleet default of 5
+
+    # ── night 2 (or the tick's own `coord-release-window.service` re-entry —
+    #    that unit's ExecStart carries the SAME operator-added `--min-behind
+    #    1` every time it runs, exactly like `coord-release-window.service`
+    #    in the issue's own evidence section): same marker, same target.
+    #    Before #2870, the belt-and-braces `coord release propagate` call
+    #    never passed `--min-behind` AT ALL regardless of what this run's own
+    #    gate resolved, so the real subprocess fell back to the fleet default
+    #    (5) and held. After the fix it is gated at the marker's own arm
+    #    threshold (1).
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    fire = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(config_path),
+         "--target", "0.4.111", "--daemon-host", "server", "--min-behind", "1"],
+    )
+    assert fire.exit_code == 0, fire.output
+    assert len(prop_calls) == 1
+    assert prop_calls[0]["min_behind"] == 1, (
+        "the discharge call re-resolved the fleet default instead of the "
+        "marker's own arm threshold — this is the exact #2870 freeze"
+    )
+    # And the marker actually clears — it does not survive the next
+    # propagate the way it did in the incident.
+    assert dq_cmd.read_roll_pending() is None
