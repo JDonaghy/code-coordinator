@@ -459,6 +459,37 @@ def test_a_busy_daemon_host_defers_the_whole_run(
     assert pending.reason == "propagate"
 
 
+def test_a_busy_daemon_deferral_stamps_this_runs_own_threshold_onto_the_marker(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2870: the marker `_ensure_roll_pending_marker` arms here must carry
+    THIS run's own already-passed `--min-behind`/`propagation.
+    min_releases_behind` threshold (`RollPending.min_releases_behind`) — so
+    whatever eventually discharges it (`coord release nightly-window`'s
+    belt-and-braces `coord release propagate` call, or the drive-queue
+    tick's spawned `coord-release-window.service`) is gated at the SAME
+    threshold that armed it, not a threshold re-resolved from scratch."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "server", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    monkeypatch.setattr(
+        release_cmd, "_releases_behind_count", lambda *a, **k: (7, None),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--min-behind", "5"],
+    )
+    assert result.exit_code == 0, result.output
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.min_releases_behind == 5
+
+
 def test_a_busy_daemon_dry_run_defers_without_writing_the_marker(
     valid_config_path, state_dir, no_network, monkeypatch
 ):

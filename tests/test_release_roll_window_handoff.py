@@ -467,6 +467,99 @@ class TestTickFiresAtTheInterDriveGap:
         assert payload["roll_pending"]["target_version"] == "0.5.230"
 
 
+class TestTickFiresOnTheBetweenLegsSettleWindowReading:
+    """#2870 part 2: apply #2854's between-legs/settle-window reading to the
+    tick's own fire condition, not just `coord release propagate`'s.
+
+    The 2026-08-28 incident: a drive-queue row stayed `running` in the
+    queue (Work and Test legs landed, Review not yet dispatched) with its
+    last-known host `elitebook` — no LIVE assignment right now, and long
+    past the #2854 settle window. `coord release propagate`, run directly,
+    read this as `quiescent — nothing in flight` (see `test_release_roll_
+    between_legs_2854.py`'s own coverage of `assess_quiescence` for that
+    half). But the tick's own reconciliation, asked from `dellserver`
+    (#1870: a local tmux read proves nothing about a row launched
+    elsewhere), read the SAME row as `unknown` — still occupying a slot —
+    and the pre-#2870 fire condition (`plan.occupied == 0`) never fired the
+    pending roll at all: the queue froze on a strictly stricter bar than
+    the one that actually mattered.
+    """
+
+    def _seed_between_legs_row(
+        self, coord_db, issue: int, *, finished_ago: float, host: str = "elitebook"
+    ) -> None:
+        """A `running` queue row whose last leg finished on *host*
+        *finished_ago* seconds before "now" — no live assignment for it
+        right now (the row is between legs), matching the shape
+        `test_release_roll_between_legs_2854.py` builds directly against
+        `assess_quiescence`, here seeded through the real DB so the whole
+        `coord drive-queue tick` CLI path exercises it end to end."""
+        finished_at = time.time() - finished_ago
+        state._update_drive_queue_entry_local(
+            REPO, issue, state="running", launch_host=host,
+            launched_at=finished_at - 5000.0,
+        )
+        coord_db.execute(
+            "INSERT INTO assignments "
+            "(assignment_id, repo_name, issue_number, issue_title, "
+            " machine_name, type, status, dispatched_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"a-{issue}-work", REPO, issue, f"issue {issue}", host, "work",
+             "done", finished_at - 500.0, finished_at),
+        )
+        coord_db.commit()
+
+    def test_a_between_legs_row_still_fires_the_roll_even_though_occupied_is_nonzero(
+        self, cli, seed, launches, coord_db, monkeypatch
+    ):
+        seed(issues={2862: "open"})
+        cli("add", REPO, "2862")
+        # Launched on a DIFFERENT host than the tick below runs on — #1870's
+        # `unknown` verdict, still occupying a slot from THIS tick's own
+        # reconciliation, with no local tmux session to disprove it.
+        self._seed_between_legs_row(coord_db, 2862, finished_ago=1000.0)
+        dq_cmd.write_roll_pending(_pending(target_version="9.9.9"))
+
+        monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+        result = cli("tick")
+
+        assert result.exit_code == 0, result.output
+        # The tick's OWN reconciliation still reads this as occupied — #1870
+        # never disproves a foreign `launch_host`.
+        entry = queued(2862)
+        assert entry["state"] == "running"
+
+        # And yet — the whole point — the roll still fires: #2854's
+        # settle-window reading, re-derived for this exact row, overrides
+        # the strict `occupied == 0` bar.
+        assert len(launches) == 1, launches
+        assert "coord-release-window.service" in launches[0]
+
+        survived = dq_cmd.read_roll_pending()
+        assert survived is not None, "the tick must never clear the marker itself"
+        assert survived.target_version == "9.9.9"
+
+    def test_a_between_legs_row_still_within_the_settle_window_does_not_fire(
+        self, cli, seed, launches, coord_db, monkeypatch
+    ):
+        """The mirror case: the same shape, but the gap is only 5s old — too
+        fresh to trust (#2854's own debounce). Must NOT fire."""
+        seed(issues={2863: "open"})
+        cli("add", REPO, "2863")
+        self._seed_between_legs_row(coord_db, 2863, finished_ago=5.0)
+        dq_cmd.write_roll_pending(_pending(target_version="9.9.9"))
+
+        monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+        result = cli("tick")
+
+        assert result.exit_code == 0, result.output
+        assert launches == [], (
+            "a gap too fresh to trust must not fire the roll — #2854's own "
+            "debounce"
+        )
+        assert dq_cmd.read_roll_pending() is not None
+
+
 class TestRollPendingDoesNotBlockDirectMerges:
     """#2587 review (non-blocking): forcing the tick's reconcile-only
     capacity posture while a roll is pending must not also suppress the

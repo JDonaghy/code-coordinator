@@ -1561,6 +1561,26 @@ class RollPending:
     #: fleet still busy — bumped by the shell each tick it does NOT fire the
     #: roll. Never bumped by `plan_tick` itself (pure; no counting state).
     deferrals: int = 0
+    #: #2870: the ``propagation.min_releases_behind``/``--min-behind``
+    #: threshold this marker was ARMED at — `coord release nightly-window`/
+    #: `coord.commands.release._ensure_roll_pending_marker` stamp the
+    #: effective threshold THEIR OWN run resolved (override, else
+    #: `coordinator.yml`, else 1) at the moment they write this marker.
+    #: Before #2870, discharge (`_run_propagate`'s `coord release propagate`
+    #: subprocess) always re-resolved its OWN threshold from scratch — the
+    #: fleet default, never whatever `--min-behind` armed this marker at —
+    #: so a marker armed below the fleet default (e.g. a
+    #: `coord-release-window.service` ExecStart carrying `--min-behind 1`
+    #: against a fleet configured `min_releases_behind: 5`) could never
+    #: reach the threshold its own discharge path required and froze the
+    #: queue forever. Carried through to `_run_propagate` as `--min-behind`
+    #: so discharge is gated at the SAME threshold arm used. `None` for a
+    #: marker written before this field existed (`from_dict`'s tolerant
+    #: parse) or one whose arming run never evaluated the gate at all
+    #: (`effective_min_behind <= 1`) — the discharge call then falls back to
+    #: ITS OWN effective threshold, matching the pre-#2870 behaviour rather
+    #: than guessing.
+    min_releases_behind: int | None = None
 
     def expired(self, now: float) -> bool:
         """Has this marker outlived ITS OWN bound — TTL or deferral ceiling?
@@ -1589,6 +1609,7 @@ class RollPending:
             "ttl_seconds": self.ttl_seconds,
             "max_deferrals": self.max_deferrals,
             "deferrals": self.deferrals,
+            "min_releases_behind": self.min_releases_behind,
         }
 
     @classmethod
@@ -1615,6 +1636,7 @@ class RollPending:
                 data.get("max_deferrals"), ROLL_PENDING_DEFAULT_MAX_DEFERRALS
             ),
             deferrals=_as_int_default(data.get("deferrals"), 0),
+            min_releases_behind=_as_optional_int(data.get("min_releases_behind")),
         )
 
 
@@ -1630,6 +1652,21 @@ def _as_int_default(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_optional_int(value: Any) -> int | None:
+    """Tolerant parse for a field that is legitimately absent (``None``),
+    unlike :func:`_as_int_default`'s fields which always have a real
+    fallback — see `RollPending.min_releases_behind`'s own docstring for why
+    "not recorded" must stay `None` rather than silently becoming some
+    default int a caller could mistake for a real threshold.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

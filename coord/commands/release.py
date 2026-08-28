@@ -654,10 +654,23 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
 
 
 def _ensure_roll_pending_marker(
-    target_version: str, *, reason: str, dry_run: bool = False
+    target_version: str, *, reason: str, min_releases_behind: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """#2587: make sure a roll-pending marker exists for *target_version*,
     without resetting an already-live one's clock.
+
+    #2870: *min_releases_behind* is the effective `propagation.
+    min_releases_behind`/`--min-behind` threshold THIS run resolved and
+    already gated on before reaching this call (see the #2583 gate just
+    above this function's one call site) — stamped onto the marker
+    (`RollPending.min_releases_behind`) so whatever eventually discharges it
+    (`coord.commands.release._run_propagate`, threaded a matching
+    `--min-behind`) is gated at the SAME threshold this arm used, not
+    whatever threshold ITS OWN invocation happens to resolve. Like
+    `target_version`/`reason`, this is updated on every re-arm (a re-arm is
+    a fresh decision about what SHOULD roll and at what threshold) — only
+    `set_at`/`deferrals` stay frozen (see below).
 
     #2869: ``dry_run=True`` is the ONE seam every call site must go through —
     it never touches disk, only echoing what it *would* have written, in the
@@ -712,7 +725,10 @@ def _ensure_roll_pending_marker(
             )
             return
         write_roll_pending(
-            _dataclasses.replace(existing, target_version=target_version, reason=reason)
+            _dataclasses.replace(
+                existing, target_version=target_version, reason=reason,
+                min_releases_behind=min_releases_behind,
+            )
         )
         return
     if dry_run:
@@ -723,7 +739,10 @@ def _ensure_roll_pending_marker(
         )
         return
     write_roll_pending(
-        RollPending(target_version=target_version, set_at=_time.time(), reason=reason)
+        RollPending(
+            target_version=target_version, set_at=_time.time(), reason=reason,
+            min_releases_behind=min_releases_behind,
+        )
     )
 
 
@@ -1123,7 +1142,14 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # too, so a plain periodic `coord-release-propagate.timer` run also
         # arms the drive-queue tick's own inter-drive-gap trigger instead of
         # requiring an operator to separately reach for `nightly-window`.
-        _ensure_roll_pending_marker(record.target_version, reason="propagate", dry_run=dry_run)
+        # #2870: stamp THIS run's own already-passed `effective_min_behind`
+        # (resolved above, 3a) onto the marker, so whatever discharges it is
+        # gated at the threshold that armed it, not a threshold re-resolved
+        # from scratch later.
+        _ensure_roll_pending_marker(
+            record.target_version, reason="propagate",
+            min_releases_behind=effective_min_behind, dry_run=dry_run,
+        )
         _finish(rp.STATUS_DEFERRED, 0)
 
     still_busy = busy_hosts - set(current)
@@ -2846,7 +2872,7 @@ def _latest_propagate_record_since(state_dir: Path, since: float) -> dict | None
 
 def _run_propagate(
     *, daemon_host: str, target_version: str, config_path: Path, state_dir: Path,
-    runner=None, now_fn=None,
+    min_behind: int | None = None, runner=None, now_fn=None,
 ) -> tuple[str, int, str, float | None]:
     """``coord release propagate --daemon-host ... --target ... --json``.
 
@@ -2857,6 +2883,20 @@ def _run_propagate(
     left to re-resolve PyPI's "latest" a second time — so the version this
     run decided was needed is the version that actually rolls, even if a new
     release lands on PyPI mid-drain.
+
+    #2870: *min_behind*, when given, is passed through as `--min-behind` —
+    the threshold the roll-pending marker being discharged here was ARMED
+    at (`RollPending.min_releases_behind`), NOT this process's own
+    `propagation.min_releases_behind`. Before this, this call never passed
+    `--min-behind` at all, so `coord release propagate` always re-resolved
+    ITS OWN threshold from `coordinator.yml` — a marker armed below the
+    fleet default (e.g. `coord release nightly-window --min-behind 1`
+    against a fleet configured `min_releases_behind: 5`) could never reach
+    the threshold ITS discharge required and held forever, `alert: (none)`
+    the whole time. ``None`` (an old marker with no recorded threshold, or
+    one whose arming run never evaluated the gate) omits the flag, matching
+    the pre-#2870 behaviour — this process resolves its own default exactly
+    as it always did.
 
     Returns ``(status, exit_code, combined_output, propagate_started_at)``.
     ``status`` is read from the propagation journal entry that run itself
@@ -2883,6 +2923,8 @@ def _run_propagate(
         "--daemon-host", daemon_host, "--target", target_version,
         "--json", "--config", str(config_path),
     ]
+    if min_behind is not None:
+        argv.extend(["--min-behind", str(min_behind)])
     try:
         proc = run(argv, capture_output=True, text=True, timeout=1800)
     except Exception as exc:  # noqa: BLE001
@@ -3224,9 +3266,24 @@ def release_nightly_window(
         # attempt, safe to make redundantly since `coord release propagate`
         # never carries `--force` here (trap 1) and simply defers again if
         # the fleet is still busy.
+        # #2870: gate the discharge at the threshold the marker was ARMED
+        # at (`existing.min_releases_behind`), not whatever `coord release
+        # propagate` would re-resolve on its own — that mismatch is exactly
+        # how a marker armed via `--min-behind 1` froze the queue against a
+        # fleet configured `min_releases_behind: 5`, forever holding at "3
+        # behind, threshold 5" no matter how many times this fired. A
+        # marker with no recorded threshold (written before this field
+        # existed, or whose arming run never evaluated the gate at all)
+        # falls back to THIS run's own `effective_min_behind` — the same
+        # value it would have used before #2870.
         prop_status, prop_exit, prop_output, prop_started_at = _run_propagate(
             daemon_host=daemon_name, target_version=existing.target_version,
             config_path=config_path, state_dir=state_dir,
+            min_behind=(
+                existing.min_releases_behind
+                if existing.min_releases_behind is not None
+                else effective_min_behind
+            ),
         )
         record.propagate_status = prop_status
         record.propagate_exit_code = prop_exit
@@ -3303,6 +3360,13 @@ def release_nightly_window(
     # re-arm — the queue froze because the bound that was supposed to save it
     # could never be reached. Only a genuinely fresh marker (no existing one
     # at all) gets a new clock.
+    # #2870: every write below stamps `effective_min_behind` — THIS run's
+    # own already-resolved threshold (section 2b above) — onto the marker,
+    # so `_run_propagate`'s belt-and-braces call above (and any future
+    # discharge) is gated at the SAME threshold that armed it, not whatever
+    # `coord release propagate` would re-resolve on its own later. Updated
+    # on every re-arm, same as `target_version`/`reason` just below — only
+    # `set_at`/`deferrals` are the frozen "clock" #2607 protects.
     if existing is not None:
         click.echo(
             f"replacing stale roll-pending marker ({existing.describe()}) "
@@ -3313,6 +3377,7 @@ def release_nightly_window(
         write_roll_pending(
             _dataclasses.replace(
                 existing, target_version=record.target_version, reason="nightly-window",
+                min_releases_behind=effective_min_behind,
             )
         )
     else:
@@ -3321,6 +3386,7 @@ def release_nightly_window(
                 target_version=record.target_version,
                 set_at=time.time(),
                 reason="nightly-window",
+                min_releases_behind=effective_min_behind,
             )
         )
     click.echo(

@@ -426,6 +426,59 @@ def test_a_marker_pending_for_the_same_target_is_fired_and_cleared_on_success(
     assert not escalations
 
 
+def test_a_marker_pending_for_the_same_target_discharges_at_its_own_arm_threshold(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2870: the belt-and-braces `coord release propagate` call this
+    command makes for an existing marker must be gated at the threshold the
+    marker was ARMED at (`RollPending.min_releases_behind`), never at
+    whatever `propagation.min_releases_behind` (or this run's OWN
+    `--min-behind`) happens to resolve to. Before #2870 this kwarg was never
+    passed at all, so a marker armed via `--min-behind 1` against a fleet
+    configured `min_releases_behind: 5` could never discharge — every
+    belt-and-braces attempt (and every tick-fired `coord-release-window.
+    service` re-entry) re-resolved the fleet default and held forever."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    # Armed at threshold 7 (e.g. by a prior `--min-behind 7` run) — a value
+    # deliberately unreachable by THIS run's own resolution (no `--min-behind`
+    # / no `propagation:` block here, so it defaults to 1), proving the
+    # marker's own threshold is what's threaded through, not this run's.
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31", min_releases_behind=7))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(prop_calls) == 1
+    assert prop_calls[0]["min_behind"] == 7  # the marker's own arm threshold, not 1
+
+
+def test_a_marker_with_no_recorded_threshold_falls_back_to_this_runs_own(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """A marker written before #2870 (or whose arming run never evaluated
+    the #2583 gate at all) carries no `min_releases_behind` — the discharge
+    call falls back to THIS run's own effective threshold, exactly the
+    pre-#2870 behaviour, rather than guessing or omitting the flag."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31", min_releases_behind=None))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(prop_calls) == 1
+    # No `--min-behind` and no `propagation:` block on THIS run -> defaults
+    # to 1, exactly as `_resolve_min_behind` always has.
+    assert prop_calls[0]["min_behind"] == 1
+
+
 def test_a_marker_pending_for_the_same_target_up_to_date_race_clears_it_too(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
