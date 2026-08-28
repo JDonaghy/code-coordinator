@@ -88,10 +88,14 @@ Everything else is compared as-is on purpose.  In particular floats are **not**
 rounded: SQLite's ``REAL`` is 8-byte and Postgres's ``REAL`` is 4-byte, so a
 ``cost_usd`` that comes back ``0.41999998688697815`` on one side is exactly the
 kind of silent write-path divergence this harness exists to surface, and
-rounding it away would make the oracle lie.  Likewise ``True`` is not folded
-into ``1``: an ``INTEGER``-backed flag column arriving as a Python ``bool``
-ships as JSON ``true`` and fails the parse of the whole ``BoardPayload``
-(#632/#546/#628).
+rounding it away would make the oracle lie.
+
+Comparison is also **type-aware** (:func:`values_differ`), because Python's
+``1 == True`` and ``1 == 1.0`` would otherwise silently tolerate two of the
+divergences that matter most: an ``INTEGER``-backed flag column arriving as a
+Python ``bool`` ships as JSON ``true`` and fails the parse of the whole
+``BoardPayload`` (#632/#546/#628), and a JSON ``1`` and a JSON ``1.0``
+deserialise differently into a typed Rust struct.
 """
 
 from __future__ import annotations
@@ -849,9 +853,6 @@ class Dump:
     def row_count(self, table: str) -> int:
         return len(self.rows.get(table, []))
 
-    def non_empty_tables(self) -> tuple[str, ...]:
-        return tuple(t for t in self.tables if self.rows[t])
-
 
 def dump_database(conn: Any, *, label: str) -> Dump:
     """Read every table on *conn* back out in canonical form."""
@@ -1166,6 +1167,13 @@ def compare_backends(
     return compare_dumps(dumps[0], dumps[1])
 
 
+#: :func:`main`'s exit status when a requested backend could not be opened at
+#: all.  Distinct from 1 ("the backends disagree") on purpose: an operator
+#: scripting the cutover check must be able to tell "Postgres isn't reachable"
+#: apart from "Postgres is reachable and wrong".
+EXIT_UNAVAILABLE = 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tests.write_parity",
@@ -1177,6 +1185,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--a", default="sqlite", help="first backend (default: sqlite)")
     parser.add_argument("--b", default="sqlite", help="second backend (default: sqlite)")
     args = parser.parse_args(argv)
+
+    from tests.backends import BACKEND_POSTGRES, postgres_available
+
+    if BACKEND_POSTGRES in (args.a, args.b):
+        unavailable = postgres_available()
+        if unavailable:
+            # An actionable line, not a driver traceback: "psycopg is missing"
+            # and "no server at that DSN" are setup problems with known fixes,
+            # and the message already names both.
+            print(f"cannot run: {unavailable}", file=sys.stderr)
+            return EXIT_UNAVAILABLE
 
     report = compare_backends(args.a, args.b)
     print(report.render())
