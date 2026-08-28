@@ -544,30 +544,43 @@ def test_cli_prints_the_report_and_exits_zero_when_clean(capsys) -> None:
     assert "no differences" in out
 
 
+def test_cli_reports_an_unreachable_backend_distinctly(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """"Postgres isn't reachable" and "Postgres is reachable and wrong" must be
+    distinguishable by exit status — an operator scripting the cutover check
+    reads one as "go install a server" and the other as "stop the cutover"."""
+    monkeypatch.setattr(backends, "postgres_available", lambda: "no server here")
+    exit_code = write_parity.main(["--b", "postgres"])
+    captured = capsys.readouterr()
+    assert exit_code == write_parity.EXIT_UNAVAILABLE
+    assert "no server here" in captured.err
+    assert captured.out == ""
+
+
 def test_cli_exits_non_zero_when_the_backends_disagree(
     monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    monkeypatch.setattr(state, "_UPSERT_SQL", _insert_or_replace_variant())
+    """The status an operator actually branches on.
+
+    The divergence is injected by giving the *second* side a shortened workload
+    — the same "a write silently did nothing on one backend" shape as
+    :func:`test_catches_a_write_that_silently_does_nothing`, driven all the way
+    through ``main()`` so the exit code and the printed report are both real.
+    """
     real_run_and_dump = write_parity.run_and_dump
-    calls: list[int] = []
+    reduced = tuple(s for s in WORKLOAD if s.name != "snapshot_config")
+    sides: list[str] = []
 
-    def _first_side_is_unmutated(conn, *, label, workload=WORKLOAD):
-        """Run side A with the real statement and side B with the injected one —
-        the CLI's own two-backend loop, with a divergence in the middle."""
-        calls.append(1)
-        if len(calls) == 1:
-            with monkeypatch.context() as ctx:
-                ctx.setattr(state, "_UPSERT_SQL", _ORIGINAL_UPSERT_SQL)
-                return real_run_and_dump(conn, label=label, workload=workload)
-        return real_run_and_dump(conn, label=label, workload=workload)
+    def _second_side_skips_a_step(conn, *, label, workload=WORKLOAD):
+        sides.append(label)
+        chosen = workload if len(sides) == 1 else reduced
+        return real_run_and_dump(conn, label=label, workload=chosen)
 
-    monkeypatch.setattr(write_parity, "run_and_dump", _first_side_is_unmutated)
+    monkeypatch.setattr(write_parity, "run_and_dump", _second_side_skips_a_step)
     exit_code = write_parity.main([])
     out = capsys.readouterr().out
+
     assert exit_code == 1
     assert "difference(s)" in out
-    assert "assignments" in out
-
-
-#: Captured at import, before any test can monkeypatch it.
-_ORIGINAL_UPSERT_SQL = state._UPSERT_SQL
+    assert "machines:" in out
