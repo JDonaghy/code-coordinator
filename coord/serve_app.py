@@ -43,8 +43,20 @@ to the pre-#1943 response, forever, for every pinned client that never sends
 the header. A value outside ``[coord.dao.MIN_SCHEMA_VERSION,
 coord.dao.SCHEMA_VERSION]`` (or non-integer) is refused with a 4xx naming the
 supported range, never silently downgraded. ``/healthz`` advertises that range
-as ``schema_min``/``schema_max``. No v2 response body exists yet -- see
-``docs/STORE_SERVICE.md`` Phase B for what comes after this mechanism.
+as ``schema_min``/``schema_max``.
+
+Resource-shaped routes (#1944): ``PATCH /issue/{repo_name}/{number}``,
+``GET``/``POST /issue/{repo_name}/{number}/comments`` and
+``PATCH /assignment/{assignment_id}`` sit **alongside** the RPC routes they
+will eventually replace, which are untouched and keep working unchanged.
+Request/response shapes are the explicit DTOs in ``coord/rest_schema.py``
+(the #1849 discipline, applied to the write surface);
+:data:`RPC_SUPERSEDED_BY_RESOURCE` is the mapping, and the routes it names are
+marked ``deprecated`` in the served spec.  ``SCHEMA_VERSION`` is deliberately
+**not** bumped: the DTO shapes are new surface with no pinned client, so they
+need no negotiated opt-in, and a bump would advertise a v2 that the other ~50
+routes do not serve.  Migrating callers is #1946; retiring the RPC routes is
+#1947, gated on #1945's zero-usage telemetry.
 """
 
 from __future__ import annotations
