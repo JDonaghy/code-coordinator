@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from coord import db as db_mod
+from coord import sql
 from coord.dao import CoordStore, SqliteStore
 from coord.db import _ensure_schema
 
@@ -37,6 +39,27 @@ def read_db(tmp_path: Path) -> Path:
     conn.commit()
     conn.close()
     return p
+
+
+@pytest.fixture(autouse=True)
+def _default_to_sqlite_store_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#827: ``SqliteStore._connect()`` now consults
+    ``coord.db._resolve_store_target()`` to decide its backend on every call.
+    Unlike ``coord.db.get_connection()``'s write-path singleton (protected by
+    conftest.py's autouse ``coord_db`` fixture, which overrides the
+    connection before ``_resolve_store_target`` is ever reached),
+    ``SqliteStore`` has no such override -- so without this, a real ambient
+    ``coordinator.yml`` on whatever machine runs this suite (e.g. an
+    operator's own ``~/.coord/coordinator.yml``) could silently point every
+    read in this file at Postgres. Pin the default to SQLite here, the same
+    way conftest.py's ``_no_board_service`` pins board-service resolution off
+    by default -- a test that wants to exercise the Postgres routing
+    overrides this via its own ``monkeypatch.setattr`` (applied after this
+    fixture's setup, so it wins).
+    """
+    monkeypatch.setattr(
+        db_mod, "_resolve_store_target", lambda: db_mod._StoreTarget(backend=sql.DIALECT_SQLITE)
+    )
 
 
 def _dummy_for(param: inspect.Parameter) -> object:
@@ -146,3 +169,96 @@ def test_audit_recent_count_fails_open_when_table_missing(tmp_path: Path) -> Non
         assert store._audit_recent_count(ro_conn) == 0
     finally:
         ro_conn.close()
+
+
+# ── _connect() dialect routing (#827 review fix) ─────────────────────────────
+#
+# Blocking finding: `SqliteStore._connect()` used to hardcode
+# `backend=sql.DIALECT_SQLITE` unconditionally, so `dao.py`'s read path
+# (the `coord serve` daemon's `/board`, `coord notifier`, `coord reports`,
+# `coord usage`, ...) was structurally incapable of ever reaching a
+# configured Postgres store -- with `store.backend: postgres` fully
+# configured, writes went to Postgres while every read silently kept
+# serving a stale, empty local SQLite file. `_connect()` now resolves its
+# backend the same way `coord.db.get_connection()`'s write path does.
+
+
+class TestConnectDialectRouting:
+    def test_connect_uses_sqlite_by_default(
+        self, read_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sanity check for the routing itself (not just the autouse
+        default): explicitly resolving to SQLite still opens the on-disk
+        path this store was constructed with."""
+        monkeypatch.setattr(
+            db_mod,
+            "_resolve_store_target",
+            lambda: db_mod._StoreTarget(backend=sql.DIALECT_SQLITE),
+        )
+        store = SqliteStore(read_db)
+        conn = store._connect()
+        try:
+            assert sql.detect_dialect(conn) == sql.DIALECT_SQLITE
+        finally:
+            conn.close()
+
+    def test_connect_routes_to_postgres_when_store_configured(
+        self, read_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When `coordinator.yml` configures `store.backend: postgres`,
+        `_connect()` must ask `coord.sql.connect` for a Postgres connection
+        with the configured DSN -- not silently keep opening
+        `self._path` (SQLite) regardless of config, which is exactly the
+        split-brain this fix closes. `coord.sql.connect` itself is faked
+        here (psycopg is an optional dependency, not installed in this
+        environment -- see coord/sql.py's module docstring); what's under
+        test is `_connect()`'s ROUTING, not the Postgres connection
+        machinery, which `tests/test_sql_dialect.py` already covers via its
+        own fake-psycopg-shaped connections.
+        """
+        monkeypatch.setattr(
+            db_mod,
+            "_resolve_store_target",
+            lambda: db_mod._StoreTarget(
+                backend=sql.DIALECT_POSTGRES, dsn="postgresql://user@host/db"
+            ),
+        )
+        # Past `coord.db.refuse_postgres_under_pytest`'s #1960-analogue guard
+        # -- mirrors `tests/test_db.py`'s own `_bypass_pytest_trigger` pattern
+        # for exercising code on the far side of that guard.
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+        calls: list[dict] = []
+
+        def _fake_sql_connect(**kwargs):
+            calls.append(kwargs)
+            return sqlite3.connect(":memory:")
+
+        monkeypatch.setattr(sql, "connect", _fake_sql_connect)
+
+        store = SqliteStore(read_db)
+        conn = store._connect()
+        try:
+            assert calls == [
+                {"backend": sql.DIALECT_POSTGRES, "dsn": "postgresql://user@host/db"}
+            ]
+        finally:
+            conn.close()
+
+    def test_connect_refuses_postgres_under_pytest(
+        self, read_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1960's SQLite write-path guard has a read-path analogue here too
+        (`coord.db.refuse_postgres_under_pytest`) -- no test should ever open
+        a real Postgres socket, even if `_resolve_store_target()` somehow
+        resolves to one (a leaked ambient config, a copy-pasted fixture)."""
+        monkeypatch.setattr(
+            db_mod,
+            "_resolve_store_target",
+            lambda: db_mod._StoreTarget(
+                backend=sql.DIALECT_POSTGRES, dsn="postgresql://user@host/db"
+            ),
+        )
+        store = SqliteStore(read_db)
+        with pytest.raises(db_mod.ProductionDatabaseGuardError):
+            store._connect()
