@@ -41,6 +41,13 @@ const APPROVED_COL_CLIENT: usize = 22;
 const APPROVED_COL_REPOS: usize = 16;
 const APPROVED_COL_OUTCOME: usize = 32;
 
+/// #2863: label of the attended (`--interactive`, #2750) intake-session
+/// context-menu item. Deliberately shares no substring with the sealed
+/// ms-67 slice's `PULL_ITEM` needle ("Pull into decomposition session") so
+/// that slice's `find`/`screen_contains` can never match this row by
+/// accident.
+pub(crate) const APPROVED_ATTENDED_INTAKE_ITEM: &str = "Open attended intake session…";
+
 /// Contract §3c: the literal placeholder for a row whose `repos_for_project`
 /// resolved empty — never a blank cell, so "no mapping" and "not yet
 /// loaded" are never visually indistinguishable.
@@ -168,32 +175,102 @@ impl CoordApp {
         })
     }
 
-    /// Contract §4a: the one-item context menu for an approved-work-items
-    /// row — "Pull into decomposition session", disabled (present, greyed,
-    /// inert) when the row's `repos` resolved empty (the same "— no mapping
-    /// —" condition §3c renders). Re-resolves `submission_id` against the
-    /// current `approved_submissions()` rather than trusting a cached flag
-    /// on the target, so a `/board` poll that changes the mapping between
+    /// Contract §4a: the context menu for an approved-work-items row.
+    ///
+    /// Item 1 — "Pull into decomposition session" (the HEADLESS dispatch),
+    /// disabled (present, greyed, inert) when the row's `repos` resolved
+    /// empty (the same "— no mapping —" condition §3c renders). It is
+    /// pinned by the sealed ms-67 slice as the **top** item with that exact
+    /// label and action id: never reorder, relabel, or re-flag it.
+    ///
+    /// Item 2 (#2863) — "Open attended intake session…", the `--interactive`
+    /// counterpart #2750 added to the very same CLI verb. It is a SECOND
+    /// item rather than a flag on the first precisely because §4c pins the
+    /// first one's argv verbatim; both stay, and #2750 wants them
+    /// interchangeable per iteration (the ledger, #2749, is the memory — not
+    /// the session). Greyed with a reason when this machine can't host it —
+    /// see [`Self::attended_intake_blocked_reason`].
+    ///
+    /// Re-resolves `submission_id` against the current
+    /// `approved_submissions()` rather than trusting a cached flag on the
+    /// target, so a `/board` poll that changes the mapping between
     /// right-click and click can't leave a stale decision baked in.
     pub(crate) fn context_menu_items_for_approved_row(
         &self,
         submission_id: &str,
     ) -> Vec<ContextMenuItem> {
-        let mapped = self
+        let repos: Vec<String> = self
             .approved_submissions()
             .iter()
             .find(|e| e.submission_id == submission_id)
-            .map(|e| !e.repos.is_empty())
-            .unwrap_or(false);
-        let item = ContextMenuItem::action(
+            .map(|e| e.repos.clone())
+            .unwrap_or_default();
+
+        let pull = ContextMenuItem::action(
             "pull-into-decomposition-session",
             "Pull into decomposition session",
         );
-        vec![if mapped {
-            item
+        let pull = if repos.is_empty() {
+            pull.disabled_because("no repo mapping")
         } else {
-            item.disabled_because("no repo mapping")
-        }]
+            pull
+        };
+
+        let attended = ContextMenuItem::action(
+            "open-attended-intake-session",
+            APPROVED_ATTENDED_INTAKE_ITEM,
+        );
+        let attended = match self.attended_intake_blocked_reason(&repos) {
+            Some(reason) => attended.disabled_because(&reason),
+            None => attended,
+        };
+
+        vec![pull, attended]
+    }
+
+    /// #2863: `Some(reason)` when "Open attended intake session…" must be
+    /// greyed for a row whose mapped repos are `repos`, `None` when it can
+    /// run here.
+    ///
+    /// Mirrors `_run_decompose_chat_interactive`'s own refusals
+    /// (`coord/commands/portal.py`) exactly, so the menu never offers a verb
+    /// the CLI is going to reject: no mapping at all, this host not being a
+    /// configured machine, or the local machine not claiming **every** repo
+    /// the submission maps to. `--interactive` is local-only for now (Track
+    /// B / #486 is remote), which is why there is no machine picker here.
+    ///
+    /// Note this reads `BoardData::local_machine`, resolved in
+    /// `data.rs` by a **case-insensitive** hostname compare — so it is not
+    /// affected by #2860 (the Python-side `local_machine()`'s
+    /// case-sensitive match). The CLI it launches still is; #2860 remains
+    /// the prerequisite for the launch itself succeeding, not for this
+    /// greying decision being right.
+    pub(crate) fn attended_intake_blocked_reason(&self, repos: &[String]) -> Option<String> {
+        if repos.is_empty() {
+            return Some("no repo mapping".to_string());
+        }
+        let local = self.data.local_machine.clone();
+        if local.is_empty() {
+            return Some("this machine is not in coordinator.yml".to_string());
+        }
+        const NO_REPOS: &[String] = &[];
+        let claimed = self
+            .data
+            .machines
+            .iter()
+            .find(|m| m.name == local)
+            .map(|m| m.repos.as_slice())
+            .unwrap_or(NO_REPOS);
+        let missing: Vec<&str> = repos
+            .iter()
+            .filter(|r| !claimed.iter().any(|c| c == *r))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(format!("{local} does not claim {}", missing.join(", ")))
+        }
     }
 
     /// Row index (into `approved_submissions()`) under `pos`, or `None` when
@@ -734,6 +811,10 @@ mod tests {
     /// `disabled_because` on an unmapped one. Unit-level, no driver/render
     /// needed; the sealed slice only ever observes the *consequence*
     /// (clicking is a no-op), never this struct-level fact directly.
+    ///
+    /// #2863 widened the menu to two items; the sealed slice pins the
+    /// headless one as the TOP item with an exact label and action id, so
+    /// this asserts index 0 specifically, not "the only item".
     #[test]
     fn context_menu_items_for_approved_row_gates_on_mapping() {
         let app = make_test_app(BoardData {
@@ -745,7 +826,6 @@ mod tests {
         });
 
         let mapped_items = app.context_menu_items_for_approved_row("sub_mapped");
-        assert_eq!(mapped_items.len(), 1);
         assert!(!mapped_items[0].disabled, "mapped row's item must be enabled");
         assert_eq!(
             mapped_items[0].action_id.as_deref(),
@@ -753,10 +833,219 @@ mod tests {
         );
 
         let unmapped_items = app.context_menu_items_for_approved_row("sub_unmapped");
-        assert_eq!(unmapped_items.len(), 1);
         assert!(
             unmapped_items[0].disabled,
             "unmapped row's item must be disabled, not omitted"
+        );
+    }
+
+    // ── #2863: the attended (`--interactive`, #2750) sibling item ──────────
+
+    /// Board data for the #2863 greying tests: one approved row mapped to
+    /// `repos`, plus a local machine named `"local"` that claims
+    /// `local_claims`.
+    fn attended_board(repos: Vec<String>, local_claims: Vec<String>) -> BoardData {
+        BoardData {
+            approved_submissions: vec![one_approved_row("sub_0000", repos)],
+            local_machine: "local".to_string(),
+            machines: vec![Machine {
+                name: "local".to_string(),
+                host: "local.example.ts.net".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: local_claims,
+                version: None,
+                worktree_bytes: 0,
+            }],
+            ..BoardData::default()
+        }
+    }
+
+    /// #2863: the new item is a SECOND entry, below the sealed slice's
+    /// pinned top item — never a change to it. The headless item's label,
+    /// position and action id are exactly what `tests/acceptance/ms-67`
+    /// asserts; regressing any of them breaks a sealed suite that only
+    /// `coord acceptance mock --amend` may move.
+    #[test]
+    fn attended_intake_item_is_added_below_the_pinned_headless_item() {
+        let app = make_test_app(attended_board(
+            vec!["claude-coordinator".to_string()],
+            vec!["claude-coordinator".to_string()],
+        ));
+        let items = app.context_menu_items_for_approved_row("sub_0000");
+
+        assert_eq!(items.len(), 2, "exactly two items: headless, then attended");
+        assert_eq!(
+            items[0].action_id.as_deref(),
+            Some("pull-into-decomposition-session"),
+            "ms-67 §4a pins the HEADLESS item as the top menu item",
+        );
+        assert_eq!(
+            items[0].label, "Pull into decomposition session",
+            "ms-67 §4a pins this label verbatim — do not touch it",
+        );
+        assert_eq!(
+            items[1].action_id.as_deref(),
+            Some("open-attended-intake-session"),
+        );
+        assert_eq!(items[1].label, APPROVED_ATTENDED_INTAKE_ITEM);
+        assert!(
+            !items[1].label.contains("Pull into decomposition session"),
+            "the attended label must not contain the sealed slice's PULL_ITEM \
+             needle, or its `find`/`click` helpers could target the wrong row",
+        );
+    }
+
+    /// #2863: `--interactive` is local-only (Track B / #486), and
+    /// `_run_decompose_chat_interactive` refuses when this machine doesn't
+    /// claim EVERY mapped repo. The menu greys the item with that reason
+    /// rather than offering a verb the CLI will reject.
+    #[test]
+    fn attended_intake_item_is_enabled_only_when_local_machine_claims_every_repo() {
+        // Claims all of them → enabled.
+        let app = make_test_app(attended_board(
+            vec!["grocery-list".to_string()],
+            vec!["grocery-list".to_string(), "claude-coordinator".to_string()],
+        ));
+        let items = app.context_menu_items_for_approved_row("sub_0000");
+        assert!(
+            !items[1].disabled,
+            "a machine claiming the mapped repo must be offered the attended \
+             session, reason: {:?}",
+            items[1].disabled_reason,
+        );
+
+        // Claims only SOME of them → greyed, and the reason names the gap.
+        let app = make_test_app(attended_board(
+            vec!["grocery-list".to_string(), "coord-portal".to_string()],
+            vec!["grocery-list".to_string()],
+        ));
+        let items = app.context_menu_items_for_approved_row("sub_0000");
+        assert!(items[1].disabled, "a partial claim must not be offered");
+        let reason = items[1].disabled_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("coord-portal"),
+            "the greyed reason must name the repo this machine lacks, got: \
+             {reason:?}",
+        );
+        assert!(
+            !items[0].disabled,
+            "the HEADLESS item stays enabled — it dispatches to whichever \
+             machine claims the repo, so the local claim is irrelevant to it",
+        );
+    }
+
+    /// #2863: with no resolvable local machine (this host isn't in
+    /// `coordinator.yml` at all) the attended item is greyed with a reason
+    /// saying so — never silently enabled into a launch that must fail.
+    #[test]
+    fn attended_intake_item_is_greyed_when_this_host_is_not_a_configured_machine() {
+        let app = make_test_app(BoardData {
+            approved_submissions: vec![one_approved_row(
+                "sub_0000",
+                vec!["grocery-list".to_string()],
+            )],
+            ..BoardData::default()
+        });
+        let items = app.context_menu_items_for_approved_row("sub_0000");
+        assert!(items[1].disabled);
+        assert!(
+            items[1]
+                .disabled_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("coordinator.yml"),
+            "reason should point at the config gap, got: {:?}",
+            items[1].disabled_reason,
+        );
+    }
+
+    /// #2863: an unmapped row greys BOTH items — the attended one for the
+    /// same "no repo mapping" reason §4a already gives the headless one.
+    #[test]
+    fn attended_intake_item_is_greyed_on_an_unmapped_row() {
+        let app = make_test_app(attended_board(vec![], vec!["grocery-list".to_string()]));
+        let items = app.context_menu_items_for_approved_row("sub_0000");
+        assert!(items[0].disabled && items[1].disabled);
+        assert_eq!(items[1].disabled_reason.as_deref(), Some("no repo mapping"));
+    }
+
+    /// #2863 acceptance: selecting the new item shells exactly
+    /// `coord portal decompose-chat <id> --interactive` — the same fact
+    /// `pull_action_spawns_the_decompose_chat_command` above asserts for the
+    /// headless argv, checked here on the launch LINE because the attended
+    /// path deliberately does not go through `command_runner` (it needs a
+    /// TTY; see `launch_attended_intake_session`).
+    #[test]
+    fn attended_intake_launch_cmd_is_the_sealed_argv_plus_interactive() {
+        let cmd = crate::app::dialogs::build_attended_intake_launch_cmd(None, "sub_0000");
+        assert_eq!(
+            cmd, "coord portal decompose-chat sub_0000 --interactive\r",
+            "must be §4c's verbatim verb plus the one #2750 flag",
+        );
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+
+        let cmd = crate::app::dialogs::build_attended_intake_launch_cmd(
+            Some("/home/john/.coord/coordinator.yml"),
+            "sub_0000",
+        );
+        assert!(
+            cmd.contains("--config /home/john/.coord/coordinator.yml"),
+            "must inject --config like every other interactive launcher: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"), "got: {cmd}");
+    }
+
+    /// #2863 acceptance (black-box, through the real
+    /// `event → handle → open_context_menu → render` chain): right-clicking
+    /// an approved row shows BOTH items.
+    #[test]
+    fn right_click_shows_both_the_headless_and_attended_items() {
+        let mut app = make_test_app(attended_board(
+            vec!["claude-coordinator".to_string()],
+            vec!["claude-coordinator".to_string()],
+        ));
+        app.active_view = SidebarView::Approved;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        driver.type_char('.');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Pull into decomposition session"),
+            "the sealed slice's item must survive #2863 unchanged:\n{screen}",
+        );
+        assert!(
+            screen.contains("Open attended intake session"),
+            "#2863: the attended item must be offered on the same menu:\n\
+             {screen}",
+        );
+    }
+
+    /// #2863 (companion to the above): on a machine that can't host it, the
+    /// attended item is still RENDERED — greyed with its reason beside it,
+    /// the same "present, greyed, inert" convention §4a pins for the
+    /// headless item on an unmapped row. A hidden item leaves the operator
+    /// with no clue why the board won't start the conversation.
+    #[test]
+    fn attended_item_renders_with_its_reason_when_this_machine_cannot_host_it() {
+        let mut app = make_test_app(attended_board(
+            vec!["grocery-list".to_string()],
+            vec!["claude-coordinator".to_string()],
+        ));
+        app.active_view = SidebarView::Approved;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        driver.type_char('.');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Open attended intake"),
+            "the greyed item must still be painted:\n{screen}",
+        );
+        assert!(
+            screen.contains("does not claim grocery-list"),
+            "the reason must be visible so the operator knows WHY:\n{screen}",
         );
     }
 
@@ -810,6 +1099,145 @@ mod tests {
             ]],
             "the pull action must shell exactly `coord portal decompose-chat \
              <submission_id>` (contract §4c)",
+        );
+    }
+
+    // ── #2863: one coherent error surface on a failed headless dispatch ────
+
+    /// #2863 acceptance: "A non-zero exit from either action leaves the
+    /// operator with **one** coherent error surface — not a success toast
+    /// followed by a failure toast followed by a timeout toast."
+    ///
+    /// Drives the REAL spawn → poll → result pipeline (`new_for_test`'s
+    /// `no_spawn` branch resolves the canned result synchronously at spawn
+    /// time), the same seam `gate_a_dispatch_failure_opens_full_text_error_
+    /// dialog` uses.
+    #[test]
+    fn failed_decompose_chat_dispatch_leaves_exactly_one_error_surface() {
+        let mut app = make_test_app(BoardData {
+            approved_submissions: vec![one_approved_row(
+                "sub_0000",
+                vec!["claude-coordinator".to_string()],
+            )],
+            ..BoardData::default()
+        });
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        // The live 2026-08-27/28 failure, verbatim in shape: the thin-client
+        // refusal, multi-sentence, with the actionable half at the END.
+        let refusal = "Error: coord portal decompose-chat must run on the \
+             daemon host. This machine is a thin client (board_service is set \
+             in ~/.coord/client.toml). ssh to the daemon host and run it \
+             there, or use the attended --interactive session locally.";
+        app.command_runner.push_canned_result(1, refusal);
+
+        app.dispatch_approved_pull_into_decomposition("sub_0000");
+        // Precondition: the optimistic §4d toast really did fire first —
+        // otherwise "retracted" would pass vacuously.
+        assert!(
+            app.toasts
+                .iter()
+                .any(|(t, _, _)| t.title == "Decomposition chat"),
+            "contract §4d's optimistic toast must fire at dispatch time",
+        );
+        assert!(app.pending_decomposition_chat.is_some());
+
+        app.run_periodic_work();
+
+        // 1. The optimistic "chat ready" toast is retracted — it is now
+        //    known to be false and must not sit beside the error.
+        assert!(
+            !app.toasts
+                .iter()
+                .any(|(t, _, _)| t.title == "Decomposition chat"),
+            "the optimistic \"chat ready\" toast must be retracted once the \
+             dispatch is known to have failed",
+        );
+        // 2. The generic 40-col "Command failed" toast is suppressed — the
+        //    modal is the single notification.
+        assert!(
+            !app.toasts.iter().any(|(t, _, _)| t.title == "Command failed"),
+            "the truncating command-failed toast must be suppressed when the \
+             full-text modal is shown",
+        );
+        // 3. The 30 s bind-timeout toast can never fire: nothing is pending.
+        assert!(
+            app.pending_decomposition_chat.is_none(),
+            "a failed dispatch must disarm the bind timeout — no assignment \
+             is ever going to appear, so its \"timed out\" toast would only \
+             restate the same failure as a second, different problem",
+        );
+        // 4. The FULL refusal is readable, not a ~40-col truncation.
+        let body = app
+            .decompose_chat_error_dialog
+            .as_ref()
+            .expect("a failed decomposition dispatch must raise the modal");
+        assert!(
+            body.contains("thin client") && body.contains("--interactive"),
+            "the modal must carry the COMPLETE reason including its trailing \
+             actionable sentence, got: {body}",
+        );
+        assert!(
+            body.contains("sub_0000"),
+            "the modal must name the submission that failed, got: {body}",
+        );
+    }
+
+    /// #2863: the failure modal actually paints through the real
+    /// ShellAdapter → render path, word-wrapped, and Esc dismisses it.
+    #[test]
+    fn decompose_chat_error_dialog_renders_full_reason_and_dismisses() {
+        let mut app = make_test_app(BoardData::default());
+        app.decompose_chat_error_dialog = Some(
+            "Error: coord portal decompose-chat must run on the daemon host. \
+             ssh to the daemon host and run it there."
+                .to_string(),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        assert!(
+            driver.screen_contains("Decomposition session dispatch failed"),
+            "modal title must render on screen:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("ssh to the daemon host"),
+            "the tail of the refusal — the actionable half a 40-col toast \
+             eats — must be readable on screen:\n{}",
+            driver.screen(),
+        );
+
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Decomposition session dispatch failed"),
+            "Esc must dismiss the modal:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #2863: the label matcher fires on the headless dispatch this issue
+    /// fixes and on nothing else — a sibling `portal` verb keeps the normal
+    /// command-failed toast.
+    #[test]
+    fn is_decompose_chat_dispatch_label_matches_only_that_dispatch() {
+        use crate::app::dialogs::{
+            decompose_chat_label_submission_id, is_decompose_chat_dispatch_label,
+        };
+        assert!(is_decompose_chat_dispatch_label(
+            "coord portal decompose-chat SUB-1EA1D3"
+        ));
+        assert!(!is_decompose_chat_dispatch_label("coord portal ledger SUB-1EA1D3"));
+        assert!(!is_decompose_chat_dispatch_label("coord portal link SUB-1EA1D3 42"));
+        assert!(!is_decompose_chat_dispatch_label("coord milestone dispatch api 42"));
+
+        assert_eq!(
+            decompose_chat_label_submission_id("coord portal decompose-chat SUB-1EA1D3"),
+            Some("SUB-1EA1D3".to_string()),
+        );
+        assert_eq!(
+            decompose_chat_label_submission_id("coord portal decompose-chat"),
+            None,
+            "a malformed label must not panic",
         );
     }
 }

@@ -219,6 +219,8 @@ impl CoordApp {
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
             || self.gate_a_error_dialog.is_some()
+            // #2863: same modal class as the line above.
+            || self.decompose_chat_error_dialog.is_some()
             || self.pending_machine_picker.is_some()
             || self.pending_new_terminal_picker.is_some()
             || self.pending_new_terminal.is_some()
@@ -279,6 +281,8 @@ impl CoordApp {
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
             || self.gate_a_error_dialog.is_some()
+            // #2863: same modal class as the line above.
+            || self.decompose_chat_error_dialog.is_some()
             || self.pending_new_terminal.is_some()
             || self.pending_quiet_hours.is_some()
         {
@@ -664,6 +668,13 @@ pub(crate) fn icon_for_action(action_id: &str) -> Option<&'static str> {
         // session, not a PTY, and reusing `⌨` would misleadingly imply
         // otherwise (contract §1/§4c).
         "pull-into-decomposition-session" => Some("⇢"),
+        // #2863: the ATTENDED (`--interactive`, #2750) counterpart of the
+        // item above genuinely *is* the PTY family — a real tmux-attached
+        // `claude` on this machine, launched through the embedded terminal
+        // exactly like `start-work-interactive` and friends — so it takes
+        // the `⌨` glyph the comment above deliberately withholds from the
+        // headless one.
+        "open-attended-intake-session" => Some("⌨"),
         // Panel-level verbs (`toolbar:<verb>` keys after the prefix).
         "notify" => Some("ⓘ"),
         "retry" => Some("↻"),

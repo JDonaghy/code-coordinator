@@ -258,6 +258,18 @@ impl CoordApp {
             // generic toast for this one case so we don't double-notify.
             let gate_a_dispatch_failed =
                 result.exit_code != 0 && is_gate_a_mock_dispatch_label(&result.label);
+            // #2863: a failed `coord portal decompose-chat` gets the same
+            // treatment for the same reason — its commonest failure is the
+            // multi-sentence thin-client refusal, which names its own fix
+            // and is unreadable clipped to ~40 cols. Unlike Gate A this ALSO
+            // has to undo the optimistic "chat ready — type to start" toast
+            // that contract §4d requires firing at dispatch time, before the
+            // exit code exists; `fail_pending_decomposition_chat` does all
+            // three (retract, disarm the 30 s bind timeout, raise the modal)
+            // so the operator is left with exactly one error surface instead
+            // of three contradictory toasts.
+            let decompose_chat_dispatch_failed =
+                result.exit_code != 0 && is_decompose_chat_dispatch_label(&result.label);
             if result.exit_code != 0
                 && !should_suppress_command_failed_toast(
                     &result.label,
@@ -267,6 +279,7 @@ impl CoordApp {
                 && !diagnose_json_rejected
                 && !is_diagnose_legacy_retry
                 && !gate_a_dispatch_failed
+                && !decompose_chat_dispatch_failed
             {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
@@ -299,6 +312,27 @@ impl CoordApp {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
                 self.gate_a_error_dialog = Some(reason);
+            }
+            // #2863: collapse a failed decomposition dispatch down to one
+            // coherent surface. The FULL stderr (not just its first
+            // meaningful line, the way Gate A above takes it) goes into the
+            // modal: the thin-client refusal's actionable half — "run it on
+            // the daemon host" — is in its later sentences, so first-line
+            // truncation would reproduce exactly the unreadability this is
+            // fixing. Falls back to the first meaningful line, then to the
+            // bare exit code, so an empty stderr still says something.
+            if decompose_chat_dispatch_failed {
+                let stderr = result.stderr.trim();
+                let reason = if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    first_meaningful_stderr_line(&result.stdout).unwrap_or_else(|| {
+                        format!("exit {} — no stderr captured", result.exit_code)
+                    })
+                };
+                let submission_id = decompose_chat_label_submission_id(&result.label)
+                    .unwrap_or_else(|| "this submission".to_string());
+                self.fail_pending_decomposition_chat(&submission_id, &reason);
             }
             // #863: Fix-dispatch cap preflight completed.  A clean exit means
             // the cap doesn't block this dispatch (or `--force` already
