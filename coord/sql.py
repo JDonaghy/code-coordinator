@@ -606,6 +606,61 @@ def table_columns(conn: Any, table: str) -> list[tuple[str, str]]:
     raise UnsupportedDialectError(dialect)
 
 
+def foreign_keys(conn: Any, table: str) -> list[tuple[str, str, str]]:
+    """Return ``[(from_column, ref_table, ref_column), ...]`` for every FK
+    *table* declares (empty if none, or if *table* doesn't exist) --
+    portably across SQLite's ``PRAGMA foreign_key_list(...)`` and Postgres's
+    standard ``information_schema`` constraint views (#828).
+
+    SQLite's FK introspection is a pragma, like ``table_info`` above -- same
+    reasoning, same fix: this is the one place that pragma's statement text
+    may appear outside ``coord/db.py``, so a caller (``coord.store_migrate``,
+    today) never writes it directly. Postgres has no single-pragma
+    equivalent; the standard three-way join across
+    ``information_schema.table_constraints`` /
+    ``key_column_usage`` / ``constraint_column_usage`` is the SQL-standard
+    way to ask "what does this table reference, and through which column"
+    without touching Postgres's own (non-standard) ``pg_catalog`` tables.
+
+    The table name is interpolated into the SQLite ``PRAGMA`` text for the
+    same reason :func:`table_columns` does -- pragmas take no bound
+    parameter for their target object; every call site passes a hardcoded
+    table constant, never user input.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        cur = execute(conn, f"PRAGMA foreign_key_list({table})")  # noqa: S608 -- table name, not user input
+        edges = []
+        for row in cur.fetchall():
+            values = tuple(row)
+            # id, seq, table, from, to, on_update, on_delete, match
+            edges.append((values[3], values[2], values[4] or "rowid"))
+        return edges
+    if dialect == DIALECT_POSTGRES:
+        cur = execute(
+            conn,
+            "SELECT kcu.column_name, ccu.table_name AS ref_table, "
+            "ccu.column_name AS ref_column "
+            "FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage kcu "
+            "  ON tc.constraint_name = kcu.constraint_name "
+            "  AND tc.table_schema = kcu.table_schema "
+            "JOIN information_schema.constraint_column_usage ccu "
+            "  ON tc.constraint_name = ccu.constraint_name "
+            "  AND tc.table_schema = ccu.table_schema "
+            "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = ?",
+            (table,),
+        )
+        edges = []
+        for row in cur.fetchall():
+            try:
+                edges.append((row["column_name"], row["ref_table"], row["ref_column"]))
+            except (KeyError, TypeError, IndexError):
+                edges.append((row[0], row[1], row[2]))
+        return edges
+    raise UnsupportedDialectError(dialect)
+
+
 # ── WAL (#2782) ───────────────────────────────────────────────────────────
 #
 # WAL is a SQLite storage concept with no Postgres equivalent at all -- unlike
