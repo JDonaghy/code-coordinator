@@ -11,6 +11,7 @@ import pytest
 
 from coord import db as db_mod
 from coord import sql
+from coord.config import ConfigError
 from coord.db import (
     _ensure_schema,
     override_connection,
@@ -1151,6 +1152,47 @@ class TestResolveStoreTarget:
         failure -- it fails open to SQLite exactly like a missing file."""
         config_path = tmp_path / "coordinator.yml"
         config_path.write_text("repos: not-a-list\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        target = db_mod._resolve_store_target()
+        assert target.backend == sql.DIALECT_SQLITE
+
+    def test_propagates_config_error_for_a_malformed_explicit_store_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """#827 review, blocking finding 2: an explicit `store:` block that
+        fails to validate (here: `backend: postgres` with no `dsn`) must
+        fail LOUD -- raise, not silently resolve to SQLite. Before this fix
+        the same broad `except Exception` that legitimately fails open for
+        "no config file at all" also swallowed this, so a deployment that
+        intentionally opted into Postgres and typo'd/broke its `store:`
+        block got zero error and silently started serving out of an empty
+        local SQLite file."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_VALID_REPOS_MACHINES_YAML + "store:\n  backend: postgres\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        with pytest.raises(ConfigError, match="dsn"):
+            db_mod._resolve_store_target()
+
+    def test_propagates_config_error_for_an_invalid_store_backend_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Same as above for the other `_parse_store` validation failure
+        shape -- an unrecognized `backend` value."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_VALID_REPOS_MACHINES_YAML + "store:\n  backend: mysql\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        with pytest.raises(ConfigError, match="backend"):
+            db_mod._resolve_store_target()
+
+    def test_defaults_to_sqlite_on_invalid_yaml_syntax(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Genuinely broken YAML (not just semantically wrong) is exactly
+        the "config problem unrelated to an explicit store: block" shape --
+        it can't even be parsed far enough to know whether `store:` was
+        present, so this fails open like a missing file, not loud."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text("repos: [\n  - unterminated\n")
         monkeypatch.setenv("COORD_CONFIG", str(config_path))
         target = db_mod._resolve_store_target()
         assert target.backend == sql.DIALECT_SQLITE

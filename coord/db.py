@@ -134,29 +134,62 @@ class _StoreTarget:
 def _resolve_store_target() -> _StoreTarget:
     """Resolve ``coordinator.yml``'s ``store:`` block (#827).
 
-    Fails open to SQLite — :data:`sql.DIALECT_SQLITE`, today's only backend —
-    on ANY problem loading config: no resolvable ``coordinator.yml`` (a fresh
-    worktree, a bare test invocation, an agent that hasn't been given one
-    yet), a parse error, whatever. A missing/broken *config* must never be
-    how a caller discovers it's talking to the wrong database — this mirrors
-    ``coord.audit._cached_config``'s fail-open shape for the same reason.
+    Two different failure shapes get two deliberately different outcomes
+    (#827 review, blocking finding 2 — see that finding for the full
+    incident this replaced):
+
+    - **No config resolvable at all**, or a config that exists but fails for
+      a reason that has nothing to do with an explicit ``store:`` block
+      (bad YAML, a bad ``repos:``/``machines:`` entry, ...) fails OPEN to
+      SQLite — a fresh worktree, a bare test invocation, or an agent that
+      hasn't been handed a ``coordinator.yml`` yet must never be unable to
+      open its local database. This mirrors ``coord.audit._cached_config``'s
+      fail-open shape for the same reason.
+    - **An explicit ``store:`` block that fails to validate** (a typo'd
+      ``backend``, ``backend: postgres`` with no ``dsn``, ...) fails LOUD —
+      whatever :func:`coord.config._parse_store` raises propagates
+      unchanged. A deployment that intentionally opted into Postgres and
+      then typo'd or broke that block must find out immediately; silently
+      falling back to an empty local SQLite file with no error is exactly
+      the split-brain this config seam exists to prevent — a broken/missing
+      config must never be how a caller discovers it's talking to the wrong
+      database, in *either* direction.
+
+    Deliberately does NOT run the full :func:`coord.config.load` /
+    :func:`coord.config.parse_mapping` validation pipeline — it reads only
+    the raw ``store:`` mapping out of the YAML directly, so a config problem
+    completely unrelated to storage can never masquerade as, or suppress, a
+    storage-backend decision; only ``store:``'s own shape is ever
+    load-bearing here.
 
     Called at most once per process: only from :func:`get_connection`'s
     first-open path (for SQLite) or its first-open-on-this-thread path (for
     Postgres) — never on every call, since ``_conn``/the thread-local cache
-    short-circuits every call after that. A full ``coordinator.yml``
-    parse+validate is real I/O, but "once per process" (or "once per thread",
-    under Postgres) is not the hot-loop cost ``coord.audit``'s own caching
-    comment warns about (~2,900 writes/hour) — so unlike that module, this
-    intentionally does not cache across calls; there is nothing to amortize.
+    short-circuits every call after that. A YAML read+parse is real I/O, but
+    "once per process" (or "once per thread", under Postgres) is not the
+    hot-loop cost ``coord.audit``'s own caching comment warns about (~2,900
+    writes/hour) — so unlike that module, this intentionally does not cache
+    across calls; there is nothing to amortize.
     """
-    try:
-        from coord.config import load as _load_config  # noqa: PLC0415
+    import yaml  # noqa: PLC0415
 
-        cfg = _load_config()
+    from coord.config import resolve_config_path  # noqa: PLC0415
+
+    try:
+        path = resolve_config_path()
+        raw = yaml.safe_load(path.read_text()) if path.exists() else None
     except Exception:
         return _StoreTarget(backend=sql.DIALECT_SQLITE)
-    store = cfg.store
+
+    if not isinstance(raw, dict) or "store" not in raw:
+        return _StoreTarget(backend=sql.DIALECT_SQLITE)
+
+    from coord.config import _parse_store  # noqa: PLC0415
+
+    # A malformed `store:` block raises ConfigError here -- deliberately NOT
+    # caught. See the docstring above: this is the one config problem that
+    # must fail loud rather than fail open.
+    store = _parse_store(raw["store"])
     if store.backend != sql.DIALECT_POSTGRES:
         return _StoreTarget(backend=sql.DIALECT_SQLITE)
     return _StoreTarget(backend=sql.DIALECT_POSTGRES, dsn=store.dsn)
@@ -264,6 +297,33 @@ def _open(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def refuse_postgres_under_pytest(target_desc: str) -> None:
+    """Raise :class:`ProductionDatabaseGuardError` if called during a pytest
+    run (#1960's SQLite analogue, widened to Postgres by #827).
+
+    Shared by :func:`_open_postgres` (this module's write-path opener) and
+    ``coord.dao.SqliteStore._connect`` (the daemon's read path) — both are
+    "the one place a real Postgres connection gets opened" for their
+    respective sides, and neither should ever reach a live Postgres server
+    from a test: no test's ``coordinator.yml`` should set
+    ``store.backend: postgres``, but if one somehow does (a leaked ambient
+    config, a copy-pasted fixture), this fails loud instead of a test suite
+    silently trying to open a real socket -- or hanging on one.
+    """
+    marker = os.environ.get("PYTEST_CURRENT_TEST")
+    if not marker:
+        return
+    raise ProductionDatabaseGuardError(
+        f"Refusing to open {target_desc} while running under pytest "
+        f"(PYTEST_CURRENT_TEST={marker!r}). No test should ever resolve "
+        "`store.backend: postgres` from coordinator.yml -- see #1960, the "
+        "SQLite analogue of this guard. Fix: rely on the autouse `coord_db` "
+        "fixture (it overrides the connection before this is ever reached "
+        "for the write path), or don't set store.backend in a test "
+        "environment's config."
+    )
+
+
 def _open_postgres(dsn: str) -> Any:
     """Open (and, if needed, migrate) the configured Postgres connection —
     the Postgres analogue of :func:`_open` (#827).
@@ -272,18 +332,24 @@ def _open_postgres(dsn: str) -> Any:
     ``store.dsn``), so opening it always means opening THE production store
     -- unlike ``_open``, there is no "arbitrary path a test/caller passed in"
     case to distinguish, hence no *is_production* parameter here.
+
+    #827 review, non-blocking concern: the per-THREAD connection cache
+    :func:`get_connection` builds this into means ``_migrate_if_needed``
+    (below) can run concurrently from more than one thread on first connect
+    against a fresh Postgres database -- the old process-wide SQLite
+    singleton naturally serialized this, a per-thread cache does not. Two
+    request-handler threads racing to open the first connection could both
+    observe ``schema_version < _DB_SCHEMA_VERSION`` and both attempt the
+    migration DDL at once. Not exercised today (no Postgres is live
+    anywhere per this issue's own "mergeable and inert" scope), and the
+    migration functions themselves are written to be idempotent/order-
+    tolerant on SQLite already, but this has never been proven safe under
+    genuine Postgres concurrency -- left as a flagged gap for #829's
+    cutover to either measure (maybe never actually races in practice) or
+    close (e.g. a Postgres advisory lock around this call) before real
+    traffic depends on it.
     """
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        raise ProductionDatabaseGuardError(
-            "Refusing to open the configured production Postgres store "
-            "while running under pytest "
-            f"(PYTEST_CURRENT_TEST={os.environ['PYTEST_CURRENT_TEST']!r}). "
-            "No test should ever resolve `store.backend: postgres` from "
-            "coordinator.yml -- see #1960, the SQLite analogue of this "
-            "guard. Fix: rely on the autouse `coord_db` fixture (it "
-            "overrides the connection before this is ever reached), or "
-            "don't set store.backend in a test environment's config."
-        )
+    refuse_postgres_under_pytest("the configured production Postgres store")
     conn = sql.connect(backend=sql.DIALECT_POSTGRES, dsn=dsn)
     sql.apply_connection_setup(conn)
     sql.apply_row_factory(conn)
