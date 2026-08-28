@@ -2718,70 +2718,62 @@ class TestDispatchErrorSurfacing:
 class TestProviderNamePersistence:
     """#324: record_dispatched() persists provider_name on the assignment row."""
 
-    def test_record_dispatched_stores_provider_name(self) -> None:
+    # #2884 bucket B: these two used to hand-roll `sqlite3.connect(":memory:")`
+    # + _ensure_schema + override_connection — a verbatim re-implementation of
+    # the autouse `coord_db` fixture, which already gives every test exactly
+    # that. Declaring `coord_db` receives the same connection and follows
+    # COORD_TEST_BACKEND. The raw row read goes through `coord.sql.execute`
+    # (the #2719 paramstyle seam) rather than `conn.execute("... ?")` so the
+    # `?` placeholder is translated for whichever backend is live.
+
+    def test_record_dispatched_stores_provider_name(self, coord_db) -> None:
         """provider_name kwarg is persisted in the assignments table."""
-        import sqlite3
-        from coord.db import override_connection, close
+        from coord import sql
         from coord.state import record_dispatched, load_dispatched
 
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        from coord.db import _ensure_schema
-        _ensure_schema(conn)
-        override_connection(conn)
-        try:
-            p = Proposal(
-                id=1, machine_name="laptop", repo_name="api",
-                issue_number=10, issue_title="Fix auth", rationale="ok",
-                briefing="do the thing", type="work",
-            )
-            record_dispatched(
-                assignment_id="asgn-001",
-                proposal=p,
-                repo_github="acme/api",
-                provider_name="fast-claude",
-            )
-            rows = load_dispatched()
-            assert rows, "expected at least one dispatched row"
-            # The raw row should carry provider_name
-            row = conn.execute(
-                "SELECT provider_name FROM assignments WHERE assignment_id=?",
-                ("asgn-001",),
-            ).fetchone()
-            assert row is not None
-            assert row["provider_name"] == "fast-claude"
-        finally:
-            close()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            briefing="do the thing", type="work",
+        )
+        record_dispatched(
+            assignment_id="asgn-001",
+            proposal=p,
+            repo_github="acme/api",
+            provider_name="fast-claude",
+        )
+        rows = load_dispatched()
+        assert rows, "expected at least one dispatched row"
+        # The raw row should carry provider_name
+        row = sql.execute(
+            coord_db,
+            "SELECT provider_name FROM assignments WHERE assignment_id=?",
+            ("asgn-001",),
+        ).fetchone()
+        assert row is not None
+        assert row["provider_name"] == "fast-claude"
 
-    def test_record_dispatched_provider_name_defaults_to_null(self) -> None:
+    def test_record_dispatched_provider_name_defaults_to_null(self, coord_db) -> None:
         """When provider_name is not passed, the column stays NULL (backward
         compat — existing callers in cli.py don't pass the arg)."""
-        import sqlite3
-        from coord.db import override_connection, close
+        from coord import sql
         from coord.state import record_dispatched
 
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        from coord.db import _ensure_schema
-        _ensure_schema(conn)
-        override_connection(conn)
-        try:
-            p = Proposal(
-                id=1, machine_name="laptop", repo_name="api",
-                issue_number=10, issue_title="Fix auth", rationale="ok",
-                briefing="do the thing", type="work",
-            )
-            record_dispatched(
-                assignment_id="asgn-002",
-                proposal=p,
-                repo_github="acme/api",
-                # no provider_name → default None
-            )
-            row = conn.execute(
-                "SELECT provider_name FROM assignments WHERE assignment_id=?",
-                ("asgn-002",),
-            ).fetchone()
-            assert row is not None
-            assert row["provider_name"] is None
-        finally:
-            close()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            briefing="do the thing", type="work",
+        )
+        record_dispatched(
+            assignment_id="asgn-002",
+            proposal=p,
+            repo_github="acme/api",
+            # no provider_name → default None
+        )
+        row = sql.execute(
+            coord_db,
+            "SELECT provider_name FROM assignments WHERE assignment_id=?",
+            ("asgn-002",),
+        ).fetchone()
+        assert row is not None
+        assert row["provider_name"] is None

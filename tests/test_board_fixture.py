@@ -40,11 +40,9 @@ tui/src/app/tests.rs::board_payload_deserializes_real_sample.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 from coord.board_bool_guard import find_integer_bool_mismatches
-from coord.db import _ensure_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
@@ -63,20 +61,19 @@ def _rust_wire_source() -> str:
 _PROJECTED_TABLES = ("assignments", "machines", "merge_queue", "proposals", "issues")
 
 
-def _schema_columns(conn: sqlite3.Connection) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
-    for table in _PROJECTED_TABLES:
-        out[table] = {row[1]: row[2] for row in conn.execute(f"PRAGMA table_info({table})")}
-    return out
+def _schema_columns(conn) -> dict[str, dict[str, str]]:
+    """``{table: {column: declared_type}}`` for the projected tables.
 
+    #2884 bucket B: was ``conn.execute("PRAGMA table_info(...)")`` reading
+    ``row[1]``/``row[2]`` positionally. ``coord.sql.table_columns`` is the
+    portable seam for exactly this (#2782) — SQLite's ``PRAGMA table_info``
+    and Postgres's ``information_schema.columns``, same ``(name, type)``
+    tuples out — so this reads the live schema on whichever backend
+    ``COORD_TEST_BACKEND`` selected.
+    """
+    from coord import sql
 
-def _migrated_schema_columns() -> dict[str, dict[str, str]]:
-    conn = sqlite3.connect(":memory:")
-    try:
-        _ensure_schema(conn)
-        return _schema_columns(conn)
-    finally:
-        conn.close()
+    return {table: dict(sql.table_columns(conn, table)) for table in _PROJECTED_TABLES}
 
 
 # ── Fixture freshness ────────────────────────────────────────────────────────
@@ -125,7 +122,7 @@ def test_board_sample_fixture_parses_as_representative_payload():
 
 # ── Producer-side INTEGER-bool guard ─────────────────────────────────────────
 
-def test_no_unguarded_integer_bool_columns_reach_the_wire():
+def test_no_unguarded_integer_bool_columns_reach_the_wire(coord_db):
     """The real-world check: cross-reference the live schema against the real
     Rust consumer (`types.rs` + its generated `generated.rs` sibling, #1941).
     Fails the moment a future `ALTER TABLE ... ADD COLUMN x INTEGER` (meant as
@@ -133,7 +130,7 @@ def test_no_unguarded_integer_bool_columns_reach_the_wire():
     `deserialize_with = "de_bool_from_int_or_bool"` guard on the Rust side —
     i.e. it kills the #632 class before it can reoccur.
     """
-    mismatches = find_integer_bool_mismatches(_rust_wire_source(), _migrated_schema_columns())
+    mismatches = find_integer_bool_mismatches(_rust_wire_source(), _schema_columns(coord_db))
     assert mismatches == [], (
         f"INTEGER column(s) {mismatches} map to an unguarded Rust `bool` field in "
         f"{TYPES_RS_PATH} or {GENERATED_RS_PATH} — add "
