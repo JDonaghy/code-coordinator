@@ -43,8 +43,20 @@ to the pre-#1943 response, forever, for every pinned client that never sends
 the header. A value outside ``[coord.dao.MIN_SCHEMA_VERSION,
 coord.dao.SCHEMA_VERSION]`` (or non-integer) is refused with a 4xx naming the
 supported range, never silently downgraded. ``/healthz`` advertises that range
-as ``schema_min``/``schema_max``. No v2 response body exists yet -- see
-``docs/STORE_SERVICE.md`` Phase B for what comes after this mechanism.
+as ``schema_min``/``schema_max``.
+
+Resource-shaped routes (#1944): ``PATCH /issue/{repo_name}/{number}``,
+``GET``/``POST /issue/{repo_name}/{number}/comments`` and
+``PATCH /assignment/{assignment_id}`` sit **alongside** the RPC routes they
+will eventually replace, which are untouched and keep working unchanged.
+Request/response shapes are the explicit DTOs in ``coord/rest_schema.py``
+(the #1849 discipline, applied to the write surface);
+:data:`RPC_SUPERSEDED_BY_RESOURCE` is the mapping, and the routes it names are
+marked ``deprecated`` in the served spec.  ``SCHEMA_VERSION`` is deliberately
+**not** bumped: the DTO shapes are new surface with no pinned client, so they
+need no negotiated opt-in, and a bump would advertise a v2 that the other ~50
+routes do not serve.  Migrating callers is #1946; retiring the RPC routes is
+#1947, gated on #1945's zero-usage telemetry.
 """
 
 from __future__ import annotations
@@ -70,7 +82,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from coord import __version__, board_schema
+from coord import __version__, board_schema, rest_schema
 from coord.config import Config
 from coord.config_reload import reload_config_if_stale
 from coord.dao import MIN_SCHEMA_VERSION, SCHEMA_VERSION, CoordStore
@@ -2618,6 +2630,61 @@ def _board_response_schema(components: dict) -> dict:
     }
 
 
+# #1944 (Phase B): every RPC route a resource-shaped route now covers, mapped to
+# the replacement a caller should migrate to.  :func:`_mark_superseded_rpc_routes`
+# stamps ``deprecated: true`` + this pointer onto each one's spec entry.
+#
+# Deprecation here is a **documentation signal only**.  The routes themselves are
+# untouched and keep working byte-identically; retirement is #1947 and is gated
+# on the zero-usage telemetry #1945 adds, never on this table.
+#
+# Two entries are reads that a resource *GET* already covers rather than
+# something a PATCH could express — they are listed so the spec still tells a
+# caller where to go.
+RPC_SUPERSEDED_BY_RESOURCE: dict[str, str] = {
+    "/issue-edit": "PATCH /issue/{repo_name}/{number} (title / body)",
+    "/issue-label": "PATCH /issue/{repo_name}/{number} (add_labels / remove_labels)",
+    "/issue-labels": "PATCH /issue/{repo_name}/{number} (labels)",
+    "/issue-milestone": "PATCH /issue/{repo_name}/{number} (milestone)",
+    "/issue-milestone-remove": 'PATCH /issue/{repo_name}/{number} ("milestone": null)',
+    "/issue-close": 'PATCH /issue/{repo_name}/{number} ("state": "closed")',
+    "/issue-reopen": 'PATCH /issue/{repo_name}/{number} ("state": "open")',
+    "/issue-comment": 'POST /issue/{repo_name}/{number}/comments ("action": "post")',
+    "/issue-comments": (
+        "GET /issue/{repo_name}/{number}/comments, or POST the same path with "
+        '"action": "capture" / "sync"'
+    ),
+    "/assignment-usage": "PATCH /assignment/{assignment_id}",
+    "/assignment-session-id": "PATCH /assignment/{assignment_id} (claude_session_id)",
+    "/assignment-failure-reason": "PATCH /assignment/{assignment_id} (failure_reason)",
+    "/assignment-test-plan": (
+        "GET /assignment/{assignment_id} — test_plan is a field on the row"
+    ),
+    "/issue-test-mode": (
+        "GET /issue/{repo_name}/{number} — derive it from labels via "
+        "coord.models.test_mode_from_labels"
+    ),
+}
+
+
+def _mark_superseded_rpc_routes(paths: dict) -> None:
+    """Stamp ``deprecated: true`` + a replacement pointer on the RPC entries.
+
+    Mutates *paths* in place.  Every key in
+    :data:`RPC_SUPERSEDED_BY_RESOURCE` must exist in the spec — a typo or a
+    renamed route would otherwise silently stop marking anything, so this
+    raises rather than skipping (``tests/test_serve_rest_routes.py`` pins it).
+    """
+    for rpc_path, replacement in RPC_SUPERSEDED_BY_RESOURCE.items():
+        entry = paths[rpc_path]
+        for operation in entry.values():
+            operation["deprecated"] = True
+            operation["summary"] = (
+                f"{operation['summary']} [DEPRECATED #1944 — use {replacement}; "
+                "still fully supported, retirement is #1947]"
+            )
+
+
 def openapi_spec() -> dict:
     """#757: the daemon's OpenAPI 3 document.
 
@@ -2647,6 +2714,28 @@ def openapi_spec() -> dict:
             "error": {"type": "string", "nullable": True},
         },
     }
+    # #1944: the resource-shaped issue/assignment routes all carry the same
+    # path parameters as the GETs that predate them, so declare each once.
+    assignment_id_param = {
+        "name": "assignment_id",
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string"},
+    }
+    issue_path_params = [
+        {
+            "name": "repo_name",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "string"},
+        },
+        {
+            "name": "number",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "integer"},
+        },
+    ]
     paths = {
         "/healthz": {
             "get": {
@@ -2708,19 +2797,46 @@ def openapi_spec() -> dict:
                     "/board collection bounds. Local DB only — no gh calls, no "
                     "derived board sections."
                 ),
-                "parameters": [
-                    {
-                        "name": "assignment_id",
-                        "in": "path",
-                        "required": True,
-                        "schema": {"type": "string"},
-                    }
-                ],
+                "parameters": [assignment_id_param],
                 "responses": {
                     "200": {"description": "OK (one full assignment row)"},
                     "404": {"description": "Unknown assignment id"},
                 },
-            }
+            },
+            "patch": {
+                "summary": (
+                    "#1944: partial update of one assignment row — the "
+                    "resource-shaped stand-in for POST /assignment-usage, "
+                    "/assignment-session-id and /assignment-failure-reason. "
+                    "Every field optional; omit to leave alone. Does not 404 "
+                    "on an unknown id, matching the RPC routes it replaces."
+                ),
+                "parameters": [assignment_id_param],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": dataclass_schema(
+                                rest_schema.AssignmentPatch, components
+                            )
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": dataclass_schema(
+                                    rest_schema.AssignmentPatchResult, components
+                                )
+                            }
+                        },
+                    },
+                    "400": {"description": "Invalid JSON body or unknown field"},
+                    "503": {"description": "Write failed"},
+                },
+            },
         },
         "/issue/{repo_name}/{number}": {
             "get": {
@@ -2728,25 +2844,111 @@ def openapi_spec() -> dict:
                     "Single-issue detail (#1337): the complete row including the "
                     "full body. Local DB only — no gh calls."
                 ),
-                "parameters": [
-                    {
-                        "name": "repo_name",
-                        "in": "path",
-                        "required": True,
-                        "schema": {"type": "string"},
-                    },
-                    {
-                        "name": "number",
-                        "in": "path",
-                        "required": True,
-                        "schema": {"type": "integer"},
-                    },
-                ],
+                "parameters": issue_path_params,
                 "responses": {
                     "200": {"description": "OK (one full issue row)"},
                     "404": {"description": "Unknown issue"},
                 },
-            }
+            },
+            "patch": {
+                "summary": (
+                    "#1944: partial update of one issue — the resource-shaped "
+                    "stand-in for POST /issue-edit, /issue-label, /issue-labels, "
+                    "/issue-milestone, /issue-milestone-remove, /issue-close and "
+                    "/issue-reopen. Mutations apply in a fixed order (content → "
+                    "labels → milestone → state). An explicit null milestone "
+                    "clears it; an omitted key leaves it alone."
+                ),
+                "parameters": issue_path_params,
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": dataclass_schema(
+                                rest_schema.IssuePatch, components
+                            )
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": dataclass_schema(
+                                    rest_schema.IssuePatchResult, components
+                                )
+                            }
+                        },
+                    },
+                    "400": {
+                        "description": (
+                            "Invalid JSON body, unknown field, or a contradictory "
+                            "combination (labels + add_labels, comment without state)"
+                        )
+                    },
+                    "404": {"description": "number is not an integer"},
+                    "409": {"description": "Close refused — open children (#1196)"},
+                    "422": {"description": "Label not found in the repo"},
+                    "503": {"description": "Write failed"},
+                },
+            },
+        },
+        "/issue/{repo_name}/{number}/comments": {
+            "get": {
+                "summary": (
+                    "#1944: an issue's captured comments, oldest-first — the "
+                    "resource-shaped stand-in for GET /issue-comments."
+                ),
+                "parameters": issue_path_params,
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": dataclass_schema(
+                                    rest_schema.IssueCommentList, components
+                                )
+                            }
+                        },
+                    },
+                    "404": {"description": "number is not an integer"},
+                    "503": {"description": "Read failed"},
+                },
+            },
+            "post": {
+                "summary": (
+                    "#1944: create or mirror one comment — the resource-shaped "
+                    "stand-in for POST /issue-comment (action=post, the default) "
+                    "and POST /issue-comments (action=capture / action=sync)."
+                ),
+                "parameters": issue_path_params,
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": dataclass_schema(
+                                rest_schema.IssueCommentCreate, components
+                            )
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": dataclass_schema(
+                                    rest_schema.IssueCommentResult, components
+                                )
+                            }
+                        },
+                    },
+                    "400": {"description": "Invalid body, unknown field or action"},
+                    "404": {"description": "number is not an integer"},
+                    "503": {"description": "Write failed"},
+                },
+            },
         },
         "/config": {
             "get": {
@@ -4598,6 +4800,7 @@ def openapi_spec() -> dict:
             }
         },
     }
+    _mark_superseded_rpc_routes(paths)
     return build_spec(
         title="coord serve",
         version=__version__,
@@ -7316,6 +7519,339 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    # ── #1944: resource-shaped routes (Phase B) ──────────────────────────────
+    #
+    # These sit ALONGSIDE the RPC routes above, which are untouched and keep
+    # working byte-identically.  Each one is behaviour-equivalent to the RPC
+    # route(s) it will eventually replace: it calls the *same* ``state._*_local``
+    # helper with the same arguments and maps the same exceptions onto the same
+    # status codes.  See ``coord/rest_schema.py`` for the request/response DTOs
+    # and the full RPC↔resource mapping table.
+    #
+    # Retirement of the RPC routes is #1947 and is gated on #1945's zero-usage
+    # telemetry — nothing here removes or changes anything.
+
+    def _resource_issue_key(request: Request) -> tuple[str, int] | Response:
+        """``(repo_name, number)`` from the path, or the 404 ``get_issue`` gives."""
+        repo_name = request.path_params["repo_name"]
+        try:
+            return repo_name, int(request.path_params["number"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "number must be an integer"}, status_code=404)
+
+    async def patch_issue(request: Request) -> Response:
+        """#1944: partial update of one issue — the resource-shaped stand-in for
+        /issue-edit, /issue-label, /issue-labels, /issue-milestone,
+        /issue-milestone-remove, /issue-close and /issue-reopen.
+
+        Mutations run in a fixed order (content → labels → milestone → state)
+        regardless of request key order, so a PATCH that both relabels and
+        closes behaves identically every time.  A missing key means "leave
+        alone"; an explicit ``"milestone": null`` means "clear it" — which is
+        why this reads the raw dict rather than round-tripping through
+        :class:`~coord.rest_schema.IssuePatch`.
+        """
+        from coord import state  # noqa: PLC0415
+        from coord.github_ops import (  # noqa: PLC0415
+            GhNotFound,
+            IssueHasOpenChildrenError,
+        )
+
+        key = _resource_issue_key(request)
+        if isinstance(key, Response):
+            return key
+        repo_name, number = key
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        unknown = rest_schema.unknown_fields(rest_schema.IssuePatch, body)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unknown field(s): {', '.join(unknown)}"}, status_code=400
+            )
+        if body.get("labels") is not None and (
+            body.get("add_labels") or body.get("remove_labels")
+        ):
+            return JSONResponse(
+                {
+                    "error": (
+                        "labels (cache replace) is mutually exclusive with "
+                        "add_labels/remove_labels (tracker write)"
+                    )
+                },
+                status_code=400,
+            )
+        new_state = body.get("state")
+        if new_state is not None and new_state not in ("open", "closed"):
+            return JSONResponse(
+                {"error": f"state must be 'open' or 'closed', got {new_state!r}"},
+                status_code=400,
+            )
+        if body.get("comment") is not None and new_state is None:
+            return JSONResponse(
+                {
+                    "error": (
+                        "comment requires a state change; to comment without "
+                        "one use POST /issue/{repo_name}/{number}/comments"
+                    )
+                },
+                status_code=400,
+            )
+
+        repo_github = body.get("repo_github")
+        applied: list[str] = []
+        labels_out: list[str] | None = None
+        labels_changed: bool | None = None
+        try:
+            if body.get("title") is not None or body.get("body") is not None:
+                state._edit_issue_content_local(
+                    repo_name,
+                    number,
+                    title=body.get("title"),
+                    body=body.get("body"),
+                    repo_github=repo_github,
+                )
+                applied.append("content")
+            if body.get("labels") is not None:
+                labels_updated = state._update_issue_labels_local(
+                    repo_name, number, body["labels"]
+                )
+                if labels_updated:
+                    labels_out = sorted(set(body["labels"]))
+                    applied.append("labels")
+            elif body.get("add_labels") or body.get("remove_labels"):
+                labels_out, labels_changed = state._apply_issue_labels_local(
+                    repo_name,
+                    number,
+                    add=set(body.get("add_labels") or []),
+                    remove=set(body.get("remove_labels") or []),
+                    repo_github=repo_github,
+                )
+                applied.append("labels")
+            if "milestone" in body:
+                if body["milestone"] is None:
+                    state._unassign_issue_milestone_local(
+                        repo_name, number, repo_github=repo_github
+                    )
+                    applied.append("milestone_remove")
+                else:
+                    state._assign_issue_milestone_local(
+                        repo_name,
+                        number,
+                        body["milestone"],
+                        milestone_title=body.get("milestone_title"),
+                        repo_github=repo_github,
+                    )
+                    applied.append("milestone")
+            if new_state == "closed":
+                state._close_issue_local(
+                    repo_name,
+                    number,
+                    comment=body.get("comment"),
+                    repo_github=repo_github,
+                    force=bool(body.get("force", False)),
+                )
+                applied.append("state")
+            elif new_state == "open":
+                state._reopen_issue_local(
+                    repo_name,
+                    number,
+                    comment=body.get("comment"),
+                    repo_github=repo_github,
+                )
+                applied.append("state")
+        except GhNotFound as e:
+            # Same 422 /issue-label gives: the label name is wrong, not a
+            # transient backend failure.
+            return JSONResponse(
+                {"error": "label not found", "detail": str(e), "applied": applied},
+                status_code=422,
+            )
+        except IssueHasOpenChildrenError as e:
+            # Same 409 /issue-close gives (#1196), so state.close_issue can
+            # convert it back into the same exception client-side.
+            return JSONResponse(
+                {"error": "open children", "detail": str(e), "applied": applied},
+                status_code=409,
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue patch failed", "detail": str(e), "applied": applied},
+                status_code=503,
+            )
+        return JSONResponse(
+            asdict(
+                rest_schema.IssuePatchResult(
+                    updated=bool(applied),
+                    applied=applied,
+                    labels=labels_out,
+                    labels_changed=labels_changed,
+                )
+            )
+        )
+
+    async def get_issue_comments_resource(request: Request) -> Response:
+        """#1944: ``GET /issue/{repo}/{n}/comments`` — the resource-shaped read
+        that pairs with the POST below, behaviour-identical to
+        ``GET /issue-comments?repo_name=…&issue_number=…``."""
+        from coord import state  # noqa: PLC0415
+
+        key = _resource_issue_key(request)
+        if isinstance(key, Response):
+            return key
+        repo_name, number = key
+        try:
+            comments = state.list_issue_comments(repo_name, number)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-comments read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(asdict(rest_schema.IssueCommentList(comments=comments)))
+
+    async def post_issue_comments_resource(request: Request) -> Response:
+        """#1944: ``POST /issue/{repo}/{n}/comments`` — the resource-shaped
+        stand-in for /issue-comment (``action="post"``, the default) and
+        /issue-comments (``action="capture"`` / ``"sync"``)."""
+        from coord import state  # noqa: PLC0415
+
+        key = _resource_issue_key(request)
+        if isinstance(key, Response):
+            return key
+        repo_name, number = key
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        unknown = rest_schema.unknown_fields(rest_schema.IssueCommentCreate, body)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unknown field(s): {', '.join(unknown)}"}, status_code=400
+            )
+        action = body.get("action") or "post"
+        if action not in ("post", "capture", "sync"):
+            return JSONResponse(
+                {"error": f"unknown action: {action!r}"}, status_code=400
+            )
+        if action in ("post", "capture") and not body.get("body"):
+            return JSONResponse(
+                {"error": f"body is required for action {action!r}"}, status_code=400
+            )
+        try:
+            synced: int | None = None
+            if action == "post":
+                state._comment_on_issue_local(
+                    repo_name,
+                    number,
+                    body["body"],
+                    repo_github=body.get("repo_github"),
+                )
+            elif action == "capture":
+                state._record_issue_comment_capture_local(
+                    repo_name=repo_name,
+                    issue_number=number,
+                    body=body["body"],
+                    gh_comment_id=body.get("gh_comment_id"),
+                    author=body.get("author"),
+                    created_at=body.get("created_at"),
+                )
+            else:
+                synced = state._sync_issue_comments_local(
+                    repo_name, number, repo_github=body.get("repo_github")
+                )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-comment write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            asdict(
+                rest_schema.IssueCommentResult(ok=True, action=action, synced=synced)
+            )
+        )
+
+    async def patch_assignment(request: Request) -> Response:
+        """#1944: partial update of one assignment row — the resource-shaped
+        stand-in for /assignment-usage, /assignment-session-id and
+        /assignment-failure-reason.
+
+        Deliberately does **not** 404 on an unknown assignment id: the three
+        RPC routes issue an UPDATE that matches no rows and return 200, and a
+        new failure mode would be a trap for the mechanical client migration
+        (#1946).  ``updated`` reports which *fields were sent*, not whether a
+        row matched — exactly as the RPC ``{"ok": true}`` does.
+        """
+        from coord import state  # noqa: PLC0415
+
+        aid = request.path_params["assignment_id"]
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        unknown = rest_schema.unknown_fields(rest_schema.AssignmentPatch, body)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unknown field(s): {', '.join(unknown)}"}, status_code=400
+            )
+
+        applied: list[str] = []
+        try:
+            # The predicates below are copied verbatim from
+            # post_assignment_usage so the two cannot diverge on edge cases
+            # (an explicit null cost, a zero token count, is_interactive=false).
+            if body.get("cost_usd") is not None:
+                state._update_assignment_cost_local(aid, body["cost_usd"])
+                applied.append("cost_usd")
+            if any(k in body for k in rest_schema.USAGE_TOKEN_FIELDS):
+                state._update_assignment_tokens_local(
+                    aid,
+                    input_tokens=int(body.get("input_tokens") or 0),
+                    output_tokens=int(body.get("output_tokens") or 0),
+                    cache_creation_tokens=int(body.get("cache_creation_tokens") or 0),
+                    cache_read_tokens=int(body.get("cache_read_tokens") or 0),
+                    num_turns=int(body.get("num_turns") or 0),
+                )
+                applied.append("tokens")
+            if body.get("is_interactive"):
+                state._mark_assignment_interactive_local(aid)
+                applied.append("is_interactive")
+            if body.get("smoke_tests") is not None:
+                state._update_assignment_smoke_tests_local(aid, body["smoke_tests"])
+                applied.append("smoke_tests")
+            if body.get("completion_summary"):
+                state._update_assignment_completion_summary_local(
+                    aid, body["completion_summary"]
+                )
+                applied.append("completion_summary")
+            if body.get("stop_reason"):
+                state._update_assignment_stop_reason_local(aid, body["stop_reason"])
+                applied.append("stop_reason")
+            if body.get("claude_session_id") is not None:
+                state._update_assignment_claude_session_id_local(
+                    aid, body["claude_session_id"]
+                )
+                applied.append("claude_session_id")
+            if body.get("failure_reason") is not None:
+                state._set_assignment_failure_reason_local(aid, body["failure_reason"])
+                applied.append("failure_reason")
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": "assignment patch failed",
+                    "detail": str(e),
+                    "applied": applied,
+                },
+                status_code=503,
+            )
+        return JSONResponse(
+            asdict(
+                rest_schema.AssignmentPatchResult(
+                    updated=bool(applied), applied=applied
+                )
+            )
+        )
+
     async def get_audit(request: Request) -> Response:
         # #1037: paginated read over audit_log — deliberately its own endpoint
         # (NOT riding /board, which is a bounded current-state snapshot). Keyset
@@ -8783,6 +9319,21 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/board", board, methods=["GET"]),
         Route("/assignment/{assignment_id}", get_assignment, methods=["GET"]),
         Route("/issue/{repo_name}/{number}", get_issue, methods=["GET"]),
+        # #1944 (Phase B): resource-shaped routes ALONGSIDE the RPC ones below.
+        # Nothing here removes or changes an RPC route; see rest_schema.py for
+        # the resource↔RPC mapping table.
+        Route("/assignment/{assignment_id}", patch_assignment, methods=["PATCH"]),
+        Route("/issue/{repo_name}/{number}", patch_issue, methods=["PATCH"]),
+        Route(
+            "/issue/{repo_name}/{number}/comments",
+            get_issue_comments_resource,
+            methods=["GET"],
+        ),
+        Route(
+            "/issue/{repo_name}/{number}/comments",
+            post_issue_comments_resource,
+            methods=["POST"],
+        ),
         Route("/audit", get_audit, methods=["GET"]),
         # #1742: report engine. Catalogue first, then the run route — both
         # read-only, both alongside /audit because they read the same data.
