@@ -147,6 +147,7 @@ from coord.commands.release import release_group, release_preflight
 # #2220: `coord repo add` / `coord repo doctor` — onboarding a repo, and
 # verifying it actually happened across all five layers.
 from coord.commands.repo import repo_group
+from coord.commands.store_migrate import migrate_to_postgres
 from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
@@ -491,6 +492,7 @@ main.add_command(release_preflight)
 main.add_command(release_group)
 # #2220: repo onboarding + its verifier.
 main.add_command(repo_group)
+main.add_command(migrate_to_postgres)
 main.add_command(tui_group)
 
 

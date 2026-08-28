@@ -361,6 +361,20 @@ def _open_postgres(dsn: str) -> Any:
     return conn
 
 
+def open_postgres_connection(dsn: str) -> Any:
+    """Public entry point onto :func:`_open_postgres` for tooling that needs
+    a fully-migrated Postgres connection outside the ``get_connection()``
+    singleton -- today, only ``coord.store_migrate``'s importer (#828), which
+    opens a target that may not (yet) be the DSN this process's own
+    ``coordinator.yml`` names, so it calls this directly with whatever DSN
+    the operator gave it rather than going through :func:`get_connection`'s
+    config-resolution path. Same guarantees as every other caller of
+    :func:`_open_postgres`: refuses under pytest, and runs the same schema
+    creation/migration path SQLite gets (#827 item 3).
+    """
+    return _open_postgres(dsn)
+
+
 # #2752: a clean, tagged release is always exactly "X.Y.Z" -- setuptools_scm
 # only emits anything else (a ".devN+g<sha>" local/dev suffix, a bare
 # "0+unknown" when no distribution resolves at all, or git-describe's
