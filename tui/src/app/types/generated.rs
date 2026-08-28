@@ -555,12 +555,15 @@ pub(crate) struct OpenIssue {
     /// #406: GitHub milestone title (e.g. "v0.5").  `None` when no milestone.
     #[serde(default)]
     pub(crate) milestone_title: Option<String>,
-    /// #2497: true when the `/board` wire bounded `body` — set for a closed
-    /// (non-epic) issue, whose body `board_wire.bound_issue_row` drops to 0
-    /// chars (#1791). `#[serde(default)]` so an older daemon (pre-#2497,
-    /// never stamps this) deserializes as `false` — the pre-existing
-    /// behavior of trusting `body` verbatim. Absent for open/epic issues,
-    /// whose bodies the wire never truncates to 0.
+    /// #2497: true when the `/board` wire bounded `body`. Set for every
+    /// NON-EPIC issue, closed or open: `board_wire.bound_issue_row` drops a
+    /// closed body to 0 chars (#1791) and an open one to its machine-parsed
+    /// `**Allowed:**` residue (#1939), because the Issue tabs hydrate the
+    /// real text lazily from `GET /issue/{repo}/{number}`. Absent only for
+    /// epic bodies, which stay inline for the client-side Milestone DAG
+    /// parse. `#[serde(default)]` so an older daemon (pre-#2497, never
+    /// stamps this) deserializes as `false` — the pre-existing behavior of
+    /// trusting `body` verbatim.
     ///
     /// Not part of `coord.board_schema.BoardIssue` — stamped onto the row
     /// afterward by `coord/board_wire.py`; kept here by hand alongside its

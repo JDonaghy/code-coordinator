@@ -30903,6 +30903,129 @@
         );
     }
 
+    /// #1939: an **open** non-epic issue's body now leaves the `/board`
+    /// collection wire too — `board_wire.bound_issue_row` keeps only the
+    /// machine-parsed `**Allowed:**` residue plus the truncation notice, on
+    /// the strength of exactly this lazy path (1.39 MB / 81% of issue-body
+    /// bytes off every uncached poll). The closed-issue sibling above proved
+    /// hydration for a body the wire drops to 0 chars; this proves it for
+    /// the newly-lazy open case, end to end through `ShellAdapter → handle →
+    /// render_frame`, so the size win rests on a tested path rather than an
+    /// assumption.
+    #[test]
+    fn tuidriver_board_open_issue_body_hydrates_after_truncation() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Exactly what `bound_issue_row` puts on the wire for an open
+        // non-epic issue that declares its file scope: the `**Allowed:**`
+        // line survives, everything else is replaced by the notice.
+        const WIRE_BODY: &str = "- **Allowed:** `coord/board_wire.py`\n\
+             \n… [truncated on the /board wire — full text: detail endpoint]";
+        const FULL_BODY: &str =
+            "The open issue prose the collection wire no longer carries at all";
+
+        // `CoordApp` isn't `Clone`, so build a fresh one per phase.
+        let build = || {
+            let assignments =
+                vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+            let mut app = make_app_with_assignments(assignments);
+            app.data.open_issues.push(OpenIssue {
+                repo_name: "repo-a".to_string(),
+                number: 10,
+                title: "Fix dashboard rendering".to_string(),
+                body: WIRE_BODY.to_string(),
+                state: "open".to_string(),
+                labels: Vec::new(),
+                milestone_number: None,
+                milestone_title: None,
+                body_truncated: true,
+                body_len: Some(4096),
+                synced_at: None,
+            });
+            app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+            app.board_detail_tab = BoardDetailTab::Issue;
+            app
+        };
+
+        // 1. Before hydration: the notice renders, and the fetch is armed for
+        //    an OPEN issue — the gate must not be closed-only.
+        let app = build();
+        assert_eq!(
+            app.issue_body_fetch_target(),
+            Some(("repo-a".to_string(), 10)),
+            "an open truncated issue on the Issue tab must arm the detail fetch"
+        );
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("truncated on the /board wire"),
+            "pre-hydration the wire's truncation notice must render:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(FULL_BODY),
+            "the full body is NOT on the collection wire:\n{}",
+            driver.screen()
+        );
+
+        // 2. The background detail fetch lands.
+        let mut app = build();
+        app.issue_detail_cache.insert(
+            ("repo-a".to_string(), 10),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some(FULL_BODY.to_string()),
+            },
+        );
+        assert_eq!(
+            app.issue_body_fetch_target(),
+            None,
+            "hydrated → nothing left to fetch"
+        );
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains(FULL_BODY),
+            "hydrated full body must render on the Board > Issue tab:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("truncated on the /board wire"),
+            "the notice must not survive hydration:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1939: the server keeps an open issue's `**Allowed:**` line(s) inline
+    /// precisely so this parse — which `acceptance_for_path_arg` runs
+    /// SYNCHRONOUSLY while handling a Pipeline right-click dispatch, with no
+    /// user action to hide a detail fetch behind — still resolves. Asserts
+    /// the residue shape `board_wire._machine_readable_residue` emits parses
+    /// identically to the original body it was cut from.
+    #[test]
+    fn allowed_globs_survive_the_1939_open_body_cut() {
+        let full_body = "Prose nothing parses.\n\
+             ## Files\n\
+             - **Allowed:** `tui/src/app/**`, `coord/board_wire.py`\n\
+             - **Forbidden:** docs/README.\n\
+             More prose.\n";
+        // What `bound_issue_row` leaves on the wire: matching lines only,
+        // plus the truncation notice.
+        let wire_body = "- **Allowed:** `tui/src/app/**`, `coord/board_wire.py`\n\
+             \n… [truncated on the /board wire — full text: detail endpoint]";
+
+        let from_full = parse_allowed_globs_from_issue_body(full_body);
+        let from_wire = parse_allowed_globs_from_issue_body(wire_body);
+        assert_eq!(
+            from_full,
+            vec!["tui/src/app/**".to_string(), "coord/board_wire.py".to_string()],
+        );
+        assert_eq!(
+            from_wire, from_full,
+            "the /board residue must parse to the same globs as the full body — \
+             otherwise #1939's byte win silently breaks --for-path resolution"
+        );
+    }
+
     /// Test 2 — list rendering:
     ///
     /// An issue with a known title must appear in the Board sidebar tree.

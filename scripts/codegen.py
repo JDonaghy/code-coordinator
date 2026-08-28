@@ -1050,12 +1050,15 @@ RUST_EXTRA_FIELDS: dict[str, tuple[RustField, ...]] = {
         RustField(
             name="body_truncated", ty="bool", serde=("default",),
             doc=(
-                "#2497: true when the `/board` wire bounded `body` — set for a closed",
-                "(non-epic) issue, whose body `board_wire.bound_issue_row` drops to 0",
-                "chars (#1791). `#[serde(default)]` so an older daemon (pre-#2497,",
-                "never stamps this) deserializes as `false` — the pre-existing",
-                "behavior of trusting `body` verbatim. Absent for open/epic issues,",
-                "whose bodies the wire never truncates to 0.",
+                "#2497: true when the `/board` wire bounded `body`. Set for every",
+                "NON-EPIC issue, closed or open: `board_wire.bound_issue_row` drops a",
+                "closed body to 0 chars (#1791) and an open one to its machine-parsed",
+                "`**Allowed:**` residue (#1939), because the Issue tabs hydrate the",
+                "real text lazily from `GET /issue/{repo}/{number}`. Absent only for",
+                "epic bodies, which stay inline for the client-side Milestone DAG",
+                "parse. `#[serde(default)]` so an older daemon (pre-#2497, never",
+                "stamps this) deserializes as `false` — the pre-existing behavior of",
+                "trusting `body` verbatim.",
                 "",
                 "Not part of `coord.board_schema.BoardIssue` — stamped onto the row",
                 "afterward by `coord/board_wire.py`; kept here by hand alongside its",
@@ -1142,10 +1145,22 @@ def emit_rust_struct(schema_name: str, rust_name: str, schemas: dict[str, Any]) 
     lines.extend(meta["attrs"])
     lines.append(f"#[derive({', '.join(meta['derives'])})]")
     lines.append(f"{meta['vis']} struct {rust_name} {{")
+    extras = RUST_EXTRA_FIELDS.get(rust_name, ())
+    # #1939: an extras entry WINS over the mechanical walk when the spec also
+    # declares that property. `RUST_EXTRA_FIELDS` exists for the wire-only
+    # `<field>_truncated`/`<field>_len` flags `board_wire.py` stamps on, and
+    # `/openapi.json` now declares them too (it always should have — they were
+    # just rare enough on the wire that nothing noticed). Without this the walk
+    # and the table would BOTH emit them: duplicate struct fields, and the
+    # auto-derived `body_len: i64` would shadow the hand-written
+    # `Option<i64>` that `issue_body_fetch_target`'s `len?` gate depends on.
+    extra_names = {f.name for f in extras}
     for python_name, field_schema in properties.items():
+        if python_name in extra_names:
+            continue
         field = overrides.get(python_name) or _rust_auto_field(python_name, field_schema)
         lines.extend(_render_rust_field(field))
-    for field in RUST_EXTRA_FIELDS.get(rust_name, ()):
+    for field in extras:
         lines.extend(_render_rust_field(field))
     lines.append("}")
     return "\n".join(lines)
