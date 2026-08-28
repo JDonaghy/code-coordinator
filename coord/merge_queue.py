@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -3753,6 +3754,54 @@ def save_queue(items: list[QueuedMerge]) -> None:
     retry_on_locked(_write)
 
 
+# ── Merged-history lookups (#1107 Part 3) ───────────────────────────────────
+#
+# `housekeeping.sweep()` archives MERGED merge_queue rows older than the
+# archive retention window into `merge_queue_archive` (same move-not-delete
+# pattern as `assignments`/`notifications`) so the live table stays bounded
+# instead of growing forever. `enqueue_approved_work()` and `staging_items()`
+# both dedup on "(repo, issue) already merged" to avoid re-surfacing an issue
+# whose prior work attempt already shipped — once the winning entry ages out
+# of the live table, that check must still see it, so it consults the
+# archive too.
+
+def _archived_merged_issue_keys(conn: sqlite3.Connection) -> set[tuple[str, int]]:
+    """(repo_name, issue_number) pairs recorded MERGED in the archive.
+
+    `merge_queue_archive` only exists once a housekeeping sweep has archived
+    at least one row (or archiving is disabled entirely), so this is
+    defensive against the table being absent.
+    """
+    try:
+        rows = sql.execute(
+            conn,
+            "SELECT repo_name, issue_number FROM merge_queue_archive WHERE state = ?",
+            (MERGED,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {(r["repo_name"], r["issue_number"]) for r in rows}
+
+
+def merged_issue_keys() -> set[tuple[str, int]]:
+    """All ``(repo_name, issue_number)`` pairs ever recorded MERGED.
+
+    Unions the live ``merge_queue`` table with ``merge_queue_archive`` so
+    callers get a correct answer regardless of whether the winning entry has
+    since been archived by ``housekeeping.sweep()``.
+    """
+    conn = get_connection()
+    live = {
+        (r["repo_name"], r["issue_number"])
+        for r in sql.execute(
+            conn,
+            "SELECT repo_name, issue_number FROM merge_queue WHERE state = ?",
+            (MERGED,),
+        ).fetchall()
+    }
+    return live | _archived_merged_issue_keys(conn)
+
+
 # ── Enqueue ──────────────────────────────────────────────────────────────
 
 def enqueue(
@@ -5403,12 +5452,10 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
     queued_branches: set[str] = {x.branch for x in existing_queue if x.branch}
 
     # Fast-lookup: (repo_name, issue_number) pairs already MERGED so we skip
-    # issues whose prior attempt was already shipped.
-    already_merged: set[tuple[str, int]] = {
-        (x.repo_name, x.issue_number)
-        for x in existing_queue
-        if x.state == MERGED
-    }
+    # issues whose prior attempt was already shipped. Consults the archive
+    # too (#1107 Part 3) since the winning entry may have aged out of the
+    # live table by the time a later duplicate work item shows up here.
+    already_merged = merged_issue_keys()
 
     result: list[StagingItem] = []
     completed = list(getattr(board, "completed", []) or [])
