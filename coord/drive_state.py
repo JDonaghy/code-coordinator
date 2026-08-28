@@ -111,6 +111,13 @@ class IssueState:
     work_acceptance_state: str = ""
     work_acceptance_reason: str = ""
     work_acceptance_sha: str = ""
+    # #2871: when the work row went terminal — ``None`` for a row still
+    # running/pending or predating this column. Paired with `issue_title`
+    # below so `decide()` can tell a genuinely-still-blocking
+    # `refused_policy` row apart from one whose issue was retargeted
+    # (title rewritten) after it finished, and can name the row's age in
+    # whatever it reports instead of silently re-quoting stale prose.
+    work_finished_at: float | None = None
 
     review_aid: str = ""
     review_status: str = ""
@@ -181,6 +188,13 @@ class IssueState:
     # `oracle:exempt`/`manifest.exempt` opt-out for the trust gate
     # (`AcceptanceGateChecker.is_issue_exempt`) without a second board scan.
     issue_labels: tuple[str, ...] = ()
+    # #2871: this issue's CURRENT GitHub title — resolved from the same
+    # `/board` `issues` row `issue_labels` is, no extra I/O. Compared
+    # against a terminal `refused_policy` work row's branch (workers name
+    # branches `issue-{N}-{slugify(title)}` at dispatch time) to detect a
+    # retarget: an issue whose deliverable was rewritten after the worker
+    # refused no longer matches the branch that refusal was about.
+    issue_title: str = ""
 
     # The JIT slice's own `type="test-author"` assignment (#1171: keyed on
     # `for_issue_number == issue`, NOT `issue_number` — that field is the
@@ -355,6 +369,13 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         return default if value is None else value
 
     exit_code = (work or {}).get("exit_code")
+    finished_at_raw = (work or {}).get("finished_at")
+    try:
+        work_finished_at = (
+            float(finished_at_raw) if finished_at_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        work_finished_at = None
 
     # #1453: oracle-loop JIT slice resolution — both reads are over data
     # already published on /board, no extra I/O (see IssueState's docstring
@@ -368,10 +389,12 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
     # instead of discovering a mismatch only when #1711's dispatch-time
     # guard refuses it. No extra I/O: `issues` is already part of *payload*.
     issue_labels: list[str] = []
+    issue_title = ""
     for oi in payload.get("issues") or []:
         if oi.get("repo_name") == repo and oi.get("number") == issue:
             milestone_number = oi.get("milestone_number")
             issue_labels = list(oi.get("labels") or [])
+            issue_title = oi.get("title") or ""
             break
 
     milestone_tracking_issue = None
@@ -451,6 +474,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_acceptance_state=g(work, "acceptance_state"),
         work_acceptance_reason=g(work, "acceptance_reason"),
         work_acceptance_sha=g(work, "acceptance_sha"),
+        work_finished_at=work_finished_at,
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
@@ -472,6 +496,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         milestone_number=milestone_number,
         milestone_tracking_issue=milestone_tracking_issue,
         issue_labels=tuple(issue_labels),
+        issue_title=issue_title,
         # #2024: the per-issue Test-stage policy, off the labels already read
         # above (no extra I/O). `test_mode_from_labels` is the same function
         # `coord.state._get_issue_test_mode_local` uses, so the driver and the

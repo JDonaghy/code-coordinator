@@ -2764,6 +2764,23 @@ def test_a_policy_refusal_parks_without_spending_an_attempt():
     assert POLICY_REFUSAL_REASON in reconcile.updates["last_reason"]
 
 
+def test_a_policy_refusal_park_reason_names_a_remedy_that_actually_clears_it():
+    """#2871: before this fix, the printed remedy (`coord drive-queue
+    remove` once handled) was misleading — `coord.drive.decide()` re-read
+    the SAME stale `refused_policy` row on every relaunch regardless of
+    what the issue said by then, so `remove`+`add` looked like the fix but
+    did nothing. The park reason must name the precondition that actually
+    matters (retargeting the issue) rather than pure queue surgery."""
+    entries = [entry(2195, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2195): POLICY_REFUSAL_REASON},
+    )
+    reason = plan.reconciles[0].reason
+    assert "retarget the issue" in reason
+    assert "dispatches fresh work automatically" in reason
+
+
 def test_a_policy_refusal_parks_even_on_a_fresh_entrys_first_tick():
     entries = [entry(2195, state=STATE_RUNNING, attempts=0)]
     plan = plan_tick(

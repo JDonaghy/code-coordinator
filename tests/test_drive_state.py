@@ -142,6 +142,44 @@ def test_project_resolves_issue_labels_from_the_issues_list():
     assert state.issue_labels == ("oracle:exempt", "bug")
 
 
+def test_project_resolves_issue_title_from_the_issues_list():
+    """#2871: `decide()`'s retarget-detection compares a terminal
+    `refused_policy` row's branch against THIS — the issue's current
+    title — no extra I/O, same `/board` `issues` row `issue_labels` reads."""
+    payload = {
+        "assignments": [],
+        "issues": [
+            {"repo_name": REPO, "number": 1392, "title": "Rewritten deliverable"},
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.issue_title == "Rewritten deliverable"
+
+
+def test_project_defaults_issue_title_empty_with_no_matching_issue():
+    payload = {"assignments": []}
+    state = project(payload, REPO, 1392, make_config())
+    assert state.issue_title == ""
+
+
+def test_project_reads_work_finished_at_from_the_work_row():
+    """#2871: paired with `issue_title` so `decide()` can name a
+    pre-dispatch refusal's age instead of leaving it unstated."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", status="refused_policy", finished_at=12345.0)
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_finished_at == 12345.0
+
+
+def test_project_defaults_work_finished_at_none_when_absent():
+    payload = {"assignments": [row(assignment_id="w1")]}
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_finished_at is None
+
+
 def test_project_refuses_an_unconfigured_repo():
     with pytest.raises(DriveStateError, match="not in coordinator.yml"):
         project({"assignments": []}, "nope", 1, make_config())

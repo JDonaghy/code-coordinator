@@ -1840,6 +1840,71 @@ def test_refused_policy_work_is_terminal_and_carries_the_2234_marker():
     assert "needs the coordinator" in action.message.lower()
 
 
+def test_refused_policy_still_blocking_names_the_assignment_and_age():
+    """#2871: even the still-blocking case must stop reading as though a
+    FRESH worker just refused again — the message names the pre-dispatch
+    assignment it refused on and the row's age, not just generic prose."""
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="refused_policy",
+            work_finished_at=1000.0,
+        )
+    )
+    assert action.is_exit
+    assert "pre-dispatch refusal on assignment w1" in action.message
+    assert "refused_policy" in action.message
+    assert POLICY_REFUSAL_MARKER in action.message
+
+
+def test_refused_policy_is_bypassed_when_the_issue_was_retargeted():
+    """#2871 / CC#916: a `refused_policy` row is a verdict on the ASK the
+    worker was shown, not a standing veto on the issue number forever.
+    `coord.claim.find_work_claim` never even sees this row (terminal rows
+    live in `board.completed`) — the reason a stale refusal vetoed every
+    later drive was entirely in `decide()` reading the fossil row as "this
+    run's" state before ever reaching dispatch. If the issue's title was
+    rewritten after the row finished, the branch it would have produced no
+    longer matches — that mismatch means the ask changed, so this must
+    dispatch fresh work instead of dying on the old refusal again."""
+    s = state(
+        work_aid="w1",
+        work_status="refused_policy",
+        work_branch="issue-1392-old-pre-retarget-title",
+        issue_title="A completely different retargeted deliverable",
+        work_finished_at=1000.0,
+    )
+    action = step(s)
+    assert action.kind == RUN
+    assert action.command[0] == "assign"
+    assert action.audit_event is not None
+    event_type, summary, details = action.audit_event
+    assert event_type == "refused_policy_stale"
+    assert "w1" in summary
+    assert details["stale_assignment_id"] == "w1"
+    assert details["stale_branch"] == "issue-1392-old-pre-retarget-title"
+
+
+def test_refused_policy_is_not_bypassed_when_the_title_is_unchanged():
+    """The inverse of the retarget test above: the branch still matches
+    `issue-{N}-{slugify(current title)}`, so nothing was retargeted — this
+    must still die rather than silently re-dispatch over a worker that
+    correctly refused."""
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "Exactly the title this branch was named from"
+    s = state(
+        work_aid="w1",
+        work_status="refused_policy",
+        work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+        issue_title=title,
+    )
+    action = step(s)
+    assert action.is_exit
+    assert POLICY_REFUSAL_MARKER in action.message
+    assert action.audit_event is None
+
+
 def test_an_unknown_terminal_status_refuses_to_guess():
     """No terminal status may fall through to a bare wait (PR #1386)."""
     action = step(state(work_aid="w1", work_status="wat"))

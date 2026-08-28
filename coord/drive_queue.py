@@ -3107,18 +3107,32 @@ def _reconcile_running(
     # _decide` marks a `refused_policy` work row with `POLICY_REFUSAL_
     # MARKER` (coord.models) rather than `EXIT_DISPATCH_REFUSED`, so this is
     # checked purely off `own_reason` text, independent of `exit_refused`.
-    # Unlike #2063 this NEVER self-clears — a policy refusal names a
-    # STANDING rule, not a pending verdict — so it deliberately does not get
-    # the "queue resumes it automatically" wording Gate-A's park does; see
-    # `plan_tick`'s pre-pass below, which recognises this same marker and
-    # leaves the entry parked rather than falling through to the CI-park
-    # auto-resume. An operator clears it exactly like a `blocked` entry:
-    # handle it, then `coord drive-queue remove`.
+    # Unlike #2063 this does not self-clear on its own timer — a policy
+    # refusal names a STANDING rule, not a pending verdict — so it
+    # deliberately does not get the "queue resumes it automatically" wording
+    # Gate-A's park does; see `plan_tick`'s pre-pass below, which recognises
+    # this same marker and leaves the entry parked rather than falling
+    # through to the CI-park auto-resume.
+    #
+    # #2871: the precondition IS an operator action, but it is a RETARGET
+    # (rewrite the issue so its deliverable isn't the coordinator-only thing
+    # that got refused), not queue surgery. Before #2871, `coord.drive.
+    # decide()` re-read the SAME stale `refused_policy` row on every relaunch
+    # regardless of what the issue said by then, so `remove`+`add` looked
+    # like the fix but did nothing — a fresh queue row, same blocking
+    # assignment. `decide()` now compares that row's branch against the
+    # issue's CURRENT title-derived slug (`_refused_policy_is_stale`) and
+    # bypasses a stale refusal instead of dying on it again, so `remove`+
+    # `add` (or any later relaunch) genuinely works — but only once the
+    # retarget has actually happened.
     if own_reason and is_policy_refusal_reason(own_reason):
         reason = (
             f"{own_reason} — parking without spending an attempt (#2234); "
-            "needs the coordinator, not a relaunch — `coord drive-queue "
-            "remove` once handled"
+            "needs the coordinator, not a relaunch — retarget the issue "
+            "(rewrite its title so the deliverable isn't coordinator-only), "
+            "then `coord drive-queue remove`+`add` (or just relaunch "
+            "`coord drive`) — it now detects the retarget and dispatches "
+            "fresh work automatically (#2871)"
         )
         return (
             Reconcile(
