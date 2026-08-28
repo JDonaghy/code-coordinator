@@ -744,6 +744,51 @@ def test_summary_reports_a_failed_heartbeat_loudly():
     assert result.moved is False
 
 
+def test_a_raised_heartbeat_always_lands_in_errors_too():
+    """#2862: a heartbeat that *raises* sets ``heartbeat_ok=False`` AND appends
+    to ``errors`` — the two are never independent.
+
+    This invariant is why the daemon's old Step 3d reporting could not work.
+    ``coord/serve_app.py``'s tick loop read it as::
+
+        if portal_result.moved or portal_result.errors:
+            log.info(...)
+        elif not portal_result.heartbeat_ok:
+            log.warning(...)      # <- written for a failed heartbeat
+
+    and since every real heartbeat failure populates ``errors``, the ``if``
+    always won and the ``elif`` was dead code for the one case it existed to
+    catch.  If a future refactor stops recording the heartbeat exception as an
+    error, that branch structure becomes viable again — but the daemon-side
+    fix (report on ``errors or not heartbeat_ok``) stays correct either way.
+    """
+    result = sync_tick(client=FakeClient(heartbeat_error=PortalBridgeError("401")))
+    assert result.heartbeat_ok is False
+    assert result.errors, (
+        "a raised heartbeat produced no error entry — the daemon's Step 3d "
+        "reporting branch (see the docstring) assumes these move together"
+    )
+    assert any("heartbeat" in e for e in result.errors)
+    # And the pass that could not heartbeat left the portal's freshness marker
+    # untouched — which is exactly the frozen `last_heartbeat_at` column #2862
+    # was diagnosed from.
+    assert portal_store.get_sync_state().last_heartbeat_at is None
+
+
+def test_a_quiet_healthy_pass_is_still_reportable():
+    """The steady state the journal must show (#2862): nothing moved, no
+    errors, heartbeat landed.  Before the fix this pass logged at INFO on a
+    daemon where INFO was discarded, so a working bridge and a dead one were
+    byte-identical from the outside."""
+    result = sync_tick(client=FakeClient())
+    assert result.enabled is True
+    assert result.moved is False
+    assert not result.errors
+    assert result.heartbeat_ok is True
+    assert "heartbeat=ok" in result.summary()
+    assert portal_store.get_sync_state().last_heartbeat_at is not None
+
+
 # ── the daemon wiring ───────────────────────────────────────────────────────
 
 

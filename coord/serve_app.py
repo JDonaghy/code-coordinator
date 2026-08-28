@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import asyncio
+    import logging
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -84,6 +85,85 @@ SERVE_PORT = 7435
 # command-line ``--token`` would leak the secret into ``ps``).
 SERVE_TOKEN_ENV = "COORD_SERVE_TOKEN"
 SERVE_TOKEN_FILE = Path.home() / ".coord" / "serve_token"
+
+# #2862: the daemon's own logging configuration.  See
+# ``configure_daemon_logging`` for why this exists at all.
+DAEMON_LOG_LEVEL_ENV = "COORD_LOG_LEVEL"
+DEFAULT_DAEMON_LOG_LEVEL = "INFO"
+#: ``logging.Handler.name`` of the handler this module installs, so repeated
+#: calls update it in place instead of stacking duplicates onto the logger.
+DAEMON_LOG_HANDLER_NAME = "coord-daemon"
+#: The logger tree the handler is attached to — every ``coord.*`` logger in
+#: this package (``coord.serve``, ``coord.review``, ``coord.notify``, …).
+DAEMON_LOG_LOGGER = "coord"
+
+
+def configure_daemon_logging(level: str | None = None) -> "logging.Logger":
+    """Make ``coord.*`` log records actually reach the journal (#2862).
+
+    **This repo configures logging nowhere else, and that is a bug in exactly
+    one place: the long-lived daemons.**  For a short-lived CLI the default is
+    fine — Python's root logger sits at ``WARNING`` with no handler attached,
+    so ``log.warning`` reaches :data:`logging.lastResort` (a bare stderr
+    ``StreamHandler``) and ``log.info`` is dropped before it is even
+    formatted, because ``Logger.isEnabledFor(INFO)`` is ``False``.
+
+    ``coord serve`` inherits that default, and ``uvicorn.run(...,
+    log_level="info")`` does **not** fix it: uvicorn's ``LOGGING_CONFIG``
+    configures only the ``uvicorn`` / ``uvicorn.error`` / ``uvicorn.access``
+    loggers and leaves the root logger handler-less.  The consequence is the
+    whole of #2862: every ``log.info`` in ``_tick_loop`` — the passive
+    reconcile, the notify drain, auto-drain, milestone-gate and, the one that
+    cost two debugging rounds, **Step 3d's portal-sync summary** — was a
+    silent no-op on the real daemon.  "Zero portal-related lines in the
+    journal" was therefore never evidence that the bridge was quiet; it was
+    guaranteed by construction whether the bridge ran or not.
+
+    Called from ``coord serve``'s entry point (``coord.commands.lifecycle``)
+    **before** ``uvicorn.run``.  uvicorn's own ``dictConfig`` sets
+    ``disable_existing_loggers: False``, so the handler installed here
+    survives that call untouched.
+
+    *level* defaults to ``$COORD_LOG_LEVEL`` and then to ``INFO``; an
+    unrecognised value degrades to ``INFO`` rather than raising (a typo in a
+    systemd ``EnvironmentFile`` must not stop the daemon from booting).
+
+    ``propagate`` is deliberately left at its default ``True``: the root
+    logger has no handlers under uvicorn, and :meth:`logging.Logger.callHandlers`
+    only falls back to ``lastResort`` when it found *no* handler anywhere in
+    the chain — so records are emitted exactly once, while pytest's ``caplog``
+    (which captures at the root) still sees them.
+
+    Idempotent: repeated calls re-level the existing handler instead of
+    stacking a second copy, so a test (or a future second entry point) can
+    call it freely.  Returns the configured logger.
+    """
+    import logging  # noqa: PLC0415
+    import logging.handlers  # noqa: PLC0415,F401 — ensure the module is fully loaded
+
+    raw = level or os.environ.get(DAEMON_LOG_LEVEL_ENV) or DEFAULT_DAEMON_LOG_LEVEL
+    resolved = logging.getLevelName(str(raw).strip().upper())
+    if not isinstance(resolved, int):
+        # `getLevelName` returns the string "Level FOO" for an unknown name.
+        resolved = logging.INFO
+
+    logger = logging.getLogger(DAEMON_LOG_LOGGER)
+    logger.setLevel(resolved)
+    for existing in logger.handlers:
+        if getattr(existing, "name", None) == DAEMON_LOG_HANDLER_NAME:
+            existing.setLevel(resolved)
+            return logger
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.name = DAEMON_LOG_HANDLER_NAME
+    handler.setLevel(resolved)
+    # No timestamp: journald stamps every line itself, and a second one only
+    # makes `journalctl -u coord-serve | grep portal` noisier.  The logger
+    # name IS the grep handle — `coord.serve`, `coord.portal_sync`, … — which
+    # `lastResort` (message only, no name, no level) never gave us.
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    return logger
 
 
 def resolve_serve_token(flag_token: str | None = None) -> str | None:
@@ -7804,6 +7884,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # portal's queue, and the heartbeat the portal uses to decide whether
         # to trust the status it is showing is stale by exactly the downtime.
         last_portal_sync = 0.0
+        # #2862: the last (enabled, interval-positive) gate state Step 3d
+        # logged, so a *change* — including the very first evaluation, from
+        # ``None`` — is announced exactly once instead of either never (a
+        # `False` boolean gate is silent by design) or on every 30 s tick.
+        last_portal_gate_state: tuple[bool, bool] | None = None
 
         # #1220: fleet-wide orphaned-worktree sweep on its own slow cadence
         # (default hourly; 0 disables).  Separate timer from housekeeping/
@@ -7973,6 +8058,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             nonlocal last_notify_drain, last_notifier, last_portal_sync
+            nonlocal last_portal_gate_state
             from coord.audit import (  # noqa: PLC0415
                 flush_lock_contention_summary as _flush_audit_lock_contention_summary,
             )
@@ -8315,29 +8401,92 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # `config` actually *is* (`_config_mtime`/`config.path` at the
                 # top of `_tick_loop`, and how the daemon was launched) before
                 # re-suspecting this expression.
+                #
+                # #2862 — the SECOND time this went quiet, with #2824's root
+                # cause ruled out (no `~/.coord/client.toml` on the daemon
+                # host, the right `--config` on argv, `portal.enabled: true`
+                # in that exact file). The check the note above asks for came
+                # back clean, and the actual answer was that the *question was
+                # unanswerable from the journal*: `coord serve` never
+                # configures logging, and `uvicorn.run(log_level="info")`
+                # configures only the `uvicorn*` loggers — so the root logger
+                # stayed handler-less at WARNING and `log.info(...)` below was
+                # dropped before formatting, on every pass, forever. "Zero
+                # portal lines in the journal" was therefore not evidence of a
+                # quiet bridge; it was true whether Step 3d ran or not. Fixed
+                # at the source by `configure_daemon_logging()` (top of this
+                # module, called from `coord serve`'s entry point). Two
+                # consequences are handled right here:
+                #
+                #   1. The gate's *state* is now announced on change (below),
+                #      so "Step 3d is not running, and here is which half of
+                #      the guard said no" is greppable instead of inferred
+                #      from a frozen DB column three layers down. A `False`
+                #      boolean gate is silent by design — that is the shape of
+                #      a boolean, so the fix is to log the boolean, not to
+                #      keep re-reading the expression.
+                #   2. Every pass now logs exactly one line, and a pass that
+                #      failed logs it at WARNING. The old `elif not
+                #      portal_result.heartbeat_ok: log.warning(...)` could
+                #      never fire for the case it was written for: a heartbeat
+                #      that *raises* also appends to `SyncResult.errors` (see
+                #      `coord.portal_sync.sync_tick`), so the `if
+                #      ... or portal_result.errors` branch above it always won
+                #      and downgraded the report to the INFO level that was
+                #      being discarded. A failed heartbeat is the single most
+                #      important thing this step can say — the portal is
+                #      showing a status nothing is refreshing — and it was
+                #      structurally unable to say it.
                 try:
-                    portal_due = (
-                        portal_sync_interval > 0
-                        and config.portal.enabled
-                        and _time.monotonic() - last_portal_sync
-                        >= portal_sync_interval
-                    )
+                    portal_enabled = bool(config.portal.enabled)
                 except Exception:  # noqa: BLE001
-                    portal_due = False
+                    portal_enabled = False
                     log.warning("portal sync guard failed", exc_info=True)
+                portal_gate_state = (portal_enabled, portal_sync_interval > 0)
+                if portal_gate_state != last_portal_gate_state:
+                    last_portal_gate_state = portal_gate_state
+                    if not portal_enabled:
+                        log.warning(
+                            "portal sync: Step 3d DISABLED — portal.enabled is "
+                            "false in the config this daemon is running on "
+                            "(%s); the customer-portal bridge will not run",
+                            config.path,
+                        )
+                    elif portal_sync_interval <= 0:
+                        log.warning(
+                            "portal sync: Step 3d DISABLED — "
+                            "COORD_PORTAL_SYNC_INTERVAL=%s; the "
+                            "customer-portal bridge will not run",
+                            portal_sync_interval,
+                        )
+                    else:
+                        log.info(
+                            "portal sync: Step 3d ENABLED — every %.0fs "
+                            "(config=%s)",
+                            portal_sync_interval,
+                            config.path,
+                        )
+                portal_due = (
+                    portal_gate_state[0]
+                    and portal_gate_state[1]
+                    and _time.monotonic() - last_portal_sync >= portal_sync_interval
+                )
                 if portal_due:
                     last_portal_sync = _time.monotonic()
                     try:
                         portal_result = await run_in_threadpool(
                             _portal_sync_tick, config
                         )
-                        if portal_result.moved or portal_result.errors:
-                            log.info("%s", portal_result.summary())
-                        elif not portal_result.heartbeat_ok:
-                            # A quiet pass that could not even heartbeat is the
-                            # one thing worth saying out loud: the portal is
-                            # now showing a status nothing is refreshing.
+                        # One line per pass, unconditionally (#2862): a
+                        # heartbeat that lands and moves nothing is the
+                        # bridge's healthy steady state, and it is exactly
+                        # the state whose absence took two issues to notice.
+                        # `summary()` already opens with "portal sync: " — do
+                        # not prefix it again.
+                        if portal_result.errors or not portal_result.heartbeat_ok:
                             log.warning("%s", portal_result.summary())
+                        else:
+                            log.info("%s", portal_result.summary())
                     except Exception:  # noqa: BLE001
                         log.warning("portal sync tick failed", exc_info=True)
                 # Step 4: #762 archival sweep on a slow cadence (default hourly).
@@ -8494,30 +8643,84 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     except Exception:  # noqa: BLE001
                         log.warning("wal-checkpoint tick failed", exc_info=True)
 
+        def _watch(task, name: str):  # noqa: ANN001,ANN202
+            """Say so — loudly — if a background loop ever stops (#2862).
+
+            These are bare ``asyncio.create_task`` loops with no supervisor:
+            if one raises out of its ``while True``, its entire cadence stops
+            for the rest of the process's life and nothing says a word.
+            ``asyncio``'s own "Task exception was never retrieved" warning
+            only fires when the task object is garbage-collected, and these
+            are held alive by ``_ctx``'s frame until shutdown — so in
+            practice the traceback surfaces at process exit, if ever.
+
+            #2862 listed "the tick loop itself stalled" as suspect 3, to be
+            "ruled out first" and filed separately if confirmed, and there
+            was no way to do either from the journal. Now there is: a dead
+            loop is one ERROR line naming itself.
+
+            Returns *task* so call sites stay one expression.
+            """
+            if task is None:
+                return None
+
+            def _done(t) -> None:  # noqa: ANN001
+                if t.cancelled():
+                    return  # normal shutdown — `_ctx`'s finally cancels these
+                exc = t.exception()
+                log.error(
+                    "daemon loop %r STOPPED (%s) — its periodic work will not "
+                    "run again until `coord serve` is restarted",
+                    name,
+                    "raised" if exc is not None else "returned unexpectedly",
+                    exc_info=exc,
+                )
+
+            task.add_done_callback(_done)
+            return task
+
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202
-            task = (
-                asyncio.create_task(_tick_loop()) if interval > 0 else None
+            # #2862: name the config this daemon is actually running on, once,
+            # at startup. Step 3d's debugging note asks whoever hits the next
+            # "the bridge is quiet" to "check what `config` actually *is* ...
+            # and how the daemon was launched" — this is that check, answered
+            # in the journal instead of by reading /proc.
+            log.info(
+                "tick loop starting: config=%s portal.enabled=%s "
+                "reconcile=%.0fs portal_sync=%.0fs",
+                config.path,
+                getattr(getattr(config, "portal", None), "enabled", None),
+                interval,
+                portal_sync_interval,
             )
-            gate_task = (
+            task = _watch(
+                asyncio.create_task(_tick_loop()) if interval > 0 else None,
+                "tick",
+            )
+            gate_task = _watch(
                 asyncio.create_task(_gate_refresh_loop())
                 if interval > 0 and gate_refresh_interval > 0
-                else None
+                else None,
+                "gate-refresh",
             )
-            health_task = (
+            health_task = _watch(
                 asyncio.create_task(_health_refresh_loop())
                 if interval > 0 and health_poll_interval > 0
-                else None
+                else None,
+                "health-refresh",
             )
-            phantom_heal_task = (
+            phantom_heal_task = _watch(
                 asyncio.create_task(_phantom_heal_loop())
                 if interval > 0 and phantom_heal_interval > 0
-                else None
+                else None,
+                "phantom-heal",
             )
-            auto_revalidate_task = (
+            auto_revalidate_task = _watch(
                 asyncio.create_task(_auto_revalidate_loop())
                 if interval > 0 and auto_revalidate_interval > 0
-                else None
+                else None,
+                "auto-revalidate",
             )
             try:
                 yield
