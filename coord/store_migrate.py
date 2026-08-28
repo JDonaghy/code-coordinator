@@ -437,7 +437,10 @@ def run_import(
     would import into, unless *force* is passed -- in which case those
     tables are wiped (``DELETE``, not ``DROP``, so a table
     :func:`_ensure_target_table` didn't just create keeps its schema) and
-    re-imported. Refuse-by-default was chosen over silent upsert because
+    re-imported. The wipe is its own pass in **reverse** topological order
+    (children before parents) and finishes before the first insert: deleting
+    a parent while a not-yet-wiped child still references it is an immediate
+    FK violation on Postgres. Refuse-by-default was chosen over silent upsert because
     there is no single conflict key that's safe to upsert on across all 28+
     tables (composite keys, archive mirrors with no PK at all) -- a blind
     "insert or replace everything" risks masking a genuine double-run
@@ -507,11 +510,27 @@ def run_import(
                     "(pass force=True / --force to wipe and re-import)"
                 )
 
+            # Two passes, in opposite directions, and they must stay separate.
+            # *tables* is in parent-first FK order (see
+            # _topological_import_order), which is right for the INSERTs but
+            # exactly backwards for the DELETEs: wiping "split_proposals"
+            # while "split_chunks"'s old rows still reference it is an
+            # immediate Postgres FK violation (split_chunks.split_proposal_id
+            # is NOT NULL REFERENCES split_proposals(id), no ON DELETE
+            # CASCADE, not DEFERRABLE). Interleaving delete-then-insert per
+            # table in one forward pass hits that on every --force re-run
+            # against a target holding split-workflow data, so the wipe runs
+            # child-first over reversed(tables) and completes before the
+            # first insert.
+            for table in reversed(tables):
+                if table in existing:
+                    sql.execute(target_conn, f'DELETE FROM "{table}"')  # noqa: S608
+            if existing:
+                target_conn.commit()
+
             report = ImportReport(dry_run=False)
             for table in tables:
                 _ensure_target_table(source_conn, target_conn, table)
-                if table in existing:
-                    sql.execute(target_conn, f'DELETE FROM "{table}"')  # noqa: S608
                 report.tables.append(import_table(source_conn, target_conn, table))
             return report
         finally:
