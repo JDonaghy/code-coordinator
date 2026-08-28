@@ -705,6 +705,29 @@ def _no_real_github_backoff_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_issues_sync_status_store(monkeypatch, tmp_path):
+    """#2858: never let a test write the OPERATOR'S real
+    ``~/.coord/issues_sync_status.json``.
+
+    Same hazard as ``_no_real_github_backoff_store`` immediately above, one
+    file over: this one is the per-repo issues-sync staleness clock
+    (``coord.issues_sync_status``) that both ``coord.serve_app.
+    _sync_issues_tick``'s starvation-floor bypass and the
+    ``issues_sync_staleness`` health check read. A leaked test write could
+    plant a fake stale/fresh timestamp that either spuriously trips a real
+    fleet's staleness alarm or masks a real one.
+
+    ``coord.issues_sync_status._state_path`` reads
+    ``$COORD_ISSUES_SYNC_STATE`` first for exactly this redirect, the same
+    env-var seam ``_no_real_github_backoff_store`` uses, not a monkeypatched
+    private function.
+    """
+    monkeypatch.setenv(
+        "COORD_ISSUES_SYNC_STATE", str(tmp_path / "issues-sync-status.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_roll_pending_store(monkeypatch, tmp_path):
     """#2587: never let a test write the OPERATOR'S real
     ``~/.coord/roll_pending.json``.

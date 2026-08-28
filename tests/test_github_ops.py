@@ -2018,6 +2018,81 @@ class TestGhRateLimitDetection:
         assert exc.request_id == "AAAA:BBBB:CCCC"
         assert exc.retry_after_s == 47.0
 
+    def test_primary_wording_reclassified_secondary_when_quota_healthy(
+        self, coord_db,
+    ) -> None:
+        """#2858: `gh`'s own stderr says nothing about "secondary", but a
+        live `gh api rate_limit` read (the second `subprocess.run` call --
+        `_primary_quota_healthy`) shows the primary quota comfortably
+        unused. That is the real signature of the secondary (abuse-
+        detection) limiter, per `coord.github_throttle`'s own docstring --
+        must reclassify rather than trust `gh`'s ambiguous wording.
+        """
+        responses = [
+            MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+            ),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"resources": {"core": {"limit": 5000, "remaining": 4986}}}
+                ),
+                stderr="",
+            ),
+        ]
+        with patch("coord.github_ops.subprocess.run", side_effect=responses):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        assert excinfo.value.secondary is True
+        from coord import github_throttle
+
+        backoff = github_throttle.current()
+        assert backoff is not None and backoff.reason == "secondary_rate_limit"
+
+    def test_primary_wording_stays_primary_when_quota_check_fails(
+        self, coord_db,
+    ) -> None:
+        """The `gh api rate_limit` confirmation call itself can fail (auth,
+        network) -- `_primary_quota_healthy` returns unknown, and #2858
+        leaves the pre-existing classification untouched rather than
+        guessing."""
+        responses = [
+            MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: API rate limit exceeded (HTTP 403)",
+            ),
+            MagicMock(returncode=1, stdout="", stderr="gh: auth error"),
+        ]
+        with patch("coord.github_ops.subprocess.run", side_effect=responses):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        assert excinfo.value.secondary is False
+
+    def test_primary_wording_stays_primary_when_quota_genuinely_exhausted(
+        self, coord_db,
+    ) -> None:
+        """A REAL primary-quota exhaustion (remaining near 0) must NOT be
+        reclassified as secondary -- #2858's fix only overrides the label
+        when there is positive evidence the primary quota is healthy."""
+        responses = [
+            MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: API rate limit exceeded (HTTP 403)",
+            ),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"resources": {"core": {"limit": 5000, "remaining": 0}}}
+                ),
+                stderr="",
+            ),
+        ]
+        with patch("coord.github_ops.subprocess.run", side_effect=responses):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("api", "repos/acme/api/branches/main")
+        assert excinfo.value.secondary is False
+
 
 class TestGhBackoffConsultedBeforeEachCall:
     """#2809: `_gh` consults the shared backoff BEFORE issuing a network
@@ -2099,6 +2174,58 @@ class TestGhBackoffConsultedBeforeEachCall:
         ):
             github_ops._gh("issue", "view", "1")
         sleep_mock.assert_not_called()
+
+    def test_force_through_backoff_bypasses_deep_skip_and_succeeds(
+        self, coord_db,
+    ) -> None:
+        """#2858: a caller that sets ``force_through_backoff=True`` still
+        gets the short jittered pre-call sleep, but skips the "still deep
+        inside the window, don't even try" raise that
+        ``test_deep_inside_backoff_skips_the_network_call`` above confirms
+        for an ordinary caller — the starvation-floor escape hatch for
+        ``coord.serve_app._sync_issues_tick``.
+        """
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="orig-request-id", retry_after_s=600.0,
+        )
+        with patch("coord.github_ops.time.sleep") as sleep_mock, patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="[]", stderr=""),
+        ) as run_mock:
+            result = github_ops._gh(
+                "issue", "list", force_through_backoff=True
+            )
+        assert result == "[]"
+        run_mock.assert_called_once()
+        sleep_mock.assert_called_once()
+
+    def test_force_through_backoff_still_raises_on_a_real_rate_limit(
+        self, coord_db,
+    ) -> None:
+        """Bypassing the pre-emptive skip is not a guarantee of success --
+        if the real network call still comes back rate-limited, it still
+        raises (and still re-records the hit) exactly like any other
+        caller's real attempt would; #2858 only removes the SAMPLING
+        starvation, not the limiter itself."""
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="orig-request-id", retry_after_s=600.0,
+        )
+        with patch("coord.github_ops.time.sleep"), patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: You have exceeded a secondary rate limit (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops._gh("issue", "list", force_through_backoff=True)
+        assert excinfo.value.from_cache is False
 
 
 class TestParseGhInclude:

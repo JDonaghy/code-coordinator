@@ -201,7 +201,7 @@ def test_build_board_view_reads_merge_and_activity_from_work_like_rows():
                 {"repo_name": REPO, "issue_number": 1660, "type": "review", "status": "running"},
             ],
             "issues": [
-                {"repo_name": REPO, "number": 1654, "state": "open"},
+                {"repo_name": REPO, "number": 1654, "state": "open", "synced_at": 1_700_000_000.0},
                 {"repo_name": REPO, "number": 1650, "state": "closed"},
             ],
         },
@@ -212,6 +212,11 @@ def test_build_board_view_reads_merge_and_activity_from_work_like_rows():
     assert view.facts(entry_key(REPO, 1654)).open
     assert not view.facts(entry_key(REPO, 1660)).active_work
     assert view.live_sessions == frozenset({entry_key(REPO, 1654)})
+    # #2858: `synced_at`, when the `/board` payload carries it, is threaded
+    # onto `IssueFacts.issue_synced_at` -- a row that never carried it (1650
+    # here) stays `None`, the safe "not stale" default.
+    assert view.facts(entry_key(REPO, 1654)).issue_synced_at == 1_700_000_000.0
+    assert view.facts(entry_key(REPO, 1650)).issue_synced_at is None
 
 
 def test_build_board_view_reads_merge_ci_pending_from_the_live_plan_reason():
@@ -2297,6 +2302,93 @@ def test_a_parked_entry_never_reaches_blocked_even_deep_into_the_attempt_budget(
     assert plan.reconciles[0].outcome == "parked"
     assert plan.blocked == ()
     assert plan.alert is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2858: a `running` entry whose board `issues` cache row is STALE must not
+# have a negative `landed` reading (still "open") trusted enough to spend a
+# retry/exhausted attempt on — the cache may simply not have caught up with
+# a merge/close yet (a starved `coord.serve_app._sync_issues_tick`). Same
+# "park, don't spend an attempt" treatment as #1891's CI-pending case just
+# above; `_issue_cache_stale` is the predicate, `ISSUE_CACHE_STALE_CEILING_S`
+# the threshold (aliased from `coord.issues_sync_status.
+# STALENESS_WARN_SECONDS` — the same point `coord.health` starts warning).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _stale_open_board(*, synced_at: float, active: bool = False) -> BoardView:
+    facts = IssueFacts(
+        known=True, issue_state="open", issue_synced_at=synced_at, active_work=active,
+    )
+    return BoardView(issues={entry_key(REPO, 1650): facts})
+
+
+def test_a_dead_drive_with_a_stale_cache_parks_instead_of_retrying():
+    from coord.drive_queue import ISSUE_CACHE_STALE_CEILING_S
+
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    stale_board = _stale_open_board(
+        synced_at=NOW - ISSUE_CACHE_STALE_CEILING_S - 1.0
+    )
+    plan = plan_tick(entries, stale_board, capacity=1, now=NOW)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()
+    assert plan.launch is None
+    assert "stale" in reconcile.reason
+
+
+def test_a_stale_cache_park_never_reaches_blocked_even_deep_into_the_budget():
+    """Mirrors the #1891 CI-pending sibling: attempts genuinely never move,
+    however close to the ceiling the entry already was."""
+    from coord.drive_queue import ISSUE_CACHE_STALE_CEILING_S
+
+    entries = [entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)]
+    stale_board = _stale_open_board(
+        synced_at=NOW - ISSUE_CACHE_STALE_CEILING_S - 1.0
+    )
+    plan = plan_tick(entries, stale_board, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "parked"
+    assert plan.blocked == ()
+    assert plan.alert is None
+
+
+def test_a_dead_drive_with_a_fresh_cache_still_retries_normally():
+    """A cache row synced comfortably within the ceiling is trusted exactly
+    as before #2858 — the negative `landed` reading stands, and a dead
+    drive with nothing else going for it still retries."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    fresh_board = _stale_open_board(synced_at=NOW - 5.0)
+    plan = plan_tick(entries, fresh_board, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_a_dead_drive_with_no_synced_at_at_all_still_retries_normally():
+    """#2858 backward compatibility: `issue_synced_at=None` (every board
+    payload/test fixture that predates this field, or a board with no
+    `issues` row at all for this key) must never be treated as stale — the
+    safe default is trusting the cache exactly as it always did."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(open_=(1650,)), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_stale_cache_never_overrides_a_positive_landed_reading():
+    """Staleness only ever softens a NEGATIVE `landed` reading — a stale
+    cache that already shows the issue merged/closed is still trusted
+    outright and reconciles straight to `done`, same as always."""
+    from coord.drive_queue import ISSUE_CACHE_STALE_CEILING_S
+
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    facts = IssueFacts(
+        known=True, issue_state="closed",
+        issue_synced_at=NOW - ISSUE_CACHE_STALE_CEILING_S - 1.0,
+    )
+    stale_but_closed = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, stale_but_closed, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "done"
 
 
 def test_a_parked_entry_resumes_to_waiting_and_launches_once_ci_reports():

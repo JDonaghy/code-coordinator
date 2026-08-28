@@ -232,6 +232,58 @@ def _classify_rate_limit(stderr: str) -> tuple[bool, bool]:
     return False, False
 
 
+# #2858 proposal 4: a plain "rate limit" 403 with no "secondary" wording gets
+# classified `primary_rate_limit` by `_classify_rate_limit` above purely from
+# `gh`'s stderr text — but GitHub's abuse-detection (secondary) limiter fires
+# on request RATE/concurrency, not the primary quota, and its own error text
+# does not reliably say "secondary" (see :mod:`coord.github_throttle`'s
+# docstring: "does not show up in `gh api rate_limit` at all"). The
+# 2026-08-27 incident this closes: every hit was recorded `primary_rate_
+# limit` while `gh api rate_limit` read `core 4986/5000` the whole time —
+# sending an operator to check a quota that was never the problem.
+_PRIMARY_HEALTHY_REMAINING_FLOOR = 50
+_RATE_LIMIT_CHECK_TIMEOUT_S = 5.0
+
+
+def _primary_quota_healthy() -> bool | None:
+    """Best-effort ``True``/``False``/``None`` (unknown) reading of whether
+    the primary REST quota is currently healthy.
+
+    Shells out directly rather than through :func:`_gh` — deliberately: this
+    runs FROM INSIDE `_gh`'s own rate-limit failure handling, so routing it
+    back through `_gh` would recurse into the same seam that just failed
+    (and would itself be subject to the very backoff this call exists to
+    disambiguate). `gh api rate_limit` is GitHub's own documented exemption
+    from counting against the quota it reports, so one extra call here does
+    not make the situation this is diagnosing any worse.
+
+    Returns ``None`` — "don't know, don't reclassify" — on ANY failure
+    (missing binary, timeout, non-zero exit, unparseable JSON): silently
+    mislabeling a hit as ``secondary_rate_limit`` on a guess would be worse
+    than leaving the pre-#2858 ``primary_rate_limit`` default alone, since
+    only a *positive* health reading is stronger evidence than "gh's own
+    stderr didn't say 'secondary'".
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", "rate_limit"],
+            capture_output=True, text=True, timeout=_RATE_LIMIT_CHECK_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    core = ((payload or {}).get("resources") or {}).get("core") or {}
+    remaining = core.get("remaining")
+    if not isinstance(remaining, (int, float)):
+        return None
+    return remaining >= _PRIMARY_HEALTHY_REMAINING_FLOOR
+
+
 def _extract_rate_limit_detail(stderr: str) -> GhResponseMeta:
     """Best-effort status/request-id extraction from `gh`'s plain stderr
     text (no `-i`, no headers) -- covers every `_gh` call site, not just the
@@ -294,7 +346,7 @@ def _parse_gh_include(raw: str) -> tuple[GhResponseMeta, str]:
     return GhResponseMeta(status, request_id, retry_after), body
 
 
-def _gh(*args: str) -> str:
+def _gh(*args: str, force_through_backoff: bool = False) -> str:
     """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
 
     #1483: this is the single seam every ``_gh``-backed helper in this module
@@ -319,11 +371,28 @@ def _gh(*args: str) -> str:
     call entirely and raises immediately, reusing the ORIGINAL hit's detail.
     That skip is the actual damping: fewer requests reach a limiter that
     only decays when request volume drops.
+
+    #2858: ``force_through_backoff=True`` is the starvation-floor escape
+    hatch for a caller on a SLOW, fixed cadence (``coord.serve_app.
+    _sync_issues_tick``'s 300s tick) that a shared latch re-armed by faster
+    pollers can otherwise starve indefinitely — every sample this caller
+    takes lands mid-window, so it never once falls through to the short
+    sleep-then-call path below, and it is exactly this class of caller a
+    2026-08-27 incident showed CAN keep failing for 39+ minutes straight
+    even though GitHub's real limiter had already cleared (a direct `gh`
+    call succeeded in under a second the whole time). Setting it skips ONLY
+    the pre-emptive "still deep inside the window, don't even try" branch
+    immediately below — the short jittered pre-call sleep just after it
+    still runs unchanged, and a genuinely-still-active real limit still
+    raises (and still re-records) normally once the actual network call is
+    made. This never removes damping for the callers the latch exists to
+    protect (this flag is not theirs to set); it only stops a rare,
+    low-frequency caller from being permanently outbid by them.
     """
     backoff_sleep_s, active_backoff = github_throttle.consult()
     if active_backoff is not None:
         remaining = active_backoff.until - time.time()
-        if remaining > github_throttle.MAX_PRECALL_SLEEP_S:
+        if remaining > github_throttle.MAX_PRECALL_SLEEP_S and not force_through_backoff:
             # Still well inside a known backoff window -- don't add another
             # request to a limiter that only recovers when the rate drops.
             # This is not a fresh observation, so it is not re-recorded.
@@ -379,6 +448,14 @@ def _gh(*args: str) -> str:
         record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration, detail=stderr)
         is_rate_limit, is_secondary = _classify_rate_limit(stderr)
         if is_rate_limit:
+            if not is_secondary:
+                # #2858: `gh`'s own text didn't say "secondary" -- confirm
+                # against the live primary quota before believing it rather
+                # than assuming the text is always right. `None` (couldn't
+                # tell) leaves `is_secondary` exactly as `_classify_rate_
+                # limit` set it -- see `_primary_quota_healthy`'s docstring.
+                if _primary_quota_healthy():
+                    is_secondary = True
             text_meta = _extract_rate_limit_detail(stderr)
             # `-i` callers (get_branch_sha/get_default_branch_head) get
             # headers on stdout even on a non-2xx response -- prefer that
@@ -435,18 +512,36 @@ def _json_loads_or(raw: str | None, default: Any = None) -> Any:
         return default
 
 
-def _gh_json(*args: str, default: Any = None) -> Any:
+def _gh_json(*args: str, default: Any = None, force_through_backoff: bool = False) -> Any:
     """Run ``gh`` with *args* and JSON-decode its stdout, failing open.
 
     Composes :func:`_gh` (still raises on a non-zero ``gh`` exit / missing
     binary / timeout) with :func:`_json_loads_or` (fails open to *default* on
     empty/malformed stdout from an otherwise-successful invocation). See
     :func:`_json_loads_or` for why this exists.
+
+    *force_through_backoff* passes straight through to :func:`_gh` — see its
+    docstring (#2858). Deliberately omitted from the call entirely (rather
+    than forwarded as an explicit ``False``) when unset: a bare ``_gh(*args)``
+    keeps every OTHER ``_gh_json``-based call site's exact pre-#2858 call
+    signature, which matters because several tests mock ``_gh`` directly and
+    assert on its exact call args — forwarding an always-present keyword
+    would have changed every one of those, not just the callers that
+    actually use this.
     """
-    return _json_loads_or(_gh(*args), default)
+    if force_through_backoff:
+        raw = _gh(*args, force_through_backoff=True)
+    else:
+        raw = _gh(*args)
+    return _json_loads_or(raw, default)
 
 
-def get_open_issues(repo: str) -> list[dict]:
+def get_open_issues(repo: str, *, force_through_backoff: bool = False) -> list[dict]:
+    """*force_through_backoff* (#2858): set by ``coord.serve_app.
+    _sync_issues_tick`` once ``coord.issues_sync_status.is_starved(repo)``
+    says this repo has gone too long without a successful sync — see
+    :func:`coord.github_ops._gh`'s docstring for what it actually changes.
+    """
     # #658: raised from 100 → 500 so repos with many open issues don't silently
     # skip old issue numbers during coord sync.  GitHub paginates the REST list
     # endpoint at 100 items internally, so this costs ~5 API calls for a large
@@ -456,6 +551,7 @@ def get_open_issues(repo: str) -> list[dict]:
         "--json", "number,title,labels,milestone,body,assignees",
         "--limit", "500",
         default=[],
+        force_through_backoff=force_through_backoff,
     )
 
 
