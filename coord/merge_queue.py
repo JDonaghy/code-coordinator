@@ -3778,7 +3778,11 @@ def _archived_merged_issue_keys(conn: sqlite3.Connection) -> set[tuple[str, int]
             "SELECT repo_name, issue_number FROM merge_queue_archive WHERE state = ?",
             (MERGED,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sql.driver_errors():  # #2784: not just sqlite3.OperationalError
+        # "no such table" surfaces as a *different* driver-named exception
+        # per backend (sqlite3.OperationalError vs psycopg.errors.
+        # UndefinedTable), so this must go through the dialect seam or the
+        # not-yet-archived case becomes an uncaught crash on Postgres.
         return set()
     return {(r["repo_name"], r["issue_number"]) for r in rows}
 
