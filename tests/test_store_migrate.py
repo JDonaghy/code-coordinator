@@ -408,6 +408,68 @@ class TestRunImport:
             assert by_table["split_proposals"].target_rows == 1
             assert by_table["split_chunks"].target_rows == 1
 
+    def _seed_split_workflow_source(self, tmp_path: Path) -> Path:
+        conn = _open_source(tmp_path)
+        try:
+            cur = conn.execute(
+                "INSERT INTO split_proposals (repo_name, issue_number, issue_title) "
+                "VALUES (?, ?, ?)",
+                ("r1", 1, "t1"),
+            )
+            proposal_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO split_chunks (split_proposal_id, title, scope) VALUES (?, ?, ?)",
+                (proposal_id, "chunk", "scope"),
+            )
+            conn.execute(
+                "INSERT INTO machines (name, host) VALUES (?, ?)", ("m1", "m1.local")
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return tmp_path / "source.db"
+
+    def test_force_rerun_wipes_children_before_parents(self, tmp_path: Path) -> None:
+        """Regression for the *delete* half of the FK-ordering bug.
+
+        ``tables`` is in parent-first order so the INSERTs are FK-safe, but
+        that order is backwards for ``force``'s wipe: a single forward pass
+        that deleted and re-inserted each table in turn would ``DELETE FROM
+        split_proposals`` while split_chunks' *old* rows (wiped only on a
+        later iteration) still reference them --
+        ``split_chunks.split_proposal_id`` is NOT NULL REFERENCES
+        split_proposals(id) with no ON DELETE CASCADE and not DEFERRABLE, so
+        an enforcing target rejects that DELETE outright.
+
+        This is the scenario --force exists for: a target that *already
+        holds* FK-linked rows from a prior successful import. FK enforcement
+        is turned on explicitly (scratch_database's SQLite branch leaves it
+        off) so the test fails loudly on a regression rather than vacuously
+        passing.
+        """
+        source_path = self._seed_split_workflow_source(tmp_path)
+        with scratch_database(tmp_path, "target.db") as target_conn:
+            sql.execute(target_conn, "PRAGMA foreign_keys=ON")
+            store_migrate.run_import(sqlite_path=source_path, target_connector=lambda: target_conn)
+
+            # The target now holds FK-linked rows -- exactly the state the
+            # per-table delete-then-insert pass blew up on.
+            report = store_migrate.run_import(
+                sqlite_path=source_path, force=True, target_connector=lambda: target_conn
+            )
+            assert report.ok
+            by_table = {t.table: t for t in report.tables}
+            assert by_table["split_proposals"].target_rows == 1
+            assert by_table["split_chunks"].target_rows == 1
+            assert by_table["machines"].target_rows == 1
+            # And the child rows still point at a live parent after the wipe.
+            rows = sql.execute(
+                target_conn,
+                "SELECT c.id FROM split_chunks c "
+                "JOIN split_proposals p ON p.id = c.split_proposal_id",
+            ).fetchall()
+            assert len(rows) == 1
+
 
 class TestMigrateToPostgresCli:
     """``coord migrate-to-postgres`` -- the CLI wrapper around ``run_import``.
