@@ -2303,6 +2303,35 @@ def _board_response_schema(components: dict) -> dict:
     for cls in board_schema.BOARD_PROJECTIONS.values():
         dataclass_schema(cls, components)
 
+    # #1939: `coord.board_wire` stamps `<field>_truncated` / `<field>_len`
+    # onto bounded rows *after* the DTO projection. They are wire-only (no DB
+    # column backs them), so they are not — and should not be — DTO fields;
+    # but they ARE on the wire, and since #1939 made issue-body bounding
+    # unconditional every open non-epic issue carries them. Declare them off
+    # board_wire's own field table so the published schema stays a superset
+    # of what /board emits (asserted by
+    # tests/test_board_schema.py::test_board_dtos_and_projection_cannot_drift).
+    from coord.board_wire import BOUNDED_TEXT_FIELDS  # noqa: PLC0415
+
+    for _table, _fields in BOUNDED_TEXT_FIELDS.items():
+        _props = components[board_schema.BOARD_PROJECTIONS[_table].__name__]["properties"]
+        for _field in _fields:
+            _props[f"{_field}_truncated"] = {
+                "type": "boolean",
+                "description": (
+                    f"#1337/#1939: true when the /board wire bounded `{_field}`. "
+                    "Additive-only — absent (not false) when nothing was cut. "
+                    "Fetch the full value from the single-resource detail read."
+                ),
+            }
+            _props[f"{_field}_len"] = {
+                "type": "integer",
+                "description": (
+                    f"#1337/#1939: `{_field}`'s full length before bounding. "
+                    f"Present only alongside `{_field}_truncated`."
+                ),
+            }
+
     planned_merge_ref = dataclass_schema(PlannedMerge, components)
     staging_item_ref = dataclass_schema(StagingItem, components)
 

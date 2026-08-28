@@ -15,14 +15,12 @@ This module is the single place the per-field wire policy lives:
   with ``<field>_truncated: true`` (+ ``<field>_len``).  Consumers that need
   the full text (fix-worker briefings, the TUI findings pane) fetch the
   single-resource detail endpoint ``GET /assignment/{id}``.
-* **Bounded documents** — ``issues.body``, ``test_plan`` — get a *high* hard
-  cap that today truncates nothing real (issue-body p99 ≈ 9 KB, cap 16 KB)
-  but bounds the pathological row, because clients parse these semantically
-  (work orders, ``## Files`` globs) and an aggressive prefix cut would break
-  those parses.  **Tracking (epic) issue bodies are exempt entirely** — the
-  TUI's Milestone DAG parses ``## Work order`` client-side out of the full
-  body (see :func:`bound_issue_row`); GitHub's own 64 KB issue-body limit ×
-  the handful of epics per board keeps the exemption bounded.  Full body:
+* **Bounded documents** — ``test_plan`` — get a *high* hard cap that today
+  truncates nothing real but bounds the pathological row, because clients
+  parse these semantically and an aggressive prefix cut would break those
+  parses.
+* **``issues.body`` is not on the collection wire at all** (#1939), except
+  for tracking (epic) issues.  See :func:`bound_issue_row`.  Full body:
   ``GET /issue/{repo}/{number}``.
 
 Everything here is wire-only: the DB row, the detail endpoints, and local
@@ -49,6 +47,18 @@ issues outright, on top of the existing per-field width caps. Both cuts are
 flagged on the payload (``board_truncated`` + counts) so a client can tell
 it received a trimmed board rather than the whole history — see
 :func:`bound_board_payload`.
+
+**#1939 (instance #5): the 16 KB body cap bounded the pathological row and
+nothing else.** #1337 gave ``issues.body`` a *document* cap high enough that
+it truncates no real issue (p99 ≈ 9 KB against a 16 KB cap), and #1791 then
+dropped the body of *closed* issues outright.  What was left — every **open,
+non-epic** body, shipped whole on every uncached poll — was still 1.44 MB of
+a 1.69 MB issue-body payload measured on the live board, for a field no
+collection view renders: the TUI's Board / Pipeline Issue tabs have hydrated
+the full body from ``GET /issue/{repo}/{number}`` since #2497.  So the body
+now leaves the collection wire for open issues too, and :func:`bound_issue_row`
+keeps only the machine-parsed *residue* a client cannot re-fetch in time —
+see :data:`ALLOWED_GLOB_MARKER`.
 """
 
 from __future__ import annotations
@@ -87,6 +97,27 @@ BOARD_PAYLOAD_BYTE_BUDGET = 2_500_000
 # Appended to truncated *plain-text* fields so a human reading the preview
 # (TUI pane, dialog) knows it is one — machine consumers use the flags.
 TRUNCATION_NOTICE = "\n… [truncated on the /board wire — full text: detail endpoint]"
+
+# #1939: the ONE line-level marker a thin client parses out of a non-epic
+# issue body *synchronously*, without a user action that could wait for a
+# detail fetch — `tui/src/app/pipeline.rs`'s
+# `parse_allowed_globs_from_issue_body` MARKER, read by
+# `acceptance_for_path_arg` while handling a Pipeline right-click dispatch on
+# a repo with more than one acceptance route (`claude-coordinator` itself has
+# two: `coord/**` and `tui/**`). Lines carrying it survive the body cut; see
+# `_machine_readable_residue`. Kept in sync with the Rust side by
+# tests/test_board_wire.py::test_allowed_glob_marker_matches_the_rust_parser,
+# the same cross-language guard posture as coord/board_bool_guard.py.
+#
+# Measured cost of the retention: ZERO on today's live board — 0 of 781
+# issue bodies carry the marker (the house `## Files` convention is a bare
+# backticked-path list, which that parser does not read), so the residue is
+# empty for every real row and the byte win below is unaffected. It is kept
+# anyway because the marker IS the documented spelling
+# (`parse_allowed_globs_from_issue_body`'s own tests use it) and a body that
+# adopts it must keep resolving `--for-path` from the Pipeline right-click
+# rather than silently degrading to "dispatch from the CLI instead".
+ALLOWED_GLOB_MARKER = "**Allowed:**"
 
 
 def _preview(text: str, cap: int) -> str:
@@ -150,8 +181,31 @@ def _bound_test_plan(row: dict, cap: int) -> None:
     row["test_plan"] = None
 
 
+#: table → every field this module may stamp ``<field>_truncated`` /
+#: ``<field>_len`` onto.  Those flags are **wire-only**: they are not DB
+#: columns, so they are deliberately absent from the DTOs in
+#: ``coord/board_schema.py`` (whose rule — "a column not declared here is not
+#: on the wire" — is about *columns*).  They are still on the wire, so
+#: ``coord/serve_app.py``'s ``_board_payload_schema`` publishes them off this
+#: table; before #1939 made issue-body bounding unconditional they fired
+#: rarely enough that ``/openapi.json`` never had to admit they existed.
+BOUNDED_TEXT_FIELDS: dict[str, tuple[str, ...]] = {
+    "assignments": (
+        "review_findings",
+        "test_reason",
+        "smoke_test_reason",
+        "failure_reason",
+        "test_plan",
+    ),
+    "issues": ("body",),
+}
+
+
 def bound_assignment_row(row: dict) -> None:
-    """Apply the wire policy to one ``/board`` assignment row (mutates)."""
+    """Apply the wire policy to one ``/board`` assignment row (mutates).
+
+    Every field it may bound is listed in :data:`BOUNDED_TEXT_FIELDS`.
+    """
     _bound_review_findings(row, PREVIEW_CHARS)
     _bound_text_field(row, "test_reason", PREVIEW_CHARS)
     _bound_text_field(row, "smoke_test_reason", PREVIEW_CHARS)
@@ -172,6 +226,26 @@ def _is_closed_issue(row: dict) -> bool:
     return isinstance(state, str) and state.strip().lower() == "closed"
 
 
+def _machine_readable_residue(body: str) -> str:
+    """The lines of *body* a **client** parses without a user action, joined
+    back together (#1939).
+
+    Everything else in a non-epic body is display material, and the Issue
+    tab re-fetches that from ``GET /issue/{repo}/{number}`` on demand.  What
+    cannot be re-fetched in time is the ``## Files`` glob declaration that
+    ``acceptance_for_path_arg`` reads *synchronously* while handling a
+    right-click dispatch — so those lines, and only those, stay inline.
+
+    Line-scoped by construction: the Rust parser matches
+    :data:`ALLOWED_GLOB_MARKER` per line and reads only the backtick spans
+    that follow it on that same line, so retaining whole matching lines is
+    exactly equivalent to retaining the whole body as far as it can tell.
+    """
+    return "".join(
+        f"{line}\n" for line in body.splitlines() if ALLOWED_GLOB_MARKER in line
+    )
+
+
 def bound_issue_row(row: dict) -> None:
     """Apply the wire policy to one ``/board`` issue row (mutates).
 
@@ -183,24 +257,54 @@ def bound_issue_row(row: dict) -> None:
     work-order items past DOCUMENT_CHARS would silently drop DAG nodes on
     thin clients — a regression in exactly the failure class #1337 exists to
     close.  The exemption stays bounded in practice: an epic body is capped
-    at 65,536 chars by GitHub itself and boards carry few epics (~31 today,
-    0.19 MB total).
+    at 65,536 chars by GitHub itself and boards carry few epics (48 open
+    today, 0.24 MB total).
 
     **Closed (non-epic) issues drop the body entirely** (#1791): a closed
     issue is terminal — no pipeline decision, client-side or server-side,
-    reads its body once it's closed — and #1337's DOCUMENT_CHARS cap alone
-    still left 110 closed issues carrying 0.57 MB on every /board GET. Full
-    text stays on ``GET /issue/{repo}/{number}``. Open (non-epic) issue
-    bodies — the ones ``pipeline.rs``'s ``acceptance_for_path_arg`` and
-    ``dialogs.rs`` parse client-side — keep the DOCUMENT_CHARS cap
-    unchanged.
+    reads its body once it's closed.
+
+    **Open (non-epic) issues keep only the machine-parsed residue** (#1939).
+    The rest of an open body is display material, and both Issue tabs have
+    hydrated it lazily from ``GET /issue/{repo}/{number}`` since #2497 — so
+    shipping it inline was 1.44 MB per uncached poll, per client, for text
+    nothing renders until a user opens one issue.  ``body_truncated`` +
+    ``body_len`` are stamped exactly as for a closed issue, which is what
+    arms that hydration (``pipeline.rs::issue_body_fetch_target``).
     """
     if _is_tracking_issue(row):
         return
     if _is_closed_issue(row):
         _bound_text_field(row, "body", 0)
         return
-    _bound_text_field(row, "body", DOCUMENT_CHARS)
+    _bound_open_issue_body(row)
+
+
+def _bound_open_issue_body(row: dict) -> None:
+    """#1939: replace an open non-epic ``body`` with its machine-readable
+    residue + the truncation notice, stamping the same
+    ``body_truncated``/``body_len`` flags :func:`_bound_text_field` does.
+
+    A body whose residue is not actually smaller than the original (a body
+    that *is* one ``**Allowed:**`` line, or an empty one) is left alone
+    rather than flagged — same "nothing was cut, so the shape is unchanged"
+    rule the width caps follow.
+    """
+    val = row.get("body")
+    if not isinstance(val, str) or not val:
+        return
+    residue = _machine_readable_residue(val)
+    # Backstop for a pathological body that is nothing but glob declarations
+    # — can't happen with a real issue, but the point of this module is that
+    # no collection field is unbounded.
+    if len(residue) > DOCUMENT_CHARS:
+        residue = residue[:DOCUMENT_CHARS]
+    replacement = residue + TRUNCATION_NOTICE
+    if len(replacement) >= len(val):
+        return
+    row["body_len"] = len(val)
+    row["body_truncated"] = True
+    row["body"] = replacement
 
 
 def _open_issue_keys(issues) -> set[tuple[str, int]]:
