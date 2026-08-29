@@ -6879,11 +6879,19 @@ class AgentServer:
         reclaimed, which is how ``cargo-target/quadraui`` reached 38G against
         a 20 GiB cap and filled ``/home``.
 
-        Also passes the absolute free-disk floor (#2137 item 4), and parks
-        the sweep's verdict where the ``cargo_targets`` health check can read
-        it so ``cargo_over_cap`` reaches an operator instead of dead-ending
-        in this dict.  Best-effort: any failure degrades to an empty dict
-        rather than aborting the worktree sweep that calls it.
+        Also passes the absolute free-disk floor (#2137 item 4) and, since
+        #2919, every local checkout's own ``target/`` dir
+        (``checkout_target_dirs``) — without this the floor can only ever
+        reclaim from the shared cache, which is precisely the 2026-08-28
+        incident: a stale ``~/src/quadraui/target`` sat untouched two
+        directories away while the sweep evicted the whole cache to
+        compensate for bytes it structurally could not reach.  Mirrors
+        ``fix_cargo_targets``'s own ``_checkout_target_dirs`` in
+        ``coord/health/checks/cargo_targets.py``.  Also parks the sweep's
+        verdict where the ``cargo_targets`` health check can read it so
+        ``cargo_over_cap`` reaches an operator instead of dead-ending in this
+        dict.  Best-effort: any failure degrades to an empty dict rather than
+        aborting the worktree sweep that calls it.
         """
         with self._lock:
             live_repos = {
@@ -6892,10 +6900,16 @@ class AgentServer:
                 if a.status in (PENDING, RUNNING)
             }
         try:
+            from coord.health.context import local_checkouts  # noqa: PLC0415
+
+            checkout_target_dirs = [
+                c.path / "target" for c in local_checkouts(self._health_config)
+            ]
             result = cargo_cache.sweep(
                 self.state_dir,
                 protect_repos=live_repos,
                 free_floor=cargo_cache.free_floor_bytes(),
+                checkout_target_dirs=checkout_target_dirs,
             )
         except OSError as e:  # pragma: no cover - defensive
             _log.warning("cargo cache GC failed: %s", e)

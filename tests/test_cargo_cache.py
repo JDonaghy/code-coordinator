@@ -20,7 +20,7 @@ import pytest
 from coord import cargo_cache
 from coord.agent import stash_artifacts_for_branch
 
-from tests.test_agent import _init_repo, _server, _spec
+from tests.test_agent import _init_repo, _server, _spec, _write_config
 
 
 class _FakeFcntlHeld:
@@ -795,6 +795,44 @@ def test_free_floor_reachable_still_evicts_when_cache_is_the_dominant_consumer(
     assert r["cargo_cache_bytes"] == 0
 
 
+def test_free_floor_unreachable_reason_set_even_when_cache_already_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression (#2919 review): when the cache is already at/near 0 bytes —
+    e.g. right after a prior tier-3 eviction, which is exactly the state the
+    2026-08-28 incident left the cache in (``cargo_cache_bytes: 0``) — and the
+    free-space floor is still breached, the ``total <= limit`` early return
+    must not swallow the floor-unreachable verdict.  ``total`` and ``limit``
+    are both ``0`` in that state, so the guard fires before the reclaim tiers
+    even run; ``cargo_over_cap_reason`` and the WARN log still have to land,
+    the same as when there was cache left to try tiers 1-2 against."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    root.mkdir(parents=True)  # cache root exists but already empty
+    checkout_target = tmp_path / "src" / "quadraui" / "target"
+    _fill(checkout_target, 500)  # too small (and not stale) to close the gap
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_800, free=200),
+    )
+
+    with caplog.at_level("WARNING", logger=cargo_cache._log.name):
+        r = cargo_cache.sweep(
+            tmp_path,
+            cap=1_000_000,
+            free_floor=10_000,
+            checkout_target_dirs=[checkout_target],
+        )
+
+    assert r["cargo_cache_bytes"] == 0
+    assert r["cargo_floor_unreachable"] is True
+    assert r["cargo_over_cap_reason"] is not None
+    assert "top non-cache consumers" in r["cargo_over_cap_reason"]
+    assert any("floor unreachable" in rec.message for rec in caplog.records)
+
+
 def test_pruning_never_follows_a_symlink_out_of_the_cache(tmp_path: Path) -> None:
     """The #1402 guard, re-asserted against the new tiers: an ``incremental``
     symlink pointing outside the cache is not a prune candidate."""
@@ -845,6 +883,56 @@ def test_agent_gc_publishes_the_over_cap_verdict(tmp_path: Path) -> None:
     assert status is not None
     assert status["cargo_cache_bytes"] == result["cargo_cache_bytes"]
     assert "checked_at" in status
+
+
+def test_gc_cargo_cache_wires_local_checkout_target_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2919 review: ``AgentServer._gc_cargo_cache`` — the automatic sweep run
+    after every worktree clean, the exact code path that produced the
+    2026-08-28 incident — must feed real per-checkout ``target/`` paths into
+    ``sweep()``'s ``checkout_target_dirs``.  Before this fix that parameter
+    was always left at its default (``None``) in production, so the whole
+    non-cache reclaim tier was dead code outside ``cargo_cache.sweep()``'s own
+    unit tests: a stale ``~/src/<repo>/target`` would never actually be
+    reclaimed, no matter how far the free-space floor was breached.
+    """
+    from types import SimpleNamespace
+
+    from coord.config import load as load_config
+
+    repo = _init_repo(tmp_path / "repo")
+    checkout_target = repo / "target"
+    _fill(checkout_target, 9000)
+    _age(checkout_target, 60 * 86400)
+
+    cfg_path = _write_config(
+        tmp_path / "coordinator.yml", repos=["api"], repo_paths={"api": str(repo)}
+    )
+    cfg = load_config(cfg_path)
+
+    server = _server(tmp_path, repo_path=repo, health_config=cfg)
+    root = server.state_dir / "cargo-target"
+    _repo_cache(root, "api", warm=1000)
+
+    monkeypatch.setenv(cargo_cache.FREE_FLOOR_ENV, "1")
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_000, free=1000),
+    )
+    try:
+        result = server._gc_cargo_cache()
+    finally:
+        server.shutdown()
+
+    # Reclaimed — not just scanned — which only happens if the checkout's
+    # real `target/` path reached `sweep()` at all.
+    assert result["cargo_checkout_pruned_bytes"] == 9000
+    assert result["cargo_checkout_pruned"] == [
+        {"path": str(checkout_target), "bytes": 9000}
+    ]
+    assert not checkout_target.exists()
 
 
 # ── agent wiring ────────────────────────────────────────────────────────────

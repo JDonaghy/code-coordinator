@@ -254,7 +254,15 @@ def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     protect_repos = _live_repos(ctx)
     try:
         sweep_result = sweep(
-            ctx.coord_dir, protect_repos=protect_repos, free_floor=free_floor_bytes()
+            ctx.coord_dir,
+            protect_repos=protect_repos,
+            free_floor=free_floor_bytes(),
+            # #2919: same non-cache tier the automatic post-worktree-clean
+            # sweep now gets (`AgentServer._gc_cargo_cache`) — without it
+            # this opt-in fixer shares the earlier bug of being unable to
+            # reclaim a stale per-checkout `target/` before the floor forces
+            # a whole-cache eviction.
+            checkout_target_dirs=sorted(_checkout_target_dirs(ctx)),
         )
     except OSError as exc:
         return FixOutcome(
