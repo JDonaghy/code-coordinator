@@ -5,7 +5,7 @@
 //! `coord/board_schema.py` (#1849) — #1941. Regenerate after any field change:
 //!
 //! ```text
-//! .venv/bin/python scripts/codegen.py --rust
+//! COORD_TUI_SRC=<coord-tui checkout root> .venv/bin/python scripts/codegen.py --rust
 //! ```
 //!
 //! (The fence is load-bearing, and `text` is the load-bearing part of *it*:
@@ -14,17 +14,21 @@
 //! that command as an indented block, or in a bare ``` fence, breaks
 //! `cargo test --doc` with `error: expected item, found `.``.)
 //!
-//! `tests/test_generated_rust_fixture.py` fails CI if this file drifts from what
-//! the generator produces right now, so a stale checkout can't merge — the Rust
-//! equivalent of `tests/test_generated_types_fixture.py` on the TS side.
+//! #2897: the destination is named explicitly (`--out PATH` / `$COORD_TUI_SRC`
+//! — see this script's module docstring), the same shape #2009 gave the TS
+//! half. `tests/test_generated_rust_fixture.py` proves the generator runs and
+//! covers every schema; the byte-for-byte freshness check against *this file
+//! as committed* is coord-tui's own CI job once it exists
+//! (`docs/ADR_COORD_TUI_CI.md`) rather than a test in this repo.
 //!
 //! **Every field defaults.** `/board` is one JSON payload: a single type
 //! mismatch on a single field fails the *entire* `BoardPayload` parse and
 //! blanks every TUI panel — the #632/#546/#628 failure class this repo has
-//! been bitten by three times (see `coord/board_bool_guard.py`). INTEGER-backed
-//! boolean columns (`is_interactive`, `hold_after`, `no_acceptance`,
-//! `review_scoped`) stay typed as an integer, or go through a coercing
-//! deserializer — never a plain `bool` — for the same reason.
+//! been bitten by three times. INTEGER-backed boolean columns
+//! (`is_interactive`, `hold_after`, `no_acceptance`, `review_scoped`) stay
+//! typed as an integer, or go through a coercing deserializer — never a
+//! plain `bool` — for the same reason (`coord/board_schema.py`'s
+//! `INTEGER_BACKED_BOOLEANS`, asserted int-typed by `tests/test_board_schema.py`).
 //!
 //! Field types for anything already consumed by the TUI are hand-pinned in
 //! `RUST_FIELD_OVERRIDES` (`scripts/codegen.py`) to match this file's

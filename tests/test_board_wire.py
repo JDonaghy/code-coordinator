@@ -221,7 +221,8 @@ def test_bound_issue_row_open_epic_body_still_inline() -> None:
 
 
 def test_allowed_glob_marker_matches_the_rust_parser() -> None:
-    """Cross-language guard (#1939), same posture as coord/board_bool_guard.py:
+    """Cross-language guard (#1939), the same posture the now-retired
+    coord/board_bool_guard.py used (#2897, docs/ADR_COORD_TUI_CI.md):
     `ALLOWED_GLOB_MARKER` decides what survives the body cut on the *server*,
     but the consumer that needs it is `parse_allowed_globs_from_issue_body`
     in the Rust TUI. If someone renames the marker on one side only, the
