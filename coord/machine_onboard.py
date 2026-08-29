@@ -1099,12 +1099,24 @@ def summary_line(report: MachineDoctorReport) -> str:
 #: **Only the live layers ``coord doctor`` does not already render itself.**
 #: It prints the #2912 host-resolution line, its own ``unreachable`` line, the
 #: #1712 capabilities/repos cross-check and the #1570 D per-capability probe —
-#: i.e. all of ``network`` and all of ``agent``. Folding those back in would
-#: print every one of them twice under two different names, which is how a
-#: report stops being read. What ``coord doctor`` renders *nowhere* is layers
-#: 4-6 — clone presence, graphify, the agent's venv — and those are three of
-#: the six silent failures #2915 was opened for.
-DOCTOR_LIVE_LAYERS: tuple[str, ...] = ("clones", "graph", "runtime")
+#: i.e. all of ``network`` and all of ``agent``. ``clones`` is EXCLUDED here
+#: for the same reason: the #1712 cross-check
+#: (``_health_vs_config_lines`` in ``coord/commands/status.py``) already
+#: computes "declared repo, not published" from the exact same ``degraded``/
+#: ``published_repos`` shape ``evaluate_clones`` reads, for both the
+#: total-loss case (a repo entirely unserved) and the #2219 partial-drift
+#: case — it just prints the verdict under a different name
+#: (``CRIT repos: ...`` instead of ``clones.missing``/``clones.not_served``).
+#: Folding ``clones`` back in here printed the SAME defect twice under two
+#: names, which is how a report stops being read (found in review of
+#: #2915). What ``coord doctor`` renders *nowhere* is layers 5-6 — graphify
+#: and the agent's venv — and those are two of the six silent failures
+#: #2915 was opened for; clone presence is the third, and it is covered by
+#: the pre-existing #1712 check instead. ``coord machine doctor`` on its own
+#: still renders the full ``clones`` layer (:func:`format_report` walks
+#: :data:`LAYERS`, not this tuple) — this only trims what gets folded into
+#: the fleet-wide ``coord doctor`` report.
+DOCTOR_LIVE_LAYERS: tuple[str, ...] = ("graph", "runtime")
 
 
 def doctor_summary_lines(

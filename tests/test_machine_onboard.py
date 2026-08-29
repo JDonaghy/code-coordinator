@@ -388,7 +388,15 @@ def test_disabled_linger_crits_and_names_the_delayed_symptom():
 def test_doctor_summary_lines_only_carry_the_layers_doctor_does_not_render(cfg):
     """`coord doctor` already prints the #2912 host line, its own unreachable
     line, the #1712 cross-check and the #1570 D probes. Folding those in again
-    would print each finding twice under two names."""
+    would print each finding twice under two names.
+
+    ``clones`` is one of those already-covered layers: the #1712 cross-check
+    (``_health_vs_config_lines``) derives "declared repo, not served" from
+    the same ``degraded``/``published_repos`` shape ``evaluate_clones`` reads,
+    just under its own ``CRIT repos: ...`` name — so it must NOT come through
+    ``doctor_summary_lines``'s default layers either (a regression a review
+    of #2915 caught: both fired for the same defect in the same `coord
+    doctor` run)."""
     health = _health(
         repos=[], degraded={"api": "repo_path missing"},
         capabilities=[],
@@ -399,12 +407,15 @@ def test_doctor_summary_lines_only_carry_the_layers_doctor_does_not_render(cfg):
     )
     report = machine_onboard.evaluate(_facts(cfg, health=health, ts_matches=False))
     lines = "\n".join(line for _, line in machine_onboard.doctor_summary_lines(report))
-    assert "clones.missing" in lines
     assert "graph.graphify_missing" in lines
     assert "runtime.agent_venv_broken" in lines
     # Already rendered by `coord doctor` itself — must not appear twice.
     assert "host_resolves_offtailnet" not in lines
     assert "capabilities_unpublished" not in lines
+    assert "clones.missing" not in lines
+    # The full `clones` layer is still available directly, for `coord
+    # machine doctor`'s own report — only the `coord doctor` fold excludes it.
+    assert any(f.check == "clones.missing" for f in report.findings)
 
 
 # ── The CLI ────────────────────────────────────────────────────────────────
@@ -578,7 +589,12 @@ def test_coord_doctor_surfaces_a_half_onboarded_machine(
     config_path, cfg, monkeypatch
 ):
     """#2915's wiring ask: a half-onboarded MACHINE shows up in the fleet
-    report without anyone remembering to run the dedicated command."""
+    report without anyone remembering to run the dedicated command.
+
+    The repo-clone defect itself is already reported by the pre-existing
+    #1712 cross-check (`_health_vs_config_lines`, "CRIT repos: ..."), so the
+    onboarding fold must not print it a second time under the
+    `clones.missing` name — that duplication was caught in review of #2915."""
     health = _health(
         repos=[], degraded={"api": "repo_path ~/src/api does not exist"},
         health={"results": [
@@ -590,7 +606,11 @@ def test_coord_doctor_surfaces_a_half_onboarded_machine(
         config_path, monkeypatch, [_status(cfg.machines[0], health=health)]
     )
     assert result.exit_code == 1, result.output
-    assert "clones.missing" in result.output
+    # The machine-onboarding fold must not print its own `clones.*` name for
+    # a defect the #1712 cross-check immediately above it already reported
+    # (as `CRIT repos: ...` + the `degraded` detail line) — that was the
+    # literal duplication caught in review of #2915.
+    assert "clones.missing" not in result.output
     assert "graph.graphify_missing" in result.output
     assert "runtime.agent_venv_broken" in result.output
 
