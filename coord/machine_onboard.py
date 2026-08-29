@@ -183,6 +183,13 @@ class MachineFacts:
     linger: bool | None = None
     linger_error: str | None = None
 
+    # ── Layer 6: coord resolvable from a WORKER-shaped PATH (needs SSH —
+    # `/health` cannot see it either: it answers from the AGENT's own
+    # process, which still has ~/.coord-venv/bin on PATH) ────────────────
+    coord_on_worker_path: bool | None = None
+    coord_on_worker_path_error: str | None = None
+    coord_on_worker_path_version: str | None = None
+
     def check(self, check_id: str, subject: str | None = None) -> HealthCheckFact | None:
         for row in self.health_checks:
             if row.check_id == check_id and (subject is None or row.subject == subject):
@@ -288,6 +295,66 @@ def probe_linger(host: str, *, timeout: float = 20.0) -> tuple[bool | None, str 
     return None, "`loginctl` did not report a Linger property (not systemd?)"
 
 
+def probe_coord_on_worker_path(
+    host: str, *, timeout: float = 20.0
+) -> tuple[bool | None, str | None, str | None]:
+    """Can a WORKER-shaped shell on *host* resolve ``coord`` at all?
+
+    This is #2937's whole gap: workers are spawned with ``~/.coord-venv/bin``
+    stripped from ``PATH`` (#402, hardened by #2569) so a `pip install` in a
+    worktree can never land in the agent's own runtime venv — but nothing
+    upstream of that check ever asks whether ``coord`` is *still resolvable*
+    once that directory is gone. dell64 passed every existing layer of
+    ``coord machine doctor`` — including ``runtime.agent_venv`` (which only
+    proves the AGENT can find its own venv) — while being structurally
+    incapable of recording a single test verdict, because the agent's PATH
+    was the only PATH anything had checked.
+
+    Returns ``(found, error, version)``. Fail-soft, same discipline as
+    :func:`probe_linger`: this needs SSH, which ``/health`` structurally
+    cannot substitute for (the agent process answering a probe still has its
+    own venv on PATH — proving nothing about a worker's shell) — so an SSH
+    failure reports ``(None, reason, None)``, UNKNOWN, never a fabricated
+    CRIT. ``found=False`` — the actual defect this check exists to catch — is
+    the one outcome that must never collapse into UNKNOWN.
+    """
+    import subprocess  # noqa: PLC0415
+
+    script = (
+        'venv_bin="$HOME/.coord-venv/bin"; '
+        'stripped=$(printf %s "$PATH" | tr ":" "\\n" | grep -v "^$venv_bin$" | paste -sd: -); '
+        'found=$(PATH="$stripped" command -v coord 2>/dev/null); '
+        'if [ -z "$found" ]; then echo "COORD_ON_WORKER_PATH=absent"; '
+        'else ver=$(PATH="$stripped" "$found" --version 2>&1 | tr "\\n" " "); '
+        'echo "COORD_ON_WORKER_PATH=$found VERSION=$ver"; fi'
+    )
+    try:
+        result = subprocess.run(
+            [
+                "ssh", "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={max(1, int(timeout))}",
+                host, script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"ssh probe failed: {exc}", None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()[-1:]
+        return None, f"ssh probe failed: {detail[0] if detail else 'no output'}", None
+
+    text = (result.stdout or "").strip()
+    if "COORD_ON_WORKER_PATH=absent" in text:
+        return False, None, None
+    if "COORD_ON_WORKER_PATH=" in text:
+        rest = text.split("COORD_ON_WORKER_PATH=", 1)[1]
+        _path, _, version_part = rest.partition(" VERSION=")
+        return True, None, (version_part.strip() or None)
+    return None, "worker-PATH probe produced no parseable output", None
+
+
 def gather_facts(
     cfg: "Config",
     machine_name: str,
@@ -382,6 +449,11 @@ def gather_facts(
         facts.linger, facts.linger_error = probe_linger(
             machine.host, timeout=ssh_timeout
         )
+        (
+            facts.coord_on_worker_path,
+            facts.coord_on_worker_path_error,
+            facts.coord_on_worker_path_version,
+        ) = probe_coord_on_worker_path(machine.host, timeout=ssh_timeout)
     return facts
 
 
@@ -989,6 +1061,67 @@ def evaluate_runtime(facts: MachineFacts) -> list[Finding]:
                     ),
                 )
             )
+
+    if facts.coord_on_worker_path is False:
+        out.append(
+            Finding(
+                layer="runtime", check="runtime.coord_on_worker_path_missing", severity=CRIT,
+                summary=(
+                    "`coord` does not resolve on a WORKER-shaped PATH (with "
+                    "~/.coord-venv/bin stripped, as #402/#2569 spawn workers) — "
+                    "this machine can dispatch and run a worker, but that worker "
+                    "cannot run `coord test` to record a verdict. This is exactly "
+                    "the #2937 gap: every other layer here, and `/health` itself, "
+                    "only ever sees the AGENT's own PATH"
+                ),
+                subject=facts.name,
+                fix=(
+                    "install `coord` somewhere on the agent user's PATH outside "
+                    "~/.coord-venv (e.g. `pipx install code-coordinator`, or a "
+                    "system-wide non-editable install) — the fix must survive "
+                    "~/.coord-venv/bin being removed from PATH, because that is "
+                    "exactly what a worker's shell does."
+                ),
+            )
+        )
+    elif facts.coord_on_worker_path is True:
+        expected = (facts.version or "").strip()
+        reported = facts.coord_on_worker_path_version or ""
+        if expected and expected not in reported:
+            out.append(
+                Finding(
+                    layer="runtime", check="runtime.coord_on_worker_path_version_mismatch",
+                    severity=WARN,
+                    summary=(
+                        f"`coord` on the worker PATH reports {reported!r}, but the "
+                        f"agent's own /health reports version {expected!r} — a "
+                        "worker may record verdicts against a stale or unrelated "
+                        "install"
+                    ),
+                    subject=facts.name,
+                    fix="reinstall/upgrade the worker-PATH `coord` to match the agent's version.",
+                )
+            )
+        else:
+            out.append(
+                Finding(
+                    layer="runtime", check="runtime.coord_on_worker_path", severity=OK,
+                    summary=f"`coord` resolves on a worker-shaped PATH ({reported or 'version unreported'})",
+                    subject=facts.name,
+                )
+            )
+    else:
+        out.append(
+            Finding(
+                layer="runtime", check="runtime.coord_on_worker_path_unknown", severity=UNKNOWN,
+                summary=(
+                    "worker-PATH `coord` resolution not checked — /health cannot "
+                    f"see it (it only proves the AGENT can find coord); "
+                    f"{facts.coord_on_worker_path_error or 'pass --ssh to probe it'}"
+                ),
+                subject=facts.name,
+            )
+        )
 
     if facts.linger is True:
         out.append(
