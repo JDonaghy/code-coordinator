@@ -1279,6 +1279,39 @@ def _repo_onboarding_lines(cfg, statuses) -> list[tuple[bool, str]]:
     return out
 
 
+def _machine_onboarding_lines(cfg, machine, statuses, ts_map) -> list[tuple[bool, str]]:
+    """Render one machine's onboarding residue as ``coord doctor`` lines
+    (:mod:`coord.machine_onboard`, #2915).
+
+    The machine-side counterpart of :func:`_repo_onboarding_lines`, and the
+    wiring #2915 asks for: a half-onboarded *machine* shows up in the fleet
+    report without anyone remembering to ask. ``dell64`` was onboarded through
+    six separately-silent failures and the only thing that ever noticed any of
+    them was an operator reading logs by hand.
+
+    Costs **zero** extra round trips — it re-reads the ``/health`` body this
+    command already fetched, and the ``ts_map`` it already resolved once for
+    the #2912 host check. No SSH, so ``runtime.linger`` stays UNKNOWN here and
+    is never surfaced (UNKNOWN is not a problem); ``coord machine doctor
+    <name> --ssh`` is what answers it.
+
+    Mirrors :func:`_unit_drift_lines`/:func:`_release_lag_lines`: same
+    computation as the dedicated command (#2096's "two surfaces, one function"
+    rule), projected into doctor's output. Best-effort — a machine whose facts
+    can't be gathered is skipped rather than breaking the fleet report.
+    """
+    from coord import machine_onboard  # noqa: PLC0415
+
+    try:
+        facts = machine_onboard.gather_facts(
+            cfg, machine.name, statuses=statuses, ts_map=ts_map or {}
+        )
+        report = machine_onboard.evaluate(facts)
+    except Exception:  # noqa: BLE001 — never break the fleet report
+        return []
+    return machine_onboard.doctor_summary_lines(report)
+
+
 def _release_lag_lines(report) -> list[tuple[bool, str]]:
     """Render a :class:`coord.release_verify.VerifyReport`'s findings as
     ``coord doctor`` lines (#2082).
@@ -1431,6 +1464,20 @@ def doctor(
         # the manifest says this host should run and that isn't actually
         # `systemctl --user enable`d.
         for is_problem, line in _unit_enablement_lines(health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
+
+        # #2915: is this MACHINE only half-onboarded? Costs nothing extra —
+        # reuses the `/health` body and the `ts_map` already resolved above.
+        # Deliberately only the three layers nothing else in this command
+        # renders (repo clones, graphify, the agent venv); see
+        # `machine_onboard.DOCTOR_LIVE_LAYERS` for why network/agent are not
+        # folded in a second time. Placed BEFORE the tool_versions
+        # early-continue below for the same reason #1712's cross-check is:
+        # "the graph CLI is missing" and "this clone does not exist" must not
+        # be skipped just because the agent is also too old to report probes.
+        for is_problem, line in _machine_onboarding_lines(cfg, m, statuses, ts_map):
             click.echo(line)
             if is_problem:
                 any_problem = True

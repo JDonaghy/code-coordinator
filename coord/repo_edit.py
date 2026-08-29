@@ -271,6 +271,63 @@ def insert_portal_project_repo_entry(text: str, entry: str) -> str:
     return "".join(lines)
 
 
+# ── #2915: a whole `machines:` entry ─────────────────────────────────────────
+
+
+def render_machine_entry(
+    name: str,
+    host: str,
+    *,
+    capabilities: list[str] | None = None,
+    repo_paths: dict[str, str] | None = None,
+    max_workers: int | None = None,
+) -> str:
+    """The ``machines:`` list entry for a new machine, as a YAML fragment.
+
+    Same restraint as :func:`render_repo_entry` — only the fields ``coord
+    machine add`` can determine *correctly*. ``quiet_hours`` is deliberately
+    omitted (a guessed timezone silently suppresses dispatch for hours).
+
+    ``repos:`` is rendered from ``repo_paths``' KEYS rather than taking a
+    separate list, so the two can never disagree. That disagreement is
+    exactly incident item 4 of #2915: a ``repo_paths`` key naming the
+    checkout's *directory* (``claude-coordinator``) instead of the fleet's
+    *repo name* (``code-coordinator``) makes ``_parse_machines`` raise, and
+    the ENTIRE ``coordinator.yml`` then fails to load — for every machine,
+    not just the new one. The caller validates those keys against the
+    config's own ``repos:`` names before calling this.
+    """
+    caps = capabilities or []
+    paths = repo_paths or {}
+    lines = [
+        f"  - name: {name}",
+        f"    host: {host}",
+        f"    capabilities: [{', '.join(caps)}]",
+        f"    repos: [{', '.join(paths)}]",
+    ]
+    if max_workers is not None:
+        lines.append(f"    max_workers: {max_workers}")
+    if paths:
+        lines.append("    repo_paths:")
+        lines.extend(f"      {repo}: {path}" for repo, path in paths.items())
+    return "\n".join(lines) + "\n"
+
+
+def insert_machine_entry(text: str, entry: str) -> str:
+    """Append *entry* to the ``machines:`` list in *text*, preserving comments.
+
+    Mirrors :func:`insert_repo_entry` exactly — same block finder, same
+    one-blank-line separation — because the two blocks have the same shape
+    and a second, subtly-different implementation is how the pair drifts.
+    """
+    lines = text.splitlines(keepends=True)
+    _, end = _find_block(lines, "machines")
+    block = entry if entry.endswith("\n") else entry + "\n"
+    prefix = "" if (end > 0 and not lines[end - 1].strip()) else "\n"
+    lines[end:end] = [prefix + block]
+    return "".join(lines)
+
+
 def _machine_entry_range(lines: list[str], machine: str) -> tuple[int, int]:
     """``(start, end)`` line indices of one machine's entry inside ``machines:``."""
     m_start, m_end = _find_block(lines, "machines")
