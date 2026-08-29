@@ -1278,6 +1278,50 @@ class TestAcceptanceExpectedRedCommand:
         assert result.exit_code == 2
         assert "unknown repo" in result.output
 
+    def test_sweeps_the_relocated_root_for_an_entrypoint_linked_driver(
+        self, tmp_path: Path,
+    ) -> None:
+        """#2896 review (blocking, impact 2): this listing hardcoded the
+        repo-root `tests/acceptance/`, so every relocated milestone's
+        entries were silently omitted from it — the exact "long-lived
+        expected_red entry is invisible debt" failure #2164 built this
+        command to surface."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true",
+            entrypoint="tui/tests/acceptance.rs",
+        )
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api", return_value={},
+        ) as mock_list:
+            result = CliRunner().invoke(main, [
+                "acceptance", "expected-red", "coord-tui", "--config", str(config_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert mock_list.call_args.kwargs["search_roots"] == [
+            "tests/acceptance/", "tui/tests/acceptance/",
+        ]
+
+    def test_directory_discovered_driver_still_sweeps_only_the_shared_root(
+        self, tmp_path: Path,
+    ) -> None:
+        """The ms-37 shape (no `entrypoint:`) never moved — adding roots
+        must not change what a directory-discovered driver searches."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true",
+        )
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api", return_value={},
+        ) as mock_list:
+            result = CliRunner().invoke(main, [
+                "acceptance", "expected-red", "coord-tui", "--config", str(config_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert mock_list.call_args.kwargs["search_roots"] == ["tests/acceptance/"]
+
 
 class TestAcceptanceExpectedRedClear:
     """#2266: the remedy half of the #2164 detector — `--clear` invokes
@@ -1315,6 +1359,32 @@ class TestAcceptanceExpectedRedClear:
         assert "clearing 1 STUCK issue(s)" in result.output
         assert "#944: cleared expected_red for #944" in result.output
         assert "#945" not in result.output.split("clearing 1 STUCK issue(s)")[1]
+
+    def test_clear_forwards_the_relocated_search_roots(self, tmp_path: Path) -> None:
+        """#2896 review (blocking, impact 3): without the relocated root,
+        `clear_expected_red_via_pr` reports "no expected_red entries found
+        for this issue" for a relocated milestone that has them, so the
+        clearing PR is never opened."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true",
+            entrypoint="tui/tests/acceptance.rs",
+        )
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms-65": {2282: {"ms65::a"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.return_value = {"state": "CLOSED"}
+            mock_clear.return_value = "cleared expected_red for #2282: ms65::a (PR #501)"
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 0, result.output
+        assert mock_clear.call_args.kwargs["search_roots"] == [
+            "tests/acceptance/", "tui/tests/acceptance/",
+        ]
 
     def test_clear_with_issue_filter_on_an_open_issue_clears_nothing(
         self, tmp_path: Path,

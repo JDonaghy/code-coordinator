@@ -5605,7 +5605,9 @@ def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None
     return None
 
 
-def _expected_red_ids_for_entry(entry: QueuedMerge, gh_ops: GhOps) -> frozenset[str]:
+def _expected_red_ids_for_entry(
+    entry: QueuedMerge, gh_ops: GhOps, config=None,
+) -> frozenset[str]:
     """#2199 review (blocking finding 2) / #2266 review (non-blocking
     finding): the ``expected_red`` test ids, if any, recorded against
     *entry*'s issue in some ``ms-*/manifest.yml`` on ``entry.target_branch``.
@@ -5636,12 +5638,28 @@ def _expected_red_ids_for_entry(entry: QueuedMerge, gh_ops: GhOps) -> frozenset[
     (unreachable API, older ``gh_ops`` stub missing the list/get methods)
     reads as "nothing recorded", matching :func:`coord.acceptance.
     find_ms_manifest_for_issue_via_api`'s own fail-soft posture.
+
+    #2896 review: *config*, when given, supplies the acceptance SEARCH
+    ROOTS for the lookup (``coord.acceptance.search_roots_for_repo``). It
+    is not optional in spirit — without it the sweep only sees the shared
+    repo-root ``tests/acceptance/`` tree, so a relocated
+    (entrypoint-linked) milestone's entries read as "nothing recorded" and
+    :func:`_maybe_clear_expected_red` silently takes its "not in scope for
+    the oracle loop at all" branch: no clear, no ``MergeEvent``, no audit
+    row — exactly the #2199 regression its own docstring says was fixed.
+    It defaults to ``None`` only so an older/partial caller degrades to the
+    legacy single-root behaviour instead of raising.
     """
-    from coord.acceptance import find_ms_manifest_for_issue_via_api  # noqa: PLC0415
+    from coord.acceptance import (  # noqa: PLC0415
+        find_ms_manifest_for_issue_via_api,
+        search_roots_for_repo,
+    )
 
     try:
         found = find_ms_manifest_for_issue_via_api(
-            entry.repo_github, entry.target_branch, entry.issue_number, gh_ops=gh_ops,
+            entry.repo_github, entry.target_branch, entry.issue_number,
+            gh_ops=gh_ops,
+            search_roots=search_roots_for_repo(config, entry.repo_name),
         )
     except Exception:  # noqa: BLE001 — best-effort, same posture as callers
         return frozenset()
@@ -5651,11 +5669,13 @@ def _expected_red_ids_for_entry(entry: QueuedMerge, gh_ops: GhOps) -> frozenset[
     return frozenset(data.expected_red.get(entry.issue_number, frozenset()))
 
 
-def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
+def _issue_has_expected_red_entries(
+    entry: QueuedMerge, gh_ops: GhOps, config=None,
+) -> bool:
     """Whether *entry*'s issue has at least one ``expected_red`` entry
     recorded against it. See :func:`_expected_red_ids_for_entry` for why
-    this scope check exists."""
-    return bool(_expected_red_ids_for_entry(entry, gh_ops))
+    this scope check exists — and why *config* matters."""
+    return bool(_expected_red_ids_for_entry(entry, gh_ops, config))
 
 
 def _record_expected_red_audit(
@@ -5756,7 +5776,9 @@ def _acceptance_patch_id_matches(
     return acceptance_patch_id is not None and acceptance_patch_id == branch_patch_id
 
 
-def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> MergeEvent | None:
+def _maybe_clear_expected_red(
+    entry: QueuedMerge, board, gh_ops: GhOps, config=None,
+) -> MergeEvent | None:
     """#2164: right after *entry*'s PR has actually merged into
     ``entry.target_branch``, clear any of its issue's ``expected_red``
     entries that the trust gate (``coord acceptance record``) already
@@ -5794,6 +5816,15 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     protect (every rebased oracle-loop merge). See
     :func:`_acceptance_patch_id_matches` for the content-addressed
     fallback that tells a pure rebase apart from a genuine content change.
+
+    #2896 review: *config* is threaded through so every ``expected_red``
+    lookup below searches the repo's real acceptance roots, not just the
+    shared repo-root tree. A relocated (entrypoint-linked) milestone's
+    manifest lives beside its driver's entrypoint (``tui/tests/
+    acceptance/ms-NN/``); without *config* the lookup finds nothing there,
+    the ``not ids`` branch below reads that as "never in scope for the
+    oracle loop", and the clear silently never happens — the exact #2199
+    failure this function's diagnostics exist to make impossible.
     """
     if entry.assignment_type not in CLOSES_ISSUE_TYPES:
         return None
@@ -5806,7 +5837,7 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         )
     acceptance_state = getattr(work, "acceptance_state", None)
     if acceptance_state != "passed":
-        ids = _expected_red_ids_for_entry(entry, gh_ops)
+        ids = _expected_red_ids_for_entry(entry, gh_ops, config)
         if not ids:
             # Not in scope for the oracle loop at all — the pre-#2199
             # silent no-op is still correct here, not a regression (see
@@ -5868,19 +5899,20 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         )
         _record_expected_red_audit(
             entry, "expected_red_clear_skipped_sha_mismatch", msg,
-            test_ids=_expected_red_ids_for_entry(entry, gh_ops),
+            test_ids=_expected_red_ids_for_entry(entry, gh_ops, config),
         )
         return MergeEvent(entry, "expected_red_clear_skipped", msg)
 
     from coord.acceptance import (  # noqa: PLC0415
         classify_expected_red_clear_result,
         clear_expected_red_via_pr,
+        search_roots_for_repo,
     )
 
     # Captured *before* the clear attempt: a successful clear edits the
     # manifest, so looking this up afterwards would just find the ids the
     # clear itself just removed (#2266 review non-blocking finding).
-    ids = _expected_red_ids_for_entry(entry, gh_ops)
+    ids = _expected_red_ids_for_entry(entry, gh_ops, config)
     if patch_id_verified:
         # #2298: name the arm taken — a durable row independent of whether
         # there ends up being anything to clear (the "no_op" branch below
@@ -5897,6 +5929,7 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     msg = clear_expected_red_via_pr(
         entry.repo_github, entry.repo_name, entry.target_branch, entry.issue_number,
         gh_ops=gh_ops,
+        search_roots=search_roots_for_repo(config, entry.repo_name),
     )
     # #2266 review (blocking finding 1): a binary "did the message start
     # with 'cleared expected_red'" conflated a genuine failure with "there
@@ -6660,10 +6693,14 @@ def process(
                     if for_issue is not None and for_issue != entry.issue_number:
                         from coord.acceptance import (  # noqa: PLC0415
                             missing_expected_red_warning,
+                            search_roots_for_repo,
                         )
 
                         warning = missing_expected_red_warning(
                             entry.repo_github, entry.branch, for_issue, gh_ops=gh_ops,
+                            search_roots=search_roots_for_repo(
+                                config, entry.repo_name,
+                            ),
                         )
                         if warning:
                             events.append(MergeEvent(
@@ -7431,7 +7468,7 @@ def process(
                 # before Test/Review/this merge actually happen). Best
                 # effort, never blocks or fails the merge itself.
                 try:
-                    clear_event = _maybe_clear_expected_red(entry, board, gh_ops)
+                    clear_event = _maybe_clear_expected_red(entry, board, gh_ops, config)
                 except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
                     clear_event = MergeEvent(entry, "expected_red_clear_failed", str(e))
                 if clear_event is not None:

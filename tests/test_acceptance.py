@@ -37,6 +37,7 @@ from coord.acceptance import (
     oracle_loop_contract_block,
     parse_manifest_text,
     resolve_for_path,
+    search_roots_for_repo,
 )
 # Aliased on import: pytest treats any module-level `test_*` name as a
 # collectible test function, and `test_ids_for_issue` takes required
@@ -1014,6 +1015,187 @@ class TestClearExpectedRedViaPr:
         assert path == "tests/acceptance/ms01/manifest.d/944.yml"
         assert "expected_red" not in content
         assert branch.startswith("coord/clear-expected-red-944-ms01")
+
+
+class _MultiRootApiGhOps(_FakeApiGhOps):
+    """#2896 review: a `_FakeApiGhOps` whose `list_repo_subdirs` actually
+    honours the *path* it is asked about, instead of returning one fixed
+    repo-root listing regardless. Without that, a test cannot tell a sweep
+    that searches the relocated (entrypoint-linked) root apart from one
+    that only ever looks at `tests/acceptance/` — which is exactly the bug
+    these tests exist to pin."""
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        out = {
+            name[len(prefix):].split("/")[0]
+            for name in self.files
+            if name.startswith(prefix) and "/" in name[len(prefix):]
+        }
+        if not out:
+            raise RuntimeError(f"not found: {path}")
+        return sorted(out)
+
+
+# The two roots a routed repo with an entrypoint-linked driver declares —
+# `coord.config.AcceptanceConfig.acceptance_search_roots` output shape.
+BOTH_ROOTS = ["tests/acceptance/", "tui/tests/acceptance/"]
+
+MS65_MANIFEST = (
+    "tests:\n  ms65::a: 2282\n  ms65::b: 2282\n"
+    "expected_red:\n  2282:\n    - ms65::a\n"
+)
+
+
+class TestSearchRootsForRepo:
+    """#2896 review: the one place the "…or fall back to the legacy
+    repo-root tree" rule is spelled, so every API-only sweep agrees."""
+
+    def test_no_config_falls_back_to_the_legacy_root(self) -> None:
+        assert search_roots_for_repo(None, None) == ["tests/acceptance/"]
+        assert search_roots_for_repo(None, "claude-coordinator") == ["tests/acceptance/"]
+
+    def test_driverless_repo_falls_back_to_the_legacy_root(self) -> None:
+        cfg = Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+        assert search_roots_for_repo(cfg, "api") == ["tests/acceptance/"]
+
+    def test_entrypoint_linked_driver_adds_its_sibling_root(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="claude-coordinator", github="acme/cc")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers={
+                "claude-coordinator": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(
+                        match="coord/**", kind="cli-pytest", run="pytest",
+                    ),
+                    AcceptanceDriverConfig(
+                        match="tui/**", kind="tui-tuidriver", run="cargo test",
+                        entrypoint="tui/tests/acceptance.rs",
+                    ),
+                ]),
+            }),
+        )
+        assert search_roots_for_repo(cfg, "claude-coordinator") == BOTH_ROOTS
+
+
+class TestApiSweepsSearchRelocatedRoots:
+    """#2896 review (blocking): the GitHub-API-only `expected_red` sweep
+    hardcoded the repo-root `tests/acceptance/`, so every RELOCATED
+    (entrypoint-linked) milestone — ms-65/ms-67 here, whose slices now live
+    at `tui/tests/acceptance/ms-NN/` — went dark to it. That silently broke
+    three things at once: the merge queue's post-merge #2164 trust-gate
+    clear (which read "nothing recorded" as "never in scope" and returned
+    bare `None`, the exact #2199 regression), `coord acceptance
+    expected-red`'s listing (#2164's invisible-debt detector), and
+    `clear_expected_red_via_pr` (which reported "no expected_red entries
+    found" and never opened the clearing PR)."""
+
+    def test_find_ms_manifest_misses_a_relocated_milestone_without_roots(self) -> None:
+        """The bug, pinned: default (legacy single-root) behaviour is
+        preserved exactly — and is wrong for a relocated milestone."""
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        assert find_ms_manifest_for_issue_via_api("acme/x", "main", 2282, gh_ops=ops) is None
+
+    def test_find_ms_manifest_finds_a_relocated_milestone(self) -> None:
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        found = find_ms_manifest_for_issue_via_api(
+            "acme/x", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert found is not None
+        path, _text, _sha, data = found
+        assert path == "tui/tests/acceptance/ms-65/manifest.yml"
+        assert data.expected_red == {2282: frozenset({"ms65::a"})}
+
+    def test_find_ms_manifest_finds_a_relocated_fragment(self) -> None:
+        """#2543 fragments live under the relocated root too."""
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.d/2282.yml": MS65_MANIFEST,
+        })
+        found = find_ms_manifest_for_issue_via_api(
+            "acme/x", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert found is not None
+        assert found[0] == "tui/tests/acceptance/ms-65/manifest.d/2282.yml"
+
+    def test_legacy_root_still_found_when_both_roots_searched(self) -> None:
+        """A directory-discovered driver's slices (ms-37 here) never moved —
+        adding roots must not cost the legacy tree its own lookups."""
+        ops = _MultiRootApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": MS01_MANIFEST,
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        legacy = find_ms_manifest_for_issue_via_api(
+            "acme/x", "main", 944, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        relocated = find_ms_manifest_for_issue_via_api(
+            "acme/x", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert legacy is not None and legacy[0] == "tests/acceptance/ms01/manifest.yml"
+        assert relocated is not None
+        assert relocated[0] == "tui/tests/acceptance/ms-65/manifest.yml"
+
+    def test_a_missing_root_does_not_abort_the_sweep(self) -> None:
+        """A root that doesn't exist on this branch (a repo with no
+        `tests/acceptance/` at all) must skip to the next root, not read as
+        "nothing found anywhere" — the single-root fail-soft posture,
+        preserved across N roots."""
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        found = find_ms_manifest_for_issue_via_api(
+            "acme/x", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert found is not None
+
+    def test_list_expected_red_unions_both_roots(self) -> None:
+        ops = _MultiRootApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": MS01_MANIFEST,
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        assert list_expected_red_via_api("acme/x", "main", gh_ops=ops) == {
+            "ms01": {944: frozenset({"ms01::a"})},
+        }
+        assert list_expected_red_via_api(
+            "acme/x", "main", gh_ops=ops, search_roots=BOTH_ROOTS,
+        ) == {
+            "ms01": {944: frozenset({"ms01::a"})},
+            "ms-65": {2282: frozenset({"ms65::a"})},
+        }
+
+    def test_missing_expected_red_warning_sees_a_relocated_milestone(self) -> None:
+        """#2191's writer/gate seam must not go silent on a relocated
+        slice — silence there is indistinguishable from "no slice
+        authored"."""
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.yml": "tests:\n  ms65::a: 2282\n",
+        })
+        assert missing_expected_red_warning("acme/x", "main", 2282, gh_ops=ops) is None
+        warning = missing_expected_red_warning(
+            "acme/x", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert warning is not None
+        assert "tui/tests/acceptance/ms-65/manifest.yml" in warning
+
+    def test_clear_expected_red_opens_the_pr_for_a_relocated_milestone(self) -> None:
+        ops = _MultiRootApiGhOps({
+            "tui/tests/acceptance/ms-65/manifest.yml": MS65_MANIFEST,
+        })
+        assert clear_expected_red_via_pr(
+            "acme/x", "coord-tui", "main", 2282, gh_ops=ops,
+        ) == "no expected_red entries found for this issue"
+
+        msg = clear_expected_red_via_pr(
+            "acme/x", "coord-tui", "main", 2282, gh_ops=ops, search_roots=BOTH_ROOTS,
+        )
+        assert msg.startswith("cleared expected_red for #2282")
+        assert ops.created_prs, "a clearing PR must actually be opened"
+        path, _branch, content = ops.updated_files[-1]
+        assert path == "tui/tests/acceptance/ms-65/manifest.yml"
+        assert "expected_red" not in content
 
 
 class TestClassifyExpectedRedClearResult:

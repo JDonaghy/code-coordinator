@@ -55,6 +55,7 @@ from coord.acceptance import (
     load_expected_red,
     load_manifest,
     ms_dir_for_issue,
+    search_roots_for_repo,
     test_ids_for_issue,
 )
 from coord.acceptance_drivers import DriverError, run_driver
@@ -796,7 +797,16 @@ def acceptance_expected_red(
         click.echo(f"error: unknown repo {repo!r}", err=True)
         sys.exit(2)
 
-    by_ms = list_expected_red_via_api(repo_entry.github, repo_entry.default_branch)
+    # #2896 review: sweep EVERY acceptance search root this repo declares,
+    # not just the shared repo-root tree — a relocated (entrypoint-linked)
+    # milestone's slices live beside their driver's entrypoint (e.g.
+    # `tui/tests/acceptance/ms-65/`), and omitting those roots is exactly
+    # the "long-lived expected_red entry is invisible debt" failure this
+    # command exists to prevent (#2164 acceptance criterion 4).
+    search_roots = search_roots_for_repo(cfg, repo)
+    by_ms = list_expected_red_via_api(
+        repo_entry.github, repo_entry.default_branch, search_roots=search_roots,
+    )
     if not by_ms:
         click.echo(f"no expected_red entries on {repo}@{repo_entry.default_branch}.")
         return
@@ -830,12 +840,16 @@ def acceptance_expected_red(
     if not do_clear:
         return
 
-    _clear_stuck_expected_red(repo, repo_entry, stuck, only_issue)
+    _clear_stuck_expected_red(
+        repo, repo_entry, stuck, only_issue, search_roots=search_roots,
+    )
 
 
 def _clear_stuck_expected_red(
     repo: str, repo_entry: Repo, stuck: list[tuple[str, int, frozenset[str]]],
     only_issue: int | None,
+    *,
+    search_roots: list[str] | None = None,
 ) -> None:
     """#2266: the remedy half of `coord acceptance expected-red --clear`.
 
@@ -850,6 +864,13 @@ def _clear_stuck_expected_red(
     review, non-blocking finding: without this, a caller scripting this
     command in CI/cron could only detect a fully-failed run by reading
     stdout or separately querying the audit log).
+
+    *search_roots* (#2896 review): the same roots the listing above swept,
+    forwarded so the clear resolves a relocated (entrypoint-linked)
+    milestone's manifest. Passing the caller's roots rather than
+    re-deriving them here keeps detector and remedy on identical scope —
+    a `--clear` that could not find what the listing just named would be
+    the split-brain #2266 built the shared classifier to avoid.
     """
     from coord.acceptance import (  # noqa: PLC0415
         classify_expected_red_clear_result,
@@ -880,7 +901,7 @@ def _clear_stuck_expected_red(
     for ms, issue_number, ids in stuck:
         msg = clear_expected_red_via_pr(
             repo_entry.github, repo, repo_entry.default_branch, issue_number,
-            gh_ops=github_ops,
+            gh_ops=github_ops, search_roots=search_roots,
         )
         click.echo(f"  #{issue_number}: {msg}")
         status = classify_expected_red_clear_result(msg)

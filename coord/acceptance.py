@@ -22,7 +22,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 
 import yaml
 
@@ -57,6 +57,28 @@ def acceptance_root_for_driver(base: Path, entrypoint: str) -> Path:
     if not entrypoint:
         return base / ACCEPTANCE_DIRNAME
     return base / entrypoint_sibling_acceptance_dir(entrypoint)
+
+
+def search_roots_for_repo(config: Config | None, repo_name: str | None) -> list[str]:
+    """Every repo-relative, trailing-slash directory *repo_name*'s
+    milestone-scoped acceptance slices could live under (#2896) — a thin,
+    fail-open wrapper over
+    :meth:`coord.config.AcceptanceConfig.acceptance_search_roots`.
+
+    Single source of truth for the "…or fall back to the legacy repo-root
+    tree" rule that every multi-root caller needs, so the fallback is
+    spelled once instead of re-derived at each call site: returns
+    ``[ACCEPTANCE_DIRNAME + "/"]`` when there is no *config*/*repo_name* in
+    hand (an API-only caller invoked without one, e.g. an older
+    ``coord.merge_queue`` entry point) or when the repo declares no
+    acceptance driver at all. Callers therefore always get at least one
+    candidate root and never have to special-case an empty list.
+    """
+    if config is None or not repo_name:
+        return [ACCEPTANCE_DIRNAME + "/"]
+    return config.acceptance.acceptance_search_roots(repo_name) or [
+        ACCEPTANCE_DIRNAME + "/"
+    ]
 
 
 def ms_dirname(milestone_number: int) -> str:
@@ -111,7 +133,7 @@ def gate_a_contract_candidates(
     configured (or no entrypoint-linked one) at all, so a caller gets a
     sane single candidate rather than an empty list either way.
     """
-    roots = config.acceptance.acceptance_search_roots(repo_name) or [ACCEPTANCE_DIRNAME + "/"]
+    roots = search_roots_for_repo(config, repo_name)
     return [gate_a_contract_path(milestone_number, root) for root in roots]
 
 
@@ -240,9 +262,7 @@ def resolve_for_path(
         return None
 
     lister = list_mock_dir or _default_list_mock_dir
-    search_roots = config.acceptance.acceptance_search_roots(repo_cfg.name) or [
-        ACCEPTANCE_DIRNAME + "/"
-    ]
+    search_roots = search_roots_for_repo(config, repo_cfg.name)
     mocks_dirs = [_mocks_dir(milestone_number, root) for root in search_roots]
     names: list[str] = []
     for mocks_dir in mocks_dirs:
@@ -1142,7 +1162,11 @@ def _fetch_manifest_source_via_api(
 
 
 def _fetch_ms_manifest_via_api(
-    repo_github: str, branch: str, ms_dir: str, get_file: Callable[..., "tuple[str, str]"],
+    repo_github: str,
+    branch: str,
+    ms_dir: str,
+    get_file: Callable[..., "tuple[str, str]"],
+    acceptance_dir: str = ACCEPTANCE_DIRNAME,
 ) -> "tuple[str, str, str, ManifestData] | None":
     """One ms-dir's LEGACY single-file ``manifest.(yml|yaml|json)`` via
     *get_file* — see :func:`_fetch_manifest_source_via_api`. Since #2543,
@@ -1150,9 +1174,16 @@ def _fetch_ms_manifest_via_api(
     fragment instead (:func:`_fetch_ms_manifest_fragment_via_api`); this
     still covers the milestone-level ``gate_a:``/``exempt:`` blocks (which
     stay in the single shared file by choice, #2543) and any not-yet-migrated
-    milestone whose per-issue data is still all in one file."""
+    milestone whose per-issue data is still all in one file.
+
+    #2896: *acceptance_dir* is the search root *ms_dir* sits under —
+    defaults to the shared repo-root :data:`ACCEPTANCE_DIRNAME`, but a
+    relocated (entrypoint-linked) slice lives under that driver's own
+    sibling ``acceptance/`` dir instead, so multi-root callers pass each
+    :func:`search_roots_for_repo` candidate in turn."""
+    dirname = acceptance_dir.rstrip("/") if acceptance_dir else ACCEPTANCE_DIRNAME
     return _fetch_manifest_source_via_api(
-        repo_github, branch, f"{ACCEPTANCE_DIRNAME}/{ms_dir}", "manifest", get_file,
+        repo_github, branch, f"{dirname}/{ms_dir}", "manifest", get_file,
     )
 
 
@@ -1162,72 +1193,106 @@ def _fetch_ms_manifest_fragment_via_api(
     ms_dir: str,
     issue_number: int,
     get_file: Callable[..., "tuple[str, str]"],
+    acceptance_dir: str = ACCEPTANCE_DIRNAME,
 ) -> "tuple[str, str, str, ManifestData] | None":
     """*issue_number*'s own ``ms-NN/manifest.d/<issue_number>.(yml|yaml|
     json)`` fragment via *get_file* (#2543) — see
     :func:`_fetch_manifest_source_via_api`. A targeted fetch by exact,
     predictable filename, no directory listing required, since the caller
-    already knows the issue number it's looking for."""
+    already knows the issue number it's looking for.
+
+    *acceptance_dir*: see :func:`_fetch_ms_manifest_via_api` (#2896)."""
+    dirname = acceptance_dir.rstrip("/") if acceptance_dir else ACCEPTANCE_DIRNAME
     return _fetch_manifest_source_via_api(
         repo_github,
         branch,
-        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
+        f"{dirname}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
         str(issue_number),
         get_file,
     )
 
 
 def find_ms_manifest_for_issue_via_api(
-    repo_github: str, branch: str, issue_number: int, *, gh_ops: Any = None,
+    repo_github: str,
+    branch: str,
+    issue_number: int,
+    *,
+    gh_ops: Any = None,
+    search_roots: "Sequence[str] | None" = None,
 ) -> "tuple[str, str, str, ManifestData] | None":
     """API-only (no local checkout) equivalent of :func:`ms_dir_for_issue`:
-    search every ``tests/acceptance/ms-*/`` on *branch* via the GitHub
-    Contents API for the one whose ``tests``/``issues``/``expected_red``
-    mapping covers *issue_number* — checking, per ms-dir, *issue_number*'s
-    own ``manifest.d/<issue_number>.(yml|json)`` fragment (#2543) FIRST
-    (a targeted, exact-filename fetch), then the legacy single-file
+    search every ``<root>/ms-*/`` on *branch* via the GitHub Contents API
+    for the one whose ``tests``/``issues``/``expected_red`` mapping covers
+    *issue_number* — checking, per ms-dir, *issue_number*'s own
+    ``manifest.d/<issue_number>.(yml|json)`` fragment (#2543) FIRST (a
+    targeted, exact-filename fetch), then the legacy single-file
     ``manifest.(yml|yaml|json)``.
 
-    Returns ``(path, text, blob_sha, data)`` for the first match (ms-dirs
-    scanned in sorted-name order for determinism), or ``None`` when nothing
-    maps *issue_number* at all. *gh_ops* is any object exposing
-    ``list_repo_subdirs``/``get_repo_file_with_sha`` (defaults to
-    :mod:`coord.github_ops`; tests inject a stub) — mirrors
-    ``coord.merge_queue.GhOps``'s optional-attribute convention: a *gh_ops*
-    that lacks either method (an older stub) is treated as "nothing found"
-    rather than raising, since this whole sweep is best-effort.
+    Returns ``(path, text, blob_sha, data)`` for the first match (roots in
+    the given order, ms-dirs within a root scanned in sorted-name order for
+    determinism), or ``None`` when nothing maps *issue_number* at all.
+    *gh_ops* is any object exposing ``list_repo_subdirs``/
+    ``get_repo_file_with_sha`` (defaults to :mod:`coord.github_ops`; tests
+    inject a stub) — mirrors ``coord.merge_queue.GhOps``'s
+    optional-attribute convention: a *gh_ops* that lacks either method (an
+    older stub) is treated as "nothing found" rather than raising, since
+    this whole sweep is best-effort.
+
+    #2896 review: *search_roots* is every repo-relative directory a
+    milestone's slices could live under — pass
+    :func:`search_roots_for_repo`'s output when a ``Config``/repo name is
+    in hand. It defaults to the legacy repo-root :data:`ACCEPTANCE_DIRNAME`
+    alone, which is *wrong for a relocated milestone*: this function is a
+    GitHub-API sweep taking only a ``owner/repo`` string, so it cannot look
+    the roots up itself, and a caller that omits them silently misses every
+    entrypoint-linked driver's slices (ms-65/ms-67 here). A listing failure
+    on one root skips to the next rather than abandoning the sweep, keeping
+    the single-root fail-soft behaviour identical.
     """
     ops = gh_ops or _default_github_ops()
     list_subdirs = getattr(ops, "list_repo_subdirs", None)
     get_file = getattr(ops, "get_repo_file_with_sha", None)
     if list_subdirs is None or get_file is None:
         return None
-    try:
-        subdirs = list_subdirs(repo_github, ACCEPTANCE_DIRNAME, branch)
-    except Exception:  # noqa: BLE001 — best-effort sweep, never raises
-        return None
 
-    for name in sorted(subdirs):
-        frag = _fetch_ms_manifest_fragment_via_api(
-            repo_github, branch, name, issue_number, get_file,
-        )
-        if frag is not None:
-            _path, _text, _blob_sha, data = frag
+    roots = list(search_roots) if search_roots else search_roots_for_repo(None, None)
+    for root in roots:
+        dirname = root.rstrip("/") or ACCEPTANCE_DIRNAME
+        try:
+            subdirs = list_subdirs(repo_github, dirname, branch)
+        except Exception:  # noqa: BLE001 — best-effort sweep, never raises
+            continue
+
+        for name in sorted(subdirs):
+            frag = _fetch_ms_manifest_fragment_via_api(
+                repo_github, branch, name, issue_number, get_file, dirname,
+            )
+            if frag is not None:
+                _path, _text, _blob_sha, data = frag
+                if issue_number in data.expected_red or test_ids_for_issue(
+                    data.tests, issue_number
+                ):
+                    return frag
+            found = _fetch_ms_manifest_via_api(
+                repo_github, branch, name, get_file, dirname,
+            )
+            if found is None:
+                continue
+            _path, _text, _blob_sha, data = found
             if issue_number in data.expected_red or test_ids_for_issue(
                 data.tests, issue_number
             ):
-                return frag
-        found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
-        if found is None:
-            continue
-        _path, _text, _blob_sha, data = found
-        if issue_number in data.expected_red or test_ids_for_issue(data.tests, issue_number):
-            return found
+                return found
     return None
 
 
 def missing_expected_red_warning(
-    repo_github: str, branch: str, issue_number: int, *, gh_ops: Any = None,
+    repo_github: str,
+    branch: str,
+    issue_number: int,
+    *,
+    gh_ops: Any = None,
+    search_roots: "Sequence[str] | None" = None,
 ) -> str | None:
     """#2191 — the writer/gate seam: is *issue_number* the signature of an
     unwritten ``expected_red`` registry on *branch*'s manifest? That
@@ -1260,10 +1325,16 @@ def missing_expected_red_warning(
     evaluate.
 
     Otherwise returns a human-readable warning naming the missing ids.
+
+    *search_roots* (#2896 review): forwarded to
+    :func:`find_ms_manifest_for_issue_via_api` — without it a relocated
+    (entrypoint-linked) milestone's manifest is never found, so this check
+    reads as "no slice authored, out of scope" and stays silent on exactly
+    the milestones it should be watching.
     """
     ops = gh_ops or _default_github_ops()
     found = find_ms_manifest_for_issue_via_api(
-        repo_github, branch, issue_number, gh_ops=ops,
+        repo_github, branch, issue_number, gh_ops=ops, search_roots=search_roots,
     )
     if found is None:
         return None
@@ -1296,7 +1367,11 @@ def missing_expected_red_warning(
 
 
 def list_expected_red_via_api(
-    repo_github: str, branch: str, *, gh_ops: Any = None,
+    repo_github: str,
+    branch: str,
+    *,
+    gh_ops: Any = None,
+    search_roots: "Sequence[str] | None" = None,
 ) -> "dict[str, dict[int, frozenset[str]]]":
     """Every ``expected_red:`` entry across every ``ms-NN`` manifest on
     *branch*, via the API alone — the read half of the #2164 visibility
@@ -1316,6 +1391,15 @@ def list_expected_red_via_api(
     dir) is unavailable on *gh_ops*: that case degrades to "legacy file
     only", same fail-open posture as everywhere else in this module, not to
     "nothing found."
+
+    #2896 review: *search_roots* is every repo-relative directory a
+    milestone's slices could live under (:func:`search_roots_for_repo`);
+    every root is swept and the results unioned per ms-dir NAME, since a
+    given milestone lives under exactly one root in practice. Defaulting to
+    the legacy repo-root :data:`ACCEPTANCE_DIRNAME` alone is what made this
+    listing silently omit every relocated (entrypoint-linked) milestone's
+    entries — precisely the "long-lived expected_red entry is invisible
+    debt" failure #2164 built this command to prevent.
     """
     ops = gh_ops or _default_github_ops()
     list_subdirs = getattr(ops, "list_repo_subdirs", None)
@@ -1323,44 +1407,50 @@ def list_expected_red_via_api(
     list_dir = getattr(ops, "list_repo_dir", None)
     if list_subdirs is None or get_file is None:
         return {}
-    try:
-        subdirs = list_subdirs(repo_github, ACCEPTANCE_DIRNAME, branch)
-    except Exception:  # noqa: BLE001
-        return {}
 
+    roots = list(search_roots) if search_roots else search_roots_for_repo(None, None)
     out: dict[str, dict[int, frozenset[str]]] = {}
-    for name in sorted(subdirs):
-        merged: dict[int, frozenset[str]] = {}
+    for root in roots:
+        dirname = root.rstrip("/") or ACCEPTANCE_DIRNAME
+        try:
+            subdirs = list_subdirs(repo_github, dirname, branch)
+        except Exception:  # noqa: BLE001
+            continue
 
-        found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
-        if found is not None:
-            _path, _text, _blob_sha, data = found
-            for issue, ids in data.expected_red.items():
-                merged[issue] = merged.get(issue, frozenset()) | ids
+        for name in sorted(subdirs):
+            merged: dict[int, frozenset[str]] = dict(out.get(name, {}))
 
-        if list_dir is not None:
-            frag_dir = f"{ACCEPTANCE_DIRNAME}/{name}/{MANIFEST_FRAGMENTS_DIRNAME}"
-            try:
-                filenames = list_dir(repo_github, frag_dir, branch)
-            except Exception:  # noqa: BLE001 — no fragments dir, or a transient hiccup
-                filenames = []
-            for filename in filenames:
-                if Path(filename).suffix not in (".yml", ".yaml", ".json"):
-                    continue
-                frag_path = f"{frag_dir}/{filename}"
-                try:
-                    text, _sha = get_file(repo_github, frag_path, branch)
-                except Exception:  # noqa: BLE001
-                    continue
-                try:
-                    frag_data = parse_manifest_text(text, source=frag_path)
-                except ManifestError:
-                    continue
-                for issue, ids in frag_data.expected_red.items():
+            found = _fetch_ms_manifest_via_api(
+                repo_github, branch, name, get_file, dirname,
+            )
+            if found is not None:
+                _path, _text, _blob_sha, data = found
+                for issue, ids in data.expected_red.items():
                     merged[issue] = merged.get(issue, frozenset()) | ids
 
-        if merged:
-            out[name] = merged
+            if list_dir is not None:
+                frag_dir = f"{dirname}/{name}/{MANIFEST_FRAGMENTS_DIRNAME}"
+                try:
+                    filenames = list_dir(repo_github, frag_dir, branch)
+                except Exception:  # noqa: BLE001 — no fragments dir, or a transient hiccup
+                    filenames = []
+                for filename in filenames:
+                    if Path(filename).suffix not in (".yml", ".yaml", ".json"):
+                        continue
+                    frag_path = f"{frag_dir}/{filename}"
+                    try:
+                        text, _sha = get_file(repo_github, frag_path, branch)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    try:
+                        frag_data = parse_manifest_text(text, source=frag_path)
+                    except ManifestError:
+                        continue
+                    for issue, ids in frag_data.expected_red.items():
+                        merged[issue] = merged.get(issue, frozenset()) | ids
+
+            if merged:
+                out[name] = merged
     return out
 
 
@@ -1371,6 +1461,7 @@ def clear_expected_red_via_pr(
     issue_number: int,
     *,
     gh_ops: Any = None,
+    search_roots: "Sequence[str] | None" = None,
 ) -> str:
     """#2164 trust-gate clearing, corrected: call this ONLY after the fix's
     own PR has actually merged into *default_branch*
@@ -1389,10 +1480,17 @@ def clear_expected_red_via_pr(
     already-successfully-recorded, already-merged fix): a failure anywhere
     degrades to a ``"warning: ..."`` string the caller can log, not an
     exception that could take down merge-queue processing.
+
+    *search_roots* (#2896 review): forwarded to
+    :func:`find_ms_manifest_for_issue_via_api`. Omitting it for a relocated
+    (entrypoint-linked) milestone makes this report ``"no expected_red
+    entries found for this issue"`` for an issue that has them, so the
+    clearing PR is never opened and the entry stays red forever.
     """
     ops = gh_ops or _default_github_ops()
     found = find_ms_manifest_for_issue_via_api(
         repo_github, default_branch, issue_number, gh_ops=ops,
+        search_roots=search_roots,
     )
     if found is None:
         return "no expected_red entries found for this issue"
