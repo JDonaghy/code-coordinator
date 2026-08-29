@@ -3926,7 +3926,16 @@ def openapi_spec() -> dict:
                                 "type": "object",
                                 "properties": {
                                     "repo_name": {"type": "string"},
-                                    "issue": {"type": "object"},
+                                    # #2900: was a bare `{"type": "object"}`.
+                                    # A generated client can only be as typed
+                                    # as the served spec, and an untyped body
+                                    # generates the hand-built JSON literal
+                                    # #2900 exists to delete — so the nested
+                                    # payload is now an explicit DTO. Same
+                                    # field set as before, just declared.
+                                    "issue": dataclass_schema(
+                                        rest_schema.IssueUpsertIssue, components
+                                    ),
                                 },
                                 "required": ["repo_name", "issue"],
                             }
@@ -4206,7 +4215,28 @@ def openapi_spec() -> dict:
                     },
                 },
                 "responses": {
-                    "200": {"description": "OK"},
+                    # #2900: was an undeclared `{"description": "OK"}`. The
+                    # handler has always returned these two fields and
+                    # coord-tui's `apply_issue_labels_remote` has always read
+                    # them — a generated client can only be as typed as the
+                    # served spec says, so declare what is actually sent.
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "labels": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "changed": {"type": "boolean"},
+                                    },
+                                }
+                            }
+                        },
+                    },
                     "400": {"description": "Missing field"},
                 },
             }

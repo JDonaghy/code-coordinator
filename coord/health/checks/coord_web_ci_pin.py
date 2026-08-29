@@ -42,16 +42,38 @@ checkout-derived lane reports absence.
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 from coord import __version__ as LOCAL_COORD_VERSION
+from coord.health.checks._ci_pin import (
+    SERVER_EXTRA,
+    TOMBSTONE_DIST,
+    CoordPin,
+    find_coord_pins,
+    floor_exceeds,
+    norm_dist,
+    pin_values,
+)
+from coord.health.checks._ci_pin import where as _where
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import expand, shorten_path
+
+# #2900 re-exports: the parsing half of this module moved to `_ci_pin` when
+# `coord_tui_ci_pin` became its second consumer. These names stay importable
+# from here — they are this module's documented surface, and the split is an
+# internal reorganisation, not a contract change.
+__all__ = [
+    "CHECK_ID",
+    "COORD_WEB_MARKER",
+    "COORD_WEB_REPO_NAME",
+    "SERVER_EXTRA",
+    "TOMBSTONE_DIST",
+    "CoordPin",
+    "find_coord_pins",
+    "probe_coord_web_ci_pin",
+    "resolve_coord_web_checkout",
+]
 
 CHECK_ID = "coord_web_ci_pin"
 
@@ -65,113 +87,6 @@ COORD_WEB_REPO_NAME = "coord-web"
 #: literal reason this cross-repo coupling exists.
 COORD_WEB_MARKER = "playwright.acceptance.config.ts"
 
-#: The extra that carries uvicorn/Starlette. ``coord web`` is a **server**
-#: command; since the base/`[server]` split (#1237) the bare distribution
-#: installs a client-only coord that cannot serve anything.
-SERVER_EXTRA = "server"
-
-#: PyPI cannot rename a project, so ``claude-coordinator`` is a permanent
-#: tombstone that will never gain another release (#2106). CI still asking
-#: for it does not get a stale coord — it gets whatever ancient version that
-#: tombstone last published, forever.
-TOMBSTONE_DIST = "claude-coordinator"
-
-_INSTALL_RE = re.compile(r"\b(?:pip3?|uv\s+pip|pipx)\s+install\b", re.IGNORECASE)
-
-# `code-coordinator[server]>=0.4.90` and friends. Deliberately tolerant of
-# quoting (`'code-coordinator[server]'`) and of the underscore spelling pip
-# normalises away, because this is reading someone else's hand-written YAML.
-_REQ_RE = re.compile(
-    r"(?P<dist>code[-_]coordinator|claude[-_]coordinator)"
-    r"(?:\s*\[(?P<extras>[^\]]*)\])?"
-    r"(?P<constraint>"
-    r"(?:\s*(?:===|[<>!~=]=|[<>])\s*[^\s'\",;\\]+)"
-    r"(?:\s*,\s*(?:===|[<>!~=]=|[<>])\s*[^\s'\",;\\]+)*"
-    r")?",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True)
-class CoordPin:
-    """One ``pip install <coord>`` requirement found in `coord-web`'s CI."""
-
-    workflow: str  # file name, e.g. "ci.yml"
-    job: str  # job id, e.g. "e2e"
-    spec: str  # the requirement as written, e.g. "code-coordinator[server]"
-    dist: str  # normalised distribution name
-    extras: tuple[str, ...] = ()
-    constraint: str | None = None  # ">=0.4.90", "==0.4.90", or None
-
-    @property
-    def has_server_extra(self) -> bool:
-        return SERVER_EXTRA in self.extras
-
-    @property
-    def is_tombstone(self) -> bool:
-        return self.dist == TOMBSTONE_DIST
-
-    @property
-    def is_exact_pin(self) -> bool:
-        """True for ``==``/``===``, the spec shape that rots silently.
-
-        ``~=`` is deliberately included: ``~=0.4.90`` freezes the minor
-        series just as effectively for a project on a single ``0.x`` line.
-        """
-        c = (self.constraint or "").lstrip()
-        return c.startswith(("==", "===", "~="))
-
-    @property
-    def floor(self) -> str | None:
-        """The ``>=`` version, when the spec declares one."""
-        for part in (self.constraint or "").split(","):
-            part = part.strip()
-            if part.startswith(">="):
-                return part[2:].strip()
-        return None
-
-
-def _norm_dist(raw: str) -> str:
-    return raw.strip().lower().replace("_", "-")
-
-
-def _version_tuple(s: str) -> tuple[int, ...] | None:
-    parts = re.findall(r"\d+", s or "")
-    return tuple(int(p) for p in parts) if parts else None
-
-
-def _release_tuple(s: str) -> tuple[int, ...] | None:
-    """A comparable tuple, but only for a version that is a real release.
-
-    ``coord.__version__`` falls back to ``0+unknown`` when it cannot resolve
-    a distribution (a source checkout with no install, a wheel-less CI box).
-    Comparing a CI floor against *that* would report every floor as "ahead of
-    this machine" — a fabricated finding, and fabricating findings is how a
-    check earns the right to be ignored. Unknown stays unknown.
-    """
-    if not s or "unknown" in s.lower():
-        return None
-    t = _version_tuple(s)
-    return t if t and len(t) >= 2 else None
-
-
-def _floor_exceeds(floor: str, local: str) -> bool:
-    """True iff *floor* is strictly newer than *local*, both being releases.
-
-    Compares at equal precision — a floor of ``0.4`` is satisfied by a local
-    ``0.4.91``, so the shorter tuple is padded rather than compared as-is
-    (``(0, 4, 91) > (0, 4)`` would otherwise read as "ahead").
-    """
-    f, loc = _release_tuple(floor), _release_tuple(local)
-    if not f or not loc:
-        return False
-    width = max(len(f), len(loc))
-
-    def pad(t: tuple[int, ...]) -> tuple[int, ...]:
-        return t + (0,) * (width - len(t))
-
-    return pad(f) > pad(loc)
-
 
 def resolve_coord_web_checkout(ctx: HealthContext) -> Path | None:
     """This machine's `coord-web` checkout, if it has one.
@@ -184,7 +99,7 @@ def resolve_coord_web_checkout(ctx: HealthContext) -> Path | None:
     if configured:
         return expand(configured, ctx.home)
     for checkout in ctx.checkouts:
-        if _norm_dist(checkout.name) == COORD_WEB_REPO_NAME:
+        if norm_dist(checkout.name) == COORD_WEB_REPO_NAME:
             return checkout.path
     # Fall back to the structural marker so a rename of the repo doesn't
     # silently turn this lane off — an off lane is indistinguishable from a
@@ -193,82 +108,6 @@ def resolve_coord_web_checkout(ctx: HealthContext) -> Path | None:
         if (checkout.path / COORD_WEB_MARKER).is_file():
             return checkout.path
     return None
-
-
-def _iter_run_steps(checkout_path: Path):
-    """Yield ``(workflow_file_name, job_id, run_script)`` for every step.
-
-    A sibling of :func:`coord.health.checks.toolchain._iter_workflow_steps`,
-    but keeping the workflow/job labels: a finding here has to name *where*
-    in someone else's repo to go fix it, or it is just as much of a mystery
-    as the thing it replaced.
-    """
-    workflows_dir = checkout_path / ".github" / "workflows"
-    if not workflows_dir.is_dir():
-        return
-    try:
-        files = sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml"))
-    except OSError:
-        return
-    for wf_file in files:
-        try:
-            doc = yaml.safe_load(wf_file.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(doc, dict):
-            continue
-        jobs = doc.get("jobs")
-        if not isinstance(jobs, dict):
-            continue
-        for job_id, job in jobs.items():
-            if not isinstance(job, dict):
-                continue
-            for step in job.get("steps") or []:
-                if not isinstance(step, dict):
-                    continue
-                run = step.get("run")
-                if isinstance(run, str) and run.strip():
-                    yield wf_file.name, str(job_id), run
-
-
-def find_coord_pins(checkout_path: Path) -> list[CoordPin]:
-    """Every ``pip install <coord>`` requirement in the checkout's workflows.
-
-    Only ``run:`` scripts that actually invoke an installer are scanned — a
-    comment or an echo naming the package is not a pin, and treating it as
-    one would grade prose.
-    """
-    found: list[CoordPin] = []
-    seen: set[tuple[str, str, str]] = set()
-    for workflow, job, run in _iter_run_steps(checkout_path):
-        for line in run.splitlines():
-            if not _INSTALL_RE.search(line):
-                continue
-            for m in _REQ_RE.finditer(line):
-                extras = tuple(
-                    e.strip().lower() for e in (m.group("extras") or "").split(",") if e.strip()
-                )
-                constraint = (m.group("constraint") or "").strip() or None
-                spec = m.group(0).strip()
-                key = (workflow, job, spec)
-                if key in seen:
-                    continue
-                seen.add(key)
-                found.append(
-                    CoordPin(
-                        workflow=workflow,
-                        job=job,
-                        spec=spec,
-                        dist=_norm_dist(m.group("dist")),
-                        extras=extras,
-                        constraint=constraint,
-                    )
-                )
-    return found
-
-
-def _where(pin: CoordPin) -> str:
-    return f"{pin.workflow}:{pin.job}"
 
 
 def _result(
@@ -315,17 +154,7 @@ def probe_coord_web_ci_pin(ctx: HealthContext) -> CheckResult:
         "present": True,
         "checkout": str(checkout),
         "local_version": LOCAL_COORD_VERSION,
-        "pins": [
-            {
-                "workflow": p.workflow,
-                "job": p.job,
-                "spec": p.spec,
-                "dist": p.dist,
-                "extras": list(p.extras),
-                "constraint": p.constraint,
-            }
-            for p in pins
-        ],
+        "pins": pin_values(pins),
     }
 
     if not pins:
@@ -388,7 +217,7 @@ def probe_coord_web_ci_pin(ctx: HealthContext) -> CheckResult:
         )
 
     floors = {p.floor for p in pins if p.floor}
-    unsatisfiable = sorted(f for f in floors if _floor_exceeds(f, LOCAL_COORD_VERSION))
+    unsatisfiable = sorted(f for f in floors if floor_exceeds(f, LOCAL_COORD_VERSION))
     if unsatisfiable:
         return _result(
             Severity.WARN,

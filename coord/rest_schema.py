@@ -199,6 +199,45 @@ class AssignmentPatchResult:
     applied: list[str] = field(default_factory=list)
 
 
+# ── POST /issue-upsert (a verb route, declared here anyway — #2900) ──────────
+
+
+@dataclass(kw_only=True)
+class IssueUpsertIssue:
+    """The nested ``issue`` object of ``POST /issue-upsert``'s body.
+
+    **Why a verb route's DTO lives in this module.** Everything above is a
+    *resource*-route DTO (#1944); ``/issue-upsert`` is an RPC route with no
+    resource-shaped successor. It is declared here regardless because #2900
+    needs it: ``scripts/codegen.py --rust`` generates coord-tui's write
+    client from ``components/schemas``, and this was the one body whose spec
+    said only ``{"type": "object"}`` — enough for a human, but it generates a
+    bare ``serde_json::Value``, which is exactly the hand-built
+    ``serde_json::json!`` literal #2900 exists to delete. A generated client
+    can only be as typed as the served spec is.
+
+    The field set is ``coord.state._upsert_issue_local``'s, which is the
+    handler's sole consumer. ``number`` is the only required one — everything
+    else has a documented fallback there.
+    """
+
+    #: The issue number. The one field ``post_issue_upsert`` 400s without.
+    number: int
+    #: Falls back to ``""`` when absent or null.
+    title: str | None = None
+    #: Falls back to ``""`` when absent or null.
+    body: str | None = None
+    #: Lower-cased by the handler; falls back to ``"open"``.
+    state: str | None = None
+    #: Label *names*. The handler also accepts GitHub's ``{"name": ...}``
+    #: dict shape for a raw ``gh issue view`` payload and flattens it, but a
+    #: generated client sends the flat form, so that is what the wire
+    #: contract declares.
+    labels: list[str] | None = None
+    milestone_number: int | None = None
+    milestone_title: str | None = None
+
+
 # ── validation helper ────────────────────────────────────────────────────────
 
 #: The token-ish ``/assignment-usage`` fields that are written as one group.
