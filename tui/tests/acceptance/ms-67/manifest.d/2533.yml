@@ -1,0 +1,64 @@
+# Manifest fragment for #2533 (PB-3) — "Pull into decomposition session"
+# (contract §4), part of milestone ms-67 (tracking issue #2530).
+#
+# Per-issue manifest fragment (#2543): this file belongs to #2533 alone and
+# no other slice writes to it. It is merged (never clobbered) with
+# tests/acceptance/ms-67/manifest.yml (milestone-level `gate_a:`/`exempt:`
+# only) and any sibling issue's own manifest.d/<issue>.yml fragment by
+# coord.acceptance.load_manifest / load_expected_red.
+#
+# Slice: pull_decomposition_2533.rs · mocks: approved-items-context-menu.screen,
+# approved-items-chat-opened.screen
+
+tests:
+  # §4a — the list status bar advertises the right-click menu this action
+  # hangs off (the `right-click=menu` half of
+  # mocks/approved-items-populated.screen row 39, which #2532's slice
+  # deliberately handed over to this issue)
+  pull_decomposition_2533::list_status_bar_advertises_the_right_click_menu: 2533
+  # §4a — right-clicking a MAPPED row offers "Pull into decomposition session"
+  pull_decomposition_2533::right_click_mapped_row_offers_pull_into_decomposition_session: 2533
+  # §4a — …as the TOP item of the menu (asserted structurally: the row above
+  # it is the menu box's top border, not another entry)
+  pull_decomposition_2533::pull_item_is_the_top_menu_item: 2533
+  # §4a — on an UNMAPPED row ("— no mapping —") the item is still rendered:
+  # "present, greyed, inert", never hidden
+  pull_decomposition_2533::right_click_unmapped_row_still_shows_the_item: 2533
+  # §4a — …and clicking it there is a no-op (the observable consequence of
+  # ContextMenuItem.disabled == true, which a symbols-only grid cannot show)
+  pull_decomposition_2533::pull_item_is_inert_on_an_unmapped_row: 2533
+  # §4d — triggering the action fires the "chat ready — type to start" toast
+  # immediately on dispatch (the contract's own "within one tick" bullet)
+  pull_decomposition_2533::pull_action_fires_the_chat_ready_toast: 2533
+  # §4d — …titled "Decomposition chat", with a body naming the submission
+  # ("sub_2f6a1c: chat ready — type to start.")
+  pull_decomposition_2533::pull_action_toast_is_titled_and_names_the_submission: 2533
+
+expected_red:
+  # #2533 — OBSERVED, not intended. Taken from a real run of the sealed suite
+  # at authoring time (the driver command quoted at the top of
+  # tests/acceptance/ms-67/manifest.yml, run from this repo at
+  # `test-author-ms-67-slice-2533`): 6 of this slice's 7 ids FAILED. Every
+  # one of them needs the row context menu, which does not exist yet — the
+  # four §4a ids fail on the missing "Pull into decomposition session" item
+  # itself, and the two §4d toast ids fail earlier still, in the helper that
+  # has to click that item.
+  #
+  # `list_status_bar_advertises_the_right_click_menu` is DELIBERATELY ABSENT
+  # from this list: it was observed GREEN, because #2532's already-landed
+  # panel ships the `right-click=menu` hint. It is this slice's ratchet — the
+  # hint must keep rendering once the menu it advertises exists — not a red
+  # expectation.
+  #
+  # (The same run also reported failures in `plans_detail_1122::*` (ms-38) and
+  # `tabs_discoverability_2287::*` / `tabs_persistence_2286::*` (ms-65) — other
+  # milestones' slices, pre-existing and untouched by this work. The ms-65 two
+  # did not fail on a first, otherwise-identical run, so they look flaky rather
+  # than newly broken; either way they are outside this slice.)
+  2533:
+    - pull_decomposition_2533::right_click_mapped_row_offers_pull_into_decomposition_session
+    - pull_decomposition_2533::pull_item_is_the_top_menu_item
+    - pull_decomposition_2533::right_click_unmapped_row_still_shows_the_item
+    - pull_decomposition_2533::pull_item_is_inert_on_an_unmapped_row
+    - pull_decomposition_2533::pull_action_fires_the_chat_ready_toast
+    - pull_decomposition_2533::pull_action_toast_is_titled_and_names_the_submission

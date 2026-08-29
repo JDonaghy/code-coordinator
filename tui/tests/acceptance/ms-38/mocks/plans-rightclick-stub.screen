@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ┌ PLANS ─────────────────────────────────────────────────────────────────────────┐
+ M│ ▼ ◇ claude-coordinator  [38 ⚠1]   │ ★ NORTH STAR  Make coord-tui Plans panel feel like a rich client               │
+ ▶│   ● #38 Plans panel -> rich cl…   │    updated 2026-07-12 · 7d ago                                                 │
+ >│   ○ #37 Oracle loop               │ ▾ claude-coordinator  (2 tracked)   ready=3  blocked=1   ⚠ 1 need attention    │
+ ▦│ ▶ ◇ quadraui              [3 ⚠1]  │  claude-coordinator  #38  Plans panel -> rich cl…  epic:#1120 [● ready_waiting │
+ ≣│ ▶ ◇ vimcode               [0]     │ ▸ claude-coordinator  #45  Q3 planning stub           epic:—   no work order   │
+▎◆│                                   │┌────────────────────────────────────────┐                                      │
+ ◉│                                   ││ Create work order / promote to epic…   │                                      │
+ §│                                   ││ ────────────────────────────────────── │                                      │
+ $│                                   ││ Refresh                              r │                                      │
+  │                                   │└────────────────────────────────────────┘                                      │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+ ⚙│                                   └────────────────────────────────────────────────────────────────────────────────┘
+ right-click=menu  ?=help  c=capture  q=quit

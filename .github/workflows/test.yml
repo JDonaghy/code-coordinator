@@ -324,7 +324,7 @@ jobs:
   # the TS half above (`--out PATH` / `$COORD_TUI_SRC`, no fallback default,
   # docs/ADR_COORD_TUI_CI.md), and #2899 moved the crate out — so the Rust
   # byte-comparison is now, exactly like the TS one, EXCLUSIVELY the
-  # downstream repo's CI job. coord-tui's `.github/workflows/codegen.yml`
+  # downstream repo's CI job. coord-tui's `.github/workflows/codegen-drift.yml`
   # installs `code-coordinator[server]` from PyPI and runs
   # `COORD_TUI_SRC=. python -m ... codegen --rust --check` against its own
   # committed `src/app/types/generated.rs`.

@@ -1,0 +1,40 @@
+▎B│ ⌕ Filter issues…                  [ [A]dd ]  [ [N]otify ]  [ [R]etry ]  [ [P]urge ]                                 
+ M│                                   Board     Issue    [Chat]   Terminal                                              
+ ▶│▾ claude-coordinator                                                                                                 
+ >│  #101 Fix login race timeout        Decomposition chat → sub_2f6a1c  (Ctrl+S/Alt+Enter = send · Esc = close)        
+ ▦│  #102 Auth token refresh bug                                                                                        
+ ≣│                                   ┌──────────────────────────────────────────────┐                                  
+ ◆│                                   │ Decomposition chat                            │                                 
+ ◉│                                   │ sub_2f6a1c: chat ready — type to start.        │                                
+ §│                                   └──────────────────────────────────────────────┘                                  
+ ▤│                                                                                                                     
+ ⇅│                                                                                                                     
+ ✓│                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+ ⚙│                                                                                                                     
+ n=notify  m=merge  R=retry  P=purge  q=quit                                                                            

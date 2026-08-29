@@ -1,0 +1,40 @@
+ B│ AUDIT                                2m ago    dispatch  coordinator  coord#1039     Dispatched work to laptop: Fix…
+ M│  42 entries                          5m ago    test      user         coord#1039     Test passed: claude-coor…      
+ ▶│  ⊙ 7 recent (15m)                    12m ago   review    worker       coord#1038     Review approved: claude-coor…  
+ >│                                      1h0m ago  merge     coordinator  coord#1036     Merged: claude-coordinator#10… 
+ ▦│                                      3h12m ago dispatch  coordinator  coord#1036     Dispatched work to precision:… 
+ ≣│                                      24h0m ago dispatch  coordinator  coord#1042     Dispatched work to laptop: Te… 
+ ◆│                                      ───────────────────────────────────────────────────────────────────────────────
+ ◉│                                      ── Entry Detail ────────────────────────────────────────────────────────────── 
+▎§│                                      ts:          2025-07-10T14:23:11Z                                              
+  │                                      tier:        business                                                          
+  │                                      category:    dispatch                                                          
+  │                                      event_type:  dispatched                                                        
+  │                                      actor:       coordinator                                                       
+  │                                      repo:        claude-coordinator                                                
+  │                                      issue:       1039                                                              
+  │                                      assignment:  a1b2c3d4                                                          
+  │                                      machine:     laptop                                                            
+  │                                      summary:     Dispatched work to laptop: Fix filter UI controls (#1040)         
+  │                                      details:     {"branch":"issue-1039-fix-filters","type":"work"}                 
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+ ⚙│                                                                                                                     
+ j/k=nav  Esc=close detail  r=refresh  q=quit                                                                           

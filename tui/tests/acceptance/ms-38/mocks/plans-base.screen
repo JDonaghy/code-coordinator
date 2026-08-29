@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ┌ PLANS ─────────────────────────────────────────────────────────────────────────┐
+ M│ ▶ ◇ claude-coordinator  [38 ⚠1]  │ ★ NORTH STAR  Make coord-tui Plans panel feel like a rich client               │
+ ▶│ ▶ ◇ quadraui             [3 ⚠1]  │    updated 2026-07-12 · 7d ago                                                  │
+ >│ ▶ ◇ vimcode               [0]     │ ▾ claude-coordinator  (2 tracked)   ready=3  blocked=1   ⚠ 1 need attention    │
+ ▦│                                   │  claude-coordinator  #38  Plans panel -> rich cl…  epic:#1120  [● ready_waiting │
+ ≣│                                   │  claude-coordinator  #37  Oracle loop               epic:#1117  [100% done]     │
+▎◆│                                   │    +36 without a work order  (press u to expand)                                │
+ ◉│                                   │ ▾ quadraui  (1 tracked)   ready=1  blocked=0   ⚠ 1 need attention               │
+ §│                                   │  quadraui  #5  Help layer + palette     epic:#431   ready=1  [● ready_waiting]  │
+ $│                                   │    +2 without a work order  (press u to expand)                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+  │                                   │                                                                                 │
+ ⚙│                                   └─────────────────────────────────────────────────────────────────────────────────┘
+ j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  q=quit

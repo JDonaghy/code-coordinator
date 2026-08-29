@@ -1,0 +1,1052 @@
+# Acceptance manifest for milestone ms-65 ("coord-tui: per-panel document tabs
+# (preview/pin)", tracking issue #2289). Maps each acceptance test-id -> the
+# work-order issue it covers.
+#
+# Driver: tui-tuidriver (coordinator.yml `acceptance.drivers`, route `tui/**`)
+#   cd tui && cargo test --test acceptance -- --format json
+#
+# Test-ids are the libtest `name` emitted by `cargo test --test acceptance`
+# (module-qualified fn path). The slice files live in this directory and are
+# `include!`d at crate root by `tui/tests/acceptance.rs`.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# #2283 / #2284 / #2285 / #2286 / #2287 / #2288 append their own entries here
+# when their slices are authored just-in-time. #2281 has no UI surface of its
+# own (contract §7) and therefore no slice; it is exercised by every test below
+# running at all, since `make_app_with_board_json` is what seeds their fixture.
+
+tests:
+  # ── #2282 (W-1) — Board panel document tab strip (contract §2) ───────────
+  # Slice: board_tabs_2282.rs · mocks: board-baseline-no-tabs.screen,
+  # board-preview-tab.screen, board-pinned-3-tabs.screen
+  #
+  # §2a — zero tabs render no strip (the regression bar; also §4's empty-state
+  # target and §8a's absent-hint reference). THIS IS THE GREEN CONTROL — see
+  # the `expected_red` block below.
+  board_tabs_2282::zero_doc_tabs_render_no_tab_strip: 2282
+  # §2a — with >=1 tab the strip sits between the toolbar and the sub-tab bar,
+  # and carries a `#<N>` substring
+  board_tabs_2282::doc_tab_strip_renders_between_the_toolbar_and_the_subtab_bar: 2282
+  # §2a — the `Board / Issue / Chat / Terminal` sub-tab bar renders regardless
+  # of tab state, and the strip never displaces it upward
+  board_tabs_2282::subtab_bar_renders_regardless_of_doc_tab_state: 2282
+  # §2b + §1 — preview label `∘ #<N> <title>` truncated at 22 columns
+  board_tabs_2282::preview_tab_label_is_the_issue_number_and_title_truncated_to_22_columns: 2282
+  # §2b — pinned labels `#<N> <title>` truncated at 20 columns, no `∘ ` marker
+  board_tabs_2282::pinned_tab_labels_are_truncated_to_20_columns: 2282
+  # §2c — the active tab is bracketed `[<label> ×]`, inactive tabs are not
+  board_tabs_2282::active_tab_is_bracketed_and_inactive_tabs_are_not: 2282
+  # §2d — every open closable tab carries the trailing `×` (TAB_CLOSE_CHAR)
+  board_tabs_2282::every_open_tab_renders_the_close_glyph: 2282
+  # §2e rule 1 (append branch) — one single click opens one preview tab
+  board_tabs_2282::single_click_opens_one_preview_tab: 2282
+  # §2e rule 1 (replace branch) + rule 4 — a second single click replaces the
+  # preview in place; count stays 1
+  board_tabs_2282::second_single_click_replaces_the_preview_tab_in_place: 2282
+  # §2e rule 2 — single-clicking an already-open row activates it, adds nothing
+  board_tabs_2282::single_click_on_an_already_open_row_activates_it_without_adding_a_tab: 2282
+  # §2e rule 3 — a double click pins the tab and drops the `∘ ` marker
+  board_tabs_2282::double_click_pins_the_tab_and_drops_the_preview_marker: 2282
+  # §2e — the 2-tab intermediate state the contract explicitly warns not to
+  # confuse with the 3-double-click sequence (pinned #101 + preview #102)
+  board_tabs_2282::a_pinned_tab_plus_a_single_click_yields_two_tabs_one_of_them_preview: 2282
+  # §2e — the headline end state of mocks/board-pinned-3-tabs.screen
+  board_tabs_2282::three_double_clicks_yield_three_pinned_tabs_with_the_last_active: 2282
+  # §2f (half one) — activating a tab selects the matching sidebar row (`▸`)
+  board_tabs_2282::activating_a_tab_selects_its_sidebar_row: 2282
+  # §2f (half two) — …and SCROLLS it into view. See the quadraui#595 note below.
+  board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view: 2282
+
+  # ── #2283 (W-2) — close / navigate / overflow / empty state (contract §4) ─
+  # Slice: board_tabs_close_2283.rs · mock: board-tabs-overflow.screen
+  # (plus board-baseline-no-tabs.screen as §4's empty-state target)
+  #
+  # §4 — clicking a tab's `×` closes exactly that tab and no other
+  board_tabs_close_2283::clicking_a_tabs_close_glyph_closes_exactly_that_tab: 2283
+  # #2283 AC — …while clicking its BODY activates it and closes nothing.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  board_tabs_close_2283::clicking_a_tab_body_activates_it_without_closing_it: 2283
+  # §4 — middle-click anywhere on a tab (not just its `×`) closes it
+  board_tabs_close_2283::middle_clicking_a_tab_body_closes_it: 2283
+  # §4 — `Ctrl-W` closes the active tab, left neighbour becomes active
+  board_tabs_close_2283::ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour: 2283
+  # §4 — …and the rule's other branch: leftmost closed → new leftmost active
+  board_tabs_close_2283::ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost: 2283
+  # §4 — `Ctrl-Tab` next, wrapping last → first
+  board_tabs_close_2283::ctrl_tab_moves_to_the_next_tab_and_wraps_at_the_end: 2283
+  # §4 — `Ctrl-Shift-Tab` previous, wrapping first → last
+  board_tabs_close_2283::ctrl_shift_tab_moves_to_the_previous_tab_and_wraps_at_the_start: 2283
+  # §4 — overflow: `‹` renders, `›` does not, active tab stays visible
+  board_tabs_close_2283::overflowing_tabs_render_the_left_scroll_affordance_and_keep_the_active_tab_visible: 2283
+  # §4 — the mirror case §4 tells a test-author to drive for `›`
+  board_tabs_close_2283::activating_a_scrolled_out_tab_scrolls_it_back_into_view_and_renders_the_right_affordance: 2283
+  # §4 — closing the LAST tab restores the zero-tab baseline
+  board_tabs_close_2283::closing_the_last_tab_restores_the_zero_tab_baseline: 2283
+  # §4 + §2a — CONTROL: strip chrome (`×`, `‹`, `›`) must not leak into the
+  # zero-tab state. THIS IS THE GREEN CONTROL — see `expected_red` below.
+  board_tabs_close_2283::zero_tabs_render_no_close_or_overflow_glyphs: 2283
+
+  # ── #2284 (W-3) — Pipeline's own independent tab set (contract §3) ────────
+  # Slice: pipeline_tabs_2284.rs · mocks: pipeline-tabs-independent.screen
+  # (plus board-pinned-3-tabs.screen — §3b calls the two "the independence
+  # pair")
+  #
+  # §3a — zero Pipeline tabs render no strip on Pipeline. THIS IS THE GREEN
+  # CONTROL — see the `expected_red` block below.
+  pipeline_tabs_2284::pipeline_with_zero_doc_tabs_renders_no_tab_strip: 2284
+  # §3a — Pipeline has no toolbar, so its strip is the FIRST main-panel content
+  # row, immediately above the Overview/Issue/Log/Summary/Terminal sub-tab bar
+  # (with §3a's own stated contrast: on Board the toolbar precedes the strip)
+  pipeline_tabs_2284::pipeline_doc_tab_strip_is_the_first_main_panel_row_with_no_toolbar_above_it: 2284
+  # §3b bullet 1 — switching to Pipeline shows Pipeline's (empty) set, not the
+  # Board's three tabs, and does not lose them. THIS IS A GREEN RATCHET — see
+  # the `expected_red` block below.
+  pipeline_tabs_2284::switching_to_pipeline_hides_the_boards_tabs_without_losing_them: 2284
+  # §3b + #2284 AC 1 — two Pipeline tabs with three already open on the Board
+  # shows EXACTLY two on Pipeline, and no Board document leaks into the strip
+  pipeline_tabs_2284::pipeline_opens_its_own_two_tabs_while_the_board_keeps_three: 2284
+  # §3b bullet 2 + AC 2 — the milestone's headline round trip: Board →
+  # Pipeline → Board restores the same three tabs, same order, same active tab
+  pipeline_tabs_2284::board_pipeline_board_round_trip_restores_the_boards_tabs_order_and_active_tab: 2284
+  # §3b + AC 3 — each scope owns its own preview slot: a single click in
+  # Pipeline leaves the Board's `∘ ` preview tab exactly where it was
+  pipeline_tabs_2284::each_scope_owns_its_own_preview_slot: 2284
+  # §3b + AC 4 — reveal-on-activate is per scope: activating a Pipeline tab
+  # selects its row in the PIPELINE sidebar and leaves the Board's selection
+  pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards: 2284
+
+  # ── #2285 (T-4) — per-tab detail sub-state (contract §5) ─────────────────
+  # Slice: detail_substate_2285.rs · mocks: none of its own (§5 is explicitly
+  # mock-less: "this issue is invisible to a static screen grid"); it borrows
+  # `board-baseline-no-tabs.screen`'s `PIPELINE STAGES` detail heading as the
+  # "this tab is on its default `Board` sub-tab" marker.
+  #
+  # §5 bullet 1a — a tab opened while another sits on `Issue` starts on the
+  # DEFAULT `Board` sub-tab (issue #2285: "Defaults on open match today's
+  # defaults (Board / Overview, scroll 0)")
+  detail_substate_2285::a_newly_opened_tab_starts_on_the_default_board_sub_tab: 2285
+  # §5 bullet 1b — tab A keeps `Issue` while tab B is driven to `Board`;
+  # switching back to A shows A's own sub-tab, and back to B shows B's
+  detail_substate_2285::switching_back_to_a_tab_restores_that_tabs_own_sub_tab: 2285
+  # §5 bullet 2 — scrolling tab A's Issue body neither moves tab B's nor is
+  # lost when A is re-activated
+  detail_substate_2285::scrolling_one_tabs_issue_body_leaves_the_other_tabs_position_alone: 2285
+  # §5 bullet 3 — closing a tab DISCARDS its sub-state: re-opening the same
+  # issue number starts from `Board` / scroll 0
+  detail_substate_2285::closing_a_tab_discards_its_sub_state_and_reopening_starts_from_the_defaults: 2285
+  # §5 bullet 4 — the Terminal sub-tab belongs to the tab that opened it: a
+  # new tab does not land in it, and returning to the opener does. (Session
+  # LIVENESS is not asserted — see coordinator finding 12 below.)
+  detail_substate_2285::terminal_sub_tab_selection_follows_its_own_tab: 2285
+  # #2285 AC 4 / "behaviour-preserving for a single open tab" — with exactly
+  # one tab open, sub-tab and scroll behave as they do today.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  detail_substate_2285::a_single_open_tab_keeps_todays_sub_tab_and_scroll_behaviour: 2285
+
+  # ── #2287 (T-5) — discoverability: status bar / `?` help / right-click ────
+  # Slice: tabs_discoverability_2287.rs · mocks: board-tab-context-menu.screen,
+  # board-tabs-help-overlay.screen (plus board-preview-tab.screen and
+  # board-baseline-no-tabs.screen — §8a's own hint-present / hint-absent
+  # reference pair)
+  #
+  # §8a — with >=1 tab open the status bar advertises the tab gestures
+  tabs_discoverability_2287::status_bar_shows_the_tab_hints_while_a_tab_is_open: 2287
+  # §8a — …as the contract's pinned, verbatim substring (two spaces between
+  # segments). Split from the clause above so a spacing/ordering deviation
+  # reds exactly one id.
+  tabs_discoverability_2287::status_bar_tab_hint_is_the_contracts_verbatim_string: 2287
+  # §8a + #2287 AC — the dynamic half: the hint goes away again when the last
+  # tab closes (a latched hint passes the static control but fails this)
+  tabs_discoverability_2287::status_bar_tab_hints_disappear_when_the_last_tab_closes: 2287
+  # §8a — CONTROL: zero tabs => no tab hint, and the Board's own pre-ms-65
+  # hints survive. THIS IS THE GREEN CONTROL — see `expected_red` below.
+  tabs_discoverability_2287::zero_tabs_status_bar_keeps_the_boards_own_hints_and_shows_no_tab_hints: 2287
+  # §8b — `?` opens an overlay titled "Board — Help"
+  tabs_discoverability_2287::help_overlay_opens_on_question_mark_with_the_board_title: 2287
+  # §8b — …listing the four pinned key-binding phrases ("open preview tab",
+  # "pin tab", "close active tab", "cycle tabs")
+  tabs_discoverability_2287::help_overlay_lists_the_document_tab_key_bindings: 2287
+  # §8b — …and the two mouse gestures the status bar cannot advertise,
+  # under the "Document tabs" heading
+  tabs_discoverability_2287::help_overlay_lists_the_mouse_tab_gestures_under_a_document_tabs_heading: 2287
+  # §8b — ` Esc=close ` while open, and `Esc` closes it
+  tabs_discoverability_2287::help_overlay_advertises_and_honours_escape_to_close: 2287
+  # §8c — right-clicking a tab opens the four-item menu (Close checked as a
+  # standalone item, not as a prefix of its two longer siblings)
+  tabs_discoverability_2287::right_clicking_a_tab_opens_a_menu_with_close_close_others_close_all_and_pin_tab: 2287
+  # §8c — "Close others" leaves exactly the right-clicked (middle) tab
+  tabs_discoverability_2287::close_others_leaves_exactly_the_right_clicked_tab: 2287
+  # §8c — "Close all" leaves none and restores the zero-tab state
+  tabs_discoverability_2287::close_all_leaves_no_tabs_and_restores_the_zero_tab_state: 2287
+  # §8c — "Close" closes the right-clicked tab and no other (see finding 16)
+  tabs_discoverability_2287::close_menu_item_closes_the_right_clicked_tab_and_no_other: 2287
+  # §8c + #2287 AC — "Pin tab" promotes a preview tab (drops `∘ `) without
+  # changing count or order
+  tabs_discoverability_2287::pin_tab_promotes_a_preview_tab_without_changing_count_or_order: 2287
+  # §8c — "hidden or inert" on an already-pinned tab, asserted through the
+  # outcome both readings share (see finding 17)
+  tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab: 2287
+  # ── #2286 (T-5) — persistence, `~/.coord/tabs.json` (contract §6) ─────────
+  # Slice: tabs_persistence_2286.rs · mocks: none of its own (§6 is explicitly
+  # mock-less: "No visual mock (this is a file-format contract, not a
+  # screen)"); its rendered halves lean on `board-baseline-no-tabs.screen`
+  # (the zero-tab state a missing/malformed file must produce) and
+  # `board-pinned-3-tabs.screen` (three restored tabs, §2c bracket included).
+  #
+  # §6 bullet 1 (save side) — 3 Board tabs are written as an ORDERED `tabs`
+  # list with `active` set and `preview` null
+  tabs_persistence_2286::three_board_tabs_are_saved_to_tabs_json_in_strip_order_with_the_active_tab: 2286
+  # §6 (`preview` is "the key of the one preview tab […] must also appear in
+  # `tabs`") — the file-level half of "restored as a preview, not promoted"
+  tabs_persistence_2286::a_preview_tab_is_saved_as_the_scopes_preview_slot: 2286
+  # §6 bullet 1 + #2286 AC 1 (Board half) — three Board tabs restored after a
+  # restart, persisted active tab preserved
+  tabs_persistence_2286::board_tabs_are_restored_from_tabs_json_after_a_restart: 2286
+  # §6 + #2286 AC 2 — a restored preview tab keeps §1's `∘ ` marker, i.e. is
+  # not promoted to pinned on load
+  tabs_persistence_2286::a_restored_preview_tab_is_still_a_preview_tab: 2286
+  # §6 bullet 1 + #2286 AC 1 (Pipeline half) — the same file restores two
+  # Pipeline tabs to the PIPELINE panel with its own active tab (see
+  # coordinator finding 15 for the live blocker on entering that panel)
+  tabs_persistence_2286::pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab: 2286
+  # §6 bullet 2 + #2286 AC 3 — a document whose issue is gone from the board is
+  # dropped on load, never rendered, never round-tripped into a re-saved file
+  tabs_persistence_2286::a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load: 2286
+  # §6 bullet 3 (first branch) — the active document being pruned activates a
+  # surviving neighbour (WHICH one is not pinned — see finding 16)
+  tabs_persistence_2286::pruning_the_active_document_activates_a_surviving_neighbour: 2286
+  # §6 bullet 3 (second branch) — nothing survives the prune → no tabs at all.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  tabs_persistence_2286::a_scope_whose_documents_are_all_pruned_starts_with_no_tabs: 2286
+  # §6 bullet 4 + #2286 AC 4 — missing / empty / malformed file all start
+  # clean, never a panic, never a partial parse.
+  # THIS IS THE GREEN CONTROL — see the `expected_red` block below.
+  tabs_persistence_2286::a_missing_empty_or_malformed_tabs_json_starts_with_no_tabs: 2286
+
+  # ── #2288 (T-5) — side-by-side split, two tab groups in one panel (§9) ────
+  # Slice: board_split_2288.rs · mock: board-split-side-by-side.screen
+  # (plus board-tabs-help-overlay.screen for the one §8b "Split" clause §8b
+  # itself hands to §9 — see finding 18 below)
+  #
+  # §9 + #2288 AC 1 — `Ctrl-W v` yields two panes SIDE BY SIDE, proven by the
+  # grid: one `║` column spanning >=2 rows, strictly inside the main panel,
+  # with ink either side. This is contract Note 1's inverted-`SplitDirection`
+  # warning made executable.
+  board_split_2288::ctrl_w_v_splits_the_board_panel_into_two_panes_side_by_side: 2288
+  # §9 — "Each pane owns its own doc-tab strip": `×` on BOTH sides of the
+  # divider on the strip row
+  board_split_2288::each_split_pane_renders_its_own_document_tab_strip: 2288
+  # §9 — …and its own `Board / Issue / Chat / Terminal` sub-tab bar in the
+  # narrower rect (mock row 2 renders it twice)
+  board_split_2288::each_split_pane_renders_its_own_sub_tab_bar: 2288
+  # §9 — the panel toolbar is PANEL-scoped: its row carries no `║` and sits
+  # above the first divider row (mock row 0)
+  board_split_2288::the_panel_toolbar_spans_the_full_width_above_both_panes: 2288
+  # §9 — "The two panes' tab sets, active tabs and preview slots never merge"
+  # (side-agnostic: partition, one bracketed tab per pane, exactly one `∘`)
+  board_split_2288::the_two_panes_tab_sets_never_merge: 2288
+  # §9 — the mock's own left/right assignment, quoted verbatim in §9's prose.
+  # The ONE side-pinning id in this slice; see finding 19 below.
+  board_split_2288::the_split_renders_the_contracts_left_and_right_pane_content: 2288
+  # §9 — the split-pane label budget is its own pinned constant: 14 columns,
+  # NOT §2b's single-pane 20
+  board_split_2288::split_pane_tab_labels_truncate_at_fourteen_columns: 2288
+  # §9 + §1 — …and 16 for a preview tab (the same `+2` marker rule on the
+  # smaller base), NOT §2b's 22
+  board_split_2288::split_pane_preview_tab_labels_truncate_at_sixteen_columns: 2288
+  # §9 + #2288 AC 2 — an independent preview slot per pane: a click in the
+  # focused pane replaces ITS preview and leaves the other pane's alone
+  board_split_2288::each_pane_owns_its_own_preview_slot: 2288
+  # §9 key table — `Ctrl-W w` moves focus to the next pane, read through §2e
+  # rule 1's "the focused group's preview" (focus has no glyph of its own)
+  board_split_2288::ctrl_w_w_moves_focus_to_the_other_pane: 2288
+  # §9 Design + #2288 AC 3 — dragging the `║` divider resizes both panes and
+  # the content reflows (direction only; see finding 20)
+  board_split_2288::dragging_the_divider_resizes_both_panes_and_the_content_reflows: 2288
+  # #2288 AC 4 — closing the last tab in one pane collapses that pane back to
+  # a single-pane layout
+  board_split_2288::closing_the_last_tab_in_a_pane_collapses_back_to_a_single_pane: 2288
+  # §9 key table — `Ctrl-W x` closes the focused pane, leaving the OTHER
+  # pane's set whole and in order (side-agnostic)
+  board_split_2288::ctrl_w_x_closes_the_focused_pane: 2288
+  # §9 — "Closing the last remaining pane in a scope is a no-op (or disabled)
+  # — a scope always has >=1 pane". See finding 17 (the `Ctrl-W` collision).
+  board_split_2288::closing_the_last_remaining_pane_is_a_no_op: 2288
+  # §9 + #2288 AC 5 — "With one pane, rendering is BYTE-IDENTICAL to the
+  # non-split case", asserted as a split → collapse round trip so it cannot
+  # pass vacuously
+  board_split_2288::collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte: 2288
+  # §9 — CONTROL: one pane is the default and `║` renders "only when a panel
+  # has >=2 panes". THIS IS THE GREEN CONTROL — see the `expected_red` block.
+  board_split_2288::a_single_pane_panel_renders_no_divider: 2288
+  # §8b's "Split" section — §9's four keys, rendered in #2287's overlay.
+  # Authored HERE because #2287's slice explicitly deferred it; see finding 18.
+  board_split_2288::help_overlay_lists_the_split_key_bindings: 2288
+
+# ── expected_red (#2164) ───────────────────────────────────────────────────
+# Hand-derived from a REAL run of the sealed suite against origin/main at the
+# time of authoring (`cd tui && cargo test --test acceptance --features
+# test-support board_tabs_2282`): 14 failed, 1 passed. Not guessed, and not
+# left empty (#2191 — an empty block parks the slice).
+#
+# `zero_doc_tabs_render_no_tab_strip` is deliberately ABSENT: it is the control.
+# It is green today (there is no strip) and must stay green after #2282 lands
+# (contract §2a: "when zero tabs are open, the strip renders nothing and
+# reserves no row" — the strictest form of #2285's behaviour-preserving bar).
+# Listing it would make its inevitable pass a HARD FAILURE.
+expected_red:
+  2282:
+    - board_tabs_2282::doc_tab_strip_renders_between_the_toolbar_and_the_subtab_bar
+    - board_tabs_2282::subtab_bar_renders_regardless_of_doc_tab_state
+    - board_tabs_2282::preview_tab_label_is_the_issue_number_and_title_truncated_to_22_columns
+    - board_tabs_2282::pinned_tab_labels_are_truncated_to_20_columns
+    - board_tabs_2282::active_tab_is_bracketed_and_inactive_tabs_are_not
+    - board_tabs_2282::every_open_tab_renders_the_close_glyph
+    - board_tabs_2282::single_click_opens_one_preview_tab
+    - board_tabs_2282::second_single_click_replaces_the_preview_tab_in_place
+    - board_tabs_2282::single_click_on_an_already_open_row_activates_it_without_adding_a_tab
+    - board_tabs_2282::double_click_pins_the_tab_and_drops_the_preview_marker
+    - board_tabs_2282::a_pinned_tab_plus_a_single_click_yields_two_tabs_one_of_them_preview
+    - board_tabs_2282::three_double_clicks_yield_three_pinned_tabs_with_the_last_active
+    - board_tabs_2282::activating_a_tab_selects_its_sidebar_row
+    - board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view
+
+  # #2283 — OBSERVED, not intended. Taken from a real run of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 11 ids, 9 FAILED and
+  # 2 passed. The 2 that passed are deliberately ABSENT below:
+  #
+  #   * `zero_tabs_render_no_close_or_overflow_glyphs` — the CONTROL. Green
+  #     today (there is no strip chrome with zero tabs) and must stay green
+  #     after #2283 lands: an implementation that unconditionally paints the
+  #     `‹`/`›` affordances would satisfy the overflow tests and break this
+  #     one. Listing it would make its inevitable pass a HARD FAILURE.
+  #   * `clicking_a_tab_body_activates_it_without_closing_it` — a RATCHET.
+  #     #2282 already ships tab-body activation, so the positive half is green;
+  #     the test exists for the negative half (a body click must never close),
+  #     which #2283's new `TabBarHit::TabClose(i)` routing could regress.
+  2283:
+    - board_tabs_close_2283::clicking_a_tabs_close_glyph_closes_exactly_that_tab
+    - board_tabs_close_2283::middle_clicking_a_tab_body_closes_it
+    - board_tabs_close_2283::ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour
+    - board_tabs_close_2283::ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost
+    - board_tabs_close_2283::ctrl_tab_moves_to_the_next_tab_and_wraps_at_the_end
+    - board_tabs_close_2283::ctrl_shift_tab_moves_to_the_previous_tab_and_wraps_at_the_start
+    - board_tabs_close_2283::overflowing_tabs_render_the_left_scroll_affordance_and_keep_the_active_tab_visible
+    - board_tabs_close_2283::activating_a_scrolled_out_tab_scrolls_it_back_into_view_and_renders_the_right_affordance
+    - board_tabs_close_2283::closing_the_last_tab_restores_the_zero_tab_baseline
+
+  # #2284 — OBSERVED, not intended. Taken from three consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 7 ids, the
+  # same 5 FAILED and the same 2 passed on every run. The 2 that passed are
+  # deliberately ABSENT below:
+  #
+  #   * `pipeline_with_zero_doc_tabs_renders_no_tab_strip` — the CONTROL.
+  #     Green today (no panel paints a strip with nothing open) and must stay
+  #     green after #2284 lands: an implementation that reserves the Pipeline
+  #     strip row unconditionally, or that renders the Board's tabs on
+  #     Pipeline, breaks exactly this test. Listing it would make its
+  #     inevitable pass a HARD FAILURE.
+  #   * `switching_to_pipeline_hides_the_boards_tabs_without_losing_them` — a
+  #     RATCHET. Green today for the degenerate reason that the single global
+  #     set #2282 shipped renders only on the Board, so nothing leaks onto
+  #     Pipeline and nothing is lost coming back. Both halves become real
+  #     constraints the moment the set is keyed by scope: a per-scope map that
+  #     rebuilds (rather than preserves) the outgoing scope's entry fails the
+  #     return leg, and a strip that paints the focused scope's tabs on the
+  #     wrong panel fails the outbound one.
+  2284:
+    - pipeline_tabs_2284::pipeline_doc_tab_strip_is_the_first_main_panel_row_with_no_toolbar_above_it
+    - pipeline_tabs_2284::pipeline_opens_its_own_two_tabs_while_the_board_keeps_three
+    - pipeline_tabs_2284::board_pipeline_board_round_trip_restores_the_boards_tabs_order_and_active_tab
+    - pipeline_tabs_2284::each_scope_owns_its_own_preview_slot
+    - pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards
+
+  # #2285 — OBSERVED, not intended. Taken from two consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 6 ids, the
+  # same 5 FAILED and the same 1 passed on both runs, each of the 5 dying on a
+  # §5 clause (never on a precondition — verified by reading the panic line of
+  # every failure). The 1 that passed is deliberately ABSENT below:
+  #
+  #   * `a_single_open_tab_keeps_todays_sub_tab_and_scroll_behaviour` — the
+  #     RATCHET, and the issue's own regression bar ("This slice is
+  #     behaviour-preserving for a single open tab"). Green today for the
+  #     degenerate reason that there is one global sub-state and one tab to
+  #     own it; it must STAY green once the state moves onto the document.
+  #     An implementation that keys sub-state by something other than the
+  #     active document (or that resets it on every activation) breaks
+  #     exactly this test. Listing it would make its inevitable pass a HARD
+  #     FAILURE.
+  2285:
+    - detail_substate_2285::a_newly_opened_tab_starts_on_the_default_board_sub_tab
+    - detail_substate_2285::switching_back_to_a_tab_restores_that_tabs_own_sub_tab
+    - detail_substate_2285::scrolling_one_tabs_issue_body_leaves_the_other_tabs_position_alone
+    - detail_substate_2285::closing_a_tab_discards_its_sub_state_and_reopening_starts_from_the_defaults
+    - detail_substate_2285::terminal_sub_tab_selection_follows_its_own_tab
+
+  # #2287 — OBSERVED, not intended. Taken from two consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 14 ids, the
+  # same 13 FAILED and the same 1 passed on both runs. Every one of the 13 died
+  # on a §8 clause, never on a §2/§4 precondition — verified by reading the
+  # panic line of each failure (the §8c ones all land in `assert_menu_item` /
+  # `click_menu_item`, i.e. "no such menu"; the §8a/§8b ones on the missing
+  # hint string and the missing overlay). The 1 that passed is deliberately
+  # ABSENT below:
+  #
+  #   * `zero_tabs_status_bar_keeps_the_boards_own_hints_and_shows_no_tab_hints`
+  #     — the CONTROL. Green today (nothing renders "click=preview", and the
+  #     Board status bar already reads `… n=notify  m=merge  R=retry  P=purge
+  #     q=quit`) and it must STAY green after #2287 lands: an implementation
+  #     that appends the tab hints unconditionally, or that replaces the
+  #     Board's own hint set with them outright, passes every §8a test above
+  #     and breaks exactly this one. Listing it would make its inevitable pass
+  #     a HARD FAILURE.
+  2287:
+    - tabs_discoverability_2287::status_bar_shows_the_tab_hints_while_a_tab_is_open
+    - tabs_discoverability_2287::status_bar_tab_hint_is_the_contracts_verbatim_string
+    - tabs_discoverability_2287::status_bar_tab_hints_disappear_when_the_last_tab_closes
+    - tabs_discoverability_2287::help_overlay_opens_on_question_mark_with_the_board_title
+    - tabs_discoverability_2287::help_overlay_lists_the_document_tab_key_bindings
+    - tabs_discoverability_2287::help_overlay_lists_the_mouse_tab_gestures_under_a_document_tabs_heading
+    - tabs_discoverability_2287::help_overlay_advertises_and_honours_escape_to_close
+    - tabs_discoverability_2287::right_clicking_a_tab_opens_a_menu_with_close_close_others_close_all_and_pin_tab
+    - tabs_discoverability_2287::close_others_leaves_exactly_the_right_clicked_tab
+    - tabs_discoverability_2287::close_all_leaves_no_tabs_and_restores_the_zero_tab_state
+    - tabs_discoverability_2287::close_menu_item_closes_the_right_clicked_tab_and_no_other
+    - tabs_discoverability_2287::pin_tab_promotes_a_preview_tab_without_changing_count_or_order
+    - tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab
+  # #2286 — OBSERVED, not intended. Taken from real runs of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 9 ids, the same 7
+  # FAILED and the same 2 passed on three consecutive full-suite runs and on
+  # three slice-filtered runs. Every one of the 7 died on a §6 clause — four on
+  # "nothing was restored" (no strip renders after seeding `tabs.json`), three
+  # on "no such file exists after opening tabs" — never on a harness
+  # precondition; verified by reading the panic line of every failure. The
+  # suite's other 6 failures (audit_1039, plans_detail_1122) are PRE-EXISTING:
+  # a `--skip tabs_persistence_2286` baseline run on the same commit reproduces
+  # exactly those 6, so this slice's sandboxed `HOME` (finding 14) is not
+  # destabilising them. The 2 that passed are deliberately ABSENT below:
+  #
+  #   * `a_missing_empty_or_malformed_tabs_json_starts_with_no_tabs` — the
+  #     CONTROL. Green today for the degenerate reason that nothing is ever
+  #     loaded, and it must STAY green once loading lands: an implementation
+  #     that `unwrap()`s the parse (panic) or best-effort restores the
+  #     well-formed prefix of a truncated file breaks exactly this test, which
+  #     is §6 bullet 4's whole point. Listing it would make its inevitable pass
+  #     a HARD FAILURE.
+  #   * `a_scope_whose_documents_are_all_pruned_starts_with_no_tabs` — a
+  #     RATCHET, §6 bullet 3's second branch ("if none survive, start with no
+  #     tabs"). Green today because nothing renders at all; it becomes a real
+  #     constraint the moment restore lands, since an implementation that
+  #     renders a dead tab, or keeps a pruned document active and paints its
+  #     label, fails it.
+  2286:
+    - tabs_persistence_2286::three_board_tabs_are_saved_to_tabs_json_in_strip_order_with_the_active_tab
+    - tabs_persistence_2286::a_preview_tab_is_saved_as_the_scopes_preview_slot
+    - tabs_persistence_2286::board_tabs_are_restored_from_tabs_json_after_a_restart
+    - tabs_persistence_2286::a_restored_preview_tab_is_still_a_preview_tab
+    - tabs_persistence_2286::pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab
+    - tabs_persistence_2286::a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load
+    - tabs_persistence_2286::pruning_the_active_document_activates_a_surviving_neighbour
+
+  # #2288 — OBSERVED, not intended. Taken from real runs of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 17 ids, the same 16
+  # FAILED and the same 1 passed on two consecutive FULL-suite runs and on two
+  # slice-filtered runs. Every one of the 16 died on a §9 clause, never on a
+  # harness precondition — verified by reading the panic line of each failure:
+  # 14 of them in `divider_col()`'s "no `║` is on the grid at all" assertion
+  # (i.e. `Ctrl-W v` does not split yet), one in
+  # `collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte`'s own
+  # §9 split precondition, one in `closing_the_last_remaining_pane_is_a_no_op`'s
+  # §9 no-op assertion (it observed the bare `Ctrl-W` of finding 17 close a
+  # tab), and one in `help_overlay_lists_the_split_key_bindings` on the missing
+  # `Split` section — that last one got cleanly past its "Board — Help"
+  # precondition, so #2287's overlay chrome is already there and only §9's rows
+  # are absent. The suite's other 10 failures (audit_1039, plans_detail_1122,
+  # tabs_discoverability_2287, tabs_persistence_2286) are PRE-EXISTING and
+  # unchanged by this slice. The 1 that passed is deliberately ABSENT below:
+  #
+  #   * `a_single_pane_panel_renders_no_divider` — the CONTROL. Green today
+  #     (nothing paints `║`) and it must STAY green after #2288 lands: §9 pins
+  #     that the glyph renders "only when a panel has ≥2 panes" and that "one
+  #     pane is the default". An implementation that paints the `SplitTree`'s
+  #     divider unconditionally, or that seeds the Board with two leaves
+  #     because "the tree shape allows more later", satisfies every split test
+  #     above and breaks exactly this one. Listing it would make its inevitable
+  #     pass a HARD FAILURE.
+  2288:
+    - board_split_2288::ctrl_w_v_splits_the_board_panel_into_two_panes_side_by_side
+    - board_split_2288::each_split_pane_renders_its_own_document_tab_strip
+    - board_split_2288::each_split_pane_renders_its_own_sub_tab_bar
+    - board_split_2288::the_panel_toolbar_spans_the_full_width_above_both_panes
+    - board_split_2288::the_two_panes_tab_sets_never_merge
+    - board_split_2288::the_split_renders_the_contracts_left_and_right_pane_content
+    - board_split_2288::split_pane_tab_labels_truncate_at_fourteen_columns
+    - board_split_2288::split_pane_preview_tab_labels_truncate_at_sixteen_columns
+    - board_split_2288::each_pane_owns_its_own_preview_slot
+    - board_split_2288::ctrl_w_w_moves_focus_to_the_other_pane
+    - board_split_2288::dragging_the_divider_resizes_both_panes_and_the_content_reflows
+    - board_split_2288::closing_the_last_tab_in_a_pane_collapses_back_to_a_single_pane
+    - board_split_2288::ctrl_w_x_closes_the_focused_pane
+    - board_split_2288::closing_the_last_remaining_pane_is_a_no_op
+    - board_split_2288::collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte
+    - board_split_2288::help_overlay_lists_the_split_key_bindings
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — three findings from authoring this slice. None of them
+# is a worker's to fix, and none was resolved by editing the contract (a
+# test-author may not amend one; #2289 also forbids amending it mid-drive).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 1. §2a's `driver.screen_contains("[Board]")` is FALSE against the shipped
+#    app, and §2a itself calls the sub-tab bar "unchanged by this milestone".
+#    The shipped bar renders `Board  Issue  Board Chat  Terminal`: quadraui's
+#    `draw_tab_bar` marks the active tab with colour, not brackets, and
+#    coord-tui's labels are `" Board "` / `" Issue "` / `" Board Chat "` /
+#    `" Terminal "` (`tui/src/app/render.rs`). The mocks' `[Board]` and the
+#    mocks' `Chat` (vs. the shipped `Board Chat`) are both mock artifacts.
+#    This slice locates the bar by its real labels instead. §2c's `[<label> ×]`
+#    bracket on the *doc*-tab strip is untouched by this: the contract calls
+#    that "a new, milestone-local convention", i.e. genuinely #2282's job, and
+#    it IS asserted literally.
+#
+# 2. §2a's "with zero doc tabs open, the row immediately below the toolbar row
+#    IS the `Board / Issue / Chat / Terminal` row" is false of §2a's own
+#    reference mock (in `mocks/board-baseline-no-tabs.screen` row 1 is blank
+#    and the sub-tab bar is row 2) and of the shipped app (row 1 is the
+#    `[ ↻ Sync (S) ]` button row). What the prose and both mocks DO agree on is
+#    the ordering, so that is what is asserted. If the literal row-index claim
+#    was meant, it needs a contract amendment — asserting it as written would
+#    be red against a correct implementation.
+#
+# 3. §2f's scroll half is blocked on milestone pre-requisite quadraui#595
+#    (`SidebarSystem::reveal`), which is NOT landed at the currently pinned
+#    quadraui rev (`d70da7dff7ef9f1eb578ee48aca69297e548348e`). Measured, not
+#    assumed: on a 120×11 grid with contract §7's five issues, neither wheel
+#    `UiEvent::Scroll` nor arrow-key selection moves the Board sidebar list —
+#    arrowing down to #105 updates the detail pane while the list keeps showing
+#    #101–#103. `activating_a_tab_scrolls_its_sidebar_row_into_view` will stay
+#    red until the pin bump named in #2289's pre-requisite table lands, however
+#    complete #2282's own code is. Its setup reaches #105 through the sidebar
+#    FILTER box rather than by scrolling, so every step before the two final
+#    asserts is a harness precondition and says "NOT a #2282 defect" in its
+#    panic message.
+#
+# Also worth knowing, not a contract problem: the mocks draw sidebar rows as
+# `#102 Auth token refresh bug`; the shipped sidebar renders
+# `      #102  Auth token refresh b` (two spaces, title truncated to the
+# 35-column sidebar). The slice's `ROW_*` click targets are taken from a real
+# render for that reason. `TuiDriver` at the pinned rev has neither
+# `double_click()` (quadraui#592) nor styled-cell reads (quadraui#593); the
+# slice works around the first by dispatching the `MouseDown`+`UiEvent::DoubleClick`
+# pair the real runner's `DoubleClickDetector` produces (deterministic, no
+# 400 ms wall clock), and around the second via contract §1's `∘ ` marker plus
+# `×`-counting, exactly as §2e instructs.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2283 slice (contract §4).
+# Independent of the #2282 notes above; again, none is a worker's to fix and
+# none was resolved by editing the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 4. `mocks/board-tabs-overflow.screen` CONTRADICTS §2b's pinned label width.
+#    §2b pins 20 columns (22 with §1's `∘ ` marker) for the single-pane strip,
+#    and `mocks/board-pinned-3-tabs.screen` renders exactly that
+#    (`#101 Fix login race… ×`). §4's own mock renders a visibly narrower
+#    label — `‹ #102 Auth… ×  #103 Race… ×  #104 Flak… ×  [#105 Memo… ×]`,
+#    roughly 10 columns. The two cannot both be right, and the discrepancy is
+#    load-bearing for that mock's headline claim: at the mock's own ~10-column
+#    width all five tabs would fit the 82-column main panel and there would be
+#    no overflow to depict, whereas at §2b's 20 columns only three fit
+#    (measured against the shipped app, which already implements §2b's width:
+#    `#103 Race condition… × #104 Flaky CI on ma… × [#105 Memory leak in… ×]`).
+#    So the mock's "only 4 fit the strip width" is not reproducible under
+#    either reading. This slice therefore asserts NEITHER the label width nor
+#    the fitting count — only §4's own testable clauses (`‹` present / `›`
+#    absent with #105 active, the mirror with #101 active, and "the active
+#    tab's `#<N>` is always present regardless of scroll offset"), all of
+#    which hold under both readings. If the 20/22 value is the intended one,
+#    the overflow mock wants regenerating; if the mock is right, §2b wants
+#    amending. Either way it is a Gate-A amendment, not a worker decision.
+#
+# 5. §4's "closing the last tab returns to `mocks/board-baseline-no-tabs.screen`'s
+#    EXACT state" cannot be taken literally. That mock has `▸ #101` selected;
+#    any scenario that opens a tab and closes it necessarily arrives with that
+#    issue selected instead (§2f's reveal-on-activate selected it). A
+#    full-frame comparison would be red against a correct implementation, so
+#    `closing_the_last_tab_restores_the_zero_tab_baseline` asserts the parts
+#    that ARE well defined — no `×`/`∘`/`‹`/`›` anywhere, and the sub-tab bar
+#    back on the exact row it held before any tab was opened (i.e. the strip
+#    reserved no row, §2a) — plus selection-follows-tree as a RELATION (the
+#    detail pane's `claude-coordinator #<N>` header matches whichever sidebar
+#    row is `▸`-marked) rather than by pinning which row that is. Flagged as a
+#    `TODO(test-author)` in the slice too.
+#
+# 6. §4 pins the `Ctrl-Shift-Tab` CHORD but not its wire encoding, and the two
+#    plausible ones differ: `Key::Named(Tab)` + `{ctrl, shift}`, or
+#    `Key::Named(BackTab)` + `{ctrl, shift}` (crossterm folds Shift-Tab into
+#    `KeyCode::BackTab`; quadraui's `tui::events` maps that to
+#    `NamedKey::BackTab`). Pinning one would invent a detail the contract is
+#    silent on, so the slice's `ctrl_shift_tab()` helper sends the `Tab` form
+#    and, only if the STRIP ROW is unchanged, the `BackTab` form — either
+#    satisfies the clause, handling neither still fails. (The fallback is
+#    gated on the strip row, not the whole frame: an unhandled `Tab` chord
+#    still repaints the sidebar focus ring, measured, which would otherwise
+#    mask the fallback.)
+#
+# Also worth knowing, not a contract problem: the quadraui pin has MOVED since
+# the #2282 slice was authored — `tui/Cargo.toml` now says
+# `d6ae247c007721284dc895d4fbf42b5f4a5ba47f`, at which quadraui#592 and #594
+# HAVE landed. `TuiDriver` now has real `double_click()`, `middle_click()`,
+# `right_click()`, `click_with()`, `set_double_click_folding()` and
+# `tab_close_center()`. This slice uses the first four and pins folding OFF so
+# repeated clicks are never a wall-clock race. It deliberately does NOT use
+# `tab_close_center()`, which needs the `WidgetId` the implementation gives the
+# doc-tab bar — an implementation detail a sealed slice must not guess at; it
+# resolves each tab's `×` from the rendered grid instead. Styled-cell reads
+# (quadraui#593) have also landed (`style_at`/`styled_row`), but §1's ruling
+# stands: the `∘ ` marker remains the pinned preview signal, and this slice
+# asserts no styles.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2284 slice (contract §3).
+# Independent of the #2282 / #2283 notes above; again, none is a worker's to
+# fix by editing this suite, and none was resolved by editing the contract.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 7. LIVE HARNESS BLOCKER (flaky, machine-dependent, and it will bite #2284's
+#    worker on the very first run): **entering the Pipeline panel destroys the
+#    seeded fixture in the sealed suite.** Switching panels runs
+#    `sync_active_view_from_shell` -> `maybe_kick_pipeline_loader` ->
+#    `refresh()` -> `start_data_load()` (`tui/src/app/data.rs:2620`). That
+#    function short-circuits to `BoardData::default()` — so
+#    `apply_pending_data`'s #620 degraded-tick guard keeps the seeded board —
+#    but the short-circuit is gated `#[cfg(test)]` ONLY. `tui/tests/acceptance.rs`
+#    is a separate integration-test crate, so the `coord_tui` it links is built
+#    WITHOUT `cfg(test)`; the loader therefore reads the real local
+#    `~/.coord/coord.db`, and the next dispatched event (`dispatch_handle`
+#    drains the receiver before handling anything) wholesale-replaces
+#    `self.data`. Measured on this machine: two clicks after landing on
+#    Pipeline, the Board sidebar renders the developer's real `api (1)` repo
+#    and the Pipeline tree is empty ("Loading tracked issues…").
+#
+#    It is a RACE, not a certainty — the load runs on a spawned thread, so
+#    whether the fixture survives depends on whether that thread finished
+#    before the next event. Across three authoring runs, 3 of the 5 red ids
+#    died at the harness precondition and 2 got far enough to fail on the real
+#    §3a clause; which is which varied run to run. Every affected assertion
+#    says `HARNESS PRECONDITION (NOT a #2284 defect …)` in its panic message so
+#    the two failure modes are distinguishable from a JSON report alone.
+#
+#    The fix is one line of app code, and this repo has already made it once
+#    for the same reason: `resolve_board_service()`
+#    (`tui/src/app/data.rs:1950`) is gated
+#    `#[cfg(any(test, feature = "test-support"))]` with a comment citing #1039
+#    and naming this exact external-crate `cfg(test)` trap.
+#    `start_data_load()`'s stub needs the same widening. It is NOT in #2284's
+#    "Files" list, so the coordinator should either land it as a prerequisite
+#    or explicitly authorise the worker to widen that cfg — without it the five
+#    red ids below cannot go green reliably no matter how correct the
+#    per-scope tab model is.
+#
+# 8. §3b's "same scroll position as before the switch" is not asserted. The
+#    round-trip test opens three tabs in an 82-column strip, where nothing is
+#    scrolled, and the contract pins no rendered signal for a *restored* strip
+#    scroll offset beyond §4's `‹`/`›` affordances — which are #2283's slice
+#    and whose own mock the #2283 author already flagged (finding 4) as
+#    contradicting §2b's label width. Inventing an observable for it would
+#    have meant inventing a width. Flagged as a `TODO(test-author)` in the
+#    slice.
+#
+# 9. §2f's scroll half is likewise not re-asserted for the Pipeline scope.
+#    #2284's own AC says "reveals its row in the Pipeline sidebar, not the
+#    Board's", and the contract pins the scroll requirement only for the Board
+#    (§2f, five issues on a short viewport). This slice asserts the per-scope
+#    SELECTION (`▸ #201` inside the Pipeline sidebar's columns 3–37, plus the
+#    Board's own `▸ #103` surviving a Pipeline-side activation) and leaves the
+#    scroll half to #2282's slice, which owns §2f. Also a `TODO(test-author)`.
+#
+# Also worth knowing, not a contract problem: the Pipeline sidebar nests
+# tracked issues under state -> repo -> milestone nodes whose innermost node is
+# COLLAPSED by default, and renders rows as `#201  Add retry backoffwork`
+# (two spaces, title truncated to the 35-column sidebar, stage badge butted
+# against it) — nothing like the mocks' `#201 Add retry backoff to fetch`. The
+# slice therefore targets Pipeline rows by their `#<N>` tag restricted to the
+# sidebar columns (§0), never by a full row string, and expands that group as a
+# labelled precondition. The fixture also gives #101–#103 an untracked label
+# and #201–#203 the tracked `coord` one: the Board sidebar lists all six (it
+# does not filter by label) while the Pipeline lists only the 200s, which is
+# what makes the mocks' 100s/200s ranges disjoint in a single seeded board.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2285 slice (contract §5).
+# Independent of the #2282 / #2283 / #2284 notes above; again, none is a
+# worker's to fix by editing this suite, and none was resolved by editing the
+# contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 10. §5's `driver.screen_contains("[Issue]")` / `[Board]` clauses are NOT
+#     assertable — same root cause as finding 1, restated because §5 depends
+#     on it far more heavily than §2a did. The shipped Board sub-tab bar
+#     renders ` Board  Issue  Board Chat  Terminal ` and marks the active tab
+#     with colour + modifiers only (quadraui's `draw_tab_bar`); there is no
+#     bracket anywhere in that row, and the third tab is `Board Chat`, not
+#     `Chat`. Asserting `[Issue]` literally would make #2285's worker restyle
+#     a bar §2c itself says "pre-dates this milestone" — i.e. it would turn a
+#     mock artifact into a work item. This slice reads the ACTIVE SUB-TAB OFF
+#     ITS CONTENT instead: `Issue` ⇔ that tab's issue-body lines are on
+#     screen, `Board` ⇔ `PIPELINE STAGES` is and no body line is, `Terminal`
+#     ⇔ the terminal pane's placeholder is. That is strictly stronger than
+#     the bracket check (it proves the PANE switched, not just the bar) and it
+#     is what a shared-sub-state regression actually looks like on screen.
+#     If the bracket convention was meant as a requirement rather than a mock
+#     artifact, it needs a contract amendment naming which issue owns it.
+#
+# 11. The fixture needed issue BODIES, which contract §7's fixture JSON does
+#     not carry. §5 bullet 2 is about scroll position inside the Issue
+#     sub-tab, and §7's five issues have no `body`, so their Issue sub-tab
+#     renders an unscrollable placeholder. This slice therefore extends §7's
+#     set (same five numbers, same verbatim titles) with a 40-line
+#     line-numbered body on #101/#102/#103 — `BBB-line-01…40` for #102 and so
+#     on — which makes both "whose body is this" and "where is it scrolled
+#     to" readable straight off the grid. `make_app_with_board_json` (#2281)
+#     accepts `body` already, so no seam change is needed; flagging only
+#     because §7 says the fixture "must be able to produce" the listed set and
+#     a future author of §6's persistence slice will want bodies too.
+#
+# 12. §5 bullet 4's "keeps running" half is asserted by NOBODY in this suite,
+#     and cannot be from a `TuiDriver`. Detail terminal sessions are spawned
+#     and polled by `drive_detail_terminals`, which the app calls from
+#     `tick()`; `quadraui::tui::testing::TuiDriver` at the pinned rev exposes
+#     `render`, `dispatch` and input helpers but no tick pump, so no PTY is
+#     ever spawned in the sealed suite (the Terminal sub-tab sits on its
+#     `Starting shell session…` placeholder — which is, usefully, a stable
+#     "this tab is on Terminal" marker). Contract Note 6 already concedes a
+#     screen grid cannot show a background session staying alive, but it does
+#     not name a substitute observable. `terminal_sub_tab_selection_follows_
+#     its_own_tab` asserts the half that IS observable and that a shared-
+#     sub-state implementation gets wrong (the Terminal sub-tab is owned by
+#     the tab that opened it). Verifying that `detail_terminal_sessions` is
+#     torn down on tab CLOSE and not on tab SWITCH needs either a driver tick
+#     hook (a quadraui ask) or an in-crate `#[cfg(test)]` unit test in
+#     `tui/src/app/terminal.rs` — worth asking #2285's worker for the latter,
+#     since this suite structurally cannot cover it.
+#
+# 13. The per-tab EXPANDED/FOCUSED STAGE is not covered by any test. The issue
+#     body's Design section moves "the focused/expanded-stage selection" onto
+#     the document, but contract §5 — the sealed statement of this issue's
+#     black-box surface — never mentions it, and stage expansion lives on the
+#     Pipeline Overview sub-tab, which this external test crate cannot drive
+#     at all while finding 7's fixture-wipe blocker stands. Inventing an
+#     observable for it would have meant inventing behaviour. If it is meant
+#     to be gated by acceptance, §5 needs a clause and finding 7 needs fixing
+#     first.
+#
+# Also worth knowing, not a contract problem: scrolling is driven with
+# `UiEvent::Scroll` over the main panel (one notch = one line on the Board
+# detail pane, measured), not with `j`/`k` — bare `j`/`k` reach the detail
+# pane only after `Ctrl-W` moves focus off the sidebar, an unrelated surface.
+# And this slice deliberately does NOT assert the sub-tab-switch scroll reset
+# the app performs today (`detail_scroll = 0` on a sub-tab click): no clause
+# pins it either way, so pinning it could force a wrong implementation.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2287 slice (contract §8).
+# Independent of the #2282 / #2283 / #2284 / #2285 notes above; again, none is
+# a worker's to fix by editing this suite, and none was resolved by editing
+# the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 14. §8b's `?` overlay has TWO sections and the second one is #2288's, not
+#     #2287's. §8b pins "Document tabs" AND "Split (§9's four keys)", and
+#     `mocks/board-tabs-help-overlay.screen` renders the four split rows
+#     (`Ctrl-W v  split right`, `Ctrl-W s  split down`, `Ctrl-W w  next pane`,
+#     `Ctrl-W x  close pane`). This slice asserts the Document-tabs section
+#     only. #2287's own acceptance criteria say just "`?` lists the tab key
+#     bindings"; the split keys belong to §9 (#2288), which the milestone's
+#     work order puts AFTER this issue, and §9 note 2 says `Ctrl-W s` is a
+#     reserved placeholder that does nothing in ms-65. Asserting those rows
+#     here would gate #2287's acceptance run on a later issue's surface — and,
+#     for `Ctrl-W s`, on a binding the contract says must NOT work yet. If the
+#     Split section is meant to be gated by acceptance, it wants an id in
+#     #2288's slice (the overlay is #2287's to build; the rows it lists for
+#     split are #2288's to justify). Flagged as a `TODO(test-author)` in the
+#     slice too.
+#
+# 15. §8a's hint is pinned "whenever the active panel owns a tab set", but the
+#     Pipeline half is not asserted. Pipeline owns its own set (§3), so the
+#     hint presumably applies there too, but the contract names no
+#     Pipeline hint-present mock and finding 7 above (the #2284 author's) is a
+#     live blocker: entering the Pipeline panel from this external test crate
+#     can wholesale-replace the seeded fixture, because `start_data_load()`'s
+#     deterministic short-circuit is gated `#[cfg(test)]` only. Rather than
+#     add a fourteenth id with a known race, this slice asserts §8a on the
+#     Board only — where both of §8a's own reference mocks live. If finding
+#     7's one-line cfg widening lands, a Pipeline hint id is cheap to add.
+#
+# 16. §8c does not say what the menu's **"Close"** item does. The section
+#     spells out the effect of "Close others", "Close all" and "Pin tab" and
+#     is silent on the first item. `close_menu_item_closes_the_right_clicked_
+#     tab_and_no_other` takes the only reading the label admits, and the one
+#     §4 already pins for the `×` route: the RIGHT-CLICKED tab closes, the
+#     others survive. The fixture deliberately right-clicks a tab that is NOT
+#     the active one (#102 while #103 is active) so the two readings are
+#     distinguishable — if "Close" was meant to close the *active* tab, that
+#     needs a contract amendment, not a silent implementation choice.
+#     Flagged as a `TODO(test-author)` in the slice.
+#
+# 17. §8c's "hidden **or** inert" is permissive, so neither the presence nor
+#     the absence of "Pin tab" on an already-pinned tab is assertable on its
+#     own. `pin_tab_is_hidden_or_inert_on_an_already_pinned_tab` asserts the
+#     outcome BOTH readings share instead — the tab set is unchanged (count,
+#     order, and still no `∘ ` marker anywhere) — taking the item's branch
+#     when it renders and dismissing the menu when it does not. It is not
+#     vacuous: it first requires the menu to open on a pinned tab at all
+#     (§8c gates only the one item, not the menu), which is why it was RED at
+#     authoring time.
+#
+# 18. §8b's overlay is driven with ZERO tabs open, though
+#     `mocks/board-tabs-help-overlay.screen` depicts it over a 3-tab board.
+#     §8b's testable clause carries no tab precondition ("`driver.press('?')`
+#     while the Board panel is active"), and #2287's own rationale — the
+#     gestures are "undiscoverable by anyone who did not read the issue" — is
+#     at its strongest before the operator has opened anything. If the tab
+#     section of the overlay is meant to be conditional on an open tab set,
+#     that is a contract amendment; as written, four ids here would be red
+#     against such an implementation.
+#
+# Also worth knowing, not a contract problem: (a) the shipped Board status bar
+# is a full row of segments — `coord-tui  Board  [Sidebar]  ↻ 0s  QUEUE: empty
+# FLEET: OK  (coord health  n=notify  m=merge  R=retry  P=purge  q=quit` — and
+# is already truncated at 120 columns, whereas §8a's own reference mock renders
+# only ` click=preview  dbl-click=pin  ctrl-w=close  ctrl-tab=next  q=quit`.
+# The control asserts the four Board hint segments (`n=notify`, `R=retry`,
+# `P=purge`, `q=quit`) survive in the ZERO-tab state only, which is the only
+# state §8a calls "unchanged"; it deliberately pins nothing about what the row
+# looks like once the tab hints are in it, since the mock implies the left-hand
+# segments give way. (b) `"Close"` is a prefix of both `"Close others"` and
+# `"Close all"`, so a bare `screen_contains("Close")` would pass on a menu
+# missing the item entirely; the slice's `menu_item_row()` rejects a match
+# whose label is immediately followed by another item's continuation. It does
+# NOT require the row to end after the label — §8c pins no accelerator column
+# for this menu, but ms-38's menus do render one (`Refresh … r`), so an item
+# carrying an accelerator must still count. (c) §8c pins no gesture for
+# activating an open menu item; a left click on the item's own label is the
+# only activation path any context menu in this app already documents, so that
+# is what the slice sends.
+# FOR THE COORDINATOR — findings from authoring the #2286 slice (contract §6).
+# Independent of the #2282 / #2283 / #2284 / #2285 notes above; again, none is
+# a worker's to fix by editing this suite, and none was resolved by editing the
+# contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 14. **A REAL CONSTRAINT ON #2286's IMPLEMENTATION, discovered while making §6
+#     observable: the restore must run on the FIXTURE construction path, and
+#     the coord-dir has no injectable seam.** Two facts force this:
+#
+#       (a) The sealed suite's only way to build an app is #2281's
+#           `make_app_with_board_json` → `make_test_app`, which today sets
+#           `doc_tabs: DocTabs::default()` outright. `CoordApp::new()` is
+#           public but builds the real daemon-backed app with an EMPTY board,
+#           against which every persisted document would be pruned on load
+#           (§6: "drop any document whose issue is absent from the board") — so
+#           it structurally cannot witness a restore. If the load is wired only
+#           into real startup, the five restore/prune ids above stay red no
+#           matter how correct `doc_tabs.rs` is.
+#
+#       (b) Every `~/.coord/…` path resolves through `std::env::var_os("HOME")`
+#           (`TuiSettings::path`, `Workspace::path`, `app::data::coord_dir`).
+#           There is no `COORD_HOME`-style override, so this slice sandboxes
+#           `HOME` to a temp dir (serialised behind a slice-global mutex,
+#           restored on drop including on panic) rather than clobbering the
+#           developer's real `~/.coord/tabs.json`. That window is
+#           process-global: while it is held, concurrently-running tests from
+#           OTHER slices see the sandboxed `HOME` too. Measured at authoring
+#           time it changes nothing — a `--skip tabs_persistence_2286` baseline
+#           reproduces exactly the same 6 pre-existing failures — but it is a
+#           latent cross-slice coupling, and it will get worse: once (a) lands,
+#           EVERY ms-65 slice's zero-tab control (`zero_doc_tabs_render_no_tab_strip`,
+#           `pipeline_with_zero_doc_tabs_renders_no_tab_strip`,
+#           `zero_tabs_render_no_close_or_overflow_glyphs`) will start reading
+#           the developer's REAL `~/.coord/tabs.json` and go red on any machine
+#           where a human has used the shipped feature.
+#
+#     Both halves point at the same cheap fix, which is a coordinator call, not
+#     a worker's: give the coord-dir an injectable seam under
+#     `#[cfg(any(test, feature = "test-support"))]` (the exact widening this
+#     repo already applied to `resolve_board_service()` for #1039, and that
+#     finding 7 asks for on `start_data_load()`), and have the fixture path
+#     restore through it. Absent that, either the restore is untestable or the
+#     rest of ms-65's suite becomes machine-dependent.
+#
+# 15. Entering the Pipeline panel — finding 7's fixture-wipe blocker — did NOT
+#     bite this slice at authoring time, and the reason is worth recording:
+#     under the sandboxed `HOME` there is no `~/.coord/coord.db` to load, so
+#     `start_data_load` has nothing to overwrite the seeded board with.
+#     `pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab`
+#     got cleanly past its `Overview` precondition and failed on its §6 clause
+#     on every run. That is a side effect of the sandbox, not a fix: finding 7
+#     stands for every other slice, and if #2286's worker moves the tab load
+#     off the `HOME` seam the protection disappears with it.
+#
+# 16. §6 bullet 3 says "a surviving neighbour in `tabs` (order preserved)
+#     becomes active" without pinning WHICH neighbour. §4 pins a left-neighbour
+#     rule, but that is #2283's `Ctrl-W` close gesture, and §6 does not extend
+#     it to this load-time prune. `pruning_the_active_document_activates_a_surviving_neighbour`
+#     therefore asserts only what is pinned — exactly one tab is bracketed
+#     (§2c) and it is one of the survivors — and deliberately does not pin left
+#     vs. right. Also a `TODO(test-author)` in the slice. If a specific rule was
+#     meant, it needs a contract amendment.
+#
+# 17. **Per-tab sub-state persistence is asserted by NOBODY.** §6's last bullet
+#     pins that the sub-tab selection is persisted ("as a string — yes") while
+#     scroll offsets may be dropped, but §6's pinned JSON shape carries no
+#     field for it: a document key is `{"repo": …, "issue": …}` and nothing
+#     more. There is therefore no pinned place to look for it in the file, and
+#     no pinned rule for what a restored tab's sub-tab is when the field is
+#     absent. Asserting it would have meant inventing a field name, so no test
+#     covers it. If it is meant to be gated by acceptance, §6's shape needs the
+#     field spelled out.
+#
+# Also worth knowing, not a contract problem: §6 pins that a restart restores,
+# but not WHEN the file is written. `saved_tabs_json()` therefore reads
+# `~/.coord/tabs.json` after the tab edits and, if it is not there yet, again
+# after a `q` quit — so an implementation that flushes on tab mutation and one
+# that flushes on exit both satisfy the two save-side tests; only a run that
+# produces no file at all fails them. The file's field names (`tabs` /
+# `active` / `preview`, and a key's `repo` / `issue`) ARE asserted as written,
+# on §6 Note 5's own authority ("the shape above is what `coord acceptance
+# author` will write fixtures against"; a deviation is "an amendment, not a
+# silent implementation choice").
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2288 slice (contract §9).
+# Independent of the #2282 / #2283 / #2284 / #2285 / #2287 / #2286 notes above;
+# again, none is a worker's to fix by editing this suite, and none was resolved
+# by editing the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 17. **§4's bare `Ctrl-W` and §9's `Ctrl-W <key>` leader chords COLLIDE on the
+#     same prefix, and the contract never says how they coexist.** §4 pins
+#     "`Ctrl-W` closes the active tab and activates a defined neighbour" — a
+#     shipped #2283 clause with its own sealed ids
+#     (`ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour`,
+#     `ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost`). §9's key table
+#     then pins `Ctrl-W v` / `Ctrl-W s` / `Ctrl-W w` / `Ctrl-W x` as pane
+#     chords "following this app's existing `Ctrl-W`-as-pane-leader convention
+#     already shipped for the Terminal panel". The two readings are mutually
+#     exclusive as stated:
+#
+#       (a) If `Ctrl-W` closes immediately, it swallows §9's chords — measured:
+#           `closing_the_last_remaining_pane_is_a_no_op` observed the shipped
+#           app close `#102` on the `Ctrl-W` and drop the `x`, which is exactly
+#           the failure mode a worker will hit first.
+#       (b) If `Ctrl-W` enters a pending-leader state, §4's close is delayed
+#           until the next keystroke, which #2283's two ids may or may not
+#           tolerate depending on how they were written (this slice has not
+#           read them).
+#
+#     A third reading — pending-leader, and any key that is NOT one of
+#     `v`/`s`/`w`/`x` falls through to §4's close plus that key — satisfies
+#     both sections, but the contract does not name it and a worker should not
+#     have to invent it. **This is a Gate-A amendment, not a worker decision.**
+#     This slice sends §9's chords as written and asserts §9's outcomes; it
+#     deliberately does NOT re-assert §4's bare-`Ctrl-W` behaviour (that is
+#     #2283's slice's subject, and taking a side here would pin one of the two
+#     readings). Flagged as a `TODO(test-author)` in the slice too.
+#
+# 18. **§8b's "Split" section of the `?` help overlay was owned by NOBODY, so
+#     one id for it is authored in THIS slice.** §8b pins the overlay as having
+#     two sections — "Document tabs" and "Split (§9's four keys)" — and
+#     `mocks/board-tabs-help-overlay.screen` rows 11–15 render `Split`,
+#     `Ctrl-W v  split right`, `Ctrl-W s  split down`, `Ctrl-W w  next pane`,
+#     `Ctrl-W x  close pane`. #2287's author deliberately left them out and
+#     said so (finding 14 above, and a closing `TODO(test-author)` in their
+#     slice): the split keys are §9's, and asserting them under #2287 would
+#     gate that issue's acceptance run on a later issue's surface.
+#     `help_overlay_lists_the_split_key_bindings` closes the hole from the
+#     other side — it is a §9 fact rendered in a #2287 surface. Two
+#     consequences the coordinator should know: (a) #2288's acceptance run now
+#     depends on #2287's overlay chrome existing, which the work order already
+#     guarantees (#2287 precedes #2288) and which the authoring run confirmed
+#     is already shipped — the id got past its "Board — Help" precondition and
+#     failed only on the missing `Split` section; (b) it asserts the `Ctrl-W s`
+#     help ROW, not that the chord does anything, because §9 Note 2 pins that
+#     key as a reserved forward-compatibility placeholder ms-65 must NOT
+#     implement.
+#
+# 19. **§9 never states which pane holds focus after `Ctrl-W v`.** The mock
+#     settles it implicitly — `mocks/board-split-side-by-side.screen` puts the
+#     two pinned tabs on the LEFT and the post-split single click's preview on
+#     the RIGHT, and §2e rule 1 opens a preview in the *focused* group, so the
+#     new (right) pane must have received focus. That inference is load-bearing
+#     for the whole slice, so it is confined to ONE id
+#     (`the_split_renders_the_contracts_left_and_right_pane_content`): every
+#     other test here is deliberately side-agnostic (it asserts the partition,
+#     never which half is which), so if the intended behaviour is "focus stays
+#     in the original pane" exactly one id is wrongly red instead of nine. If
+#     the mock's assignment is authoritative, §9's prose should say so; if it
+#     is not, that id wants regenerating along with the mock.
+#
+# 20. **§9 pins no resize arithmetic for the divider drag.** #2288's AC 3
+#     ("Dragging the divider resizes both panes and the content reflows") and
+#     §9's Design bullet ("Divider drag resizes") name the gesture but no
+#     minimum pane width, no snapping rule, and no cells-per-column mapping —
+#     while §9's prose elsewhere calls the divider's position "a fixed column".
+#     `dragging_the_divider_resizes_both_panes_and_the_content_reflows`
+#     therefore asserts only what IS pinned: the divider moves in the drag's
+#     direction, it remains a single vertical divider, and both panes still
+#     render their own strip (i.e. the content reflowed rather than a pane
+#     being clipped away). Inventing a landing column would have meant
+#     inventing behaviour. Also a `TODO(test-author)` in the slice.
+#
+# 21. **`mocks/board-split-side-by-side.screen`'s status bar CONTRADICTS §8a's
+#     pinned hint string.** §8a pins, as an exact substring "taken verbatim
+#     from the issue body", `click=preview  dbl-click=pin  ctrl-w=close
+#     ctrl-tab=next`, and #2287's slice asserts it literally. The split mock's
+#     row 39 instead reads `click=preview  dbl-click=pin  ctrl-w v/s=split
+#     ctrl-w w=next pane  q=quit` — it DROPS `ctrl-w=close` and `ctrl-tab=next`
+#     and adds two split segments. §9 pins no status-bar string of its own, so
+#     asserting the mock's row would contradict #2287's sealed id and
+#     asserting §8a's would contradict the mock. **No status-bar clause is
+#     authored in this slice for that reason.** If the split state is meant to
+#     re-word the hint, §8a needs an amendment saying so (and #2287's
+#     `status_bar_tab_hint_is_the_contracts_verbatim_string` would need a
+#     precondition of "no split"); if the mock is wrong, it wants regenerating.
+#     Either way it is a Gate-A call, and a worker who takes the mock literally
+#     will red an already-sealed #2287 id.
+#
+# 22. §9 says nothing about what a NEWLY created pane holds at the instant
+#     `Ctrl-W v` returns — an empty tab set, a copy of the focused document
+#     (vim's split semantics), or the moved active tab. The mock only shows the
+#     state after a subsequent single click, which every one of those readings
+#     can reach. No test asserts the new pane's initial contents; every fixture
+#     here opens a tab in the new pane before reading it. Also a
+#     `TODO(test-author)` in the slice.
+#
+# Also worth knowing, not a contract problem: (a) the split is asserted on the
+# BOARD panel only — §9's "per-pane-within-scope" implies Pipeline splits too,
+# but the contract names no Pipeline split mock and finding 7 above (the #2284
+# author's) documents a live fixture-wipe blocker on entering Pipeline from
+# this external test crate. (b) Orientation is proved structurally rather than
+# by any enum: `divider_col()` requires every `║` on the grid to share ONE
+# column across ≥2 rows and to sit strictly inside §0's main-panel span
+# (columns 38–119). A `SplitDirection` mix-up (contract Note 1 / #2288's own
+# ⚠) either paints no `║` or paints a horizontal run of them, and both die
+# there with a message naming the inversion — this is the one place the
+# milestone's headline trap is actually caught. (c) The mock puts the divider
+# at column 78, i.e. a 40-column left pane and a 41-column right one, matching
+# §9's "roughly 40 columns of content width"; the slice asserts the divider is
+# strictly interior, not that exact column, since §9 pins the 14/16 label
+# budget but never the 50/50 default as a testable number.

@@ -1,0 +1,109 @@
+# Acceptance manifest for milestone ms-67 ("TUI portal bridge: project↔repo
+# mapping + briefed decomposition", tracking issue #2530). Maps each
+# acceptance test-id -> the work-order issue it covers.
+#
+# Driver: tui-tuidriver (coordinator.yml `acceptance.drivers`, route `tui/**`)
+#   cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance \
+#       --features test-support -- -Z unstable-options --format json
+#
+# Test-ids are the libtest `name` emitted by that command (module-qualified fn
+# path). The slice files live in this directory and are `include!`d at crate
+# root by `tui/tests/acceptance.rs` (the sealed driver entrypoint).
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# this file carries only #2532's already-landed entries plus the
+# milestone-level blocks (#2543: per-issue slices now land in their own
+# `manifest.d/<issue>.yml` fragment instead of appending here — see
+# `manifest.d/2533.yml`). #2531 (contract §2) is config-only and has no
+# screen surface, so its slice, if any, will be a `cli-pytest` one, not a
+# tui-tuidriver one — it may land as its own `manifest.d/2531.yml` fragment
+# too.
+
+tests:
+  # ── #2532 (PB-2) — "Approved work items" panel (contract §3) ─────────────
+  # Slice: approved_items_2532.rs · mocks: approved-items-empty.screen,
+  # approved-items-populated.screen, approved-items-detail.screen
+  #
+  # §3a — the `✓` panel icon is registered in the activity bar
+  approved_items_2532::activity_bar_shows_approved_panel_icon: 2532
+  # §3a — …appended after `⇅` Queue and before the bottom-pinned `⚙` Settings
+  approved_items_2532::activity_bar_places_approved_between_queue_and_settings: 2532
+  # §3b — the panel title "APPROVED WORK ITEMS" renders whenever it is active
+  approved_items_2532::sidebar_shows_panel_title: 2532
+  # §3b — sidebar aggregate line "<N> ready to pull"
+  approved_items_2532::sidebar_shows_ready_to_pull_count: 2532
+  # §3b — "⚠ <M> missing a repo mapping" renders iff a visible row is unmapped
+  approved_items_2532::sidebar_flags_rows_missing_a_repo_mapping: 2532
+  # §3b — …and is omitted when every visible row has >=1 mapped repo
+  approved_items_2532::sidebar_omits_missing_mapping_line_when_every_row_is_mapped: 2532
+  # §3c — the four-column header row (Submission / Client / Project /
+  # Repo(s) / Outcome)
+  approved_items_2532::main_panel_renders_the_column_header_row: 2532
+  # §3c — a mapped row shows its submission reference + server-resolved repo
+  approved_items_2532::mapped_row_shows_submission_reference_and_repo: 2532
+  # §3c — an unmapped row shows the literal "— no mapping —" placeholder
+  approved_items_2532::unmapped_row_shows_the_no_mapping_placeholder: 2532
+  # §3c — rows are oldest-first (see the slice's harness note 5 on why this is
+  # asserted as "older above newer" on an already-ordered payload)
+  approved_items_2532::rows_render_oldest_first: 2532
+  # §3c — the Outcome column truncates in list mode (paired with the §3e
+  # untruncated-detail test below)
+  approved_items_2532::list_mode_truncates_the_outcome_column: 2532
+  # §3d — zero rows: the empty-state line
+  approved_items_2532::empty_state_message: 2532
+  # §3d — zero rows: no header row is drawn over an empty list
+  approved_items_2532::empty_state_has_no_column_header_row: 2532
+  # §3d — zero rows: sidebar reads "0 ready to pull", no ⚠ line
+  approved_items_2532::empty_state_sidebar_shows_zero_count: 2532
+  # §3d — zero rows: status-bar hint " no approved submissions  q=quit "
+  approved_items_2532::empty_state_status_bar_hint: 2532
+  # list-mode status-bar hints (mocks/approved-items-populated.screen row 39);
+  # its `right-click=menu` half belongs to #2533 and is asserted there
+  approved_items_2532::list_mode_status_bar_hints: 2532
+  # §3e — Enter opens the "── Submission Detail ──" region
+  approved_items_2532::enter_opens_the_submission_detail: 2532
+  # §3e — the four briefing field labels (outcome/audience/done/constraints)
+  approved_items_2532::detail_shows_the_four_briefing_field_labels: 2532
+  # §3e — identity + routing context (submission/client/project/repos/received)
+  approved_items_2532::detail_shows_identity_and_routing_context: 2532
+  # §3e — values are rendered untruncated in the detail region
+  approved_items_2532::detail_shows_untruncated_field_values: 2532
+  # §3e — detail-mode status-bar hint "Esc=close detail"
+  approved_items_2532::detail_mode_status_bar_hint: 2532
+  # §3e — Esc closes the detail; the list above is unaffected
+  approved_items_2532::esc_closes_the_detail_and_leaves_the_list_intact: 2532
+
+expected_red:
+  # #2532 — OBSERVED, not intended. Taken from a real run of the sealed suite
+  # at authoring time (the driver command quoted at the top of this file, run
+  # from this repo at `test-author-ms-67-slice-2532`): all 22 of this slice's
+  # ids FAILED, none passed. Every one of them routes through
+  # `nav_to_approved()`, which panics with a screen dump because the `✓`
+  # panel:approved activity-bar icon does not exist yet — so there is no green
+  # control and no green ratchet in this slice to exclude.
+  #
+  # (The same run also reported 5 failures in `plans_detail_1122::*` — an
+  # ms-38 slice, pre-existing and untouched by this work.)
+  2532:
+    - approved_items_2532::activity_bar_shows_approved_panel_icon
+    - approved_items_2532::activity_bar_places_approved_between_queue_and_settings
+    - approved_items_2532::sidebar_shows_panel_title
+    - approved_items_2532::sidebar_shows_ready_to_pull_count
+    - approved_items_2532::sidebar_flags_rows_missing_a_repo_mapping
+    - approved_items_2532::sidebar_omits_missing_mapping_line_when_every_row_is_mapped
+    - approved_items_2532::main_panel_renders_the_column_header_row
+    - approved_items_2532::mapped_row_shows_submission_reference_and_repo
+    - approved_items_2532::unmapped_row_shows_the_no_mapping_placeholder
+    - approved_items_2532::rows_render_oldest_first
+    - approved_items_2532::list_mode_truncates_the_outcome_column
+    - approved_items_2532::empty_state_message
+    - approved_items_2532::empty_state_has_no_column_header_row
+    - approved_items_2532::empty_state_sidebar_shows_zero_count
+    - approved_items_2532::empty_state_status_bar_hint
+    - approved_items_2532::list_mode_status_bar_hints
+    - approved_items_2532::enter_opens_the_submission_detail
+    - approved_items_2532::detail_shows_the_four_briefing_field_labels
+    - approved_items_2532::detail_shows_identity_and_routing_context
+    - approved_items_2532::detail_shows_untruncated_field_values
+    - approved_items_2532::detail_mode_status_bar_hint
+    - approved_items_2532::esc_closes_the_detail_and_leaves_the_list_intact

@@ -83,23 +83,33 @@ git clone --no-local --quiet "$SOURCE_URL" "$WORK/src" 2>/dev/null \
 cd "$WORK/src"
 git checkout --quiet "$SOURCE_REF"
 
+# `$SUBDIR/Cargo.toml`, not bare `-d "$SUBDIR"`: the crate's move is required
+# to leave `tui/tests/acceptance.rs` + `tui/tests/acceptance/**` PHYSICALLY
+# behind, unmoved — they are this repo's sealed acceptance oracle (#944), and
+# a `type="work"` diff may never delete a sealed path (coord/review.py); see
+# the review finding on #2899 this script's own comment above links to. So
+# `tui/` keeps existing (non-empty) at the tip even after the crate itself is
+# gone, and directory presence alone can no longer tell "has the move
+# happened yet". `Cargo.toml` is the crate's own marker instead.
 if [[ -z "$FROM_COMMIT" ]]; then
-    if [[ -d "$SUBDIR" ]]; then
+    if [[ -f "$SUBDIR/Cargo.toml" ]]; then
         FROM_COMMIT="$(git rev-parse HEAD)"
     else
-        # `tui/` is already gone from the tip. Find the last commit that had
-        # it: `git log -- <path>` still finds the DELETING commit, so take
-        # its parent. Reported explicitly — silently extracting from an
+        # The crate is already gone from the tip (orphaned sealed test files
+        # under `$SUBDIR/tests/acceptance{.rs,/}` may still be sitting there —
+        # expected, see above). Find the last commit that had `Cargo.toml`:
+        # `git log -- <path>` still finds the DELETING commit, so take its
+        # parent. Reported explicitly — silently extracting from an
         # unexpected commit is precisely how you get a repo whose history
         # looks fine and whose contents are a month stale.
-        deleting="$(git log --format=%H --diff-filter=D -1 -- "$SUBDIR" || true)"
-        [[ -n "$deleting" ]] || die "no $SUBDIR/ at $SOURCE_REF and no commit that deleted it"
+        deleting="$(git log --format=%H --diff-filter=D -1 -- "$SUBDIR/Cargo.toml" || true)"
+        [[ -n "$deleting" ]] || die "no $SUBDIR/Cargo.toml at $SOURCE_REF and no commit that deleted it"
         FROM_COMMIT="$(git rev-parse "$deleting^")"
-        say "$SUBDIR/ is absent at $SOURCE_REF; extracting from $FROM_COMMIT (parent of the deleting commit $deleting)"
+        say "$SUBDIR/Cargo.toml is absent at $SOURCE_REF; extracting from $FROM_COMMIT (parent of the deleting commit $deleting)"
     fi
 fi
 git checkout --quiet "$FROM_COMMIT"
-[[ -d "$SUBDIR" ]] || die "$SUBDIR/ does not exist at $FROM_COMMIT"
+[[ -f "$SUBDIR/Cargo.toml" ]] || die "$SUBDIR/Cargo.toml does not exist at $FROM_COMMIT"
 say "extracting from $(git rev-parse --short HEAD) ($(git log -1 --format=%s | cut -c1-60))"
 
 # ── the split ───────────────────────────────────────────────────────────────

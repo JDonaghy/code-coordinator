@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ╔══ ▸ command palette ═══════════════════════════════════════════════════════════╗
+ M│ ▶ ◇ claude-coordinator  [38 ⚠1]  ║  > _______________________________________________________________              ║
+ ▶│ ▶ ◇ quadraui             [3 ⚠1]  ║  ─── Plans actions ───────────────────────────────────────────────────────────  ║
+ >│ ▶ ◇ vimcode               [0]     ║  ◆ Dispatch milestone             dispatch selected plan's ready frontier      ║
+ ▦│                                   ║  ◆ Open milestone chat            open a steward chat for the selected plan    ║
+ ≣│                                   ║  ◆ Quick capture plan             coord milestone capture (fast stub)          ║
+▎◆│                                   ║  ◆ Guided chat (new plan)         coord milestone chat --new                   ║
+ ◉│                                   ║  ◆ View order / DAG               show work-order dependency graph             ║
+ §│                                   ║  ◆ Edit milestone…                edit milestone title / description           ║
+ $│                                   ║  ◆ Add issue to milestone…        attach an issue to this plan                 ║
+  │                                   ║  ◆ Toggle untracked milestones    show/hide milestones without work order      ║
+  │                                   ║  ─── Global ────────────────────────────────────────────────────────────────── ║
+  │                                   ║  ⚙ Settings                       open settings panel                          ║
+  │                                   ║  ↻ Refresh                        reload board data from daemon                ║
+  │                                   ╚════════════════════════════════════════════════════════════════════════════════╝
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+ ⚙│
+ /=palette  Esc=close  q=quit
