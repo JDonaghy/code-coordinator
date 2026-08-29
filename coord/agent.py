@@ -6130,14 +6130,30 @@ class AgentServer:
 
         See `_tool_versions_ttl` for why: probing shells out per tool, and
         `/health` is polled frequently.
+
+        #2913: `probe_all()` normally restricts probing to `self.capabilities`
+        so a plain CLI-only machine never pays to probe a browser or GTK4 it
+        never claimed. A config-free agent's `self.capabilities` is `[]` by
+        construction — it has nothing of its own to declare; the coordinator
+        supplies capabilities from its OWN `coordinator.yml` at dispatch time
+        (docs/EPHEMERAL_WORKERS.md). Probing only `self.capabilities` there
+        means `/health.tool_versions` never covers cargo, python3, or any
+        other capability-gated tool, so `unmet_capabilities()` — the #1570 D
+        cross-check `dispatch_smoke` relies on before routing capability-
+        gated work here — finds nothing to compare and fails OPEN, not
+        closed, exactly backwards from what #1570 D exists to guarantee.
+        Probe every known capability instead for a config-free agent: it has
+        no legitimate narrower set to restrict to anyway, since it doesn't
+        know what the coordinator is about to route to it.
         """
         now = time.time()
         cached = self._tool_versions_cache
         if cached is not None and (now - cached[0]) < self._tool_versions_ttl:
             return cached[1]
-        from coord.prereqs import probe_all, tool_versions_summary
+        from coord.prereqs import ALL_CAPABILITY_NAMES, probe_all, tool_versions_summary
 
-        summary = tool_versions_summary(probe_all(self.capabilities))
+        probe_caps = ALL_CAPABILITY_NAMES if self.config_free_reason is not None else self.capabilities
+        summary = tool_versions_summary(probe_all(probe_caps))
         self._tool_versions_cache = (now, summary)
         return summary
 

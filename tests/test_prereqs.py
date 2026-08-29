@@ -178,6 +178,30 @@ class TestProbeAll:
             "meets_floor": None, "capability": None, "ok": False,
         }
 
+    def test_all_capability_names_probes_every_capability_prereq(self) -> None:
+        """#2913: `ALL_CAPABILITY_NAMES` is what `AgentServer` probes for a
+        config-free agent in place of its own (empty) `capabilities` — it
+        must actually cover every `CAPABILITY_PREREQS` entry, else the
+        cross-check it exists to unblock would quietly narrow again."""
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(prereqs.ALL_CAPABILITY_NAMES)
+        expected_tools = {p.tool for p in prereqs.CAPABILITY_PREREQS} | {"git", "gh"}
+        assert set(probes) == expected_tools
+
+
+class TestAllCapabilityNames:
+    def test_matches_every_declared_capability(self) -> None:
+        declared = {
+            p.capability for p in prereqs.CAPABILITY_PREREQS if p.capability is not None
+        }
+        assert prereqs.ALL_CAPABILITY_NAMES == declared
+
+    def test_nonempty(self) -> None:
+        # A regression guard against this collapsing to an empty set (e.g. a
+        # future refactor of CAPABILITY_PREREQS dropping `capability` values)
+        # and silently making the #2913 fix probe nothing again.
+        assert prereqs.ALL_CAPABILITY_NAMES
+
 
 class TestUnmetCapabilities:
     def test_empty_when_capability_backs_out(self) -> None:
