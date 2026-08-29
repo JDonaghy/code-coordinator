@@ -831,7 +831,7 @@ def _fold_status_for_link(
         )
 
     try:
-        row = enqueue_status(link.submission_id, status, now=now)
+        row = enqueue_status(link.submission_id, status, config=config, now=now)
     except PortalSyncError as exc:
         return StatusFoldResult(
             link.submission_id, status, f"refused: {exc}", failed=True,
