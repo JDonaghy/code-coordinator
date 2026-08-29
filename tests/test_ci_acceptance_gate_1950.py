@@ -34,12 +34,21 @@ Playwright cache, install retries, bounded timeout, paths gating) is now
 `coord-web`'s CI's to make about `coord-web`'s CI, where the files those
 assertions describe actually live.
 
+#2899 update — THE TUI-TUIDRIVER HALF OF THIS FILE MOVED TOO, ON EXACTLY THE
+#2009 PRECEDENT ABOVE. The `coord-tui` crate left this repo for its own
+`coord-tui` repo, taking `tests/acceptance.rs`, the ms-33/38/65/67 slices and
+`cargo-test.yml` with it. So `.github/workflows/cargo-test.yml` and the
+`tui/**` route in `.github/coord-ci-acceptance.yml` are gone from here, and
+every assertion that parsed them is coord-tui's CI's to make about coord-tui's
+CI — where the files those assertions describe actually live. This repo's
+scaffold for that is `scripts/coord-tui-scaffold/.github/`, which the
+`test_the_coord_tui_scaffold_*` guards below check on its way out the door,
+since it is the only moment this repo can.
+
 What this file keeps is everything #1950 protects that is still IN this
-repo — the cli-pytest and tui-tuidriver routes — plus two new guards
-(`test_no_workflow_gates_a_webapp_route_that_no_longer_exists`,
-`test_ci_acceptance_config_has_no_webapp_route`) so the deletion cannot be
-half-undone into the worst state of all: a job or route that looks like a
-gate, is named like a gate, and covers a path that cannot appear in a diff.
+repo — the cli-pytest route — plus the guards that stop either deletion from
+being half-undone into the worst state of all: a job or route that looks like
+a gate, is named like a gate, and covers a path that cannot appear in a diff.
 """
 
 from __future__ import annotations
@@ -50,9 +59,10 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "test.yml"
-CARGO_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "cargo-test.yml"
 CI_ACCEPTANCE_CONFIG_PATH = REPO_ROOT / ".github" / "coord-ci-acceptance.yml"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+#: #2899: the new repo's CI, staged here until the extraction script pushes it.
+SCAFFOLD_DIR = REPO_ROOT / "scripts" / "coord-tui-scaffold"
 
 
 def _load_workflow(path: Path = WORKFLOW_PATH) -> dict:
@@ -109,16 +119,21 @@ def test_cli_pytest_route_runs_through_the_2164_ci_wrapper() -> None:
     )
 
 
-def test_ci_acceptance_config_resolves_both_remaining_routes() -> None:
+def test_ci_acceptance_config_resolves_the_remaining_route() -> None:
     """.github/coord-ci-acceptance.yml is what every `coord acceptance run
     --all --ci` step in CI points `--config` at (the real
     ~/.coord/coordinator.yml is outside this repo and unreachable from a
-    runner). Parse it with the SAME loader coord.cli uses, and confirm both
-    remaining in-repo routes (#1125: coord/** -> cli-pytest, tui/** ->
-    tui-tuidriver) resolve — a typo'd `match:` glob or a missing route would
-    silently make some CI step's `--for-path` resolve to nothing (a loud
-    `sys.exit(1)`, but only ever discovered by watching that job actually go
-    red in CI, not by this faster/local check)."""
+    runner). Parse it with the SAME loader coord.cli uses, and confirm the
+    one remaining in-repo route (#1125: coord/** -> cli-pytest) resolves — a
+    typo'd `match:` glob or a missing route would silently make some CI
+    step's `--for-path` resolve to nothing (a loud `sys.exit(1)`, but only
+    ever discovered by watching that job actually go red in CI, not by this
+    faster/local check).
+
+    #2899: the `tui/** -> tui-tuidriver` half of this assertion moved to
+    coord-tui. See `test_ci_acceptance_config_has_no_tui_route` below for
+    the guard that replaced it here.
+    """
     assert CI_ACCEPTANCE_CONFIG_PATH.exists(), (
         f"{CI_ACCEPTANCE_CONFIG_PATH} is missing — every `coord acceptance "
         "run --all --ci --config .github/coord-ci-acceptance.yml` step in "
@@ -128,9 +143,7 @@ def test_ci_acceptance_config_resolves_both_remaining_routes() -> None:
 
     cfg = load_coord_config(str(CI_ACCEPTANCE_CONFIG_PATH))
     cli = cfg.acceptance.driver_for("claude-coordinator", "coord/cli.py")
-    tui = cfg.acceptance.driver_for("claude-coordinator", "tui/src/main.rs")
     assert cli is not None and cli.kind == "cli-pytest"
-    assert tui is not None and tui.kind == "tui-tuidriver"
     # #2164's --all always resolves the `{ms}` template to None (scope="all"
     # has no single milestone to substitute) — render_run_command leaves an
     # unreferenced `{ms}` LITERAL in that case rather than stripping it, so
@@ -139,11 +152,108 @@ def test_ci_acceptance_config_resolves_both_remaining_routes() -> None:
     # named `tests/acceptance/{ms}` here and crash outright. Every route in
     # this CI-only config must be written to already cover its whole
     # accumulated suite without needing a substitution.
-    for driver in (cli, tui):
-        assert "{ms}" not in driver.run, (
-            f"{driver.kind} route's run command still references {{ms}}, "
-            f"which --all leaves unsubstituted and literal: {driver.run!r}"
+    assert "{ms}" not in cli.run, (
+        f"{cli.kind} route's run command still references {{ms}}, "
+        f"which --all leaves unsubstituted and literal: {cli.run!r}"
+    )
+
+
+def test_ci_acceptance_config_has_no_tui_route() -> None:
+    """#2899: `tui/**` cannot appear in a diff against this repo any more.
+
+    Same failure shape as the webapp guard below, and the same reason it is
+    asserted rather than assumed: `driver_for()` is FIRST-match (#1540), so a
+    re-added tui route sits above cli-pytest and shadows it for any path it
+    matches — while its `run:` command `cd`s into a directory this repo does
+    not have. That is a CI step failing for a reason with nothing to do with
+    the change under test.
+    """
+    from coord.config import load as load_coord_config
+
+    cfg = load_coord_config(str(CI_ACCEPTANCE_CONFIG_PATH))
+    for probe in ("tui/src/main.rs", "tui/tests/acceptance.rs"):
+        resolved = cfg.acceptance.driver_for("claude-coordinator", probe)
+        assert resolved is None or resolved.kind != "tui-tuidriver", (
+            "a tui-tuidriver route is back in .github/coord-ci-acceptance.yml, "
+            f"matching {probe} — a path this repo cannot contain (#2899)"
         )
+
+
+def test_this_repos_sealed_set_is_exactly_the_acceptance_dir() -> None:
+    """#2899: with the tui-tuidriver entrypoint gone, this repo's sealed set
+    collapses back to `tests/acceptance/`.
+
+    Worth pinning because the sealed set is what `coord/review.py` turns into
+    an unconditional `request-changes`, and it is DERIVED from the configured
+    driver `entrypoint:` rather than hardcoded — so it followed the crate
+    automatically, and would just as automatically widen again if a route
+    with an `entrypoint:` outside `tests/acceptance/` came back.
+    """
+    from coord.config import load as load_coord_config
+
+    cfg = load_coord_config(str(CI_ACCEPTANCE_CONFIG_PATH))
+    sealed = set(cfg.acceptance.sealed_paths("claude-coordinator"))
+    assert sealed == {"tests/acceptance/"}, sealed
+    assert not any(p.startswith("tui/") for p in sealed)
+
+
+def test_the_coord_tui_scaffold_carries_the_gates_that_left_this_repo() -> None:
+    """#2899: the tui-tuidriver CI gate did not disappear, it moved.
+
+    This repo can only assert that once — at the moment the scaffold is
+    staged here, before `scripts/extract-coord-tui.sh` pushes it into the new
+    repo. After that it is coord-tui's CI's own business. Skipping the check
+    entirely, though, is how a "move" quietly becomes a "delete": the whole
+    point of #1950 is that a gate nobody runs looks exactly like a gate that
+    passes.
+    """
+    cargo_wf = SCAFFOLD_DIR / ".github" / "workflows" / "cargo-test.yml"
+    assert cargo_wf.exists(), f"{cargo_wf} missing — the moved Rust gate has no home"
+    workflow = yaml.safe_load(cargo_wf.read_text())
+    steps = _job_steps(workflow, "cargo-test")
+
+    plain = _step_runs(steps, "cargo test")
+    assert plain is not None, "the scaffolded workflow runs no `cargo test` at all"
+
+    acc = _step_runs(steps, "coord acceptance run")
+    assert acc is not None, (
+        "no step in the scaffolded cargo-test.yml runs `coord acceptance "
+        "run` — the tui-tuidriver sealed route would be unreachable from "
+        "coord-tui's CI, i.e. the move lost the gate"
+    )
+    run = acc["run"]
+    assert "--all" in run and "--ci" in run, (
+        f"the scaffolded acceptance step doesn't use the #2164 CI wrapper "
+        f"contract: {run!r}"
+    )
+    assert "--repo coord-tui" in run, (
+        f"the scaffolded acceptance step still names the old repo: {run!r}"
+    )
+
+
+def test_the_coord_tui_scaffold_has_a_root_relative_sealed_entrypoint() -> None:
+    """#2899: the crate is at the new repo's ROOT, so every path in its CI
+    config must have shed the `tui/` prefix — including the driver
+    `entrypoint:` the sealed set is derived from.
+
+    A leftover prefix here is the quietest possible failure: the config still
+    parses, the driver still resolves, and the sealed set names a file that
+    does not exist — so the oracle-tamper gate protects nothing.
+    """
+    from coord.config import load as load_coord_config
+
+    cfg_path = SCAFFOLD_DIR / ".github" / "coord-ci-acceptance.yml"
+    assert cfg_path.exists(), f"{cfg_path} missing"
+    cfg = load_coord_config(str(cfg_path))
+
+    driver = cfg.acceptance.driver_for("coord-tui", "src/main.rs")
+    assert driver is not None and driver.kind == "tui-tuidriver"
+    assert "{ms}" not in driver.run
+    assert "cd tui" not in driver.run, driver.run
+
+    sealed = set(cfg.acceptance.sealed_paths("coord-tui"))
+    assert sealed == {"tests/acceptance.rs", "tests/acceptance/"}, sealed
+    assert not any(p.startswith("tui/") for p in sealed)
 
 
 def test_ci_acceptance_config_has_no_webapp_route() -> None:
@@ -211,22 +321,36 @@ def test_non_acceptance_test_job_excludes_the_sealed_suite() -> None:
     )
 
 
-def test_cargo_test_workflow_runs_the_tui_sealed_suite_through_the_wrapper() -> None:
-    """The tui-tuidriver route (ms-33, ms-38) is reachable from NEITHER the
-    plain `cargo test` step in cargo-test.yml (the `acceptance` test target
-    requires `--features test-support`, so a bare `cargo test` silently
-    skips building it) NOR scripts/coord-test-runner.sh's Test-stage `cargo
-    test` (same gate). Before #2180 this route ran in no CI job at all."""
-    workflow = yaml.safe_load(CARGO_WORKFLOW_PATH.read_text())
-    steps = _job_steps(workflow, "cargo-test")
-    test_step = _step_runs(steps, "coord acceptance run")
-    assert test_step is not None, (
-        "no step in cargo-test.yml's 'cargo-test' job runs `coord "
-        "acceptance run` — the tui-tuidriver sealed route (ms-33/ms-38) is "
-        "unreachable from CI"
+def test_no_workflow_gates_a_tui_path_that_no_longer_exists() -> None:
+    """#2899, mirroring the webapp guard above: no workflow in THIS repo may
+    be `paths:`-gated to, or `cd` into, the moved `tui/` tree.
+
+    A `paths:` filter naming a path that can never change is a job that never
+    runs — indistinguishable in the Actions UI from a job that runs and
+    passes. Asserted over EVERY workflow file rather than a named list, and
+    skipping comment lines, since several of them explain the move on
+    purpose."""
+    offenders = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if line.lstrip().startswith("#"):
+                continue
+            if "tui/" in line:
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "workflow(s) still reference the moved tui/ tree (#2899):\n"
+        + "\n".join(offenders)
     )
-    run = test_step["run"]
-    assert "--all" in run and "--ci" in run, (
-        f"cargo-test.yml's acceptance step doesn't use the #2164 CI "
-        f"wrapper contract: {run!r}"
+
+
+def test_the_cargo_test_workflow_is_gone_from_this_repo() -> None:
+    """#2899: `.github/workflows/cargo-test.yml` moved to coord-tui.
+
+    Left here it would be strictly worse than absent: `paths:`-gated on
+    `tui/**`, so it never triggers, while still appearing in the Actions UI
+    as a configured Rust gate for a repo with no Rust in it.
+    """
+    assert not (WORKFLOWS_DIR / "cargo-test.yml").exists(), (
+        "cargo-test.yml is back in this repo — it gates a tree that moved to "
+        "coord-tui (#2899), so it can only ever be a gate that never runs"
     )
