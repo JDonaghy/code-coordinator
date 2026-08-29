@@ -1236,6 +1236,142 @@ class _PatchIdGh(_ExpectedRedGh):
         return self._patch_ids.get(branch)
 
 
+class _RelocatedExpectedRedGh(_ExpectedRedGh):
+    """#2896 review: `_ExpectedRedGh`, but the ms-dir manifest lives under
+    the RELOCATED (entrypoint-linked) acceptance root — `tui/tests/
+    acceptance/ms01/manifest.yml`, where a `tui-tuidriver` route's slices
+    now live — and nothing at all sits under the shared repo-root tree.
+    `list_repo_subdirs` honours the path it is asked about (the real
+    `github_ops` one does), so a sweep that only ever looks at
+    `tests/acceptance/` finds nothing here, exactly as it would on the
+    real fleet."""
+
+    RELOCATED = "tui/tests/acceptance/ms01/manifest.yml"
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        if path.rstrip("/") != "tui/tests/acceptance":
+            raise RuntimeError(f"not found: {path}")
+        return ["ms01"]
+
+    def get_repo_file_with_sha(self, repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+        if path != self.RELOCATED:
+            raise RuntimeError("not found")
+        return self.manifest_text, "blob-sha"
+
+
+def _relocated_config():
+    """A `Config` whose only repo routes `tui/**` through an
+    entrypoint-linked driver — so `acceptance_search_roots("api")` is
+    `["tests/acceptance/", "tui/tests/acceptance/"]` (#2896)."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
+    from coord.models import Repo
+
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(routes=[
+                AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+                AcceptanceDriverConfig(
+                    match="tui/**", kind="tui-tuidriver", run="cargo test",
+                    entrypoint="tui/tests/acceptance.rs",
+                ),
+            ]),
+        }),
+    )
+
+
+class TestExpectedRedClearForRelocatedMilestone:
+    """#2896 review (blocking, impact 1): with the slices relocated under
+    `tui/tests/acceptance/`, the merge queue's `expected_red` lookup — which
+    hardcoded the repo-root tree — found nothing, so
+    `_maybe_clear_expected_red` took its "not in scope for the oracle loop
+    at all" branch and returned bare `None`: no clear, no `MergeEvent`, no
+    audit row. That is precisely the #2199 regression its own docstring says
+    was fixed ("indistinguishable from #1965's genuine vacuous-assertion
+    alarm"), reintroduced for every relocated milestone."""
+
+    @staticmethod
+    def _board(completed):
+        from coord.models import Board
+        return Board(active=[], completed=list(completed))
+
+    @staticmethod
+    def _work(*, acceptance_state=None, acceptance_sha=None) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="worker/w1",
+            acceptance_state=acceptance_state, acceptance_sha=acceptance_sha,
+        )
+
+    def test_clears_a_relocated_milestones_entries(self) -> None:
+        board = self._board([self._work(acceptance_state="passed", acceptance_sha="cafesha")])
+        gh = _RelocatedExpectedRedGh()
+
+        events = process(
+            [_q("w1", size=10)], gh, board=board, config=_relocated_config(),
+            # The review/smoke gates only engage once a `config` is present;
+            # they are orthogonal to the expected_red sweep under test.
+            skip_review=True, skip_smoke=True,
+        )
+
+        assert events[-1].kind == "expected_red_clear"
+        assert "ms01::a" in events[-1].message
+        assert gh.update_repo_file_calls
+        assert gh.update_repo_file_calls[0][0] == _RelocatedExpectedRedGh.RELOCATED
+        assert "expected_red" not in gh.update_repo_file_calls[0][1]
+
+    def test_without_a_config_the_sweep_degrades_to_the_legacy_root(self) -> None:
+        """The documented fallback, pinned (`coord.acceptance.
+        search_roots_for_repo(None, ...)`): a caller with no `config` in
+        hand degrades to the legacy repo-root tree rather than raising — so
+        it finds nothing here. This is the shape of the bug the three tests
+        above fix; it stays only as the no-config degradation contract, not
+        as behaviour any live `coord merge` takes (`process` always has a
+        `config`)."""
+        board = self._board([self._work(acceptance_state="passed", acceptance_sha="cafesha")])
+        gh = _RelocatedExpectedRedGh()
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert not gh.update_repo_file_calls
+        assert not [e for e in events if e.kind == "expected_red_clear"]
+
+    def test_no_acceptance_skip_is_still_named_for_a_relocated_milestone(self) -> None:
+        """The silent-`None` half of the same regression: an in-scope issue
+        with no passing trust-gate verdict must still get its loud,
+        actionable diagnostic (#2199), not be misread as out of scope."""
+        board = self._board([self._work()])  # acceptance_state=None
+        gh = _RelocatedExpectedRedGh()
+
+        events = process(
+            [_q("w1", size=10)], gh, board=board, config=_relocated_config(),
+            # The review/smoke gates only engage once a `config` is present;
+            # they are orthogonal to the expected_red sweep under test.
+            skip_review=True, skip_smoke=True,
+        )
+
+        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
+        assert "coord acceptance record" in events[-1].message
+
+    def test_out_of_scope_merge_stays_silent_with_a_config(self) -> None:
+        """#2199 review finding 2, preserved: an issue with no
+        `expected_red` entries under ANY root is genuinely out of scope and
+        must still skip silently — threading `config` must not make the
+        loud diagnostic fire fleet-wide."""
+        board = self._board([self._work()])  # acceptance_state=None
+        gh = _RelocatedExpectedRedGh(manifest_text="tests:\n  ms01::a: 1\n")
+
+        events = process(
+            [_q("w1", size=10)], gh, board=board, config=_relocated_config(),
+            # The review/smoke gates only engage once a `config` is present;
+            # they are orthogonal to the expected_red sweep under test.
+            skip_review=True, skip_smoke=True,
+        )
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
+
 class TestExpectedRedClearOnMerge:
     """#2164 review (blocking finding 1): clearing `expected_red` must wait
     for the fix's own PR to actually merge into the default branch, not
