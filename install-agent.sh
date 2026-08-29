@@ -109,13 +109,51 @@ echo "Installed: $("$VENV_DIR/bin/coord" version)"
 
 # The venv is now fully installed and verified working (coord version printed
 # above). Disarm the cleanup trap here: everything from this point on
-# (machine-name detection, the systemd unit, node shims, systemctl,
-# loginctl) is unrelated to venv creation, and a failure in any of it must
-# NOT delete a venv that already works — that would poison the retry with a
-# from-scratch pip re-install just to get back to the same later failure
-# (#2911 review).
+# (machine-name detection, the systemd unit, the coord CLI shim, node shims,
+# systemctl, loginctl) is unrelated to venv creation, and a failure in any of
+# it must NOT delete a venv that already works — that would poison the retry
+# with a from-scratch pip re-install just to get back to the same later
+# failure (#2911 review).
 trap - EXIT
 CREATED_VENV=0
+
+# --- coord CLI shim (#2936) --------------------------------------------------
+# Workers are spawned with THIS agent's own venv stripped from PATH (#402,
+# hardened by #2569's PIP_REQUIRE_VIRTUALENV after an 11h fleet outage — see
+# coord/agent.py's `_worker_subprocess_env`). That strip is correct and must
+# stay: a worker's bare `pip install -e .` must never land in the fleet's
+# live $VENV_DIR. But nothing else guarantees a worker's PATH resolves
+# `coord` itself — and when it doesn't, a smoke/test worker can run its
+# whole suite, pass, and be structurally unable to record the verdict via
+# `coord test <id> --passed`. The missing verdict then reads as a TEST
+# FAILURE and walks the model-escalation ladder for an infrastructure gap,
+# never a weak model (#2936; one instance cost an extra opus rerun of an
+# already-passing sonnet leg).
+#
+# $HOME/.local/bin is (a) already put on the coord-agent unit's PATH below
+# and (b) NOT stripped from a worker's PATH — #2569's strip matches
+# $VENV_DIR/bin by name/realpath only, never $HOME/.local/bin. A plain
+# symlink there closes the gap for every worker this agent spawns.
+#
+# MUST point at $VENV_DIR itself — the blue/green symlink `coord agent
+# update` repoints atomically on every release (docs/AGENT_OPERATIONS.md) —
+# NOT at a `readlink -f`-resolved `.blue`/`.green` path. Resolving it here
+# would freeze the shim on whichever side happens to be live at install
+# time and silently go stale on the very next blue/green swap.
+COORD_SHIM_DIR="$HOME/.local/bin"
+COORD_SHIM_TARGET="$VENV_DIR/bin/coord"
+COORD_SHIM_LINK="$COORD_SHIM_DIR/coord"
+mkdir -p "$COORD_SHIM_DIR"
+if [ -L "$COORD_SHIM_LINK" ] && [ "$(readlink "$COORD_SHIM_LINK")" = "$COORD_SHIM_TARGET" ]; then
+    : # already ours, and already pointed at the unresolved blue/green symlink
+elif [ -e "$COORD_SHIM_LINK" ] || [ -L "$COORD_SHIM_LINK" ]; then
+    echo "warning: $COORD_SHIM_LINK exists and is not the coord shim — left as-is"
+    echo "  A smoke/test worker on this machine cannot record its verdict via"
+    echo "  'coord test <id> --passed' unless 'coord' resolves on ITS PATH (#2936)."
+else
+    ln -s "$COORD_SHIM_TARGET" "$COORD_SHIM_LINK"
+    echo "Installed coord shim: $COORD_SHIM_LINK -> $COORD_SHIM_TARGET"
+fi
 
 # Detect machine name if not provided
 if [ -z "$MACHINE_NAME" ]; then
