@@ -111,23 +111,25 @@ activation from an earlier command carried forward.
 The full suite exceeds Claude Code's 600s Bash ceiling on this repo and
 duplicates the Test stage + CI, which both run it against your pushed SHA
 regardless. Run just the file(s) that mirror what you changed — `pytest
-tests/test_<module>.py` for a `coord/<module>.py` change, `cargo test` from
-`tui/` scoped with a test-name filter for a `tui/**` change. To see what
+tests/test_<module>.py` for a `coord/<module>.py` change. To see what
 the Test stage itself would run for your diff (and confirm you're not
 missing a suite), `scripts/coord-test-runner.sh <worktree> --print-routing`
 computes the routing without actually building or testing anything.
 
-## Working on `tui/` — the `quadraui` pin
-
-**`coord-tui` pins `quadraui` to a git rev in `tui/Cargo.toml`**
-(`quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "<sha>" }`, #1973) —
-never edit that `rev` as a shortcut for co-development, and never build `tui/` against
-whatever happens to be checked out in `~/src/quadraui`; a quadraui merge broke coord-tui's
-build with zero coord-tui commits and no warning once already, which is exactly what the pin
-prevents. Bumping the pin deliberately, and building against an unmerged quadraui branch/PR
-without touching the pin, are both procedures — see the `tui-quadraui-workflow` skill
-(`coord/skills/tui-quadraui-workflow/SKILL.md`) for the steps; install it with `coord
-install-skills` if it isn't already on this machine.
+> **#2899: the TUI is not in this repo.** The `coord-tui` crate that used to live
+> under `tui/` is now the standalone [`JDonaghy/coord-tui`](https://github.com/JDonaghy/coord-tui)
+> repo, checked out at `~/src/coord-tui`. Its rules — the `quadraui` git-rev pin, the
+> `TuiDriver` harness, its sealed `tests/acceptance.rs` — live in **its** CLAUDE.md,
+> per this file's own scope rule above: a rule that does not change what someone
+> editing *this* repo does, does not belong here. If your briefing asks you to change
+> Rust, you are in the wrong checkout — say so rather than recreating `tui/`.
+>
+> Two seams still cross the split, and both run **from coord-tui's CI, pulling
+> `code-coordinator` from PyPI** — never the other way round: `scripts/codegen.py --rust`
+> (its `src/app/types/generated.rs` wire types) and `scripts/gen_board_fixture.py`
+> (its `tests/fixtures/board_sample.json`). Both take `--out PATH` or `$COORD_TUI_SRC`
+> and deliberately have **no fallback default**, so a missing checkout is an error
+> rather than a gate that passes against nothing.
 
 ## Key Design Decisions
 
@@ -163,7 +165,7 @@ The reviewer reads the rules and enforces them against the diff. It does not hav
 ## Rules for workers
 
 - **Only the coordinator writes docs.** Workers must **not** update README, CHANGELOG, or shared documentation files — parallel doc edits cause merge conflicts. If a briefing lists docs in `files_forbidden`, respect it. An issue whose *entire* deliverable is a doc edit is coordinator work and should never have been dispatched; say so and stop rather than editing the doc.
-- **Never edit the sealed suite — which is `tests/acceptance/**` *plus every declared driver entrypoint*.** Those suites are delivered read-only / run-only; write your own unit and internal tests instead. **In this repo the sealed set includes `tui/tests/acceptance.rs`** — it is the `tui-tuidriver` driver's `entrypoint:`, and an entrypoint is sealed as a whole file, so it is sealed despite living nowhere near `tests/acceptance/`. Do not be reassured by its prologue calling itself "a seam smoke test": *any* `type="work"` diff touching a sealed path is an **unconditional, mandatory `request-changes`** (`coord/review.py`), and the additive-only carve-out applies only to `test-author` / `mock-author` dispatches. TuiDriver tests belong **in-crate** under `#[cfg(test)]` anyway — see the coord-tui section below. The authoritative list is `AcceptanceConfig.sealed_paths()` in `coord/config.py`; if a briefing's `## Files` names a sealed path, that briefing is wrong — say so and put the test somewhere else rather than following it.
+- **Never edit the sealed suite — which is `tests/acceptance/**` *plus every declared driver entrypoint*.** Those suites are delivered read-only / run-only; write your own unit and internal tests instead. **In this repo, since #2899 moved `tui/` out, the sealed set is exactly `tests/acceptance/**`** — the `tui-tuidriver` `entrypoint:` that used to widen it (`tui/tests/acceptance.rs`, sealed as a whole file despite living nowhere near `tests/acceptance/`) went to the coord-tui repo with the crate, and is sealed *there*. The entrypoint rule itself has not changed, so do not assume a one-directory sealed set in any other repo. *Any* `type="work"` diff touching a sealed path is an **unconditional, mandatory `request-changes`** (`coord/review.py`), and the additive-only carve-out applies only to `test-author` / `mock-author` dispatches. The authoritative list is `AcceptanceConfig.sealed_paths()` in `coord/config.py` — it is derived from the configured driver `entrypoint:`, never hardcoded, which is why it followed the crate automatically; if a briefing's `## Files` names a sealed path, that briefing is wrong — say so and put the test somewhere else rather than following it.
 - **Stay in file scope.** If you must touch a file outside your briefing, note it in your final message.
 - **Commit and push before your final message** — even if the build is broken or you ran out of time. Uncommitted work is destroyed when the session ends.
 - **`gh` is on the deny-list.** The coordinator owns all GitHub interaction; use plain `git`.
@@ -188,12 +190,6 @@ versus keep in the coordinator session, and the coordinator session's own
 > silently no-opping.
 
 **How it runs:** black-box tests are part of the repo's normal test command, so the **Test stage** executes them on a capability-matched machine — `smoke_tests.capability_rules` route platform-specific suites to capable hardware (a GTK box; a machine with a browser). Favor the automated pre-review gate; the point is to trust the suite so manual/interactive smoke (incl. driving from a phone) is rarely needed.
-
-### coord-tui — quadraui `TuiDriver` (harness shipped: #690 / #691)
-- Drives the whole app through the real `event → handle → render` path against ratatui's headless `TestBackend` and asserts on the screen grid. `cargo test`-native, deterministic, no TTY.
-- `CoordApp` implements quadraui's `ShellApp`, so use `quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), w, h)`. API: `find("text")` → coords, `click(x, y)`, `press`, `type_char`, `screen()`, `screen_contains(needle)`. **Locate targets with `find` — never hardcode coordinates.**
-- **Reuse the existing fixtures** — `make_test_app(data: BoardData) -> CoordApp` (and `make_app_with_assignments`, `make_app_with_one_completed_issue`, …) in `tui/src/app.rs` build a full app from in-memory `BoardData`, no live daemon. Put the tests **in-crate** (`#[cfg(test)]`), **not** in `tui/tests/` — the fixtures are `#[cfg(test)]`/private and an integration-test crate can't see them.
-- Limit: `TuiDriver` renders to `TestBackend`, so it does **not** parse real ANSI — terminal-protocol bugs (raw-mode, SGR mouse, the embedded `claude` PTY pane) are out of reach and still need a live smoke. A native pty + vt100 tier is tracked in quadraui#302 (unbuilt).
 
 ### coord web (Phone Control Center)
 - The phone web app lives in `coord/dashboard/webapp/` (React / Vite / TS PWA, served by `coord/dashboard/server.py`). **Build the bundle before first use** — `dist/` is gitignored: `npm install && npm run build` from `coord/dashboard/webapp/`, re-run after pulling changes to `src/`. The server falls back to the legacy `index.html` when `dist/` is absent.

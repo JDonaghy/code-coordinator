@@ -1,0 +1,55 @@
+# #2899: coord-tui's own CI-local coordinator.yml stand-in, split out of
+# code-coordinator's `.github/coord-ci-acceptance.yml` when the crate moved.
+#
+# `coord acceptance run --all --ci` needs SOME coordinator.yml to resolve
+# `acceptance.drivers.coord-tui`. The fleet's real config lives outside every
+# repo (~/.coord/coordinator.yml on the coordinator host) and is unreachable
+# from a GitHub Actions runner, so this file is that — scoped to exactly what
+# CI needs and nothing else.
+#
+# THE ONE DELIBERATE DIFFERENCE from the fleet's real route: `run:` never
+# references the `{ms}` template. `{ms}` is substituted only when `coord
+# acceptance run` is scoped to one issue (`--issue N`); `--all` (Gate C,
+# what `--ci` requires) passes `ms=None` and leaves `{ms}` LITERAL by design.
+# A route written for `--issue` scoping would try to collect a path named
+# `tests/acceptance/{ms}` and crash outright. That difference costs nothing
+# here: `cargo test --test acceptance` always runs the whole
+# `tests/acceptance.rs` entrypoint (which `include!`s every ms-NN/*.rs slice)
+# regardless of scope, so this route never referenced `{ms}` in the first
+# place — it is byte-identical to the fleet's.
+repos:
+  - name: coord-tui
+    github: JDonaghy/coord-tui
+    default_branch: main
+
+# Not a real fleet machine — just enough for coord.config.load() to parse.
+# `coord.acceptance.acceptance_capability_gap` gives an unrecognized host
+# (any GitHub Actions runner, which will never match `host:`) the benefit of
+# the doubt and proceeds rather than refusing, so this entry is never
+# actually matched against anything at run time.
+machines:
+  - name: ci-runner
+    host: ci-runner
+
+acceptance:
+  drivers:
+    # FLAT, with no `routes:` — the shape #2007 gave coord-web and #2899 gave
+    # this repo. A `routes:` list disambiguates paths WITHIN one repo; this
+    # repo's root IS the crate root, so there is nothing to disambiguate.
+    coord-tui:
+      kind: tui-tuidriver
+      # RUSTC_BOOTSTRAP=1 + -Z unstable-options: `--format json` is
+      # nightly-gated; verified working on stable rustc (#1042).
+      # --features test-support: Cargo.toml's `acceptance` test target has
+      # `required-features = ["test-support"]`, so a plain `cargo test` (no
+      # flag) silently skips building/running it altogether — that gap is
+      # exactly what made this route unreachable from CI before #2180.
+      run: "RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features test-support -- -Z unstable-options --format json"
+      mock: "*.screen"
+      capability: rust
+      # #1552/#2896/#2899: `cargo test --test acceptance` can't see a slice
+      # at all until `tests/acceptance.rs` `include!`s it, so that file is
+      # the sealed set's entry point (AcceptanceConfig.sealed_paths) — and
+      # the sibling `tests/acceptance/` directory it wires in is derived from
+      # this path and sealed too. Both were `tui/`-prefixed before the move.
+      entrypoint: tests/acceptance.rs

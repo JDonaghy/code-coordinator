@@ -325,12 +325,13 @@ def tui_update(
             click.echo(
                 f"refusing to overwrite {dest_path}: it reports version "
                 f"{DEV_BUILD_SENTINEL_VERSION!r}, the sentinel a locally "
-                "`cargo build`'d coord-tui always carries (tui/Cargo.toml's "
+                "`cargo build`'d coord-tui always carries (coord-tui's "
+                "Cargo.toml "
                 "committed version is only stamped for real in CI release "
                 "builds). This looks like a dev build someone is iterating "
                 "on -- pass --force to overwrite it anyway, or keep "
-                "building it yourself: cd tui && cargo build && cp "
-                f"target/debug/coord-tui {dest_path}",
+                "building it yourself: from a coord-tui checkout, "
+                f"cargo build && cp target/debug/coord-tui {dest_path}",
                 err=True,
             )
             sys.exit(3)
