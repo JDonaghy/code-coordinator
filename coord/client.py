@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from coord import __version__
 from coord._board_mapping import assemble_board, infer_review_state
 from coord.models import Board
 
@@ -69,7 +70,20 @@ def resolve_board_service(
 
 
 def _headers(svc: ServiceConfig) -> dict[str, str]:
-    return {"Authorization": f"Bearer {svc.token}"} if svc.token else {}
+    # #1945: every request identifies itself as this package + its running
+    # version, whether it's the interactive `coord` CLI, an agent's own
+    # pinned `~/.coord-venv`, or the drive-queue runner -- all three are
+    # literally this same Python package, just invoked from a different
+    # entry point, so there is no finer-grained identity to report short of
+    # a caller passing one explicitly (none does today). This is what lets
+    # the daemon's deprecated-RPC-route telemetry (coord.deprecation_telemetry)
+    # name which client + version is still calling a route marked deprecated
+    # in the OpenAPI spec, instead of an unattributed hit that nobody can
+    # act on.
+    headers = {"X-Coord-Client": "coord-py", "X-Coord-Client-Version": __version__}
+    if svc.token:
+        headers["Authorization"] = f"Bearer {svc.token}"
+    return headers
 
 
 def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:

@@ -453,6 +453,55 @@ class _SchemaNegotiationMiddleware(BaseHTTPMiddleware):
         )
 
 
+class _DeprecatedRouteTelemetryMiddleware(BaseHTTPMiddleware):
+    """Record client identity + version on every call to a deprecated RPC
+    route (#1945, Phase B of #60 -- retirement needs a number, not a belief).
+
+    ``RPC_SUPERSEDED_BY_RESOURCE`` (defined further down this module) is the
+    single source of truth for "which routes are deprecated" -- the same
+    dict :func:`_mark_superseded_rpc_routes` stamps ``deprecated: true``
+    with in the served OpenAPI spec (#1944). Matching against it here rather
+    than a second hardcoded list means every route the spec calls
+    deprecated is automatically covered by telemetry too; they cannot drift
+    apart.
+
+    Innermost middleware by construction (appended last in ``build_app``,
+    after gzip / schema negotiation / bearer auth) -- it only ever sees a
+    request that has already cleared every earlier gate, so it counts real
+    calls that reached a deprecated handler, not requests bounced upstream.
+
+    Capture happens by calling
+    :func:`coord.deprecation_telemetry.record_deprecated_rpc_call`, which is
+    itself best-effort and never raises -- but this dispatch method wraps it
+    in its own ``try/except`` besides, so even an import failure or a
+    surprising ``request.headers`` type can never turn telemetry into a
+    broken response. The write is a single local SQLite insert (the same
+    ``record_audit`` every board-mutation handler in this file already calls
+    synchronously on its own request path), so it adds no meaningfully
+    different latency than those existing writes -- there is no separate
+    async/background-thread mechanism elsewhere in this file to match, and
+    none is warranted here either.
+    """
+
+    async def dispatch(self, request: Request, call_next):  # noqa: ANN001, ANN201
+        if request.url.path in RPC_SUPERSEDED_BY_RESOURCE:
+            try:
+                from coord.deprecation_telemetry import (  # noqa: PLC0415
+                    CLIENT_HEADER,
+                    CLIENT_VERSION_HEADER,
+                    record_deprecated_rpc_call,
+                )
+
+                record_deprecated_rpc_call(
+                    request.url.path,
+                    client=request.headers.get(CLIENT_HEADER),
+                    client_version=request.headers.get(CLIENT_VERSION_HEADER),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must never break a request
+                pass
+        return await call_next(request)
+
+
 def _reload_config_if_stale(
     current: Config, last_mtime: float | None
 ) -> tuple[Config, float | None]:
@@ -9559,4 +9608,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     ]
     if token:
         middleware.append(Middleware(_BearerAuthMiddleware, token=token))
+    # #1945: innermost -- runs closest to the route handler, after schema
+    # negotiation and (if configured) bearer auth have already let the
+    # request through, so telemetry only counts calls that actually reached
+    # a deprecated route's handler.
+    middleware.append(Middleware(_DeprecatedRouteTelemetryMiddleware))
     return Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)

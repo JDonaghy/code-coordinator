@@ -3366,6 +3366,183 @@ def run_trend(
     )
 
 
+# ── deprecated-routes: evidence for RPC retirement (#1945) ────────────────
+#
+# A live snapshot, same posture as `drive-queue-status`: no window, no
+# `repo` param — a deprecated *route* is not scoped to one repo the way an
+# issue is. Folds `coord.deprecation_telemetry`'s audit rows (category
+# "deprecation", written by the daemon's `_DeprecatedRouteTelemetryMiddleware`
+# on every call to a route in `coord.serve_app.RPC_SUPERSEDED_BY_RESOURCE`)
+# into one row per deprecated route: last call, distinct calling
+# client+version pairs, and a total count.
+#
+# The one thing this report exists to get right that a log grep would not:
+# telling "zero calls" (a real, actionable signal — safe to consider for
+# retirement) apart from "no data collected" (telemetry not running for
+# THIS route or ANY route — an old daemon build, `audit.level: business`
+# dropping the operational-tier rows, or the audit table's own retention
+# trim — which must never be read as "safe").  The distinction is made at
+# the corpus level: if literally zero deprecation-category rows exist
+# anywhere (any route), collection cannot be confirmed live, so EVERY route
+# reads `no_data` rather than the misleadingly reassuring `zero_calls`.
+
+DEPRECATED_ROUTES_COLUMNS = [
+    "route",
+    "replacement",
+    "status",
+    "last_call",
+    "call_count",
+    "clients",
+]
+
+# One entry per DEPRECATED_ROUTES_COLUMNS entry, same order (#1760).
+DEPRECATED_ROUTES_COLUMN_META = [
+    ColumnMeta(id="route", label="Route", kind="text", weight=1.5),
+    ColumnMeta(id="replacement", label="Replacement", kind="text", weight=2.5),
+    ColumnMeta(id="status", label="Status", kind="enum"),
+    ColumnMeta(id="last_call", label="Last Call", kind="timestamp"),
+    ColumnMeta(id="call_count", label="Calls", kind="int", align="right"),
+    ColumnMeta(id="clients", label="Clients", kind="list"),
+]
+
+# `status` values.  `no_data` and `zero_calls` are BOTH "nothing seen for
+# this route" — they differ only in whether that absence is trustworthy —
+# so a client rendering this column must not collapse them to one meaning.
+DEPRECATED_ROUTE_NO_DATA = "no_data"
+DEPRECATED_ROUTE_ZERO_CALLS = "zero_calls"
+DEPRECATED_ROUTE_IN_USE = "in_use"
+
+
+def fold_deprecated_routes(
+    entries: Iterable[Mapping[str, Any]],
+    generated_at: float,
+    *,
+    routes: Mapping[str, str] | None = None,
+) -> ReportResult:
+    """Fold already-fetched deprecation-telemetry audit rows into a
+    per-route snapshot.  **Pure** — no DB, no daemon, no clock.
+
+    ``entries`` is whatever ``coord.audit.query_audit_log(category=
+    "deprecation")`` (paginated by the caller — see :func:`run_deprecated_routes`)
+    returned, newest-first.  ``routes`` defaults to
+    ``coord.serve_app.RPC_SUPERSEDED_BY_RESOURCE`` so the set of routes this
+    report covers can never drift from the set the daemon actually stamps
+    ``deprecated: true`` on in the served OpenAPI spec (#1944) — there is
+    exactly one source of truth for "which routes are deprecated", and this
+    report reads it rather than redeclaring it (the ``routes=`` override
+    exists purely so this stays a pure function a test can call without
+    importing the daemon module).
+    """
+    if routes is None:
+        from coord.serve_app import RPC_SUPERSEDED_BY_RESOURCE  # noqa: PLC0415
+
+        routes = RPC_SUPERSEDED_BY_RESOURCE
+
+    entries = list(entries)
+    any_data = bool(entries)
+
+    by_route: dict[str, list[Mapping[str, Any]]] = {r: [] for r in routes}
+    for entry in entries:
+        details = entry.get("details") or {}
+        route = details.get("route")
+        if route in by_route:
+            by_route[route].append(entry)
+
+    rows: list[dict[str, Any]] = []
+    for route in sorted(routes):
+        calls = sorted(
+            by_route.get(route, []), key=lambda e: e.get("ts") or 0, reverse=True
+        )
+        last_call = calls[0].get("ts") if calls else None
+        clients: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for call in calls:
+            details = call.get("details") or {}
+            pair = (
+                details.get("client") or "unknown",
+                details.get("client_version") or "unknown",
+            )
+            if pair not in seen:
+                seen.add(pair)
+                clients.append(f"{pair[0]}@{pair[1]}")
+        if calls:
+            status = DEPRECATED_ROUTE_IN_USE
+        elif any_data:
+            status = DEPRECATED_ROUTE_ZERO_CALLS
+        else:
+            status = DEPRECATED_ROUTE_NO_DATA
+        rows.append(
+            {
+                "route": route,
+                "replacement": routes[route],
+                "status": status,
+                "last_call": last_call,
+                "call_count": len(calls),
+                "clients": clients,
+            }
+        )
+
+    notes: list[str] = []
+    if not any_data:
+        notes.append(
+            "No deprecation telemetry has been recorded at all, for any "
+            "route — this may mean genuinely zero calls, or that capture "
+            "is not running (an old daemon build predating #1945, "
+            "`audit.level: business` dropping operational-tier rows, or "
+            "the audit table's own retention trim). Every row above reads "
+            "`no_data`, not `zero_calls` — treat it as UNKNOWN, never as "
+            "evidence it is safe to retire."
+        )
+
+    return ReportResult(
+        report_id="deprecated-routes",
+        generated_at=generated_at,
+        window=(generated_at, generated_at),
+        columns=list(DEPRECATED_ROUTES_COLUMNS),
+        column_meta=list(DEPRECATED_ROUTES_COLUMN_META),
+        rows=rows,
+        notes=notes,
+    )
+
+
+def _default_fetch_deprecation_entries(
+    generated_at: float,
+) -> tuple[list[dict], bool]:
+    return fetch_audit_window(since=0.0, until=generated_at, category="deprecation")
+
+
+def run_deprecated_routes(
+    *,
+    now: float | None = None,
+    fetch: Callable[[float], tuple[Sequence[Mapping[str, Any]], bool]] | None = None,
+    routes: Mapping[str, str] | None = None,
+) -> ReportResult:
+    """Fetch every recorded deprecated-RPC-route call and fold it (#1945).
+
+    ``fetch``/``routes`` are test seams (mirrors every other ``run_*``'s
+    ``fetch=`` seam). Production always walks the FULL audit history
+    (``since=0``), never a recent window — "this route has not been called
+    in months" is exactly the number #1945 exists to produce, and a
+    windowed report would silently hide the very evidence retirement needs.
+    ``query_audit_log`` orders newest-first, so ``last_call`` is accurate
+    even if the walk is truncated by the page cap; only the full
+    client/version set and total ``call_count`` could then be incomplete,
+    which is called out in a note exactly like every other truncated fold
+    in this module.
+    """
+    generated_at = time.time() if now is None else float(now)
+    fetch_fn = _default_fetch_deprecation_entries if fetch is None else fetch
+    entries, truncated = fetch_fn(generated_at)
+    result = fold_deprecated_routes(entries, generated_at, routes=routes)
+    if truncated:
+        result.notes.append(
+            "Audit history walk hit its page cap before covering the full "
+            "history — `clients`/`call_count` may be missing older calls, "
+            "though `last_call` (newest-first order) is still accurate."
+        )
+    return result
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -3683,6 +3860,22 @@ TREND = ReportDef(
 )
 
 
+DEPRECATED_ROUTES = ReportDef(
+    id="deprecated-routes",
+    title="Deprecated RPC Routes",
+    description=(
+        "Per deprecated RPC route (the #1944 superseded-by-resource table): "
+        "last call, distinct calling client+version pairs, and a total "
+        "count — evidence for retirement instead of belief (#1945). "
+        "`status` distinguishes `in_use` from `zero_calls` (a real, "
+        "actionable signal) from `no_data` (telemetry not confirmed live — "
+        "never safe to read as `zero_calls`)."
+    ),
+    params=(),
+    run=run_deprecated_routes,
+)
+
+
 # ── CSV serialisation (#1765) ──────────────────────────────────────────────
 #
 # One serializer, server-side, for every surface: `coord report run --format
@@ -3863,6 +4056,7 @@ REPORTS: dict[str, ReportDef] = {
     USAGE.id: USAGE,
     QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
     TREND.id: TREND,
+    DEPRECATED_ROUTES.id: DEPRECATED_ROUTES,
 }
 
 
