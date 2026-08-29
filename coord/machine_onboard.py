@@ -499,9 +499,15 @@ def evaluate_config(facts: MachineFacts) -> list[Finding]:
         out.append(
             Finding(
                 layer="config", check="config.no_repos", severity=CRIT,
-                summary="declares no `repos:` — nothing can ever be dispatched here",
+                summary=(
+                    "declares no `repos:` — nothing can ever be dispatched "
+                    f"here. The fleet's repos are {sorted(facts.known_repos)}"
+                ),
                 subject=facts.name,
-                fix=f"coord machine add {facts.name} ... --repos <name,...> (re-run is safe)",
+                fix=(
+                    "add the repo NAMES from that list (not checkout directory "
+                    "names) to this machine's `repos:` and `repo_paths:`."
+                ),
             )
         )
     return out

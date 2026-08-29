@@ -369,10 +369,13 @@ def _print_add_residue(
         "comes up config-free publishes no capabilities at all, and every "
         "config-vs-/health cross-check then reads as absence rather than truth."
     )
-    for repo, path in repo_paths.items():
-        click.echo(f"  4. clone {repo} to {path} on {name} — the worker WORKTREE BASE")
-    if not repo_paths:
-        click.echo(f"  4. clone each repo onto {name} — the worker WORKTREE BASE")
+    click.echo(
+        f"  4. clone each repo onto {name} — these are the worker WORKTREE "
+        "BASES, not convenience checkouts; without one, every dispatch of "
+        "that repo here is refused while `coord status` stays green:"
+    )
+    for repo, path in (repo_paths or {"<each repo>": "~/src/<repo>"}).items():
+        click.echo(f"       {repo}: {path}")
     click.echo(
         f"  5. `loginctl enable-linger \"$USER\"` on {host} — without it "
         "coord-agent dies at the next logout/reboot and never comes back, and "
