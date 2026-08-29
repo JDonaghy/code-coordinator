@@ -1501,6 +1501,29 @@ def test_decision_propose_routes_through_the_daemon_on_a_thin_client(
 # ── #2903 (phase 1 of #2902): the draft gate ────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def default_approval_policy(tmp_path, monkeypatch):
+    """Pin `portal.approval` to ABSENT for this module (#2903).
+
+    The `enqueue-*` / `drafts` / `draft *` commands take no `--config`; they
+    read whatever `config.load()` resolves, which on a real fleet machine is
+    `~/.coord/coordinator.yml`. Without this, "does the default policy gate a
+    design round?" would be answered by whatever the operator has configured
+    that day — a test that passes here and fails on `dellserver`. Pointing
+    `$COORD_CONFIG` at a config with a `portal:` block and deliberately NO
+    `approval:` key makes the answer the built-in default, everywhere.
+
+    Autouse but harmless to the rest of the module: every pre-existing test
+    either passes `--config` explicitly (which wins) or never loads a config
+    at all.
+    """
+    path = tmp_path / "policy-coordinator.yml"
+    path.write_text(DISABLED_CONFIG_YAML)
+    monkeypatch.setenv("COORD_CONFIG", str(path))
+    return str(path)
+
+
+
 def test_draft_gate_commands_are_registered():
     result = run("portal", "--help")
     assert result.exit_code == 0
@@ -1732,3 +1755,23 @@ def test_draft_gate_commands_refuse_on_a_thin_client(thin_client, args):
     assert result.exit_code != 0
     assert "must run on the daemon host" in result.output
     assert "dellserver" in result.output
+
+
+def test_a_configured_ungated_kind_queues_straight_through(tmp_path, monkeypatch):
+    """#2903 end to end: coordinator.yml -> policy -> outbox state."""
+    path = tmp_path / "ungated.yml"
+    path.write_text(
+        DISABLED_CONFIG_YAML
+        + "portal:\n  approval:\n    question: false\n"
+    )
+    monkeypatch.setenv("COORD_CONFIG", str(path))
+
+    ok = run("portal", "enqueue-question", "sub_1", "which blue?")
+    assert ok.exit_code == 0, ok.output
+    assert "queued:" in ok.output
+    assert "drafted" not in ok.output
+
+    from coord import portal_store
+
+    assert [r.seq for r in portal_store.pending_outbox()] == [1, 2]
+    assert portal_store.draft_outbox() == []
