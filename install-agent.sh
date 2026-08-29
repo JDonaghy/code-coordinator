@@ -169,11 +169,21 @@ cat > "$UNIT_DIR/coord-agent.service" << UNIT
 [Unit]
 Description=Coordinator agent server (port $PORT)
 After=network-online.target
+# #2938: bound Restart=always below so a genuinely broken binary fails loud
+# (systemd 'failed'/start-limit-hit) instead of crash-looping silently
+# forever — see deploy/coord-agent.service's header for the full incident.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=$VENV_DIR/bin/coord agent --machine $MACHINE_NAME --port $PORT
-Restart=on-failure
+# #2938: was Restart=on-failure. POST /update stops this process cleanly so
+# it can come back on the swapped venv via an explicit self-restart
+# (coord/agent_app.py); if that explicit restart is ever lost, on-failure
+# never fires for a clean exit and the unit is gone for good, port 7433
+# refused, no remote-control channel left. Restart=always is the backstop.
+Restart=always
 RestartSec=5
 # #1671: include ~/.cargo/bin so a rustup-installed toolchain resolves to
 # both this agent process (the "rust" capability probe, coord/prereqs.py)

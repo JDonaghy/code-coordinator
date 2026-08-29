@@ -36,11 +36,23 @@
 #     put --token on ExecStart — it would leak via `ps`).
 #
 # See docs/AGENT_OPERATIONS.md → "Control-center daemon (coord serve)".
-
+#
+# #2938: Restart=always (was on-failure), + a StartLimitIntervalSec/
+# StartLimitBurst backstop — see deploy/coord-agent.service's header for the
+# full incident this closes (a clean stop that Restart=on-failure correctly
+# declines to act on, with no other recovery path, leaving the unit
+# `enabled`/`inactive` forever). coord-serve restarts through the same
+# `_restart_sibling_unit` caller as coord-agent's own self-restart
+# (coord/agent_app.py, #2069), so it is exposed to the identical failure
+# shape if that restart request is ever lost. 5 restarts / 5 minutes before
+# systemd gives up and lands the unit in `failed` (`start-limit-hit`) —
+# visible, not a silent crash-loop.
 [Unit]
 Description=coord serve — portable control-center daemon (#584)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -78,7 +90,7 @@ Type=simple
 # ahead of ~/.local/bin or ~/.coord-venv/bin.
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
-Restart=on-failure
+Restart=always
 RestartSec=3
 # #2095: coord-web (its sibling on the same host, restarted through the same
 # `_restart_sibling_unit` caller) went down for the length of a fleet roll
