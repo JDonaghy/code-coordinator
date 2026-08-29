@@ -22,7 +22,6 @@ gets a test here, referenced by the check id it produces:
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -32,7 +31,7 @@ from coord import machine_onboard
 from coord.commands.machine import machine_add, machine_doctor
 from coord.config import ConfigError
 from coord.config import load as load_config
-from coord.machine_onboard import CRIT, OK, UNKNOWN, WARN, HealthCheckFact, MachineFacts
+from coord.machine_onboard import CRIT, OK, UNKNOWN, WARN, MachineFacts
 from coord.network import ONLINE, TIMEOUT, MachineStatus
 
 
@@ -238,6 +237,20 @@ def test_declared_repo_without_a_repo_path_crits():
     assert "KEY" in (finding.fix or "")
 
 
+def test_a_machine_declaring_no_repos_is_told_the_vocabulary_to_use():
+    """A brand-new machine that looks perfect and is never routed anything.
+    The remedy names the fleet's actual repo names, because guessing them is
+    exactly how the directory-name-as-key mistake gets made."""
+    facts = MachineFacts(
+        name="dell64", configured=True, host="dell64.tail1234.ts.net",
+        declared_capabilities=["python"], known_repos=["api", "web"],
+    )
+    finding = _by_check(machine_onboard.evaluate(facts), "config.no_repos")
+    assert finding.severity == CRIT
+    assert "['api', 'web']" in finding.summary
+    assert "not checkout directory names" in (finding.fix or "")
+
+
 def test_config_loader_names_the_key_vs_value_trap(tmp_path):
     """Incident 4's fatal half: a `repo_paths` KEY that names no configured
     repo aborts the ENTIRE load — for every machine. The message has to say
@@ -318,6 +331,55 @@ def test_a_tied_fleet_has_no_majority_to_grade_against(cfg):
     assert machine_onboard.fleet_version_mode({"a": "1", "b": "2"}) is None
     assert machine_onboard.fleet_version_mode({"a": "1"}) is None
     assert machine_onboard.fleet_version_mode({"a": "1", "b": "1", "c": "2"}) == "1"
+
+
+# ── systemd linger: the one thing /health structurally cannot see ──────────
+
+
+def _ssh_result(stdout, returncode=0, stderr=""):
+    import subprocess  # noqa: PLC0415
+
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [("Linger=yes\n", True), ("Linger=no\n", False)],
+)
+def test_probe_linger_parses_loginctl(stdout, expected):
+    with patch("subprocess.run", return_value=_ssh_result(stdout)):
+        assert machine_onboard.probe_linger("host") == (expected, None)
+
+
+def test_probe_linger_fails_soft_rather_than_reporting_a_defect():
+    """A machine with no `loginctl` at all (macOS uses launchd —
+    docs/MAC_MINI.md) must read UNKNOWN, never "linger disabled"."""
+    with patch("subprocess.run", return_value=_ssh_result("Linger=unknown\n")):
+        linger, error = machine_onboard.probe_linger("host")
+    assert linger is None
+    assert "not systemd" in error
+
+    with patch("subprocess.run",
+               return_value=_ssh_result("", returncode=255, stderr="No route to host")):
+        linger, error = machine_onboard.probe_linger("host")
+    assert linger is None
+    assert "No route to host" in error
+
+
+def test_disabled_linger_crits_and_names_the_delayed_symptom():
+    facts = MachineFacts(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        linger=False,
+    )
+    finding = _by_check(machine_onboard.evaluate(facts), "runtime.linger_disabled")
+    assert finding.severity == CRIT
+    # The symptom is DELAYED — that is what makes it silent.
+    assert "next logout or reboot" in finding.summary
+    assert "enable-linger" in (finding.fix or "")
 
 
 # ── The doctor fold-in must not duplicate what `coord doctor` already prints ─
