@@ -8,7 +8,9 @@ a generic "offline".
 
 from __future__ import annotations
 
+import json
 import socket
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -117,6 +119,150 @@ def check_all(
     workers = max_workers or min(8, len(machines))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda m: check_machine(m, timeout=timeout), machines))
+
+
+# #2912: `coord doctor` checks reachability by resolving `host:` and hitting
+# it — but never checks whether `host:` resolves to the RIGHT thing. A LAN
+# DHCP/DNS entry that happens to share a name with a tailnet node (e.g. a
+# WSL2 box named `dell64` whose Windows host also registers `dell64.lan`)
+# shadows MagicDNS in the resolver order: `tailscale ping <name>` succeeds
+# (it talks to tailscaled directly, not the resolver) while plain HTTP by
+# name times out against the wrong LAN device — indistinguishable from a
+# dead agent, a firewall, or a crashed unit. The two helpers below let
+# `coord doctor` name that specific cause instead.
+
+
+def tailscale_ip_map(timeout: float = 5.0) -> dict[str, tuple[str, str]] | None:
+    """Map each tailnet node's short hostname (lowercased) to its
+    ``(tailnet_ipv4, magicdns_fqdn)``, read from the LOCAL machine's own
+    ``tailscale status --json`` — i.e. what THIS box's tailscaled believes,
+    which is what its own DNS resolver should agree with.
+
+    Returns ``None`` when the ``tailscale`` CLI is missing, not logged in,
+    or anything else goes wrong. This check is best-effort and must fail
+    soft: a probe that cannot tell tailnet truth from LAN truth must stay
+    silent rather than fabricate a mismatch.
+    """
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+
+    nodes = list((data.get("Peer") or {}).values())
+    self_node = data.get("Self")
+    if self_node:
+        nodes.append(self_node)
+
+    out: dict[str, tuple[str, str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        host_name = (node.get("HostName") or "").strip().lower()
+        if not host_name:
+            continue
+        ipv4 = next(
+            (ip for ip in (node.get("TailscaleIPs") or []) if ":" not in ip), None
+        )
+        if not ipv4:
+            continue
+        dns_name = (node.get("DNSName") or "").rstrip(".")
+        out[host_name] = (ipv4, dns_name)
+    return out
+
+
+def resolve_host_ip(host: str, timeout: float = 5.0) -> str | None:
+    """Resolve *host* via normal system DNS/hosts resolution — the same
+    resolution path plain HTTP-by-name takes. ``None`` on any failure."""
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+@dataclass
+class HostResolutionCheck:
+    """Does a machine's configured ``host:`` resolve to ITS tailnet address?
+
+    ``matches is None`` means "could not determine" (no local ``tailscale``,
+    the node wasn't found in this box's peer list, or ``host:`` didn't
+    resolve at all) — that's a different, softer story than ``False``
+    ("resolved, but to the wrong place") and callers must not conflate them.
+    """
+
+    matches: bool | None
+    resolved_ip: str | None = None
+    tailnet_ip: str | None = None
+    magicdns_fqdn: str | None = None
+    reason: str = ""
+
+
+def check_host_resolution(
+    machine: Machine, ts_map: dict[str, tuple[str, str]] | None
+) -> HostResolutionCheck:
+    """Compare ``machine.host``'s DNS resolution against what *ts_map*
+    (from :func:`tailscale_ip_map`) says this tailnet node's real address
+    is. Pure function of its inputs — no I/O — so it's unit-testable
+    without a live tailnet or DNS resolver.
+    """
+    if ts_map is None:
+        return HostResolutionCheck(
+            matches=None, reason="tailscale not available locally — skipped"
+        )
+
+    peer = ts_map.get(machine.name.strip().lower())
+    if peer is None:
+        # `machine.name` and `machine.host`'s leading label don't always
+        # agree (host aliases, an already-FQDN host, ...) — fall back to
+        # the host's own short label before giving up.
+        peer = ts_map.get(machine.host.split(".")[0].strip().lower())
+    if peer is None:
+        return HostResolutionCheck(
+            matches=None,
+            reason=f"{machine.name!r} not found in local tailscale peer list — skipped",
+        )
+
+    tailnet_ip, magicdns_fqdn = peer
+    resolved = resolve_host_ip(machine.host)
+    if resolved is None:
+        return HostResolutionCheck(
+            matches=None,
+            tailnet_ip=tailnet_ip,
+            magicdns_fqdn=magicdns_fqdn,
+            reason=f"{machine.host!r} did not resolve at all",
+        )
+    if resolved == tailnet_ip:
+        return HostResolutionCheck(
+            matches=True,
+            resolved_ip=resolved,
+            tailnet_ip=tailnet_ip,
+            magicdns_fqdn=magicdns_fqdn,
+        )
+    return HostResolutionCheck(
+        matches=False,
+        resolved_ip=resolved,
+        tailnet_ip=tailnet_ip,
+        magicdns_fqdn=magicdns_fqdn,
+        reason=(
+            f"{machine.host!r} resolves to {resolved}, not this machine's "
+            f"tailnet address {tailnet_ip} — a LAN DNS entry is very likely "
+            "shadowing MagicDNS for this name"
+        ),
+    )
 
 
 @dataclass

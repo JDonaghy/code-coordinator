@@ -923,6 +923,39 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         click.echo("FLEET: ?  (health footer unavailable — coord health for detail)")
 
 
+def _host_resolution_lines(machine, ts_map: dict[str, tuple[str, str]] | None) -> list[tuple[bool, str]]:
+    """#2912: does ``host:`` actually resolve to THIS machine's tailnet
+    address? A LAN DHCP/DNS entry that shares a name with a tailnet node
+    (e.g. a WSL2 box named ``dell64`` whose Windows host also registers
+    ``dell64.lan``) shadows MagicDNS in the resolver order — HTTP-by-name
+    times out against the wrong LAN device while ``tailscale ping`` and the
+    agent's own ``/health`` are both perfectly healthy, so the symptom is
+    indistinguishable from a dead agent, a firewall, or a crashed unit.
+
+    Fires regardless of whether the machine is currently reachable — that's
+    the whole point: it names the cause a plain "unreachable" cannot, and it
+    also catches a collision BEFORE it manifests as an outage. Silent when
+    ``coord.network.check_host_resolution`` can't determine an answer (no
+    local ``tailscale``, node not in this box's peer list, ``host:`` doesn't
+    resolve at all) — those are absence-of-evidence, not a finding.
+
+    Pure function over :func:`coord.network.check_host_resolution`'s result
+    — no I/O of its own — so it's testable without a live tailnet.
+    """
+    from coord import network  # noqa: PLC0415
+
+    result = network.check_host_resolution(machine, ts_map)
+    if result.matches is not False:
+        return []
+    return [(
+        True,
+        f"  ✗ CRIT machines.host_resolves_offtailnet: {result.reason} "
+        f"(#2912). Remedy: set `host: {result.magicdns_fqdn}` in "
+        "coordinator.yml — the MagicDNS FQDN — instead of the bare "
+        "hostname, which a LAN DNS entry can shadow.",
+    )]
+
+
 def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
     """Cross-check a machine's ``/health`` against what ``coordinator.yml``
     declares for it. Returns ``(is_problem, line)`` pairs (#1712).
@@ -1323,6 +1356,7 @@ def doctor(
     expected: str | None,
     use_pypi: bool,
 ) -> None:
+    from coord import network
     from coord.network import check_all
     from coord.prereqs import ToolProbe, unmet_capabilities
 
@@ -1339,10 +1373,23 @@ def doctor(
             sys.exit(2)
 
     statuses = check_all(machines, timeout=timeout)
+    # #2912: resolved once, locally, up front — every machine's `host:` is
+    # checked against the SAME local tailscale peer list, and a single
+    # `tailscale status --json` covers the whole fleet. `None` when
+    # tailscale isn't available on THIS box; `_host_resolution_lines`
+    # renders nothing in that case rather than fabricating a mismatch.
+    ts_map = network.tailscale_ip_map(timeout=timeout)
     any_problem = False
     for s in statuses:
         m = s.machine
         click.echo(f"{m.name} ({m.host}):")
+        # Runs even when unreachable — that's the case this exists for:
+        # naming why "unreachable" is misleading instead of leaving it
+        # indistinguishable from a dead agent or a crashed unit.
+        for is_problem, line in _host_resolution_lines(m, ts_map):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
         if not s.is_online:
             click.echo(f"  ✗ unreachable — {s.reason}")
             any_problem = True
