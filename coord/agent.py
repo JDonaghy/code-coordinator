@@ -4067,7 +4067,11 @@ composer on the client's side pauses on the most recent question only, so \
 a scattershot list gets a partial answer at best. Then:
 
     coord portal enqueue-question <submission_id> "<question>"
-    coord portal enqueue-status <submission_id> needs-input
+
+   This one command queues the question AND announces it to the customer \
+(#2901) — `enqueue-question` queues its own `needs-input` status right \
+behind the question, so there is no separate announcement step to remember \
+or forget.
 
    and STOP — end your final turn summarizing the question and why, and run \
 nothing else this iteration (no filing, no decisions). IL-3's consumer \
