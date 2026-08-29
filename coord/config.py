@@ -2717,6 +2717,27 @@ def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> Qu
     )
 
 
+# #2915: appended to both "unknown repo" refusals in `_parse_machines`.
+#
+# Onboarding dell64 on 2026-08-28, a `repo_paths` KEY named the checkout's
+# DIRECTORY (`claude-coordinator`) instead of the fleet's REPO NAME
+# (`code-coordinator`). The two differ by design here — see the #2104 note in
+# coordinator.example.yml — so the mistake is easy and the blast radius is
+# total: this raise aborts the whole load, which takes `coordinator.yml` down
+# for EVERY machine, not just the one with the typo. The old message named the
+# bad key and stopped there, leaving an operator to work out that keys and
+# values are drawn from different vocabularies. `coord machine add` now
+# validates this before writing; this hint is for every config edited by hand.
+_REPO_NAME_HINT = (
+    "In `repo_paths`, the KEY is the repo NAME from this file's own `repos:` "
+    "block and the VALUE is the on-disk path — they routinely differ (a repo "
+    "renamed on GitHub keeps its old checkout directory). Note this error "
+    "aborts the ENTIRE config load, so it takes every machine down, not just "
+    "this one. `coord machine add` validates repo names before writing; "
+    "`coord machine doctor <name>` checks the rest."
+)
+
+
 def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
     if raw is None:
         raise ConfigError("Config must define 'machines'")
@@ -2752,7 +2773,8 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
         unknown = [r for r in machine_repos if r not in repo_names]
         if unknown:
             raise ConfigError(
-                f"machines[{i}] ({name!r}) references unknown repos: {unknown}"
+                f"machines[{i}] ({name!r}) references unknown repos: {unknown} "
+                f"— configured repos are {sorted(repo_names)}. {_REPO_NAME_HINT}"
             )
 
         repo_paths = entry.get("repo_paths", {}) or {}
@@ -2763,7 +2785,9 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
         unknown_paths = [r for r in repo_paths if r not in repo_names]
         if unknown_paths:
             raise ConfigError(
-                f"machines[{i}] ({name!r}) repo_paths references unknown repos: {unknown_paths}"
+                f"machines[{i}] ({name!r}) repo_paths references unknown repos: "
+                f"{unknown_paths} — configured repos are {sorted(repo_names)}. "
+                f"{_REPO_NAME_HINT}"
             )
 
         # #1417: optional per-machine capacity override. `None` (unset)

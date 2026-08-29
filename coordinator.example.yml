@@ -84,6 +84,36 @@ repos:
     # ci_command: "npm run test:e2e"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
 
+# #2915: DO NOT hand-write a new entry here — use `coord machine add <name>
+# --host <h> --capabilities ... --repos ...`, then `coord machine doctor
+# <name> --ssh`. Onboarding a machine is a sequence assembled from four
+# documents that don't cross-reference each other (docs/AGENT_OPERATIONS.md,
+# docs/GRAPHIFY_SETUP.md, docs/MAC_MINI.md, docs/WSL_WINDOWS_WORKER.md) and
+# EVERY step of it fails silently. The two traps this block itself sets:
+#
+#   `host:` — must be the address that answers /health, and the only way to
+#   be sure of that is the MagicDNS FQDN (`<node>.<tailnet>.ts.net`). A bare
+#   hostname is resolved by the normal system resolver, so a LAN DHCP/DNS
+#   entry sharing the name (a WSL2 box named `dell64` whose Windows host also
+#   registers `dell64.lan`) shadows MagicDNS and every board read becomes
+#   [timeout] — while `tailscale ping` and the agent's own /health are both
+#   perfectly healthy. `coord machine add` refuses a --host that resolves
+#   off-tailnet; `coord doctor` reports it continuously (#2912).
+#
+#   `repo_paths:` — the KEY is the repo NAME from the `repos:` block above,
+#   the VALUE is the on-disk path. They differ on purpose here (see the #2104
+#   note above: the repo is `code-coordinator`, the checkout has always been
+#   `~/src/claude-coordinator`), so using the directory name as the key is an
+#   easy mistake with a TOTAL blast radius — `_parse_machines` raises, and
+#   the whole coordinator.yml then fails to load for EVERY machine, not just
+#   the new one. A repo listed under `repos:` with no `repo_paths` entry is
+#   the quieter version: the config loads and dispatch is refused for exactly
+#   that repo (#1801).
+#
+# Neither `coord machine add` nor anything else installs the agent, clones
+# the repos, installs graphify, or enables `loginctl enable-linger` — those
+# stay a human's job and are printed as explicit residue. `coord machine
+# doctor` verifies all of them from live state afterward.
 machines:
   # Desktop A — Dell Precision, full GTK builds
   - name: precision
