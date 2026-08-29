@@ -55,26 +55,57 @@ Usage:
     # exit 1 (no write) if that file is stale
     COORD_WEB_SRC=~/src/coord-web .venv/bin/python scripts/codegen.py --check
 
-#1941 — THIS SCRIPT ALSO GENERATES coord-tui's RUST WIRE TYPES. Unlike the TS
-half above, `tui/` still lives in *this* repo, so there is no cross-repo
-`--out`/env-var story: the Rust output path is a fixed, checked-in file,
-`tui/src/app/types/generated.rs`. The source of truth is a *different*
-OpenAPI document than the TS path reads — `coord.serve_app.openapi_spec()`
-(the daemon app, port 7435), not `coord.dashboard.server.openapi_spec()` (the
-dashboard app, port 7434) — because `GET /board`, the endpoint the TUI
-actually polls, is specified there, from the seven explicit wire DTOs in
-`coord/board_schema.py` (#1849). See `generate_rust()` below for the
-mechanical schema-walk + hand-curated-override split, which mirrors
-`ENUM_OVERRIDES`/`_ENUM_BLOCK` above but at the level of individual struct
-fields rather than whole enum types (Rust's richer type system — visibility,
-`#[serde(rename/default/deserialize_with)]`, custom deserializers for the
-INTEGER-backed-boolean guard — needs a finer-grained override point than TS
-did).
+#1941 (extended by #2897) — THIS SCRIPT ALSO GENERATES coord-tui's RUST WIRE
+TYPES, and as of #2897 the Rust half is cross-repo capable the SAME SHAPE as
+the TS half above. `tui/` still lives in *this* repo today, but the eventual
+split (tracked separately — this story produces the shape, not the move)
+means the destination can't stay a fixed, checked-in path either: it is named
+explicitly by `--out PATH` or by `$COORD_TUI_SRC` pointing at a checkout root
+whose `tui/` holds coord-tui's crate, with the same no-fallback-default
+reasoning as `resolve_output_path` above — a guess is always wrong
+post-split, and under `--check` it is wrong in the direction that reports
+success. Today `$COORD_TUI_SRC=.` (this checkout's own root) reproduces the
+old fixed-path behaviour exactly (`<root>/tui/src/app/types/generated.rs`,
+i.e. `tui/src/app/types/generated.rs`).
 
-    # regenerate tui/src/app/types/generated.rs
-    .venv/bin/python scripts/codegen.py --rust
+The source of truth is a *different* OpenAPI document than the TS path reads
+— `coord.serve_app.openapi_spec()` (the daemon app, port 7435), not
+`coord.dashboard.server.openapi_spec()` (the dashboard app, port 7434) —
+because `GET /board`, the endpoint the TUI actually polls, is specified
+there, from the seven explicit wire DTOs in `coord/board_schema.py` (#1849).
+See `generate_rust()` below for the mechanical schema-walk + hand-curated-
+override split, which mirrors `ENUM_OVERRIDES`/`_ENUM_BLOCK` above but at the
+level of individual struct fields rather than whole enum types (Rust's richer
+type system — visibility, `#[serde(rename/default/deserialize_with)]`,
+custom deserializers for the INTEGER-backed-boolean guard — needs a
+finer-grained override point than TS did).
+
+The drift GATE splits the same way #2009 split the TS one (docs/
+ADR_COORD_TUI_CI.md, #2897): what stays here is
+`tests/test_generated_rust_fixture.py`, narrowed to what one checkout can
+prove — the generator runs, produces well-formed output, and covers every
+schema in the served `/board` spec. The byte-for-byte comparison against a
+committed `generated.rs` belongs to coord-tui's own CI once it exists,
+installing `code-coordinator[server]` from PyPI to get this script — the same
+shape `docs/ADR_COORD_WEB_CI.md` (#2006) already gave the TS half, just not
+stood up yet (standing it up is the still-open "move" story's job, not
+this one's).
+
+The producer-side INTEGER-backed-boolean guard that used to cross-reference
+the Rust source text against a live SQLite schema (`coord/board_bool_guard.py`)
+is RETIRED as of #2897 — see `docs/ADR_COORD_TUI_CI.md` for the reasoning.
+Short version: #2895 (Phase 1 of #2894) deleted coord-tui's last direct SQL
+reader, so the structs this file generates are now the *only* Rust consumer
+of column types, and they are already pinned int-vs-bool by the DTO-level
+assertion in `tests/test_board_schema.py` (`board_schema.INTEGER_BACKED_BOOLEANS`).
+The text-scraping half had no remaining subject once that was true.
+
+    # today, while tui/ still lives in this repo:
+    COORD_TUI_SRC=. .venv/bin/python scripts/codegen.py --rust
     # exit 1 (no write) if that file is stale
-    .venv/bin/python scripts/codegen.py --rust --check
+    COORD_TUI_SRC=. .venv/bin/python scripts/codegen.py --rust --check
+    # or name the file directly
+    .venv/bin/python scripts/codegen.py --rust --out tui/src/app/types/generated.rs
 """
 
 from __future__ import annotations
@@ -90,16 +121,25 @@ from coord.serve_app import openapi_spec as board_openapi_spec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: Fixed, in-repo destination for the generated Rust wire types (#1941).
-#: Unlike `OUTPUT_RELPATH` above, `tui/` never left this repo, so there is no
-#: cross-repo destination ambiguity to resolve — no `--out`, no env var.
-RUST_OUTPUT_PATH = REPO_ROOT / "tui" / "src" / "app" / "types" / "generated.rs"
-
 #: Path of the emitted file RELATIVE to a `coord-web` checkout's root.
 OUTPUT_RELPATH = Path("src") / "api" / "generated.ts"
 
 #: Env var naming a `coord-web` checkout root, used when `--out` is absent.
 OUTPUT_ENV_VAR = "COORD_WEB_SRC"
+
+#: Path of the emitted file RELATIVE to a `$COORD_TUI_SRC` checkout root
+#: (#2897) — i.e. `<root>/tui/src/app/types/generated.rs`. The `tui/` prefix
+#: stays even though the TS analogue (`OUTPUT_RELPATH`) has no `webapp/`
+#: prefix: today `$COORD_TUI_SRC` names *this* checkout (its coord-tui crate
+#: lives under `tui/`), and the eventual split hasn't decided coord-tui's own
+#: root layout yet — that decision belongs to the still-open "move" story,
+#: not this one.
+RUST_OUTPUT_RELPATH = Path("tui") / "src" / "app" / "types" / "generated.rs"
+
+#: Env var naming a checkout root whose `tui/` holds coord-tui's crate,
+#: used when `--out` is absent (#2897). `$COORD_TUI_SRC=.` (this checkout's
+#: own root) reproduces today's old fixed-path behaviour exactly.
+RUST_OUTPUT_ENV_VAR = "COORD_TUI_SRC"
 
 
 class OutputPathError(Exception):
@@ -124,6 +164,31 @@ def resolve_output_path(explicit: str | Path | None = None) -> Path:
         f"the coord-web repo, so pass --out PATH or set ${OUTPUT_ENV_VAR} to "
         f"a coord-web checkout root (the file is written to its "
         f"{OUTPUT_RELPATH}). See this script's module docstring."
+    )
+
+
+def resolve_rust_output_path(explicit: str | Path | None = None) -> Path:
+    """Where to write/check ``generated.rs``: ``--out`` > ``$COORD_TUI_SRC``.
+
+    Mirrors ``resolve_output_path`` above, for the Rust half (#2897). Raises
+    :class:`OutputPathError` when neither is set, rather than guessing:
+    `tui/` still lives in this repo today, but silently falling back to that
+    fixed path would either recreate a dead directory nobody consumes once
+    coord-tui moves out, or, worse, report "up to date" against a file that
+    is not the one actually named — the same failure shape #2009 called out
+    for the TS half. Pass ``COORD_TUI_SRC=.`` to reproduce today's old
+    fixed-path behaviour explicitly.
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    root = os.environ.get(RUST_OUTPUT_ENV_VAR)
+    if root:
+        return Path(root).expanduser() / RUST_OUTPUT_RELPATH
+    raise OutputPathError(
+        "no destination for generated.rs. Pass --out PATH or set "
+        f"${RUST_OUTPUT_ENV_VAR} to a coord-tui checkout root (the file is "
+        f"written to its {RUST_OUTPUT_RELPATH}) — e.g. $COORD_TUI_SRC=. for "
+        "this checkout's own tui/. See this script's module docstring."
     )
 
 # Schemas to emit as TS interfaces, in display order — purely cosmetic (TS
@@ -1174,7 +1239,7 @@ RUST_HEADER = """\
 //! `coord/board_schema.py` (#1849) — #1941. Regenerate after any field change:
 //!
 //! ```text
-//! .venv/bin/python scripts/codegen.py --rust
+//! COORD_TUI_SRC=<coord-tui checkout root> .venv/bin/python scripts/codegen.py --rust
 //! ```
 //!
 //! (The fence is load-bearing, and `text` is the load-bearing part of *it*:
@@ -1183,17 +1248,21 @@ RUST_HEADER = """\
 //! that command as an indented block, or in a bare ``` fence, breaks
 //! `cargo test --doc` with `error: expected item, found `.``.)
 //!
-//! `tests/test_generated_rust_fixture.py` fails CI if this file drifts from what
-//! the generator produces right now, so a stale checkout can't merge — the Rust
-//! equivalent of `tests/test_generated_types_fixture.py` on the TS side.
+//! #2897: the destination is named explicitly (`--out PATH` / `$COORD_TUI_SRC`
+//! — see this script's module docstring), the same shape #2009 gave the TS
+//! half. `tests/test_generated_rust_fixture.py` proves the generator runs and
+//! covers every schema; the byte-for-byte freshness check against *this file
+//! as committed* is coord-tui's own CI job once it exists
+//! (`docs/ADR_COORD_TUI_CI.md`) rather than a test in this repo.
 //!
 //! **Every field defaults.** `/board` is one JSON payload: a single type
 //! mismatch on a single field fails the *entire* `BoardPayload` parse and
 //! blanks every TUI panel — the #632/#546/#628 failure class this repo has
-//! been bitten by three times (see `coord/board_bool_guard.py`). INTEGER-backed
-//! boolean columns (`is_interactive`, `hold_after`, `no_acceptance`,
-//! `review_scoped`) stay typed as an integer, or go through a coercing
-//! deserializer — never a plain `bool` — for the same reason.
+//! been bitten by three times. INTEGER-backed boolean columns
+//! (`is_interactive`, `hold_after`, `no_acceptance`, `review_scoped`) stay
+//! typed as an integer, or go through a coercing deserializer — never a
+//! plain `bool` — for the same reason (`coord/board_schema.py`'s
+//! `INTEGER_BACKED_BOOLEANS`, asserted int-typed by `tests/test_board_schema.py`).
 //!
 //! Field types for anything already consumed by the TUI are hand-pinned in
 //! `RUST_FIELD_OVERRIDES` (`scripts/codegen.py`) to match this file's
@@ -1223,27 +1292,37 @@ def generate_rust() -> str:
 
 
 def _main_rust(args: list[str]) -> int:
+    try:
+        output_path = resolve_rust_output_path(_parse_out(args))
+    except OutputPathError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     content = generate_rust()
     if "--check" in args:
-        if not RUST_OUTPUT_PATH.exists():
+        # #2897: a MISSING file is a hard failure, not "stale vs empty" —
+        # mirrors the TS `--check` path's reasoning below. Absence usually
+        # means --out/$COORD_TUI_SRC is pointing somewhere that is not a
+        # coord-tui checkout, and treating that as ordinary staleness would
+        # send an operator off to regenerate into the wrong directory.
+        if not output_path.exists():
             print(
-                f"{RUST_OUTPUT_PATH} does not exist — run `python scripts/codegen.py "
-                "--rust` to generate it.",
+                f"{output_path} does not exist — is --out/${RUST_OUTPUT_ENV_VAR} "
+                "pointing at a coord-tui checkout?",
                 file=sys.stderr,
             )
             return 1
-        if RUST_OUTPUT_PATH.read_text() != content:
+        if output_path.read_text() != content:
             print(
-                f"{RUST_OUTPUT_PATH} is stale — run `python scripts/codegen.py --rust` "
-                "to regenerate.",
+                f"{output_path} is stale — run `python scripts/codegen.py "
+                f"--rust --out {output_path}` to regenerate.",
                 file=sys.stderr,
             )
             return 1
-        print(f"{RUST_OUTPUT_PATH} is up to date.")
+        print(f"{output_path} is up to date.")
         return 0
-    RUST_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RUST_OUTPUT_PATH.write_text(content)
-    print(f"wrote {RUST_OUTPUT_PATH}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+    print(f"wrote {output_path}")
     return 0
 
 
@@ -1262,9 +1341,9 @@ def _parse_out(args: list[str]) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if "--rust" in args:
-        # #1941: the Rust path has a fixed in-repo destination (no --out/env
-        # var story — see RUST_OUTPUT_PATH's docstring), so it skips the
-        # TS-only path resolution below entirely.
+        # #2897: the Rust path is now cross-repo capable the same shape as
+        # the TS path below (--out / $COORD_TUI_SRC, no fallback default) —
+        # see resolve_rust_output_path's docstring.
         return _main_rust(args)
     try:
         output_path = resolve_output_path(_parse_out(args))

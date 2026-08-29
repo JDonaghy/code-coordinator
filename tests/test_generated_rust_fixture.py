@@ -1,16 +1,28 @@
-"""#1941: coord-tui's Rust wire types stay generated and CI-gated, the same
-way the webapp's TS types already are (`tests/test_generated_types_fixture.py`).
+"""#1941/#2897: coord-tui's Rust wire types stay generated, the same way the
+webapp's TS types already are (`tests/test_generated_types_fixture.py`).
 
-Unlike the TS half, `tui/` never left this repo (#2009 only moved the
-webapp), so the Rust path has a fixed, checked-in destination —
-`tui/src/app/types/generated.rs` — and this test can do the full
-byte-for-byte freshness check the TS test lost when its own destination
-moved to `coord-web`. That's what actually gates CI here: a Python dataclass
-field added, removed, or retyped on any of the seven `/board` projections
-(`coord/board_schema.py`) without regenerating goes red in
-`test_committed_generated_rs_matches_generator_output` below — the direct
-`scripts/codegen.py --rust --check` equivalent, exercised in-process instead
-of as a subprocess so a failure here points straight at the diff.
+#2897 made the Rust half cross-repo capable the same shape #2009 gave the TS
+half: the destination is named explicitly by `--out PATH` or `$COORD_TUI_SRC`
+(a checkout root whose `tui/` holds coord-tui's crate), with no fallback
+default. `tui/` has not actually moved out of this repo yet — that is a
+separate, still-open "move" story — so this file can no longer assume there
+is a single checked-in `generated.rs` to byte-compare against the way it did
+before #2897: once coord-tui has its own checkout and CI, the committed file
+this repo's `tui/` carries is that CI's freshness gate to run, exactly as
+`coord-web`'s CI runs the TS byte-comparison (`docs/ADR_COORD_WEB_CI.md`).
+
+What stays provable from a single checkout, and what this file now pins,
+mirrors `tests/test_generated_types_fixture.py` exactly:
+
+  - the generator runs at all against the real served `/board` spec,
+  - it emits a Rust struct for EVERY targeted schema, so a newly registered
+    board projection cannot be silently dropped from the wire contract, and
+  - `--out` / `$COORD_TUI_SRC` resolve (or refuse to guess) the same way the
+    TS path's `resolve_output_path` does.
+
+`docs/ADR_COORD_TUI_CI.md` records this split, plus the retirement of the
+INTEGER-backed-bool text-scraping guard (`coord/board_bool_guard.py`) that
+used to also read `tui/src/app/types.rs` as Rust source text.
 """
 
 from __future__ import annotations
@@ -21,10 +33,13 @@ import pytest
 
 import scripts.codegen as codegen
 from scripts.codegen import (
-    RUST_OUTPUT_PATH,
+    RUST_OUTPUT_ENV_VAR,
+    RUST_OUTPUT_RELPATH,
     RUST_STRUCTS,
+    OutputPathError,
     board_openapi_spec,
     generate_rust,
+    resolve_rust_output_path,
 )
 
 
@@ -51,34 +66,14 @@ def test_generated_output_is_non_empty_rust():
     assert "pub struct Assignment" in generated
 
 
-def test_committed_generated_rs_matches_generator_output():
-    """The actual CI gate: `tui/src/app/types/generated.rs` as committed must
-    equal what `generate_rust()` produces right now. This is what makes a
-    stale branch (schema changed, generator not re-run) fail here instead of
-    shipping a silently-drifted Rust struct — see the acceptance criterion on
-    #1941: "a field added to a board projection dataclass fails CI until the
-    Rust types are regenerated."
-    """
-    assert RUST_OUTPUT_PATH.exists(), (
-        f"{RUST_OUTPUT_PATH} is missing — run `python scripts/codegen.py --rust` "
-        "to generate it."
-    )
-    committed = RUST_OUTPUT_PATH.read_text()
-    fresh = generate_rust()
-    assert committed == fresh, (
-        f"{RUST_OUTPUT_PATH} is stale — run `python scripts/codegen.py --rust` "
-        "to regenerate it and commit the result."
-    )
-
-
 def test_new_field_on_a_board_projection_changes_the_generated_output(monkeypatch):
     """Acceptance proof for #1941, without needing a real `board_schema.py`
     edit: patch the served schema the generator reads (the same
     `coord.serve_app.openapi_spec()` document `board_openapi_spec()` wraps)
     to carry one extra property, the way it would the moment a dataclass
     field is added, and confirm the generator's output changes to include
-    it — the mechanism `--check` (and the test above) relies on to catch a
-    stale branch.
+    it — the mechanism `--rust --check` relies on, wherever it now runs, to
+    catch a stale branch.
     """
     baseline = generate_rust()
 
@@ -91,11 +86,6 @@ def test_new_field_on_a_board_projection_changes_the_generated_output(monkeypatc
     changed = generate_rust()
     assert changed != baseline
     assert "new_test_field_1941" in changed
-
-    # And the freshness check itself would now fail against the committed
-    # file — i.e. exactly the CI-red a stale branch is supposed to produce.
-    committed = RUST_OUTPUT_PATH.read_text()
-    assert committed != changed
 
 
 def _implicit_doctest_lines(rust_src: str) -> list[str]:
@@ -156,16 +146,6 @@ def test_generated_rust_has_no_accidental_doctests():
     )
 
 
-def test_committed_generated_rs_has_no_accidental_doctests():
-    """The same guard against the file as committed, which is what
-    `cargo test --doc` actually reads."""
-    offenders = _implicit_doctest_lines(RUST_OUTPUT_PATH.read_text())
-    assert not offenders, (
-        f"{RUST_OUTPUT_PATH} carries doc-comment lines rustdoc will compile "
-        f"as a Rust doctest: {offenders}."
-    )
-
-
 def test_implicit_doctest_detector_actually_detects_one():
     """The guard above only means something if it fires on the real defect —
     pin it to the exact header shape that broke `cargo test --doc`."""
@@ -192,26 +172,61 @@ def test_implicit_doctest_detector_actually_detects_one():
     assert _implicit_doctest_lines(fixed) == []
 
 
-def test_check_flag_fails_when_generated_rs_is_stale(tmp_path, monkeypatch):
-    """`--rust --check` is the CLI seam CI actually invokes — cover it
-    directly rather than only its `generate_rust()` half."""
+# ── --out / $COORD_TUI_SRC resolution (#2897) ────────────────────────────────
+# Mirrors test_generated_types_fixture.py's coverage of resolve_output_path.
+
+
+def test_out_flag_names_the_destination(tmp_path, monkeypatch):
+    """`--out PATH` wins outright, env or no env."""
+    monkeypatch.setenv(RUST_OUTPUT_ENV_VAR, str(tmp_path / "from-env"))
+    explicit = tmp_path / "explicit" / "generated.rs"
+    assert resolve_rust_output_path(explicit) == explicit
+
+
+def test_env_var_resolves_relative_to_a_checkout_root(tmp_path, monkeypatch):
+    monkeypatch.setenv(RUST_OUTPUT_ENV_VAR, str(tmp_path))
+    assert resolve_rust_output_path(None) == tmp_path / RUST_OUTPUT_RELPATH
+
+
+def test_no_destination_is_an_error_not_a_guess(monkeypatch):
+    """#2897: no hard-coded in-repo default. Guessing is always wrong once
+    coord-tui has its own checkout, and under `--check` it is wrong in the
+    direction that reports success."""
+    monkeypatch.delenv(RUST_OUTPUT_ENV_VAR, raising=False)
+    with pytest.raises(OutputPathError):
+        resolve_rust_output_path(None)
+
+
+# ── `--rust --check` CLI seam ─────────────────────────────────────────────────
+
+
+def test_check_flag_fails_when_generated_rs_is_stale(tmp_path):
     stale_path = tmp_path / "generated.rs"
     stale_path.write_text("// stale\n")
-    monkeypatch.setattr(codegen, "RUST_OUTPUT_PATH", stale_path)
 
-    assert codegen.main(["--rust", "--check"]) == 1
+    assert codegen.main(["--rust", "--out", str(stale_path), "--check"]) == 1
 
 
-def test_check_flag_fails_when_generated_rs_is_missing(tmp_path, monkeypatch):
+def test_check_flag_fails_when_generated_rs_is_missing(tmp_path):
     missing_path = tmp_path / "does-not-exist" / "generated.rs"
-    monkeypatch.setattr(codegen, "RUST_OUTPUT_PATH", missing_path)
 
-    assert codegen.main(["--rust", "--check"]) == 1
+    assert codegen.main(["--rust", "--out", str(missing_path), "--check"]) == 1
 
 
-def test_check_flag_passes_when_generated_rs_is_fresh(tmp_path, monkeypatch):
+def test_check_flag_passes_when_generated_rs_is_fresh(tmp_path):
     fresh_path = tmp_path / "generated.rs"
-    monkeypatch.setattr(codegen, "RUST_OUTPUT_PATH", fresh_path)
 
-    assert codegen.main(["--rust"]) == 0  # writes fresh_path
-    assert codegen.main(["--rust", "--check"]) == 0
+    assert codegen.main(["--rust", "--out", str(fresh_path)]) == 0  # writes fresh_path
+    assert codegen.main(["--rust", "--out", str(fresh_path), "--check"]) == 0
+
+
+def test_rust_check_with_no_destination_refuses_and_writes_nothing(tmp_path, monkeypatch):
+    """Acceptance criterion: neither `--out` nor `$COORD_TUI_SRC` set exits
+    non-zero, naming both, and writes nothing."""
+    monkeypatch.delenv(RUST_OUTPUT_ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = codegen.main(["--rust"])
+
+    assert exit_code != 0
+    assert list(tmp_path.iterdir()) == []

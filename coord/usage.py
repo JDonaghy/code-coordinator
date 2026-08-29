@@ -380,9 +380,9 @@ def fetch_usage_rows(
     :class:`~coord.models.Assignment` instances — the aggregator consumes the
     daemon ``/board`` ``assignments`` shape directly, including
     ``is_interactive``, which is a real DB/wire column but (deliberately,
-    #748/#632 — see :mod:`coord.board_bool_guard`) not an ``Assignment``
-    dataclass field, so converting through ``Assignment`` would silently
-    drop it.
+    #748/#632 — see ``coord.board_schema.INTEGER_BACKED_BOOLEANS`` and
+    ``tests/test_board_schema.py``) not an ``Assignment`` dataclass field, so
+    converting through ``Assignment`` would silently drop it.
 
     Remote reads the same ``/board`` endpoint ``coord status`` polls. Local
     reads the sqlite DB directly via ``SqliteStore.list_assignments()``

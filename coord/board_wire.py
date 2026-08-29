@@ -113,7 +113,8 @@ TRUNCATION_NOTICE = "\n… [truncated on the /board wire — full text: detail e
 # two: `coord/**` and `tui/**`). Lines carrying it survive the body cut; see
 # `_machine_readable_residue`. Kept in sync with the Rust side by
 # tests/test_board_wire.py::test_allowed_glob_marker_matches_the_rust_parser,
-# the same cross-language guard posture as coord/board_bool_guard.py.
+# the same cross-language-guard posture the now-retired coord/board_bool_
+# guard.py used (#2897, docs/ADR_COORD_TUI_CI.md).
 #
 # Measured cost of the retention: ZERO on today's live board — 0 of 781
 # issue bodies carry the marker (the house `## Files` convention is a bare

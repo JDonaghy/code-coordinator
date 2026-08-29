@@ -287,10 +287,12 @@ BOARD_PROJECTIONS: dict[str, type] = {
 #: therefore ship as ``0``/``1``.  Their DTO fields are annotated ``int`` on
 #: purpose; ``tests/test_board_schema.py`` asserts the generated JSON Schema
 #: types them ``integer`` and never ``boolean``, so the wire shape survives a
-#: storage-engine swap (Postgres would make these real ``BOOLEAN``s).  This is
-#: the DTO-level counterpart of ``coord/board_bool_guard.py``'s consumer-side
-#: check against the real Rust wire structs (``tui/src/app/types.rs`` and,
-#: since #1941, its generated ``types/generated.rs`` sibling).
+#: storage-engine swap (Postgres would make these real ``BOOLEAN``s).  This
+#: WAS the DTO-level counterpart of ``coord/board_bool_guard.py``'s consumer-
+#: side check against the real Rust wire structs (``tui/src/app/types.rs``
+#: and its generated ``types/generated.rs`` sibling, #1941); that
+#: text-scraping check is retired as of #2897 (docs/ADR_COORD_TUI_CI.md) —
+#: this assertion is now the sole remaining guard.
 INTEGER_BACKED_BOOLEANS: frozenset[str] = frozenset(
     {"is_interactive", "review_scoped", "hold_after", "no_acceptance"}
 )
