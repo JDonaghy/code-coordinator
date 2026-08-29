@@ -73,15 +73,28 @@ symlinks, silently replacing it with a disconnected regular file. Edit the
 checkout itself:
 
 ```bash
-coord sessions --remote        # MUST be empty — restart breaks interactive finalize
 ssh <daemon-host> 'vi ~/src/coord-settings/coord/coordinator.yml'
 ssh <daemon-host> 'git -C ~/src/coord-settings commit -am "..." && git -C ~/src/coord-settings push'
-ssh <daemon-host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-serve'
-coord config                   # re-caches from the daemon; new value proves both the edit and the reload
+coord config                   # re-caches from the daemon; new value proves the edit landed
 ```
 
-The daemon does not hot-reload — without the restart, the file is changed and
-nothing uses it.
+**No `coord-serve` restart needed here** (#1081). The daemon tracks the
+backing file's mtime and swaps in a freshly-parsed `Config` the moment the
+tick loop notices it changed (`_reload_config_if_stale` in
+`coord/serve_app.py`, bound to the shared `coord.config_reload.reload_config_if_stale`)
+— restarting the daemon for a config edit buys nothing for the config and
+costs you item above's interactive-finalize risk for no reason. `GET
+/config` (what `coord config` re-fetches) always serves the raw bytes fresh
+regardless of the reload.
+
+**A malformed edit is swallowed, not rejected** — if the pushed/pulled file
+fails to parse, the reload logs a warning and keeps serving the last-good
+`Config` (the daemon's own gating decisions keep running on stale rules,
+silently), but still advances its mtime marker so it won't retry until the
+file changes again. **Validate the YAML before you push it.** See
+`docs/OPERATING_GOTCHAS.md` #14 for the full failure-mode list (symlink
+replaced by a regular file, uncommitted checkout changes, checkout out of
+sync with `origin`) and `coord diagnose --config-provenance` to check them.
 
 ## Summary table
 
@@ -92,7 +105,9 @@ nothing uses it.
 
 A full deploy needs **both** checks, and often waiting: a machine running a
 worker can't be agent-updated, and a fleet with a live interactive session
-can't have its daemon restarted.
+can't have its daemon restarted. A `coordinator.yml` edit needs **neither** —
+it hot-reloads, so don't restart `coord-serve` just because you touched the
+config.
 
 ## Rules
 
@@ -102,3 +117,6 @@ can't have its daemon restarted.
 - Never edit `~/.coord/coordinator.yml` / `coordinator.remote.yml` directly on
   a thin client or via the daemon-host symlink and expect it to stick — edit
   the `coord-settings` checkout and push.
+- Never restart `coord-serve` after a `coordinator.yml` edit "just to be
+  safe" — it hot-reloads on its own (#1081), and the restart only adds the
+  interactive-finalize risk from the section above for no benefit.
