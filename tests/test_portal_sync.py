@@ -21,6 +21,7 @@ from coord.portal_sync import (
     enqueue_preview,
     enqueue_question,
     enqueue_status,
+    ordering_block_reason,
     sync_tick,
 )
 
@@ -222,12 +223,12 @@ def test_reallocation_converges_and_then_the_announcement_goes():
 
 
 def test_second_question_cannot_ride_on_the_first_questions_confirmation():
+    # enqueue_question (#2901) queues its own needs-input status right
+    # behind the question — no separate enqueue_status call needed here.
     enqueue_question(SUB, "which colour?")
-    enqueue_status(SUB, "needs-input")
     sync_tick(client=FakeClient())  # round 1 lands cleanly
 
     enqueue_question(SUB, "which font?")
-    enqueue_status(SUB, "needs-input")
     # The second question fails to send; its announcement must not overtake it.
     client = FakeClient(push_error=PortalBridgeError("boom"))
     sync_tick(client=client)
@@ -236,6 +237,46 @@ def test_second_question_cannot_ride_on_the_first_questions_confirmation():
     client2 = FakeClient()
     sync_tick(client=client2)
     assert client2.pushed_kinds == ["question", "status"]
+
+
+def test_enqueue_question_queues_its_own_announcement():
+    """#2901: a question pushed without a status row behind it sends no
+    email (coord-portal's own rule — a push only mails the customer when it
+    actually names ``status``). `enqueue_question` must queue that status
+    itself, in the same call, so the announcement cannot be forgotten."""
+    question_row, status_row = enqueue_question(SUB, "which colour?")
+
+    assert question_row.kind == portal_sync.KIND_QUESTION
+    assert status_row.kind == portal_sync.KIND_STATUS
+    assert status_row.announces == "needs-input"
+    assert status_row.requires_kind == portal_sync.KIND_QUESTION
+    # The announcement is seq N+1 right behind its question — the ordering
+    # guard (`ANNOUNCING_STATUSES`/`ordering_block_reason`) keys off exactly
+    # this adjacency.
+    assert status_row.seq == question_row.seq + 1
+
+
+def test_enqueue_question_reproduces_sub_1ea1d3_second_question_also_announced():
+    """Regression for #2901 / SUB-1EA1D3: question (applied) -> status
+    (applied) -> a second question with NO status row behind it — the real
+    outbox shape that shipped with no email. With the fold, the second
+    `enqueue_question` call must also queue its own status, so the drain
+    sends question -> status -> question -> status in order, never a bare
+    trailing question."""
+    enqueue_question(SUB, "Two things to help us scope...")
+    sync_tick(client=FakeClient())  # first question + its announcement land
+
+    enqueue_question(SUB, "Thanks -- that covers who...")
+    client = FakeClient()
+    sync_tick(client=client)
+
+    assert client.pushed_kinds == ["question", "status"]
+    rows = portal_store.outbox_for_submission(SUB)
+    assert [r.kind for r in rows] == ["question", "status", "question", "status"]
+    assert [r.state for r in rows] == [portal_store.STATE_APPLIED] * 4
+    # The second question's announcement never sent ahead of its own
+    # question being confirmed applied.
+    assert ordering_block_reason(rows[3]) is None
 
 
 def test_a_stalled_submission_does_not_stall_another_customers():
@@ -1875,9 +1916,9 @@ def _push_and_apply_question(question: str = "Offline-first, yes or no?"):
     path `mark_applied`'s `kind == "question"` branch runs for real once
     `_push` gets a 200 back, which is what writes the `question_pushed`
     ledger entry `_consume_questions` later pairs an answer against."""
-    row = enqueue_question(SUB, question)
-    portal_store.mark_applied(row)
-    return row
+    question_row, _status_row = enqueue_question(SUB, question)
+    portal_store.mark_applied(question_row)
+    return question_row
 
 
 class TestQuestionAnswerFields:

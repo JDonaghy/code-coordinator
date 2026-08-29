@@ -356,13 +356,36 @@ def enqueue_preview(
 
 def enqueue_question(
     submission_id: str, question: str, *, now: float | None = None
-) -> portal_store.OutboxRow:
-    """Queue an open question for the customer."""
+) -> tuple[portal_store.OutboxRow, portal_store.OutboxRow]:
+    """Queue an open question for the customer, plus the announcement of it.
+
+    Queuing the question alone sends no email — the portal only mails the
+    customer off a push that actually names ``status``
+    (coord-portal's `src/bridge/updates.ts`) — so a caller that asked a
+    question and forgot the follow-up `enqueue_status(..., "needs-input")`
+    left the customer never told (#2901, SUB-1EA1D3: exactly this happened
+    to a real submission). Folding the announcement in here, in the same
+    call, immediately after the question row, makes that omission
+    impossible rather than merely documented: the existing
+    `ANNOUNCING_STATUSES`/`ordering_block_reason` guard then holds the
+    status row until this question is confirmed applied, for free, because
+    it is seq N+1 behind the question's seq N.
+
+    A second question on a submission already at `needs-input` still gets
+    its own status row here — coord-portal deliberately does not coalesce
+    a repeat `needs-input` (`src/notifications.ts`), on the grounds that a
+    second question is plausibly real news, so re-announcing is intended,
+    not churn to suppress.
+
+    Returns ``(question_row, status_row)`` in that seq order.
+    """
     if not question or not question.strip():
         raise PortalSyncError("question must be non-empty")
-    return portal_store.enqueue(
+    question_row = portal_store.enqueue(
         submission_id, KIND_QUESTION, {"question": question}, now=now
     )
+    status_row = enqueue_status(submission_id, "needs-input", now=now)
+    return question_row, status_row
 
 
 def enqueue_status(

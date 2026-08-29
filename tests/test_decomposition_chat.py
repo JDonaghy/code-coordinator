@@ -689,10 +689,18 @@ def test_system_prompt_describes_both_modes():
     assert "MODE: FILE" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
 
 
-def test_system_prompt_ask_terminal_move_uses_enqueue_commands():
+def test_system_prompt_ask_terminal_move_uses_enqueue_question_only():
+    """#2901: `enqueue_question` now queues its own `needs-input`
+    announcement, so the ASK move's own step list must not tell the session
+    to run a second `enqueue-status` command — that was the exact
+    forgettable two-step sequence #2901 folded away (SUB-1EA1D3)."""
     assert "coord portal enqueue-question" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
-    assert "coord portal enqueue-status" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
     assert "needs-input" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+    ask_section = DECOMPOSITION_CHAT_SYSTEM_PROMPT.split("1. ASK")[1].split(
+        "2. PROPOSE"
+    )[0]
+    assert "enqueue-status" not in ask_section
+    assert "queues its own" in ask_section
 
 
 def test_system_prompt_propose_terminal_move_uses_decision_commands():

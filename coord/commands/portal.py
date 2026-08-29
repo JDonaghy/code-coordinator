@@ -1351,18 +1351,30 @@ def portal_enqueue_preview(submission_id: str, preview_url: str) -> None:
 @click.argument("submission_id")
 @click.argument("question")
 def portal_enqueue_question(submission_id: str, question: str) -> None:
-    """Queue an open question for SUBMISSION_ID (sent on the next sync)."""
+    """Queue an open question for SUBMISSION_ID (sent on the next sync).
+
+    Also queues the `needs-input` status that announces it (#2901) — a
+    question with no status row behind it sends no email, so this command
+    always queues both rows in one call rather than leaving the second one
+    to a caller who might forget it.
+    """
     _refuse_if_thin_client("enqueue-question")
 
     from coord.portal_sync import PortalSyncError, enqueue_question  # noqa: PLC0415
 
     try:
-        row = enqueue_question(submission_id, question)
+        question_row, status_row = enqueue_question(submission_id, question)
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
     click.secho(
-        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} question",
+        f"queued: {question_row.submission_id} seq={question_row.seq} "
+        f"rev={question_row.revision} question",
+        fg="green",
+    )
+    click.secho(
+        f"queued: {status_row.submission_id} seq={status_row.seq} "
+        f"rev={status_row.revision} status=needs-input",
         fg="green",
     )
 
