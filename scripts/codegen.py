@@ -127,18 +127,20 @@ OUTPUT_RELPATH = Path("src") / "api" / "generated.ts"
 #: Env var naming a `coord-web` checkout root, used when `--out` is absent.
 OUTPUT_ENV_VAR = "COORD_WEB_SRC"
 
-#: Path of the emitted file RELATIVE to a `$COORD_TUI_SRC` checkout root
-#: (#2897) — i.e. `<root>/tui/src/app/types/generated.rs`. The `tui/` prefix
-#: stays even though the TS analogue (`OUTPUT_RELPATH`) has no `webapp/`
-#: prefix: today `$COORD_TUI_SRC` names *this* checkout (its coord-tui crate
-#: lives under `tui/`), and the eventual split hasn't decided coord-tui's own
-#: root layout yet — that decision belongs to the still-open "move" story,
-#: not this one.
-RUST_OUTPUT_RELPATH = Path("tui") / "src" / "app" / "types" / "generated.rs"
+#: Path of the emitted file RELATIVE to a `coord-tui` checkout's root —
+#: i.e. `<coord-tui>/src/app/types/generated.rs`.
+#:
+#: #2897 introduced this with a `tui/` prefix, because `$COORD_TUI_SRC` then
+#: named *this* checkout and the crate lived under its `tui/`. #2899 moved
+#: the crate to the standalone `coord-tui` repo, where it sits at the repo
+#: ROOT — so the prefix is gone and this is now exactly the shape of the TS
+#: analogue (`OUTPUT_RELPATH`, relative to a `coord-web` checkout root).
+RUST_OUTPUT_RELPATH = Path("src") / "app" / "types" / "generated.rs"
 
-#: Env var naming a checkout root whose `tui/` holds coord-tui's crate,
-#: used when `--out` is absent (#2897). `$COORD_TUI_SRC=.` (this checkout's
-#: own root) reproduces today's old fixed-path behaviour exactly.
+#: Env var naming a `coord-tui` checkout root, used when `--out` is absent
+#: (#2897). Since #2899 that is a real, separate checkout (`~/src/coord-tui`),
+#: not this one — `$COORD_TUI_SRC=.` is only correct when run FROM a coord-tui
+#: checkout, which is exactly what coord-tui's own CI drift gate does.
 RUST_OUTPUT_ENV_VAR = "COORD_TUI_SRC"
 
 
@@ -171,13 +173,11 @@ def resolve_rust_output_path(explicit: str | Path | None = None) -> Path:
     """Where to write/check ``generated.rs``: ``--out`` > ``$COORD_TUI_SRC``.
 
     Mirrors ``resolve_output_path`` above, for the Rust half (#2897). Raises
-    :class:`OutputPathError` when neither is set, rather than guessing:
-    `tui/` still lives in this repo today, but silently falling back to that
-    fixed path would either recreate a dead directory nobody consumes once
-    coord-tui moves out, or, worse, report "up to date" against a file that
-    is not the one actually named — the same failure shape #2009 called out
-    for the TS half. Pass ``COORD_TUI_SRC=.`` to reproduce today's old
-    fixed-path behaviour explicitly.
+    :class:`OutputPathError` when neither is set, rather than guessing: since
+    #2899 the crate is not in this repo at all, so any fallback would either
+    recreate a dead directory nobody consumes or — worse, under ``--check`` —
+    report "up to date" against a file that is not the one actually named.
+    That is the same failure shape #2009 called out for the TS half.
     """
     if explicit is not None:
         return Path(explicit).expanduser()
@@ -185,10 +185,11 @@ def resolve_rust_output_path(explicit: str | Path | None = None) -> Path:
     if root:
         return Path(root).expanduser() / RUST_OUTPUT_RELPATH
     raise OutputPathError(
-        "no destination for generated.rs. Pass --out PATH or set "
+        "no destination for generated.rs. Since #2899 the TUI lives in the "
+        "coord-tui repo, so pass --out PATH or set "
         f"${RUST_OUTPUT_ENV_VAR} to a coord-tui checkout root (the file is "
-        f"written to its {RUST_OUTPUT_RELPATH}) — e.g. $COORD_TUI_SRC=. for "
-        "this checkout's own tui/. See this script's module docstring."
+        f"written to its {RUST_OUTPUT_RELPATH}). See this script's module "
+        "docstring."
     )
 
 # Schemas to emit as TS interfaces, in display order — purely cosmetic (TS

@@ -85,6 +85,12 @@ def _run(repo: Path, *extra_args: str) -> subprocess.CompletedProcess[str]:
 
 # ── this repo: hardcoded path routing ───────────────────────────────────────
 #
+# #2899 shrank this arm from two toolchains to one: the `coord-tui` crate that
+# lived under `tui/**` moved to its own repo, so what is left is pytest behind
+# a path filter. The arm itself is kept (see the runner's header §1) — the
+# `--repo NAME` that selects it is supplied out-of-band by the fleet config, so
+# deleting it here would REFUSE every Test dispatch until that config caught up.
+#
 # #2104 renamed the distribution AND the repo `claude-coordinator` ->
 # `code-coordinator`, but the `--repo NAME` the runner receives comes from
 # the FLEET's coordinator.yml, which lives in a separate checkout updated
@@ -98,15 +104,68 @@ def test_coordinator_python_diff_routes_pytest_only(repo: Path, repo_name: str) 
     _commit(repo, {"coord/foo.py": "x\n"}, "py change")
     result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 populated-home=0"
 
 
 @pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
-def test_coordinator_rust_diff_routes_cargo_only(repo: Path, repo_name: str) -> None:
+def test_coordinator_rust_diff_no_longer_routes_anywhere(
+    repo: Path, repo_name: str
+) -> None:
+    """#2899: `tui/**` is not a path in this repo any more.
+
+    This used to be `test_coordinator_rust_diff_routes_cargo_only`, pinning
+    the second arm of a two-toolchain router. The crate moved to the
+    standalone `coord-tui` repo, which routes through `--fallback-command`
+    like every other repo, so a stray `tui/`-prefixed path here is now just
+    an unrecognised path — and an unrecognised path in a repo that HAS a
+    routing rule is a legitimate SKIP, not the #1408 REFUSE case (that one is
+    "no rule for this repo at all"). Asserted rather than deleted because the
+    distinction is exactly what #1408 is about, and silently turning a
+    previously-tested route into a silent no-op is how a Test gate goes green
+    on unrun tests.
+    """
     _commit(repo, {"tui/foo.rs": "x\n"}, "rs change")
     result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=0 cargo=1 populated-home=0"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=0 populated-home=0"
+
+    run = _run(repo, "--repo", repo_name)
+    assert run.returncode == 0
+    assert "SKIP:" in run.stdout
+
+
+@pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
+def test_coordinator_routing_line_no_longer_reports_a_cargo_arm(
+    repo: Path, repo_name: str
+) -> None:
+    """#2899: the `cargo=` field is gone from the ROUTING line entirely.
+
+    Pinned because the field going to a permanent `cargo=0` — rather than
+    away — would read to a human skimming Test-stage logs as "the Rust suite
+    ran and found nothing", which is the opposite of the truth.
+    """
+    _commit(repo, {"coord/foo.py": "x\n"}, "py change")
+    result = _run(repo, "--repo", repo_name, "--print-routing")
+    assert "cargo" not in result.stdout.strip().splitlines()[-1]
+
+
+@pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
+def test_coordinator_route_survives_a_fallback_command_being_passed(
+    repo: Path, repo_name: str
+) -> None:
+    """#2899: the coordinator arm is deliberately NOT collapsed into the
+    fallback arm, because `--repo NAME` comes from the fleet's coordinator.yml
+    (a separate, out-of-band checkout). If that config starts passing
+    `--fallback-command` for this repo before or after the arm is retired, the
+    hardcoded route must still win — running pytest twice, or REFUSE-ing, are
+    both worse than the path-scoped route this repo already has.
+    """
+    _commit(repo, {"coord/foo.py": "x\n"}, "py change")
+    result = _run(
+        repo, "--repo", repo_name, "--fallback-command", "pytest", "--print-routing"
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 populated-home=0"
 
 
 @pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
@@ -124,7 +183,7 @@ def test_omitting_repo_flag_defaults_to_coordinator_for_backcompat(repo: Path) -
     _commit(repo, {"coord/foo.py": "x\n"}, "py change")
     result = _run(repo, "--print-routing")  # no --repo at all
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 populated-home=0"
 
 
 # ── any other repo: no hardcoded rule, must REFUSE without a fallback ───────

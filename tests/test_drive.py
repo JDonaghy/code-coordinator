@@ -709,19 +709,15 @@ def test_the_default_gate_checker_resolve_for_path_returns_none_for_unknown_repo
     assert checker.resolve_for_path("no-such-repo", 38) is None
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TUI_PIPELINE_RS = REPO_ROOT / "tui" / "src" / "app" / "pipeline.rs"
-
-
-def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
+def test_gate_a_contract_path_agrees_across_python_dispatch_and_drive():
     """#1453's acceptance bar: "the gate matches the TUI's and Python's,
-    with a test asserting the three implementations agree."
+    with a test asserting the implementations agree."
 
     Three independent call sites decide whether a milestone's Gate-A
     contract exists:
 
-    - ``tui/src/app/pipeline.rs::gate_a_contract_exists_for`` — a local-fs
-      check for the interactive JIT-author menu item (#1060).
+    - coord-tui's ``src/app/pipeline.rs::gate_a_contract_exists_for`` — a
+      local-fs check for the interactive JIT-author menu item (#1060).
     - ``coord.milestone_dispatch.gate_a_status`` — the #930 milestone-
       dispatch gate (GitHub-fetch based); also what #1453's
       ``GitHubAcceptanceGateChecker`` reuses (previous test).
@@ -733,6 +729,21 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
     the Python side — rather than re-deriving their own. A drifted format is
     silent: the driver would wait forever for a contract that actually
     exists at a slightly different path.
+
+    #2899 DROPPED THE RUST THIRD OF THIS TEST. It read
+    ``tui/src/app/pipeline.rs`` as source text and regex-extracted its
+    ``.join()`` segments; that file is not in this checkout any more, so the
+    assertion is not weakened here — it is structurally impossible here. A
+    single-checkout test cannot pin two repos. Re-establishing it is a
+    CROSS-REPO drift net, which #2894 files as its own story precisely so a
+    red there does not block this move; the natural home is coord-tui's CI,
+    which already installs ``code-coordinator`` from PyPI for the
+    ``generated.rs`` gate and can therefore import
+    ``coord.acceptance.gate_a_contract_path`` and compare against its own
+    ``pipeline.rs`` — the same direction the codegen and board-fixture gates
+    now run.
+
+    What survives here is the Python pair, which is what this checkout owns.
 
     #2896: ``gate_a_status``/``resolve_oracle_decision`` no longer call
     ``gate_a_contract_path`` directly — they go through
@@ -750,30 +761,6 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
 
     path = gate_a_contract_path(42)
     assert path == "tests/acceptance/ms-42/contract.md"
-
-    # Rust: gate_a_contract_exists_for builds the same path via four
-    # `.join()` calls — extract the literal segments and rebuild the
-    # equivalent path to prove no drift.
-    rust_src = TUI_PIPELINE_RS.read_text(encoding="utf-8")
-    fn_match = re.search(
-        r"fn gate_a_contract_exists_for.*?\n    \}\n", rust_src, re.S
-    )
-    assert fn_match is not None, (
-        f"gate_a_contract_exists_for not found in {TUI_PIPELINE_RS} — update "
-        "this test's regex (it may have been renamed/moved), and re-verify "
-        "it still agrees with gate_a_contract_path rather than silently "
-        "leaving this test unable to catch a real drift"
-    )
-    fn_src = fn_match.group(0)
-    join_calls = re.findall(r'\.join\(\s*(?:"([^"]+)"|format!\("([^"]+)", \w+\))\s*\)', fn_src)
-    segments = [a or b for a, b in join_calls]
-    assert segments == ["tests", "acceptance", "ms-{}", "contract.md"], (
-        f"gate_a_contract_exists_for's path segments changed to {segments!r} "
-        "— update coord.acceptance.gate_a_contract_path (and this test) to "
-        "match, in the SAME change"
-    )
-    rust_path = "/".join(segments).replace("ms-{}", "ms-42")
-    assert rust_path == path
 
     # Python: coord.milestone_dispatch.gate_a_status must go through
     # gate_a_contract_candidates (#2896) — itself built on

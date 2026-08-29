@@ -262,7 +262,7 @@ def test_print_routing_names_the_arm_when_the_diff_touches_a_test_file(repo: Pat
 
     assert result.returncode == 0
     assert result.stdout.strip().splitlines()[-1] == (
-        "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=1"
+        "ROUTING mode=coordinator pytest=1 populated-home=1"
     )
     assert "populated-$HOME arm (#2269) will re-run 1 diff-scoped test file(s)" in result.stdout
     assert "tests/test_ambient.py" in result.stdout
@@ -284,7 +284,7 @@ def test_print_routing_says_the_arm_is_skipped_for_a_diff_with_no_test_files(
 
     assert result.returncode == 0
     assert result.stdout.strip().splitlines()[-1] == (
-        "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
+        "ROUTING mode=coordinator pytest=1 populated-home=0"
     )
     assert "populated-$HOME arm (#2269) SKIPPED" in result.stdout
     assert "no python test files" in result.stdout
@@ -307,7 +307,7 @@ def test_the_sealed_acceptance_suite_is_not_in_the_arms_scope(repo: Path) -> Non
     result = _run(repo, "--print-routing")
 
     assert result.stdout.strip().splitlines()[-1] == (
-        "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
+        "ROUTING mode=coordinator pytest=1 populated-home=0"
     )
 
 

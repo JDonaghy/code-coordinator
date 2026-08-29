@@ -22,7 +22,11 @@ NODE_MAJOR="22"
 OPENCODE_VERSION="1.18.11"    # pinned to match the standing fleet -- see #1777
 RUST_HOME="/opt/rust"
 CARGO_TARGET_SEED="/opt/cargo-target-seed"
-REPOS=(code-coordinator quadraui vimcode)
+# #2899: coord-tui joins the clone list as its own repo. `~/src/coord-tui` is
+# what `coordinator.yml`'s `repo_paths.coord-tui` names on every machine that
+# carries it, and what `resolve_coord_tui_checkout` discovers for the
+# tui_binary health lane.
+REPOS=(code-coordinator coord-tui quadraui vimcode)
 GITHUB_ORG="JDonaghy"
 
 WITH_GTK=0; WITH_BROWSER=0; SEED_CARGO_TARGET=0
@@ -165,10 +169,13 @@ done
 
 # Warm the crate registry: the dominant cold-start cost is fetching hundreds of
 # crate sources, not compiling them.
-for repo in code-coordinator quadraui vimcode; do
-    as_coord "cd ~/src/${repo} && [ -f Cargo.toml -o -f tui/Cargo.toml ] && cargo fetch --locked 2>/dev/null || true"
+# #2899: `coord-tui` is its own repo now, with a ROOT Cargo.toml like every
+# other Rust checkout — so the `-f tui/Cargo.toml` special case that existed
+# only for code-coordinator's nested crate is gone, and code-coordinator (now
+# pure Python) drops out of this loop entirely.
+for repo in coord-tui quadraui vimcode; do
+    as_coord "cd ~/src/${repo} 2>/dev/null && [ -f Cargo.toml ] && cargo fetch --locked 2>/dev/null || true"
 done
-as_coord "cd ~/src/code-coordinator/tui 2>/dev/null && cargo fetch --locked || true"
 
 # Warm pip + npm caches for the coordinator's own dev/test deps.
 as_coord "~/.coord-venv/bin/pip download -q -d /tmp/wheelwarm 'code-coordinator[dev]' 2>/dev/null || true; rm -rf /tmp/wheelwarm"
@@ -180,7 +187,7 @@ if [[ $SEED_CARGO_TARGET -eq 1 ]]; then
     # needs a larger OS disk. Boot copies it onto the free local NVMe.
     log "8b/9  seeding compiled cargo target (large)"
     install -d -o "$COORD_USER" "$CARGO_TARGET_SEED"
-    as_coord "cd ~/src/code-coordinator/tui && CARGO_TARGET_DIR=$CARGO_TARGET_SEED cargo build || true"
+    as_coord "cd ~/src/coord-tui && CARGO_TARGET_DIR=$CARGO_TARGET_SEED cargo build || true"
     du -sh "$CARGO_TARGET_SEED" || true
 fi
 

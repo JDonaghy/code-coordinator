@@ -9,11 +9,6 @@ board_state.json
 agent_setup.json
 coordinator.yml
 
-# Rust build artifacts (coord-tui)
-tui/target/
-tui/*.err
-tui/*.out
-
 # scripts/coord-test-runner.sh scratch output, written into the worktree it
 # is pointed at. Harmless in the throwaway worktree the Test stage uses, but
 # a worker who runs the runner against its own checkout and then `git add -A`
@@ -32,11 +27,6 @@ tui/*.out
 .cargo-acceptance.out
 .fallback.out
 .coord-ci-home/
-
-# #1973: opt-in local quadraui path override (see
-# tui/cargo-config-local-quadraui.toml.example) — never commit a
-# machine-local co-development override.
-tui/.cargo/config.toml
 
 # scratch $HOME created inside disposable worktrees by the CI-mode
 # acceptance runner (scripts/coord-test-runner.sh) — never meant to

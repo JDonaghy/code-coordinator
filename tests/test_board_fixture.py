@@ -18,55 +18,76 @@ types, and they are already pinned int-vs-bool by the DTO-level assertion in
 tests/test_board_schema.py (`board_schema.INTEGER_BACKED_BOOLEANS`) — the
 text-scraping check had no remaining subject once that was true.
 
-What's left here is the fixture-freshness half, unrelated to the bool guard:
-  - test_board_sample_fixture_is_up_to_date: the committed
-    tui/tests/fixtures/board_sample.json must be byte-identical to what
-    scripts/gen_board_fixture.py produces right now, so the fixture can't
-    silently drift from the schema that generated it.
-  - test_board_sample_fixture_parses_as_representative_payload: sanity-checks
-    the same shape the Rust round-trip test asserts on.
+#2899 NARROWED WHAT'S LEFT, for the same structural reason and along the same
+lines #2897 narrowed tests/test_generated_rust_fixture.py.  The committed
+fixture moved to the coord-tui repo (`tests/fixtures/board_sample.json`,
+beside the Rust test that reads it), so the byte-comparison
+`test_board_sample_fixture_is_up_to_date` used to make has no subject in this
+checkout — there is nothing here to compare the generator's output against.
+That comparison did not disappear; it became coord-tui's own CI freshness
+gate, which installs `code-coordinator[server]` from PyPI, re-runs
+`scripts/gen_board_fixture.py --out`, and diffs against its committed copy —
+exactly the shape `generated.rs`'s drift gate has.
 
-The Rust side reads the identical committed fixture in
-tui/src/app/tests.rs::board_payload_deserializes_real_sample.
+What one checkout CAN still prove, and what stays here:
+  - test_board_sample_fixture_parses_as_representative_payload: the generator
+    runs and emits the shape the Rust round-trip asserts on, so a Python-side
+    regression is caught here rather than in coord-tui's suite.
+  - test_board_sample_fixture_destination_is_not_guessed: the generator
+    refuses to write anywhere unless told, so a coord-tui checkout is never
+    silently skipped and a freshness gate never passes vacuously.
+
+The Rust side reads the committed fixture in coord-tui's
+src/app/tests.rs::board_payload_deserializes_real_sample.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
+import pytest
+
+from scripts.gen_board_fixture import (
+    FIXTURE_ENV_VAR,
+    FIXTURE_RELPATH,
+    FixtureOutputPathError,
+    fixture_json_text,
+    resolve_fixture_path,
+)
 
 
-# ── Fixture freshness ────────────────────────────────────────────────────────
+# ── Where the fixture goes (#2899) ───────────────────────────────────────────
 
-def test_board_sample_fixture_is_up_to_date():
-    """The committed golden fixture must match the generator's current output.
+def test_board_sample_fixture_destination_is_not_guessed(monkeypatch) -> None:
+    """No `--out`, no `$COORD_TUI_SRC` → refuse, never guess.
 
-    Regenerate with `.venv/bin/python scripts/gen_board_fixture.py` after any
-    coord/db.py schema change that should be reflected in the fixture.
+    A guessed path here is worse than an error: coord-tui's freshness gate
+    diffs the generator's output against a committed file, so a generator that
+    quietly wrote somewhere else would make that gate pass vacuously.
     """
-    from scripts.gen_board_fixture import fixture_json_text
+    monkeypatch.delenv(FIXTURE_ENV_VAR, raising=False)
+    with pytest.raises(FixtureOutputPathError):
+        resolve_fixture_path()
 
-    assert FIXTURE_PATH.exists(), (
-        f"{FIXTURE_PATH} is missing — run "
-        "`.venv/bin/python scripts/gen_board_fixture.py` to generate it."
-    )
-    on_disk = FIXTURE_PATH.read_text()
-    regenerated = fixture_json_text()
-    assert on_disk == regenerated, (
-        "tui/tests/fixtures/board_sample.json is stale — regenerate it with "
-        "`.venv/bin/python scripts/gen_board_fixture.py` and commit the result."
-    )
+
+def test_board_sample_fixture_destination_is_relative_to_a_coord_tui_checkout(
+    monkeypatch, tmp_path
+) -> None:
+    """`$COORD_TUI_SRC` names a coord-tui CHECKOUT ROOT; the crate is at that
+    root since #2899, so the fixture lands at `<root>/tests/fixtures/`, with
+    no `tui/` prefix left over from the in-repo layout."""
+    monkeypatch.setenv(FIXTURE_ENV_VAR, str(tmp_path))
+    assert resolve_fixture_path() == tmp_path / FIXTURE_RELPATH
+    assert "tui" not in FIXTURE_RELPATH.parts
+    # An explicit --out still wins outright.
+    assert resolve_fixture_path(tmp_path / "elsewhere.json") == tmp_path / "elsewhere.json"
 
 
 def test_board_sample_fixture_parses_as_representative_payload():
     """Sanity-check the same shape the Rust round-trip test asserts on, so a
     Python-side regression in the generator is caught before it ever reaches
     the Rust suite."""
-    import json
-
-    payload = json.loads(FIXTURE_PATH.read_text())
+    payload = json.loads(fixture_json_text())
     assert payload["round_number"] == 3
     assert payload["assignments"], "fixture must carry at least one assignment"
     assert any(a.get("is_interactive") == 1 for a in payload["assignments"]), (

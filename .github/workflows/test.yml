@@ -31,17 +31,15 @@ jobs:
       # testpaths=["tests"]) was the one accidental gap. (ms-51 — Playwright,
       # never .py either — left this repo entirely with the webapp, #2009.)
       - run: pytest --ignore=tests/acceptance
-      # #2897: the Rust drift gate `tests/test_generated_rust_fixture.py`
-      # no longer byte-compares the committed `tui/src/app/types/generated.rs`
-      # (see docs/ADR_COORD_TUI_CI.md and the header comment further down
-      # this file) — this explicit step stands in for that comparison while
-      # `tui/` still lives here. `$COORD_TUI_SRC=.` names this checkout as
-      # the coord-tui root (`RUST_OUTPUT_RELPATH` keeps the `tui/` prefix for
-      # exactly this reason). One matrix leg only: the generator's output
-      # depends on `coord.serve_app.openapi_spec()`, not the Python version.
-      - name: python scripts/codegen.py --rust --check
-        if: matrix.python-version == '3.12'
-        run: COORD_TUI_SRC=. python scripts/codegen.py --rust --check
+      # #2899: the `COORD_TUI_SRC=. python scripts/codegen.py --rust --check`
+      # step that used to live here is GONE. It was #2897's explicit stand-in
+      # for the byte-comparison, held here only for as long as the crate did
+      # — that ADR (docs/ADR_COORD_TUI_CI.md) says in terms: "the day
+      # coord-tui gets its own checkout + CI, delete the step below (its
+      # replacement lives in that CI, installing `code-coordinator[server]`
+      # from PyPI exactly as `coord-web`'s does)". This is that day. There is
+      # no `generated.rs` in this checkout to compare against, so the step
+      # could only fail or — worse — pass vacuously.
       # #2180: the cli-pytest sealed route (acceptance.drivers routes
       # "coord/**" -> cli-pytest -> tests/acceptance/ms-37) run through the
       # #2164 CI wrapper instead of a raw `pytest tests/acceptance` call, so
@@ -321,24 +319,21 @@ jobs:
   # for it to run against, and a job that installs Node to build nothing is
   # how the previous `acceptance`-on-every-push waste (#2389) started.
   #
-  # #1941/#2897: `scripts/codegen.py` also generates coord-tui's RUST wire
-  # types (`--rust`). #2897 gave that half the SAME cross-repo shape as the
-  # TS half above (`--out PATH` / `$COORD_TUI_SRC`, no fallback default,
-  # docs/ADR_COORD_TUI_CI.md) — but `tui/` has not actually moved out of
-  # this repo yet, so unlike the TS byte-comparison (which is now
-  # exclusively `coord-web`'s CI job), the Rust byte-comparison has nowhere
-  # else to run yet and stays HERE, as an explicit step below rather than a
-  # pytest test:
+  # #1941/#2897/#2899: `scripts/codegen.py` also generates coord-tui's RUST
+  # wire types (`--rust`). #2897 gave that half the SAME cross-repo shape as
+  # the TS half above (`--out PATH` / `$COORD_TUI_SRC`, no fallback default,
+  # docs/ADR_COORD_TUI_CI.md), and #2899 moved the crate out — so the Rust
+  # byte-comparison is now, exactly like the TS one, EXCLUSIVELY the
+  # downstream repo's CI job. coord-tui's `.github/workflows/codegen.yml`
+  # installs `code-coordinator[server]` from PyPI and runs
+  # `COORD_TUI_SRC=. python -m ... codegen --rust --check` against its own
+  # committed `src/app/types/generated.rs`.
   #
-  #     COORD_TUI_SRC=. python scripts/codegen.py --rust --check
-  #
-  # `tests/test_generated_rust_fixture.py` itself is narrowed to what one
+  # Nothing about that gate can run here: this checkout has no `generated.rs`
+  # to compare against. What stays is
+  # `tests/test_generated_rust_fixture.py`, narrowed by #2897 to what one
   # checkout can prove — the generator runs and covers every schema — same
-  # as `tests/test_generated_types_fixture.py`; it no longer byte-compares
-  # the committed `tui/src/app/types/generated.rs`. The day coord-tui gets
-  # its own checkout + CI, delete the step below (its replacement lives in
-  # that CI, installing `code-coordinator[server]` from PyPI exactly as
-  # `coord-web`'s does) — no pytest file to un-narrow.
+  # as `tests/test_generated_types_fixture.py`.
   #
   # The consumer-side INTEGER-backed-bool text-scraping guard
   # (`coord/board_bool_guard.py`) that used to also read Rust source text
