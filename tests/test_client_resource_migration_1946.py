@@ -328,6 +328,9 @@ def test_reads_use_the_resource_gets_not_the_rpc_projections(thin_client, rw_db)
 
     assert state.get_issue_test_mode("api", ISSUE) == "smoke"
     assert state.get_test_plan(AID) == {"steps": ["a"], "blockers": []}
+    assert state.get_issue_test_mode("api", 999) is None, (
+        "an unknown issue is not a policy"
+    )
     for _method, path in thin_client.seen:
         assert path not in ("/issue-test-mode", "/assignment-test-plan"), (
             "#1946: the deprecated read projections must no longer be called"

@@ -4792,7 +4792,18 @@ def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
 
             row = fetch_issue(svc, repo_name, issue_number)
             if row is not None:
-                return test_mode_from_labels(row.get("labels"))
+                labels = row.get("labels")
+                if isinstance(labels, str):
+                    # #1849 types this `list[str]` on the wire, but the column
+                    # underneath is JSON TEXT. Decode defensively: handed a raw
+                    # string, `test_mode_from_labels` iterates it CHARACTERWISE
+                    # and quietly answers None — which reads as "no policy set"
+                    # and would auto-dispatch a headless smoke test for an issue
+                    # explicitly labeled `test-mode:smoke`. That is the #906 bug
+                    # this function exists to prevent, so it must not come back
+                    # through a shape mismatch.
+                    labels = json.loads(labels or "[]")
+                return test_mode_from_labels(labels)
         except Exception:  # noqa: BLE001 — fail-open; caller respects auto_queue
             _log.warning(
                 "#906: get_issue_test_mode: daemon read failed for %s#%s, using local",

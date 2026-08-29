@@ -140,6 +140,27 @@ def test_get_issue_test_mode_ignores_garbage_daemon_value(monkeypatch, coord_db)
     assert get_issue_test_mode("api", 1) is None
 
 
+def test_get_issue_test_mode_decodes_json_string_labels(monkeypatch, coord_db) -> None:
+    """A daemon serving `labels` as raw JSON TEXT still yields the policy.
+
+    #1946: handed a *string*, `test_mode_from_labels` iterates it
+    characterwise and answers None — indistinguishable from "no label set",
+    which is exactly the silent auto-dispatch #906 exists to prevent. So the
+    shape is normalised before the derivation rather than trusted.
+    """
+    import json
+
+    from coord.state import get_issue_test_mode
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc, "fetch_issue",
+        lambda *a, **k: {"labels": json.dumps(["coord", "test-mode:smoke"])},
+    )
+
+    assert get_issue_test_mode("api", 287) == "smoke"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # update_assignment_claude_session_id / get_test_plan /
 # set_assignment_failure_reason: daemon-routing paths
