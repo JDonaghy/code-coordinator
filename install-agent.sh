@@ -36,6 +36,9 @@ echo "=== code-coordinator agent installer ==="
 python3 --version | grep -qE "3\.(1[2-9]|[2-9][0-9])" || {
     echo "error: Python 3.12+ required"; exit 1
 }
+# Used later to size the apt hint if `python3 -m venv` fails; failure here
+# just means the hint falls back to the unversioned package name.
+PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "")
 
 # Check claude CLI
 which claude >/dev/null 2>&1 || {
@@ -44,11 +47,49 @@ which claude >/dev/null 2>&1 || {
 }
 
 # Create/update venv
-if [ -d "$VENV_DIR" ]; then
+#
+# #2911: a first run that fails partway (e.g. Ubuntu 24.04 shipping python3
+# without ensurepip) can leave $VENV_DIR existing with a bin/ that has
+# python3 but no pip. Trusting `-d "$VENV_DIR"` alone then skips
+# `python3 -m venv` on retry and the script dies later at
+# "$VENV_DIR/bin/pip: No such file or directory" - a message that names pip,
+# not the actual problem. Validate the venv is actually usable instead of
+# just present, and recreate it if not. Also trap failures so a venv this
+# run itself created (but never finished installing into) doesn't poison
+# the next retry either.
+CREATED_VENV=0
+on_exit() {
+    local status=$?
+    if [ "$status" -ne 0 ] && [ "$CREATED_VENV" -eq 1 ] && [ -d "$VENV_DIR" ]; then
+        echo "" >&2
+        echo "install failed - removing the venv this run created at $VENV_DIR" >&2
+        echo "so the next attempt starts clean instead of finding a partial one." >&2
+        rm -rf "$VENV_DIR"
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+
+if [ -d "$VENV_DIR" ] && [ -x "$VENV_DIR/bin/pip" ]; then
     echo "Updating existing installation at $VENV_DIR..."
 else
+    if [ -d "$VENV_DIR" ]; then
+        echo "Existing $VENV_DIR has no bin/pip (partial or failed install) - recreating..."
+        rm -rf "$VENV_DIR"
+    fi
     echo "Creating virtual environment at $VENV_DIR..."
-    python3 -m venv "$VENV_DIR"
+    CREATED_VENV=1
+    if ! python3 -m venv "$VENV_DIR"; then
+        echo "" >&2
+        echo "error: 'python3 -m venv' failed to create $VENV_DIR." >&2
+        echo "  On Debian/Ubuntu this usually means venv/ensurepip support isn't installed:" >&2
+        if [ -n "$PY_VERSION" ]; then
+            echo "    sudo apt install python3-venv python${PY_VERSION}-venv" >&2
+        else
+            echo "    sudo apt install python3-venv" >&2
+        fi
+        exit 1
+    fi
 fi
 
 # Install/upgrade
