@@ -62,9 +62,10 @@ class TestReopenIssueRouting:
         captured: dict = {}
         monkeypatch.setattr(
             cc,
-            "post_record",
-            lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-            or {"updated": True},
+            "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"updated": True},
         )
 
         def _boom(*a, **k):
@@ -73,8 +74,9 @@ class TestReopenIssueRouting:
         monkeypatch.setattr("coord.github_ops.reopen_issue", _boom)
 
         state.reopen_issue("api", 42, comment="my bad", repo_github="acme/api")
-        assert captured["path"] == "/issue-reopen"
-        assert captured["payload"]["issue_number"] == 42
+        # #1946: was POST /issue-reopen.
+        assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/42")
+        assert captured["payload"]["state"] == "open"
         assert captured["payload"]["comment"] == "my bad"
         assert captured["payload"]["repo_github"] == "acme/api"
 

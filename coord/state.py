@@ -37,6 +37,13 @@ from coord._board_mapping import (
 )
 from coord.audit import record_audit as _record_audit
 from coord.board_service import resolve as _board_service_resolve
+# #1946: the resource-shaped routes (#1944) are now the client's first choice;
+# `_route_write` stays for the ~30 RPC endpoints that have no resource
+# counterpart, and is what the three `_route_*` helpers fall back to when the
+# daemon on the other end predates #1944.
+from coord.board_service import route_assignment_patch as _route_assignment_patch
+from coord.board_service import route_issue_comment as _route_issue_comment
+from coord.board_service import route_issue_patch as _route_issue_patch
 from coord.board_service import route_write as _route_write
 from coord.db import get_connection, is_lock_contention_error, retry_on_locked
 from coord.models import (
@@ -2614,8 +2621,9 @@ def update_assignment_smoke_tests(
     if not assignment_id:
         return
     svc = _board_service()
-    resp = _route_write(
-        svc, "/assignment-usage", {"assignment_id": assignment_id, "smoke_tests": smoke_tests}
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"smoke_tests": smoke_tests},
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -2655,8 +2663,9 @@ def update_assignment_completion_summary(
     if not assignment_id or not summary:
         return
     svc = _board_service()
-    resp = _route_write(
-        svc, "/assignment-usage", {"assignment_id": assignment_id, "completion_summary": summary}
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"completion_summary": summary},
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -2701,10 +2710,11 @@ def update_assignment_claude_session_id(
         return
     svc = _board_service()
     try:
-        resp = _route_write(
+        resp = _route_assignment_patch(
             svc,
-            "/assignment-session-id",
-            {"assignment_id": assignment_id, "claude_session_id": claude_session_id},
+            assignment_id,
+            {"claude_session_id": claude_session_id},
+            rpc_endpoint="/assignment-session-id",
         )
     except Exception as _e:  # noqa: BLE001
         import httpx as _httpx  # noqa: PLC0415
@@ -2747,8 +2757,9 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     if not assignment_id:
         return
     svc = _board_service()
-    resp = _route_write(
-        svc, "/assignment-usage", {"assignment_id": assignment_id, "cost_usd": cost_usd}
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"cost_usd": cost_usd},
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -3060,17 +3071,17 @@ def update_assignment_tokens(
     if total <= 0 and num_turns <= 0:
         return
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_assignment_patch(
         svc,
-        "/assignment-usage",
+        assignment_id,
         {
-            "assignment_id": assignment_id,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_tokens": cache_creation_tokens,
             "cache_read_tokens": cache_read_tokens,
             "num_turns": num_turns,
         },
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -3151,10 +3162,9 @@ def update_assignment_stop_reason(assignment_id: str, stop_reason: str) -> None:
     if not assignment_id or not stop_reason:
         return
     svc = _board_service()
-    resp = _route_write(
-        svc,
-        "/assignment-usage",
-        {"assignment_id": assignment_id, "stop_reason": stop_reason},
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"stop_reason": stop_reason},
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -3190,8 +3200,9 @@ def mark_assignment_interactive(assignment_id: str) -> None:
     if not assignment_id:
         return
     svc = _board_service()
-    resp = _route_write(
-        svc, "/assignment-usage", {"assignment_id": assignment_id, "is_interactive": True}
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"is_interactive": True},
+        rpc_endpoint="/assignment-usage",
     )
     if resp is not None:
         return
@@ -3252,31 +3263,38 @@ def get_test_plan(assignment_id: str) -> dict | None:
     Returns ``None`` when the row doesn't exist, the column is NULL
     (plan not yet generated), or the stored JSON is malformed.
 
-    **Daemon-aware (#906):** routes to ``GET /assignment-test-plan`` when a
-    ``board_service`` is configured so a thin client (e.g. running
-    ``--smoke-of`` for a local checkout but with the canonical DB on the
-    daemon) reads the real cached plan rather than returning None from an
-    empty local DB.  Fails-OPEN on error (returns None and lets the smoke
-    briefing fall back to "no plan found").
+    **Daemon-aware (#906):** reads from the daemon when a ``board_service`` is
+    configured so a thin client (e.g. running ``--smoke-of`` for a local
+    checkout but with the canonical DB on the daemon) reads the real cached
+    plan rather than returning None from an empty local DB.  Fails-OPEN on
+    error (returns None and lets the smoke briefing fall back to "no plan
+    found").
+
+    **#1946:** that read is now ``GET /assignment/{id}``, whose row already
+    carries ``test_plan`` — the deprecated ``POST /assignment-test-plan`` was
+    only ever a one-field projection of it, which is why #1944 gave it a
+    pointer rather than a PATCH shape.  ``fetch_assignment`` returns ``None``
+    on 404, which here means both "unknown assignment" and "daemon predates
+    the endpoint"; both fall through to the local read, exactly as the old
+    fail-open path did.
     """
     if not assignment_id:
         return None
     svc = _board_service()
     if svc is not None:
         try:
-            from coord.client import post_record  # noqa: PLC0415
+            from coord.client import fetch_assignment  # noqa: PLC0415
 
-            resp = post_record(
-                svc, "/assignment-test-plan", {"assignment_id": assignment_id}
-            )
-            raw = resp.get("test_plan")
-            if not raw:
-                return None
-            try:
-                value = json.loads(raw) if isinstance(raw, str) else raw
-            except (json.JSONDecodeError, TypeError):
-                return None
-            return value if isinstance(value, dict) else None
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                raw = row.get("test_plan")
+                if not raw:
+                    return None
+                try:
+                    value = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                return value if isinstance(value, dict) else None
         except Exception:  # noqa: BLE001 — fail-open; smoke briefing handles None
             _log.warning(
                 "#906: get_test_plan: daemon read failed for %s, using local",
@@ -3334,10 +3352,15 @@ def set_assignment_failure_reason(assignment_id: str, reason: str) -> None:
         return
     svc = _board_service()
     try:
-        resp = _route_write(
+        resp = _route_assignment_patch(
             svc,
-            "/assignment-failure-reason",
-            {"assignment_id": assignment_id, "reason": reason},
+            assignment_id,
+            # The resource route names this field `failure_reason`; the RPC
+            # route it falls back to still calls it `reason`, so the fallback
+            # payload is spelled out rather than derived from the patch.
+            {"failure_reason": reason},
+            rpc_endpoint="/assignment-failure-reason",
+            rpc_payload={"assignment_id": assignment_id, "reason": reason},
         )
     except Exception as _e:  # noqa: BLE001
         import httpx as _httpx  # noqa: PLC0415
@@ -4446,10 +4469,15 @@ def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) ->
     table and the TUI Pipeline (which reads it) wouldn't reflect the move.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-labels",
-        {"repo_name": repo_name, "issue_number": issue_number, "labels": labels},
+        repo_name,
+        issue_number,
+        {"labels": labels},
+        rpc_endpoint="/issue-labels",
+        rpc_payload={
+            "repo_name": repo_name, "issue_number": issue_number, "labels": labels,
+        },
     )
     if resp is not None:
         return bool(resp.get("updated"))
@@ -4534,19 +4562,35 @@ def apply_issue_labels(
 ) -> tuple[list[str], bool]:
     """Add and/or remove arbitrary labels on an issue through the seam (#802).
 
-    Routes to the daemon (``POST /issue-label``) when ``board_service`` is
-    set, else writes locally. Returns ``(new_labels, changed)`` where
-    ``changed`` is ``True`` when at least one label was added or removed.
+    Routes to the daemon (``PATCH /issue/{repo}/{n}`` since #1946, falling
+    back to ``POST /issue-label`` against a daemon that predates #1944) when
+    ``board_service`` is set, else writes locally. Returns
+    ``(new_labels, changed)`` where ``changed`` is ``True`` when at least one
+    label was added or removed.
 
     Tolerates already-present ``add`` labels and already-absent ``remove``
     labels (idempotent — no error raised). Updates the local ``issues``
     cache so the TUI reflects the change without waiting for ``coord sync``.
+
+    With *both* sets empty the resource route applies no label mutation and so
+    reports no label set, and this returns ``([], False)`` rather than
+    ``(current_labels, False)``. No caller reads ``new_labels`` when
+    ``changed`` is false, and both CLI entry points reject an empty
+    add+remove before reaching here, so the two are interchangeable — but the
+    ``changed`` half, which callers *do* branch on, is identical either way.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-label",
+        repo_name,
+        issue_number,
         {
+            "add_labels": sorted(add),
+            "remove_labels": sorted(remove),
+            "repo_github": repo_github,
+        },
+        rpc_endpoint="/issue-label",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "add": sorted(add),
@@ -4555,7 +4599,12 @@ def apply_issue_labels(
         },
     )
     if resp is not None:
-        return resp.get("labels", []), bool(resp.get("changed"))
+        # `labels`/`labels_changed` on the resource route, `labels`/`changed`
+        # on the RPC one; read both so a deploy-lag fallback is invisible here.
+        changed = resp.get("labels_changed")
+        if changed is None:
+            changed = resp.get("changed")
+        return resp.get("labels") or [], bool(changed)
     return _apply_issue_labels_local(
         repo_name, issue_number,
         add=add, remove=remove,
@@ -4715,8 +4764,8 @@ def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
     ``github_ops.set_test_mode_label``, so the value is fresh whenever the TUI
     has dispatched a headless session after #685.
 
-    **Daemon-aware (#906):** routes to ``POST /issue-test-mode`` when a
-    ``board_service`` is configured.  This function's caller,
+    **Daemon-aware (#906):** reads from the daemon when a ``board_service`` is
+    configured.  This function's caller,
     ``coord.reconcile.reconcile()`` (not the similarly-named, genuinely
     daemon-tick-only ``reconcile_completed_assignments()`` — an earlier
     version of this docstring conflated the two), is reached unconditionally
@@ -4726,19 +4775,24 @@ def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
     auto-dispatch a headless smoke test for an issue explicitly labeled
     ``test-mode:smoke``. Fails-OPEN on error (returns ``None``, same as "no
     label set" — matches pre-#906 local-DB-miss behaviour).
+
+    **#1946:** that read is now ``GET /issue/{repo}/{n}`` plus
+    :func:`coord.models.test_mode_from_labels`, replacing the deprecated
+    ``POST /issue-test-mode``.  The policy is *derived from labels* in exactly
+    one place (#2024) — moving the derivation client-side keeps it that way
+    rather than adding a second reading of the same labels on the wire, which
+    is why #1944 pointed this route at the resource GET instead of giving it
+    a PATCH shape.  A ``None`` row (unknown issue, or a daemon predating the
+    endpoint) falls through to the local read, same as the old fail-open path.
     """
     svc = _board_service()
     if svc is not None:
         try:
-            from coord.client import post_record  # noqa: PLC0415
+            from coord.client import fetch_issue  # noqa: PLC0415
 
-            resp = post_record(
-                svc,
-                "/issue-test-mode",
-                {"repo_name": repo_name, "issue_number": issue_number},
-            )
-            value = resp.get("test_mode")
-            return value if value in ("auto", "smoke") else None
+            row = fetch_issue(svc, repo_name, issue_number)
+            if row is not None:
+                return test_mode_from_labels(row.get("labels"))
         except Exception:  # noqa: BLE001 — fail-open; caller respects auto_queue
             _log.warning(
                 "#906: get_issue_test_mode: daemon read failed for %s#%s, using local",
@@ -4790,10 +4844,13 @@ def edit_issue_content(
     Returns True when something was written, False on a no-op (no fields given).
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-edit",
-        {
+        repo_name,
+        issue_number,
+        {"title": title, "body": body, "repo_github": repo_github},
+        rpc_endpoint="/issue-edit",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "title": title,
@@ -4963,10 +5020,22 @@ def assign_issue_milestone(
     cache can be fully populated).
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-milestone",
+        repo_name,
+        issue_number,
         {
+            # `milestone` is both the assign and the clear field: an explicit
+            # None CLEARS (that is `unassign_issue_milestone`'s payload), so
+            # this relies on the declared `milestone_number: int` — every
+            # caller resolves a real number first (`coord milestone assign`
+            # looks the milestone up before calling here).
+            "milestone": milestone_number,
+            "milestone_title": milestone_title,
+            "repo_github": repo_github,
+        },
+        rpc_endpoint="/issue-milestone",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "milestone_number": milestone_number,
@@ -5048,10 +5117,15 @@ def unassign_issue_milestone(
     change on its next refresh without waiting for ``coord sync``.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-milestone-remove",
-        {
+        repo_name,
+        issue_number,
+        # An explicit `null` is what CLEARS the milestone; omitting the key
+        # would mean "leave it alone" (rest_schema: absent is not null).
+        {"milestone": None, "repo_github": repo_github},
+        rpc_endpoint="/issue-milestone-remove",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "repo_github": repo_github,
@@ -5118,11 +5192,12 @@ def close_issue(
     """Close an issue through the issue-tracker seam (#1003, mirrors
     ``edit_issue_content``).
 
-    Routes to the daemon (``POST /issue-close``) when ``board_service`` is
-    set, else writes locally. The actual TRACKER write (GitHub via ``gh``
-    today) lives in the ``_local`` impl, so the backend stays behind one
-    seam — the "Close / archive plan" Plans-panel action never calls raw
-    ``gh``.
+    Routes to the daemon (``PATCH /issue/{repo}/{n}`` with ``state:
+    "closed"`` since #1946, falling back to ``POST /issue-close`` against a
+    daemon that predates #1944) when ``board_service`` is set, else writes
+    locally. The actual TRACKER write (GitHub via ``gh`` today) lives in the
+    ``_local`` impl, so the backend stays behind one seam — the "Close /
+    archive plan" Plans-panel action never calls raw ``gh``.
 
     #1196: *force* threads through to ``github_ops.close_issue``'s
     open-children guard — ``False`` (the default) refuses to close an issue
@@ -5136,18 +5211,29 @@ def close_issue(
     """
     svc = _board_service()
     if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
         from coord.github_ops import IssueHasOpenChildrenError  # noqa: PLC0415
         import httpx  # noqa: PLC0415
 
         try:
-            post_record(svc, "/issue-close", {
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-                "comment": comment,
-                "repo_github": repo_github,
-                "force": force,
-            })
+            _route_issue_patch(
+                svc,
+                repo_name,
+                issue_number,
+                {
+                    "state": "closed",
+                    "comment": comment,
+                    "repo_github": repo_github,
+                    "force": force,
+                },
+                rpc_endpoint="/issue-close",
+                rpc_payload={
+                    "repo_name": repo_name,
+                    "issue_number": issue_number,
+                    "comment": comment,
+                    "repo_github": repo_github,
+                    "force": force,
+                },
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 409:
                 try:
@@ -5209,10 +5295,13 @@ def comment_on_issue(
     for an open issue.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_comment(
         svc,
-        "/issue-comment",
-        {
+        repo_name,
+        issue_number,
+        {"action": "post", "body": body, "repo_github": repo_github},
+        rpc_endpoint="/issue-comment",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "body": body,
@@ -5263,10 +5352,13 @@ def reopen_issue(
     Idempotent — reopening an already-open issue is a no-op.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_patch(
         svc,
-        "/issue-reopen",
-        {
+        repo_name,
+        issue_number,
+        {"state": "open", "comment": comment, "repo_github": repo_github},
+        rpc_endpoint="/issue-reopen",
+        rpc_payload={
             "repo_name": repo_name,
             "issue_number": issue_number,
             "comment": comment,
@@ -5497,12 +5589,30 @@ def record_issue_comment_capture(
     Best-effort by design: the caller (``github_ops.post_issue_comment``)
     already wraps this in a try/except, but a DB error here still must never
     propagate back out as a failure of the (already-successful) GitHub post.
+
+    **#1946 — the one seam that does NOT migrate.** Its caller passes the
+    ``gh --repo`` slug (``owner/repo``) as *repo_name*, because
+    ``issue_comments`` is keyed that way while ``issues`` is keyed on
+    ``coordinator.yml``'s short ``name:``.  A slash cannot be a path segment
+    on ``POST /issue/{repo_name}/{n}/comments``, so this keeps using
+    ``/issue-comments`` — see
+    :func:`coord.board_service.resource_addressable`.  #1947 must not read
+    that route's residual telemetry as "some client failed to migrate".
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_comment(
         svc,
-        "/issue-comments",
+        repo_name,
+        issue_number,
         {
+            "action": "capture",
+            "body": body,
+            "gh_comment_id": gh_comment_id,
+            "author": author,
+            "created_at": created_at,
+        },
+        rpc_endpoint="/issue-comments",
+        rpc_payload={
             "action": "capture",
             "repo_name": repo_name,
             "issue_number": issue_number,
@@ -5631,10 +5741,13 @@ def sync_issue_comments(
     Returns the number of comments processed.
     """
     svc = _board_service()
-    resp = _route_write(
+    resp = _route_issue_comment(
         svc,
-        "/issue-comments",
-        {
+        repo_name,
+        issue_number,
+        {"action": "sync", "repo_github": repo_github},
+        rpc_endpoint="/issue-comments",
+        rpc_payload={
             "action": "sync",
             "repo_name": repo_name,
             "issue_number": issue_number,

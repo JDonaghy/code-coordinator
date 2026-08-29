@@ -122,6 +122,24 @@ def _no_board_service(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_resource_route_support():
+    """#1946: forget which daemons support the resource routes between tests.
+
+    ``coord.board_service`` memoizes, per (daemon url, route), whether a
+    resource route answered 404/405 — i.e. whether that daemon predates
+    #1944 — so a thin client pays the doomed round trip once instead of on
+    every write.  The memo is module-level, so without this a test that
+    exercises the deploy-lag fallback would silently un-migrate every later
+    test that reuses the same fake daemon URL.
+    """
+    from coord import board_service
+
+    board_service.reset_resource_route_support()
+    yield
+    board_service.reset_resource_route_support()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_webapp_bundle(monkeypatch, tmp_path):
     """#2009: never let the HOST's live webapp bundle change a test's answer.
 

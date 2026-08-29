@@ -111,9 +111,10 @@ class TestUnassignIssueMilestoneRouting:
         captured: dict = {}
         monkeypatch.setattr(
             cc,
-            "post_record",
-            lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-            or {"updated": True},
+            "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"updated": True},
         )
 
         def _boom(*a, **k):
@@ -122,8 +123,11 @@ class TestUnassignIssueMilestoneRouting:
         monkeypatch.setattr("coord.github_ops.unassign_issue_milestone", _boom)
 
         state.unassign_issue_milestone("api", 42, repo_github="acme/api")
-        assert captured["path"] == "/issue-milestone-remove"
-        assert captured["payload"]["issue_number"] == 42
+        # #1946: was POST /issue-milestone-remove. An explicit null milestone
+        # is what CLEARS it — omitting the key would mean "leave it alone".
+        assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/42")
+        assert "milestone" in captured["payload"]
+        assert captured["payload"]["milestone"] is None
         assert captured["payload"]["repo_github"] == "acme/api"
 
     def test_local_path_calls_github_ops_and_clears_cache(
@@ -174,9 +178,10 @@ class TestCloseIssueRouting:
         captured: dict = {}
         monkeypatch.setattr(
             cc,
-            "post_record",
-            lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-            or {"updated": True},
+            "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"updated": True},
         )
 
         def _boom(*a, **k):
@@ -185,8 +190,9 @@ class TestCloseIssueRouting:
         monkeypatch.setattr("coord.github_ops.close_issue", _boom)
 
         state.close_issue("api", 42, comment="done", repo_github="acme/api")
-        assert captured["path"] == "/issue-close"
-        assert captured["payload"]["issue_number"] == 42
+        # #1946: was POST /issue-close.
+        assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/42")
+        assert captured["payload"]["state"] == "closed"
         assert captured["payload"]["comment"] == "done"
         assert captured["payload"]["repo_github"] == "acme/api"
 
@@ -235,8 +241,11 @@ class TestCloseIssueRouting:
             cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
         )
 
-        def _raise_409(svc, path, payload, **kw):
-            request = httpx.Request("POST", "http://d:7435/issue-close")
+        # #1946: the refusal now comes off PATCH /issue/{repo}/{n}. A 409 is
+        # NOT a "this daemon predates #1944" signal (only 404/405 are), so it
+        # must propagate rather than silently falling back to the RPC route.
+        def _raise_409(svc, method, path, payload=None, **kw):
+            request = httpx.Request(method, f"http://d:7435{path}")
             response = httpx.Response(
                 409,
                 json={"error": "open children", "detail": "refusing to close: open children #1039"},
@@ -244,7 +253,11 @@ class TestCloseIssueRouting:
             )
             raise httpx.HTTPStatusError("409", request=request, response=response)
 
-        monkeypatch.setattr(cc, "post_record", _raise_409)
+        monkeypatch.setattr(cc, "request_resource", _raise_409)
+        monkeypatch.setattr(
+            cc, "post_record",
+            lambda *a, **k: pytest.fail("a 409 must not fall back to the RPC route"),
+        )
 
         with pytest.raises(IssueHasOpenChildrenError, match="open children #1039"):
             state.close_issue("api", 1041, repo_github="acme/api")
