@@ -21,11 +21,22 @@ Two layers, matching the two ways this can regress:
   binaries, and `verify-assets` must not fail for their absence (#2898's
   acceptance criterion 1).
 
-  coord-tui's workflow is staged at ``tui/.github/workflows/release-tui.yml``
-  — inside ``tui/``, NOT the repo root's ``.github/workflows/`` — so GitHub
-  never reads it here (it is inert, and cannot race publish.yml) and #2894's
-  move story carries it across with the crate.  These tests read it from that
-  staged path on purpose: an inert file is exactly the kind that rots.
+  #2899 (phase 4) then RAN that move.  ``release-tui.yml`` was staged at
+  ``tui/.github/workflows/release-tui.yml`` — inert here, because GitHub only
+  reads workflows from the repo root — precisely so the ``tui/`` split would
+  carry it into coord-tui, and it left with the crate.  Every assertion this
+  file used to make *about that workflow's contents* (its own ``v*`` trigger,
+  its per-target asset check, its tag-is-on-main guard) is now coord-tui's
+  CI's business about a file in coord-tui's repo, on the same reasoning
+  tests/test_ci_acceptance_gate_1950.py retired the tui CI-gate assertions.
+
+  What stays here is the half this repo can still see, and it is the half
+  #1242 was actually about: publish.yml owns this repo's ``v*`` tag alone,
+  creates exactly one Release, and no ``release-tui.yml`` exists anywhere in
+  this repo to race it.  Plus the handoff itself —
+  ``scripts/extract-coord-tui.sh`` must *verify* the workflow arrived, since
+  that is the one moment this repo can prove the moved assertions still have
+  a subject.
 
   This is a grep-shaped test on purpose (cf. tests/test_ci_acceptance_gate_1950.py):
   you cannot run GitHub Actions in pytest, and the failure mode being guarded
@@ -55,10 +66,13 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 PUBLISH_YML = WORKFLOW_DIR / "publish.yml"
-# #2898: staged inside `tui/`, not the repo root's `.github/workflows/`.
-# GitHub only reads workflows from the root, so this one is inert here and
-# travels with the crate when #2894's move story runs.
-RELEASE_TUI_YML = REPO_ROOT / "tui" / ".github" / "workflows" / "release-tui.yml"
+# #2898 staged release-tui.yml inside `tui/`; #2899 ran the split, so it is
+# gone from this repo entirely and lives in coord-tui's own
+# `.github/workflows/`. Nothing here may read it — these two paths are what
+# this repo asserts about it now: that it is absent, and that the extraction
+# checks it arrived.
+RELEASE_TUI_BASENAME = "release-tui.yml"
+EXTRACT_SCRIPT = REPO_ROOT / "scripts" / "extract-coord-tui.sh"
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_release_wheel.py"
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -136,52 +150,80 @@ class TestSplitReleaseChannels:
             "resolve or resurrect the fused channel."
         )
 
-    def test_the_tui_workflow_fires_on_its_own_tag_push(self) -> None:
-        """#2898 undoes #1242's `workflow_call`. The race that arrangement
-        existed to stop needed TWO workflows sharing ONE Release; two repos
-        with two tag namespaces have nothing to race over — and a caller in
-        another repo could not hand this one a tag from its own history
-        anyway."""
-        tui_triggers = _triggers(_load(RELEASE_TUI_YML))
-        assert tui_triggers.get("push", {}).get("tags") == ["v*"], (
-            "release-tui.yml must fire on its own `v*` push in coord-tui's "
-            f"repo; triggers are {sorted(tui_triggers)}"
-        )
-        assert "workflow_call" not in tui_triggers, (
-            "release-tui.yml is still a reusable workflow (#1242's "
-            "arrangement). Nothing can call it any more — publish.yml lives "
-            "in a different repo — so it would simply never run."
-        )
-        assert "workflow_dispatch" in tui_triggers, (
-            "the standalone dry run must survive the split: it is the only way "
-            "to exercise build+stamp+verify without cutting a real Release"
-        )
+    def test_no_release_tui_workflow_survives_anywhere_in_this_repo(self) -> None:
+        """#2899: the workflow left with the crate, and must not come back.
 
-    def test_the_tui_workflow_is_staged_outside_this_repos_workflow_dir(self) -> None:
-        """It must NOT be readable by GitHub here — a `v*` tag in this repo
-        would otherwise trigger it, rebuilding the very binaries #2898 removed
-        from this channel and racing publish.yml for this repo's Release."""
-        assert RELEASE_TUI_YML.exists(), f"{RELEASE_TUI_YML} is missing"
-        assert not (WORKFLOW_DIR / "release-tui.yml").exists(), (
-            "release-tui.yml is back in the repo root's .github/workflows/, "
-            "where GitHub WILL run it on this repo's `v*` tags"
-        )
+        Two distinct hazards, one assertion each. In the repo root's
+        `.github/workflows/` GitHub WOULD run it, on this repo's `v*` tags —
+        rebuilding the very binaries #2898 removed from this channel and
+        racing publish.yml for this repo's Release. Anywhere ELSE in the tree
+        it is inert, which is worse in a slower way: a second, unread copy of
+        coord-tui's release process that drifts from the real one and that
+        somebody eventually "restores".
+        """
         live = sorted(p.name for p in WORKFLOW_DIR.glob("*.yml"))
-        assert "release-tui.yml" not in live, live
+        assert RELEASE_TUI_BASENAME not in live, (
+            f"{RELEASE_TUI_BASENAME} is back in the repo root's "
+            f".github/workflows/, where GitHub WILL run it on this repo's "
+            f"`v*` tags: {live}"
+        )
+        strays = [
+            str(p.relative_to(REPO_ROOT))
+            for p in REPO_ROOT.rglob(RELEASE_TUI_BASENAME)
+            if ".git/" not in str(p)
+        ]
+        assert strays == [], (
+            f"{RELEASE_TUI_BASENAME} still exists in this repo ({strays}). "
+            "It moved to coord-tui in #2899; a copy left here is a second "
+            "release process nobody runs and nobody updates."
+        )
 
-    def test_exactly_one_step_creates_a_github_release_per_channel(self) -> None:
-        """#1242's invariant, generalised. Each channel needs exactly one
-        release-creating step: two in one repo is the upsert race, zero means
-        the channel publishes nothing at all — and for coord-tui that would
-        leave `coord tui update`'s resolution source permanently empty."""
-        for label, path in (("publish.yml", PUBLISH_YML), ("release-tui.yml", RELEASE_TUI_YML)):
-            steps = _steps_using(_load(path), "softprops/action-gh-release")
-            assert len(steps) == 1, (
-                f"{label} has {len(steps)} release-creating step(s) "
-                f"({[j for j, _ in steps]}); each channel needs exactly one"
-            )
-            _, step = steps[0]
-            assert step["with"].get("generate_release_notes") is True, label
+    def test_the_extraction_verifies_the_release_workflow_came_along(self) -> None:
+        """The handoff, which is all this repo can still prove.
+
+        The assertions this class used to make about release-tui.yml's
+        contents (its own `v*` trigger, its per-target asset completeness
+        check, its tag-is-on-main guard) are coord-tui's CI's business now —
+        same reasoning tests/test_ci_acceptance_gate_1950.py retired the tui
+        CI-gate assertions when the gate moved. What must not be lost is that
+        the file ARRIVES: a split that silently dropped it would leave
+        coord-tui with no release channel at all, and `coord tui update`'s
+        resolution source permanently empty, with nothing red anywhere.
+        `scripts/extract-coord-tui.sh` is the one place that can catch it.
+        """
+        body = EXTRACT_SCRIPT.read_text()
+        checks = [
+            line for line in body.splitlines()
+            if line.lstrip().startswith("check ") and RELEASE_TUI_BASENAME in line
+        ]
+        assert checks, (
+            "extract-coord-tui.sh no longer VERIFIES "
+            f".github/workflows/{RELEASE_TUI_BASENAME} survived the split — "
+            "the only guard left in this repo that coord-tui gets a release "
+            "channel at all"
+        )
+        assert any(f".github/workflows/{RELEASE_TUI_BASENAME}" in c for c in checks), (
+            "the check does not assert the workflow landed at the path GitHub "
+            f"reads: {checks}"
+        )
+
+    def test_exactly_one_step_creates_a_github_release_in_this_channel(self) -> None:
+        """#1242's invariant, for the channel this repo still owns.
+
+        Two release-creating steps in one repo is the upsert race #1242 was
+        filed for; zero means the channel publishes nothing at all. The
+        matching assertion for coord-tui's channel moved to coord-tui with
+        release-tui.yml (see the class docstring) — asserting it from here
+        would need a copy of that file, which is exactly what
+        `test_no_release_tui_workflow_survives_anywhere_in_this_repo` forbids.
+        """
+        steps = _steps_using(_load(PUBLISH_YML), "softprops/action-gh-release")
+        assert len(steps) == 1, (
+            f"publish.yml has {len(steps)} release-creating step(s) "
+            f"({[j for j, _ in steps]}); this channel needs exactly one"
+        )
+        _, step = steps[0]
+        assert step["with"].get("generate_release_notes") is True
 
     def test_this_repos_release_carries_the_wheel_and_no_binaries(self) -> None:
         """#2898 criterion 1: a wheel, no coord-tui binaries, and no failure
@@ -211,45 +253,23 @@ class TestSplitReleaseChannels:
             "as incomplete — the exact regression #2898's criterion 1 names."
         )
 
-    def test_the_tui_channel_checks_its_own_asset_completeness(self) -> None:
-        """The completeness bar publish.yml used to enforce for the fused
-        channel does not evaporate — it moves with the binaries. Windows stays
-        deliberately absent (`best_effort: true` in the matrix), so a
-        Windows-only hiccup cannot withhold an otherwise-complete release."""
-        jobs = _load(RELEASE_TUI_YML)["jobs"]
-        release_job = next(
-            job for job in jobs.values()
-            if _steps_using({"jobs": {"j": job}}, "softprops/action-gh-release")
-        )
-        check = "\n".join(s.get("run", "") for s in release_job["steps"] if s.get("run"))
-        for target in ("x86_64-linux", "x86_64-macos", "aarch64-macos"):
-            assert target in check, (
-                f"release-tui.yml does not assert coord-tui-{target} is present; "
-                "a silently binary-less release is what PKG-3's acceptance bar "
-                "forbids, and it is now the only place that check can live"
-            )
-        assert "x86_64-windows" not in check, (
-            "Windows is best_effort — requiring it would let one flaky leg "
-            "withhold the whole release"
-        )
+    def test_this_channel_keeps_its_own_tag_is_on_main_guard(self) -> None:
+        """#1471's guard, for the tag this repo still publishes.
 
-    def test_the_tui_channel_reinstates_the_tag_is_on_main_guard(self) -> None:
-        """#1471's guard moved to publish.yml's `verify-tag` in #1242 because
-        publish.yml owned the trigger. Now that the tag push reaches
-        release-tui.yml directly in a repo where publish.yml does not exist,
-        the guard has to come back with it — a Release cut from a tag whose
-        commit branch protection rejected advertises code nobody can
-        reproduce."""
-        jobs = _load(RELEASE_TUI_YML)["jobs"]
+        A Release cut from a tag whose commit branch protection rejected
+        advertises code nobody can reproduce. The coord-tui half of this
+        assertion moved with release-tui.yml (class docstring); the half that
+        guards THIS repo's `v*` tag stays, and is the one that regresses if
+        someone simplifies publish.yml after the split.
+        """
         runs = "\n".join(
             step.get("run", "")
-            for job in jobs.values()
-            for step in (job.get("steps") or [])
+            for _job, step in _all_steps(_load(PUBLISH_YML))
             if step.get("run")
         )
         assert "merge-base --is-ancestor" in runs, (
-            "release-tui.yml publishes on its own tag push with no "
-            "tag-is-on-main guard anywhere in it"
+            "publish.yml publishes on a `v*` tag push with no tag-is-on-main "
+            "guard anywhere in it"
         )
 
     def test_dry_run_builds_and_checks_everything_but_publishes_nothing(self) -> None:
@@ -338,29 +358,35 @@ class TestSplitReleaseChannels:
             f"build-wheel still sets up Node with nothing to build: {uses}"
         )
 
-    def test_tui_workflow_uploads_the_asset_names_coord_tui_update_expects(self) -> None:
-        from coord.tui_release import asset_filename
+    def test_the_asset_names_coord_tui_update_resolves_are_pinned(self) -> None:
+        """The `coord tui update` ↔ release-tui.yml contract, from the side
+        this repo still owns.
 
-        steps = _load(RELEASE_TUI_YML)["jobs"]["build"]["steps"]
-        upload = next(
-            step
-            for step in steps
-            if isinstance(step.get("uses"), str)
-            and step["uses"].startswith("actions/upload-artifact")
+        This used to render release-tui.yml's `upload-artifact` path with the
+        matrix substituted by hand and compare it to `asset_filename()`. Both
+        halves lived here; since #2899 the workflow is in coord-tui and only
+        the RESOLVER is here, so the comparison cannot be made in one
+        checkout.
+
+        Pinning the resolver's output is the half that matters here anyway:
+        `coord tui update` runs on THIS side, and the way this contract breaks
+        from THIS side is somebody "tidying" `_TARGETS` or `asset_filename`
+        into names the published assets do not use — which fails at the
+        download, on an operator's machine, with a 404. The workflow half is
+        release-tui.yml's own repo's to assert now.
+        """
+        from coord.tui_release import _TARGETS, asset_filename
+
+        assert {asset_filename(t) for t in set(_TARGETS.values())} == {
+            "coord-tui-x86_64-linux",
+            "coord-tui-x86_64-macos",
+            "coord-tui-aarch64-macos",
+            "coord-tui-x86_64-windows.exe",
+        }, (
+            "the asset names `coord tui update` downloads changed. They must "
+            "match release-tui.yml's `Stage artifact` step in the coord-tui "
+            "repo verbatim — a mismatch is a 404 at update time, not a red CI."
         )
-        path = upload["with"]["path"]
-        # `${{ matrix.target_name }}`/`${{ matrix.bin_ext }}` substituted by hand.
-        for target in ("x86_64-linux", "aarch64-macos", "x86_64-windows"):
-            ext = ".exe" if target.endswith("-windows") else ""
-            rendered = (
-                path.replace("${{ matrix.target_name }}", target).replace(
-                    "${{ matrix.bin_ext }}", ext
-                )
-            )
-            assert rendered.endswith(asset_filename(target)), (
-                f"release-tui.yml uploads {rendered!r} but coord/tui_release.py's "
-                f"`coord tui update` looks for {asset_filename(target)!r}"
-            )
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -2,30 +2,46 @@
 
 `coord merge --revalidate` runs its composed suite inside the `coord-serve`
 daemon — a systemd *user* unit. A systemd user unit's PATH is systemd's, not a
-login shell's: `~/.profile` is never sourced for it, so `~/.cargo/bin` is
-absent and a bare `cargo` dies with "command not found". Before this fix the
-runner let that surface as `FAIL(rust)` → `RESULT: FAIL`, which `--revalidate`
-rendered as `SUITE FAILED` — a false red verdict on a branch whose six CI
-checks were green, and an operator sent to debug a branch that was fine.
+login shell's: `~/.profile` is never sourced for it, so a toolchain installed
+under `$HOME` is simply absent and a bare invocation dies with "command not
+found". Before this fix the runner let that surface as a red suite → `RESULT:
+FAIL`, which `--revalidate` rendered as `SUITE FAILED` — a false red verdict on
+a branch whose six CI checks were green, and an operator sent to debug a branch
+that was fine.
 
-Two properties are asserted here, both on OUTPUT rather than exit code alone
-(the exit code is the cheap half; the message is what an operator acts on):
+#2899 NARROWED THE SUBJECT, it did not change the property. The original bug
+was `~/.cargo/bin/cargo` being invisible to the daemon, because this repo used
+to carry the `coord-tui` Rust crate under `tui/**` and the runner had a
+dedicated cargo arm (with its own `resolve_cargo` PATH → `$CARGO_HOME/bin` →
+`rustup which` ladder). That crate now lives in the standalone `coord-tui`
+repo, which — like quadraui and vimcode — runs through `--fallback-command`,
+i.e. `bash -lc`, a LOGIN shell that *does* source the rcs. So the cargo
+resolver went away with the arm, and what is left to guard here is:
 
-1. With cargo reachable ONLY at `$CARGO_HOME/bin/cargo` and nothing on PATH,
-   the runner still finds it and the suite runs.
-2. With cargo genuinely nowhere, the runner says `TOOLCHAIN MISSING`, exits
-   with its dedicated infrastructure code (3), and never emits `FAIL(rust)` or
-   `RESULT: FAIL` — a missing toolchain and a failing test must never produce
-   the same verdict.
+1. THE PYTHON ARM. `run_python` builds `$WT/.venv` with `python3`; if there is
+   no `python3` on the daemon's PATH there is no interpreter, no suite, and
+   "no suite" is not a verdict. It must report `TOOLCHAIN MISSING(python)`.
+2. THE FALLBACK ARM. Every other repo's own `test_command` is run through the
+   login shell; exit 127 is the shell's "command not found", the same class as
+   a missing cargo, and must not read as a red suite.
+3. THE OTHER HALF. A genuinely failing suite must still be a failure — the
+   #1814 fix must not launder real red into "could not run".
+4. #2899/#2804: the coordinator route must not reach for cargo (or a shared
+   `quadraui` sibling checkout) at all any more, even on a `tui/`-prefixed
+   diff and even when a cargo IS available.
 
-The tests fake `cargo` with a shell script, so they need no Rust toolchain and
-run in milliseconds. PATH is scrubbed to `/usr/bin:/bin` — enough for the
-coreutils the script itself calls, and a faithful stand-in for the daemon's
-`systemctl --user show-environment` PATH, which has no `~/.cargo/bin` either.
+Both properties are asserted on OUTPUT rather than exit code alone (the exit
+code is the cheap half; the message is what an operator acts on).
+
+The tests fake the toolchains with shell scripts, so they need no Rust or venv
+build and run in milliseconds. PATH is scrubbed to a synthesized bin directory
+— enough for the coreutils the script itself calls, and a faithful stand-in for
+the daemon's `systemctl --user show-environment` PATH.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,8 +56,47 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord-test-runner.sh
 #: up empty (e.g. a minimal container without PATH set at all).
 BASH = shutil.which("bash") or "/usr/bin/bash"
 
-#: No ~/.cargo/bin, no ~/.local/bin — the shape of the daemon's PATH.
-SCRUBBED_PATH = "/usr/bin:/bin"
+#: The system directories a synthesized PATH is mirrored from.
+_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+
+def _mirror_bin_dir(dest: Path, omit_prefixes: tuple[str, ...] = ()) -> Path:
+    """A bin dir of symlinks to the real system tools, minus `omit_prefixes`.
+
+    The runner shells out to a dozen coreutils (git, awk, sed, sort, tr, ...),
+    so "scrub PATH" cannot mean "empty PATH" — it means "everything the script
+    itself needs, and specifically NOT the toolchain under test". Mirroring by
+    symlink keeps the omission surgical: a hand-curated allowlist would silently
+    grow a second failure mode every time the runner learns a new command.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    for d in _SYSTEM_BIN_DIRS:
+        src = Path(d)
+        if not src.is_dir():
+            continue
+        for entry in os.scandir(src):
+            if entry.name.startswith(omit_prefixes):
+                continue
+            link = dest / entry.name
+            if link.exists() or link.is_symlink():
+                continue
+            try:
+                link.symlink_to(entry.path)
+            except OSError:  # pragma: no cover - defensive
+                pass
+    return dest
+
+
+@pytest.fixture(scope="module")
+def full_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A PATH with every system tool, including `python3`."""
+    return _mirror_bin_dir(tmp_path_factory.mktemp("fullbin"))
+
+
+@pytest.fixture(scope="module")
+def no_python_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The daemon's shape for the python arm: coreutils, but no interpreter."""
+    return _mirror_bin_dir(tmp_path_factory.mktemp("nopybin"), omit_prefixes=("python",))
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -50,11 +105,9 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-@pytest.fixture
-def rust_repo(tmp_path: Path) -> Path:
-    """A repo whose diff vs `base` touches tui/**, so routing picks the Rust arm."""
-    r = tmp_path / "repo"
-    (r / "tui").mkdir(parents=True)
+def _repo(root: Path, changed: str) -> Path:
+    r = root / "repo"
+    (r / Path(changed).parent).mkdir(parents=True, exist_ok=True)
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@t.com")
     _git(r, "config", "user.name", "Test")
@@ -62,38 +115,39 @@ def rust_repo(tmp_path: Path) -> Path:
     _git(r, "add", "README.md")
     _git(r, "commit", "-qm", "initial")
     _git(r, "tag", "base")
-    (r / "tui" / "lib.rs").write_text("fn main() {}\n")
+    (r / changed).write_text("x\n")
     _git(r, "add", "-A")
-    _git(r, "commit", "-qm", "rs change")
+    _git(r, "commit", "-qm", "change")
     return r
 
 
-def _fake_cargo(at: Path) -> Path:
-    """A `cargo` that reports a passing suite, so we test resolution not Rust."""
-    at.parent.mkdir(parents=True, exist_ok=True)
-    at.write_text(
-        "#!/bin/sh\n"
-        'echo \"running 5 tests\"\n'
-        'echo \"test result: ok. 5 passed; 0 failed\"\n'
-        "exit 0\n"
-    )
-    at.chmod(0o755)
-    return at
+@pytest.fixture
+def py_repo(tmp_path: Path) -> Path:
+    """A repo whose diff vs `base` touches coord/**, so routing picks pytest."""
+    return _repo(tmp_path, "coord/foo.py")
+
+
+@pytest.fixture
+def tui_repo(tmp_path: Path) -> Path:
+    """A repo whose diff vs `base` touches tui/** — a dead route since #2899."""
+    return _repo(tmp_path, "tui/lib.rs")
 
 
 def _run(
-    repo: Path, tmp_path: Path, *extra_args: str, **env_overrides: str
+    repo: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    *extra_args: str,
+    **env_overrides: str,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the runner with a daemon-shaped (scrubbed) environment."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    # #2804: the Rust arm no longer symlinks a `quadraui` sibling at all —
-    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so a
-    # `QUADRAUI_SRC` checkout is not part of this environment anymore.
+    # #2804/#2899: the Rust arm is gone, so nothing here symlinks a `quadraui`
+    # sibling and no `QUADRAUI_SRC` checkout is part of this environment.
     env = {
-        "PATH": SCRUBBED_PATH,
+        "PATH": str(bin_dir),
         "HOME": str(home),
-        "COORD_TEST_CARGO_TARGET": str(tmp_path / "cargo-target"),
         "TMPDIR": str(tmp_path),
     }
     env.update(env_overrides)
@@ -101,166 +155,39 @@ def _run(
         [BASH, str(SCRIPT), str(repo), "--base-ref", "base", *extra_args],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
         env=env,
     )
 
 
-# ── (a) resolution: cargo off PATH but at its default location ──────────────
+# ── (a) absence: a distinct, actionable infrastructure error ────────────────
 
 
-def test_cargo_off_path_is_still_found_at_cargo_home(
-    rust_repo: Path, tmp_path: Path
+def test_missing_python3_reports_toolchain_missing_not_a_failed_suite(
+    py_repo: Path, tmp_path: Path, no_python_bin: Path
 ) -> None:
-    """The #1814 host, exactly: nothing on PATH, cargo at ~/.cargo/bin.
-
-    This is the case that used to fail. Asserting the suite reports PASS is
-    the point — a runner that "handles" a missing PATH by reporting a clean
-    infrastructure error would still leave --revalidate unusable.
-    """
-    home = tmp_path / "home"
-    cargo = _fake_cargo(home / ".cargo" / "bin" / "cargo")
-
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS(rust)" in result.stdout
-    assert "RESULT: PASS" in result.stdout
-    # It says WHICH cargo it used — the diagnostic that makes the next
-    # environment surprise a five-second investigation.
-    assert str(cargo) in result.stdout
-    assert "TOOLCHAIN MISSING" not in result.stdout
-
-
-def test_no_quadraui_sibling_symlink_created(rust_repo: Path, tmp_path: Path) -> None:
-    """#2804: the Rust arm must not create (or need) a shared quadraui
-    sibling anymore.
-
-    Before this fix the runner symlinked `$(dirname "$WT")/quadraui` ->
-    `$QUADRAUI_SRC` on every Rust-routed run — ONE location shared by every
-    worktree ever tested on this machine, silently repointed by whichever
-    run happened second. `tui/Cargo.toml` has pinned quadraui to a git rev
-    since #1973, so a normal build never touches `~/src/quadraui` at all;
-    asserting PASS with no quadraui checkout anywhere in the environment,
-    and no `quadraui` path appearing next to the worktree, proves the
-    runner no longer depends on or creates that shared state.
-    """
-    home = tmp_path / "home"
-    _fake_cargo(home / ".cargo" / "bin" / "cargo")
-
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS(rust)" in result.stdout
-    sibling = rust_repo.parent / "quadraui"
-    assert not sibling.exists(), "runner must not create a shared quadraui sibling (#2804)"
-    assert "linking" not in result.stdout.lower()
-
-
-def test_cargo_home_env_var_is_honoured(rust_repo: Path, tmp_path: Path) -> None:
-    """A non-default CARGO_HOME resolves too — not just the ~/.cargo hardcode."""
-    cargo = _fake_cargo(tmp_path / "elsewhere" / "bin" / "cargo")
-
-    result = _run(
-        rust_repo,
-        tmp_path,
-        "--repo",
-        "claude-coordinator",
-        CARGO_HOME=str(tmp_path / "elsewhere"),
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS(rust)" in result.stdout
-    assert str(cargo) in result.stdout
-
-
-def test_cargo_on_path_wins(rust_repo: Path, tmp_path: Path) -> None:
-    """PATH is still consulted first — the fallbacks are fallbacks."""
-    on_path = tmp_path / "bin"
-    _fake_cargo(on_path / "cargo")
-
-    result = _run(
-        rust_repo,
-        tmp_path,
-        "--repo",
-        "claude-coordinator",
-        PATH=f"{on_path}:{SCRUBBED_PATH}",
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert f"cargo: {on_path / 'cargo'}" in result.stdout
-
-
-def test_resolved_cargo_bin_dir_is_prepended_to_path(
-    rust_repo: Path, tmp_path: Path
-) -> None:
-    """cargo shells out to rustc, which lives beside it.
-
-    Resolving the cargo binary alone would find cargo and then die inside it,
-    so the whole bin dir goes on PATH. The fake cargo proves it by invoking a
-    bare `rustc` that exists only in that directory.
-    """
-    home = tmp_path / "home"
-    bindir = home / ".cargo" / "bin"
-    _fake_cargo(bindir / "cargo")
-    (bindir / "cargo").write_text(
-        "#!/bin/sh\n"
-        "rustc --version || exit 9\n"
-        'echo \"test result: ok. 1 passed; 0 failed\"\n'
-    )
-    (bindir / "cargo").chmod(0o755)
-    (bindir / "rustc").write_text("#!/bin/sh\necho rustc 1.0.0\n")
-    (bindir / "rustc").chmod(0o755)
-
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS(rust)" in result.stdout
-
-
-def test_rustup_which_is_the_last_resort(rust_repo: Path, tmp_path: Path) -> None:
-    """No cargo at the default location, but rustup knows where it is."""
-    home = tmp_path / "home"
-    cargo = _fake_cargo(tmp_path / "toolchains" / "bin" / "cargo")
-    rustup = home / ".cargo" / "bin" / "rustup"
-    rustup.parent.mkdir(parents=True, exist_ok=True)
-    rustup.write_text(f'#!/bin/sh\n[ \"$1\" = which ] && echo \"{cargo}\"\n')
-    rustup.chmod(0o755)
-
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert str(cargo) in result.stdout
-
-
-# ── (b) absence: a distinct, actionable infrastructure error ────────────────
-
-
-def test_missing_cargo_reports_toolchain_missing_not_a_failed_suite(
-    rust_repo: Path, tmp_path: Path
-) -> None:
-    """The core #1814 guard.
+    """The core #1814 guard, on the arm that survived #2899.
 
     A missing toolchain and a failing test must never produce the same
     verdict. Asserting the ABSENCE of the failure wording matters as much as
-    the presence of the new wording: `FAIL(rust)` / `RESULT: FAIL` is what
-    `--revalidate` turned into `SUITE FAILED`.
+    the presence of the new wording: `RESULT: FAIL` is what `--revalidate`
+    turned into `SUITE FAILED`.
     """
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
+    result = _run(py_repo, tmp_path, no_python_bin, "--repo", "claude-coordinator")
 
-    assert result.returncode == 3, result.stdout + result.stderr
     out = result.stdout + result.stderr
-    assert "TOOLCHAIN MISSING(rust)" in out
-    assert "cargo" in out
+    assert result.returncode == 3, out
+    assert "TOOLCHAIN MISSING(python)" in out
+    assert "python3" in out
     assert "RESULT: INFRA" in out
 
-    assert "FAIL(rust)" not in out
+    assert "FAIL(python)" not in out
     assert "RESULT: FAIL" not in out
     assert "command not found" not in out
 
 
-def test_missing_cargo_message_names_where_it_looked_and_why(
-    rust_repo: Path, tmp_path: Path
+def test_missing_python3_message_names_where_it_looked_and_why(
+    py_repo: Path, tmp_path: Path, no_python_bin: Path
 ) -> None:
     """The message has to be actionable, not just distinct.
 
@@ -268,26 +195,33 @@ def test_missing_cargo_message_names_where_it_looked_and_why(
     for, that no test ran, and that a systemd unit's PATH is the likely
     culprit. That last clause is the whole diagnosis for this bug class.
     """
-    result = _run(rust_repo, tmp_path, "--repo", "claude-coordinator")
+    result = _run(py_repo, tmp_path, no_python_bin, "--repo", "claude-coordinator")
     out = result.stdout + result.stderr
 
-    assert "rustup which cargo" in out
-    assert "CARGO_HOME" in out
+    assert "searched: PATH" in out
     assert "INFRASTRUCTURE failure" in out
     assert "systemd" in out
-    assert f"PATH={SCRUBBED_PATH}" in out
+    assert f"PATH={no_python_bin}" in out
 
 
-def test_missing_cargo_is_written_to_the_report_file(
-    rust_repo: Path, tmp_path: Path
+def test_missing_python3_is_written_to_the_report_file(
+    py_repo: Path, tmp_path: Path, no_python_bin: Path
 ) -> None:
     """`--report` is what the Test gate reads back; the classification must
     survive into it rather than existing only on the console."""
     report = tmp_path / "report.txt"
-    _run(rust_repo, tmp_path, "--repo", "claude-coordinator", "--report", str(report))
+    _run(
+        py_repo,
+        tmp_path,
+        no_python_bin,
+        "--repo",
+        "claude-coordinator",
+        "--report",
+        str(report),
+    )
 
     body = report.read_text()
-    assert "TOOLCHAIN MISSING(rust)" in body
+    assert "TOOLCHAIN MISSING(python)" in body
     assert "RESULT: INFRA" in body
     assert "RESULT: FAIL" not in body
 
@@ -296,24 +230,29 @@ def test_missing_cargo_is_written_to_the_report_file(
 
 
 def test_fallback_command_not_found_is_infrastructure_not_failure(
-    rust_repo: Path, tmp_path: Path
+    py_repo: Path, tmp_path: Path, full_bin: Path
 ) -> None:
-    """quadraui/vimcode run their own configured command via --fallback-command.
+    """quadraui/vimcode/coord-tui run their own configured command via
+    --fallback-command.
 
     127 is the shell's "command not found": the suite never started, so it is
-    the same class as a missing cargo and must not read as a red suite.
+    the same class as a missing interpreter and must not read as a red suite.
+    Since #2899 this is also how `coord-tui`'s `cargo test` would report a
+    genuinely absent cargo — the arm that used to own that case is gone, so
+    this is the only remaining guard for the original #1814 symptom.
     """
     result = _run(
-        rust_repo,
+        py_repo,
         tmp_path,
+        full_bin,
         "--repo",
         "quadraui",
         "--fallback-command",
         "definitely-not-a-real-binary-1814 test",
     )
 
-    assert result.returncode == 3, result.stdout + result.stderr
     out = result.stdout + result.stderr
+    assert result.returncode == 3, out
     assert "TOOLCHAIN MISSING(fallback)" in out
     assert "definitely-not-a-real-binary-1814" in out
     assert "FAIL(fallback)" not in out
@@ -321,12 +260,12 @@ def test_fallback_command_not_found_is_infrastructure_not_failure(
 
 
 def test_a_genuinely_failing_fallback_suite_is_still_a_failure(
-    rust_repo: Path, tmp_path: Path
+    py_repo: Path, tmp_path: Path, full_bin: Path
 ) -> None:
     """The other half of the distinction: a real red suite must not be
     laundered into an infrastructure error by this change."""
     result = _run(
-        rust_repo, tmp_path, "--repo", "quadraui", "--fallback-command", "exit 7"
+        py_repo, tmp_path, full_bin, "--repo", "quadraui", "--fallback-command", "exit 7"
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
@@ -334,3 +273,42 @@ def test_a_genuinely_failing_fallback_suite_is_still_a_failure(
     assert "RESULT: FAIL" in result.stdout
     assert "TOOLCHAIN MISSING" not in result.stdout
     assert "RESULT: INFRA" not in result.stdout
+
+
+# ── (b) #2899: the coordinator route never reaches for cargo again ──────────
+
+
+def test_coordinator_route_never_invokes_cargo_or_a_quadraui_sibling(
+    tui_repo: Path, tmp_path: Path, full_bin: Path
+) -> None:
+    """#2899 (keeping #2804's guard alive after the arm it guarded left).
+
+    Before #2899 a `tui/**` diff routed to a cargo arm which, before #2804,
+    symlinked `$(dirname "$WT")/quadraui` — ONE location shared by every
+    worktree this machine ever tested, silently repointed by whichever run
+    happened second. The crate is now in its own repo, so the coordinator
+    route must not shell out to cargo at all: a stray `tui/`-prefixed path
+    here is an unrecognised path, i.e. a legitimate SKIP.
+
+    A real (recording) `cargo` is placed on PATH deliberately — proving the
+    runner does not call one it *could* have found is stronger than proving it
+    fails without one.
+    """
+    marker = tmp_path / "cargo-was-invoked"
+    cargo = full_bin / "cargo"
+    cargo.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    cargo.chmod(0o755)
+    try:
+        result = _run(tui_repo, tmp_path, full_bin, "--repo", "claude-coordinator")
+    finally:
+        cargo.unlink()
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "SKIP:" in out
+    assert not marker.exists(), "the coordinator route must not shell out to cargo (#2899)"
+    assert not (tui_repo.parent / "quadraui").exists(), (
+        "runner must not create a shared quadraui sibling (#2804)"
+    )
+    assert "TOOLCHAIN MISSING" not in out
+    assert "RESULT: FAIL" not in out
