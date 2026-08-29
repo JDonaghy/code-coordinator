@@ -321,7 +321,7 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
     Prereq(
         tool="gtk4", binary="pkg-config", version_args=("--modversion", "gtk4"),
         version_re=r"(\S+)", min_version=None, capability="gtk",
-        what_breaks="the tui/ `--features gtk` build cannot link against GTK4",
+        what_breaks="the coord-tui `--features gtk` build cannot link against GTK4",
     ),
     # `browser` gates Playwright acceptance suites in the repos this fleet
     # drives — the `coord-web` repo's `test:e2e` -> `playwright test` (it

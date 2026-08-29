@@ -240,7 +240,8 @@ coord tui update      # downloads the release binary matching `coord --version`
 coord tui status       # check the installed version against the coordinator's
 ```
 
-(Building from source is only for developing the TUI itself: `cd tui && cargo build`.)
+(Building from source is only for developing the TUI itself, and it lives in its own
+repo since #2899: `git clone https://github.com/JDonaghy/coord-tui && cd coord-tui && cargo build`.)
 
 The whole lifecycle can also be driven as **human-attended interactive sessions** launched from
 a pipeline row's right-click menu — a testing agent, a reviewer, a merge agent, or a fix worker,

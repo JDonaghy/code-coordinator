@@ -1,0 +1,75 @@
+name: Rust tests
+
+# #2899 (Phase 4 of JDonaghy/code-coordinator#2894): this is
+# code-coordinator's `.github/workflows/cargo-test.yml`, moved here with the
+# crate. Two things changed, both mechanical:
+#   * the crate is at the REPO ROOT now, so there is no `working-directory:
+#     tui` and no `workspaces: tui` cache scope;
+#   * the `paths:` filters are gone. They existed to keep a Rust job off a
+#     pure-Python diff in a two-language repo. Every diff here is Rust.
+#
+# #1973: Cargo.toml pins quadraui by `git`/`rev` rather than a sibling path
+# dependency, so `cargo test` fetches quadraui straight from GitHub at the
+# pinned rev — there is nothing to check out or reproduce a sibling-directory
+# layout for. That also retired this workflow's original #1865 "canary" role:
+# a scheduled run would just rebuild the same pinned rev forever and report
+# green regardless of what quadraui's develop is doing — a canary that cannot
+# smell smoke. Per #1973's decision, vimcode (which keeps the floating path
+# dep on purpose) is the sole canary for quadraui breaks.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A few integration tests (commands::tests) spawn the real `coord` CLI
+      # (e.g. `coord --version`) via Command::new("coord") and assert it
+      # succeeds, so the Python package must be installed and on PATH inside
+      # this otherwise Rust-only job.
+      #
+      # #2899: `pip install -e .` no longer works — code-coordinator is a
+      # different repo. Install the published wheel instead, which is also
+      # what every other cross-repo gate here does (see codegen-drift.yml).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install coord CLI (integration tests spawn it)
+        run: pip install 'code-coordinator[server]'
+
+      - name: cargo test
+        run: cargo test
+
+      # #2180: the tui-tuidriver sealed acceptance route run through the
+      # #2164 CI wrapper. Plain `cargo test` above does NOT exercise this —
+      # the `acceptance` test target has `required-features =
+      # ["test-support"]` (Cargo.toml), so cargo silently skips building it
+      # without that flag.
+      #
+      # STILL continue-on-error at the STEP level (not job level), unchanged
+      # from code-coordinator: six pre-existing failures predate #2180 and
+      # are not yet declared in either manifest's `expected_red:`. That work
+      # is a test-author session's — `tests/acceptance/**` and its
+      # `manifest.yml` files are SEALED, so a `type="work"` diff touching
+      # them is an unconditional review rejection. #2899 deliberately did not
+      # change the crate or its suites, only where they live, so this stays
+      # exactly as red-tolerant as it was the day before the move: a move
+      # that also flipped a gate from advisory to blocking would make any
+      # resulting red impossible to attribute.
+      - name: coord acceptance run --all --ci (tui-tuidriver route)
+        run: >-
+          coord acceptance run --repo coord-tui --all --ci
+          --for-path src/main.rs
+          --config .github/coord-ci-acceptance.yml --path .
+        continue-on-error: true

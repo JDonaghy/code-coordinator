@@ -1,0 +1,113 @@
+name: Generated-artifact drift
+
+# #2899 (Phase 4 of code-coordinator#2894), implementing the phase-3 ADR
+# (code-coordinator's docs/ADR_COORD_TUI_CI.md).
+#
+# WHY THIS JOB EXISTS. Two files committed in THIS repo are not written by
+# hand — they are generated from code-coordinator's live board schema:
+#
+#   src/app/types/generated.rs        <- scripts/codegen.py --rust  (#1941)
+#   tests/fixtures/board_sample.json  <- scripts/gen_board_fixture.py (#748)
+#
+# While the crate lived inside code-coordinator, a single pytest run could
+# byte-compare both, because generator and output shared a checkout. They do
+# not any more. So the comparison runs HERE, in the DOWNSTREAM repo, pulling
+# the generator from upstream — the same direction and the same shape
+# coord-web's `generated.ts` gate has had since #2009. Never the other way
+# round: code-coordinator must not need a coord-tui checkout to be green, or
+# the two repos deadlock on each other's CI.
+#
+# WHAT A RED HERE MEANS. Not "this PR is broken" by default — it usually
+# means code-coordinator's wire schema moved and this repo has not caught up.
+# The fix is to re-run the generator and commit its output, in a PR here.
+# That is exactly the drift this gate exists to make loud rather than let
+# rot: a stale `generated.rs` deserialises `/board` into the wrong shape and
+# blanks the entire board (#632/#546/#628), silently.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # PART 1 — the LIBRARY, from PyPI, tracking latest and never an exact
+      # pin (ADR_COORD_TUI_CI.md, "Which `coord` that CI installs, and why").
+      # The generators import `coord.serve_app.openapi_spec()` and
+      # `coord.dao.SqliteStore`; `serve_app` imports Starlette at module
+      # scope, gated behind the `server` extra (#1237), so the bare
+      # distribution raises ModuleNotFoundError the moment `--rust` is used.
+      #
+      # Unpinned on purpose: this gate's subject is "does this repo match the
+      # coordinator people are actually running", and the fleet runs the
+      # latest published wheel. A pin answers "does this match the coord we
+      # froze", which is green while a real drift ships. The cost is that an
+      # upstream release can turn this red with no commit here — that is the
+      # intended signal, not a flake.
+      - name: Install code-coordinator (the library the generators import)
+        run: pip install 'code-coordinator[server]'
+
+      - name: Report the coordinator version this repo is checked against
+        id: coordver
+        run: |
+          set -euo pipefail
+          coord --version
+          ver="$(coord --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          echo "version=$ver" >>"$GITHUB_OUTPUT"
+
+      # PART 2 — the GENERATOR SCRIPTS. `scripts/codegen.py` and
+      # `scripts/gen_board_fixture.py` are NOT in the wheel:
+      # `[tool.setuptools.packages.find] include = ["coord*"]` ships the
+      # package, not the repo's `scripts/` directory. So they are checked out
+      # at the tag matching the wheel installed above, rather than from
+      # `main` — pairing a `main` script with a released library is exactly
+      # the skew this gate is supposed to detect, and it would surface as a
+      # confusing generator crash instead of a legible drift diff.
+      #
+      # FOLLOW-UP (deliberately not done in #2899, which changed no code in
+      # the crate): the cleaner shape is to ship both generators as console
+      # scripts on the `code-coordinator` distribution, at which point Part 2
+      # collapses into Part 1 and the version pairing becomes automatic.
+      - name: Fetch the generator scripts at the matching tag
+        uses: actions/checkout@v4
+        with:
+          repository: JDonaghy/code-coordinator
+          ref: v${{ steps.coordver.outputs.version }}
+          path: .coord-upstream
+          sparse-checkout: scripts
+
+      # `$COORD_TUI_SRC` names a coord-tui CHECKOUT ROOT. Since #2899 the
+      # crate is at that root, so `$GITHUB_WORKSPACE` is correct — and the
+      # relpaths the generators append (`src/app/types/generated.rs`,
+      # `tests/fixtures/board_sample.json`) carry no `tui/` prefix any more.
+      #
+      # Both generators deliberately have NO fallback default: with neither
+      # `--out` nor `$COORD_TUI_SRC` they raise rather than guess, because a
+      # guessed path under `--check` fails in the direction that reports
+      # success. That is what makes this job's green trustworthy.
+      - name: generated.rs is up to date
+        working-directory: .coord-upstream
+        run: COORD_TUI_SRC="$GITHUB_WORKSPACE" python scripts/codegen.py --rust --check
+
+      - name: board_sample.json is up to date
+        run: |
+          set -euo pipefail
+          COORD_TUI_SRC="$GITHUB_WORKSPACE" \
+            python .coord-upstream/scripts/gen_board_fixture.py
+          if ! git diff --exit-code -- tests/fixtures/board_sample.json; then
+            echo "::error::tests/fixtures/board_sample.json is stale."
+            echo "Regenerate it against the current coordinator:"
+            echo "  pip install 'code-coordinator[server]'"
+            echo "  COORD_TUI_SRC=. python <code-coordinator>/scripts/gen_board_fixture.py"
+            echo "...and commit the result."
+            exit 1
+          fi

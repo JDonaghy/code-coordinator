@@ -147,7 +147,8 @@ def detect_target(system: str | None = None, machine: str | None = None) -> str:
             f"no coord-tui release build for {system}/{machine} — "
             "release-tui.yml's build matrix only covers "
             f"{sorted({v for v in _TARGETS.values()})}. Build from source "
-            "instead: cd tui && cargo build --release --bin coord-tui"
+            "instead: from a coord-tui checkout, "
+            "cargo build --release --bin coord-tui"
         )
     return target
 
