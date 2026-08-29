@@ -592,8 +592,12 @@ def test_entrypoints_are_path_independent_across_routes(tmp_path: Path) -> None:
     p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_WITH_ENTRYPOINT)
     cfg = load(p)
     assert cfg.acceptance.entrypoints("claude-coordinator") == ["tui/tests/acceptance.rs"]
+    # #2896: the entrypoint also seals its own sibling `acceptance/` dir —
+    # where the tui-tuidriver route's relocated JIT-authored slices now live
+    # (tui/tests/acceptance/ms-NN/*.rs) — alongside the repo-root tree the
+    # cli-pytest route's ms-37 slices still use.
     assert cfg.acceptance.sealed_paths("claude-coordinator") == [
-        "tests/acceptance/", "tui/tests/acceptance.rs",
+        "tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/",
     ]
 
 

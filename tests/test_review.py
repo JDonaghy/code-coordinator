@@ -1000,6 +1000,35 @@ def test_briefing_work_type_trips_tamper_on_entrypoint() -> None:
     assert "request-changes is mandatory" in briefing
 
 
+def test_briefing_work_type_trips_tamper_on_relocated_slice() -> None:
+    """#2896: the ms-33/38/65/67 slices moved from the repo-root
+    `tests/acceptance/` into `tui/tests/acceptance/` — a `type="work"` diff
+    touching one at its NEW location must still trip mandatory
+    request-changes, exactly as it did at the old one."""
+    diff = (
+        "diff --git a/tui/tests/acceptance/ms-65/board_tabs_2282.rs "
+        "b/tui/tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "--- a/tui/tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "+++ b/tui/tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+// cheated\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=2282, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/"],
+        sealed_entrypoints=["tui/tests/acceptance.rs"],
+        assignment_type="work",
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" in briefing
+    assert "tui/tests/acceptance/ms-65/board_tabs_2282.rs" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
 def test_briefing_pytest_route_has_no_entrypoint_section() -> None:
     """#1552: the pytest route legitimately declares no entry point (pytest
     discovers by directory), so nothing extra is said and #1175's rule is

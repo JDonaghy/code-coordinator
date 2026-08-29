@@ -33,18 +33,21 @@ fn make_test_app_builds_from_board_data_with_no_live_daemon() {
 // Wires each milestone's independently-authored acceptance slice under
 // `tests/acceptance/ms-NN/` into this `--test acceptance` target so the
 // configured `tui-tuidriver` driver command runs them. The slice files hold
-// the assertions; this file only pastes them in at crate root. Paths are
-// relative to this file (`tui/tests/`), so `../../` is the repo root.
-include!("../../tests/acceptance/ms-33/audit_1039.rs");
-include!("../../tests/acceptance/ms-38/plans_help_1124.rs");
-include!("../../tests/acceptance/ms-38/plans_rightclick_1123.rs");
-include!("../../tests/acceptance/ms-38/plans_detail_1122.rs");
-include!("../../tests/acceptance/ms-65/board_tabs_2282.rs");
-include!("../../tests/acceptance/ms-65/board_tabs_close_2283.rs");
-include!("../../tests/acceptance/ms-65/pipeline_tabs_2284.rs");
-include!("../../tests/acceptance/ms-65/detail_substate_2285.rs");
-include!("../../tests/acceptance/ms-65/tabs_discoverability_2287.rs");
-include!("../../tests/acceptance/ms-65/tabs_persistence_2286.rs");
-include!("../../tests/acceptance/ms-65/board_split_2288.rs");
-include!("../../tests/acceptance/ms-67/approved_items_2532.rs");
-include!("../../tests/acceptance/ms-67/pull_decomposition_2533.rs");
+// the assertions; this file only pastes them in at crate root. #2896: the
+// slices moved from the repo-root `tests/acceptance/` into this crate
+// (`tui/tests/acceptance/`) so the crate no longer reaches outside itself —
+// paths are relative to this file (`tui/tests/`), so a bare `acceptance/` is
+// now a sibling, not `../../`.
+include!("acceptance/ms-33/audit_1039.rs");
+include!("acceptance/ms-38/plans_help_1124.rs");
+include!("acceptance/ms-38/plans_rightclick_1123.rs");
+include!("acceptance/ms-38/plans_detail_1122.rs");
+include!("acceptance/ms-65/board_tabs_2282.rs");
+include!("acceptance/ms-65/board_tabs_close_2283.rs");
+include!("acceptance/ms-65/pipeline_tabs_2284.rs");
+include!("acceptance/ms-65/detail_substate_2285.rs");
+include!("acceptance/ms-65/tabs_discoverability_2287.rs");
+include!("acceptance/ms-65/tabs_persistence_2286.rs");
+include!("acceptance/ms-65/board_split_2288.rs");
+include!("acceptance/ms-67/approved_items_2532.rs");
+include!("acceptance/ms-67/pull_decomposition_2533.rs");
