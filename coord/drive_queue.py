@@ -3759,18 +3759,29 @@ def _reconcile_blocked(
     except a CONFIRMED-clear reading OR a probe that came back unreadable
     (#2806), which is deliberate: a `blocked` entry this sweep cannot say
     anything new about must render EXACTLY as it did before #2230 existed.
-    Three ways to land there:
+    Four ways to land there:
 
     * the block is PERMANENT (:func:`is_permanent_block_reason`) — #1844's
       guard refusal or #2019's dead end — neither of which any amount of
       re-checking can ever change;
+    * the block is `_resolve_prereqs`'s own unsatisfiable ``after=`` verdict
+      (:func:`_is_unsatisfiable_prereq_reason`, #2935) — a `waiting` entry
+      that never reached `running` has no assignment and no branch, so
+      there is categorically no merge-queue row for THIS sweep to have any
+      opinion about; the entry's fate is `_reconcile_blocked_after`'s alone
+      to decide, from the ``after=`` graph, on this or a later tick. Checked
+      — and returned from — before :func:`_blocked_gate_reading` even runs,
+      specifically so :func:`_reconcile_blocked_unreadable` never gets the
+      chance to overwrite `last_reason` with a merge-gate "could not read"
+      sentence and clobber the one marker `_reconcile_blocked_after` needs
+      to recognise this row again next tick — see #2935 for the incident a
+      missing version of this branch caused;
     * there is no evidence either way (:func:`_blocked_gate_reading` returns
       ``None``) AND :func:`_reconcile_blocked_unreadable` also has nothing
-      to add — an entry that never reached the merge queue at all (a
-      dispatch-time failure, an unsatisfiable ``after=``) has nothing this
-      sweep can cheaply re-check, and guessing would be exactly the "worse
-      than nothing" sweep the issue warns a naive "retry everything" pass
-      would be;
+      to add — a dispatch-time failure (#2589's two per-run shapes) has
+      nothing this sweep can cheaply re-check, and guessing would be
+      exactly the "worse than nothing" sweep the issue warns a naive
+      "retry everything" pass would be;
     * the gate is CONFIRMED still shut — the common, honest outcome for a
       `blocked` entry that has not in fact recovered yet.
 
@@ -3800,6 +3811,58 @@ def _reconcile_blocked(
     for why it writes no state here.
     """
     if is_permanent_block_reason(entry.last_reason):
+        return None
+    if _is_unsatisfiable_prereq_reason(entry.last_reason):
+        # #2935: this entry's ONLY `blocked` cause is `_resolve_prereqs`'s
+        # own after= verdict (step 4's launch walk, or its #2362/#2756
+        # sibling `_reconcile_blocked_after`, called immediately before this
+        # function in the same per-tick loop) — a `waiting` entry that never
+        # reached `running` at all (see `_resolve_prereqs`'s own comment:
+        # "attempts is deliberately NOT incremented: nothing was ever
+        # launched for this entry"). A never-dispatched entry has no
+        # assignment and no branch, so there is no merge-queue row for
+        # #2230's gate sweep to have ANY opinion about — a merge gate cannot
+        # exist for something that was never built, and probing for one
+        # anyway is a category error, not a failed probe.
+        #
+        # This must be checked BEFORE `_blocked_gate_reading`/
+        # `_reconcile_blocked_unreadable` below, not folded into their "no
+        # evidence" handling: `_reconcile_blocked_unreadable` WRITES
+        # `last_reason` the instant the shell's live probe was attempted and
+        # came back with no key (`live_blocked_unreadable`) — and doing that
+        # here would CLOBBER this exact marker text, which is the ONLY
+        # signal `_reconcile_blocked_after` uses (both here and on every
+        # future tick) to recognise this row as an after=-caused block worth
+        # re-diagnosing at all. The claude-coordinator#2935 incident: five
+        # dependents whose prerequisite had already landed stayed `blocked`
+        # for 178-207 consecutive ticks apiece, because the FIRST tick after
+        # they became re-evaluable this way overwrote their own "will never
+        # satisfy"/"not queued, not merged and not open" text with this
+        # sweep's "no merge-queue row ... could not be read" sentence —
+        # after which `_reconcile_blocked_after`'s guard could never
+        # recognise the row again, even once the prerequisite genuinely
+        # landed. Bailing out here, before any write, keeps the marker
+        # intact for as many ticks as it takes the after= graph to actually
+        # clear — the entry's fate stays entirely `_reconcile_blocked_
+        # after`'s to decide, exactly as the issue's "Expected behaviour"
+        # asks: answered from the after= graph, never from a merge-gate
+        # probe.
+        #
+        # Deliberately a text match on the SAME two verdict shapes
+        # `_reconcile_blocked_after` itself already trusts to gate its own
+        # resume — not the #2589/#2635 per-run dispatch markers
+        # (`is_dispatch_failure_reason`/`is_empty_branch_death_reason`),
+        # which stay OUT of this function on purpose (see
+        # `test_a_pre_dispatch_reason_text_does_not_suppress_a_real_
+        # unreadable_note`): those two describe what ONE launch attempt
+        # dispatched, which can go stale the moment an earlier attempt on
+        # the SAME entry left real evidence behind, so only the shell's live
+        # re-check (`live_blocked_unreadable`) is trusted to suppress them.
+        # `_resolve_prereqs`'s unsatisfiable verdict carries no such
+        # per-run ambiguity: it is only ever written for a `waiting` entry
+        # that has NEVER reached `running`, so the "nothing was ever
+        # dispatched" reading it encodes cannot be contradicted by an
+        # earlier attempt the way a per-run marker can.
         return None
     reading = _blocked_gate_reading(entry, facts, live_blocked_gate)
     if reading is None:

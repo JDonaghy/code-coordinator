@@ -3355,6 +3355,105 @@ def test_a_blocked_entry_that_has_hit_the_resume_ceiling_stays_blocked_and_says_
     assert plan.launch is None
 
 
+# ── #2935: a never-dispatched after=-blocked entry must never reach the ────
+# merge-gate sweep at all
+#
+# claude-coordinator#2935: a `waiting` entry blocked by `_resolve_prereqs`'s
+# own unsatisfiable `after=` verdict has no assignment and no branch — there
+# is categorically no merge-queue row for #2230's sweep to have an opinion
+# about, "unreadable" or otherwise. Before this fix, `_reconcile_blocked`
+# never special-cased this shape: it fell through to `_blocked_gate_reading`
+# (which correctly finds no evidence) and then to `_reconcile_blocked_
+# unreadable`, which — whenever the shell's live probe had actually been
+# attempted (`live_blocked_unreadable` carrying a note, exactly what
+# `coord.commands.drive_queue._fetch_live_blocked_gate`'s #2806 self-heal
+# produces for a row with no merge-queue row) — WROTE `last_reason` to a
+# "could not be read" sentence. That overwrite destroyed the only marker
+# `_reconcile_blocked_after` uses to recognise this row as after=-caused at
+# all, so every later tick — even long after the prerequisite landed — took
+# the SAME "no evidence, probe unreadable" branch forever: a permanent
+# block, never resumed. These pin the fix: the merge-gate sweep must bail
+# out before ever consulting `live_blocked_unreadable` for this shape, and
+# the entry must still resume once its prereq actually lands.
+
+
+def test_a_never_dispatched_after_blocked_entry_never_reports_gate_unreadable():
+    """The shell's live probe (a real `live_blocked_unreadable` note, the
+    exact shape `_fetch_live_blocked_gate` emits for a row with no
+    merge-queue row) must not produce a `gate_unreadable` reconcile — or any
+    write at all — for an entry whose only cause is an unsatisfiable
+    `after=` verdict with its prereq still not landed."""
+    dep_key = entry_key(REPO, 2897)
+    entries = [
+        entry(2897, position=0, state=STATE_BLOCKED),
+        _blocked_entry(
+            2899,
+            position=1,
+            after=(dep_key,),
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={
+            entry_key(REPO, 2899): "no merge-queue row for this entry, even "
+            "after the self-heal enqueue attempt"
+        },
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_never_dispatched_after_blocked_entry_still_resumes_once_its_prereq_lands():
+    """End-to-end regression for the #2935 incident: a tick where the
+    prereq has NOT yet landed and the shell's probe comes back unreadable
+    must leave `last_reason` untouched (nothing in `plan.reconciles` to
+    write) — so a LATER tick, once the prereq lands, still recognises the
+    original marker and resumes normally, exactly as it would have if the
+    spurious probe had never run."""
+    dep_key = entry_key(REPO, 2897)
+    blocked_dep = entry(2897, position=0, state=STATE_BLOCKED)
+    dependent = _blocked_entry(
+        2899,
+        position=1,
+        after=(dep_key,),
+        resumes=0,
+        last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+    )
+
+    # Tick 1: prereq still blocked, shell's probe comes back unreadable —
+    # must be a total no-op (the #2935 fix).
+    tick1 = plan_tick(
+        [blocked_dep, dependent],
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={
+            entry_key(REPO, 2899): "no merge-queue row for this entry, even "
+            "after the self-heal enqueue attempt"
+        },
+    )
+    assert tick1.reconciles == ()
+
+    # Tick 2: the prereq has since landed. `dependent`'s `last_reason` is
+    # STILL the original unsatisfiable-prereq marker — untouched by tick 1 —
+    # so `_reconcile_blocked_after` recognises it and resumes it, even
+    # though a merge-gate probe against it failed in between.
+    tick2 = plan_tick(
+        [entry(2897, position=0, state=STATE_DONE), dependent],
+        board(merged=(2897,)),
+        capacity=1,
+    )
+    reconcile = next(r for r in tick2.reconciles if r.key == entry_key(REPO, 2899))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert tick2.launch is not None and tick2.launch.issue == 2899
+
+
 # ── #2362: a blocked entry resumes once its unsatisfiable after= lands ─────
 #
 # `_resolve_prereqs` blocks a `waiting` entry the instant one of its named
