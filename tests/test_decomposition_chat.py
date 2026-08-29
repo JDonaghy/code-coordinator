@@ -903,3 +903,152 @@ def test_cli_interactive_dry_run_builds_dispatch_without_launching():
     # Dry-run must not attach tmux or persist a board row.
     mock_launch.assert_not_called()
     mock_record.assert_not_called()
+
+
+# ── #2867: operator notes in RUNNING CONTEXT + the attended posture ──────────
+
+#: Captured at IMPORT time, before this module's autouse `_stub_external_io`
+#: fixture rebinds `decomposition_chat.fetch_running_context` to "no ledger
+#: yet" — the one test below that exercises the real daemon-routed fetch
+#: needs the genuine article.
+_REAL_FETCH_RUNNING_CONTEXT = decomposition_chat.fetch_running_context
+
+
+
+def test_render_running_context_section_shows_operator_notes_attributed():
+    """#2867: what the operator relayed is briefing-visible, verbatim, and
+    clearly marked as NOT something the client wrote on the portal."""
+    payload = {
+        "qa": [],
+        "unpaired_answers": [],
+        "operator_notes": [
+            {"seq": 2, "text": "Household of two; no logins needed.", "actor": "operator:jane"},
+            {"seq": 5, "text": "Calendar is a nice-to-have.", "actor": "operator:jane"},
+        ],
+        "decisions": [],
+        "archived_decisions": [],
+        "narrative": "",
+    }
+    out = decomposition_chat.render_running_context_section(payload)
+    assert "Operator-supplied background" in out
+    assert "relayed by a human" in out
+    assert "[2] Household of two; no logins needed.  (by operator:jane)" in out
+    assert "[5] Calendar is a nice-to-have.  (by operator:jane)" in out
+    # seq order preserved, and notes never render as decisions.
+    assert out.index("Household of two") < out.index("Calendar is a nice-to-have")
+    decisions_half = out.split("Current decisions", 1)[1]
+    assert "Household of two" not in decisions_half
+
+
+def test_render_running_context_section_omits_the_heading_with_no_notes():
+    out = decomposition_chat.render_running_context_section({"qa": []})
+    assert "Operator-supplied background" not in out
+
+
+def test_a_session_on_another_machine_sees_the_note_in_its_running_context(
+    monkeypatch,
+):
+    """#2867's actual acceptance bar, end to end: a note recorded by the
+    operator reaches a session briefed on a DIFFERENT machine with no shared
+    transcript. The second machine is a thin client, so it fetches the
+    ledger over `/portal-ledger` — exactly what #2750's premise ("any
+    session is briefable from it") claims and could not previously deliver
+    for operator-supplied context.
+    """
+    import coord.client as cc
+    from coord import portal_store
+
+    # ── machine A (the daemon host): the operator records what they know.
+    portal_store.seed_revision("sub_2f6a1c", 1)
+    portal_store.append_operator_note(
+        "sub_2f6a1c",
+        "Spoke to her — it's just the two of them; calendar is a nice-to-have.",
+        actor="jane",
+    )
+    wire_payload = portal_store.render_ledger_payload("sub_2f6a1c")
+
+    # ── machine B: a thin client, no shared transcript, reads over HTTP.
+    monkeypatch.setattr(
+        cc, "resolve_board_service",
+        lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+    )
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"payload": wire_payload}
+
+    monkeypatch.setattr(cc.httpx, "get", lambda url, **kw: _Resp())
+
+    # The module-level autouse fixture stubs `fetch_running_context` to "no
+    # ledger yet"; this test is precisely about the real one, so call the
+    # reference captured at import time (before any fixture could rebind it).
+    fetched = _REAL_FETCH_RUNNING_CONTEXT("sub_2f6a1c")
+    briefing = decomposition_chat.build_decomposition_chat_briefing(
+        submission=SUBMISSION,
+        topology_context="(none)",
+        discuss=True,
+        discuss_reason="under-specified",
+        running_context_section=decomposition_chat.render_running_context_section(fetched),
+    )
+    assert "Operator-supplied background" in briefing
+    assert "it's just the two of them" in briefing
+    assert "(by operator:jane)" in briefing
+
+
+def test_headless_decomposition_chat_prompt_has_no_attended_posture():
+    """#2867: headless behaviour is unchanged — still one turn, still
+    fire-and-forget. The attended addendum must NOT leak into the prompt the
+    headless dispatch builds."""
+    from coord.agent import DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/api",
+        issue_number=0,
+        issue_title="decomposition: sub_2f6a1c",
+        briefing="b",
+        type="decomposition-chat",
+    )
+    argv = default_worker_command(spec)
+    joined = " ".join(argv)
+    assert "decomposition steward" in joined.lower()
+    assert DECOMPOSITION_CHAT_ATTENDED_ADDENDUM not in joined
+    assert "YOUR FIRST TURN WRITES NOTHING" not in joined
+
+
+def test_cli_interactive_dry_run_ships_the_attended_wait_posture():
+    """#2867: `--interactive` must build a session that STATES its proposed
+    exit and stops — the defect being fixed is that #2750 reused the
+    headless prompt verbatim, so the attended session enqueued a question in
+    the same turn it decided to ask one."""
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    runner = CliRunner()
+    local = _machine("here", ["api"])
+    cfg = Config(repos=[_repo("api")], machines=[local])
+    with patch("coord.commands.portal._load_config", return_value=cfg), patch(
+        "coord.decomposition_chat.resolve_approved_submission", return_value=SUBMISSION
+    ), patch("coord.test_orchestrator.local_machine", return_value=local), patch(
+        "coord.board_service.resolve", return_value=None
+    ), patch("coord.state.record_dispatched_assignment"), patch(
+        "coord.interactive.launch_human_attended_interactive"
+    ):
+        result = runner.invoke(
+            portal_group,
+            ["decompose-chat", "sub_2f6a1c", "--interactive", "--discuss", "--dry-run"],
+        )
+    assert result.exit_code == 0, result.output
+    # The base prompt is still there...
+    assert "decomposition steward" in result.output.lower()
+    # ...plus the attended posture: write nothing, propose, wait.
+    assert "YOUR FIRST TURN WRITES NOTHING" in result.output
+    assert "END YOUR TURN AND WAIT" in result.output
+    assert "PROPOSED EXIT" in result.output
+    # ...and the operator-note offer, so the operator need not know the
+    # command exists.
+    assert "coord portal note" in result.output

@@ -4139,6 +4139,82 @@ and report back what you asked/proposed/filed/queued/linked (and any gap) \
 when done.\
 """
 
+# #2867: the ATTENDED posture. Appended to (never merged into)
+# DECOMPOSITION_CHAT_SYSTEM_PROMPT by `coord portal decompose-chat
+# --interactive` only — the headless dispatch
+# (`default_worker_command`'s `spec.type == "decomposition-chat"` branch)
+# must keep receiving the base prompt byte-for-byte, because it genuinely
+# has nobody to ask and its one-turn fire-and-forget shape is correct there.
+#
+# WHY this exists at all: #2750 shipped `--interactive` reusing the headless
+# prompt verbatim, so the attended session was written for an agent with
+# nobody to ask ("THIS iteration ends in EXACTLY ONE of three terminal
+# moves", each a command to run) and duly read the ledger, chose ASK, and
+# ran `enqueue-question` in the SAME turn — its whole output to the human
+# sitting there was a report of what it had already done. On a paid client
+# engagement where a round-trip takes days, that spent a day on questions
+# the operator may already have had answers to. The base prompt's
+# "summarize your plan before writing anything" was not enough: nothing
+# made it a STOP, and without a turn boundary a compliant session still
+# writes.
+DECOMPOSITION_CHAT_ATTENDED_ADDENDUM = """\
+
+── ATTENDED SESSION (`--interactive`) — OVERRIDES THE ABOVE ──
+
+An operator is sitting at this terminal RIGHT NOW, watching you type. That \
+changes the shape of this iteration, and where this section conflicts with \
+anything above, THIS SECTION WINS.
+
+**YOUR FIRST TURN WRITES NOTHING.** Not `coord portal enqueue-question`, not \
+`coord portal enqueue-status`, not `coord portal decision propose/reject/\
+supersede`, not `coord issue create`, not `coord milestone create`, not \
+`coord drive-queue add`, not `coord portal link`, not `coord issue edit`. \
+Read-only commands (`coord portal ledger`, `gh issue view`, reading files) \
+are fine and expected. The "EXACTLY ONE of three terminal moves" rule above \
+still decides WHICH exit this iteration takes — it just does not get to \
+happen until the operator has answered you.
+
+So your first turn is:
+
+1. State your READ — the MODE line verbatim (as always), then what RUNNING \
+CONTEXT already tells you, explicitly including any operator-supplied \
+background recorded there.
+2. State your PROPOSED EXIT — which of Ask / Propose / Decompose you intend, \
+the exact command(s) you would run (question text, decision text, issue \
+titles), and WHY that exit and not the other two.
+3. State what you are ASSUMING or MISSING — above all, anything you were \
+about to ask the CLIENT that the OPERATOR may simply know. The operator may \
+have spoken to the client since the last iteration; a client round-trip \
+costs days and an operator answer costs one line, so ask the human in front \
+of you FIRST.
+4. END YOUR TURN AND WAIT. Do not narrate a plan and then execute it in the \
+same turn — the turn boundary IS the confirmation.
+
+Then act on what the operator says: carry out the exit as proposed, or the \
+revised one they steer you to. If they confirm with no changes, run the \
+commands exactly as you stated them and report back. If they redirect you \
+into a different exit, take that one — it is still exactly one terminal \
+move per iteration.
+
+**Recording what the operator tells you.** Background the operator relays \
+("I spoke to her — it's just the two of them, and the calendar is a \
+nice-to-have") is durable, ledger-class context that every FUTURE session on \
+every machine should see. It is not a decision, so do NOT push it through \
+`coord portal decision propose`. Record it verbatim with:
+
+    coord portal note <submission_id> "<what the operator told you>"
+
+This is an ADDITIONAL write path you are permitted, on top of the ones the \
+Rules section above enumerates — and, being a write, it is also subject to \
+the first-turn rule: offer it, then record it once the operator agrees. \
+OFFER IT PROACTIVELY: the operator should not have to know this command \
+exists. Any time the operator gives you a substantive fact about the \
+client, the users, or the scope, say back what you would record and ask \
+whether to record it. Keep the wording theirs, not your paraphrase — the \
+ledger is verbatim by design, and the narrative (which is regenerable) is \
+where summarizing belongs.\
+"""
+
 # Deny list applied to decomposition-chat workers (#2533; extended #2750
 # IL-4 for the ask/propose/decompose intake loop). Unlike milestone-chat,
 # this type's WHOLE job is to write (issue create / issue edit / milestone

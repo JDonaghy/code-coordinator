@@ -1775,3 +1775,124 @@ def test_a_configured_ungated_kind_queues_straight_through(tmp_path, monkeypatch
 
     assert [r.seq for r in portal_store.pending_outbox()] == [1, 2]
     assert portal_store.draft_outbox() == []
+
+
+# ── #2867: `coord portal note` — the ledger's operator-context layer ─────────
+
+
+def test_note_is_registered_on_the_portal_group():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "note" in result.output
+
+
+def test_note_records_operator_background_verbatim_and_attributed(monkeypatch):
+    """The headline #2867 behaviour: what the operator knows gets a durable
+    home on the ledger, stored exactly as typed and attributed to a human."""
+    from coord import portal_store
+
+    portal_store.seed_revision("sub_1", 1)
+    monkeypatch.setattr("coord.commands.portal._actor", lambda: "jane")
+
+    text = (
+        "Spoke to client 2026-08-28: household of two, no logins needed; "
+        "calendar is a nice-to-have."
+    )
+    result = run("portal", "note", "sub_1", text)
+    assert result.exit_code == 0, result.output
+    assert "noted: sub_1 #1" in result.output
+
+    [entry] = portal_store.operator_notes_for_submission("sub_1")
+    assert entry.text == text  # verbatim — not summarized, not reworded
+    assert entry.actor == "operator:jane"
+    assert entry.kind == portal_store.LEDGER_KIND_OPERATOR_NOTE
+
+
+def test_note_rejects_an_unknown_submission_with_a_clear_error():
+    from coord import portal_store
+
+    result = run("portal", "note", "sub_nope", "background")
+    assert result.exit_code == 2
+    assert "unknown submission" in result.output
+    assert "sub_nope" in result.output
+    assert portal_store.ledger_for_submission("sub_nope") == []
+
+
+def test_note_rejects_empty_text():
+    from coord import portal_store
+
+    portal_store.seed_revision("sub_1", 1)
+    result = run("portal", "note", "sub_1", "   ")
+    assert result.exit_code == 2
+    assert "non-empty" in result.output
+    assert portal_store.ledger_for_submission("sub_1") == []
+
+
+def test_ledger_renders_operator_notes_attributed_and_in_seq_order(monkeypatch):
+    """#2867's acceptance bar for the read side: `coord portal ledger` shows
+    the note verbatim, under its own heading, attributed — and never as a
+    decision."""
+    from coord import portal_store
+
+    portal_store.seed_revision("sub_1", 1)
+    monkeypatch.setattr("coord.commands.portal._actor", lambda: "jane")
+    run("portal", "note", "sub_1", "Household of two.")
+    run("portal", "note", "sub_1", "Calendar is a nice-to-have.")
+
+    result = run("portal", "ledger", "sub_1")
+    assert result.exit_code == 0, result.output
+    assert "## Operator notes" in result.output
+    assert "[1] Household of two.  (by operator:jane)" in result.output
+    assert "[2] Calendar is a nice-to-have.  (by operator:jane)" in result.output
+    # Order is ledger seq order, notes never leak into the Decisions layer.
+    assert result.output.index("Household of two.") < result.output.index(
+        "Calendar is a nice-to-have."
+    )
+    decisions_section = result.output.split("## Decisions", 1)[1]
+    assert "Household of two." not in decisions_section
+
+    as_json = run("portal", "ledger", "sub_1", "--json")
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert [n["text"] for n in payload["operator_notes"]] == [
+        "Household of two.",
+        "Calendar is a nice-to-have.",
+    ]
+    assert payload["decisions"] == []
+    assert payload["narrative"] == ""
+
+
+def test_note_routes_through_the_daemon_on_a_thin_client(thin_client, monkeypatch):
+    """Same #2751 exception `decision`/`ledger`/`link` get: the operator may
+    be sitting anywhere in the fleet, so this must POST `/portal-note`
+    rather than write a thin client's own (empty, wrong) local DB."""
+    from coord import client as cc
+
+    calls = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        calls.append((path, payload))
+        return {
+            "entry": {
+                "id": 1,
+                "submission_id": payload["submission_id"],
+                "seq": 7,
+                "kind": "operator_note",
+                "question_revision": None,
+                "text": payload["text"],
+                "actor": "operator:jane",
+                "source_event_id": None,
+                "payload_json": "{}",
+                "recorded_at": 100.0,
+            }
+        }
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    result = run("portal", "note", "sub_1", "Client prefers web-only")
+    assert result.exit_code == 0, result.output
+    assert "noted: sub_1 #7" in result.output
+    assert len(calls) == 1
+    assert calls[0][0] == "/portal-note"
+    assert calls[0][1]["submission_id"] == "sub_1"
+    assert calls[0][1]["text"] == "Client prefers web-only"

@@ -3283,6 +3283,41 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-note": {
+            "post": {
+                "summary": (
+                    "#2867: append one operator-supplied background fact to a "
+                    "submission's ledger, verbatim — the layer that holds what "
+                    "the OPERATOR knows (e.g. relayed from a phone call). "
+                    "Executed HERE on the daemon, same reason /portal-decision "
+                    "is — `coord portal note`"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "submission_id": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "actor": {"type": "string"},
+                                },
+                                "required": ["submission_id", "text"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK — {'entry': <serialized LedgerEntry>}"},
+                    "400": {
+                        "description": (
+                            "Missing submission_id, empty text, or unknown submission"
+                        )
+                    },
+                },
+            },
+        },
         "/portal-ledger": {
             "get": {
                 "summary": (
@@ -6187,6 +6222,60 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     "actor": entry.actor,
                     "recorded_at": entry.recorded_at,
                     "updated_at": entry.updated_at,
+                }
+            }
+        )
+
+    async def post_portal_note(request: Request) -> Response:
+        # #2867: the ledger's operator-context layer. Same seam shape and
+        # same rationale as `/portal-decision` right above (#2751) — the
+        # operator relaying what a client told them may be sitting at any
+        # machine in the fleet, and a note written into a thin client's own
+        # empty `portal_ledger` would be silently lost. The unknown-
+        # submission check lives in `_append_operator_note_local`, i.e. HERE
+        # where the real `portal_submissions` table is, and surfaces as a
+        # 400 through the same ValueError branch.
+        import json as _json  # noqa: PLC0415
+
+        from coord import portal_store  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        submission_id = body.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return JSONResponse(
+                {"error": "portal-note needs a 'submission_id'"}, status_code=400
+            )
+        try:
+            entry = portal_store._append_operator_note_local(
+                submission_id,
+                body.get("text") or "",
+                actor=body.get("actor") or "",
+            )
+        except ValueError as e:
+            return JSONResponse({"error": f"bad portal-note: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-note write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "entry": {
+                    "id": entry.id,
+                    "submission_id": entry.submission_id,
+                    "seq": entry.seq,
+                    "kind": entry.kind,
+                    "question_revision": entry.question_revision,
+                    "text": entry.text,
+                    "actor": entry.actor,
+                    "source_event_id": entry.source_event_id,
+                    # `_ledger_from_row` (which the client feeds this dict
+                    # back into) parses this key as a JSON *string*, exactly
+                    # as it comes off a DB row — not as a nested object.
+                    "payload_json": _json.dumps(entry.payload, sort_keys=True),
+                    "recorded_at": entry.recorded_at,
                 }
             }
         )
@@ -9482,6 +9571,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/portal-link", get_portal_link, methods=["GET"]),
         Route("/portal-link", post_portal_link, methods=["POST"]),
         Route("/portal-decision", post_portal_decision, methods=["POST"]),
+        Route("/portal-note", post_portal_note, methods=["POST"]),
         Route("/portal-ledger", get_portal_ledger, methods=["GET"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),

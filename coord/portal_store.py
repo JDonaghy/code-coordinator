@@ -1739,6 +1739,44 @@ LEDGER_KIND_DRAFT_EDITED = "draft_edited"
 LEDGER_KIND_DRAFT_APPROVED = "draft_approved"
 LEDGER_KIND_DRAFT_REJECTED = "draft_rejected"
 
+#: #2867: background the OPERATOR relays — "I spoke to her; it's just the two
+#: of them and the calendar is a nice-to-have." Ledger-class, not
+#: decision-class: it is a FACT someone told the operator, not a judgment
+#: call with a proposed/confirmed lifecycle, so forcing it through
+#: `coord portal decision propose` would both lose the raw statement and
+#: pollute the decision archive. Still coord-observed in the sense this
+#: section's ownership note means — a human typed it at coord's own CLI,
+#: which is not "an agent's say-so about a fact it does not solely observe".
+#: Stored VERBATIM and never folded into the narrative (#2746: "a ledger that
+#: IS a narrative cannot be regenerated — that asymmetry is the design").
+LEDGER_KIND_OPERATOR_NOTE = "operator_note"
+
+#: Marks a ledger ``actor`` as a human at coord's CLI rather than the portal
+#: wire, so a later session can tell operator-relayed context from something
+#: the client actually wrote. See :func:`operator_actor`.
+OPERATOR_ACTOR_PREFIX = "operator:"
+
+
+def operator_actor(name: str = "") -> str:
+    """The ``actor`` string for an operator-authored ledger row.
+
+    ``"jane"`` → ``"operator:jane"``; empty → the bare ``"operator"``. Already
+    prefixed values pass through unchanged, so routing a note through the
+    daemon (which re-normalizes) can't produce ``operator:operator:jane``.
+    """
+    n = (name or "").strip()
+    if not n:
+        return "operator"
+    return n if n.startswith(OPERATOR_ACTOR_PREFIX) else f"{OPERATOR_ACTOR_PREFIX}{n}"
+
+
+def is_operator_actor(actor: str) -> bool:
+    """True when *actor* names a human at coord's CLI (:func:`operator_actor`'s
+    output) rather than the customer or an agent — what the briefing renders
+    attribute notes with."""
+    a = (actor or "").strip()
+    return a == "operator" or a.startswith(OPERATOR_ACTOR_PREFIX)
+
 
 @dataclass(frozen=True)
 class LedgerEntry:
@@ -1868,6 +1906,79 @@ def ledger_for_submission(submission_id: str) -> list[LedgerEntry]:
         (submission_id,),
     ).fetchall()
     return [_ledger_from_row(r) for r in rows]
+
+
+def operator_notes_for_submission(submission_id: str) -> list[LedgerEntry]:
+    """*submission_id*'s operator notes (#2867), oldest first — the ledger
+    rows a human typed, filtered out of :func:`ledger_for_submission`'s full
+    history by kind."""
+    return [
+        e
+        for e in ledger_for_submission(submission_id)
+        if e.kind == LEDGER_KIND_OPERATOR_NOTE
+    ]
+
+
+def _append_operator_note_local(
+    submission_id: str, text: str, *, actor: str = "", now: float | None = None
+) -> LedgerEntry:
+    """Write half of :func:`append_operator_note` — runs on the daemon host
+    (either directly, or via ``/portal-note`` on behalf of a thin client).
+
+    Validates the submission EXISTS here rather than in the CLI: on a thin
+    client the local ``portal_submissions`` table is empty by construction
+    (#2336), so a caller-side check would reject every id. Doing it here
+    means the "unknown submission" error is raised where the real table
+    lives, whichever machine the operator typed the command on.
+    """
+    if not submission_id or not submission_id.strip():
+        raise ValueError("operator note needs a submission_id")
+    if not text or not text.strip():
+        raise ValueError("operator note needs non-empty text")
+    if get_submission(submission_id) is None:
+        raise ValueError(
+            f"unknown submission {submission_id!r} — no portal submission with "
+            "that id (check `coord portal status` for the current ids)"
+        )
+    return append_ledger_entry(
+        submission_id,
+        LEDGER_KIND_OPERATOR_NOTE,
+        text=text.strip(),
+        actor=operator_actor(actor),
+        now=now,
+    )
+
+
+def _route_note(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST *payload* to the daemon's ``/portal-note`` seam, or ``None`` if
+    this process IS the daemon host — the note-shaped twin of
+    :func:`_route_decision`, and daemon-routed for exactly the same reason
+    (#2751): the operator may be sitting at any machine in the fleet, and a
+    note written into a thin client's own empty DB would be silently lost.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    return board_service.route_write(svc, "/portal-note", payload)
+
+
+def append_operator_note(
+    submission_id: str, text: str, *, actor: str = "", now: float | None = None
+) -> LedgerEntry:
+    """Append one operator-supplied background fact to *submission_id*'s
+    ledger (#2867) — routed to the daemon when ``board_service`` is
+    configured, else written locally.
+
+    Raises :class:`ValueError` for an unknown submission, empty text, or a
+    missing id. The stored text is VERBATIM (stripped of surrounding
+    whitespace only) and is never rewritten into the narrative.
+    """
+    routed = _route_note(
+        {"submission_id": submission_id, "text": text, "actor": actor}
+    )
+    if routed is not None:
+        return _ledger_from_row(routed["entry"])
+    return _append_operator_note_local(submission_id, text, actor=actor, now=now)
 
 
 # ── layer 2: decisions (agent-authored, operator-confirmed) ─────────────────
@@ -2208,6 +2319,11 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
     :func:`coord.portal_sync._record_question_answer` never drops one just
     because it can't be paired) lands in ``unpaired_answers`` instead of
     being silently lost.
+
+    Operator notes (#2867) come back verbatim under their own
+    ``operator_notes`` key, in ledger ``seq`` order — deliberately NOT mixed
+    into ``qa`` (they answer no question) and NOT folded into ``narrative``
+    (they are ledger-class facts, and the narrative is regenerable).
     """
     ledger = ledger_for_submission(submission_id)
     decisions = decisions_for_submission(submission_id)
@@ -2215,8 +2331,11 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
 
     questions: dict[int | None, dict[str, Any]] = {}
     unpaired_answers: list[LedgerEntry] = []
+    operator_notes: list[LedgerEntry] = []
     for entry in ledger:
-        if entry.kind == LEDGER_KIND_QUESTION_PUSHED:
+        if entry.kind == LEDGER_KIND_OPERATOR_NOTE:
+            operator_notes.append(entry)
+        elif entry.kind == LEDGER_KIND_QUESTION_PUSHED:
             questions.setdefault(
                 entry.question_revision, {"question": entry, "answers": []}
             )
@@ -2251,6 +2370,19 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
                 "recorded_at": a.recorded_at,
             }
             for a in unpaired_answers
+        ],
+        # #2867: verbatim, in ledger `seq` order (`ledger_for_submission` is
+        # seq-ordered and this list preserves that), carrying the operator
+        # `actor` so every renderer can attribute them rather than letting
+        # them read as something the client said.
+        "operator_notes": [
+            {
+                "seq": n.seq,
+                "text": n.text,
+                "actor": n.actor,
+                "recorded_at": n.recorded_at,
+            }
+            for n in operator_notes
         ],
         "decisions": [
             {
