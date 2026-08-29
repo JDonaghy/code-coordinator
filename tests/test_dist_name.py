@@ -371,6 +371,38 @@ class TestBuildUnderNewName:
         assert "code-coordinator" in resolved
 
 
+def _make_slot_inherit_the_ambient_venv(slot: Path) -> None:
+    """Make a fake blue/green *slot* whose ``bin/python`` is a symlink behave
+    like the real thing: a venv, not the base interpreter.
+
+    A real agent slot IS a venv (``coord/agent_update.py`` builds it with
+    ``python -m venv``), so ``slot/bin/python`` resolves ``slot``'s own
+    ``site-packages``. Symlinking the ambient interpreter into ``slot/bin``
+    does NOT reproduce that: CPython looks for ``pyvenv.cfg`` next to the
+    symlink's directory, does not find one, resolves through to the base
+    interpreter, and the slot silently gets the SYSTEM ``site-packages``.
+    Under CI (``pip install`` straight into the setup-python prefix) that is
+    harmless, but under the virtualenv CLAUDE.md tells every contributor to
+    develop in, ``import coord.commands.review`` then dies on
+    ``ModuleNotFoundError: httpx`` — a dependency that IS installed, just not
+    where the un-venv'd interpreter looks. That made this test red on every
+    branch on any venv-based checkout (found while re-running the Test stage
+    for #2897).
+
+    Carrying the ambient venv's ``pyvenv.cfg`` + ``lib/`` across restores the
+    venv the symlink dropped. A no-op when the ambient interpreter is not a
+    venv, which is exactly the CI case that already passed.
+    """
+    pyvenv_cfg = Path(sys.prefix) / "pyvenv.cfg"
+    if not pyvenv_cfg.exists():
+        return
+    (slot / "pyvenv.cfg").write_text(pyvenv_cfg.read_text())
+    for libdir in ("lib", "lib64"):
+        source = Path(sys.prefix) / libdir
+        if source.is_dir() and not (slot / libdir).exists():
+            (slot / libdir).symlink_to(source, target_is_directory=True)
+
+
 class TestAgentUpdateSmokeCheckUsesThisModule:
     """#2103 site 4 (`coord/agent_update.py`'s smoke check): the embedded
     `python -c` script now imports `coord.dist_name` instead of hardcoding
@@ -391,6 +423,7 @@ class TestAgentUpdateSmokeCheckUsesThisModule:
         (slot / "bin").mkdir(parents=True)
         (slot / "bin" / "python").symlink_to(sys.executable)
         (slot / "bin" / "coord").symlink_to(coord_console_script)
+        _make_slot_inherit_the_ambient_venv(slot)
 
         ok, detected_version, log = _smoke_check(slot, target_version=None)
 
