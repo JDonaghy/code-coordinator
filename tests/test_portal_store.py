@@ -1492,3 +1492,215 @@ class TestDraftFieldValue:
 
         row = _draft_question()
         assert portal_store.draft_field_value(row, "design_round.nope") is None
+
+
+# ── #2867: operator notes — the ledger's operator-context layer ──────────────
+
+
+class TestOperatorNotes:
+    def test_append_stores_verbatim_and_attributes_the_human(self, coord_db) -> None:
+        from coord.portal_store import (
+            LEDGER_KIND_OPERATOR_NOTE,
+            append_operator_note,
+            ledger_for_submission,
+            seed_revision,
+        )
+
+        seed_revision("sub_1", 1)
+        text = "Spoke to her — it's just the two of them; calendar is a nice-to-have."
+        entry = append_operator_note("sub_1", text, actor="jane")
+
+        assert entry.kind == LEDGER_KIND_OPERATOR_NOTE
+        assert entry.text == text
+        assert entry.actor == "operator:jane"
+        [stored] = ledger_for_submission("sub_1")
+        assert stored == entry
+
+    def test_unknown_submission_is_rejected(self, coord_db) -> None:
+        from coord.portal_store import append_operator_note, ledger_for_submission
+
+        with pytest.raises(ValueError, match="unknown submission"):
+            append_operator_note("sub_nope", "background")
+        assert ledger_for_submission("sub_nope") == []
+
+    def test_empty_text_is_rejected(self, coord_db) -> None:
+        from coord.portal_store import append_operator_note, seed_revision
+
+        seed_revision("sub_1", 1)
+        with pytest.raises(ValueError, match="non-empty"):
+            append_operator_note("sub_1", "   ")
+
+    def test_actor_is_never_double_prefixed(self, coord_db) -> None:
+        """A note routed through the daemon arrives with an ALREADY-prefixed
+        actor; re-normalizing must not yield `operator:operator:jane`."""
+        from coord.portal_store import operator_actor
+
+        assert operator_actor("jane") == "operator:jane"
+        assert operator_actor("operator:jane") == "operator:jane"
+        assert operator_actor("") == "operator"
+        assert operator_actor("   ") == "operator"
+
+    def test_notes_interleave_with_other_kinds_in_seq_order(self, coord_db) -> None:
+        from coord.portal_store import (
+            append_ledger_entry,
+            append_operator_note,
+            ledger_for_submission,
+            operator_notes_for_submission,
+            seed_revision,
+        )
+
+        seed_revision("sub_1", 1)
+        append_ledger_entry("sub_1", "question_pushed", question_revision=1, text="Q1")
+        append_operator_note("sub_1", "first note", actor="jane")
+        append_ledger_entry("sub_1", "question_pushed", question_revision=2, text="Q2")
+        append_operator_note("sub_1", "second note", actor="jane")
+
+        assert [e.seq for e in ledger_for_submission("sub_1")] == [1, 2, 3, 4]
+        assert [(n.seq, n.text) for n in operator_notes_for_submission("sub_1")] == [
+            (2, "first note"),
+            (4, "second note"),
+        ]
+
+    def test_render_ledger_payload_exposes_notes_and_keeps_them_out_of_qa(
+        self, coord_db
+    ) -> None:
+        """#2867: notes are ledger-class — they appear under their own key,
+        never as an answer, never as a decision, never in the narrative."""
+        from coord.portal_store import (
+            append_ledger_entry,
+            append_operator_note,
+            render_ledger_payload,
+            seed_revision,
+        )
+
+        seed_revision("sub_1", 1)
+        append_ledger_entry("sub_1", "question_pushed", question_revision=1, text="Q1")
+        append_operator_note("sub_1", "Household of two.", actor="jane")
+
+        payload = render_ledger_payload("sub_1")
+        assert payload["operator_notes"] == [
+            {
+                "seq": 2,
+                "text": "Household of two.",
+                "actor": "operator:jane",
+                "recorded_at": payload["operator_notes"][0]["recorded_at"],
+            }
+        ]
+        assert payload["qa"] == [
+            {"question_revision": 1, "question": "Q1", "answers": []}
+        ]
+        assert payload["unpaired_answers"] == []
+        assert payload["decisions"] == []
+        assert payload["archived_decisions"] == []
+        assert payload["narrative"] == ""
+
+    def test_append_routes_to_the_daemon_when_board_service_is_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+        from coord.portal_store import append_operator_note, ledger_for_submission
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+
+        def fake_post_record(svc, path, payload, **kw):
+            calls.append((path, payload))
+            return {
+                "entry": {
+                    "id": 1,
+                    "submission_id": payload["submission_id"],
+                    "seq": 3,
+                    "kind": "operator_note",
+                    "question_revision": None,
+                    "text": payload["text"],
+                    "actor": "operator:jane",
+                    "source_event_id": None,
+                    "payload_json": "{}",
+                    "recorded_at": 100.0,
+                }
+            }
+
+        monkeypatch.setattr(cc, "post_record", fake_post_record)
+
+        result = append_operator_note("sub_1", "Routed note", actor="jane")
+        assert calls == [
+            (
+                "/portal-note",
+                {"submission_id": "sub_1", "text": "Routed note", "actor": "jane"},
+            )
+        ]
+        assert result.seq == 3
+        assert result.text == "Routed note"
+        assert result.actor == "operator:jane"
+        # ...and nothing was written into this (thin client's) own local DB.
+        assert ledger_for_submission("sub_1") == []
+
+
+def test_daemon_portal_note_endpoint(tmp_path) -> None:
+    """#2867: POST `/portal-note` — the operator-context layer's daemon seam,
+    mirroring `test_daemon_portal_decision_endpoint` above. The operator may
+    be sitting at any machine in the fleet; the write must land in the
+    daemon's real `portal_ledger`, and an unknown submission must come back
+    as a clear 400 rather than silently creating one."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import operator_notes_for_submission, seed_revision
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-note.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+    seed_revision("sub_1", 1)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_submission = cli.post("/portal-note", json={"text": "hi"})
+        unknown_submission = cli.post(
+            "/portal-note", json={"submission_id": "sub_nope", "text": "hi"}
+        )
+        empty_text = cli.post(
+            "/portal-note", json={"submission_id": "sub_1", "text": "   "}
+        )
+        noted = cli.post(
+            "/portal-note",
+            json={
+                "submission_id": "sub_1",
+                "text": "Household of two; no logins needed.",
+                "actor": "jane",
+            },
+        )
+
+    assert missing_submission.status_code == 400
+    assert unknown_submission.status_code == 400
+    assert "unknown submission" in unknown_submission.json()["error"]
+    assert empty_text.status_code == 400
+    assert noted.status_code == 200
+    entry = noted.json()["entry"]
+    assert entry["kind"] == "operator_note"
+    assert entry["text"] == "Household of two; no logins needed."
+    assert entry["actor"] == "operator:jane"
+    # `payload_json` is a JSON *string*, because the client feeds this dict
+    # straight back into `_ledger_from_row`, which parses it as one.
+    assert entry["payload_json"] == "{}"
+
+    [stored] = operator_notes_for_submission("sub_1")
+    assert stored.text == "Household of two; no logins needed."
+    assert stored.actor == "operator:jane"

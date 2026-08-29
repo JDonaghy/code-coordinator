@@ -278,6 +278,11 @@ def render_running_context_section(payload: dict[str, Any]) -> str:
     ones carrying why), and the current narrative. This is what lets a
     fresh iteration pick up exactly where the last one left off with no
     memory of the prior session (#2750's "the loop").
+
+    Since #2867 it also renders the ledger's operator-note layer — what a
+    human relayed out of band ("I spoke to her; it's just the two of them")
+    — attributed as operator-supplied so a session can tell it from
+    something the client wrote on the portal itself.
     """
     lines: list[str] = ["RUNNING CONTEXT (from the portal ledger):", "", "Q&A so far:"]
     qa = payload.get("qa") or []
@@ -300,6 +305,22 @@ def render_running_context_section(payload: dict[str, Any]) -> str:
             f"  - A (unpaired, question_revision={a.get('question_revision')}): "
             f"{a.get('text', '')}  (by {a.get('actor') or 'customer'})"
         )
+
+    # #2867: verbatim and attributed, so a session on a different machine
+    # with no shared transcript still sees what the operator was told out of
+    # band. Placed ahead of decisions because it is INPUT to them.
+    notes = payload.get("operator_notes") or []
+    if notes:
+        lines.append("")
+        lines.append(
+            "Operator-supplied background (relayed by a human, NOT written by "
+            "the client on the portal — treat as fact, do not re-ask it):"
+        )
+        for n in notes:
+            lines.append(
+                f"  - [{n.get('seq')}] {n.get('text')}  "
+                f"(by {n.get('actor') or 'operator'})"
+            )
 
     lines.append("")
     lines.append("Current decisions (proposed/confirmed — treat as live guidance):")

@@ -596,6 +596,7 @@ def _run_decompose_chat_interactive(
 
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec as _AssignmentSpecDc,
+        DECOMPOSITION_CHAT_ATTENDED_ADDENDUM,
         DECOMPOSITION_CHAT_DENY_COMMANDS,
         DECOMPOSITION_CHAT_SYSTEM_PROMPT,
         build_deny_prompt,
@@ -664,7 +665,8 @@ def _run_decompose_chat_interactive(
     if _board_service.resolve() is not None:
         click.secho(
             "note: this machine is a thin client — `coord portal decision`/"
-            "`ledger`/`link` route through the daemon (#2751), but `coord "
+            "`ledger`/`link`/`note` route through the daemon (#2751/#2867), "
+            "but `coord "
             "portal enqueue-question`/`enqueue-status` (the Ask move) do "
             "not yet and will refuse loudly if this iteration needs them. "
             "ssh to the daemon host for that case (#2750's own stated "
@@ -699,7 +701,9 @@ def _run_decompose_chat_interactive(
         f"Intake session for portal submission {submission_id} "
         f"(MODE: {mode_word} — {discuss_reason}): read the full context at "
         f"{brief_path} (submission fields, repo topology, and the running-"
-        "context ledger so far) and let's work through it."
+        "context ledger so far) and let's work through it. This is an "
+        "ATTENDED session: state your read and your PROPOSED exit, then stop "
+        "and wait for me — write nothing until I answer (#2867)."
     )
 
     spec = _AssignmentSpecDc(
@@ -719,15 +723,22 @@ def _run_decompose_chat_interactive(
     # internal branch table has no `"decomposition-chat"` case, so leaving
     # it implicit would silently fall through to the generic work-shaped
     # branch (full WORKER_SYSTEM_PROMPT + Edit/Write/Monitor), which is
-    # wrong for a no-worktree chat type. Passing these explicitly keeps
-    # this session byte-identical, on the system prompt, to the headless
-    # dispatch path (`coord.agent.default_worker_command`'s own
-    # `spec.type == "decomposition-chat"` branch).
+    # wrong for a no-worktree chat type.
+    #
+    # #2867: the attended addendum is appended HERE and only here — the
+    # headless dispatch path (`coord.agent.default_worker_command`'s own
+    # `spec.type == "decomposition-chat"` branch) keeps the base prompt
+    # byte-for-byte, so its one-turn fire-and-forget behaviour is unchanged.
+    # This session, by contrast, has a human in the pane: the addendum makes
+    # its first turn confirm-then-write (#2742's absorbed half, which #2750
+    # only ever wired into mode SELECTION, never into the posture itself).
     argv = provider.build_command(
         spec,
         resolved_model=resolved_model,
-        system_prompt=DECOMPOSITION_CHAT_SYSTEM_PROMPT + build_deny_prompt(
-            DECOMPOSITION_CHAT_DENY_COMMANDS
+        system_prompt=(
+            DECOMPOSITION_CHAT_SYSTEM_PROMPT
+            + DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+            + build_deny_prompt(DECOMPOSITION_CHAT_DENY_COMMANDS)
         ),
         allowed_tools="Read,Bash",
     )
@@ -1805,6 +1816,16 @@ def _render_ledger_text(payload: dict) -> str:
             f"{a['text']}  (by {a['actor'] or 'customer'})"
         )
 
+    # #2867: verbatim, attributed, in ledger seq order — its own heading so
+    # a later session can tell operator-relayed background from something
+    # the client actually wrote on the portal. `.get` (not `[...]`) because
+    # a thin client may be talking to a daemon that predates this key.
+    notes = payload.get("operator_notes") or []
+    if notes:
+        lines += ["", "## Operator notes"]
+        for n in notes:
+            lines.append(f"- [{n['seq']}] {n['text']}  (by {n['actor'] or 'operator'})")
+
     lines += ["", "## Decisions"]
     current = payload["decisions"]
     if not current:
@@ -1859,6 +1880,39 @@ def portal_ledger(submission_id: str, as_json: bool) -> None:
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     click.echo(_render_ledger_text(payload))
+
+
+@portal_group.command("note")
+@click.argument("submission_id")
+@click.argument("text")
+def portal_note(submission_id: str, text: str) -> None:
+    """Record operator-supplied background about SUBMISSION_ID (#2867).
+
+    The ledger layer that holds what the OPERATOR knows — "spoke to the
+    client: household of two, no logins needed" — which before this had
+    nowhere durable to live and died with the tmux pane it was typed into.
+    Stored verbatim on the ledger, attributed to you, and rendered into
+    every future session's RUNNING CONTEXT on any machine.
+
+    Deliberately NOT `coord portal decision propose`: a relayed fact is not
+    a judgment call, has no proposed/confirmed lifecycle, and does not
+    belong in the decision archive.
+
+    Like `decision` and `link` (#2751) this is not thin-client-refused — it
+    routes through the daemon's `/portal-note` seam when `board_service` is
+    configured, so it works from wherever the operator happens to be.
+    """
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        entry = portal_store.append_operator_note(submission_id, text, actor=_actor())
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(
+        f"noted: {submission_id} #{entry.seq} (by {entry.actor}) — {entry.text}",
+        fg="green",
+    )
 
 
 @portal_group.group("decision")
