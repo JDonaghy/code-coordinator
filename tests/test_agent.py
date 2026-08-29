@@ -231,6 +231,54 @@ def test_health_tool_versions_is_cached(tmp_path: Path) -> None:
     assert third == first
 
 
+def test_health_tool_versions_probes_everything_when_config_free(
+    tmp_path: Path,
+) -> None:
+    """#2913: a config-free agent declares `capabilities=[]` by design
+    (docs/EPHEMERAL_WORKERS.md) — the coordinator's own `coordinator.yml`
+    supplies capabilities at dispatch time, not this process. Restricting
+    `/health.tool_versions` to `self.capabilities` (empty) meant the #1570 D
+    cross-check in `dispatch_smoke` never had cargo/python3/etc. to compare
+    against and silently failed OPEN for exactly the machines it exists to
+    protect. A config-free agent must now probe every known capability
+    regardless of its own (empty) declared list."""
+    from coord.prereqs import ALL_CAPABILITY_NAMES
+
+    server = AgentServer(
+        machine_name="ephemeral-1",
+        capabilities=[],
+        repos=[],
+        state_dir=tmp_path / "state",
+        worktree_writable_settings_files=[],
+        config_free_reason="no local coordinator.yml and no board service",
+    )
+    tool_versions = server.health()["tool_versions"]
+    assert "cargo" in tool_versions
+    assert "python3" in tool_versions
+    assert "gtk4" in tool_versions
+    assert "node" in tool_versions
+    # Sanity: the probed set really does cover every capability-gated tool,
+    # not just a hardcoded couple of names.
+    probed_capabilities = {
+        info["capability"] for info in tool_versions.values() if info["capability"]
+    }
+    assert probed_capabilities == set(ALL_CAPABILITY_NAMES)
+
+
+def test_health_tool_versions_stays_restricted_when_not_config_free(
+    tmp_path: Path,
+) -> None:
+    """A normal, fully-configured agent (`config_free_reason=None`, the
+    default) must NOT gain the config-free agent's wider probe — `_server`
+    declares only `capabilities=["python"]`, so `cargo`/`gtk4` stay absent,
+    same as before #2913."""
+    server = _server(tmp_path)
+    tool_versions = server.health()["tool_versions"]
+    assert "python3" in tool_versions
+    assert "cargo" not in tool_versions
+    assert "gtk4" not in tool_versions
+
+
 def test_assign_success(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     server = _server(tmp_path, repo_path=repo)

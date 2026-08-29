@@ -382,6 +382,24 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
 
 ALL_PREREQS: tuple[Prereq, ...] = BASELINE_PREREQS + CAPABILITY_PREREQS
 
+# Every capability name any `CAPABILITY_PREREQS` entry gates, in one place
+# (#2913). `probe_all()` restricts probing to a caller-supplied capability
+# set so a normal, fully-configured machine never pays to probe a browser
+# or GTK4 it never claimed — but that same restriction silently defeats
+# `unmet_capabilities()` for a config-free agent (docs/EPHEMERAL_WORKERS.md):
+# its OWN `capabilities` is `[]` by construction (nothing to declare — the
+# coordinator's `coordinator.yml` supplies capabilities at dispatch time,
+# not this process), so `probe_all(self.capabilities)` never probes cargo,
+# python3, or any other capability-gated tool, and the #1570 D cross-check
+# has nothing to compare against. `AgentServer._cached_tool_versions`
+# (coord/agent.py) passes this set instead of `self.capabilities` for a
+# config-free agent, so `/health` always reports the truth about what is
+# actually on the box regardless of what config, if any, this process
+# itself holds.
+ALL_CAPABILITY_NAMES: frozenset[str] = frozenset(
+    p.capability for p in CAPABILITY_PREREQS if p.capability is not None
+)
+
 
 def _parse_version(text: str, pattern: str) -> str | None:
     match = re.search(pattern, text)
@@ -515,6 +533,18 @@ def unmet_capabilities(
     `CAPABILITY_PREREQS` names it) is silently skipped, not flagged — an
     unprobed claim is not (yet) a *known-broken* one; this only reports
     claims this module can actually verify.
+
+    The `p is None` skip is meant for exactly one case: an agent whose
+    `/health` predates this module probing that particular tool at all.
+    Before #2913 it also silently swallowed a second, permanent case — a
+    config-free agent (`self.capabilities == []`) whose `probes` therefore
+    never included the caller's `required_caps` in the first place, so
+    `dispatch_smoke`'s #1570 D cross-check verified nothing for exactly the
+    machines it exists to protect. `AgentServer._cached_tool_versions`
+    closes that by probing `ALL_CAPABILITY_NAMES` (not `self.capabilities`)
+    when the agent is config-free, so `probes` passed in here now genuinely
+    covers every capability this function is asked about, and `p is None`
+    goes back to meaning only "predates the probe" — see coord/agent.py.
     """
     unmet: dict[str, list[str]] = {}
     for cap in capabilities:

@@ -436,6 +436,18 @@ def _capability_probe_reasons(
     would be strictly worse than the blind trust this replaces. Only an
     *explicit* probe failure refuses routing.
 
+    #2913: this used to fail open the same way for a config-free agent too
+    — `tool_versions` was present (baseline `git`/`gh`) but never covered
+    `required_caps`, since a config-free agent has no `capabilities` of its
+    own to probe against and `AgentServer._cached_tool_versions` used to
+    restrict probing to exactly that empty list. `unmet_capabilities` then
+    found nothing to compare and returned `{}`, indistinguishable from
+    "probed and clean". Fixed at the source: a config-free agent now probes
+    every known capability (`coord.prereqs.ALL_CAPABILITY_NAMES`) regardless
+    of what it declares, so `tool_versions` here genuinely covers
+    `required_caps` and this function's refusal path works the same for a
+    config-free agent as for a fully-configured one.
+
     Never raises — a connectivity hiccup here just skips the extra check;
     the POST to `/assign` right after this call in `dispatch_smoke` is the
     real reachability test and fails closed on its own if the machine is
