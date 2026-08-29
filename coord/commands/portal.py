@@ -16,8 +16,16 @@ operator see and drive it without waiting for a tick:
   that keeps a customer from being emailed toward an empty screen (#835);
 * ``requeue`` revives a row the drain retired after burning its retry budget.
 
+#2903 (phase 1 of #2902) added the gate in front of all of that — the
+``draft`` outbox state, and with it ``drafts`` (read what is awaiting an
+operator, in full) plus ``draft edit`` / ``draft approve`` / ``draft reject``
+(the three ways a row leaves it). Under the default policy an agent-authored
+``design_round`` or ``question`` cannot reach a customer without someone
+having read it.
+
 The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``,
-``requeue``, ``publish-mocks``, ``remirror``) read and write the daemon's own
+``requeue``, ``drafts``, ``draft *``, ``publish-mocks``, ``remirror``) read
+and write the daemon's own
 ``~/.coord/coord.db`` and are therefore **daemon-host commands**. Run from a
 thin client they used to silently operate on that box's empty local DB, which
 is not where the bridge lives — producing a normal-looking "nothing pending"
@@ -55,6 +63,8 @@ import datetime
 import getpass
 import json
 
+from typing import TYPE_CHECKING
+
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
@@ -64,6 +74,9 @@ from coord.portal_bridge import (
     SUBMISSION_STATUSES,
     client_from_config,
 )
+
+if TYPE_CHECKING:  # import-cycle-free type-only reference (#2903)
+    from coord.portal_store import OutboxRow
 
 
 def _actor() -> str:
@@ -1154,6 +1167,11 @@ def portal_outbox(as_json: bool, show_all: bool) -> None:
     A `pending` row with a reason is HELD, not failing: the ordering guard is
     refusing to announce something to the customer before the thing it
     announces has been confirmed applied.
+
+    A `draft` row (#2903) is not queued at all yet — it is waiting for an
+    operator to read it. Those are listed here too, so a queue that looks
+    idle cannot secretly be a queue nobody has approved; `coord portal
+    drafts` shows their full prose.
     """
     _refuse_if_thin_client("outbox")
 
@@ -1167,7 +1185,10 @@ def portal_outbox(as_json: bool, show_all: bool) -> None:
             for row in portal_store.outbox_for_submission(sub.submission_id)
         ]
     else:
-        rows = portal_store.pending_outbox()
+        rows = sorted(
+            portal_store.pending_outbox() + portal_store.draft_outbox(),
+            key=lambda r: (r.submission_id, r.seq),
+        )
 
     state = portal_store.get_sync_state()
     if as_json:
@@ -1223,7 +1244,13 @@ def portal_outbox(as_json: bool, show_all: bool) -> None:
             f"{r.submission_id} seq={r.seq} rev={r.revision} "
             f"{r.kind:<13} {r.state}"
         )
-        if held:
+        if r.state == portal_store.STATE_DRAFT:
+            click.secho(
+                f"{line}  DRAFT — awaiting approval "
+                f"(`coord portal drafts` to read it)",
+                fg="cyan",
+            )
+        elif held:
             click.secho(f"{line}  HELD — {held}", fg="yellow")
         elif r.state == portal_store.STATE_REJECTED:
             click.secho(f"{line}  {r.reason}", fg="red")
@@ -1266,6 +1293,27 @@ def portal_events(as_json: bool, limit: int) -> None:
         click.echo(f"{e.occurred_at or '-'}  {e.submission_id}  {e.kind}  {e.event_id}")
 
 
+def _echo_enqueued(row: "OutboxRow", label: str) -> None:
+    """Report one just-enqueued row, saying out loud when it is gated (#2903).
+
+    A row that landed in `draft` has NOT been queued and will never send on
+    its own; an operator told "queued:" for one would wait forever for an
+    email that is sitting behind the gate they themselves have to open.
+    """
+    from coord import portal_store  # noqa: PLC0415
+
+    body = f"{row.submission_id} seq={row.seq} rev={row.revision} {label}"
+    if row.state == portal_store.STATE_DRAFT:
+        click.secho(
+            f"drafted (awaiting approval): {body} — read it with "
+            f"`coord portal drafts`, then `coord portal draft approve "
+            f"{row.submission_id} {row.seq}`",
+            fg="cyan",
+        )
+        return
+    click.secho(f"queued: {body}", fg="green")
+
+
 @portal_group.command("enqueue-status")
 @click.argument("submission_id")
 @click.argument("status", type=click.Choice(SUBMISSION_STATUSES))
@@ -1285,10 +1333,7 @@ def portal_enqueue_status(submission_id: str, status: str) -> None:
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
-    click.secho(
-        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} status={status}",
-        fg="green",
-    )
+    _echo_enqueued(row, f"status={status}")
 
 
 @portal_group.command("enqueue-design-round")
@@ -1315,10 +1360,7 @@ def portal_enqueue_design_round(submission_id: str, payload_json: str) -> None:
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
-    click.secho(
-        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} design_round",
-        fg="green",
-    )
+    _echo_enqueued(row, "design_round")
 
 
 @portal_group.command("enqueue-preview")
@@ -1341,10 +1383,7 @@ def portal_enqueue_preview(submission_id: str, preview_url: str) -> None:
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
-    click.secho(
-        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} preview",
-        fg="green",
-    )
+    _echo_enqueued(row, "preview")
 
 
 @portal_group.command("enqueue-question")
@@ -1367,16 +1406,8 @@ def portal_enqueue_question(submission_id: str, question: str) -> None:
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
-    click.secho(
-        f"queued: {question_row.submission_id} seq={question_row.seq} "
-        f"rev={question_row.revision} question",
-        fg="green",
-    )
-    click.secho(
-        f"queued: {status_row.submission_id} seq={status_row.seq} "
-        f"rev={status_row.revision} status=needs-input",
-        fg="green",
-    )
+    _echo_enqueued(question_row, "question")
+    _echo_enqueued(status_row, "status=needs-input")
 
 
 @portal_group.command("remirror")
@@ -1489,6 +1520,243 @@ def portal_requeue(submission_id: str, seq: int) -> None:
         f"requeued: {row.submission_id} seq={row.seq} rev={row.revision} {row.kind}",
         fg="green",
     )
+
+
+# ── #2903 (phase 1 of #2902): the draft gate ────────────────────────────────
+#
+# The operator surface for the `draft` outbox state: `drafts` lists what is
+# waiting with the FULL PROSE (a gate you cannot read through is a
+# rubber-stamp), and `draft edit`/`approve`/`reject` are the three ways a row
+# leaves it. All four are daemon-host commands like every other
+# outbox-touching command — the draft rows live in the daemon's own
+# ~/.coord/coord.db and a thin client would silently review an empty queue.
+
+
+def _draft_field_lines(row: "OutboxRow") -> list[str]:
+    """The prose of one draft row, as lines, editable fields marked.
+
+    Prints the WHOLE payload, not just the editable slice: an operator
+    approving a design round has to see the decomposition and bundle key
+    they are signing off on even though neither can be rewritten here.
+    """
+    from coord.portal_store import EDITABLE_DRAFT_FIELDS  # noqa: PLC0415
+
+    editable = set(EDITABLE_DRAFT_FIELDS.get(row.kind, ()))
+    lines: list[str] = []
+
+    def _walk(value, prefix: str) -> None:
+        if isinstance(value, dict):
+            for key in sorted(value):
+                _walk(value[key], f"{prefix}.{key}" if prefix else key)
+            return
+        mark = " (editable)" if prefix in editable else ""
+        rendered = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+        lines.append(f"    {prefix}{mark}:")
+        for line in str(rendered).splitlines() or [""]:
+            lines.append(f"      {line}")
+
+    _walk(row.fields, "")
+    return lines
+
+
+@portal_group.command("drafts")
+@click.option("--json", "as_json", is_flag=True, default=False)
+@click.argument("submission_id", required=False, default=None)
+def portal_drafts(as_json: bool, submission_id: str | None) -> None:
+    """List outbox rows awaiting operator approval, with their full prose.
+
+    Under the default policy (`portal.approval` in coordinator.yml) an
+    agent-authored `design_round` or `question` lands in `draft` and no drain
+    will ever send it. This is where you read it. Then:
+
+    \b
+      coord portal draft edit    <sub> <seq>            rewrite the prose
+      coord portal draft approve <sub> <seq>            let it send
+      coord portal draft reject  <sub> <seq> --reason … kill it
+    """
+    _refuse_if_thin_client("drafts")
+
+    from coord import portal_store  # noqa: PLC0415
+
+    rows = portal_store.draft_outbox(submission_id)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "drafts": [
+                        {
+                            "submission_id": r.submission_id,
+                            "seq": r.seq,
+                            "revision": r.revision,
+                            "kind": r.kind,
+                            "state": r.state,
+                            "fields": r.fields,
+                            "enqueued_at": r.enqueued_at,
+                        }
+                        for r in rows
+                    ]
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    if not rows:
+        click.echo("drafts: none awaiting approval")
+        return
+
+    current = None
+    for r in rows:
+        if r.submission_id != current:
+            current = r.submission_id
+            click.secho(f"\n{current}", bold=True)
+        click.secho(f"  seq={r.seq} rev={r.revision} {r.kind}", fg="yellow")
+        for line in _draft_field_lines(r):
+            click.echo(line)
+    click.echo(
+        "\nApprove with `coord portal draft approve <sub> <seq>`, or reject "
+        "with `--reason`."
+    )
+
+
+@portal_group.group("draft")
+def portal_draft_group() -> None:
+    """Review an unapproved outbox row: edit / approve / reject (#2903)."""
+
+
+@portal_draft_group.command("edit")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+@click.option(
+    "--field", "field_path", default=None,
+    help="Which editable field to rewrite (default: the row kind's only one).",
+)
+@click.option(
+    "--text", default=None,
+    help="New text, instead of opening $EDITOR. Makes the command scriptable.",
+)
+def portal_draft_edit(
+    submission_id: str, seq: int, field_path: str | None, text: str | None
+) -> None:
+    """Rewrite an editable field of a draft row in $EDITOR.
+
+    Only while the row is still `draft`, and only the fields that are prose:
+    a question's text, a design round's outcome_definition. `bundle_key`,
+    `decomposition` and `revision` are refused — they are references to
+    things that exist, not wording. Editing a mock bundle is
+    `coord acceptance mock --amend`.
+
+    Both the agent's original text and your version are appended to the
+    submission's ledger, so `coord portal ledger` can still tell them apart
+    six weeks from now.
+    """
+    _refuse_if_thin_client("draft edit")
+
+    from coord import portal_store  # noqa: PLC0415
+
+    row = portal_store.get_outbox_row(submission_id, seq)
+    if row is None:
+        raise click.ClickException(
+            f"no outbox row for {submission_id} seq={seq} "
+            f"(list them with `coord portal outbox --all`)"
+        )
+    editable = portal_store.EDITABLE_DRAFT_FIELDS.get(row.kind, ())
+    if field_path is None:
+        if len(editable) != 1:
+            raise click.ClickException(
+                f"a {row.kind} row has {len(editable)} editable field(s) "
+                f"({', '.join(editable) or 'none'}) — name one with --field"
+            )
+        field_path = editable[0]
+
+    if text is None:
+        current = portal_store.draft_field_value(row, field_path)
+        edited = click.edit(str(current or ""))
+        if edited is None:
+            click.echo("unchanged — nothing written")
+            return
+        text = edited.strip()
+
+    try:
+        updated = portal_store.edit_draft(
+            submission_id, seq, field_path, text, actor=_actor()
+        )
+    except portal_store.DraftGateError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.secho(
+        f"edited: {updated.submission_id} seq={updated.seq} {updated.kind} "
+        f"{field_path} (still draft — approve it to send)",
+        fg="green",
+    )
+
+
+@portal_draft_group.command("approve")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+def portal_draft_approve(submission_id: str, seq: int) -> None:
+    """Flip a draft row to `pending`; the next sync sends it.
+
+    The row keeps its seq and revision, so approving changes only whether it
+    is eligible to send — never its place in the queue.
+    """
+    _refuse_if_thin_client("draft approve")
+
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        row = portal_store.approve_draft(submission_id, seq, actor=_actor())
+    except portal_store.DraftGateError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.secho(
+        f"approved: {row.submission_id} seq={row.seq} rev={row.revision} "
+        f"{row.kind} — now {row.state}, sends on the next `coord portal sync`",
+        fg="green",
+    )
+
+
+@portal_draft_group.command("reject")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+@click.option("--reason", required=True, help="Why. Mandatory — see #2749/#2903.")
+@click.option(
+    "--no-cascade", is_flag=True, default=False,
+    help="Refuse rather than also reject whatever announces this row.",
+)
+def portal_draft_reject(
+    submission_id: str, seq: int, reason: str, no_cascade: bool
+) -> None:
+    """Reject a draft row. REASON is mandatory.
+
+    Also rejects whatever announces it. `ordering_block_reason` treats a
+    rejected prerequisite as never-applied, so a bare reject would leave the
+    `awaiting-signoff` / `needs-input` behind it held forever, in a state
+    that reads like an ordinary hold. With `--no-cascade` the command
+    refuses instead and names the rows to deal with first.
+    """
+    _refuse_if_thin_client("draft reject")
+
+    from coord import portal_store  # noqa: PLC0415
+
+    try:
+        row, also = portal_store.reject_draft(
+            submission_id, seq, reason, cascade=not no_cascade, actor=_actor()
+        )
+    except portal_store.DraftGateError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.secho(
+        f"rejected: {row.submission_id} seq={row.seq} {row.kind} — {reason}",
+        fg="yellow",
+    )
+    for dep in also:
+        click.secho(
+            f"  also rejected: seq={dep.seq} {dep.announces or dep.kind} "
+            f"(it announced the row above and would have been held forever)",
+            fg="yellow",
+        )
 
 
 # ── #2749 (IL-3, epic #2746): the running-context ledger ────────────────────

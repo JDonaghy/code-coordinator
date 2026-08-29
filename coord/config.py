@@ -2158,6 +2158,57 @@ class PortalProjectRepo:
     repos: list[str]
 
 
+#: Every outbox row kind :mod:`coord.portal_sync` can enqueue. Duplicated
+#: here as literals rather than imported from ``coord.portal_sync``'s
+#: ``KIND_*`` constants: that module imports ``coord.portal_store`` which
+#: imports ``coord.db``, and config must stay importable by everything.
+#: ``tests/test_portal_config.py`` pins the two lists together so the copy
+#: cannot silently drift.
+PORTAL_OUTBOX_KINDS = ("status", "design_round", "question", "preview")
+
+#: The draft gate's default policy (#2903, phase 1 of #2902): the two kinds
+#: that carry **agent-authored prose to a customer** are held for an
+#: operator; the two mechanical kinds are not.
+#:
+#: ``status`` and ``preview`` are deliberately ungated. A status is one of a
+#: pinned vocabulary and a preview is a URL — neither is prose anybody would
+#: read and rewrite, and gating them would produce a rubber-stamp queue of
+#: "In progress" ×N that trains the operator to approve without reading,
+#: which is the failure mode this gate exists to prevent (see epic #2902).
+DEFAULT_PORTAL_APPROVAL: dict[str, bool] = {
+    "status": False,
+    "design_round": True,
+    "question": True,
+    "preview": False,
+}
+
+
+@dataclass
+class PortalApprovalConfig:
+    """Which outbox kinds land in ``draft`` instead of ``pending`` (#2903).
+
+    An absent ``portal.approval`` block means :data:`DEFAULT_PORTAL_APPROVAL`
+    exactly. A present block is **merged over** those defaults rather than
+    replacing them, so ``approval: {question: false}`` still gates
+    ``design_round`` — an operator relaxing one kind has not silently opened
+    every other one.
+    """
+
+    kinds: dict[str, bool] = field(
+        default_factory=lambda: dict(DEFAULT_PORTAL_APPROVAL)
+    )
+
+    def gates(self, kind: str) -> bool:
+        """True when *kind* must be operator-approved before it can be sent.
+
+        An unknown kind is **not** gated: a kind this build has never heard
+        of cannot be one of the two prose kinds the gate is for, and failing
+        closed on it would wedge a queue on an unrecognised row nobody can
+        approve (there is no CLI verb for a kind that does not exist).
+        """
+        return bool(self.kinds.get(kind, False))
+
+
 @dataclass
 class PortalConfig:
     """The outbound client to coord-portal's sync bridge (#2179, ``docs/CUSTOMER_PORTAL.md``).
@@ -2197,6 +2248,10 @@ class PortalConfig:
     # a blank cell. Mapping is *operator* knowledge (which repo a client's
     # project lands in), so it lives here and not in the portal's schema.
     project_repos: list[PortalProjectRepo] = field(default_factory=list)
+    # #2903 — the draft gate. Absent block == DEFAULT_PORTAL_APPROVAL ==
+    # design_round/question held for an operator, status/preview straight
+    # through exactly as before.
+    approval: PortalApprovalConfig = field(default_factory=PortalApprovalConfig)
 
     def repos_for_project(self, project_id: str) -> list[str]:
         """The coord repo name(s) *project_id* maps to — ``[]`` if unmapped.
@@ -4149,6 +4204,9 @@ def _parse_portal(raw: Any, repo_names: set[str] | None = None) -> PortalConfig:
     if "project_repos" in raw:
         cfg.project_repos = _parse_portal_project_repos(raw["project_repos"], repo_names)
 
+    if "approval" in raw:
+        cfg.approval = _parse_portal_approval(raw["approval"])
+
     if cfg.enabled and not (cfg.base_url and cfg.bridge_client_id and cfg.bridge_client_secret):
         # Half a credential is not a credential — coord-portal's
         # isBridgeAuthorized takes the identical position and fails closed on
@@ -4159,6 +4217,38 @@ def _parse_portal(raw: Any, repo_names: set[str] | None = None) -> PortalConfig:
         )
 
     return cfg
+
+
+def _parse_portal_approval(raw: Any) -> PortalApprovalConfig:
+    """Parse ``portal.approval`` — the draft gate's per-kind policy (#2903).
+
+    ``None`` (key present but empty) and an absent key both mean
+    :data:`DEFAULT_PORTAL_APPROVAL`. Anything present is merged OVER those
+    defaults — see :class:`PortalApprovalConfig` for why merge and not
+    replace. Every key must name a real outbox kind
+    (:data:`PORTAL_OUTBOX_KINDS`) and every value must be a bool: a typo'd
+    kind that parsed silently would read as "gated: no" and quietly send
+    agent prose to a customer, which is precisely the outcome this block
+    exists to prevent.
+    """
+    if raw is None:
+        return PortalApprovalConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'portal.approval' must be a mapping of kind -> boolean")
+
+    unknown = sorted(set(raw) - set(PORTAL_OUTBOX_KINDS))
+    if unknown:
+        raise ConfigError(
+            f"unknown portal.approval kind(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(PORTAL_OUTBOX_KINDS)})"
+        )
+
+    kinds = dict(DEFAULT_PORTAL_APPROVAL)
+    for kind, value in raw.items():
+        if not isinstance(value, bool):
+            raise ConfigError(f"portal.approval.{kind} must be a boolean")
+        kinds[kind] = value
+    return PortalApprovalConfig(kinds=kinds)
 
 
 def _parse_portal_project_repos(

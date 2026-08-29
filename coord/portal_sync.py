@@ -69,6 +69,18 @@ is **confirmed applied** — not enqueued, not attempted, applied. A crash
 between the two leaves the announcement pending and retries it next tick;
 there is no window in which the mail goes out ahead of its content.
 
+**The draft gate (#2903, phase 1 of #2902), which sits in FRONT of all of
+this.** An agent-authored ``design_round`` or ``question`` is enqueued into
+``portal_store.STATE_DRAFT`` rather than ``pending`` — a new *state*, not a
+new code path: ``pending_outbox()`` is unchanged, so the drain below simply
+never sees the row until ``coord portal draft approve`` flips it. Seq and
+revision are still allocated at enqueue time, so a draft holds its place in
+per-submission FIFO and everything behind it waits, which is exactly what
+keeps :data:`ANNOUNCING_STATUSES` honest while an operator reads. Policy is
+per kind (``portal.approval`` in coordinator.yml, default: gate the two
+prose kinds, pass ``status``/``preview`` straight through) and is read in
+exactly one place, :func:`initial_outbox_state`.
+
 **Idempotency and replay.** Inbound events dedupe on the portal's own event
 id; the cursor advances only after a page commits. Outbound rows allocate
 ``(seq, revision)`` once and keep it across every retry. A daemon that dies
@@ -244,11 +256,54 @@ class SyncResult:
         return "portal sync: " + " ".join(parts)
 
 
+# ── the draft gate's policy read (#2903, phase 1 of #2902) ──────────────────
+
+
+def _approval_config(config: Any = None) -> Any:
+    """``config.portal.approval``, or the built-in default policy.
+
+    Falls back to :class:`coord.config.PortalApprovalConfig`'s defaults
+    (design_round + question gated) whenever a config cannot be read at all
+    — an enqueue must not fail because ``coordinator.yml`` is missing, and
+    the safe answer when policy is unknown is "hold it for a human", not
+    "mail it to the customer".
+    """
+    from coord.config import PortalApprovalConfig  # noqa: PLC0415
+
+    if config is None:
+        from coord import config as config_mod  # noqa: PLC0415
+
+        try:
+            config = config_mod.load()
+        except Exception:  # noqa: BLE001 — no/broken config: use the defaults
+            return PortalApprovalConfig()
+    approval = getattr(getattr(config, "portal", None), "approval", None)
+    return approval if approval is not None else PortalApprovalConfig()
+
+
+def initial_outbox_state(kind: str, *, config: Any = None) -> str:
+    """``draft`` or ``pending`` for a newly enqueued row of *kind* (#2903).
+
+    The one place the draft gate's policy is applied. Every ``enqueue_*``
+    below routes through it, and :func:`coord.portal_store.enqueue` is
+    deliberately NOT allowed to decide for itself — the store stays the
+    mechanical allocator, so the gate cannot reach into the ordering
+    guarantees ``_push`` depends on.
+    """
+    if _approval_config(config).gates(kind):
+        return portal_store.STATE_DRAFT
+    return portal_store.STATE_PENDING
+
+
 # ── producer API: putting coord-owned facts on the queue ────────────────────
 
 
 def enqueue_design_round(
-    submission_id: str, design_round: dict[str, Any], *, now: float | None = None
+    submission_id: str,
+    design_round: dict[str, Any],
+    *,
+    config: Any = None,
+    now: float | None = None,
 ) -> portal_store.OutboxRow:
     """Queue a design round (the D1 metadata half) for *submission_id*.
 
@@ -269,6 +324,7 @@ def enqueue_design_round(
         submission_id,
         KIND_DESIGN_ROUND,
         {"design_round": design_round},
+        state=initial_outbox_state(KIND_DESIGN_ROUND, config=config),
         now=now,
     )
 
@@ -282,6 +338,7 @@ def push_design_round_bundle(
     tracking_issue_title: str,
     tracking_issue_body: str,
     round_number: int = 1,
+    config: Any = None,
     now: float | None = None,
 ) -> tuple[str, portal_store.OutboxRow]:
     """Upload *files* as a design round bundle, then queue its D1 metadata.
@@ -330,12 +387,16 @@ def push_design_round_bundle(
         bundle_key=bundle_key,
         round_number=round_number,
     )
-    row = enqueue_design_round(submission_id, design_round, now=now)
+    row = enqueue_design_round(submission_id, design_round, config=config, now=now)
     return bundle_key, row
 
 
 def enqueue_preview(
-    submission_id: str, preview_url: str, *, now: float | None = None
+    submission_id: str,
+    preview_url: str,
+    *,
+    config: Any = None,
+    now: float | None = None,
 ) -> portal_store.OutboxRow:
     """Queue a preview build URL (#2359, coord-portal#107) for *submission_id*.
 
@@ -350,12 +411,17 @@ def enqueue_preview(
         submission_id,
         KIND_PREVIEW,
         {"preview_url": preview_url},
+        state=initial_outbox_state(KIND_PREVIEW, config=config),
         now=now,
     )
 
 
 def enqueue_question(
-    submission_id: str, question: str, *, now: float | None = None
+    submission_id: str,
+    question: str,
+    *,
+    config: Any = None,
+    now: float | None = None,
 ) -> tuple[portal_store.OutboxRow, portal_store.OutboxRow]:
     """Queue an open question for the customer, plus the announcement of it.
 
@@ -382,14 +448,22 @@ def enqueue_question(
     if not question or not question.strip():
         raise PortalSyncError("question must be non-empty")
     question_row = portal_store.enqueue(
-        submission_id, KIND_QUESTION, {"question": question}, now=now
+        submission_id,
+        KIND_QUESTION,
+        {"question": question},
+        state=initial_outbox_state(KIND_QUESTION, config=config),
+        now=now,
     )
-    status_row = enqueue_status(submission_id, "needs-input", now=now)
+    status_row = enqueue_status(submission_id, "needs-input", config=config, now=now)
     return question_row, status_row
 
 
 def enqueue_status(
-    submission_id: str, status: str, *, now: float | None = None
+    submission_id: str,
+    status: str,
+    *,
+    config: Any = None,
+    now: float | None = None,
 ) -> portal_store.OutboxRow:
     """Queue an up-mapped customer status for *submission_id*.
 
@@ -426,6 +500,7 @@ def enqueue_status(
         {"status": status},
         announces=status if requires_kind else "",
         requires_kind=requires_kind,
+        state=initial_outbox_state(KIND_STATUS, config=config),
         now=now,
     )
 
@@ -830,6 +905,16 @@ def ordering_block_reason(row: portal_store.OutboxRow) -> str | None:
             f"empty screen (#835)"
         )
     latest = prior[-1]  # outbox_for_submission is ordered by seq
+    if latest.state == portal_store.STATE_DRAFT:
+        # #2903: named separately because the fix is an operator action, not
+        # patience. "is draft, not confirmed applied" reads like a transient
+        # state the loop will get to; it never will until somebody runs
+        # `coord portal draft approve`.
+        return (
+            f"holding {row.announces or row.kind}: its {row.requires_kind} "
+            f"(seq {latest.seq}) is an unapproved draft — review it with "
+            f"`coord portal drafts` and approve or reject it (#2903)"
+        )
     if latest.state != portal_store.STATE_APPLIED:
         return (
             f"holding {row.announces or row.kind}: its {row.requires_kind} "
@@ -1634,13 +1719,45 @@ def _push(
     stalled: set[str] = set()
     sent = 0
 
+    # #2903: the earliest unapproved draft per submission. `pending_outbox()`
+    # cannot see draft rows at all, so without this a pending row queued
+    # BEHIND a draft would be the first row of its submission the drain sees
+    # and would sail past it — quietly breaking the per-submission FIFO the
+    # rest of this loop is built on. A draft holds its `seq`; it must hold
+    # its place too.
+    earliest_draft: dict[str, portal_store.OutboxRow] = {}
+    for draft in portal_store.draft_outbox():
+        earliest_draft.setdefault(draft.submission_id, draft)
+
     for row in portal_store.pending_outbox():
         if sent >= limit:
             break
         if row.submission_id in stalled:
             continue
+        if row.state != portal_store.STATE_PENDING:
+            # Belt and braces for the draft gate (#2903). `pending_outbox()`
+            # already filters on `pending`, so this is unreachable today —
+            # which is exactly why it is here: the acceptance bar is "the
+            # drain cannot send an unapproved draft BY ANY PATH", and a
+            # future refactor of that query must trip over this line rather
+            # than mail a customer.
+            logger.warning(
+                "portal sync: refusing to push %s seq %d in state %r",
+                row.submission_id, row.seq, row.state,
+            )
+            stalled.add(row.submission_id)
+            continue
 
         block = ordering_block_reason(row)
+        if block is None:
+            blocking_draft = earliest_draft.get(row.submission_id)
+            if blocking_draft is not None and row.seq > blocking_draft.seq:
+                block = (
+                    f"holding {row.announces or row.kind} (seq {row.seq}): an "
+                    f"earlier {blocking_draft.kind} (seq {blocking_draft.seq}) is "
+                    f"an unapproved draft — review it with `coord portal drafts` "
+                    f"and approve or reject it (#2903)"
+                )
         if block:
             portal_store.note_hold(row, block)
             logger.info("portal sync: %s", block)

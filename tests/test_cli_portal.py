@@ -1496,3 +1496,239 @@ def test_decision_propose_routes_through_the_daemon_on_a_thin_client(
     assert "proposed: sub_1 #1" in result.output
     assert len(calls) == 1
     assert calls[0][1]["action"] == "propose"
+
+
+# ── #2903 (phase 1 of #2902): the draft gate ────────────────────────────────
+
+
+def test_draft_gate_commands_are_registered():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "drafts" in result.output
+    assert "draft" in result.output
+
+    sub = run("portal", "draft", "--help")
+    assert sub.exit_code == 0
+    for verb in ("edit", "approve", "reject"):
+        assert verb in sub.output
+
+
+def test_drafts_is_empty_by_default():
+    result = run("portal", "drafts")
+    assert result.exit_code == 0
+    assert "none awaiting approval" in result.output
+
+
+def test_an_enqueued_design_round_lands_in_draft_under_the_default_policy():
+    """No config block anywhere: the built-in default must gate it."""
+    ok = run(
+        "portal", "enqueue-design-round", "sub_1",
+        '{"round": 1, "outcome_definition": "a booking form"}',
+    )
+    assert ok.exit_code == 0, ok.output
+    assert "drafted (awaiting approval)" in ok.output
+
+    from coord import portal_store
+
+    assert portal_store.pending_outbox() == []
+    assert [r.seq for r in portal_store.draft_outbox()] == [1]
+
+
+def test_an_enqueued_status_still_queues_exactly_as_before():
+    ok = run("portal", "enqueue-status", "sub_1", "in-design")
+    assert ok.exit_code == 0, ok.output
+    assert "queued:" in ok.output
+    assert "drafted" not in ok.output
+
+    from coord import portal_store
+
+    assert [r.seq for r in portal_store.pending_outbox()] == [1]
+
+
+def test_drafts_lists_the_full_prose_per_submission():
+    run("portal", "enqueue-question", "sub_1", "which shade of blue?")
+    result = run("portal", "drafts")
+    assert result.exit_code == 0
+    assert "sub_1" in result.output
+    assert "seq=1" in result.output
+    assert "which shade of blue?" in result.output
+    assert "(editable)" in result.output
+
+
+def test_drafts_can_be_scoped_to_one_submission():
+    run("portal", "enqueue-question", "sub_1", "blue?")
+    run("portal", "enqueue-question", "sub_2", "green?")
+    result = run("portal", "drafts", "sub_2")
+    assert result.exit_code == 0
+    assert "green?" in result.output
+    assert "blue?" not in result.output
+
+
+def test_drafts_json_carries_the_fields():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run("portal", "drafts", "--json")
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["drafts"][0]["kind"] == "question"
+    assert payload["drafts"][0]["fields"]["question"] == "which blue?"
+
+
+def test_outbox_surfaces_a_draft_so_the_queue_never_looks_idle():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run("portal", "outbox")
+    assert result.exit_code == 0
+    assert "DRAFT" in result.output
+
+
+def test_draft_edit_rewrites_the_prose_and_ledgers_both_versions():
+    run("portal", "enqueue-question", "sub_1", "Whomst shall we ask re: blue?")
+    result = run("portal", "draft", "edit", "sub_1", "1", "--text", "Which blue?")
+    assert result.exit_code == 0, result.output
+    assert "still draft" in result.output
+
+    from coord import portal_store
+
+    row = portal_store.get_outbox_row("sub_1", 1)
+    assert row.fields["question"] == "Which blue?"
+    assert row.state == portal_store.STATE_DRAFT
+    entry = [
+        e
+        for e in portal_store.ledger_for_submission("sub_1")
+        if e.kind == portal_store.LEDGER_KIND_DRAFT_EDITED
+    ][0]
+    assert entry.payload["agent_text"] == "Whomst shall we ask re: blue?"
+    assert entry.payload["operator_text"] == "Which blue?"
+
+
+def test_draft_edit_refuses_a_non_editable_field():
+    run(
+        "portal", "enqueue-design-round", "sub_1",
+        '{"outcome_definition": "a form", "bundle_key": "r2://b/1"}',
+    )
+    result = run(
+        "portal", "draft", "edit", "sub_1", "1",
+        "--field", "design_round.bundle_key", "--text", "r2://elsewhere",
+    )
+    assert result.exit_code != 0
+    assert "not editable" in result.output
+    assert "design_round.outcome_definition" in result.output
+
+
+def test_draft_edit_refuses_a_row_that_has_already_left_the_gate():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    run("portal", "draft", "approve", "sub_1", "1")
+    result = run("portal", "draft", "edit", "sub_1", "1", "--text", "too late")
+    assert result.exit_code != 0
+    assert "not draft" in result.output
+
+
+def test_draft_edit_refuses_an_unknown_row():
+    result = run("portal", "draft", "edit", "sub_1", "9", "--text", "nope")
+    assert result.exit_code != 0
+    assert "no outbox row" in result.output
+
+
+def test_draft_edit_opens_the_editor_when_no_text_is_given(monkeypatch):
+    run("portal", "enqueue-question", "sub_1", "agent wording")
+    seen = {}
+
+    def _fake_edit(text):
+        seen["seeded"] = text
+        return "operator wording\n"
+
+    monkeypatch.setattr("click.edit", _fake_edit)
+    result = run("portal", "draft", "edit", "sub_1", "1")
+    assert result.exit_code == 0, result.output
+    assert seen["seeded"] == "agent wording"
+
+    from coord import portal_store
+
+    assert portal_store.get_outbox_row("sub_1", 1).fields["question"] == (
+        "operator wording"
+    )
+
+
+def test_draft_edit_leaving_the_editor_unchanged_writes_nothing(monkeypatch):
+    run("portal", "enqueue-question", "sub_1", "agent wording")
+    monkeypatch.setattr("click.edit", lambda text: None)
+    result = run("portal", "draft", "edit", "sub_1", "1")
+    assert result.exit_code == 0
+    assert "unchanged" in result.output
+
+    from coord import portal_store
+
+    assert portal_store.get_outbox_row("sub_1", 1).fields["question"] == "agent wording"
+
+
+def test_draft_approve_flips_the_row_to_pending():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run("portal", "draft", "approve", "sub_1", "1")
+    assert result.exit_code == 0, result.output
+    assert "approved" in result.output
+
+    from coord import portal_store
+
+    assert [r.seq for r in portal_store.pending_outbox()] == [1, 2]
+    assert portal_store.draft_outbox() == []
+
+
+def test_draft_approve_refuses_a_row_that_is_not_a_draft():
+    run("portal", "enqueue-status", "sub_1", "in-design")
+    result = run("portal", "draft", "approve", "sub_1", "1")
+    assert result.exit_code != 0
+    assert "not draft" in result.output
+
+
+def test_draft_reject_requires_a_reason():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run("portal", "draft", "reject", "sub_1", "1")
+    assert result.exit_code != 0
+    assert "reason" in result.output.lower()
+
+
+def test_draft_reject_also_rejects_the_announcement_behind_it():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run(
+        "portal", "draft", "reject", "sub_1", "1", "--reason", "answered at intake"
+    )
+    assert result.exit_code == 0, result.output
+    assert "rejected" in result.output
+    assert "also rejected: seq=2" in result.output
+
+    from coord import portal_store
+
+    assert [r.state for r in portal_store.outbox_for_submission("sub_1")] == [
+        "rejected",
+        "rejected",
+    ]
+
+
+def test_draft_reject_no_cascade_refuses_and_names_the_row():
+    run("portal", "enqueue-question", "sub_1", "which blue?")
+    result = run(
+        "portal", "draft", "reject", "sub_1", "1",
+        "--reason", "answered at intake", "--no-cascade",
+    )
+    assert result.exit_code != 0
+    assert "seq=2" in result.output
+
+    from coord import portal_store
+
+    assert portal_store.draft_outbox()[0].seq == 1
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("portal", "drafts"),
+        ("portal", "draft", "edit", "sub_1", "1", "--text", "x"),
+        ("portal", "draft", "approve", "sub_1", "1"),
+        ("portal", "draft", "reject", "sub_1", "1", "--reason", "no"),
+    ],
+)
+def test_draft_gate_commands_refuse_on_a_thin_client(thin_client, args):
+    """Every outbox-touching command is a daemon-host command (#2336)."""
+    result = run(*args)
+    assert result.exit_code != 0
+    assert "must run on the daemon host" in result.output
+    assert "dellserver" in result.output

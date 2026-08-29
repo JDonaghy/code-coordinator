@@ -1182,3 +1182,313 @@ class TestQuestionWatermark:
         set_question_watermark(75.0, "question-evt")
         assert get_verdict_watermark() == (50.0, "verdict-evt")
         assert get_question_watermark() == (75.0, "question-evt")
+
+
+# ── #2903 (phase 1 of #2902): the draft gate ────────────────────────────────
+
+
+def _draft_question(sub: str = "sub_d1", text: str = "which shade of blue?"):
+    from coord import portal_store
+
+    return portal_store.enqueue(
+        sub, "question", {"question": text}, state=portal_store.STATE_DRAFT
+    )
+
+
+def _draft_design(sub: str = "sub_d1", outcome: str = "a booking form"):
+    from coord import portal_store
+
+    return portal_store.enqueue(
+        sub,
+        "design_round",
+        {
+            "design_round": {
+                "round": 1,
+                "outcome_definition": outcome,
+                "decomposition": ["a", "b"],
+                "bundle_key": "r2://bundles/1",
+            }
+        },
+        state=portal_store.STATE_DRAFT,
+    )
+
+
+class TestDraftState:
+    def test_a_draft_row_is_never_returned_by_pending_outbox(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = _draft_question()
+        assert row.state == portal_store.STATE_DRAFT
+        assert portal_store.pending_outbox() == []
+        assert [r.seq for r in portal_store.draft_outbox()] == [row.seq]
+
+    def test_a_draft_still_allocates_seq_and_revision(self, coord_db) -> None:
+        """It holds its place in per-submission FIFO — rows behind it block."""
+        from coord import portal_store
+
+        first = _draft_question()
+        second = portal_store.enqueue("sub_d1", "status", {"status": "in-design"})
+        assert (first.seq, first.revision) == (1, 1)
+        assert (second.seq, second.revision) == (2, 2)
+
+    def test_enqueue_still_defaults_to_pending(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = portal_store.enqueue("sub_d1", "status", {"status": "in-design"})
+        assert row.state == portal_store.STATE_PENDING
+        assert [r.seq for r in portal_store.pending_outbox()] == [1]
+
+    def test_enqueue_refuses_a_state_that_is_not_draft_or_pending(self, coord_db) -> None:
+        from coord import portal_store
+
+        with pytest.raises(ValueError, match="can only be enqueued"):
+            portal_store.enqueue(
+                "sub_d1", "status", {"status": "shipped"}, state=portal_store.STATE_APPLIED
+            )
+
+    def test_draft_outbox_can_be_scoped_to_one_submission(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question("sub_a")
+        _draft_question("sub_b")
+        assert [r.submission_id for r in portal_store.draft_outbox("sub_a")] == ["sub_a"]
+        assert len(portal_store.draft_outbox()) == 2
+
+
+class TestEditDraft:
+    def test_rewrites_the_field_and_leaves_the_row_draft(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        updated = portal_store.edit_draft(
+            "sub_d1", 1, "question", "which blue?", actor="john"
+        )
+        assert updated.fields["question"] == "which blue?"
+        assert updated.state == portal_store.STATE_DRAFT
+
+    def test_ledgers_both_the_agents_text_and_the_operators(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question(text="Whomst shall we ask about the blue?")
+        portal_store.edit_draft("sub_d1", 1, "question", "which blue?", actor="john")
+
+        entries = [
+            e
+            for e in portal_store.ledger_for_submission("sub_d1")
+            if e.kind == portal_store.LEDGER_KIND_DRAFT_EDITED
+        ]
+        assert len(entries) == 1
+        assert entries[0].text == "which blue?"
+        assert entries[0].payload["agent_text"] == "Whomst shall we ask about the blue?"
+        assert entries[0].payload["operator_text"] == "which blue?"
+        assert entries[0].actor == "john"
+
+    def test_a_second_edit_still_records_the_agents_original(self, coord_db) -> None:
+        """Not the operator's first rewrite — the agent's words have to survive."""
+        from coord import portal_store
+
+        _draft_question(text="AGENT WORDS")
+        portal_store.edit_draft("sub_d1", 1, "question", "first pass")
+        portal_store.edit_draft("sub_d1", 1, "question", "second pass")
+
+        entries = [
+            e
+            for e in portal_store.ledger_for_submission("sub_d1")
+            if e.kind == portal_store.LEDGER_KIND_DRAFT_EDITED
+        ]
+        assert [e.payload["agent_text"] for e in entries] == ["AGENT WORDS", "AGENT WORDS"]
+        assert entries[-1].payload["previous_text"] == "first pass"
+
+    def test_edits_a_nested_design_round_field(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_design()
+        updated = portal_store.edit_draft(
+            "sub_d1", 1, "design_round.outcome_definition", "a booking form, in plain words"
+        )
+        assert updated.fields["design_round"]["outcome_definition"] == (
+            "a booking form, in plain words"
+        )
+        # ...and nothing else in the payload moved.
+        assert updated.fields["design_round"]["bundle_key"] == "r2://bundles/1"
+        assert updated.fields["design_round"]["decomposition"] == ["a", "b"]
+
+    def test_refuses_a_non_editable_field(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_design()
+        with pytest.raises(portal_store.DraftGateError, match="not editable"):
+            portal_store.edit_draft(
+                "sub_d1", 1, "design_round.bundle_key", "r2://somewhere/else"
+            )
+
+    def test_refuses_a_row_that_is_not_a_draft(self, coord_db) -> None:
+        from coord import portal_store
+
+        portal_store.enqueue("sub_d1", "question", {"question": "already out"})
+        with pytest.raises(portal_store.DraftGateError, match="not draft"):
+            portal_store.edit_draft("sub_d1", 1, "question", "too late")
+
+    def test_refuses_an_unknown_row(self, coord_db) -> None:
+        from coord import portal_store
+
+        with pytest.raises(portal_store.DraftGateError, match="no outbox row"):
+            portal_store.edit_draft("sub_d1", 9, "question", "nope")
+
+    def test_refuses_empty_text(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        with pytest.raises(portal_store.DraftGateError, match="non-empty"):
+            portal_store.edit_draft("sub_d1", 1, "question", "   ")
+
+
+class TestApproveDraft:
+    def test_flips_to_pending_keeping_seq_and_revision(self, coord_db) -> None:
+        from coord import portal_store
+
+        before = _draft_question()
+        row = portal_store.approve_draft("sub_d1", 1, actor="john")
+        assert row.state == portal_store.STATE_PENDING
+        assert (row.seq, row.revision) == (before.seq, before.revision)
+        assert [r.seq for r in portal_store.pending_outbox()] == [1]
+        assert portal_store.draft_outbox() == []
+
+    def test_appends_a_ledger_entry(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question(text="which blue?")
+        portal_store.approve_draft("sub_d1", 1, actor="john")
+        kinds = [e.kind for e in portal_store.ledger_for_submission("sub_d1")]
+        assert portal_store.LEDGER_KIND_DRAFT_APPROVED in kinds
+
+    def test_refuses_a_second_approval(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        portal_store.approve_draft("sub_d1", 1)
+        with pytest.raises(portal_store.DraftGateError, match="not draft"):
+            portal_store.approve_draft("sub_d1", 1)
+
+
+class TestRejectDraft:
+    def test_flips_to_the_existing_terminal_rejected_state(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        row, also = portal_store.reject_draft("sub_d1", 1, "off-brand")
+        assert row.state == portal_store.STATE_REJECTED
+        assert row.reason == "off-brand"
+        assert also == []
+
+    def test_a_reason_is_mandatory(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        with pytest.raises(portal_store.DraftGateError, match="must carry a reason"):
+            portal_store.reject_draft("sub_d1", 1, "   ")
+
+    def test_ledgers_the_reason_and_the_agents_text(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question(text="which blue?")
+        portal_store.reject_draft("sub_d1", 1, "we already know", actor="john")
+        entry = [
+            e
+            for e in portal_store.ledger_for_submission("sub_d1")
+            if e.kind == portal_store.LEDGER_KIND_DRAFT_REJECTED
+        ][0]
+        assert entry.text == "we already know"
+        assert entry.payload["agent_text"] == "which blue?"
+
+    def test_also_rejects_what_announces_it(self, coord_db) -> None:
+        """#2903: `ordering_block_reason` treats a rejected prerequisite as
+        never-applied, so a bare reject would hold the announcement forever."""
+        from coord import portal_store
+
+        _draft_question()
+        announcement = portal_store.enqueue(
+            "sub_d1",
+            "status",
+            {"status": "needs-input"},
+            announces="needs-input",
+            requires_kind="question",
+        )
+        row, also = portal_store.reject_draft("sub_d1", 1, "not asking that")
+
+        assert row.state == portal_store.STATE_REJECTED
+        assert [r.seq for r in also] == [announcement.seq]
+        assert also[0].state == portal_store.STATE_REJECTED
+        assert "seq 1" in also[0].reason
+        assert portal_store.pending_outbox() == []
+
+    def test_no_cascade_refuses_and_names_the_row_to_reject_first(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        portal_store.enqueue(
+            "sub_d1",
+            "status",
+            {"status": "needs-input"},
+            announces="needs-input",
+            requires_kind="question",
+        )
+        with pytest.raises(portal_store.DraftGateError, match="seq=2"):
+            portal_store.reject_draft(
+                "sub_d1", 1, "not asking that", cascade=False
+            )
+        # Nothing moved.
+        assert portal_store.draft_outbox()[0].seq == 1
+
+    def test_does_not_touch_an_announcement_that_rides_on_a_later_row(
+        self, coord_db
+    ) -> None:
+        """A second question's announcement depends on the SECOND question —
+        rejecting the first must leave it alone, exactly as the guard reads it."""
+        from coord import portal_store
+
+        _draft_question(text="q1")
+        portal_store.enqueue("sub_d1", "question", {"question": "q2"})
+        announcement = portal_store.enqueue(
+            "sub_d1",
+            "status",
+            {"status": "needs-input"},
+            announces="needs-input",
+            requires_kind="question",
+        )
+        _row, also = portal_store.reject_draft("sub_d1", 1, "superseded by q2")
+        assert also == []
+        assert portal_store.get_outbox_row("sub_d1", announcement.seq).state == (
+            portal_store.STATE_PENDING
+        )
+
+    def test_does_not_re_reject_an_already_applied_announcement(self, coord_db) -> None:
+        from coord import portal_store
+
+        _draft_question()
+        applied = portal_store.enqueue(
+            "sub_d1",
+            "status",
+            {"status": "needs-input"},
+            announces="needs-input",
+            requires_kind="question",
+        )
+        portal_store.mark_applied(applied)
+        _row, also = portal_store.reject_draft("sub_d1", 1, "too late but still")
+        assert also == []
+
+
+class TestDraftFieldValue:
+    def test_reads_a_dotted_path(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = _draft_design(outcome="a booking form")
+        assert portal_store.draft_field_value(row, "design_round.outcome_definition") == (
+            "a booking form"
+        )
+
+    def test_missing_path_reads_as_none(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = _draft_question()
+        assert portal_store.draft_field_value(row, "design_round.nope") is None

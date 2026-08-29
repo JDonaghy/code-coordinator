@@ -59,6 +59,16 @@ Row = Mapping[str, Any]
 # an operator (`coord portal requeue`), either because the portal refused the
 # field outright — a statement about the request, not the network, which
 # retrying reproduces exactly — or because the row burned its budget.
+#
+# `draft` (#2903, phase 1 of #2902) sits IN FRONT of `pending`: an
+# agent-authored `design_round` or `question` lands there under the default
+# policy and no drain can send it, because `pending_outbox` — the drain's
+# only source of rows — filters on `pending` and is deliberately unchanged.
+# A draft row is simply NOT PENDING YET. It still holds its `(seq, revision)`
+# allocation, which is what keeps `ANNOUNCING_STATUSES` honest: a
+# `needs-input` cannot overtake the question it announces just because that
+# question is sitting with the operator.
+STATE_DRAFT = "draft"
 STATE_PENDING = "pending"
 STATE_APPLIED = "applied"
 STATE_REJECTED = "rejected"
@@ -579,6 +589,7 @@ def enqueue(
     *,
     announces: str = "",
     requires_kind: str = "",
+    state: str = STATE_PENDING,
     now: float | None = None,
 ) -> OutboxRow:
     """Append one coord-owned fact to the outbox and return the stored row.
@@ -590,7 +601,22 @@ def enqueue(
     Nothing is sent here — :func:`coord.portal_sync.sync_tick` drains the
     queue. That split is what makes the ordering guarantee hold across a
     crash: the intent is durable before any customer-visible effect happens.
+
+    *state* is the draft gate (#2903): :data:`STATE_PENDING` (the default,
+    and every pre-#2903 caller's behaviour unchanged) or :data:`STATE_DRAFT`
+    for a row an operator must read first. Which one is a **policy** decision
+    and is made by the caller — :func:`coord.portal_sync.initial_outbox_state`
+    — deliberately not here: this function stays the mechanical allocator it
+    has always been, so the gate cannot break ``_push``'s #835 guarantees.
+    Note that ``seq``/``revision`` are allocated identically either way, so a
+    ``draft`` row keeps its place in per-submission FIFO and rows queued
+    behind it block. That is correct, and it is the point.
     """
+    if state not in (STATE_DRAFT, STATE_PENDING):
+        raise ValueError(
+            f"an outbox row can only be enqueued as {STATE_PENDING!r} or "
+            f"{STATE_DRAFT!r}, not {state!r}"
+        )
     stamp = time.time() if now is None else now
     conn = _conn()
     with conn:  # one transaction: allocate + insert
@@ -628,7 +654,7 @@ def enqueue(
                 json.dumps(fields, sort_keys=True),
                 announces,
                 requires_kind,
-                STATE_PENDING,
+                state,
                 stamp,
             ),
             pk_column="id",
@@ -879,6 +905,361 @@ def requeue(submission_id: str, seq: int, *, now: float | None = None) -> Outbox
         conn, "SELECT * FROM portal_outbox WHERE id = ?", (row["id"],)
     ).fetchone()
     return _outbox_from_row(updated)
+
+
+# ── the draft gate (#2903, phase 1 of #2902) ────────────────────────────────
+#
+# Everything below operates on rows in :data:`STATE_DRAFT` and nothing else.
+# The drain, the ordering guard and the revision allocator are untouched by
+# design: a draft row is not a new code path through `_push`, it is a row
+# `pending_outbox()` does not return.
+#
+# PROVENANCE. Every edit and every approve/reject appends to the EXISTING
+# ledger (`append_ledger_entry`) rather than a new audit table — six weeks
+# on, "what the agent wrote" and "what we sent" have to stay
+# distinguishable, and the ledger is already the append-only,
+# never-rewritten place coord records what it observed. An edit entry carries
+# BOTH texts: the operator's rewrite as `text`, and the agent's original
+# under `payload["agent_text"]`, which stays the FIRST recorded original
+# across any number of subsequent edits (see `_agent_original`).
+
+
+class DraftGateError(ValueError):
+    """A draft-gate operation the store refuses, with the reason as its text.
+
+    A ``ValueError`` subclass so a caller that only cares "this was a bad
+    request" keeps working, and its own type so ``coord portal draft *`` can
+    turn it into a clean ``ClickException`` rather than a traceback.
+    """
+
+
+#: Which ``fields_json`` paths an operator may rewrite, per kind (#2903).
+#: Dotted, because a ``design_round`` row's payload is nested
+#: (``{"design_round": {...}}``).
+#:
+#: Deliberately narrow. ``bundle_key`` names an R2 object that was actually
+#: uploaded, ``decomposition`` is the work order coord dispatches against and
+#: ``revision`` is the portal's dedupe key — none of the three is prose, and
+#: letting an operator retype one turns a review into a corruption vector.
+#: Editing a mock bundle stays ``coord acceptance mock --amend``.
+EDITABLE_DRAFT_FIELDS: dict[str, tuple[str, ...]] = {
+    "question": ("question",),
+    "design_round": ("design_round.outcome_definition",),
+}
+
+
+def draft_outbox(submission_id: str | None = None) -> list[OutboxRow]:
+    """Every ``draft`` row awaiting an operator, per-submission FIFO order.
+
+    Same ordering as :func:`pending_outbox` — ``(submission_id, seq)`` — so
+    ``coord portal drafts`` lists a submission's drafts in the order they
+    would be sent, which is the order they have to be read in.
+    """
+    query = "SELECT * FROM portal_outbox WHERE state = ?"
+    params: tuple[Any, ...] = (STATE_DRAFT,)
+    if submission_id:
+        query += " AND submission_id = ?"
+        params += (submission_id,)
+    query += " ORDER BY submission_id ASC, seq ASC"
+    rows = sql.execute(_conn(), query, params).fetchall()
+    return [_outbox_from_row(r) for r in rows]
+
+
+def get_outbox_row(submission_id: str, seq: int) -> OutboxRow | None:
+    """One outbox row by its ``(submission_id, seq)`` operator-facing key."""
+    row = sql.execute(
+        _conn(),
+        "SELECT * FROM portal_outbox WHERE submission_id = ? AND seq = ?",
+        (submission_id, seq),
+    ).fetchone()
+    return _outbox_from_row(row) if row is not None else None
+
+
+def _require_draft(submission_id: str, seq: int) -> OutboxRow:
+    row = get_outbox_row(submission_id, seq)
+    if row is None:
+        raise DraftGateError(
+            f"no outbox row for {submission_id} seq={seq} "
+            f"(list them with `coord portal outbox --all`)"
+        )
+    if row.state != STATE_DRAFT:
+        raise DraftGateError(
+            f"{submission_id} seq={seq} is {row.state}, not {STATE_DRAFT} — the "
+            f"draft gate only acts on a row that has not left the outbox yet"
+        )
+    return row
+
+
+def _read_back(submission_id: str, seq: int) -> OutboxRow:
+    """Re-read a row this module has just written, under its own key.
+
+    A plain lookup, not an ``assert``: asserts vanish under ``python -O``,
+    and "the row I just updated is gone" has to stay a loud failure rather
+    than a ``None`` that flows on into a caller's f-string.
+    """
+    stored = get_outbox_row(submission_id, seq)
+    if stored is None:  # pragma: no cover — the row was just updated
+        raise DraftGateError(
+            f"{submission_id} seq={seq} vanished mid-update — the outbox is "
+            f"being written by something other than this process"
+        )
+    return stored
+
+
+def _get_path(fields: dict[str, Any], path: str) -> Any:
+    cursor: Any = fields
+    for part in path.split("."):
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(part)
+    return cursor
+
+
+def _with_path(fields: dict[str, Any], path: str, value: Any) -> dict[str, Any]:
+    """A deep copy of *fields* with *path* set to *value*.
+
+    Copies rather than mutates so the caller's ``row.fields`` — which the
+    ledger entry is about to quote as the "before" text — cannot be
+    retroactively changed by the write it is describing.
+    """
+    updated = json.loads(json.dumps(fields, sort_keys=True, default=str))
+    parts = path.split(".")
+    cursor = updated
+    for part in parts[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    cursor[parts[-1]] = value
+    return updated
+
+
+def draft_field_value(row: OutboxRow, field_path: str) -> Any:
+    """The current value at dotted *field_path* in *row*'s payload.
+
+    Public so ``coord portal draft edit`` can seed ``$EDITOR`` with what is
+    there now without reaching into this module's privates.
+    """
+    return _get_path(row.fields, field_path)
+
+
+def _agent_original(submission_id: str, seq: int, current: str) -> str:
+    """The text the AGENT wrote for ``(submission_id, seq)``.
+
+    On the first edit that is whatever is in the row right now. On a second
+    edit it must NOT be the operator's first rewrite — so the earliest
+    ``draft_edited`` ledger entry for this seq wins, and the agent's words
+    survive however many rounds of polishing follow.
+    """
+    for entry in ledger_for_submission(submission_id):
+        if entry.kind != LEDGER_KIND_DRAFT_EDITED:
+            continue
+        if int(entry.payload.get("seq", -1)) == seq:
+            return str(entry.payload.get("agent_text", ""))
+    return current
+
+
+def edit_draft(
+    submission_id: str,
+    seq: int,
+    field_path: str,
+    text: str,
+    *,
+    actor: str = "",
+    now: float | None = None,
+) -> OutboxRow:
+    """Rewrite one editable field of a ``draft`` row; ledger both versions.
+
+    Refuses — with the reason in the exception — a row that is not
+    ``draft``, and a *field_path* that is not in
+    :data:`EDITABLE_DRAFT_FIELDS` for this row's kind. Never rewrites
+    ``bundle_key``/``decomposition``/``revision``, and never touches a row
+    that is already pending, applied or rejected: at that point the text has
+    left, or is leaving, the outbox and an edit would make the ledger a lie.
+    """
+    row = _require_draft(submission_id, seq)
+    editable = EDITABLE_DRAFT_FIELDS.get(row.kind, ())
+    if field_path not in editable:
+        allowed = ", ".join(editable) if editable else "(nothing)"
+        raise DraftGateError(
+            f"{field_path!r} is not editable on a {row.kind} row — editable "
+            f"here: {allowed}"
+        )
+    if not isinstance(text, str) or not text.strip():
+        raise DraftGateError("an edited field must be non-empty text")
+
+    before = str(_get_path(row.fields, field_path) or "")
+    agent_text = _agent_original(submission_id, seq, before)
+    updated = _with_path(row.fields, field_path, text)
+
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    sql.execute(
+        conn,
+        "UPDATE portal_outbox SET fields_json = ? WHERE id = ? AND state = ?",
+        (json.dumps(updated, sort_keys=True), row.id, STATE_DRAFT),
+    )
+    conn.commit()
+
+    append_ledger_entry(
+        submission_id,
+        LEDGER_KIND_DRAFT_EDITED,
+        text=text,
+        actor=actor,
+        payload={
+            "seq": seq,
+            "kind": row.kind,
+            "field": field_path,
+            "agent_text": agent_text,
+            "previous_text": before,
+            "operator_text": text,
+        },
+        now=stamp,
+    )
+    return _read_back(submission_id, seq)
+
+
+def approve_draft(
+    submission_id: str, seq: int, *, actor: str = "", now: float | None = None
+) -> OutboxRow:
+    """Flip a ``draft`` row to ``pending``; the next drain sends it.
+
+    Nothing else moves: the row keeps its ``(seq, revision)``, so approving
+    does not renumber it past anything and the ordering guard sees exactly
+    the queue it would have seen had the gate never existed.
+    """
+    row = _require_draft(submission_id, seq)
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    sql.execute(
+        conn,
+        "UPDATE portal_outbox SET state = ?, reason = '' WHERE id = ? AND state = ?",
+        (STATE_PENDING, row.id, STATE_DRAFT),
+    )
+    conn.commit()
+    append_ledger_entry(
+        submission_id,
+        LEDGER_KIND_DRAFT_APPROVED,
+        text=str(_get_path(row.fields, _primary_field(row.kind)) or ""),
+        actor=actor,
+        payload={"seq": seq, "kind": row.kind},
+        now=stamp,
+    )
+    return _read_back(submission_id, seq)
+
+
+def _primary_field(kind: str) -> str:
+    """The one field worth quoting in a ledger entry about a row of *kind*."""
+    editable = EDITABLE_DRAFT_FIELDS.get(kind, ())
+    return editable[0] if editable else kind
+
+
+def announcing_dependents(row: OutboxRow) -> list[OutboxRow]:
+    """Rows that :func:`coord.portal_sync.ordering_block_reason` would hold
+    FOREVER if *row* were rejected.
+
+    An announcing row (``needs-input``, ``awaiting-signoff``,
+    ``quality-check``) is held until the **latest** prior row of its
+    ``requires_kind`` is confirmed applied — and a ``rejected`` prerequisite
+    never becomes applied. So rejecting a draft without dealing with what
+    announces it wedges that announcement permanently, silently, in a state
+    that reads as a normal hold.
+
+    This computes the same "latest prior of ``requires_kind``" that the guard
+    does, so the two cannot disagree: a still-live row is a dependent exactly
+    when *row* is the row the guard would be waiting on.
+    """
+    siblings = outbox_for_submission(row.submission_id)
+    dependents = []
+    for candidate in siblings:
+        if candidate.seq <= row.seq:
+            continue
+        if candidate.requires_kind != row.kind:
+            continue
+        if candidate.state not in (STATE_DRAFT, STATE_PENDING):
+            continue
+        prior = [
+            r for r in siblings if r.kind == candidate.requires_kind and r.seq < candidate.seq
+        ]
+        if prior and prior[-1].seq == row.seq:
+            dependents.append(candidate)
+    return dependents
+
+
+def reject_draft(
+    submission_id: str,
+    seq: int,
+    reason: str,
+    *,
+    cascade: bool = True,
+    actor: str = "",
+    now: float | None = None,
+) -> tuple[OutboxRow, list[OutboxRow]]:
+    """Flip a ``draft`` row to the existing terminal ``rejected`` state.
+
+    *reason* is mandatory — same posture as :func:`reject_decision` (#2749):
+    six weeks on, "we did not send this" is useless without "because".
+
+    Also rejects whatever :func:`announcing_dependents` says would otherwise
+    be held forever, and returns those rows as the second element. With
+    ``cascade=False`` the call REFUSES instead and names the rows, so a
+    caller that wants to see them first can. Either way there is no path
+    that leaves a live announcement pointing at a rejected prerequisite.
+    """
+    row = _require_draft(submission_id, seq)
+    if not reason or not reason.strip():
+        raise DraftGateError("a rejected draft must carry a reason (--reason)")
+
+    dependents = announcing_dependents(row)
+    if dependents and not cascade:
+        listed = ", ".join(f"seq={d.seq} ({d.announces or d.kind})" for d in dependents)
+        raise DraftGateError(
+            f"rejecting {submission_id} seq={seq} would strand what announces "
+            f"it: {listed}. Reject those first, or re-run without "
+            f"--no-cascade to reject them together."
+        )
+
+    stamp = time.time() if now is None else now
+    text = reason.strip()
+    conn = _conn()
+    with conn:
+        sql.execute(
+            conn,
+            "UPDATE portal_outbox SET state = ?, reason = ?, sent_at = ? WHERE id = ?",
+            (STATE_REJECTED, text[:500], stamp, row.id),
+        )
+        for dep in dependents:
+            sql.execute(
+                conn,
+                "UPDATE portal_outbox SET state = ?, reason = ?, sent_at = ? WHERE id = ?",
+                (
+                    STATE_REJECTED,
+                    f"rejected with the {row.kind} (seq {row.seq}) it announces: "
+                    f"{text}"[:500],
+                    stamp,
+                    dep.id,
+                ),
+            )
+    append_ledger_entry(
+        submission_id,
+        LEDGER_KIND_DRAFT_REJECTED,
+        text=text,
+        actor=actor,
+        payload={
+            "seq": seq,
+            "kind": row.kind,
+            "reason": text,
+            "agent_text": str(_get_path(row.fields, _primary_field(row.kind)) or ""),
+            "also_rejected_seqs": [d.seq for d in dependents],
+        },
+        now=stamp,
+    )
+    stored = _read_back(submission_id, seq)
+    refreshed = [
+        r for r in outbox_for_submission(submission_id) if r.seq in {d.seq for d in dependents}
+    ]
+    return stored, refreshed
 
 
 def note_attempt(row: OutboxRow, reason: str) -> None:
@@ -1349,6 +1730,13 @@ def get_link_by_submission(submission_id: str) -> PortalLink | None:
 
 LEDGER_KIND_QUESTION_PUSHED = "question_pushed"
 LEDGER_KIND_QUESTION_ANSWERED = "question_answered"
+
+#: The draft gate's provenance kinds (#2903). Coord-observed, like every
+#: other ledger kind: an operator pressing approve/reject/edit is something
+#: coord watched happen, not an agent's say-so about itself.
+LEDGER_KIND_DRAFT_EDITED = "draft_edited"
+LEDGER_KIND_DRAFT_APPROVED = "draft_approved"
+LEDGER_KIND_DRAFT_REJECTED = "draft_rejected"
 
 
 @dataclass(frozen=True)
