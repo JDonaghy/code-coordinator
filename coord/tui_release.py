@@ -1,29 +1,44 @@
 """Resolve, download, and atomically install the `coord-tui` binary from
-this project's own GitHub Release channel (#1240, PKG-4).
+**coord-tui's own** GitHub Release channel (#1240, PKG-4; re-pointed by #2898).
 
-PKG-3 (#1239, ``.github/workflows/release-tui.yml``) already builds
-``coord-tui`` for linux/macOS/Windows on every ``vX.Y.Z`` tag push and
-attaches ``coord-tui-<target>`` assets to the same GitHub Release the Python
-wheel publishes to, with ``tui/Cargo.toml``'s version stamped from that same
-tag so ``coord-tui --version`` and ``coord --version`` agree on a release.
-This module is the client half: given the coordinator's own version (the
-single source PKG-2 established — ``coord.__version__``), find the matching
-release, detect which of PKG-3's build-matrix targets this host needs, and
-install the binary without a human ever visiting the Releases page by hand.
+``release-tui.yml`` builds ``coord-tui`` for linux/macOS/Windows on every
+``vX.Y.Z`` tag push and attaches ``coord-tui-<target>`` assets to a GitHub
+Release, with ``tui/Cargo.toml``'s version stamped from that tag. This module
+is the client half: find the release to install, detect which of that
+workflow's build-matrix targets this host needs, and install the binary
+without a human ever visiting the Releases page by hand.
 
 Kept framework-agnostic (no ``click``) so :mod:`coord.commands.tui`'s CLI
 wiring is a thin layer over functions a plain unit test can call directly.
 
-#2102: a `tui/`-only release now publishes no PyPI wheel — PyPI's simple
-index is deliberately left pointing at the older version, since the wheel a
-`tui/`-only range would build is a no-op. That is safe for this whole module
-precisely because nothing here ever asks PyPI anything: every function below
-resolves the release to install from the GitHub Releases API alone (`--repo`/
-`--api-base`, defaulting to this project's own release channel), keyed on the
-tag it is given (or, by default, ``coord.__version__`` — this coordinator's
-own installed version, resolved from :mod:`coord`, not from PyPI). Installing
-an explicit ``coord tui update --version X.Y.Z`` therefore works identically
-whether or not X.Y.Z's release carries a wheel.
+#2898 (phase 3 of #2894): **TWO CHANNELS, NOT ONE.**
+------------------------------------------------------
+Until #2898 the coordinator and coord-tui shared a release channel: ONE ``v*``
+tag in ``JDonaghy/code-coordinator`` stamped the wheel *and* the coord-tui
+binaries onto ONE GitHub Release (``publish.yml`` called ``release-tui.yml``
+as a reusable workflow, #1242), so ``coord --version`` and ``coord-tui
+--version`` agreed by construction and this module could simply install
+``coord.__version__``.
+
+That fusion is gone. coord-tui has its own repo, its own ``v*`` tag namespace
+and its own Releases, so **one tag cannot stamp two repos** and the two
+version lines move independently: a fleet on coord ``v0.5.x`` and coord-tui
+``v0.2.y`` is a *correct* state, not skew. Concretely:
+
+* :data:`DEFAULT_REPO` is **coord-tui's** repo, not this one. It is a
+  hardcoded ``owner/repo`` literal on purpose — ``docs/ADR_COORD_WEB_CI.md``'s
+  rule is that a cross-repo fact must be *visible and assertable*, not
+  computed out of reach of a test. :data:`COORDINATOR_REPO` sits next to it
+  purely so "these are two different repos" is a thing a test can read.
+* "Which version does ``coord tui update`` install by default?" is no longer
+  ``coord.__version__`` — it is :func:`fetch_latest_release_tag`, coord-tui's
+  own newest release. Asking this repo's version would resolve a tag that
+  does not exist in coord-tui's channel.
+
+Nothing here has ever asked PyPI anything, and that stays true: every function
+below resolves from the GitHub Releases API alone (``--repo``/``--api-base``),
+so an explicit ``coord tui update --version X.Y.Z`` works identically whether
+or not any wheel was ever published for that name.
 
 Two invariants drive the design:
 
@@ -58,9 +73,20 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-#: The GitHub ``owner/repo`` this coordinator's own releases live on
-#: (matches pyproject.toml's ``[project.urls] Repository``).
-DEFAULT_REPO = "JDonaghy/code-coordinator"
+#: The GitHub ``owner/repo`` **coord-tui's** releases live on (#2898).
+#:
+#: Deliberately a literal rather than something derived from config or from
+#: :mod:`coord`'s own metadata: after the #2894 split this is a cross-repo
+#: fact, and ``docs/ADR_COORD_WEB_CI.md``'s standing rule for cross-repo facts
+#: is that they must be visible in the module and assertable from a test.
+DEFAULT_REPO = "JDonaghy/coord-tui"
+
+#: This coordinator's own release channel — the repo the *wheel* ships from
+#: (matches pyproject.toml's ``[project.urls] Repository``). Nothing in this
+#: module resolves against it; it exists so the two-channel split is stated
+#: rather than implied by :data:`DEFAULT_REPO`'s value alone. See the module
+#: docstring's "TWO CHANNELS, NOT ONE".
+COORDINATOR_REPO = "JDonaghy/code-coordinator"
 
 #: GitHub's REST API root. Overridable (``coord tui update --api-base``) so
 #: tests can point this at a local stub server instead of the real network.
@@ -162,6 +188,56 @@ def fetch_release_assets(
             continue
         assets.append(ReleaseAsset(name=name, download_url=download_url, size=raw.get("size")))
     return assets
+
+
+def normalize_version(raw: str | None) -> str | None:
+    """``v0.2.7`` / ``0.2.7`` -> ``0.2.7``; empty/None -> ``None``.
+
+    Mirrors :func:`coord.release_propagate.normalize_version` — the two
+    channels are independent (#2898) but they spell versions the same way,
+    and comparing ``"v0.2.7"`` against ``"0.2.7"`` as strings would report
+    permanent skew between a release tag and what a binary prints.
+    """
+    if raw is None:
+        return None
+    return str(raw).strip().lstrip("vV") or None
+
+
+def fetch_latest_release_tag(
+    *,
+    repo: str = DEFAULT_REPO,
+    api_base: str = DEFAULT_API_BASE,
+    timeout: float = 10.0,
+    token: str | None = None,
+) -> str:
+    """coord-tui's newest published release, as a bare version (no ``v``).
+
+    #2898: this is what replaced ``coord.__version__`` as the answer to "which
+    coord-tui should be installed / are we behind?". The coordinator's version
+    is a *different channel's* tag now, so resolving against it would ask
+    coord-tui's Releases for a tag that channel never minted — a 404 on every
+    invocation, or worse, an accidental match on an unrelated release that
+    happened to share a number.
+
+    Raises on any HTTP/network failure, or when the channel has no release at
+    all — callers decide whether that is fatal (``coord tui update`` has
+    nothing to install) or a soft "could not check" (``coord tui status``).
+    """
+    import httpx  # noqa: PLC0415 — keep import cost off the non-network path
+
+    url = f"{api_base.rstrip('/')}/repos/{repo}/releases/latest"
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = httpx.get(url, timeout=timeout, headers=headers, follow_redirects=True)
+    response.raise_for_status()
+    data = response.json()
+    version = normalize_version((data or {}).get("tag_name"))
+    if not version:
+        raise ReleaseAssetNotFoundError(
+            f"{repo} has no published release to resolve a latest version from"
+        )
+    return version
 
 
 def find_asset(assets: list[ReleaseAsset], target: str) -> ReleaseAsset:

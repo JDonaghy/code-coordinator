@@ -401,18 +401,30 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                 )
             )
 
-    # ── coord-tui, until PKG-3/PKG-4 give it a real channel ──────────────
-    # #2102's grading rule: staleness (this binary's mtime vs. its `tui/`
-    # source tree — see coord.health.checks.deploy_lane_facts), never a
-    # version compared against `expected`/`--pypi`. A `tui/`-only range now
-    # publishes no PyPI wheel, so PyPI's "latest" stays behind a fresh
-    # `coord tui update` on purpose — grading coord-tui's version against it
-    # would read every such release as "ahead of expected" forever. This is
-    # also why `lanes_for_host` never emits a `coord-tui` Lane at all: a
+    # ── coord-tui: staleness only, NEVER a version vs. `expected` ────────
+    # #2102's grading rule, and #2898 makes it permanent rather than
+    # provisional: this lane reports staleness (the binary's mtime vs. its
+    # `tui/` source tree — see coord.health.checks.deploy_lane_facts), never
+    # a version compared against `expected`/`--pypi`.
+    #
+    # #2102's reason was that a `tui/`-only range published no PyPI wheel, so
+    # PyPI's "latest" sat behind a fresh `coord tui update` on purpose and
+    # grading against it read every such release as "ahead of expected"
+    # forever. #2898 (phase 3 of #2894) replaces that contingent reason with
+    # a structural one: coord-tui releases from its OWN repo on its OWN `v*`
+    # tag line, so `expected` — the coordinator's channel's version — is not
+    # a number coord-tui's version is even comparable to. A fleet on coord
+    # v0.5.31 with coord-tui v0.2.7 is CORRECT. Grading one against the other
+    # would report every such fleet as ~29 releases behind, permanently, and
+    # `coord release propagate --rollback-on-red` gates on this report.
+    #
+    # That is also why `lanes_for_host` never emits a `coord-tui` Lane: a
     # WARN here is a real, actionable finding, but it must never enter
-    # `report.versions`' skew map. If coord-tui ever gets a real
-    # installed-version lane, grade it against the latest GitHub Release
-    # tag — PyPI cannot see a tui-only release.
+    # `report.versions`' skew map, which exists precisely to compare like
+    # with like. The right home for "is this coord-tui build wire-compatible
+    # with this daemon?" is coord-tui's own CI (the phase-3 ADR) — it was
+    # never answerable by a version-number diff, it only looked answerable
+    # while one tag stamped both repos.
     for row in _rows(health, "tui_binary"):
         if row.get("severity") == "warn":
             out.append(

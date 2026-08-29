@@ -1,0 +1,327 @@
+name: Release coord-tui binaries
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ #2898 (phase 3 of #2894): THIS FILE BELONGS TO THE coord-tui REPO.     │
+# │                                                                        │
+# │ It is staged here at `tui/.github/workflows/` — NOT the repo root's    │
+# │ `.github/workflows/` — deliberately. GitHub only reads workflows from  │
+# │ the root `.github/workflows/`, so while it sits here it is INERT in    │
+# │ code-coordinator: it cannot fire, and it cannot race publish.yml. It   │
+# │ lives inside `tui/` so the #2894 move story carries it across with the │
+# │ crate instead of having to reconstruct it.                             │
+# │                                                                        │
+# │ THE MOVE STORY STILL OWES THIS FILE ONE EDIT: every path below is      │
+# │ written for code-coordinator's layout (`tui/Cargo.toml`,               │
+# │ `tui/target/release/...`, `working-directory: tui`). When the crate    │
+# │ becomes the root of its own repo, drop that `tui/` prefix. Left        │
+# │ deliberately unguessed here — re-rooting paths against a repo layout   │
+# │ that does not exist yet is how you ship a workflow that looks right    │
+# │ and builds nothing.                                                    │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# #1239 (PKG-3): coord-tui is the single biggest "offer it to someone else"
+# gap in this project — it was `version = "0.1.0"` hardcoded, hand-built
+# with `cargo build`, and copied to ~/.local/bin by hand. This workflow
+# builds coord-tui for linux/mac/windows for a `vX.Y.Z` release, stamps its
+# version from that tag, and attaches the binaries to the GitHub Release
+# `coord tui update` (coord/tui_release.py) resolves from.
+#
+# Hand-written matrix, not cargo-dist (the issue's preferred option): coord-tui
+# depends on quadraui via a `git`/`rev` dependency (`tui/Cargo.toml`, #1973) —
+# not a crates.io/registry dependency — which cargo-dist does not model, so
+# the fallback named in the issue is what's implemented here. Since #1973,
+# cargo fetches quadraui straight from GitHub at the rev pinned in
+# `tui/Cargo.toml`; there is no sibling checkout to reproduce in CI and
+# nothing here to keep in sync with that pin — it's read from the one place,
+# the manifest, same as every other dependency.
+#
+# WHY THE `v*` PUSH TRIGGER IS BACK (#2898 undoes #1242's `workflow_call`)
+# ------------------------------------------------------------------------
+# #1242 (PKG-6) made this a *reusable* workflow called by publish.yml. That
+# was the right fix for the problem it had: two workflows in ONE repo both
+# fired on `v*` and both called softprops/action-gh-release for the same
+# tag. That action upserts by `tag_name`, so whichever run's step landed
+# first created the Release and the other merely appended — which meant
+# whether the Release even carried generated notes was decided by a race.
+#
+# The race needed two workflows sharing one Release. After the #2894 split
+# there is no sharing left: coord-tui tags in its own repo and publishes to
+# its own Releases, the wheel tags in code-coordinator and publishes to
+# code-coordinator's. Two repos, two tag namespaces, two Releases, nothing
+# to race over — and `workflow_call` cannot survive the split anyway, since
+# a caller in another repo cannot hand this one a tag that exists in ITS
+# history. So the trigger goes back to the tag push, and the
+# release-creating step comes back with it (see the `release` job): in this
+# repo this workflow is the ONLY thing that publishes, so it must.
+#
+# The `workflow_dispatch` dry-run below is unchanged: it exercises the whole
+# build+stamp+verify pipeline for every target without touching any Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      fake_tag:
+        description: >-
+          Dry-run version tag (e.g. v0.0.0-dryrun). Exercises the full
+          build+stamp+verify pipeline for every target without creating or
+          touching any GitHub Release — binaries land as workflow artifacts
+          instead, so a maintainer can validate the pipeline without cutting
+          a real release.
+        required: true
+        default: v0.0.0-dryrun
+
+# Least privilege by default; only the `release` job writes to the repo.
+permissions:
+  contents: read
+
+jobs:
+  # #2898: the "tag must be an ancestor of origin/main" guard (#1471) comes
+  # back here. It lived here until #1242 moved it to publish.yml's
+  # `verify-tag` — correct while publish.yml owned the trigger, wrong again
+  # now that the tag push reaches this workflow directly in coord-tui's own
+  # repo, where publish.yml does not exist at all.
+  #
+  # What it guards: `main` is a protected branch, so `git push origin main`
+  # can be rejected while a subsequent `git push origin vX.Y.Z` still
+  # succeeds — they are independent refs. A Release cut from a tag whose
+  # commit never landed on main advertises code nobody can reproduce.
+  #
+  # Skipped for the workflow_dispatch dry run, which builds whatever branch
+  # it was dispatched against and publishes nothing.
+  verify-tag:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          tagged_commit="$(git rev-parse HEAD)"
+          echo "Tag $TAG -> $tagged_commit"
+          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
+            echo "::error::Tag $TAG points at commit $tagged_commit, which is not an ancestor of origin/main. Refusing to publish — merge the commit to main first, then re-tag it."
+            exit 1
+          fi
+
+  # RUNNER LABELS ARE A LIVE DEPENDENCY — pin them to images that still exist,
+  # and re-check when GitHub retires one (#2036).
+  #
+  # A retired runner label does not fail. It QUEUES, forever, with the job
+  # showing a perfectly ordinary "queued" spinner and the run reporting no
+  # error at all. On 2026-08-09 `macos-13` (retired) held three runs hostage —
+  # the oldest for 23 hours — and, because #1242 made publish-pypi gate on
+  # `verify-assets` -> `build-tui`, it blocked EVERY PyPI release rather than
+  # just the binary it was building. Before #1242 the same dead label only
+  # stranded a redundant standalone run, so it sat unnoticed: the breakage was
+  # already there and became load-bearing when the workflows were unified.
+  #
+  # `continue-on-error` / `best_effort` is NO protection here — those act on a
+  # job that FAILS, and a job with an unschedulable label never starts. The
+  # loud-failure guard for this class belongs in the release post-condition
+  # (#2035): fail the release if the artifact never reaches the PyPI simple
+  # index within a bounded window, instead of waiting on a runner that is
+  # never coming.
+  build:
+    # `always()`: verify-tag is *skipped* (not failed) on the dry-run
+    # dispatch, and a skipped dependency would otherwise skip this job too.
+    needs: [verify-tag]
+    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `best_effort: false` legs are the acceptance bar ("assets for at
+          # least linux + macOS") — a failure there should still fail this
+          # job and block the release, same as before.
+          - target_name: x86_64-linux
+            os: ubuntu-latest
+            bin_ext: ""
+            best_effort: false
+          # macos-15-intel, not the retired macos-13: this is the current
+          # Intel x64 image (macos-26-intel is the newer one when we want it).
+          - target_name: x86_64-macos
+            os: macos-15-intel
+            bin_ext: ""
+            best_effort: false
+          # macos-15, not macos-14: 14 is DEPRECATED, i.e. exactly one
+          # retirement away from reproducing the macos-13 hang above. Moved
+          # now rather than after it costs another release.
+          - target_name: aarch64-macos
+            os: macos-15
+            bin_ext: ""
+            best_effort: false
+          # Windows is not part of the stated acceptance bar. `best_effort:
+          # true` (via the job-level `continue-on-error` below) means a
+          # Windows-only failure — e.g. a native-dep hiccup in rusqlite's
+          # bundled build or portable-pty — no longer marks the whole
+          # `build` job failed, which would otherwise fail this whole
+          # reusable workflow and, through publish.yml's `needs: [build-tui]`,
+          # withhold the release along with the already-successful
+          # linux/macOS artifacts and the wheel.
+          - target_name: x86_64-windows
+            os: windows-latest
+            bin_ext: ".exe"
+            best_effort: true
+    runs-on: ${{ matrix.os }}
+    # See the `best_effort` matrix comment above: only the Windows leg opts
+    # into tolerating its own failure without failing the overall `build`
+    # job (and therefore blocking the `release` job, which gates on it).
+    continue-on-error: ${{ matrix.best_effort }}
+    steps:
+      # #2898: no `ref:` any more. Under the restored `push: tags` trigger
+      # the default checkout ref IS `refs/tags/<tag>`, so the build is a
+      # function of the tag by construction. The explicit pin existed only
+      # because #1242's `workflow_call` made the default the *caller's*
+      # branch.
+      - uses: actions/checkout@v4
+
+      # #1973: no sibling quadraui checkout to reproduce here any more —
+      # tui/Cargo.toml's `git`/`rev` dependency makes `cargo build` fetch
+      # quadraui straight from GitHub at the pinned rev, same as any other
+      # dependency. The release build is reproducible from the tag alone
+      # because the manifest checked out at that tag carries the pin.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+          key: release-${{ matrix.target_name }}
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        # `CALL_TAG`/`FAKE_TAG`/`REF_NAME` come in via `env:` rather than
+        # being spliced directly into this script (the standard
+        # `${{ }}`-in-`run:` anti-pattern) — `github.event.inputs.fake_tag`
+        # is `workflow_dispatch` input text, and even though triggering that
+        # dispatch already requires repo write access, passing it through an
+        # env var instead of interpolating it into the shell script avoids
+        # arbitrary text being spliced into (and executed as) bash.
+        #
+        # Precedence (#2898, now that #1242's handed-down `inputs.tag` is
+        # gone): a dry-run's fake tag, then the ref this ran against. Under
+        # `push: tags` `REF_NAME` is the tag itself; `FAKE_TAG` is null
+        # outside workflow_dispatch.
+        env:
+          FAKE_TAG: ${{ github.event.inputs.fake_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${FAKE_TAG:-$REF_NAME}"
+          version="${tag#v}"
+          echo "Building coord-tui for tag $tag (version $version)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp coord-tui version from tag
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # #1239: single-source the release version from the pushed tag,
+          # the same way pyproject.toml's setuptools-scm config derives the
+          # Python wheel's version from it — no hand-maintained version
+          # literal to drift out of sync (see #1182, the torn-install
+          # incident that made drift here a known failure mode).
+          #
+          # The `^version = ` anchor only matches a line that starts with
+          # "version" in column 0 — the [package] version field — never the
+          # nested `name = { version = "...", ... }` dependency specifiers
+          # elsewhere in the manifest (those never start a line with
+          # "version").
+          sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$version\"/" tui/Cargo.toml
+          rm tui/Cargo.toml.bak
+          grep '^version' tui/Cargo.toml
+
+      - name: Build coord-tui (release)
+        working-directory: tui
+        run: cargo build --release --bin coord-tui
+
+      - name: Verify --version reports the tag version
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          out="$(./tui/target/release/coord-tui${{ matrix.bin_ext }} --version)"
+          echo "coord-tui --version -> $out"
+          case "$out" in
+            *"$version"*) ;;
+            *)
+              echo "::error::coord-tui --version ($out) does not contain expected version $version"
+              exit 1
+              ;;
+          esac
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "tui/target/release/coord-tui${{ matrix.bin_ext }}" "dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}"
+
+      # The asset filename is load-bearing: `coord tui update`
+      # (coord/tui_release.py's `asset_filename`) resolves this exact name
+      # from a release's asset list.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coord-tui-${{ matrix.target_name }}
+          path: dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────
+  # #2898: the single owner of coord-tui's GitHub Release.
+  #
+  # #1242 deleted this job because publish.yml owned Release creation for the
+  # one shared Release. Post-split there is no shared Release: this repo has
+  # its own tag line and its own Releases, and nothing else in it publishes
+  # them. Exactly one release-creating step still holds — it is just this one
+  # now, per channel, rather than publish.yml's for both.
+  #
+  # `coord tui update`'s whole resolution path (coord/tui_release.py) reads
+  # THIS Release's asset list, so a build that uploads workflow artifacts and
+  # stops would leave the update source permanently empty.
+  # ────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build]
+    # Tag pushes only. The workflow_dispatch dry run proves the whole
+    # build+stamp+verify pipeline without ever creating a Release — that is
+    # the entire reason it exists.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # The acceptance bar: assets for linux + both macOS targets. Windows is
+      # `best_effort: true` in the matrix above and deliberately absent here,
+      # so a Windows-only hiccup cannot withhold an otherwise-complete
+      # release. This is release-tui.yml's own copy of what publish.yml's
+      # `verify-assets` used to do for the fused channel (#2898).
+      - name: Collect and check the release asset set
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -name 'coord-tui-*' -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+          missing=""
+          for target in x86_64-linux x86_64-macos aarch64-macos; do
+            [ -f "release-assets/coord-tui-$target" ] || missing="$missing coord-tui-$target"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Release ${{ github.ref_name }} would be incomplete — missing:$missing"
+            exit 1
+          fi
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*

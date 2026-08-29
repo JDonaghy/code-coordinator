@@ -595,6 +595,108 @@ def test_an_unknown_daemon_host_degrades_to_config_order():
     assert [r.host for r in rolls] == ["a", "b"]
 
 
+# ── #2898: two channels, named distinctly ────────────────────────────────
+#
+# Phase 3 of #2894 gave coord-tui its own repo, its own `v*` tag namespace and
+# its own Releases. One tag can no longer stamp two repos, so a fleet on coord
+# v0.5.x with coord-tui v0.2.y is a CORRECT state — and the plan has to say so,
+# rather than showing a `tui` lane under a coordinator version it does not
+# actually roll to.
+
+
+def test_the_tui_lane_draws_from_coord_tuis_own_channel():
+    rolls = rp.plan_lanes(daemon_host="a", hosts=["a"])
+    by_lane = {r.lane: r for r in rolls}
+    assert by_lane[rp.LANE_TUI].channel == rp.CHANNEL_TUI
+    assert by_lane[rp.LANE_PYTHON].channel == rp.CHANNEL_COORD
+    assert by_lane[rp.LANE_UNITS].channel == rp.CHANNEL_COORD
+
+
+def test_the_two_channels_are_distinct_names():
+    """Not an identity check for its own sake: if these ever collapse to one
+    string, every "names both channels distinctly" assertion below still
+    passes while showing an operator nothing."""
+    assert rp.CHANNEL_COORD != rp.CHANNEL_TUI
+    assert set(rp.LANE_CHANNELS) == set(rp.ALL_LANES)
+
+
+def test_channel_for_lane_falls_back_rather_than_raising():
+    """A labelling helper must never be able to abort a propagation."""
+    assert rp.channel_for_lane(rp.LANE_TUI) == rp.CHANNEL_TUI
+    assert rp.channel_for_lane("something-nobody-added-yet") == rp.CHANNEL_COORD
+
+
+def test_the_python_and_units_lanes_share_one_channel():
+    """#1831: the units ship as package data INSIDE the wheel, so they are two
+    lanes of one channel — splitting them would mean inventing a version
+    source for `deploy/` that does not exist."""
+    rolls = rp.plan_lanes(daemon_host="a", hosts=["a", "b"])
+    non_tui = {r.channel for r in rolls if r.lane != rp.LANE_TUI}
+    assert non_tui == {rp.CHANNEL_COORD}
+
+
+def test_a_dry_run_plan_names_both_channels_distinctly():
+    """#2898's acceptance criterion, on the rendered output an operator
+    actually reads — `coord release propagate --dry-run`."""
+    rolls = rp.plan_lanes(daemon_host="a", hosts=["a"])
+    record = rp.PropagationRecord(
+        started_at=1.0, target_version="0.5.31", dry_run=True,
+        status=rp.STATUS_ROLLED,
+        lanes=[
+            {"lane": r.lane, "host": r.host, "ok": None, "channel": r.channel,
+             "detail": f"would roll ({r.rationale})"}
+            for r in rolls
+        ],
+    )
+    out = "\n".join(rp.render_record(record))
+
+    assert rp.CHANNEL_COORD in out
+    assert rp.CHANNEL_TUI in out
+    # The tui lane's own line carries the tui channel, not the coordinator's.
+    tui_line = next(l for l in out.splitlines() if f"{rp.LANE_TUI}@" in l)
+    assert f"[{rp.CHANNEL_TUI}]" in tui_line
+    assert f"[{rp.CHANNEL_COORD}]" not in tui_line
+    python_line = next(l for l in out.splitlines() if f"{rp.LANE_PYTHON}@" in l)
+    assert f"[{rp.CHANNEL_COORD}]" in python_line
+    # ...and the header version is attributed, so `v0.5.31` above a tui lane
+    # cannot be misread as a claim about coord-tui.
+    assert f"v0.5.31 ({rp.CHANNEL_COORD})" in out.splitlines()[0]
+
+
+def test_render_record_tolerates_lane_entries_with_no_channel():
+    """Journal records written before #2898 carry no `channel` key, and
+    `coord release propagate --history` renders them."""
+    record = rp.PropagationRecord(
+        started_at=1.0, target_version="0.4.111", status=rp.STATUS_ROLLED,
+        lanes=[{"lane": "python", "host": "a", "ok": True, "detail": "rolled"}],
+    )
+    out = "\n".join(rp.render_record(record))
+    assert "python@a" in out
+    assert "channels:" not in out
+
+
+def test_the_tui_lanes_rationale_says_it_does_not_chase_the_coord_version():
+    """The rationale is journalled and rendered; #2898's failure mode is
+    somebody re-adding `--version <coordinator target>` to the tui roll, so
+    the reason it is absent lives where they will read it."""
+    rolls = rp.plan_lanes(daemon_host="a", hosts=["a"], lanes=[rp.LANE_TUI])
+    assert rp.CHANNEL_TUI in rolls[0].rationale
+    assert "2898" in rolls[0].rationale
+
+
+def test_lane_plan_line_renders_the_channel():
+    roll = rp.LaneRoll(order=3, lane=rp.LANE_TUI, host="macmini",
+                       rationale="because", channel=rp.CHANNEL_TUI)
+    assert roll.plan_line == f"3. tui@macmini [{rp.CHANNEL_TUI}] — because"
+    assert roll.label == "tui@macmini"
+
+
+def test_a_lane_roll_defaults_to_the_coordinator_channel():
+    """Defaulted, not required, so a LaneRoll built by hand (or rehydrated
+    from an older record) reads as what every lane meant before the split."""
+    assert rp.LaneRoll(order=1, lane=rp.LANE_PYTHON, host="a").channel == rp.CHANNEL_COORD
+
+
 # ── version helpers ──────────────────────────────────────────────────────
 
 

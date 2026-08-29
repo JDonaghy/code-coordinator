@@ -139,27 +139,52 @@ def test_ci_acceptance_config_only_ships_nothing():
     assert not ships_code([".github/coord-ci-acceptance.yml"])
 
 
-def test_tui_only_still_ships():
-    """#2081 asked, explicitly, whether a `tui/`-only merge should keep
-    driving a PyPI/expected-version bump given coord-tui has no remote
-    install path (`lane_is_out_of_reach` — the fleet's release-verify lanes
-    go red for a change that can never reach them). Judged not worth
-    splitting from how a release is built (out of this issue's scope, see
-    `scripts/next_release_tag.py`'s module docstring): `tui/` stays a
-    shipping prefix, on purpose, and this test is that decision pinned."""
-    assert ships_code(["tui/src/panels/queue.rs"])
+def test_tui_only_ships_nothing():
+    """#2898 (phase 3 of #2894) settles what #2081 deferred.
+
+    #2081 asked whether a `tui/`-only merge should keep driving a PyPI /
+    expected-version bump given coord-tui has no remote install path
+    (`lane_is_out_of_reach` — the fleet's release-verify lanes went red for a
+    change that could never reach them). It judged the split inseparable from
+    how a release is *built*, which was out of its scope, so `tui/` stayed a
+    shipping prefix.
+
+    #2898 does that surgery: coord-tui has its own repo, its own `v*` tag
+    namespace and its own `release-tui.yml` firing on its own tag push, so a
+    `tui/` change HERE reaches no wheel, no binary this repo publishes and no
+    host's unit directory. Cutting a tag for it would mint an immutable public
+    version for a no-op and move the fleet's expected version with no payload.
+    """
+    assert not ships_code(["tui/src/panels/queue.rs"])
+    assert not ships_code(["tui/Cargo.toml", "tui/src/main.rs"])
+
+
+def test_a_mixed_tui_and_coord_range_still_ships():
+    """The exclusion is `tui/`-ONLY, not `tui/`-present: a range that also
+    touches `coord/` releases exactly as it always did."""
+    assert ships_code(["coord/cli.py", "tui/src/panels/queue.rs"])
+
+
+def test_the_staged_tui_release_workflow_ships_nothing_either():
+    """#2898 stages coord-tui's own `release-tui.yml` at
+    `tui/.github/workflows/` — inside `tui/`, because GitHub only reads
+    workflows from the repo ROOT's `.github/workflows/`, so it is inert here
+    and travels with the crate when #2894's move story runs.
+
+    It must not cut a release from this repo: it is a workflow file (already
+    non-shipping on its own terms, see `.github/workflows/` in
+    NON_SHIPPING_PREFIXES) for a *different* repo's channel."""
+    assert not ships_code(["tui/.github/workflows/release-tui.yml"])
 
 
 # ── ships_wheel (#2102) ──────────────────────────────────────────────────
 
 
 def test_tui_only_ships_no_wheel():
-    """#2102 revisits the half #2081 deferred: a `tui/`-only range still
-    cuts a release (see `test_tui_only_still_ships` above) but its wheel is
-    byte-identical to its predecessor apart from the version string, so
-    publishing it to PyPI is pure waste. Pinned alongside `ships_code`'s
-    `tui/`-still-ships test so the two decisions cannot silently drift back
-    together."""
+    """#2102 excluded `tui/` from the wheel; #2898 excluded it from shipping
+    at all. Either way a `tui/`-only range publishes nothing to PyPI — pinned
+    next to `test_tui_only_ships_nothing` so the tag decision and the wheel
+    decision cannot silently drift apart."""
     assert not ships_wheel(["tui/src/panels/queue.rs"])
     assert not ships_wheel(["tui/src/main.rs", "tui/Cargo.toml"])
 
@@ -281,32 +306,22 @@ def test_a_workflow_only_merge_cuts_nothing():
     assert decision.tag is None
 
 
-def test_a_tui_only_merge_still_cuts_the_next_patch():
-    """#2081: judged (see the module docstring) not worth splitting `tui/`
-    out of the shipping filter, so it still bumps like any other shipping
-    path. Pinned so a future change to this behaviour is a deliberate diff,
-    not a silent regression either way."""
+def test_a_tui_only_merge_cuts_no_release_at_all():
+    """#2898: end to end through `decide()`, not just the prefix predicate.
+
+    Before the split this cut `v0.5.21` (a tag + a GitHub Release carrying the
+    coord-tui binaries, #2102, but no PyPI wheel). Now the binaries come off
+    coord-tui's own tag in its own repo, so this repo minting a version for
+    the same merge would spend an immutable public name on a no-op AND move
+    every host's expected version for a payload none of them receive."""
     decision = decide(
         tags=["v0.5.20"],
         message="fix(#2064): SSE 404 is terminal",
         changed_files=["tui/src/panels/queue.rs"],
     )
-    assert decision.release
-    assert decision.tag == "v0.5.21"
-
-
-def test_a_tui_only_merge_cuts_a_tag_but_no_wheel():
-    """#2102: the half #2081 deferred. One tag, one GitHub Release — but the
-    wheel that range would build is a no-op, so it must not be published."""
-    decision = decide(
-        tags=["v0.5.20"],
-        message="fix(#2064): SSE 404 is terminal",
-        changed_files=["tui/src/panels/queue.rs"],
-    )
-    assert decision.release
-    assert decision.tag == "v0.5.21"
+    assert not decision.release
+    assert decision.tag is None
     assert not decision.wheel
-    assert "no PyPI wheel" in decision.reason
 
 
 def test_a_mixed_merge_cuts_a_tag_and_a_wheel():

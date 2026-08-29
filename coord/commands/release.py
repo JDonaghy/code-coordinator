@@ -1179,8 +1179,13 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
 
     if dry_run:
         for roll in rolls:
+            # #2898: the channel travels with the plan entry so `--dry-run`
+            # names both channels distinctly (rendered by
+            # `rp.render_record`), rather than showing a `tui` lane under a
+            # coordinator version it does not actually roll to.
             record.lanes.append(
                 {"lane": roll.lane, "host": roll.host, "ok": None,
+                 "channel": roll.channel,
                  "detail": f"would roll ({roll.rationale})"}
             )
         if rolls:
@@ -1265,9 +1270,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         elif roll.lane == rp.LANE_UNITS:
             ok, detail = _roll_units(machine, agent_port=AGENT_PORT)
         else:
-            ok, detail = _roll_tui(
-                machine, target_version=record.target_version, local_name=local_name
-            )
+            # #2898: no target_version — the tui lane resolves its own
+            # channel's latest (see _roll_tui). record.target_version names a
+            # tag in the coordinator's channel, which coord-tui's Releases
+            # have never heard of.
+            ok, detail = _roll_tui(machine, local_name=local_name)
 
         # #2052: `ok is None` from a lane executor means "there is no channel
         # for this lane on this host" — not a failure, and emphatically not
@@ -1275,7 +1282,8 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # coord-tui binary is the canonical case: propagation itself reports
         # there is no remote install path, so counting its staleness as
         # grounds for rolling back a good python roll is a category error.
-        entry = {"lane": roll.lane, "host": roll.host, "ok": ok, "detail": detail}
+        entry = {"lane": roll.lane, "host": roll.host, "ok": ok,
+                 "channel": roll.channel, "detail": detail}
         if ok is None:
             entry["unrollable"] = True
         record.lanes.append(entry)
@@ -2141,9 +2149,7 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     return ok, "; ".join(parts)
 
 
-def _roll_tui(
-    machine, *, target_version: str, local_name: str | None
-) -> tuple[bool | None, str]:
+def _roll_tui(machine, *, local_name: str | None) -> tuple[bool | None, str]:
     """`coord tui update` — local host only, and honest about the rest.
 
     ``coord-tui`` is a binary in each host's ``~/.local/bin``; there is no
@@ -2157,25 +2163,63 @@ def _roll_tui(
     ``--rollback-on-red`` used as grounds to revert three good python rolls.
     A lane that reports "there is no remote install path" in its own failure
     message cannot also be evidence that this run went wrong.
+
+    #2898 — NO ``--version`` ANY MORE, AND THAT IS THE POINT.
+    This used to run ``coord tui update --version <this run's target>``, which
+    was correct while one tag stamped both repos (#1242). After the #2894
+    split that argument names a tag in the *coordinator's* channel, which
+    coord-tui's Releases have never heard of: passing it would 404 on every
+    run, and the propagation would report a failed tui lane forever for a
+    fleet that is in fact perfectly current. Bare ``coord tui update``
+    resolves coord-tui's OWN latest release
+    (:func:`coord.tui_release.fetch_latest_release_tag`) — that is the
+    :data:`~coord.release_propagate.CHANNEL_TUI` channel doing its own version
+    selection, not this run guessing across a channel boundary.
     """
     import subprocess  # noqa: PLC0415
+
+    from coord import release_propagate as rp  # noqa: PLC0415
 
     if local_name is None or machine.name != local_name:
         return None, (
             f"coord-tui is a per-host binary with no remote install path — run "
-            f"`coord tui update --version {target_version}` on {machine.name}"
+            f"`coord tui update` on {machine.name} ({rp.CHANNEL_TUI} channel)"
         )
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "coord.cli", "tui", "update",
-             "--version", target_version],
+            [sys.executable, "-m", "coord.cli", "tui", "update"],
             capture_output=True, text=True, timeout=300,
         )
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
     if proc.returncode == 0:
-        return True, f"coord-tui now v{target_version}"
+        installed = _installed_tui_version(proc.stdout)
+        return True, (
+            f"coord-tui now {installed} ({rp.CHANNEL_TUI} channel)"
+            if installed
+            else f"coord-tui updated from the {rp.CHANNEL_TUI} channel"
+        )
     return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
+
+
+def _installed_tui_version(stdout: str) -> str | None:
+    """The version `coord tui update` reported, parsed back out of its output.
+
+    #2898: the caller no longer *chooses* the version — coord-tui's own
+    channel does — so the only way to journal what actually landed is to read
+    it back. Both of that command's terminal lines carry it: ``coord-tui is
+    already vX -- nothing to do`` (the idempotent path) and ``Installed
+    <path> -- coord-tui reports X.`` (the install path). Returns ``None``
+    rather than guessing if neither matches; the roll still counts as
+    successful, it is just journalled without a number.
+    """
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if "coord-tui reports " in line:
+            return line.split("coord-tui reports ", 1)[1].strip().rstrip(".") or None
+        if line.startswith("coord-tui is already "):
+            return line.split("coord-tui is already ", 1)[1].split()[0].strip() or None
+    return None
 
 
 def _get(url: str, *, timeout: float) -> tuple[int | None, dict]:

@@ -268,6 +268,58 @@ LANE_TUI = "tui"
 #: *order* is :func:`plan_lanes`'s output, not this tuple.
 ALL_LANES: tuple[str, ...] = (LANE_PYTHON, LANE_UNITS, LANE_TUI)
 
+# ── release channels (#2898) ─────────────────────────────────────────────────
+#
+# Until #2898 there was only ONE channel and it did not need a name: `publish.
+# yml` turned one `v*` tag in this repo into one GitHub Release carrying the
+# wheel AND the coord-tui binaries (#1242), so "the target version" was a
+# single number every lane rolled toward, and `_roll_tui` could pass the
+# coordinator's version straight to `coord tui update --version`.
+#
+# Phase 3 of #2894 split the channels. coord-tui tags and releases from its own
+# repo, so ONE TAG CANNOT STAMP TWO REPOS and the two version lines move
+# independently. The consequence this module has to encode is narrow but sharp:
+#
+#   A fleet on coord v0.5.x with coord-tui v0.2.y is CORRECT, not five
+#   releases behind.
+#
+# Which means the tui lane's "target version" is not `record.target_version` —
+# that is the *coordinator's* channel's tag, which coord-tui's Releases have
+# never heard of. Asking for it resolves a tag that does not exist (a 404 every
+# run) or, worse, silently matches an unrelated release that happens to share a
+# number. The tui lane resolves its own channel's latest instead; see
+# ``coord/commands/release.py``'s ``_roll_tui`` and
+# :func:`coord.tui_release.fetch_latest_release_tag`.
+#
+# Naming them makes the split legible in `--dry-run` output rather than
+# implicit in which function happens to be called: `coord release propagate
+# --dry-run` prints the channel next to each planned roll, so "two channels"
+# is something an operator reads, not something they have to know.
+CHANNEL_COORD = "code-coordinator"
+CHANNEL_TUI = "coord-tui"
+
+#: Which release channel each lane draws its target version FROM.
+#:
+#: ``python``/``units`` both ship inside the wheel (#1831: the units are
+#: package data at ``coord/deploy/``), so they are two lanes of ONE channel and
+#: share ``record.target_version``. ``tui`` is the only lane whose version
+#: comes from somewhere else.
+LANE_CHANNELS: dict[str, str] = {
+    LANE_PYTHON: CHANNEL_COORD,
+    LANE_UNITS: CHANNEL_COORD,
+    LANE_TUI: CHANNEL_TUI,
+}
+
+
+def channel_for_lane(lane: str) -> str:
+    """Which release channel *lane* rolls from (#2898).
+
+    Unknown lanes fall back to :data:`CHANNEL_COORD` rather than raising: this
+    is a labelling function used in plan output and journal records, and an
+    unrecognised lane must not be able to abort a propagation.
+    """
+    return LANE_CHANNELS.get(lane.strip(), CHANNEL_COORD)
+
 # ── the gate's scope ─────────────────────────────────────────────────────────
 #
 # #2052: `coord release propagate` gated its roll on `coord release verify`,
@@ -1210,10 +1262,27 @@ class LaneRoll:
     #: and journalled, because the ordering is a protocol-safety argument and
     #: an argument nobody can read is an argument nobody can check.
     rationale: str = ""
+    #: Which release channel this lane's target version comes from (#2898).
+    #: Defaulted rather than required so an older journal record — or a test
+    #: constructing a LaneRoll by hand — still reads as the coordinator's own
+    #: channel, which is what every lane meant before the split.
+    channel: str = CHANNEL_COORD
 
     @property
     def label(self) -> str:
         return f"{self.lane}@{self.host}"
+
+    @property
+    def plan_line(self) -> str:
+        """One rendered line of ``--dry-run``'s plan, channel included.
+
+        #2898's acceptance criterion: the two channels must be named
+        *distinctly* in the plan, so an operator can see at a glance that the
+        tui lane is not chasing the coordinator's version. Kept here rather
+        than in ``coord/commands/release.py`` because this module is the pure
+        half — the rendering is testable without any I/O.
+        """
+        return f"{self.order}. {self.lane}@{self.host} [{self.channel}] — {self.rationale}"
 
 
 def plan_lanes(
@@ -1234,6 +1303,23 @@ def plan_lanes(
 
     *skip_hosts* drops hosts already on the target version, so a re-run after
     a partial failure resumes rather than restarting.
+
+    #2898: every roll carries its :data:`LANE_CHANNELS` channel. The order is
+    unaffected — the tui lane still goes last for the reason it always did (a
+    pure board-API client, safe at any skew) — but the channel is what
+    ``--dry-run`` renders, and it is what the tui lane resolves its target
+    version from.
+
+    Known gap, stated rather than silently inherited: *skip_hosts* is computed
+    by :func:`hosts_already_current` against the **coordinator's** channel
+    only, and it skips a host for EVERY lane. So a host already on the target
+    coord version is skipped for the tui lane too, even though coord-tui's
+    channel may have moved since. That is not new behaviour and it is bounded
+    — coord-tui is a per-host binary this module can only install locally
+    anyway (``_roll_tui``), so the same operator running ``coord tui update``
+    closes it in one command — but it is a real second-channel blind spot,
+    and it belongs with the missing remote install path (#2069 fix 3), not
+    with the channel split.
     """
     wanted = [lane for lane in ALL_LANES if lane in set(lanes)]
     skip = set(skip_hosts)
@@ -1256,6 +1342,7 @@ def plan_lanes(
                     order=order,
                     lane=LANE_PYTHON,
                     host=host,
+                    channel=CHANNEL_COORD,
                     rationale=(
                         "daemon host leads: a caller must never reach an "
                         "endpoint its daemon predates (the documented 405)"
@@ -1275,6 +1362,7 @@ def plan_lanes(
                     order=order,
                     lane=LANE_UNITS,
                     host=host,
+                    channel=CHANNEL_COORD,
                     rationale=(
                         "#1831: the units ship inside the wheel as "
                         "coord/deploy/, so this host's venv must have "
@@ -1293,9 +1381,12 @@ def plan_lanes(
                     order=order,
                     lane=LANE_TUI,
                     host=host,
+                    channel=CHANNEL_TUI,
                     rationale=(
                         "coord-tui is a pure board-API client — safe at any "
-                        "skew, so it goes last and can never block the fleet"
+                        "skew, so it goes last and can never block the fleet; "
+                        f"#2898: rolls to the latest in the {CHANNEL_TUI} "
+                        "channel, NOT this run's coordinator version"
                     ),
                 )
             )
@@ -1525,7 +1616,12 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
     version = data.get("target_version") or "?"
     prefix = "[dry-run] " if data.get("dry_run") else ""
     lines = [
-        f"{mark} {prefix}{_stamp(data.get('started_at'))}  v{version}  {status}"
+        # #2898: the header version is the COORDINATOR's channel's target, and
+        # says so. Before the split there was only one channel and leaving it
+        # unqualified was harmless; now an unlabelled `v0.5.31` above a tui
+        # lane reads as a claim about coord-tui, which it is not.
+        f"{mark} {prefix}{_stamp(data.get('started_at'))}  "
+        f"v{version} ({CHANNEL_COORD})  {status}"
     ]
 
     # #2583: a held run must read as "deliberately holding at N behind",
@@ -1540,12 +1636,26 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
     if quiescence.get("reason"):
         lines.append(f"    window: {quiescence['reason']}")
 
+    # #2898's acceptance criterion: `--dry-run` must name BOTH channels
+    # distinctly. Summarised once here (so the two-channel fact survives even
+    # a plan whose lanes scroll past) and then per lane below.
+    channels = [
+        c for c in dict.fromkeys(
+            str(lane.get("channel")) for lane in (data.get("lanes") or [])
+            if lane.get("channel")
+        )
+    ]
+    if channels:
+        lines.append(f"    channels: {', '.join(channels)}")
+
     for lane in data.get("lanes") or []:
         ok = lane.get("ok")
         lane_mark = "✓" if ok else ("·" if ok is None else "✗")
         detail = lane.get("detail") or ""
+        channel = lane.get("channel")
         lines.append(
             f"    {lane_mark} {lane.get('lane')}@{lane.get('host')}"
+            + (f" [{channel}]" if channel else "")
             + (f" — {detail}" if detail else "")
         )
 
