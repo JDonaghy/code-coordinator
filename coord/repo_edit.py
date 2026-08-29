@@ -202,6 +202,75 @@ def insert_acceptance_driver_entry(text: str, entry: str) -> str:
     return "".join(lines)
 
 
+# ── #2861: `portal.project_repos` ────────────────────────────────────────────
+
+
+def render_portal_project_repo_entry(project_id: str, repos: list[str]) -> str:
+    """The ``portal.project_repos`` list entry mapping *project_id* to *repos*.
+
+    ``project_id`` is quoted because the portal's identifiers are opaque
+    (``proj_67deaa6d1291`` today, but nothing promises the next one is not
+    all-digits, ``yes``, or ``on`` — each of which YAML 1.1 would silently
+    parse as a non-string and then fail ``_parse_portal_project_repos``'
+    "must be a non-empty string" check for reasons an operator would have to
+    reverse-engineer). Repo names are already validated against ``repos[]``
+    at load, so they need no quoting.
+    """
+    return (
+        f'    - project_id: "{project_id}"\n'
+        f"      repos: [{', '.join(repos)}]\n"
+    )
+
+
+def insert_portal_project_repo_entry(text: str, entry: str) -> str:
+    """Insert *entry* under ``portal: / project_repos:`` in *text*, preserving
+    comments — same contract and same "create whatever is missing" posture as
+    :func:`insert_acceptance_driver_entry`.
+
+    ``portal:`` is optional and absent on any fleet that has never talked to
+    coord-portal, so this creates the block when there is none. A created
+    block has no ``enabled:`` key, which parses as ``enabled: false`` — i.e.
+    identical to having no block at all, so writing a mapping can never
+    accidentally switch the portal client ON.
+    """
+    lines = text.splitlines(keepends=True)
+    block = entry if entry.endswith("\n") else entry + "\n"
+
+    try:
+        start, end = _find_block(lines, "portal")
+    except RepoEditError:
+        prefix = "" if (lines and not lines[-1].strip()) else "\n"
+        lines.append(prefix + "portal:\n  project_repos:\n" + block)
+        return "".join(lines)
+
+    list_line = None
+    for i in range(start + 1, end):
+        if re.match(r"^\s{2}project_repos:\s*(\[\])?\s*$", lines[i]):
+            list_line = i
+            # An inline empty flow list (`project_repos: []`) — rewrite to
+            # block form, or the entry below it would be a sibling key rather
+            # than a list item (and a second `project_repos:` further down
+            # would silently override the first).
+            if lines[i].strip() != "project_repos:":
+                lines[i] = "  project_repos:\n"
+            break
+    if list_line is None:
+        lines[start + 1:start + 1] = ["  project_repos:\n"]
+        list_line = start + 1
+        end += 1
+
+    # End of the `project_repos:` list — the first line back at <=2-space
+    # indent (a sibling of `project_repos:` itself), or the end of `portal:`.
+    insert_at = list_line + 1
+    while insert_at < end:
+        line = lines[insert_at]
+        if line.strip() and re.match(r"^\s{0,2}\S", line):
+            break
+        insert_at += 1
+    lines[insert_at:insert_at] = [block]
+    return "".join(lines)
+
+
 def _machine_entry_range(lines: list[str], machine: str) -> tuple[int, int]:
     """``(start, end)`` line indices of one machine's entry inside ``machines:``."""
     m_start, m_end = _find_block(lines, "machines")

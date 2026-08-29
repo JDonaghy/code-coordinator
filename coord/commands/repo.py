@@ -38,11 +38,32 @@ each machine, commit+push the coordinator.yml edit, ``git pull`` the
 coord-settings checkout on each machine that serves the repo (not just the
 daemon host — the doctor-checked ``machines.agent_repo_skew`` remedy), and
 ``coord repo doctor --fix``.
+
+``--for-submission SUBMISSION_ID`` (#2861) closes three of those four for the
+**portal** case — the case that motivated the epic. Measured doing genesis for
+SUB-1EA1D3 on 2026-08-27, ``coord repo create`` was one command and getting
+from there to "pullable into a decomposition session" took **nine more
+motions**, two of them recovery from a footgun the command itself set up: the
+coord-settings checkout was five commits behind origin, so the entry landed on
+a stale base and the diff looked perfectly clean. So this module now also
+carries:
+
+* an **unconditional stale-checkout guard** (:func:`_guard_settings_fresh`) on
+  plain ``repo add``/``repo create`` too — the highest-value line in #2861 and
+  independent of everything else; and
+* ``--for-submission``, which resolves the submission's ``project_id``, writes
+  the ``portal.project_repos`` mapping, commits + pushes coord-settings,
+  ``git pull``s it on every machine serving the repo (reporting per machine,
+  never aborting the sweep on one host), reconciles each machine's live
+  ``~/.coord/coordinator.yml``, and finishes with ``coord repo doctor --fix``.
 """
 
 from __future__ import annotations
 
+import shlex
+import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
@@ -53,12 +74,25 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 # `~/src/coord-settings/coord/coordinator.yml`, NOT the `~/.coord/` symlink
 # (#1832): edits must land in the checkout so they can be committed, reviewed
 # and pulled onto the daemon host.
-from coord.fleet_config_health import TRACKED_CONFIG_REL, default_settings_dir
+from coord.fleet_config_health import (
+    TRACKED_CONFIG_REL,
+    default_live_config_path,
+    default_settings_dir,
+)
 
 
 @click.group("repo", help="Add a repo to the fleet, and verify it is actually onboarded.")
 def repo_group() -> None:
     """Repo onboarding (#2220)."""
+
+
+#: Shared `--for-submission` help text — one definition so `coord repo add`
+#: and `coord repo create` cannot drift (#2861).
+_FOR_SUBMISSION_HELP = (
+    "Also map this portal submission's project to the new repo, then commit, "
+    "push and distribute coordinator.yml to every machine serving it, and "
+    "finish with `coord repo doctor --fix` (#2861)."
+)
 
 
 # ── Seed content for a freshly created repo (IL-1, #2747) ───────────────────
@@ -400,6 +434,196 @@ def _seed_files(name: str, ci_template: str) -> list[tuple[str, str, bool]]:
     ]
 
 
+# ── #2861, step 1: refuse to write onto a stale coord-settings checkout ──────
+#
+# Measured on the live fleet 2026-08-27: `coord repo create` wrote a repos[]
+# entry into a coord-settings checkout that was FIVE commits behind origin.
+# The resulting diff looked perfectly clean — nothing in `coord repo add` /
+# `coord repo create` had ever compared the checkout to its upstream — and the
+# recovery (`git checkout --`, `git pull`, re-run the config half) cost two of
+# the nine motions the whole issue exists to collapse. This guard is the
+# highest-value line in #2861 and is deliberately unconditional: it runs for
+# plain `coord repo add` too, not only for `--for-submission`.
+#
+# It fetches, because the whole failure mode is "the remote moved and nobody
+# here noticed" — `coord.fleet_config_health.config_provenance` deliberately
+# never fetches (it is a read-only diagnose sweep), so it cannot serve as the
+# gate on a WRITE.
+
+
+@dataclass
+class _SettingsFreshness:
+    """How the config checkout being written to compares to its upstream."""
+
+    checkout: Path | None = None
+    behind: int = 0
+    ahead: int = 0
+    upstream: str | None = None
+    #: Set when the comparison could not be made at all (no checkout, no
+    #: upstream ref, unparseable `git rev-list`). Never a refusal — an
+    #: unanswerable question is not a "yes" (see `_guard_settings_fresh`).
+    unknown_reason: str | None = None
+    #: Set when `git fetch` itself failed (offline, no credentials). The
+    #: comparison still runs against the existing remote-tracking ref, which
+    #: may itself be stale — reported so an operator can tell the difference.
+    fetch_error: str | None = None
+
+
+def _git(cwd: Path, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess | None:
+    """Best-effort ``git`` in *cwd*; ``None`` when git could not be run at all."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def _git_toplevel(path: Path) -> Path | None:
+    """The git checkout *path* lives in, or ``None`` if it is not in one."""
+    start = path if path.is_dir() else path.parent
+    if not start.exists():
+        return None
+    result = _git(start, "rev-parse", "--show-toplevel", timeout=10.0)
+    if result is None or result.returncode != 0:
+        return None
+    top = result.stdout.strip()
+    return Path(top) if top else None
+
+
+def _settings_checkout_of(target: Path) -> Path | None:
+    """The coord-settings checkout *target* is the tracked config OF.
+
+    ``None`` when *target* is not a git checkout's ``coord/coordinator.yml``
+    — a throwaway file, a dev ``./coordinator.yml``, or anything outside a
+    repo. See :func:`_guard_settings_fresh` for why this is deliberately
+    narrower than "is it in a git checkout at all".
+    """
+    checkout = _git_toplevel(target)
+    if checkout is None:
+        return None
+    try:
+        same = (checkout / TRACKED_CONFIG_REL).resolve() == target.resolve()
+    except OSError:  # pragma: no cover — resolve() on a broken mount
+        return None
+    return checkout if same else None
+
+
+def _settings_freshness(checkout: Path, *, fetch: bool = True) -> _SettingsFreshness:
+    """Compare *checkout* to its upstream, fetching first.
+
+    Read-only: a fetch updates remote-tracking refs, never the working tree.
+    """
+    fresh = _SettingsFreshness(checkout=checkout)
+
+    if fetch:
+        result = _git(checkout, "fetch", "--quiet", timeout=60.0)
+        if result is None:
+            fresh.fetch_error = "`git fetch` could not be run"
+        elif result.returncode != 0:
+            fresh.fetch_error = (
+                (result.stderr or result.stdout or "").strip().splitlines()[-1:]
+                or ["`git fetch` failed"]
+            )[0]
+
+    upstream = _git(checkout, "rev-parse", "--abbrev-ref", "@{upstream}", timeout=10.0)
+    if upstream is None or upstream.returncode != 0:
+        fresh.unknown_reason = "no upstream tracking ref configured"
+        return fresh
+    fresh.upstream = upstream.stdout.strip()
+
+    counts = _git(
+        checkout, "rev-list", "--left-right", "--count", f"{fresh.upstream}...HEAD",
+        timeout=15.0,
+    )
+    if counts is None or counts.returncode != 0:
+        fresh.unknown_reason = f"could not compare HEAD to {fresh.upstream}"
+        return fresh
+    parts = counts.stdout.split()
+    if len(parts) != 2:
+        fresh.unknown_reason = (
+            f"unexpected `git rev-list` output comparing HEAD to {fresh.upstream}"
+        )
+        return fresh
+    try:
+        fresh.behind, fresh.ahead = int(parts[0]), int(parts[1])
+    except ValueError:
+        fresh.unknown_reason = (
+            f"unexpected `git rev-list` output comparing HEAD to {fresh.upstream}"
+        )
+    return fresh
+
+
+def _guard_settings_fresh(target: Path, *, enabled: bool) -> None:
+    """Refuse to write *target* when its checkout is behind its upstream.
+
+    Keyed off *target*'s own git checkout rather than "is this the default
+    coord-settings path", so an explicit ``--config`` pointing INTO a
+    coord-settings checkout (an operator habit, and how #2861's live incident
+    was re-run) is guarded exactly the same — including a checkout somewhere
+    other than ``$COORD_SETTINGS_DIR``.
+
+    Narrowed to a target that IS its checkout's ``coord/coordinator.yml``
+    (:data:`TRACKED_CONFIG_REL`), i.e. the coord-settings layout. Without
+    that, ``coord repo add --config ./coordinator.yml`` run from any source
+    checkout would refuse whenever *that unrelated repo* was behind its own
+    origin — a guaranteed false positive with a confusing message, on a file
+    whose freshness has nothing to do with the fleet's config.
+
+    Deliberately NOT a refusal when the comparison is merely unanswerable
+    (no upstream, no network, git unavailable): failing closed there would
+    wedge repo onboarding on an offline machine, and "unknown" is not
+    "behind". Those states print and continue.
+    """
+    if not enabled:
+        click.echo(
+            "⚠ --skip-freshness-check: not comparing the config checkout to its "
+            "upstream. An entry written onto a stale base looks clean in the "
+            "diff and is only found later (#2861).",
+            err=True,
+        )
+        return
+
+    checkout = _settings_checkout_of(target)
+    if checkout is None:
+        return
+
+    fresh = _settings_freshness(checkout)
+    if fresh.fetch_error:
+        click.echo(
+            f"⚠ could not `git fetch` in {checkout} ({fresh.fetch_error}) — "
+            "comparing against the existing remote-tracking ref, which may "
+            "itself be stale.",
+            err=True,
+        )
+    if fresh.unknown_reason:
+        click.echo(
+            f"? freshness of {checkout} unknown — {fresh.unknown_reason}. "
+            "Writing anyway.",
+            err=True,
+        )
+        return
+    if fresh.behind:
+        raise click.ClickException(
+            f"refusing to write: {checkout} is {fresh.behind} commit(s) behind "
+            f"{fresh.upstream}. The entry would land on a STALE base and the "
+            "diff would look perfectly clean (#2861 — this cost two recovery "
+            f"motions on the live fleet). Nothing was written.\n"
+            f"  Fix: git -C {checkout} pull --ff-only\n"
+            "  Then re-run. Override (rarely right): --skip-freshness-check."
+        )
+    if fresh.ahead:
+        click.echo(
+            f"⚠ {checkout} is {fresh.ahead} commit(s) ahead of {fresh.upstream} "
+            "— local config commit(s) not yet pushed. Not a refusal, but the "
+            "fleet is not running them yet.",
+            err=True,
+        )
+
+
 def _resolve_write_target(explicit: Path | None) -> Path:
     """Where ``coord repo add`` writes.
 
@@ -470,6 +694,28 @@ def _resolve_write_target(explicit: Path | None) -> Path:
     "--config", "config_path", type=click.Path(path_type=Path), default=None,
     help="coordinator.yml to edit. Default: the coord-settings tracked file.",
 )
+@click.option("--for-submission", "submission_id", default=None, help=_FOR_SUBMISSION_HELP)
+@click.option(
+    "--refresh-live-config/--no-refresh-live-config", "refresh_live",
+    default=True, show_default=True,
+    help=(
+        "During --for-submission's distribution step, overwrite a machine's "
+        "live ~/.coord/coordinator.yml when it is a REGULAR FILE that diverges "
+        "from the checkout (a backup is written first)."
+    ),
+)
+@click.option(
+    "--skip-freshness-check", "skip_freshness", is_flag=True, default=False,
+    help=(
+        "Do NOT compare the config checkout to its upstream before writing. "
+        "Rarely right: an entry written onto a stale base looks clean in the "
+        "diff (#2861)."
+    ),
+)
+@click.option(
+    "--ssh-timeout", default=180.0, show_default=True, type=float,
+    help="Per-machine timeout for the --for-submission distribution step.",
+)
 def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     name: str,
     github_slug: str,
@@ -481,7 +727,20 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     do_labels: bool,  # noqa: FBT001
     dry_run: bool,  # noqa: FBT001
     config_path: Path | None,
+    submission_id: str | None,
+    refresh_live: bool,  # noqa: FBT001
+    skip_freshness: bool,  # noqa: FBT001
+    ssh_timeout: float,
 ) -> None:
+    # #2861: an unknown submission id / an already-mapped project must refuse
+    # BEFORE the repos[] entry is written, not after.
+    if submission_id and not dry_run:
+        _plan_for_submission(
+            target=_resolve_write_target(config_path),
+            submission_id=submission_id,
+            repo_name=name,
+            machines=[m.strip() for m in (machines_csv or "").split(",") if m.strip()],
+        )
     result = _do_repo_add_core(
         name=name,
         github_slug=github_slug,
@@ -493,7 +752,46 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         do_labels=do_labels,
         dry_run=dry_run,
         config_path=config_path,
+        check_freshness=not skip_freshness,
     )
+    if submission_id and dry_run:
+        _print_for_submission_plan(
+            name=name, submission_id=submission_id, machines=result["machines"],
+            target=result["target"], refresh_live=refresh_live,
+        )
+        return
+    if submission_id:
+        from coord.config import load as load_config  # noqa: PLC0415
+
+        _run_for_submission(
+            name=name, submission_id=submission_id, target=result["target"],
+            machines=result["machines"], cfg=load_config(result["target"]),
+            refresh_live=refresh_live, ssh_timeout=ssh_timeout, run_doctor=True,
+        )
+        # `repo add` onboards an EXISTING repo, so unlike `repo create` it
+        # seeded nothing — the residue items --for-submission does not cover
+        # are still outstanding and must not be silently dropped.
+        click.echo("")
+        click.echo(
+            "NOT DONE — --for-submission covered the config, the push, the "
+            "distribution and the doctor. Still outstanding, and unchanged "
+            "from `coord repo add`'s usual residue:"
+        )
+        click.echo(
+            f"  · clone the repo to {repo_path_tmpl or f'~/src/{name}'} on "
+            f"{', '.join(result['machines']) or '<each machine>'} "
+            "— the worker WORKTREE BASE"
+        )
+        click.echo(
+            "  · CLAUDE.md, a `pull_request`-triggered CI workflow, and the "
+            "`.githooks/` port in the repo itself — `coord repo create` seeds "
+            "these; `coord repo add` cannot, since the repo already existed"
+        )
+        click.echo(
+            "  · `test_command`/`ci_command`, `smoke_tests.capability_rules`, "
+            "and (if it joins the oracle loop) `acceptance.drivers`"
+        )
+        return
     _print_add_residue(
         target=result["target"], machines=result["machines"],
         repo_path_tmpl=repo_path_tmpl, name=name,
@@ -512,6 +810,7 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
     do_labels: bool,
     dry_run: bool,
     config_path: Path | None,
+    check_freshness: bool = True,
 ) -> dict:
     """Everything ``coord repo add`` does except printing the residue block —
     write the ``coordinator.yml`` entry, add the repo to its machines, and
@@ -541,6 +840,10 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
     from coord.repo_onboard import COORD_LABEL, TIER_LABELS  # noqa: PLC0415
 
     target = _resolve_write_target(config_path)
+    # #2861 step 1 — before ANY read of the file we are about to base an edit
+    # on, not just before the write: the whole failure mode is deriving the
+    # new content from a stale base.
+    _guard_settings_fresh(target, enabled=check_freshness)
     original = target.read_text(encoding="utf-8")
 
     try:
@@ -810,6 +1113,547 @@ def _print_add_residue(
     click.echo(f"Then: coord repo doctor {name}")
 
 
+# ── #2861: `--for-submission` — repo genesis for a portal submission ────────
+#
+# Steps 3-6 of the issue's sequence (1 is `_guard_settings_fresh`, 2 is the
+# create+seed above). Each step fails loudly and leaves the previous ones
+# intact, because every one of them is separately recoverable by hand and a
+# rollback would be strictly worse than an honest report of where it stopped.
+#
+# ── The step-5 decision the issue asked to be made deliberately ────────────
+#
+# "Distribute" has no blessed mechanism today because the daemon's live
+# `~/.coord/coordinator.yml` is a COPY on at least one fleet host, while
+# `docs/CUSTOMER_PORTAL.md` and `coord.fleet_config_health` both describe it
+# as a symlink into the coord-settings checkout.
+#
+# Decision: **this command owns the copy explicitly, and never converts
+# between the two arrangements.** Restoring the symlink everywhere is
+# tempting and was rejected: it silently widens the blast radius of every
+# future coord-settings commit (a bad push becomes live on the daemon the
+# instant someone runs `git pull`, with no separate step to notice it), and
+# `coord repo create` is the wrong command to make that fleet-wide policy
+# change from. So per machine:
+#
+#   * symlink into the checkout  → the `git pull` already refreshed it. Done.
+#   * regular file, byte-identical → nothing to do.
+#   * regular file, differs        → back it up to `<live>.bak-<stamp>` and
+#     copy the tracked file over it. The backup is the whole point: #2861's
+#     live run found a comment that existed ONLY in the daemon's copy, and a
+#     clobber with no backup would have destroyed it silently.
+#
+# `--no-refresh-live-config` reports the third case instead of acting, for an
+# operator who wants to reconcile the divergence by hand first.
+
+#: Distinct per-machine outcomes the distribution snippet reports back.
+#: Parsed from `STATE=<x>` on stdout rather than an exit code so one machine's
+#: unusual-but-fine state (no checkout at all — the norm on agent-only hosts,
+#: see #1779) never reads as a failure.
+_DISTRIBUTE_STATES: dict[str, tuple[str, str]] = {
+    "no-checkout": (
+        "·",
+        "no coord-settings checkout here — nothing to pull (expected on every "
+        "machine except the daemon host and the operator box, #1779)",
+    ),
+    "pull-failed": ("✗", "`git pull --ff-only` FAILED — this machine is still on the old config"),
+    "symlink": ("✓", "pulled; live config is a symlink into the checkout, so it followed"),
+    "live-missing": ("⚠", "pulled, but there is no live ~/.coord/coordinator.yml here"),
+    "live-current": ("✓", "pulled; live config is a copy and already matches the checkout"),
+    "live-refreshed": (
+        "✓",
+        "pulled; live config was a DIVERGING copy — backed up to <live>.bak-* and refreshed",
+    ),
+    "live-refresh-failed": ("✗", "pulled, but refreshing the live copy failed"),
+    "live-stale": (
+        "⚠",
+        "pulled, but the live config is a copy that DIFFERS and "
+        "--no-refresh-live-config was given — the daemon is still on the old file",
+    ),
+}
+
+
+@dataclass
+class _MachineDistribution:
+    """One machine's result from the distribution step."""
+
+    machine: str
+    state: str
+    head: str = ""
+    detail: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return self.state in {"pull-failed", "live-refresh-failed", "unreachable"}
+
+
+@dataclass
+class _SubmissionPlan:
+    """What ``--for-submission`` resolved before doing anything."""
+
+    submission_id: str
+    project_id: str
+    repo: str
+    already_mapped: bool = False
+    machines: list[str] = field(default_factory=list)
+
+
+def _resolve_submission_project(submission_id: str) -> str:
+    """The portal ``project_id`` *submission_id* belongs to.
+
+    Read from the read-only customer mirror
+    (``portal_submissions.customer_json``) — the same field
+    :func:`coord.approved_work.approved_submissions` resolves ``repos`` from,
+    so a mapping written here is guaranteed to be the one that panel reads
+    back. Both spellings the portal has used on the wire are accepted, for
+    the same reason ``coord.approved_work._TEXT_FIELD_ALIASES`` accepts both.
+    """
+    from coord import portal_store  # noqa: PLC0415
+
+    record = portal_store.get_submission(submission_id)
+    if record is None:
+        raise click.ClickException(
+            f"unknown submission {submission_id!r} — no row in "
+            "`portal_submissions`. Nothing was created or written. Check the "
+            "id, and note that submissions only exist on the machine that "
+            "runs `coord portal sync` (the daemon host)."
+        )
+
+    mirror = record.customer if isinstance(record.customer, dict) else {}
+    for key in ("project_id", "projectId"):
+        value = mirror.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    raise click.ClickException(
+        f"submission {submission_id!r} exists but its customer mirror carries "
+        "no project_id — the #2585 mirror-clobber shape. Nothing was created "
+        f"or written. Repair it first: coord portal remirror {submission_id} "
+        "(on the daemon host), then re-run."
+    )
+
+
+def _plan_for_submission(
+    *, target: Path, submission_id: str, repo_name: str, machines: list[str],
+) -> _SubmissionPlan:
+    """Resolve + validate the mapping BEFORE any side effect.
+
+    Refuses on a project already mapped to a different repo, naming the
+    conflict: remapping is a decision with consequences for every linked
+    milestone, and silently appending a second entry is impossible anyway
+    (``_parse_portal_project_repos`` rejects a duplicate ``project_id`` at
+    load, so the config would stop parsing fleet-wide).
+    """
+    from coord.config import load as load_config  # noqa: PLC0415
+
+    project_id = _resolve_submission_project(submission_id)
+    cfg = load_config(target)
+    existing = cfg.portal.repos_for_project(project_id)
+
+    if existing and list(existing) != [repo_name]:
+        raise click.ClickException(
+            f"project {project_id} (submission {submission_id}) is already "
+            f"mapped to {existing} in {target}, not [{repo_name!r}]. Refusing "
+            "to remap: every `coord portal link` recorded against this "
+            "submission resolves through that mapping. Nothing was created or "
+            "written. Edit portal.project_repos by hand if the remap is "
+            "genuinely what you want."
+        )
+
+    return _SubmissionPlan(
+        submission_id=submission_id,
+        project_id=project_id,
+        repo=repo_name,
+        already_mapped=bool(existing),
+        machines=list(machines),
+    )
+
+
+def _write_project_mapping(*, target: Path, plan: _SubmissionPlan) -> bool:
+    """Append ``portal.project_repos``' entry for *plan* to *target*.
+
+    Returns whether anything was written (``False`` when the mapping was
+    already exactly right — this command is re-runnable). Same seatbelt shape
+    as every other write in this module: edit, re-parse into a TEMP file,
+    confirm the mapping actually RESOLVES through the same
+    :meth:`PortalConfig.repos_for_project` the board reads, only then write.
+    """
+    if plan.already_mapped:
+        return False
+
+    import tempfile  # noqa: PLC0415
+
+    from coord.config import load as load_config  # noqa: PLC0415
+    from coord.repo_edit import (  # noqa: PLC0415
+        RepoEditError,
+        insert_portal_project_repo_entry,
+        render_portal_project_repo_entry,
+    )
+
+    original = target.read_text(encoding="utf-8")
+    entry = render_portal_project_repo_entry(plan.project_id, [plan.repo])
+    try:
+        updated = insert_portal_project_repo_entry(original, entry)
+    except RepoEditError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".yml", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(updated)
+        probe_path = Path(fh.name)
+    try:
+        new_cfg = load_config(probe_path)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"refusing to write portal.project_repos: the edited config does "
+            f"not parse ({exc}). {target} is unchanged — but the repo/machine "
+            "onboarding above already succeeded. Add the mapping by hand, "
+            "then re-run with --for-submission to distribute it."
+        ) from exc
+    finally:
+        probe_path.unlink(missing_ok=True)
+
+    if new_cfg.portal.repos_for_project(plan.project_id) != [plan.repo]:
+        raise click.ClickException(
+            f"refusing to write portal.project_repos: the edit parsed but "
+            f"{plan.project_id} does not resolve to [{plan.repo!r}]. {target} "
+            "is unchanged — but the repo/machine onboarding above already "
+            "succeeded. Add the mapping by hand."
+        )
+
+    target.write_text(updated, encoding="utf-8")
+    return True
+
+
+def _commit_and_push_settings(checkout: Path, *, message: str) -> str:
+    """Commit every staged/unstaged config change in *checkout* and push it.
+
+    Returns the pushed short SHA. Raises loudly — an unpushed commit is the
+    exact state #2861 exists to stop an operator ending up in without knowing
+    it, so a push failure must never read as success.
+    """
+    add = _git(checkout, "add", "--", str(TRACKED_CONFIG_REL))
+    if add is None or add.returncode != 0:
+        raise click.ClickException(
+            f"could not `git add {TRACKED_CONFIG_REL}` in {checkout}: "
+            f"{(add.stderr if add else 'git could not be run').strip()}. The "
+            "config edits ARE on disk — commit and push them by hand."
+        )
+
+    staged = _git(checkout, "diff", "--cached", "--quiet")
+    if staged is not None and staged.returncode == 0:
+        click.echo("  · nothing to commit — the config already matches HEAD")
+    else:
+        commit = _git(checkout, "commit", "-m", message)
+        if commit is None or commit.returncode != 0:
+            raise click.ClickException(
+                f"could not commit in {checkout}: "
+                f"{(commit.stderr or commit.stdout if commit else 'git could not be run').strip()}. "
+                "The config edits ARE on disk and staged — commit and push by hand."
+            )
+
+    push = _git(checkout, "push", timeout=120.0)
+    if push is None or push.returncode != 0:
+        raise click.ClickException(
+            f"could not push {checkout}: "
+            f"{(push.stderr or push.stdout if push else 'git could not be run').strip()}. "
+            "The commit EXISTS locally but no other machine can see it — push "
+            "by hand, then re-run the distribution with `coord repo doctor "
+            "--fix` afterwards."
+        )
+
+    head = _git(checkout, "rev-parse", "--short", "HEAD")
+    return (head.stdout.strip() if head and head.returncode == 0 else "")
+
+
+def _home_relative(path: Path) -> str:
+    """*path* as a ``$HOME``-relative shell word when it is under ``$HOME``.
+
+    The remote machine's ``$HOME`` is not this machine's, so a locally
+    expanded absolute path is wrong the moment two hosts have different
+    usernames.
+    """
+    try:
+        return f'"$HOME"/{path.relative_to(Path.home())}'
+    except ValueError:
+        return shlex.quote(str(path))
+
+
+def _distribute_script(*, refresh_live: bool) -> str:
+    """The POSIX-sh snippet run on each machine: pull, then reconcile the live
+    config per the step-5 decision documented above this section."""
+    return f"""set -u
+d={_home_relative(default_settings_dir())}
+live={_home_relative(default_live_config_path())}
+rel={shlex.quote(str(TRACKED_CONFIG_REL))}
+if [ ! -d "$d/.git" ]; then echo "STATE=no-checkout"; exit 0; fi
+if ! git -C "$d" pull --ff-only >/dev/null 2>&1; then echo "STATE=pull-failed"; exit 0; fi
+echo "HEAD=$(git -C "$d" rev-parse --short HEAD)"
+if [ -L "$live" ]; then echo "STATE=symlink"; exit 0; fi
+if [ ! -e "$live" ]; then echo "STATE=live-missing"; exit 0; fi
+if cmp -s "$live" "$d/$rel"; then echo "STATE=live-current"; exit 0; fi
+if [ {"1" if refresh_live else "0"} = 1 ]; then
+  if cp -p "$live" "$live.bak-$(date +%Y%m%dT%H%M%S)" && cp "$d/$rel" "$live"; then
+    echo "STATE=live-refreshed"
+  else
+    echo "STATE=live-refresh-failed"
+  fi
+else
+  echo "STATE=live-stale"
+fi
+"""
+
+
+def _ssh_run(host: str, script: str, *, timeout: float = 180.0):
+    """Run *script* on *host* over SSH. Mirrors ``coord.commands.agent_ops``'
+    ``BatchMode``/``ConnectTimeout``/``accept-new`` options so this never
+    hangs on a password or a host-key prompt in a non-interactive session."""
+    return subprocess.run(  # noqa: S603 — fixed argv, host from coordinator.yml
+        [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+            host,
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _run_local_distribution(*, refresh_live: bool) -> _MachineDistribution:
+    """The same reconciliation as :func:`_distribute_script`, for THIS machine.
+
+    Run unconditionally: the operator box is where the commit was just made,
+    and — on a single-host fleet — is also the daemon host, so skipping it
+    would leave the live config on the old file with nothing saying so.
+    """
+    import filecmp  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    checkout = default_settings_dir()
+    live = default_live_config_path()
+    tracked = checkout / TRACKED_CONFIG_REL
+
+    if not (checkout / ".git").exists():
+        return _MachineDistribution("this machine", "no-checkout")
+
+    pull = _git(checkout, "pull", "--ff-only", timeout=120.0)
+    if pull is None or pull.returncode != 0:
+        return _MachineDistribution("this machine", "pull-failed")
+    head = _git(checkout, "rev-parse", "--short", "HEAD")
+    sha = head.stdout.strip() if head and head.returncode == 0 else ""
+
+    if live.is_symlink():
+        return _MachineDistribution("this machine", "symlink", head=sha)
+    if not live.exists():
+        return _MachineDistribution("this machine", "live-missing", head=sha)
+    try:
+        if filecmp.cmp(live, tracked, shallow=False):
+            return _MachineDistribution("this machine", "live-current", head=sha)
+    except OSError:
+        return _MachineDistribution("this machine", "live-refresh-failed", head=sha)
+    if not refresh_live:
+        return _MachineDistribution("this machine", "live-stale", head=sha)
+    try:
+        backup = live.with_name(f"{live.name}.bak-{time.strftime('%Y%m%dT%H%M%S')}")
+        shutil.copy2(live, backup)
+        shutil.copyfile(tracked, live)
+    except OSError as exc:
+        return _MachineDistribution(
+            "this machine", "live-refresh-failed", head=sha, detail=str(exc)
+        )
+    return _MachineDistribution(
+        "this machine", "live-refreshed", head=sha, detail=f"backup: {backup}"
+    )
+
+
+def _distribute_settings(
+    machines: list[str], *, cfg, refresh_live: bool, ssh_timeout: float,
+) -> list[_MachineDistribution]:
+    """`git pull` coord-settings on every machine in *machines*, plus here.
+
+    One machine's failure never aborts the sweep — the acceptance criterion
+    is explicitly "reports per-machine success/failure rather than failing
+    silently on one host", and a half-distributed fleet that says so is
+    recoverable while one that doesn't is #2861's original nine-motion mess.
+    """
+    results = [_run_local_distribution(refresh_live=refresh_live)]
+    script = _distribute_script(refresh_live=refresh_live)
+    by_name = {m.name: m for m in cfg.machines}
+
+    for name in machines:
+        machine = by_name.get(name)
+        if machine is None:  # pragma: no cover — pre-flight already refused
+            results.append(_MachineDistribution(name, "unreachable", detail="not in config"))
+            continue
+        try:
+            proc = _ssh_run(machine.host, script, timeout=ssh_timeout)
+        except Exception as exc:  # noqa: BLE001 — one host must not abort the sweep
+            results.append(_MachineDistribution(name, "unreachable", detail=str(exc)))
+            continue
+        state, sha = "", ""
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("STATE="):
+                state = line.split("=", 1)[1].strip()
+            elif line.startswith("HEAD="):
+                sha = line.split("=", 1)[1].strip()
+        if not state:
+            results.append(
+                _MachineDistribution(
+                    name, "unreachable",
+                    detail=(proc.stderr or proc.stdout or "no STATE reported").strip()[:200],
+                )
+            )
+            continue
+        results.append(_MachineDistribution(name, state, head=sha))
+    return results
+
+
+def _print_distribution(results: list[_MachineDistribution]) -> None:
+    for result in results:
+        mark, detail = _DISTRIBUTE_STATES.get(
+            result.state, ("✗", f"unreachable or unexpected state {result.state!r}")
+        )
+        suffix = f" [{result.head}]" if result.head else ""
+        click.echo(f"  {mark} {result.machine}{suffix}: {detail}")
+        if result.detail:
+            click.echo(f"      {result.detail}")
+
+
+def _run_repo_doctor_fix(name: str) -> None:
+    """Step 6: ``coord repo doctor --fix``, in-process.
+
+    ``repo_doctor`` ``sys.exit(1)`` on any CRIT, which is right for a gate and
+    wrong as the last step of a longer command — a CRIT here means "the
+    genesis got this far and this is what is left", not "the command failed".
+    So the exit is caught and reported as findings.
+    """
+    from coord.config import resolve_config_path  # noqa: PLC0415
+
+    ctx = click.get_current_context(silent=True)
+    invoke = ctx.invoke if ctx is not None else (lambda fn, **kw: fn.callback(**kw))
+    try:
+        invoke(
+            repo_doctor,
+            name=name,
+            config_path=resolve_config_path(),
+            timeout=3.0,
+            probe_github=True,
+            verbose=False,
+            do_fix=True,
+            fix_timeout=900.0,
+        )
+    except SystemExit as exc:
+        if exc.code:
+            click.echo(
+                f"⚠ `coord repo doctor {name} --fix` reported CRIT findings "
+                "(above). Genesis got this far; those are what is left."
+            )
+    except Exception as exc:  # noqa: BLE001 — the doctor must not sink the genesis
+        click.echo(f"⚠ `coord repo doctor {name} --fix` could not run — {exc}")
+
+
+def _print_for_submission_plan(
+    *, name: str, submission_id: str, machines: list[str], target: Path,
+    refresh_live: bool,
+) -> None:
+    """``--dry-run``'s six-step plan. Deliberately printed WITHOUT resolving
+    the submission against the local DB: a dry run on a machine that has no
+    portal DB (every machine but the daemon host) must still show the plan.
+    """
+    checkout = _git_toplevel(target) or default_settings_dir()
+    hosts = ", ".join(machines) if machines else "<no --machines given>"
+    click.echo("")
+    click.echo(f"--dry-run: --for-submission {submission_id} would, in order:")
+    click.echo(
+        f"  1. refuse if {checkout} is behind its upstream (git fetch + compare)"
+    )
+    click.echo(f"  2. create + seed the repo, and write repos[{name}] to {target}")
+    click.echo(
+        f"  3. resolve {submission_id}'s project_id from its customer mirror and "
+        f"append portal.project_repos: {{project_id: <resolved>, repos: [{name}]}} "
+        "(refusing if that project is already mapped elsewhere)"
+    )
+    click.echo(f"  4. commit + push {checkout}")
+    click.echo(
+        f"  5. distribute: `git pull --ff-only` coord-settings on {hosts} and here, "
+        + (
+            "then refresh any live ~/.coord/coordinator.yml that is a diverging "
+            "copy (backing it up first)"
+            if refresh_live
+            else "reporting — but NOT refreshing — any diverging live copy"
+        )
+    )
+    click.echo(f"  6. run `coord repo doctor {name} --fix` and print its report")
+    click.echo("")
+    click.echo("Nothing was created, written, pushed or pulled.")
+
+
+def _run_for_submission(
+    *, name: str, submission_id: str, target: Path, machines: list[str], cfg,
+    refresh_live: bool, ssh_timeout: float, run_doctor: bool,
+) -> None:
+    """Steps 3-6 for a completed repo create/add (#2861)."""
+    plan = _plan_for_submission(
+        target=target, submission_id=submission_id, repo_name=name, machines=machines,
+    )
+
+    click.echo("")
+    click.echo(
+        f"--for-submission {plan.submission_id}: project {plan.project_id}"
+    )
+    if _write_project_mapping(target=target, plan=plan):
+        click.echo(f"✓ mapped {plan.project_id} → [{name}] in portal.project_repos")
+    else:
+        click.echo(f"· {plan.project_id} was already mapped to [{name}] — left alone")
+
+    checkout = _git_toplevel(target)
+    if checkout is None:
+        click.echo(
+            f"⚠ {target} is not inside a git checkout — skipping the commit, "
+            "push and distribution. The config edits are on disk here only.",
+            err=True,
+        )
+        return
+
+    click.echo(f"committing + pushing {checkout}...")
+    sha = _commit_and_push_settings(
+        checkout,
+        message=(
+            f"coord repo create: onboard {name} and map {plan.project_id} "
+            f"({plan.submission_id})"
+        ),
+    )
+    click.echo(f"✓ pushed{f' {sha}' if sha else ''}")
+
+    click.echo("distributing coord-settings to the machines serving this repo...")
+    results = _distribute_settings(
+        machines, cfg=cfg, refresh_live=refresh_live, ssh_timeout=ssh_timeout,
+    )
+    _print_distribution(results)
+    failed = [r.machine for r in results if r.failed]
+    if failed:
+        click.echo(
+            f"⚠ distribution incomplete on: {', '.join(failed)}. Those machines "
+            "are still serving the OLD config — `coord repo doctor` will report "
+            "`agent_repo_skew` for them until a `git pull` lands there.",
+            err=True,
+        )
+    click.echo(
+        "  · thin clients re-fetch `GET /config` from the daemon on essentially "
+        "every command (coord.client.REMOTE_CONFIG_CACHE), so nothing to force "
+        "there — the daemon's own file, refreshed above, is what they read."
+    )
+
+    if run_doctor:
+        click.echo("")
+        _run_repo_doctor_fix(name)
+
+
 @repo_group.command(
     "create",
     help=(
@@ -818,7 +1662,10 @@ def _print_add_residue(
         "`coord repo add`. IL-1 (#2747): shrinks `repo add`'s 8-item human "
         "residue down to 4 — the clone on each machine, the coord-settings "
         "commit+push, the per-machine coord-settings `git pull`, and `coord "
-        "repo doctor --fix`. Never shells out to "
+        "repo doctor --fix`. Add --for-submission (#2861) to close three of "
+        "those four: it maps the submission's project, commits + pushes "
+        "coord-settings, distributes it to every machine serving the repo "
+        "and runs the doctor, leaving only the clone. Never shells out to "
         "`gh` directly outside coord.github_ops, so a future GitLab backend "
         "is a driver swap, not a rewrite — and workers, for whom `gh` is "
         "deny-listed, can use this too."
@@ -864,6 +1711,30 @@ def _print_add_residue(
     "--config", "config_path", type=click.Path(path_type=Path), default=None,
     help="coordinator.yml to edit. Default: the coord-settings tracked file.",
 )
+@click.option("--for-submission", "submission_id", default=None, help=_FOR_SUBMISSION_HELP)
+@click.option(
+    "--refresh-live-config/--no-refresh-live-config", "refresh_live",
+    default=True, show_default=True,
+    help=(
+        "During --for-submission's distribution step, overwrite a machine's "
+        "live ~/.coord/coordinator.yml when it is a REGULAR FILE that diverges "
+        "from the checkout (a backup is written first). Off reports the "
+        "divergence and leaves it. Symlinked live configs are never touched "
+        "either way — the pull already refreshed them."
+    ),
+)
+@click.option(
+    "--skip-freshness-check", "skip_freshness", is_flag=True, default=False,
+    help=(
+        "Do NOT compare the config checkout to its upstream before writing. "
+        "Rarely right: an entry written onto a stale base looks clean in the "
+        "diff (#2861)."
+    ),
+)
+@click.option(
+    "--ssh-timeout", default=180.0, show_default=True, type=float,
+    help="Per-machine timeout for the --for-submission distribution step.",
+)
 def repo_create(  # noqa: PLR0913 — one option per thing the command can set
     name: str,
     github_slug: str,
@@ -877,6 +1748,10 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
     do_labels: bool,  # noqa: FBT001
     dry_run: bool,  # noqa: FBT001
     config_path: Path | None,
+    submission_id: str | None,
+    refresh_live: bool,  # noqa: FBT001
+    skip_freshness: bool,  # noqa: FBT001
+    ssh_timeout: float,
 ) -> None:
     from coord import github_ops  # noqa: PLC0415
     from coord.config import load as load_config  # noqa: PLC0415
@@ -888,6 +1763,9 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
     # (called below, after creation) re-checks all of this from scratch —
     # this pre-flight is belt-and-suspenders, not the seatbelt itself.
     target = _resolve_write_target(config_path)
+    # #2861 step 1, FIRST: a stale base must refuse before anything is created
+    # on GitHub, not just before the config write.
+    _guard_settings_fresh(target, enabled=not skip_freshness)
     try:
         cfg = load_config(target)
     except Exception as exc:  # noqa: BLE001
@@ -905,6 +1783,15 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
     if unknown:
         raise click.ClickException(
             f"unknown machine(s) {unknown} — coordinator.yml has {sorted(known)}"
+        )
+
+    # #2861 step 3, hoisted into the pre-flight: an unknown submission id or a
+    # project already mapped elsewhere must refuse BEFORE the GitHub repo
+    # exists. `_run_for_submission` re-resolves from scratch afterwards.
+    if submission_id and not dry_run:
+        _plan_for_submission(
+            target=target, submission_id=submission_id, repo_name=name,
+            machines=machines,
         )
 
     try:
@@ -928,6 +1815,11 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
             f"the {ci_template!r} CI workflow + .githooks/, then run the "
             f"equivalent of `coord repo add {name} --github {github_slug}`"
         )
+        if submission_id:
+            _print_for_submission_plan(
+                name=name, submission_id=submission_id, machines=machines,
+                target=target, refresh_live=refresh_live,
+            )
         return
 
     # ── Create + seed, through the forge seam only ────────────────────────
@@ -986,6 +1878,10 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
         do_labels=do_labels,
         dry_run=False,
         config_path=config_path,
+        # Already checked in this command's own pre-flight, before any GitHub
+        # side effect — re-fetching here would be a second network round trip
+        # answering a question nothing could have changed since.
+        check_freshness=False,
     )
     # #2748 (IL-2): a stack-appropriate acceptance.drivers entry, so the repo
     # is oracle-loop-ready on day one instead of residue item 6 nobody
@@ -999,6 +1895,25 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
             f"✓ wrote acceptance.drivers.{name} "
             f"({_ACCEPTANCE_DRIVER_TEMPLATES[ci_template]['kind']})"
         )
+
+    if submission_id:
+        # #2861: the four residue items `repo create` prints are exactly what
+        # `--for-submission` performs, so printing them here would be a list
+        # of things this command is about to do.
+        _run_for_submission(
+            name=name, submission_id=submission_id, target=result["target"],
+            machines=result["machines"], cfg=cfg, refresh_live=refresh_live,
+            ssh_timeout=ssh_timeout, run_doctor=True,
+        )
+        click.echo("")
+        click.echo(
+            "NOT DONE — 1 thing still needs a human: clone the repo to "
+            f"{repo_path_tmpl or f'~/src/{name}'} on "
+            f"{', '.join(result['machines']) or '<each machine>'} "
+            "— this is the worker WORKTREE BASE, and `coord repo doctor` "
+            "reports it until it exists."
+        )
+        return
 
     _print_create_residue(
         target=result["target"], machines=result["machines"],

@@ -13,18 +13,29 @@ partway through is reported honestly rather than silently, and that the
 residue it prints is genuinely the shrunk 4-item list — not the full 8, and
 not so shrunk that it drops the per-machine coord-settings `git pull` that
 clears `coord repo doctor`'s `agent_repo_skew` CRIT.
+
+#2861 adds a second story to this file: ``--for-submission``, which collapses
+portal repo genesis (create + seed + map the submission's project + commit +
+push + distribute to every machine + ``coord repo doctor --fix``) into one
+command, and the **stale-checkout guard** that refuses to write a
+``coordinator.yml`` entry onto a coord-settings checkout that is behind its
+upstream. Those tests drive the real thing end to end against a real (local,
+throwaway) git origin+clone pair — the guard, the commit and the push are
+git behaviour, and stubbing git would test nothing.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from coord import github_ops
-from coord.commands.repo import repo_create
+from coord.commands import repo as repo_cmd
+from coord.commands.repo import repo_add, repo_create
 
 
 CONFIG = """\
@@ -538,3 +549,558 @@ class TestGithubOpsRepoCreationSeam:
                 github_ops.create_commit_with_files(
                     "acme/grocery", "main", [("CLAUDE.md", "#\n", False)], "msg",
                 )
+
+
+# ── #2861: the stale-checkout guard + `--for-submission` ─────────────────────
+
+_GIT_ENV = [
+    "-c", "user.email=test@example.com",
+    "-c", "user.name=coord test",
+    "-c", "commit.gpgsign=false",
+    "-c", "init.defaultBranch=main",
+]
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", *_GIT_ENV, "-C", str(cwd), *args],
+        capture_output=True, text=True, check=True,
+    )
+
+
+@pytest.fixture
+def settings_checkout(tmp_path, monkeypatch):
+    """A real coord-settings checkout with a real upstream.
+
+    The guard, the commit and the push under test are *git* behaviour — a
+    stubbed git would assert only that this file's stubs agree with
+    themselves. A bare repo on local disk is a real remote as far as every
+    command here is concerned.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", *_GIT_ENV, "init", "--bare", str(origin)],
+        capture_output=True, text=True, check=True,
+    )
+    clone = tmp_path / "coord-settings"
+    subprocess.run(
+        ["git", *_GIT_ENV, "clone", str(origin), str(clone)],
+        capture_output=True, text=True, check=True,
+    )
+    tracked = clone / "coord" / "coordinator.yml"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text(CONFIG)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "initial config")
+    _git(clone, "push", "-u", "origin", "HEAD:refs/heads/main")
+    _git(clone, "branch", "--set-upstream-to=origin/main")
+
+    monkeypatch.setenv("COORD_SETTINGS_DIR", str(clone))
+    # The live config must NEVER be the operator's real ~/.coord one in a
+    # test — the distribution step writes to it.
+    live = tmp_path / "live-coordinator.yml"
+    live.write_text(CONFIG)
+    monkeypatch.setenv("COORD_CONFIG", str(live))
+    return {"origin": origin, "clone": clone, "tracked": tracked, "live": live}
+
+
+def _push_an_upstream_commit(settings):
+    """Move origin ahead so the checkout under test is behind it."""
+    other = settings["origin"].parent / "other-clone"
+    subprocess.run(
+        ["git", *_GIT_ENV, "clone", str(settings["origin"]), str(other)],
+        capture_output=True, text=True, check=True,
+    )
+    (other / "NOTES.md").write_text("someone else pushed a config change\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-m", "someone else's config change")
+    _git(other, "push")
+
+
+def _seed_submission(submission_id="SUB-1EA1D3", project_id="proj_67deaa6d1291"):
+    from coord import portal_store
+
+    portal_store.mirror_customer_facts(
+        submission_id,
+        {"project_id": project_id, "outcome": "a grocery list app"},
+    )
+
+
+@pytest.fixture
+def stub_distribution(monkeypatch):
+    """Record the per-machine distribution instead of SSHing anywhere, and
+    keep `coord repo doctor --fix` (which fans out over HTTP) out of a unit
+    test. Both seams are exercised for their *reporting*, which is what the
+    acceptance criteria name."""
+    calls = {"ssh": [], "doctor": []}
+    states = {}
+
+    class _Proc:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def _fake_ssh(host, script, *, timeout=180.0):
+        calls["ssh"].append({"host": host, "script": script, "timeout": timeout})
+        return _Proc(states.get(host, "HEAD=abc1234\nSTATE=symlink\n"))
+
+    monkeypatch.setattr(repo_cmd, "_ssh_run", _fake_ssh)
+    monkeypatch.setattr(
+        repo_cmd, "_run_repo_doctor_fix", lambda name: calls["doctor"].append(name)
+    )
+    calls["states"] = states
+    return calls
+
+
+class TestStaleCheckoutGuard:
+    """#2861 step 1 — the highest-value line in the issue. `coord repo add`
+    and `coord repo create` used to write into whatever the coord-settings
+    checkout happened to be, with no freshness check, and the resulting diff
+    looked perfectly clean."""
+
+    def test_repo_create_refuses_when_the_checkout_is_behind(
+        self, settings_checkout, monkeypatch
+    ):
+        calls = _stub_create(monkeypatch)
+        _push_an_upstream_commit(settings_checkout)
+        before = settings_checkout["tracked"].read_text()
+
+        result = CliRunner().invoke(
+            repo_create, ["grocery", "--github", "acme/grocery"],
+        )
+        assert result.exit_code != 0
+        assert "1 commit(s) behind" in result.output
+        assert "pull --ff-only" in result.output
+        # Nothing written, and — critically — nothing created on GitHub: the
+        # guard runs before the forge seam is touched at all.
+        assert settings_checkout["tracked"].read_text() == before
+        assert calls["repo_exists"] == []
+        assert calls["create_repo"] == []
+
+    def test_repo_add_refuses_when_the_checkout_is_behind(
+        self, settings_checkout, monkeypatch
+    ):
+        _stub_create(monkeypatch)
+        _push_an_upstream_commit(settings_checkout)
+        before = settings_checkout["tracked"].read_text()
+
+        result = CliRunner().invoke(
+            repo_add, ["grocery", "--github", "acme/grocery", "--no-labels"],
+        )
+        assert result.exit_code != 0
+        assert "behind" in result.output
+        assert settings_checkout["tracked"].read_text() == before
+
+    def test_skip_freshness_check_overrides_the_guard(
+        self, settings_checkout, monkeypatch
+    ):
+        _stub_create(monkeypatch)
+        _push_an_upstream_commit(settings_checkout)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--no-labels",
+                "--skip-freshness-check",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "--skip-freshness-check" in result.output
+        from coord.config import load
+
+        assert load(settings_checkout["tracked"]).repo("grocery") is not None
+
+    def test_a_current_checkout_writes_normally(self, settings_checkout, monkeypatch):
+        _stub_create(monkeypatch)
+        result = CliRunner().invoke(
+            repo_add, ["grocery", "--github", "acme/grocery", "--no-labels"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "behind" not in result.output
+        from coord.config import load
+
+        assert load(settings_checkout["tracked"]).repo("grocery") is not None
+
+
+class TestForSubmissionDryRun:
+    def test_dry_run_prints_every_step_and_writes_nothing(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        calls = _stub_create(monkeypatch)
+        _seed_submission()
+        before = settings_checkout["tracked"].read_text()
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery", "--private",
+                "--machines", "laptop,dellserver",
+                "--for-submission", "SUB-1EA1D3", "--dry-run",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        out = result.output
+        for step in ("  1. ", "  2. ", "  3. ", "  4. ", "  5. ", "  6. "):
+            assert step in out
+        assert "behind its upstream" in out
+        assert "portal.project_repos" in out
+        assert "commit + push" in out
+        assert "git pull --ff-only" in out
+        assert "laptop, dellserver" in out
+        assert "coord repo doctor grocery --fix" in out
+
+        assert settings_checkout["tracked"].read_text() == before
+        assert calls["create_repo"] == []
+        assert calls["seed"] == []
+        assert stub_distribution["ssh"] == []
+        assert stub_distribution["doctor"] == []
+
+
+class TestForSubmission:
+    def test_maps_commits_pushes_and_distributes(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        _stub_create(monkeypatch)
+        _seed_submission()
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery",
+                "--machines", "laptop,dellserver",
+                "--for-submission", "SUB-1EA1D3",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        from coord.config import load
+
+        cfg = load(settings_checkout["tracked"])
+        assert cfg.repo("grocery") is not None
+        assert cfg.portal.repos_for_project("proj_67deaa6d1291") == ["grocery"]
+
+        # Committed AND pushed — an unpushed commit is exactly the state
+        # #2861 exists to stop an operator ending up in unknowingly.
+        head = _git(settings_checkout["clone"], "rev-parse", "HEAD").stdout.strip()
+        origin_head = _git(
+            settings_checkout["clone"], "rev-parse", "origin/main"
+        ).stdout.strip()
+        assert head == origin_head
+        log = _git(settings_checkout["clone"], "log", "-1", "--pretty=%s").stdout
+        assert "grocery" in log and "SUB-1EA1D3" in log
+        assert _git(
+            settings_checkout["clone"], "status", "--porcelain"
+        ).stdout.strip() == ""
+
+        # Distributed to every machine serving the repo, each reported.
+        assert sorted(c["host"] for c in stub_distribution["ssh"]) == [
+            "dellserver.tailnet", "laptop.tailnet",
+        ]
+        assert "laptop" in result.output
+        assert "dellserver" in result.output
+        assert stub_distribution["doctor"] == ["grocery"]
+
+        # And the whole point: the submission now resolves to the new repo.
+        from coord.approved_work import approved_submissions
+
+        rows = {r["submission_id"]: r for r in approved_submissions(cfg)}
+        assert rows["SUB-1EA1D3"]["repos"] == ["grocery"]
+
+    def test_refuses_an_unknown_submission_before_touching_github(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        calls = _stub_create(monkeypatch)
+        before = settings_checkout["tracked"].read_text()
+
+        result = CliRunner().invoke(
+            repo_create,
+            ["grocery", "--github", "acme/grocery", "--for-submission", "SUB-NOPE"],
+        )
+        assert result.exit_code != 0
+        assert "unknown submission 'SUB-NOPE'" in result.output
+        assert calls["create_repo"] == []
+        assert settings_checkout["tracked"].read_text() == before
+
+    def test_refuses_a_submission_whose_mirror_has_no_project_id(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        """The #2585 mirror-clobber shape: the row exists but carries no
+        project_id, so there is nothing to map. Naming the repair command
+        matters — the failure is otherwise indistinguishable from a typo."""
+        calls = _stub_create(monkeypatch)
+        from coord import portal_store
+
+        portal_store.mirror_customer_facts("SUB-BLANK", {"outcome": "something"})
+
+        result = CliRunner().invoke(
+            repo_create,
+            ["grocery", "--github", "acme/grocery", "--for-submission", "SUB-BLANK"],
+        )
+        assert result.exit_code != 0
+        assert "no project_id" in result.output
+        assert "coord portal remirror SUB-BLANK" in result.output
+        assert calls["create_repo"] == []
+
+    def test_refuses_a_project_already_mapped_to_another_repo(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        calls = _stub_create(monkeypatch)
+        _seed_submission()
+        settings_checkout["tracked"].write_text(
+            CONFIG
+            + "\nportal:\n  project_repos:\n"
+            '    - project_id: "proj_67deaa6d1291"\n'
+            "      repos: [api]\n"
+        )
+        _git(settings_checkout["clone"], "commit", "-am", "map the project to api")
+        _git(settings_checkout["clone"], "push")
+        before = settings_checkout["tracked"].read_text()
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery",
+                "--for-submission", "SUB-1EA1D3",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "already mapped to ['api']" in result.output
+        assert "proj_67deaa6d1291" in result.output
+        assert calls["create_repo"] == []
+        assert settings_checkout["tracked"].read_text() == before
+
+    def test_distribution_reports_per_machine_failure_without_aborting(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        """One unreachable host must not sink the sweep — a half-distributed
+        fleet that says so is recoverable; one that doesn't is #2861's
+        original nine-motion mess."""
+        _stub_create(monkeypatch)
+        _seed_submission()
+        stub_distribution["states"]["laptop.tailnet"] = "STATE=pull-failed\n"
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery",
+                "--machines", "laptop,dellserver",
+                "--for-submission", "SUB-1EA1D3",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "✗ laptop" in result.output
+        assert "FAILED" in result.output
+        assert "✓ dellserver" in result.output
+        assert "distribution incomplete on: laptop" in result.output
+        # The other machine was still reached, and the doctor still ran.
+        assert len(stub_distribution["ssh"]) == 2
+        assert stub_distribution["doctor"] == ["grocery"]
+
+    def test_a_diverging_live_config_copy_is_backed_up_before_refresh(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        """The step-5 decision: this command owns the copy explicitly. The
+        live file on #2861's own fleet held a comment that existed nowhere
+        else — clobbering it with no backup would have destroyed it."""
+        _stub_create(monkeypatch)
+        _seed_submission()
+        live = settings_checkout["live"]
+        live.write_text(CONFIG + "\n# a live-only comment nobody committed\n")
+
+        result = CliRunner().invoke(
+            repo_create,
+            ["grocery", "--github", "acme/grocery", "--for-submission", "SUB-1EA1D3"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "live-only comment" not in live.read_text()
+        assert "grocery" in live.read_text()
+        backups = list(live.parent.glob(f"{live.name}.bak-*"))
+        assert len(backups) == 1
+        assert "a live-only comment nobody committed" in backups[0].read_text()
+        assert "backed up" in result.output
+
+    def test_no_refresh_live_config_reports_the_divergence_instead(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        _stub_create(monkeypatch)
+        _seed_submission()
+        live = settings_checkout["live"]
+        live.write_text(CONFIG + "\n# a live-only comment nobody committed\n")
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery",
+                "--for-submission", "SUB-1EA1D3", "--no-refresh-live-config",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "a live-only comment nobody committed" in live.read_text()
+        assert "grocery" not in live.read_text()
+        assert "DIFFERS" in result.output
+
+    def test_rerunning_the_mapping_is_idempotent(
+        self, settings_checkout, monkeypatch, stub_distribution
+    ):
+        """`repo add --for-submission` on an already-mapped project (the repo
+        entry landing separately, say) must not append a duplicate
+        project_id — `_parse_portal_project_repos` rejects duplicates at
+        LOAD, so that would take the whole fleet's config down."""
+        _stub_create(monkeypatch)
+        _seed_submission()
+
+        first = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--no-labels",
+                "--for-submission", "SUB-1EA1D3",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0, first.output
+
+        second = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery-two", "--github", "acme/grocery-two", "--no-labels",
+                "--for-submission", "SUB-1EA1D3",
+            ],
+        )
+        # A second repo for the same project is a REMAP, and is refused.
+        assert second.exit_code != 0
+        assert "already mapped to ['grocery']" in second.output
+
+        from coord.config import load
+
+        cfg = load(settings_checkout["tracked"])
+        assert [e.project_id for e in cfg.portal.project_repos] == ["proj_67deaa6d1291"]
+
+
+class TestPortalProjectRepoYamlEdit:
+    """`insert_portal_project_repo_entry` — the YAML surgery, in isolation.
+    Every shape the fleet's own config has actually been in."""
+
+    def _mapping(self, text):
+        from coord.config import load
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as fh:
+            fh.write(text)
+            path = Path(fh.name)
+        try:
+            return load(path).portal
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_creates_the_portal_block_when_there_is_none(self):
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        updated = insert_portal_project_repo_entry(
+            CONFIG, render_portal_project_repo_entry("proj_x", ["api"])
+        )
+        portal = self._mapping(updated)
+        assert portal.repos_for_project("proj_x") == ["api"]
+        # A created block must not switch the portal client ON.
+        assert portal.enabled is False
+
+    def test_appends_to_an_existing_project_repos_list(self):
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        base = (
+            CONFIG
+            + '\nportal:\n  enabled: false\n  project_repos:\n'
+            '    - project_id: "proj_a"\n      repos: [api]\n'
+        )
+        updated = insert_portal_project_repo_entry(
+            base, render_portal_project_repo_entry("proj_b", ["api"])
+        )
+        portal = self._mapping(updated)
+        assert portal.repos_for_project("proj_a") == ["api"]
+        assert portal.repos_for_project("proj_b") == ["api"]
+
+    def test_rewrites_an_inline_empty_list(self):
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        base = CONFIG + "\nportal:\n  enabled: false\n  project_repos: []\n"
+        updated = insert_portal_project_repo_entry(
+            base, render_portal_project_repo_entry("proj_a", ["api"])
+        )
+        assert updated.count("project_repos:") == 1
+        assert self._mapping(updated).repos_for_project("proj_a") == ["api"]
+
+    def test_adds_project_repos_to_a_portal_block_that_lacks_it(self):
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        base = CONFIG + '\nportal:\n  enabled: false\n  timeout_secs: 5.0\n'
+        updated = insert_portal_project_repo_entry(
+            base, render_portal_project_repo_entry("proj_a", ["api"])
+        )
+        portal = self._mapping(updated)
+        assert portal.repos_for_project("proj_a") == ["api"]
+        assert portal.timeout_secs == 5.0
+
+    def test_quotes_a_project_id_yaml_would_otherwise_coerce(self):
+        """An all-digit or `yes`-shaped opaque id must survive as a string —
+        unquoted, YAML 1.1 hands `_parse_portal_project_repos` a bool/int and
+        the whole fleet config stops loading."""
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        updated = insert_portal_project_repo_entry(
+            CONFIG, render_portal_project_repo_entry("12345", ["api"])
+        )
+        assert self._mapping(updated).repos_for_project("12345") == ["api"]
+
+
+class TestFreshnessGuardScope:
+    def test_a_dev_coordinator_yml_in_an_unrelated_checkout_is_not_guarded(
+        self, settings_checkout, tmp_path, monkeypatch
+    ):
+        """`--config ./coordinator.yml` inside some other source checkout must
+        not refuse because THAT repo is behind its own origin — the guard is
+        about the fleet's config, not whatever repo you happen to be in."""
+        _stub_create(monkeypatch)
+        # A behind-its-upstream checkout whose config is at the repo ROOT,
+        # not at the coord-settings `coord/coordinator.yml` path.
+        _push_an_upstream_commit(settings_checkout)
+        dev_config = settings_checkout["clone"] / "coordinator.yml"
+        dev_config.write_text(CONFIG)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--no-labels",
+                "--config", str(dev_config),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "behind" not in result.output
+        from coord.config import load
+
+        assert load(dev_config).repo("grocery") is not None
