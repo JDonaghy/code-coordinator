@@ -1226,8 +1226,9 @@ def reject_draft(
     with conn:
         sql.execute(
             conn,
-            "UPDATE portal_outbox SET state = ?, reason = ?, sent_at = ? WHERE id = ?",
-            (STATE_REJECTED, text[:500], stamp, row.id),
+            "UPDATE portal_outbox SET state = ?, reason = ?, sent_at = ? "
+            "WHERE id = ? AND state = ?",
+            (STATE_REJECTED, text[:500], stamp, row.id, STATE_DRAFT),
         )
         for dep in dependents:
             sql.execute(
