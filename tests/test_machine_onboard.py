@@ -387,7 +387,7 @@ def test_disabled_linger_crits_and_names_the_delayed_symptom():
 
 def test_probe_coord_on_worker_path_parses_a_found_binary():
     with patch("subprocess.run", return_value=_ssh_result(
-        "COORD_ON_WORKER_PATH=/usr/local/bin/coord VERSION=coord, version 0.9.0 \n"
+        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
     )):
         found, error, version = machine_onboard.probe_coord_on_worker_path("host")
     assert found is True
@@ -398,10 +398,44 @@ def test_probe_coord_on_worker_path_parses_a_found_binary():
 def test_probe_coord_on_worker_path_reports_absence_as_a_defect_not_unknown():
     """`found=False` is the whole point of #2937 — it must never collapse
     into the fail-soft UNKNOWN path the way an SSH outage does."""
-    with patch("subprocess.run", return_value=_ssh_result("COORD_ON_WORKER_PATH=absent\n")):
+    with patch("subprocess.run", return_value=_ssh_result("COORD_ON_WORKER_PATH_OK=0\n")):
         found, error, version = machine_onboard.probe_coord_on_worker_path("host")
     assert found is False
     assert error is None
+    assert version is None
+
+
+def test_probe_coord_on_worker_path_delegates_to_the_canonical_agent_function():
+    """#2937 review: this must not be a second, hand-rolled reimplementation
+    of the #402/#2569 PATH strip — it has to invoke the exact same
+    `coord.agent.worker_coord_reachable()` a real worker spawn's environment
+    is built from, on the worker host's own pinned interpreter, so the two
+    checks can never silently disagree (e.g. on a trailing slash, or a PATH
+    entry that's already a resolved `.blue`/`.green` path)."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
+    )) as run:
+        machine_onboard.probe_coord_on_worker_path("host")
+    args, kwargs = run.call_args
+    argv = args[0]
+    assert argv[0] == "ssh"
+    assert argv[-1] == "$HOME/.coord-venv/bin/python3 -"
+    script = kwargs["input"]
+    assert "from coord.agent import worker_coord_reachable" in script
+    assert "worker_coord_reachable()" in script
+
+
+def test_probe_coord_on_worker_path_fails_soft_when_the_pinned_interpreter_is_gone():
+    """If `~/.coord-venv/bin/python3` itself doesn't resolve on the remote
+    shell (e.g. the venv was never installed), the remote shell reports a
+    nonzero exit — same fail-soft UNKNOWN discipline as any other SSH-layer
+    trouble, never a fabricated found/absent."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "", returncode=127, stderr="bash: line 1: .coord-venv/bin/python3: No such file or directory"
+    )):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is None
+    assert "No such file" in error
     assert version is None
 
 
@@ -481,6 +515,27 @@ def test_coord_on_worker_path_version_skew_from_the_agent_warns():
     assert finding.severity == WARN
     assert "0.9.0" in finding.summary
     assert "0.7.1" in finding.summary
+
+
+def test_coord_on_worker_path_version_comparison_is_exact_not_substring():
+    """#2937 review: `expected in reported` is a substring test, and this
+    project's own version scheme makes it a trap — "0.5.29" IS a substring
+    of "coord, version 0.5.290" even though those are different releases.
+    A genuinely-skewed patch version must still warn."""
+    facts = MachineFacts(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        version="0.5.29",
+        coord_on_worker_path=True,
+        coord_on_worker_path_version="coord, version 0.5.290",
+    )
+    finding = _by_check(
+        machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_version_mismatch"
+    )
+    assert finding.severity == WARN
+    assert "0.5.29" in finding.summary
+    assert "0.5.290" in finding.summary
 
 
 # ── The doctor fold-in must not duplicate what `coord doctor` already prints ─
