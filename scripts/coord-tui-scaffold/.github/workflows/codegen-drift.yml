@@ -3,11 +3,19 @@ name: Generated-artifact drift
 # #2899 (Phase 4 of code-coordinator#2894), implementing the phase-3 ADR
 # (code-coordinator's docs/ADR_COORD_TUI_CI.md).
 #
-# WHY THIS JOB EXISTS. Two files committed in THIS repo are not written by
-# hand — they are generated from code-coordinator's live board schema:
+# WHY THIS JOB EXISTS. Three files committed in THIS repo are not written by
+# hand — they are generated from code-coordinator's live wire schema:
 #
-#   src/app/types/generated.rs        <- scripts/codegen.py --rust  (#1941)
-#   tests/fixtures/board_sample.json  <- scripts/gen_board_fixture.py (#748)
+#   src/app/types/generated.rs          <- scripts/codegen.py --rust  (#1941)
+#   src/app/types/generated_requests.rs <- scripts/codegen.py --rust  (#2900)
+#   tests/fixtures/board_sample.json    <- scripts/gen_board_fixture.py (#748)
+#
+# #2900: `--rust` writes/checks BOTH Rust files in one invocation, on purpose.
+# A second flag for the write half would be one more thing this workflow could
+# quietly stop invoking — which is exactly the silent failure
+# code-coordinator's `coord.health.checks.coord_tui_ci_pin` had to be written
+# to detect from the other side of the repo boundary. One command, one step,
+# both halves of the contract.
 #
 # While the crate lived inside code-coordinator, a single pytest run could
 # byte-compare both, because generator and output shared a checkout. They do
@@ -94,7 +102,10 @@ jobs:
       # `--out` nor `$COORD_TUI_SRC` they raise rather than guess, because a
       # guessed path under `--check` fails in the direction that reports
       # success. That is what makes this job's green trustworthy.
-      - name: generated.rs is up to date
+      # Covers generated.rs AND generated_requests.rs (#2900) — one command,
+      # and it reports BOTH before exiting rather than stopping at the first
+      # stale file and sending you back for a second round trip.
+      - name: generated.rs / generated_requests.rs are up to date
         working-directory: .coord-upstream
         run: COORD_TUI_SRC="$GITHUB_WORKSPACE" python scripts/codegen.py --rust --check
 

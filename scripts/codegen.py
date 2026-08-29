@@ -100,12 +100,29 @@ of column types, and they are already pinned int-vs-bool by the DTO-level
 assertion in `tests/test_board_schema.py` (`board_schema.INTEGER_BACKED_BOOLEANS`).
 The text-scraping half had no remaining subject once that was true.
 
-    # today, while tui/ still lives in this repo:
+#2900 — `--rust` NOW GENERATES BOTH HALVES OF THE WIRE CONTRACT. Everything
+above describes the READ path (`generated.rs`, the `/board` response DTOs).
+The WRITE path — the request/response types for every daemon route coord-tui
+POSTs or PATCHes — is generated into a sibling `generated_requests.rs` by the
+SAME `--rust` invocation. See the "#2900 — THE WRITE HALF" block comment
+further down for the design (which endpoints, why an explicit list, and the
+absent-vs-null and `X-Coord-Schema` semantics a JSON Schema cannot express).
+
+One flag rather than two, deliberately: a separate `--rust-requests` would be
+one more thing coord-tui's `codegen-drift.yml` could quietly stop invoking,
+which is the exact silent failure `coord.health.checks.coord_tui_ci_pin` had
+to be written to detect from this side of the repo boundary. `--out` still
+names the read file; the write file is written beside it (override with
+`--requests-out`).
+
+    # from a coord-tui checkout root — writes/checks BOTH files
     COORD_TUI_SRC=. .venv/bin/python scripts/codegen.py --rust
-    # exit 1 (no write) if that file is stale
+    # exit 1 (no write) if EITHER file is stale; reports both, not just the first
     COORD_TUI_SRC=. .venv/bin/python scripts/codegen.py --rust --check
-    # or name the file directly
-    .venv/bin/python scripts/codegen.py --rust --out tui/src/app/types/generated.rs
+    # or name the files directly
+    .venv/bin/python scripts/codegen.py --rust \\
+        --out src/app/types/generated.rs \\
+        --requests-out src/app/types/generated_requests.rs
 """
 
 from __future__ import annotations
@@ -1292,19 +1309,517 @@ def generate_rust() -> str:
     return "\n\n".join(parts) + "\n"
 
 
-def _main_rust(args: list[str]) -> int:
-    try:
-        output_path = resolve_rust_output_path(_parse_out(args))
-    except OutputPathError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    content = generate_rust()
-    if "--check" in args:
-        # #2897: a MISSING file is a hard failure, not "stale vs empty" —
-        # mirrors the TS `--check` path's reasoning below. Absence usually
-        # means --out/$COORD_TUI_SRC is pointing somewhere that is not a
-        # coord-tui checkout, and treating that as ordinary staleness would
-        # send an operator off to regenerate into the wrong directory.
+# ═════════════════════════════════════════════════════════════════════════════
+# #2900 — THE WRITE HALF
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Everything above generates coord-tui's READ path: the `/board` response DTOs.
+# The write path was, until this story, ungenerated — coord-tui hand-built
+# `serde_json::json!({...})` literals against the daemon's verb-shaped routes
+# (`post_daemon_json(&url, token, "/test-verdict", &json!({...}))`,
+# settings_ui.rs). Inside one repo that was tolerable: a single PR changed
+# both sides and one CI run saw it. Across the #2899 repo boundary each one
+# became an ungenerated contract, free to drift silently — and a drifted write
+# body does not blank a panel the way a drifted read does, it silently writes
+# the wrong thing (or 400s) at the moment a human is trying to record a
+# verdict.
+#
+# WHAT IS GENERATED. Only the endpoints coord-tui actually calls, listed
+# explicitly in `RUST_WRITE_ENDPOINTS` below — not all ~50 daemon routes. A
+# generated client for routes nobody calls is dead code that still has to be
+# kept green. The list is short on purpose and grows when coord-tui grows a
+# call, which is a deliberate, reviewable edit.
+#
+# The SHAPES, though, are not hand-written: each entry names a `(path,
+# method)` and the fields come from that operation's `requestBody` /
+# `200` response schema in the SAME served spec (`coord.serve_app.
+# openapi_spec()`) the read half reads. That is the whole point — rename a
+# field in `coord/board_schema.py` or `coord/rest_schema.py`, or retype one
+# in `openapi_spec()`, and this output changes, and coord-tui's
+# `--rust --check` gate goes red.
+#
+# ABSENT-vs-NULL is the one semantic that cannot be read off a JSON Schema,
+# so it is declared per endpoint as `partial`:
+#
+#   partial=False (every verb/RPC route) — an optional field serializes as an
+#     explicit `null`, byte-identical to the `json!` literal it replaces
+#     (`record_test_verdict_remote` sends `"test_reason": null` today, and a
+#     migration that silently started omitting the key would be a behaviour
+#     change smuggled in under "no functional change").
+#
+#   partial=True (the PATCH resource routes, #1944) — absent means "leave
+#     alone" and `null` means "clear", which are DIFFERENT operations
+#     (`coord/rest_schema.py`: "Absent is not null"). Those fields are emitted
+#     as `Option<Option<T>>` + `skip_serializing_if`, the only Rust shape that
+#     can express all three states. A plain `Option<T>` would make
+#     "clear the milestone" unreachable from a generated client.
+#
+# X-COORD-SCHEMA (#1943) is derived, not declared: a resource-shaped path is
+# one with `{...}` path parameters, and those — and only those — send the
+# header. Verb routes deliberately do not: absence means "today's shape", so
+# an un-migrated verb call keeps working unchanged, which is exactly the
+# property that lets coord-tui migrate endpoint-by-endpoint on its own deploy
+# lane (docs/STORE_SERVICE.md §4).
+
+#: Path of the emitted write-client file RELATIVE to a `coord-tui` checkout
+#: root, i.e. `<coord-tui>/src/app/types/generated_requests.rs`. A SIBLING of
+#: `RUST_OUTPUT_RELPATH` rather than more content appended to it: the read
+#: file is `Deserialize`-only wire *rows*, this one is `Serialize` request
+#: bodies plus their route metadata, and they are regenerated by the same
+#: command but consumed by different call sites.
+RUST_REQUESTS_OUTPUT_RELPATH = Path("src") / "app" / "types" / "generated_requests.rs"
+
+
+@dataclasses.dataclass(frozen=True)
+class WriteEndpoint:
+    """One daemon route coord-tui writes to, and the Rust names for its DTOs.
+
+    ``base`` is the Rust type-name stem: ``TestVerdict`` yields
+    ``TestVerdictRequest`` and (when the operation declares a 200 body)
+    ``TestVerdictResponse``.
+    """
+
+    path: str
+    method: str  # "post" / "patch" — lower-case, as OpenAPI keys them
+    base: str
+    #: See the ABSENT-vs-NULL note above.
+    partial: bool = False
+    #: Rendered as `///` doc comments on the request struct, after the
+    #: mechanically-derived summary line.
+    doc: tuple[str, ...] = ()
+
+    @property
+    def is_resource_shaped(self) -> bool:
+        """True for `/issue/{repo_name}/{number}`, false for `/issue-label`.
+
+        Derived from the path rather than declared, so a route that gains a
+        resource shape cannot be left behind by a stale hand-maintained flag.
+        """
+        return "{" in self.path
+
+
+#: The daemon routes coord-tui writes to. Kept in step with its
+#: `post_daemon_json` call sites; see the block comment above for why this is
+#: an explicit list and not "every POST in the spec".
+RUST_WRITE_ENDPOINTS: tuple[WriteEndpoint, ...] = (
+    WriteEndpoint(
+        path="/test-verdict",
+        method="post",
+        base="TestVerdict",
+        doc=(
+            "Replaces `record_test_verdict_remote`'s hand-built `json!` body",
+            "(#200/#590, settings_ui.rs). The `smoke_test` / `smoke_test_reason`",
+            "mirror is NOT derived here — deriving it is a client-side policy",
+            "decision (`coord test --pass/--fail` does the same derivation on the",
+            "Python side so `coord fix`'s `smoke_test == \"fail\"` guard sees it),",
+            "and this file only describes the wire.",
+        ),
+    ),
+    WriteEndpoint(
+        path="/issue-label",
+        method="post",
+        base="IssueLabel",
+        doc=(
+            "Replaces `apply_issue_labels_remote`'s hand-built `json!` body (#1012).",
+        ),
+    ),
+    WriteEndpoint(
+        path="/issue/{repo_name}/{number}",
+        method="patch",
+        base="IssuePatch",
+        partial=True,
+        doc=(
+            "#1944's resource-shaped successor to `/issue-label` (and six other",
+            "RPC routes). Send `X-Coord-Schema` with this one — see",
+            "`SCHEMA_HEADER` below.",
+        ),
+    ),
+    WriteEndpoint(
+        path="/issue-upsert",
+        method="post",
+        base="IssueUpsert",
+        doc=(
+            "Replaces `upsert_issue_remote`'s hand-built `json!` body (#2895).",
+        ),
+    ),
+    WriteEndpoint(
+        path="/purge",
+        method="post",
+        base="Purge",
+        doc=(
+            "Replaces `purge_request`'s hand-built `json!` body (#2895) — and its",
+            "`resp.get(key).and_then(as_u64).unwrap_or(0)` response digging, which",
+            "is what `PurgeResponse` is for.",
+        ),
+    ),
+)
+
+
+class WriteEndpointError(Exception):
+    """A `RUST_WRITE_ENDPOINTS` entry names something the spec does not have."""
+
+
+def _resolve_ref(schema: dict[str, Any], schemas: dict[str, Any]) -> dict[str, Any]:
+    """Follow a top-level ``$ref`` into ``components/schemas``.
+
+    Only the outermost level — nested ``$ref``s stay as references and are
+    emitted as the referenced Rust type name by `rust_type_from_schema`,
+    which is what we want (a nested object becomes its own named struct).
+    """
+    ref = schema.get("$ref")
+    if not ref:
+        return schema
+    name = ref.rsplit("/", 1)[-1]
+    if name not in schemas:
+        raise WriteEndpointError(
+            f"scripts/codegen.py: $ref {ref} is not in components/schemas — "
+            "did coord/rest_schema.py change?"
+        )
+    return schemas[name]
+
+
+def _operation(ep: WriteEndpoint, spec: dict[str, Any]) -> dict[str, Any]:
+    op = (spec.get("paths", {}).get(ep.path) or {}).get(ep.method)
+    if not isinstance(op, dict):
+        raise WriteEndpointError(
+            f"scripts/codegen.py: coord.serve_app.openapi_spec() declares no "
+            f"{ep.method.upper()} {ep.path} — RUST_WRITE_ENDPOINTS names a route "
+            "that no longer exists. Remove the entry, or restore the route."
+        )
+    return op
+
+
+def _json_schema(container: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``application/json`` schema out of a requestBody / response."""
+    if not isinstance(container, dict):
+        return None
+    content = container.get("content")
+    if not isinstance(content, dict):
+        return None
+    entry = content.get("application/json")
+    if not isinstance(entry, dict):
+        return None
+    schema = entry.get("schema")
+    return schema if isinstance(schema, dict) else None
+
+
+def _request_schema(ep: WriteEndpoint, spec: dict[str, Any], schemas: dict[str, Any]):
+    schema = _json_schema(_operation(ep, spec).get("requestBody"))
+    if schema is None:
+        raise WriteEndpointError(
+            f"scripts/codegen.py: {ep.method.upper()} {ep.path} declares no "
+            "application/json requestBody — nothing to generate a request "
+            "struct from."
+        )
+    return _resolve_ref(schema, schemas)
+
+
+def _response_schema(ep: WriteEndpoint, spec: dict[str, Any], schemas: dict[str, Any]):
+    """The 200 body schema, or None when the operation declares none.
+
+    None is legitimate — a route whose success body is uninteresting to the
+    client (`{"ok": true}` after a fire-and-forget write) needs no response
+    struct, and inventing an empty one would be noise. It is emitted only
+    when the spec actually describes something.
+    """
+    responses = _operation(ep, spec).get("responses") or {}
+    schema = _json_schema(responses.get("200"))
+    return None if schema is None else _resolve_ref(schema, schemas)
+
+
+def _path_params(ep: WriteEndpoint, spec: dict[str, Any]) -> list[dict[str, Any]]:
+    op = _operation(ep, spec)
+    return [
+        p
+        for p in (op.get("parameters") or [])
+        if isinstance(p, dict) and p.get("in") == "path"
+    ]
+
+
+def _rust_param_type(schema: dict[str, Any]) -> str:
+    """Rust argument type for a path parameter — borrowed, not owned.
+
+    A path builder should not force its caller to allocate a `String` just to
+    interpolate it.
+    """
+    return "&str" if schema.get("type") == "string" else "u64"
+
+
+def _request_field(
+    python_name: str, schema: dict[str, Any], *, required: bool, partial: bool
+) -> RustField:
+    """One field of a generated request struct — see the ABSENT-vs-NULL note."""
+    base = rust_type_from_schema(schema)
+    nullable = bool(schema.get("nullable"))
+    if required and not nullable:
+        return RustField(name=python_name, ty=base, serde=(), doc=())
+    if not partial:
+        # Verb route: absent and null are the same thing to the handler
+        # (`body.get(...)`), so a plain Option — serialized as an explicit
+        # null — reproduces today's hand-built body byte for byte.
+        return RustField(name=python_name, ty=f"Option<{base}>", serde=(), doc=())
+    # Partial (PATCH) route: three states, so a nested Option. `None` is
+    # skipped entirely (leave alone); `Some(None)` serializes as an explicit
+    # null (clear); `Some(Some(v))` sets.
+    ty = f"Option<Option<{base}>>" if nullable else f"Option<{base}>"
+    return RustField(
+        name=python_name,
+        ty=ty,
+        serde=("default", 'skip_serializing_if = "Option::is_none"'),
+        doc=(),
+    )
+
+
+def _response_field(python_name: str, schema: dict[str, Any], *, required: bool) -> RustField:
+    """One field of a generated response struct.
+
+    Every field is `#[serde(default)]`, for the same reason every `/board`
+    field is (`RUST_HEADER`): one missing or retyped key must not fail the
+    whole parse and turn a successful write into a displayed error.
+    """
+    base = rust_type_from_schema(schema)
+    ty = base if (required and not schema.get("nullable")) else f"Option<{base}>"
+    return RustField(name=python_name, ty=ty, serde=("default",), doc=())
+
+
+def _emit_write_struct(
+    name: str,
+    schema: dict[str, Any],
+    *,
+    request: bool,
+    partial: bool,
+    doc: tuple[str, ...],
+) -> str:
+    required = set(schema.get("required") or ())
+    derives = (
+        ("Clone", "Debug", "Default", "serde::Serialize")
+        if request
+        else ("Clone", "Debug", "Default", "serde::Deserialize")
+    )
+    lines = [f"/// {d}".rstrip() if d else "///" for d in doc]
+    lines.append("#[derive(" + ", ".join(derives) + ")]")
+    lines.append("#[allow(dead_code)]")
+    lines.append(f"pub(crate) struct {name} {{")
+    for field_name, field_schema in (schema.get("properties") or {}).items():
+        field = (
+            _request_field(
+                field_name, field_schema, required=field_name in required, partial=partial
+            )
+            if request
+            else _response_field(field_name, field_schema, required=field_name in required)
+        )
+        lines.extend(_render_rust_field(field))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _emit_route_impl(
+    ep: WriteEndpoint, params: list[dict[str, Any]], schema_version: int
+) -> str:
+    """The `impl <Base>Request` block: route metadata + a path builder."""
+    name = f"{ep.base}Request"
+    lines = ["#[allow(dead_code)]", f"impl {name} {{"]
+    lines.append("    /// The route template, exactly as the daemon declares it.")
+    lines.append(f'    pub(crate) const PATH: &\'static str = "{ep.path}";')
+    lines.append("    /// HTTP method for this route.")
+    lines.append(f'    pub(crate) const METHOD: &\'static str = "{ep.method.upper()}";')
+    if ep.is_resource_shaped:
+        lines.append(
+            "    /// #1943: a resource-shaped route, so send "
+            "`X-Coord-Schema: <this>`."
+        )
+        lines.append(
+            f"    pub(crate) const SCHEMA_HEADER: Option<u32> = Some({schema_version});"
+        )
+    else:
+        lines.append(
+            "    /// #1943: a verb route — send NO `X-Coord-Schema` header. Its"
+        )
+        lines.append(
+            "    /// absence means \"today's shape\", which is what keeps an"
+        )
+        lines.append(
+            "    /// un-migrated call working unchanged (docs/STORE_SERVICE.md §4)."
+        )
+        lines.append("    pub(crate) const SCHEMA_HEADER: Option<u32> = None;")
+    if params:
+        args = ", ".join(
+            f"{p['name']}: {_rust_param_type(p.get('schema') or {})}" for p in params
+        )
+        # `format!` with inline captures: every path parameter is in scope as
+        # a local of the same name, so the template is the literal route.
+        lines.append(
+            "    /// The concrete request path, with parameters interpolated."
+        )
+        lines.append(f"    pub(crate) fn path({args}) -> String {{")
+        lines.append(f'        format!("{ep.path}")')
+        lines.append("    }")
+    else:
+        lines.append("    /// The concrete request path (no parameters).")
+        lines.append("    pub(crate) fn path() -> &'static str {")
+        lines.append("        Self::PATH")
+        lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+RUST_REQUESTS_HEADER = """\
+//! AUTO-GENERATED — DO NOT EDIT BY HAND.
+//!
+//! coord-tui's daemon **write** client (#2900, Phase 4 of code-coordinator#2894),
+//! generated by `scripts/codegen.py --rust` alongside its read-path sibling
+//! `generated.rs`. Both come from `coord.serve_app.openapi_spec()`; this file
+//! covers the `requestBody` / `200` response of every route coord-tui POSTs
+//! or PATCHes. Regenerate after any wire change:
+//!
+//! ```text
+//! COORD_TUI_SRC=<coord-tui checkout root> .venv/bin/python scripts/codegen.py --rust
+//! ```
+//!
+//! (`text` is load-bearing: rustdoc compiles an unannotated code block in a
+//! doc comment as a doctest.)
+//!
+//! **Why this file exists.** Before #2900 these bodies were hand-built
+//! `serde_json::json!({...})` literals. Inside one repo that was a tolerable
+//! mirror — one PR changed both sides and one CI run saw it. Since #2899 put
+//! coord-tui in its own repo it is a cross-repo contract per endpoint, each
+//! free to drift in silence; and unlike a drifted READ (which blanks a panel
+//! loudly) a drifted WRITE silently records the wrong thing.
+//!
+//! **`X-Coord-Schema` (#1943).** Each request type carries a `SCHEMA_HEADER`
+//! const: `Some(v)` on the resource-shaped routes (`/issue/{repo}/{n}`),
+//! `None` on the verb routes, whose handlers read an absent header as
+//! "today's shape". Send the header when, and only when, it is `Some` — that
+//! asymmetry is what lets coord-tui migrate one endpoint at a time on its own
+//! deploy lane, with a client-side one-liner as the rollback
+//! (docs/STORE_SERVICE.md §4).
+//!
+//! **Absent is not null on a PATCH.** Fields of a partial-update route are
+//! `Option<Option<T>>`: `None` omits the key (leave alone), `Some(None)`
+//! sends an explicit `null` (clear), `Some(Some(v))` sets. Fields of a verb
+//! route are a plain `Option<T>` and serialize their `None` as an explicit
+//! `null`, byte-identical to the literal each one replaces.
+//!
+//! Every response field is `#[serde(default)]` for the same reason every
+//! `/board` field is: one unexpected key must not turn a successful write
+//! into a displayed parse error.\
+"""
+
+
+def _wrap_doc(text: str, width: int = 88) -> tuple[str, ...]:
+    """Wrap one long line into ``///``-able doc lines.
+
+    The route summaries come out of ``openapi_spec()`` as single sentences of
+    arbitrary length (``/issue-label``'s deprecation pointer is ~230 chars).
+    Emitting those verbatim gives the generated file lines four times the
+    width of everything around it — legal Rust, unreadable diff. Wrapped here
+    rather than at the source, because the summary is the *spec's* text and
+    shortening it there would cost the human reading `/openapi.json`.
+    """
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return tuple(lines)
+
+
+def generate_rust_requests() -> str:
+    """coord-tui's generated write client — see `RUST_REQUESTS_HEADER`."""
+    from coord.dao import SCHEMA_VERSION  # noqa: PLC0415
+
+    spec = board_openapi_spec()
+    schemas: dict[str, Any] = spec.get("components", {}).get("schemas", {})
+    parts = [RUST_REQUESTS_HEADER]
+
+    # Nested request DTOs the endpoints below `$ref` (e.g. `/issue-upsert`'s
+    # `issue`). Emitted first so the file reads top-down, and discovered from
+    # the referenced schemas rather than listed by hand.
+    nested: dict[str, dict[str, Any]] = {}
+    for ep in RUST_WRITE_ENDPOINTS:
+        req = _request_schema(ep, spec, schemas)
+        for field_schema in (req.get("properties") or {}).values():
+            ref = field_schema.get("$ref")
+            if ref:
+                nested[ref.rsplit("/", 1)[-1]] = _resolve_ref(field_schema, schemas)
+    for name in sorted(nested):
+        parts.append(
+            _emit_write_struct(
+                name,
+                nested[name],
+                request=True,
+                partial=False,
+                doc=(f"A nested request DTO — `coord.rest_schema.{name}` (#2900).",),
+            )
+        )
+
+    for ep in RUST_WRITE_ENDPOINTS:
+        req = _request_schema(ep, spec, schemas)
+        summary = _operation(ep, spec).get("summary") or ""
+        head = _wrap_doc(f"`{ep.method.upper()} {ep.path}` — {summary}".rstrip(" —"))
+        parts.append(
+            _emit_write_struct(
+                f"{ep.base}Request", req, request=True, partial=ep.partial, doc=head + ep.doc
+            )
+        )
+        parts.append(_emit_route_impl(ep, _path_params(ep, spec), SCHEMA_VERSION))
+        resp = _response_schema(ep, spec, schemas)
+        if resp is not None:
+            parts.append(
+                _emit_write_struct(
+                    f"{ep.base}Response",
+                    resp,
+                    request=False,
+                    partial=False,
+                    doc=(f"`200` body of `{ep.method.upper()} {ep.path}`.",),
+                )
+            )
+    return "\n\n".join(parts) + "\n"
+
+
+def resolve_rust_requests_output_path(
+    explicit: str | Path | None = None, *, board_out: Path | None = None
+) -> Path:
+    """Where to write/check ``generated_requests.rs``.
+
+    ``--requests-out`` > a sibling of an explicit ``--out`` > ``$COORD_TUI_SRC``.
+
+    The middle rule is what keeps `--rust` a single command: `--out` names the
+    read file, and the write file is its sibling in the same directory, which
+    is where `$COORD_TUI_SRC` would have put it anyway. Same no-fallback-
+    default reasoning as :func:`resolve_rust_output_path` — a guessed path
+    under ``--check`` fails in the direction that reports success.
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    if board_out is not None:
+        return board_out.parent / RUST_REQUESTS_OUTPUT_RELPATH.name
+    root = os.environ.get(RUST_OUTPUT_ENV_VAR)
+    if root:
+        return Path(root).expanduser() / RUST_REQUESTS_OUTPUT_RELPATH
+    raise OutputPathError(
+        "no destination for generated_requests.rs. Pass --requests-out PATH, "
+        f"or --out PATH (it is written alongside), or set ${RUST_OUTPUT_ENV_VAR} "
+        f"to a coord-tui checkout root (the file is written to its "
+        f"{RUST_REQUESTS_OUTPUT_RELPATH}). See this script's module docstring."
+    )
+
+
+def _check_or_write(output_path: Path, content: str, *, check: bool, label: str) -> int:
+    """Shared `--check`/write tail — see :func:`_main_rust`."""
+    if check:
+        # #2897: a MISSING file is a hard failure, not "stale vs empty".
+        # Absence usually means --out/$COORD_TUI_SRC is pointing somewhere
+        # that is not a coord-tui checkout, and treating that as ordinary
+        # staleness would send an operator off to regenerate into the wrong
+        # directory.
         if not output_path.exists():
             print(
                 f"{output_path} does not exist — is --out/${RUST_OUTPUT_ENV_VAR} "
@@ -1314,8 +1829,8 @@ def _main_rust(args: list[str]) -> int:
             return 1
         if output_path.read_text() != content:
             print(
-                f"{output_path} is stale — run `python scripts/codegen.py "
-                f"--rust --out {output_path}` to regenerate.",
+                f"{output_path} is stale — run `python scripts/codegen.py --rust` "
+                f"to regenerate ({label}).",
                 file=sys.stderr,
             )
             return 1
@@ -1325,6 +1840,45 @@ def _main_rust(args: list[str]) -> int:
     output_path.write_text(content)
     print(f"wrote {output_path}")
     return 0
+
+
+def _parse_requests_out(args: list[str]) -> str | None:
+    """``--requests-out PATH`` / ``--requests-out=PATH`` from *args*, or None."""
+    for i, arg in enumerate(args):
+        if arg.startswith("--requests-out="):
+            return arg.split("=", 1)[1]
+        if arg == "--requests-out":
+            if i + 1 >= len(args):
+                raise OutputPathError("--requests-out requires a PATH argument")
+            return args[i + 1]
+    return None
+
+
+def _main_rust(args: list[str]) -> int:
+    """`--rust` writes/checks BOTH generated Rust files (#2900).
+
+    One flag, one CI step, both halves of the wire contract — a separate flag
+    for the write half would be one more thing coord-tui's `codegen-drift.yml`
+    could quietly stop invoking, which is precisely the failure
+    `coord.health.checks.coord_tui_ci_pin` had to be written to detect.
+    """
+    try:
+        board_out = resolve_rust_output_path(_parse_out(args))
+        requests_out = resolve_rust_requests_output_path(
+            _parse_requests_out(args),
+            board_out=board_out if _parse_out(args) is not None else None,
+        )
+    except OutputPathError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    check = "--check" in args
+    rc = _check_or_write(board_out, generate_rust(), check=check, label="board DTOs")
+    rc_req = _check_or_write(
+        requests_out, generate_rust_requests(), check=check, label="write DTOs"
+    )
+    # Report BOTH before returning: a run that stops at the first stale file
+    # sends the reader back for a second round trip to discover the other.
+    return rc or rc_req
 
 
 def _parse_out(args: list[str]) -> str | None:
