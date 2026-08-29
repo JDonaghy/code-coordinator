@@ -334,6 +334,19 @@ def probe_cli_venv(ctx: HealthContext) -> CheckResult:
     ),
 )
 def probe_tui_binary(ctx: HealthContext) -> CheckResult:
+    """Mtime-based, and #2898 is why it stays that way.
+
+    The obvious "improvement" here is to report the binary's ``--version`` and
+    let ``coord release verify`` grade it against the fleet's expected
+    version. Don't. Since phase 3 of #2894 coord-tui releases from its own
+    repo on its own ``v*`` tag line, so the expected version this fleet is
+    propagating (the *coordinator's* channel) is not a number coord-tui's
+    version is comparable to — a fleet on coord v0.5.x with coord-tui v0.2.y
+    is correct, and grading them against each other would report every host
+    as permanently behind. See ``coord/release_verify.py``'s ``coord-tui``
+    block. "Was this binary rebuilt since its source changed?" is a question
+    that stays answerable locally, which is exactly why it is the one asked.
+    """
     binary_path = resolve_tui_binary_path(ctx)
     values: dict = {"path": str(binary_path)}
 

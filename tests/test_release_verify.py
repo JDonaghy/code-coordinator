@@ -824,16 +824,17 @@ def test_tui_binary_never_becomes_a_version_lane() -> None:
     coord/health/checks/deploy_lane_facts.py), never by comparing an
     installed version against `--expected`/`--pypi`.
 
-    That matters now specifically because a `tui/`-only release publishes no
-    PyPI wheel (#2102): PyPI's "latest" stays on the OLD version while the
-    GitHub Release and any freshly-`coord tui update`'d binary are ahead of
-    it. A version-vs-`expected` comparison for coord-tui would therefore
-    grade every such binary "ahead of expected" and turn every tui-only
-    release into a permanent false crit — exactly the outcome #2102 warns
-    against. Since `coord-tui` never enters `report.lanes`/`report.versions`
-    at all, that trap cannot fire today. If a future change adds a real
-    installed-version lane for coord-tui, it must grade against the latest
-    GitHub Release tag, not PyPI — PyPI cannot see a tui-only release at all.
+    #2102's reason was contingent: a `tui/`-only release published no PyPI
+    wheel, so PyPI's "latest" stayed on the OLD version while the GitHub
+    Release and any freshly-`coord tui update`'d binary were ahead of it, and
+    a version-vs-`expected` comparison would grade every such binary "ahead of
+    expected" forever.
+
+    #2898 (phase 3 of #2894) makes the reason structural: coord-tui releases
+    from its OWN repo on its OWN `v*` tag line, so `expected` — the
+    coordinator's channel's version — is not a number coord-tui's version is
+    comparable to at all. See `test_a_fleet_with_independent_channel_versions_
+    is_green` below for the fleet state that proves it.
     """
     report = rv.verify(
         machine_health={
@@ -854,6 +855,68 @@ def test_tui_binary_never_becomes_a_version_lane() -> None:
     assert report.versions == {
         RELEASED: ["coord-agent process (dellserver)", "~/.coord-venv (dellserver)"]
     }
+
+
+def test_a_fleet_with_independent_channel_versions_is_green() -> None:
+    """#2898 acceptance criterion 3: `coord release verify` on a fleet running
+    coord vA and coord-tui vB reports the tui lane green, not "behind".
+
+    Post-split those two numbers are drawn from two repos' tag lines and move
+    independently, so this is the NORMAL steady state — a coordinator on
+    0.5.x next to a coord-tui on 0.2.7. If coord-tui ever entered the version
+    skew map, this fleet would read as ~29 releases behind on every host,
+    permanently, and `coord release propagate --rollback-on-red` gates on this
+    report — it would revert good rolls forever, which is the #2052 shape this
+    module exists to keep closed.
+    """
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),  # coord's channel: on the expected version
+                # coord-tui's channel: a completely unrelated version line,
+                # and a binary that is NOT stale relative to its source.
+                _result("tui_binary", severity="ok", headroom="up to date",
+                        present=True, path="~/.local/bin/coord-tui",
+                        version="0.2.7", binary_mtime=2.0, source_mtime=1.0),
+            )
+        },
+        expected=RELEASED,
+    )
+
+    assert report.ok, rv.render(report)
+    assert report.severity == "ok"
+    # Nothing anywhere claims this host is behind...
+    rendered = rv.render(report)
+    assert "0.2.7" not in rendered, (
+        "coord-tui's version leaked into the verify report; it is a different "
+        "channel's tag line and cannot be graded against `expected`"
+    )
+    # ...and no finding mentions the tui lane at all.
+    assert not any(f.lane == "coord-tui" for f in report.findings), [
+        (f.lane, f.summary) for f in report.findings
+    ]
+    assert list(report.versions) == [RELEASED]
+
+
+def test_a_stale_tui_binary_is_still_a_warn_not_a_version_finding() -> None:
+    """#2898 must not silence the lane, only stop it being graded against the
+    wrong number. Local build staleness is still reported — it is a real,
+    actionable finding — it simply never enters the skew map."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result("tui_binary", severity="warn",
+                        headroom="binary is 30.0h older than tui/ source",
+                        present=True, version="0.2.7"),
+            )
+        },
+        expected=RELEASED,
+    )
+    tui = [f for f in report.findings if f.lane == "coord-tui"]
+    assert len(tui) == 1, [(f.lane, f.summary) for f in report.findings]
+    assert tui[0].severity == "warn"
+    assert list(report.versions) == [RELEASED]
 
 
 def test_absent_cli_venv_is_not_a_lane() -> None:

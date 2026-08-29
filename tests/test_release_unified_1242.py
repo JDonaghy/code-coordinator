@@ -1,27 +1,40 @@
-"""#1242 (PKG-6): one `v*` tag -> one GitHub Release, everything at one version.
+"""#1242 (PKG-6) then #2898: what "one tag, one Release" means per channel.
 
 Two layers, matching the two ways this can regress:
 
-* ``TestUnifiedReleaseWorkflow`` parses the real
-  ``.github/workflows/{publish,release-tui}.yml`` — not a fixture — and pins
-  the *structural* invariant the unification exists for.  Before it, both
-  workflows fired on `v*` and both called ``softprops/action-gh-release`` for
-  the same tag; that action upserts by ``tag_name``, so whichever run's step
-  landed first created the Release and the other appended to it.  Which meant
-  whether the Release carried generated notes was decided by a race between
-  two independent workflow runs — and neither attached the wheel at all.  The
-  fix has exactly one release-creating step in the whole system, so that's
-  what these assert: one `v*` trigger, one ``action-gh-release`` step,
-  release-tui.yml reachable only as a reusable workflow.
+* ``TestSplitReleaseChannels`` parses the real workflow YAML — not a fixture —
+  and pins the *structural* invariants, first #1242's and now #2898's.
+
+  #1242's problem: `publish.yml` and `release-tui.yml` both lived in THIS
+  repo, both fired on `v*`, and both called ``softprops/action-gh-release``
+  for the same tag.  That action upserts by ``tag_name``, so whichever run's
+  step landed first created the Release and the other appended to it — which
+  meant whether the Release carried generated notes was decided by a race
+  between two independent runs, and neither attached the wheel at all.  Its
+  fix made release-tui.yml a reusable workflow publish.yml called.
+
+  #2898 (phase 3 of #2894) removes the shared Release instead of sequencing
+  access to it: coord-tui gets its own repo, its own ``v*`` tag namespace and
+  its own Releases.  So the invariant generalises from "exactly one
+  release-creating step in the system" to **exactly one per channel**, and a
+  new one appears: tagging ``v*`` HERE must produce a wheel and NO coord-tui
+  binaries, and `verify-assets` must not fail for their absence (#2898's
+  acceptance criterion 1).
+
+  coord-tui's workflow is staged at ``tui/.github/workflows/release-tui.yml``
+  — inside ``tui/``, NOT the repo root's ``.github/workflows/`` — so GitHub
+  never reads it here (it is inert, and cannot race publish.yml) and #2894's
+  move story carries it across with the crate.  These tests read it from that
+  staged path on purpose: an inert file is exactly the kind that rots.
 
   This is a grep-shaped test on purpose (cf. tests/test_ci_acceptance_gate_1950.py):
   you cannot run GitHub Actions in pytest, and the failure mode being guarded
-  is someone re-adding a second release-creating step, which reads as
-  perfectly sensible YAML in isolation.
+  is someone re-fusing the two channels, which reads as perfectly sensible
+  YAML in isolation.
 
 * ``TestVerifyReleaseWheel`` drives ``scripts/verify_release_wheel.py``
-  against synthetic dists.  That script is the CI-observable half of "all
-  stamped the same version": it fails the publish job when setuptools-scm
+  against synthetic dists.  That script is the CI-observable half of "the
+  wheel is stamped with the tag": it fails the publish job when setuptools-scm
   resolved a ``.devN+g<sha>`` fallback instead of the tag (the shallow-clone
   failure mode #1238's ``fallback_version`` deliberately makes non-fatal for
   dev checkouts), when the ``[server]`` extra is missing from the built
@@ -42,7 +55,10 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 PUBLISH_YML = WORKFLOW_DIR / "publish.yml"
-RELEASE_TUI_YML = WORKFLOW_DIR / "release-tui.yml"
+# #2898: staged inside `tui/`, not the repo root's `.github/workflows/`.
+# GitHub only reads workflows from the root, so this one is inert here and
+# travels with the crate when #2894's move story runs.
+RELEASE_TUI_YML = REPO_ROOT / "tui" / ".github" / "workflows" / "release-tui.yml"
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_release_wheel.py"
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -101,75 +117,86 @@ def _transitive_needs(workflow: dict, job_name: str) -> set[str]:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-class TestUnifiedReleaseWorkflow:
-    def test_publish_is_the_only_v_tag_entrypoint(self) -> None:
-        publish_tags = _triggers(_load(PUBLISH_YML))["push"]["tags"]
-        assert publish_tags == ["v*"], publish_tags
+class TestSplitReleaseChannels:
+    def test_publish_owns_this_repos_v_tag_and_no_longer_calls_the_tui_workflow(self) -> None:
+        """#2898 criterion 1, structural half: nothing in this repo's release
+        run builds coord-tui any more."""
+        publish = _load(PUBLISH_YML)
+        assert _triggers(publish)["push"]["tags"] == ["v*"]
 
-        tui_triggers = _triggers(_load(RELEASE_TUI_YML))
-        assert "push" not in tui_triggers, (
-            "release-tui.yml still fires on a push trigger of its own — that is "
-            "the two-workflows-race-for-one-Release bug #1242 fixed. It must be "
-            "reachable only via publish.yml's workflow_call (plus its "
-            "workflow_dispatch dry run)."
-        )
-        assert "workflow_call" in tui_triggers, (
-            "release-tui.yml must be a reusable workflow so publish.yml can run "
-            "its build matrix inside the same run as the wheel build"
-        )
-
-    def test_publish_calls_the_tui_workflow_with_the_tag(self) -> None:
-        jobs = _load(PUBLISH_YML)["jobs"]
         callers = [
-            (name, job)
-            for name, job in jobs.items()
+            name
+            for name, job in publish["jobs"].items()
             if isinstance(job.get("uses"), str) and "release-tui.yml" in job["uses"]
         ]
-        assert len(callers) == 1, (
-            "expected exactly one job in publish.yml calling release-tui.yml as a "
-            f"reusable workflow; found {[n for n, _ in callers]}"
+        assert callers == [], (
+            f"publish.yml still calls release-tui.yml as a reusable workflow "
+            f"({callers}). Post-#2898 that workflow belongs to coord-tui's repo "
+            "and fires on ITS tag push; a `uses:` here would either fail to "
+            "resolve or resurrect the fused channel."
         )
-        _, job = callers[0]
-        # "Everything at one version" means the tag is handed down from one
-        # place, not independently re-derived on both sides.
-        assert "tag" in (job.get("with") or {}), (
-            "publish.yml must pass the tag down to release-tui.yml so the "
-            "binaries and the wheel are stamped from the same value"
-        )
-        declared = _triggers(_load(RELEASE_TUI_YML))["workflow_call"]["inputs"]
-        assert "tag" in declared, f"release-tui.yml declares inputs {sorted(declared)}"
 
-    def test_exactly_one_step_creates_the_github_release(self) -> None:
-        release_steps = [
-            (PUBLISH_YML.name, job, step)
-            for job, step in _steps_using(_load(PUBLISH_YML), "softprops/action-gh-release")
-        ] + [
-            (RELEASE_TUI_YML.name, job, step)
-            for job, step in _steps_using(_load(RELEASE_TUI_YML), "softprops/action-gh-release")
-        ]
-        assert len(release_steps) == 1, (
-            "more than one step creates/updates the GitHub Release: "
-            f"{[(f, j) for f, j, _ in release_steps]}. action-gh-release upserts "
-            "by tag_name, so two of them racing for one tag is precisely the "
-            "#1242 bug — whichever landed first decided whether the Release got "
-            "generated notes."
+    def test_the_tui_workflow_fires_on_its_own_tag_push(self) -> None:
+        """#2898 undoes #1242's `workflow_call`. The race that arrangement
+        existed to stop needed TWO workflows sharing ONE Release; two repos
+        with two tag namespaces have nothing to race over — and a caller in
+        another repo could not hand this one a tag from its own history
+        anyway."""
+        tui_triggers = _triggers(_load(RELEASE_TUI_YML))
+        assert tui_triggers.get("push", {}).get("tags") == ["v*"], (
+            "release-tui.yml must fire on its own `v*` push in coord-tui's "
+            f"repo; triggers are {sorted(tui_triggers)}"
         )
-        _, _, step = release_steps[0]
-        assert step["with"].get("generate_release_notes") is True
+        assert "workflow_call" not in tui_triggers, (
+            "release-tui.yml is still a reusable workflow (#1242's "
+            "arrangement). Nothing can call it any more — publish.yml lives "
+            "in a different repo — so it would simply never run."
+        )
+        assert "workflow_dispatch" in tui_triggers, (
+            "the standalone dry run must survive the split: it is the only way "
+            "to exercise build+stamp+verify without cutting a real Release"
+        )
 
-    def test_the_release_carries_the_wheel_and_the_binaries(self) -> None:
+    def test_the_tui_workflow_is_staged_outside_this_repos_workflow_dir(self) -> None:
+        """It must NOT be readable by GitHub here — a `v*` tag in this repo
+        would otherwise trigger it, rebuilding the very binaries #2898 removed
+        from this channel and racing publish.yml for this repo's Release."""
+        assert RELEASE_TUI_YML.exists(), f"{RELEASE_TUI_YML} is missing"
+        assert not (WORKFLOW_DIR / "release-tui.yml").exists(), (
+            "release-tui.yml is back in the repo root's .github/workflows/, "
+            "where GitHub WILL run it on this repo's `v*` tags"
+        )
+        live = sorted(p.name for p in WORKFLOW_DIR.glob("*.yml"))
+        assert "release-tui.yml" not in live, live
+
+    def test_exactly_one_step_creates_a_github_release_per_channel(self) -> None:
+        """#1242's invariant, generalised. Each channel needs exactly one
+        release-creating step: two in one repo is the upsert race, zero means
+        the channel publishes nothing at all — and for coord-tui that would
+        leave `coord tui update`'s resolution source permanently empty."""
+        for label, path in (("publish.yml", PUBLISH_YML), ("release-tui.yml", RELEASE_TUI_YML)):
+            steps = _steps_using(_load(path), "softprops/action-gh-release")
+            assert len(steps) == 1, (
+                f"{label} has {len(steps)} release-creating step(s) "
+                f"({[j for j, _ in steps]}); each channel needs exactly one"
+            )
+            _, step = steps[0]
+            assert step["with"].get("generate_release_notes") is True, label
+
+    def test_this_repos_release_carries_the_wheel_and_no_binaries(self) -> None:
+        """#2898 criterion 1: a wheel, no coord-tui binaries, and no failure
+        for their absence."""
         workflow = _load(PUBLISH_YML)
         release_job_name = next(
             name
             for name, job in workflow["jobs"].items()
             if _steps_using({"jobs": {name: job}}, "softprops/action-gh-release")
         )
-        # It can only publish what it waited for.
         waits_on = _transitive_needs(workflow, release_job_name)
-        assert {"build-wheel", "build-tui", "verify-assets"} <= waits_on, (
-            f"the release job waits on {sorted(waits_on)} — it must gate on the "
-            "wheel build, the coord-tui build, and the completeness check, or it "
-            "can publish a Release that is missing half the system"
+        assert {"build-wheel", "verify-assets"} <= waits_on, sorted(waits_on)
+        assert "build-tui" not in waits_on, (
+            "the release job still waits on a coord-tui build that this "
+            "workflow no longer runs — it would block forever"
         )
 
         check = "\n".join(
@@ -178,17 +205,57 @@ class TestUnifiedReleaseWorkflow:
             if step.get("run")
         )
         assert "*.whl" in check, "verify-assets never collects the wheel as an asset"
+        assert "coord-tui" not in check, (
+            "verify-assets still requires `coord-tui-*` assets. Nothing in "
+            "this run builds one, so EVERY release from this repo would fail "
+            "as incomplete — the exact regression #2898's criterion 1 names."
+        )
+
+    def test_the_tui_channel_checks_its_own_asset_completeness(self) -> None:
+        """The completeness bar publish.yml used to enforce for the fused
+        channel does not evaporate — it moves with the binaries. Windows stays
+        deliberately absent (`best_effort: true` in the matrix), so a
+        Windows-only hiccup cannot withhold an otherwise-complete release."""
+        jobs = _load(RELEASE_TUI_YML)["jobs"]
+        release_job = next(
+            job for job in jobs.values()
+            if _steps_using({"jobs": {"j": job}}, "softprops/action-gh-release")
+        )
+        check = "\n".join(s.get("run", "") for s in release_job["steps"] if s.get("run"))
         for target in ("x86_64-linux", "x86_64-macos", "aarch64-macos"):
             assert target in check, (
-                f"verify-assets does not assert coord-tui-{target} is present; "
+                f"release-tui.yml does not assert coord-tui-{target} is present; "
                 "a silently binary-less release is what PKG-3's acceptance bar "
-                "forbids"
+                "forbids, and it is now the only place that check can live"
             )
+        assert "x86_64-windows" not in check, (
+            "Windows is best_effort — requiring it would let one flaky leg "
+            "withhold the whole release"
+        )
+
+    def test_the_tui_channel_reinstates_the_tag_is_on_main_guard(self) -> None:
+        """#1471's guard moved to publish.yml's `verify-tag` in #1242 because
+        publish.yml owned the trigger. Now that the tag push reaches
+        release-tui.yml directly in a repo where publish.yml does not exist,
+        the guard has to come back with it — a Release cut from a tag whose
+        commit branch protection rejected advertises code nobody can
+        reproduce."""
+        jobs = _load(RELEASE_TUI_YML)["jobs"]
+        runs = "\n".join(
+            step.get("run", "")
+            for job in jobs.values()
+            for step in (job.get("steps") or [])
+            if step.get("run")
+        )
+        assert "merge-base --is-ancestor" in runs, (
+            "release-tui.yml publishes on its own tag push with no "
+            "tag-is-on-main guard anywhere in it"
+        )
 
     def test_dry_run_builds_and_checks_everything_but_publishes_nothing(self) -> None:
         """The acceptance criterion's "(or dry-run)": a maintainer must be able
-        to prove the whole asset set builds and agrees on a version *without*
-        an irreversible PyPI upload — this workflow's own changes cannot
+        to prove the asset set builds and agrees on a version *without* an
+        irreversible PyPI upload — this workflow's own changes cannot
         otherwise be tested before they run for real."""
         workflow = _load(PUBLISH_YML)
         jobs = workflow["jobs"]
@@ -204,7 +271,7 @@ class TestUnifiedReleaseWorkflow:
 
         # ...while the jobs that prove the release is complete carry no such
         # guard, so a dry run exercises them in full.
-        for name in ("build-wheel", "build-tui", "verify-assets"):
+        for name in ("build-wheel", "verify-assets"):
             assert "dry_run" not in str(jobs[name].get("if", "")), (
                 f"job {name!r} is skipped on a dry run, which defeats the point "
                 "of having one"

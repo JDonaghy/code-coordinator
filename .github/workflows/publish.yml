@@ -1,8 +1,25 @@
-name: Release (wheel + coord-tui binaries)
+name: Release (wheel)
 
 # #1242 (PKG-6): ONE `v*` tag produces ONE GitHub Release carrying the whole
 # system at one version — the PyPI wheel (with the `[server]` extra
-# declared), the coord-tui binaries, and generated release notes.
+# declared) and generated release notes.
+#
+# #2898 (phase 3 of #2894): "the whole system" no longer includes coord-tui,
+# for the same reason #2009 removed the phone webapp — it is its own repo
+# now, with its own `v*` tag namespace and its own Releases. This workflow
+# used to call `.github/workflows/release-tui.yml` as a reusable workflow
+# (`build-tui`) and gate `release` on its binaries; both are gone, and
+# `verify-assets` no longer looks for `coord-tui-*` at all. That is the
+# point of criterion 1: tagging `v*` HERE must produce a wheel and no
+# coord-tui binaries, and must not fail for their absence.
+#
+# The tui half now lives in coord-tui's repo, staged in this tree at
+# `tui/.github/workflows/release-tui.yml` until the #2894 move story carries
+# it over. It fires on its own `v*` push and creates its own Release. One
+# tag cannot stamp two repos, so the two version lines are independent by
+# construction: coord `v0.5.x` alongside coord-tui `v0.2.y` is correct, and
+# `coord tui update` / `coord release verify` are taught that in
+# `coord/tui_release.py` and `coord/release_propagate.py`.
 #
 # #2009 (epic #2002): "the whole system" no longer includes the phone webapp.
 # It used to: `build-wheel` ran `npm ci && npm run build` in
@@ -33,14 +50,16 @@ name: Release (wheel + coord-tui binaries)
 #   binaries only, with the actual Python package reachable solely from
 #   PyPI.
 #
-#   Now release-tui.yml is a *reusable* workflow (`workflow_call`) that this
-#   one calls, so both halves are jobs of a single run, and exactly one job
-#   — `release`, at the bottom — creates the GitHub Release.
+#   The fix made release-tui.yml a *reusable* workflow this one called, so
+#   both halves were jobs of a single run. Post-#2898 the two workflows are
+#   in different repos entirely, which removes the shared-Release race at the
+#   root: `release`, at the bottom, is still the only job here that creates a
+#   GitHub Release, and it is now the only release-creating step in this repo
+#   full stop.
 #
 # Version single-sourcing (#1238, PKG-2): nothing here hardcodes a version.
-# The wheel's comes from setuptools-scm reading the tag; coord-tui's comes
-# from the same tag, passed down to release-tui.yml by `plan` below. The
-# `build-wheel` and `verify-assets` jobs are the gates that they agree.
+# The wheel's comes from setuptools-scm reading the tag, and `build-wheel`'s
+# `scripts/verify_release_wheel.py` step is the gate that it took.
 #
 # Release muscle-memory: push a `vX.Y.Z` tag. Do NOT commit a version bump —
 # there is no version literal left to bump.
@@ -73,9 +92,9 @@ on:
     inputs:
       dry_run_tag:
         description: >-
-          Dry-run version tag. Builds the wheel and every
-          coord-tui target, verifies each is stamped with this version and
-          that the complete asset set is present — then STOPS. No PyPI
+          Dry-run version tag. Builds the wheel, verifies it is stamped with
+          this version and that the complete asset set is present — then
+          STOPS. No PyPI
           upload, no GitHub Release, no tag pushed. This is how you validate
           a change to this workflow, since a real run publishes immutably to
           PyPI. Must be PEP 440-parseable once the leading `v` is stripped
@@ -149,8 +168,9 @@ jobs:
   # are independent refs). Refuse to publish from a tag whose commit never
   # actually landed on main — PyPI releases are immutable, so failing here is
   # far cheaper than a bad publish. Every build job in this run gates on this
-  # one, including the coord-tui build (which used to carry its own copy of
-  # this check back when it was independently triggered by the tag push).
+  # one. (#2898: the coord-tui build is gone from this workflow entirely, and
+  # carries its own copy of this check again now that its own repo's
+  # release-tui.yml is triggered by its own tag push.)
   #
   # Skipped for dry runs, which build whatever ref they were dispatched
   # against and never publish anything.
@@ -159,9 +179,11 @@ jobs:
     if: needs.plan.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     outputs:
-      # Does THIS tag's release range ship PyPI wheel content? (#2102) A
-      # `tui/`-only range still gets here — it still cuts a tag and a
-      # GitHub Release — but publish-pypi below skips the upload for it.
+      # Does THIS tag's release range ship PyPI wheel content? (#2102)
+      # #2898: `tui/` is no longer a shipping prefix in this repo at all
+      # (scripts/next_release_tag.py) — it has its own channel — so a
+      # hand-pushed tag over a non-wheel range still cuts a tag and a GitHub
+      # Release here, and publish-pypi below skips the upload for it.
       wheel: ${{ steps.wheel.outputs.wheel }}
     steps:
       - uses: actions/checkout@v4
@@ -264,29 +286,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # PKG-3's build matrix, called as a reusable workflow so its binaries are
-  # artifacts of *this* run and land in the same Release as the wheel. The
-  # tag is passed explicitly rather than left to `github.ref_name` inside the
-  # callee: "everything at one version" should be a value handed down from
-  # one place, not re-derived independently in two.
-  build-tui:
-    needs: [plan, verify-tag]
-    if: ${{ always() && needs.plan.result == 'success' && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
-    uses: ./.github/workflows/release-tui.yml
-    with:
-      tag: ${{ needs.plan.outputs.tag }}
-      # Same reason build-wheel pins it (#2035): under `workflow_call` the
-      # default ref is the caller's branch, so the binaries would be built
-      # from main's tip and stamped with the tag's version.
-      ref: ${{ needs.plan.outputs.ref }}
-
   # The acceptance gate, and the reason a dry run is worth running: prove the
-  # single asset set is complete BEFORE anything irreversible happens. Runs
+  # asset set is complete BEFORE anything irreversible happens. Runs
   # identically in both modes.
   verify-assets:
     # `plan` is already a transitive dependency, but `needs.plan.outputs` is
     # only readable from a *direct* `needs` entry.
-    needs: [plan, build-wheel, build-tui]
+    needs: [plan, build-wheel]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -295,9 +301,17 @@ jobs:
 
       - name: Collect and check the release asset set
         shell: bash
+        # #2898: `coord-tui-*` is gone from BOTH the collect glob and the
+        # completeness loop below, and its absence must not be treated as an
+        # incomplete release — that is criterion 1 of #2898. coord-tui's
+        # binaries are published by coord-tui's own repo's release-tui.yml
+        # onto ITS Release, which is what `coord tui update` now resolves
+        # (coord/tui_release.py's DEFAULT_REPO). Re-adding a `coord-tui-*`
+        # check here would fail every release in this repo forever, since
+        # nothing in this run builds one any more.
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name 'coord-tui-*' \) \
+          find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) \
             -exec cp {} release-assets/ \;
           ls -la release-assets
 
@@ -306,15 +320,6 @@ jobs:
           # proved they carry the tag version; this proves they got here.
           compgen -G 'release-assets/*.whl' > /dev/null || missing="$missing wheel"
           compgen -G 'release-assets/*.tar.gz' > /dev/null || missing="$missing sdist"
-
-          # release-tui.yml's non-best-effort matrix legs — the stated
-          # acceptance bar. Windows is deliberately absent: it is
-          # `best_effort: true` there, so a Windows-only build hiccup must
-          # not withhold an otherwise-complete release. `coord tui update`
-          # (coord/tui_release.py) resolves exactly these asset names.
-          for target in x86_64-linux x86_64-macos aarch64-macos; do
-            [ -f "release-assets/coord-tui-$target" ] || missing="$missing coord-tui-$target"
-          done
 
           if [ -n "$missing" ]; then
             echo "::error::Release ${{ needs.plan.outputs.tag }} would be incomplete — missing:$missing"
@@ -327,10 +332,10 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  # #2102: skipped for a `tui/`-only range. Nothing changed in the wheel this
+  # #2102: skipped for a range with no wheel content. Nothing changed in the wheel this
   # run built (it's still built and still attached to the GitHub Release
   # below, byte-identical to its predecessor apart from the version string),
-  # so there is nothing to publish — a `tui/`-only merge must not mint a PyPI
+  # so there is nothing to publish — such a merge must not mint a PyPI
   # upload, and `verify-tag`'s `wheel` output (computed from the tag alone,
   # independent of how it was triggered) is what decides. Failing OPEN: an
   # empty/unset output (a value neither 'true' nor 'false') still publishes —
@@ -363,9 +368,9 @@ jobs:
   # run — `verify-assets` above already proved what it would have published.
   #
   # `always()` + the explicit `publish-pypi` result check (#2102): a
-  # `tui/`-only range SKIPS publish-pypi above rather than failing it, and a
+  # wheel-less range SKIPS publish-pypi above rather than failing it, and a
   # skipped `needs` job would otherwise skip every job downstream of it by
-  # default — which would leave `tui/`-only ranges cutting no GitHub Release
+  # default — which would leave such ranges cutting no GitHub Release
   # at all, the opposite of what this issue asks for. `success` still gates
   # normally for a mixed range that actually published.
   release:
@@ -407,7 +412,7 @@ jobs:
   # call — because the defect it guards is a property of the release path,
   # not of any one trigger.
   #
-  # #2102: for a `tui/`-only range this no longer means "servable from
+  # #2102: for a range with no wheel content this no longer means "servable from
   # PyPI" — publish-pypi deliberately skipped, so polling the index would
   # wait 600s and then fail loudly for a wheel that was never supposed to
   # exist. The post-condition instead becomes "the GitHub Release exists
@@ -447,7 +452,7 @@ jobs:
           set -euo pipefail
           args=(--tag "$TAG" --github-repo "${{ github.repository }}" --timeout 600 --interval 15)
           if [ "$WHEEL" = "false" ]; then
-            echo "::notice::$TAG shipped no PyPI wheel (tui/-only range, #2102) — checking the GitHub Release only."
+            echo "::notice::$TAG shipped no PyPI wheel (no wheel content in range, #2102) — checking the GitHub Release only."
             args+=(--skip-pypi)
           fi
           python scripts/verify_release_published.py "${args[@]}"

@@ -54,43 +54,52 @@ with a commit-message opt-out, coalesced by a workflow concurrency group**:
   in the merge commit message suppresses the tag. An escape hatch that
   lives in the merge itself needs no second action and no repo state.
 
-WHY ``tui/`` STAYS A SHIPPING PREFIX (#2081)
----------------------------------------------
-A `tui/`-only merge cuts a PyPI version whose wheel is byte-identical to its
-predecessor except the version string, and it moves the fleet's expected
-version, so every host's `coord release verify` goes red for a change that
-cannot reach any of them — coord-tui is a per-host binary with no remote
-install path (see `lane_is_out_of_reach` in `coord/release_propagate.py`).
-That is a real cost, and #2081 asked, explicitly, whether `tui/` should keep
-driving a PyPI/expected-version bump at all, or only a GitHub Release (PKG-6,
-#1242, attaches the coord-tui binaries there and does need an artifact home).
+WHY ``tui/`` IS NO LONGER A SHIPPING PREFIX (#2081 -> #2102 -> #2898)
+---------------------------------------------------------------------
+A `tui/`-only merge used to cut a PyPI version whose wheel was byte-identical
+to its predecessor except the version string, and it moved the fleet's
+expected version, so every host's `coord release verify` went red for a change
+that could not reach any of them — coord-tui is a per-host binary with no
+remote install path (see `lane_is_out_of_reach` in
+`coord/release_propagate.py`).
 
-Judged not worth doing here: the two are not separable without touching how a
-release is *built*, which #2081 puts out of scope (`publish.yml`'s jobs are
-one call, one tag, one Release — #1238/PKG-2's whole point was removing a
-second version to drift from the first). Splitting them would mean either a
-second tag namespace for coord-tui, or teaching `publish.yml` to skip the
-PyPI/verify-published leg for some tags but not others — real surgery on the
-publish pipeline, not a path-filter tweak. `tui/` therefore stays in
-:data:`SHIPPING_PREFIXES`, deliberately, and this paragraph — plus
-``test_tui_only_still_ships`` in ``tests/test_next_release_tag.py`` — is that
-decision on the record rather than left implicit.
+#2081 asked, explicitly, whether `tui/` should keep driving a PyPI/expected-
+version bump at all, or only a GitHub Release. It judged the two inseparable
+without touching how a release is *built*, which #2081 put out of scope:
+`publish.yml`'s jobs were one call, one tag, one Release. #2102 then split off
+half the answer — the tag still got cut, but the wheel upload was skipped for
+such a range (:func:`ships_wheel`).
 
-#2102 REVISITS THE OTHER HALF: THE WHEEL, NOT THE TAG
+#2898 (phase 3 of #2894) does the surgery #2081 deferred, and it settles the
+other half: coord-tui has its own repo, its own `v*` tag namespace and its own
+`release-tui.yml` firing on its own tag push, so a `tui/` change in THIS repo
+reaches no wheel, no binary this repo publishes, and no host's unit directory.
+That is exactly :data:`NON_SHIPPING_PREFIXES`' definition, which is where
+`tui/` now lives. A `tui/`-only merge here cuts nothing at all; the coord-tui
+release it wants comes from a tag in coord-tui's channel.
+
+The `tui/` tree is still present in this repo until #2894's move story lands,
+which is why the prefix is listed rather than simply absent — an unlisted
+top-level directory would default to *shipping* (see
+:data:`NON_SHIPPING_PREFIXES`), reinstating the no-op release this removes.
+``test_tui_only_ships_nothing`` in ``tests/test_next_release_tag.py`` pins it.
+
+#2102 SPLIT THE TAG DECISION FROM THE WHEEL DECISION
 ------------------------------------------------------
-The operator call above (2026-08-10) is that a `tui/`-only merge must still
-cut ONE tag and ONE GitHub Release — `coord tui update --version X.Y.Z` needs
-somewhere to fetch the binary from — but must publish no PyPI wheel, since the
-wheel a `tui/`-only range would build is byte-identical to its predecessor
-apart from the version string. That is deliberately *not* a change to
-:func:`ships_code`/:data:`SHIPPING_PREFIXES` above: the tag/release decision
-and the wheel decision are now two separate questions, answered by
-:func:`ships_code` and :func:`ships_wheel` respectively. Keeping them separate
-functions (rather than teaching one function two return values) is what lets
-each be pinned by its own tests without the two drifting apart — see
-``test_tui_only_still_ships`` (ships_code) and
-``test_tui_only_ships_no_wheel`` (ships_wheel) in
-``tests/test_next_release_tag.py``.
+#2102's operator call (2026-08-10) was that a `tui/`-only merge must still cut
+ONE tag and ONE GitHub Release — `coord tui update --version X.Y.Z` needed
+somewhere to fetch the binary from — but must publish no PyPI wheel. That
+produced the two-question shape kept here: the tag/release decision and the
+wheel decision are answered separately, by :func:`ships_code` and
+:func:`ships_wheel`. Keeping them separate functions (rather than teaching one
+function two return values) is what lets each be pinned by its own tests
+without the two drifting apart.
+
+#2898 then took `tui/` out of the picture on the tag side entirely (above), so
+the two functions currently agree on every input — but the *shape* is the part
+worth keeping, not the one prefix that motivated it. See
+``test_tui_only_ships_nothing`` and ``test_a_single_coord_file_ships_a_wheel``
+in ``tests/test_next_release_tag.py``.
 
 :func:`ships_wheel` is computed independently inside `publish.yml` (via
 ``--wheel-for-tag``), not threaded through from `auto-release.yml`'s merge-time
@@ -128,7 +137,6 @@ from dataclasses import dataclass
 #: systemd directory. Anything here is shipping code.
 SHIPPING_PREFIXES: tuple[str, ...] = (
     "coord/",
-    "tui/",
     "deploy/",
     "scripts/",
     "pyproject.toml",
@@ -173,14 +181,32 @@ NON_SHIPPING_PREFIXES: tuple[str, ...] = (
     # by a workflow step, not shipped to any wheel, binary, or host's unit
     # directory. A tag changes nothing about what a CI run sees.
     ".github/coord-ci-acceptance.yml",
+    # #2898: coord-tui releases from its own repo on its own `v*` tag line
+    # (see the module docstring). A `tui/` change here reaches no wheel, no
+    # binary this repo publishes, and no host's unit directory, so a tag
+    # minted for one would be a pure no-op that still moves the fleet's
+    # expected version. Listed explicitly rather than left to the move story
+    # to delete: while the tree is still here, an *unlisted* prefix would
+    # default to shipping.
+    "tui/",
 )
 
 #: SHIPPING_PREFIXES entries that ship a release (a tag, a GitHub Release)
-#: but never reach the PyPI wheel specifically (#2102). `tui/` is the only
-#: member: the coord-tui binaries live on the GitHub Release, never inside
-#: the wheel, so a range that touches nothing else has no wheel content to
-#: publish. See :func:`ships_wheel`.
-WHEEL_EXCLUDED_SHIPPING_PREFIXES: tuple[str, ...] = ("tui/",)
+#: but never reach the PyPI wheel specifically (#2102).
+#:
+#: **Currently empty (#2898).** `tui/` was its only member — the coord-tui
+#: binaries lived on this repo's GitHub Release, never inside the wheel — and
+#: it is now a non-shipping prefix outright, because coord-tui publishes from
+#: its own repo's Release channel. So every remaining shipping prefix reaches
+#: the wheel, and :func:`ships_wheel` currently agrees with
+#: :func:`ships_code` on every input.
+#:
+#: Kept (empty) rather than deleted along with :func:`ships_wheel`: the
+#: tag decision and the wheel decision are genuinely two questions, `publish.
+#: yml` still asks the second one via ``--wheel-for-tag``, and collapsing
+#: them now would mean re-deriving the distinction the next time an asset
+#: ships on a Release without shipping in the wheel.
+WHEEL_EXCLUDED_SHIPPING_PREFIXES: tuple[str, ...] = ()
 
 #: Case-insensitive markers in the merge commit message that suppress the
 #: release entirely.
@@ -206,7 +232,7 @@ class Decision:
     #: when ``release`` is True — a merge that cuts no release obviously ships
     #: no wheel either. Kept as its own field (not folded into ``release``)
     #: because `publish.yml` must still cut the tag and the GitHub Release for
-    #: a `tui/`-only range; only the PyPI upload is conditional.
+    #: a range with no wheel content; only the PyPI upload is conditional.
     wheel: bool = True
 
 
@@ -254,20 +280,21 @@ def ships_code(changed_files: list[str]) -> bool:
 def ships_wheel(changed_files: list[str]) -> bool:
     """Does this change reach the PyPI wheel specifically? (#2102)
 
-    A `tui/`-only range still :func:`ships_code` — it still cuts a tag and a
-    GitHub Release carrying the coord-tui binaries — but the wheel that range
-    would build is byte-identical to its predecessor apart from the version
-    string, so uploading it is pure waste and moves the fleet's PyPI-derived
-    "expected version" for a change that reaches no wheel-installed lane.
+    Distinct from :func:`ships_code` because a range can legitimately ship a
+    tag and a GitHub Release while having no wheel content to upload. As of
+    #2898 :data:`WHEEL_EXCLUDED_SHIPPING_PREFIXES` is empty — `tui/` was its
+    only member and now has its own release channel entirely — so today every
+    shipping prefix also lands inside the wheel (`coord/`, `pyproject.toml`,
+    the `deploy/*` package data) or is packaging machinery whose own change
+    legitimately wants a wheel built and verified end to end (`scripts/`,
+    `MANIFEST.in`, `install-agent.sh`), and this agrees with
+    :func:`ships_code` on every input.
 
-    Every other :data:`SHIPPING_PREFIXES` entry either lands inside the wheel
-    (`coord/`, `pyproject.toml`, the `deploy/*` package data) or is packaging
-    machinery whose own change legitimately wants a wheel built and verified
-    end to end (`scripts/`, `MANIFEST.in`, `install-agent.sh`) — so this is
-    :func:`ships_code`'s exact allow/deny walk, with `tui/` carved out as a
-    non-wheel shipping prefix rather than a non-shipping one. An empty change
-    list fails open for the same reason ``ships_code`` does: an undetectable
-    diff must never silently skip a wheel that should have shipped.
+    That is a property of today's prefix table, not a redundancy: `publish.
+    yml` asks this question separately (``--wheel-for-tag``) and its
+    publish-pypi job is still conditional on the answer. An empty change list
+    fails open for the same reason ``ships_code`` does: an undetectable diff
+    must never silently skip a wheel that should have shipped.
     """
     if not changed_files:
         return True
@@ -338,8 +365,8 @@ def decide(*, tags: list[str], message: str, changed_files: list[str]) -> Decisi
     reason = "shipping paths changed; patch/minor/major bump from v%d.%d.%d" % current
     if not wheel:
         reason += (
-            " (tui/-only — no PyPI wheel to publish; GitHub Release + "
-            "coord-tui binaries only, #2102)"
+            " (no PyPI wheel content in range — GitHub Release only, "
+            "#2102)"
         )
     return Decision(True, "v%d.%d.%d" % nxt, reason, wheel=wheel)
 

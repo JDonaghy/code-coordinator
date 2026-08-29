@@ -1,13 +1,35 @@
-"""`coord tui` — self-update the coord-tui binary from this coordinator's
-own GitHub Release channel (#1240, PKG-4).
+"""`coord tui` — self-update the coord-tui binary from **coord-tui's own**
+GitHub Release channel (#1240, PKG-4; re-pointed by #2898).
 
-PKG-3 (#1239) put ``coord-tui-<target>`` binaries on the GitHub Release; the
+PKG-3 (#1239) put ``coord-tui-<target>`` binaries on a GitHub Release; the
 gap this closes is that a user still had to find the right asset, download
 it, `chmod +x` it, and place it by hand. `coord tui update` does all of
 that in one command, and `coord tui status` (also what a bare `coord tui`
-runs) is the "lightweight version-skew notice" the issue asks for — a
-local, on-demand check, not something bolted onto `main()`'s callback and
-paid by every `coord` invocation.
+runs) is the "lightweight version-skew notice" the issue asks for — an
+on-demand check, not something bolted onto `main()`'s callback and paid by
+every `coord` invocation.
+
+#2898 — WHAT THE SKEW NOTICE COMPARES AGAINST, AND WHY IT CHANGED
+------------------------------------------------------------------
+`coord tui status` used to print the installed coord-tui version next to
+**this coordinator's** ``coord.__version__`` and call any difference skew.
+That was correct exactly as long as one ``v*`` tag stamped both (#1242): the
+wheel and the binaries came off one Release, so they agreed by construction
+and a mismatch really did mean "your binary is stale".
+
+Phase 3 of #2894 split the channels. coord-tui releases from its own repo on
+its own tag line, so coord ``v0.5.x`` alongside coord-tui ``v0.2.y`` is the
+*normal* state — comparing them would print a permanent, meaningless warning
+and train everyone to ignore the one notice that matters. The comparison is
+now installed-vs-**coord-tui's own latest release**
+(:func:`coord.tui_release.fetch_latest_release_tag`), which costs one GitHub
+API call. Wire compatibility between a coord-tui build and a board daemon is
+deliberately NOT this command's question — it belongs to coord-tui's own CI
+(the phase-3 ADR), not to a version-number diff here.
+
+That one call is the only reason this command touches the network at all, so
+``--offline`` skips it and still prints what is installed: a status command
+must stay useful on a machine that cannot reach github.com.
 
 The actual resolve/download/install mechanics live in
 :mod:`coord.tui_release`, framework-agnostic so they're unit-testable
@@ -31,10 +53,12 @@ from coord.tui_release import (
     UnsupportedPlatformError,
     detect_target,
     download_asset,
+    fetch_latest_release_tag,
     fetch_release_assets,
     find_asset,
     find_checksum_asset,
     install_atomically,
+    normalize_version,
     read_installed_version,
     sha256_file,
 )
@@ -49,8 +73,8 @@ def _dest_path(dest: str | None) -> Path:
     invoke_without_command=True,
     help=(
         "Manage the coord-tui binary. Without a subcommand, runs `coord tui "
-        "status` (installed coord-tui version vs. this coordinator's own "
-        f"version, {DEFAULT_INSTALL_PATH} by default)."
+        "status` (installed coord-tui version vs. coord-tui's own latest "
+        f"release, {DEFAULT_INSTALL_PATH} by default)."
     ),
 )
 @click.pass_context
@@ -62,11 +86,16 @@ def tui_group(ctx: click.Context) -> None:
 @tui_group.command(
     "status",
     help=(
-        "Print the installed coord-tui version next to this coordinator's "
-        "own version, and hint at `coord tui update` on skew. Purely local "
-        "-- reads `<dest> --version`, no network call -- so it's cheap "
-        "enough to run on demand without adding it to every `coord` "
-        "invocation's hot path."
+        "Print the installed coord-tui version next to the latest release "
+        f"in coord-tui's own channel ({DEFAULT_REPO}), and hint at `coord "
+        "tui update` on skew.\n\n"
+        "#2898: this compares against COORD-TUI's latest, not `coord "
+        "--version`. The two ship from separate repos on separate tag lines "
+        "since the #2894 split, so a coordinator on v0.5.x next to a "
+        "coord-tui on v0.2.y is correct, not skew -- grading one against "
+        "the other would warn forever.\n\n"
+        "One GitHub API call, and `--offline` skips even that: reading "
+        "`<dest> --version` is local, so this stays useful without network."
     ),
 )
 @click.option(
@@ -74,32 +103,106 @@ def tui_group(ctx: click.Context) -> None:
     default=None,
     help=f"Path to the coord-tui binary to check. Default: {DEFAULT_INSTALL_PATH}",
 )
-def tui_status(dest: str | None) -> None:
-    _print_skew_notice(_dest_path(dest))
+@click.option(
+    "--repo",
+    default=DEFAULT_REPO,
+    show_default=True,
+    help="GitHub owner/repo whose latest release to compare against.",
+)
+@click.option(
+    "--api-base",
+    default=DEFAULT_API_BASE,
+    show_default=True,
+    help="GitHub API base URL -- override to point at a stub endpoint (tests only).",
+)
+@click.option(
+    "--timeout",
+    default=10.0,
+    show_default=True,
+    type=float,
+    help="Network timeout (seconds) for the latest-release lookup.",
+)
+@click.option(
+    "--offline",
+    is_flag=True,
+    help="Skip the latest-release lookup entirely; just report what is installed.",
+)
+def tui_status(
+    dest: str | None,
+    repo: str,
+    api_base: str,
+    timeout: float,
+    offline: bool,  # noqa: FBT001
+) -> None:
+    _print_skew_notice(
+        _dest_path(dest), repo=repo, api_base=api_base, timeout=timeout, offline=offline
+    )
 
 
-def _print_skew_notice(binary_path: Path) -> bool:
-    """Print installed-vs-coordinator version lines. Returns True on skew
-    (including "not installed at all"), False when they match."""
+def _latest_or_none(
+    *, repo: str, api_base: str, timeout: float, offline: bool
+) -> tuple[str | None, str | None]:
+    """``(latest_version, why_not)`` — never raises.
+
+    An unreachable release channel is a *missing comparison*, not a failure:
+    the installed-version half of this command is purely local and still
+    worth printing. Returning the reason rather than swallowing it keeps
+    "could not check" visibly different from "checked, and you are current".
+    """
+    if offline:
+        return None, "--offline"
+    try:
+        return fetch_latest_release_tag(repo=repo, api_base=api_base, timeout=timeout), None
+    except Exception as exc:  # noqa: BLE001 -- any network/HTTP failure is soft here
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _print_skew_notice(
+    binary_path: Path,
+    *,
+    repo: str = DEFAULT_REPO,
+    api_base: str = DEFAULT_API_BASE,
+    timeout: float = 10.0,
+    offline: bool = False,
+) -> bool:
+    """Print installed-vs-coord-tui-latest version lines. Returns True on skew
+    (including "not installed at all"), False when they match or when the
+    latest could not be resolved (unknown is not evidence of skew)."""
+    installed: str | None = None
     if not binary_path.exists():
         click.echo(f"coord-tui: not installed at {binary_path}")
-        click.echo(f"coord:     {__version__}")
+    else:
+        installed = read_installed_version(binary_path)
+        if installed is None:
+            click.echo(f"coord-tui: {binary_path} did not report a parseable --version")
+        else:
+            click.echo(f"coord-tui: {installed} ({binary_path})")
+
+    latest, why_not = _latest_or_none(
+        repo=repo, api_base=api_base, timeout=timeout, offline=offline
+    )
+    if latest is not None:
+        click.echo(f"latest:    {latest} ({repo})")
+    else:
+        click.echo(f"latest:    unknown ({repo}) -- {why_not}")
+
+    # Printed as context, explicitly NOT as the thing being graded (#2898).
+    click.echo(
+        f"coord:     {__version__} (separate release channel since #2898 -- not compared)"
+    )
+
+    if installed is None:
         click.echo("Run `coord tui update` to install it.")
         return True
-
-    installed = read_installed_version(binary_path)
-    if installed is None:
-        click.echo(f"coord-tui: {binary_path} did not report a parseable --version")
-        click.echo(f"coord:     {__version__}")
-        click.echo("Run `coord tui update` to reinstall it.")
-        return True
-
-    click.echo(f"coord-tui: {installed} ({binary_path})")
-    click.echo(f"coord:     {__version__}")
-    if installed != __version__:
+    if latest is None:
         click.echo(
-            "⚠ version skew — run `coord tui update` to match this "
-            "coordinator's version."
+            "(could not resolve coord-tui's latest release, so no skew verdict "
+            "-- the installed version above is still accurate)"
+        )
+        return False
+    if normalize_version(installed) != normalize_version(latest):
+        click.echo(
+            f"⚠ version skew — run `coord tui update` to install coord-tui {latest}."
         )
         return True
     click.echo("✓ up to date")
@@ -109,9 +212,13 @@ def _print_skew_notice(binary_path: Path) -> bool:
 @tui_group.command(
     "update",
     help=(
-        "Download the coord-tui binary matching this coordinator's own "
-        "version (coord --version) from its GitHub Release, and install "
-        "it.\n\n"
+        "Download the newest coord-tui binary from coord-tui's own GitHub "
+        f"Release channel ({DEFAULT_REPO}), and install it.\n\n"
+        "#2898: the default version is COORD-TUI's latest release, not "
+        "`coord --version`. Since the #2894 split the coordinator's tag "
+        "line lives in a different repo, so resolving this coordinator's "
+        "version here would ask coord-tui's channel for a tag it never "
+        "minted. Pass --version to pin an exact one.\n\n"
         "Platform detection: maps this host's `platform.system()`/"
         "`platform.machine()` to one of release-tui.yml's build-matrix "
         "targets (x86_64-linux, x86_64-macos, aarch64-macos, "
@@ -137,7 +244,7 @@ def _print_skew_notice(binary_path: Path) -> bool:
     "--version",
     "version_override",
     default=None,
-    help="Install this exact version instead of this coordinator's own version (coord --version).",
+    help="Install this exact version instead of coord-tui's latest release.",
 )
 @click.option(
     "--dest",
@@ -180,7 +287,6 @@ def tui_update(
     timeout: float,
     force: bool,  # noqa: FBT001
 ) -> None:
-    target_version = version_override or __version__
     dest_path = _dest_path(dest)
 
     try:
@@ -188,6 +294,30 @@ def tui_update(
     except UnsupportedPlatformError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(1)
+
+    # #2898: resolved from coord-tui's OWN channel, before the dev-build /
+    # already-current short-circuits below — those compare the installed
+    # binary against the version this run would install, and that is no
+    # longer something the coordinator knows locally.
+    #
+    # Fatal here, unlike in `tui status`: there is nothing to install if the
+    # channel cannot be reached, and silently falling back to some other
+    # version (this coordinator's, say) is exactly the cross-channel guess
+    # the split exists to make impossible.
+    target_version = normalize_version(version_override)
+    if target_version is None:
+        try:
+            target_version = fetch_latest_release_tag(
+                repo=repo, api_base=api_base, timeout=timeout
+            )
+        except Exception as exc:  # noqa: BLE001 -- surface any network/HTTP failure plainly
+            click.echo(
+                f"error: could not resolve coord-tui's latest release from "
+                f"{repo}: {exc}",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"Latest coord-tui release in {repo}: v{target_version}")
 
     if dest_path.exists() and not force:
         installed = read_installed_version(dest_path)
@@ -204,7 +334,7 @@ def tui_update(
                 err=True,
             )
             sys.exit(3)
-        if installed == target_version:
+        if normalize_version(installed) == target_version:
             click.echo(
                 f"coord-tui is already v{target_version} at {dest_path} -- "
                 "nothing to do (--force to reinstall)."
@@ -279,7 +409,7 @@ def tui_update(
 
     installed_now = read_installed_version(dest_path)
     click.echo(f"Installed {dest_path} -- coord-tui reports {installed_now or '?'}.")
-    if installed_now != target_version:
+    if normalize_version(installed_now) != target_version:
         click.echo(
             f"⚠ installed binary reports {installed_now!r}, expected "
             f"{target_version!r} -- the release asset may be mislabeled.",

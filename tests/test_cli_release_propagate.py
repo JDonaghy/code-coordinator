@@ -2240,3 +2240,94 @@ def test_restart_sibling_services_tolerates_a_pre_2069_agent(monkeypatch):
     assert ok is None
     assert "404" in detail
     assert failed == {}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2898: the tui lane rolls its OWN channel
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_roll_tui_never_passes_a_coordinator_version(monkeypatch):
+    """THE #2898 REGRESSION TEST for the roll half.
+
+    This used to run `coord tui update --version <this run's target>`, correct
+    only while one `v*` tag stamped both repos (#1242). After the split that
+    argument names a tag in the COORDINATOR's channel, which coord-tui's
+    Releases have never heard of — it would 404 on every run and report a
+    failed tui lane for a fleet that is in fact perfectly current.
+    """
+    seen: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "Installed /home/u/.local/bin/coord-tui -- coord-tui reports 0.2.7."
+        stderr = ""
+
+    def _run(argv, **kwargs):
+        seen.append(list(argv))
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.run", _run)
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+
+    assert ok is True
+    assert len(seen) == 1
+    assert seen[0][-2:] == ["tui", "update"], seen[0]
+    assert "--version" not in seen[0], seen[0]
+    # What actually landed is read back out, not assumed.
+    assert "0.2.7" in detail
+    assert rp.CHANNEL_TUI in detail
+
+
+def test_roll_tui_reports_the_idempotent_path_version(monkeypatch):
+    class _Proc:
+        returncode = 0
+        stdout = "coord-tui is already v0.2.7 at /home/u/.local/bin/coord-tui -- nothing to do (--force to reinstall)."
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: _Proc())
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+    assert ok is True
+    assert "0.2.7" in detail
+
+
+def test_roll_tui_still_succeeds_when_the_version_cannot_be_parsed(monkeypatch):
+    """The roll is not a failure just because its output changed shape — the
+    version is journalling detail, the exit code is the verdict."""
+    class _Proc:
+        returncode = 0
+        stdout = "something entirely unexpected"
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: _Proc())
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+    assert ok is True
+    assert rp.CHANNEL_TUI in detail
+
+
+def test_roll_tui_on_a_remote_host_is_unrollable_not_failed(monkeypatch):
+    """#2052: `ok=None`. A lane that reports "there is no remote install path"
+    in its own message cannot also be evidence this run went wrong — that is
+    what made `--rollback-on-red` revert three good python rolls. The advice
+    it prints must not name a coordinator version either (#2898)."""
+    def _boom(*a, **k):  # pragma: no cover - must never be reached
+        raise AssertionError("a remote host must not shell out")
+
+    monkeypatch.setattr("subprocess.run", _boom)
+    ok, detail = release_cmd._roll_tui(_machine(name="macmini"), local_name="server")
+    assert ok is None
+    assert "no remote install path" in detail
+    assert "--version" not in detail
+    assert rp.CHANNEL_TUI in detail
+
+
+def test_roll_tui_surfaces_a_failed_update(monkeypatch):
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "error: could not resolve coord-tui's latest release"
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: _Proc())
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+    assert ok is False
+    assert "could not resolve" in detail
