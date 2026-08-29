@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ┌ Plans — Help ──────────────────────────────────────────────────────────────────┐
+ M│ ▶ ◇ claude-coordinator  [38 ⚠1]  │                                                                                 │
+ ▶│ ▶ ◇ quadraui             [3 ⚠1]  │  Navigation                      Actions                                        │
+ >│ ▶ ◇ vimcode               [0]     │  j / k        up / down           right-click   open context menu              │
+ ▦│                                   │  Enter        open detail pane    ?             this help overlay              │
+ ≣│                                   │  Esc          close / back        /             command palette                │
+▎◆│                                   │                                   c             quick capture plan             │
+ ◉│                                   │                                   C             guided chat (new plan)         │
+ §│                                   │                                   u             toggle untracked milestones    │
+ $│                                   │                                   r             refresh                        │
+  │                                   │                                   q             quit                           │
+  │                                   │  Health chips                                                                  │
+  │                                   │  ● ready_waiting   issues ready to dispatch now                                │
+  │                                   │  ⏸ stalled          work order exists but nothing moving                       │
+  │                                   │  ◐ chat_pending     a milestone-chat steward is open                           │
+  │                                   │  ⚑ no_work_order    milestone has no ## Work order block                       │
+  │                                   │                                                                                │
+  │                                   │  Tree sidebar                                                                  │
+  │                                   │  ▶ ◇ repo     collapsed — click to expand                                      │
+  │                                   │  ▼ ◇ repo     expanded — milestone leaves visible                              │
+  │                                   │  ● milestone  tracked (has ## Work order)                                      │
+  │                                   │  ○ milestone  untracked (no ## Work order)                                     │
+  │                                   │                                                                                │
+  │                                   │                                             [Esc to close]                     │
+  │                                   └────────────────────────────────────────────────────────────────────────────────┘
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+ ⚙│
+ ?=help  Esc=close  q=quit

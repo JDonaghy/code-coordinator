@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ┌ PLANS ─────────────────────────────────────────────────────────────────────────┐
+ M│ ▼ ◇ claude-coordinator  [38 ⚠1]   │  claude-coordinator  #38  Plans panel -> rich cl… epic:#1120  [● ready_waiting │
+ ▶│   ▸ #38 Plans panel -> rich cl…   ├────────────────────────────────────────────────────────────────────────────────┤
+ >│   ○ #37 Oracle loop               │ #38 Plans panel -> rich client                                                 │
+ ▦│ ▶ ◇ quadraui             [3 ⚠1]   │ epic:#1120   33% done   ⚠ ready_waiting   1 blocked                            │
+ ≣│ ▶ ◇ vimcode               [0]     ├────────────────────────────────────────────────────────────────────────────────┤
+▎◆│                                   │ Work order                                                                     │
+ ◉│                                   │  ✓ #1121  CC-1: repo tree sidebar                          done                │
+ §│                                   │  · #1122  CC-2: rich in-app detail pane                    ready               │
+ $│                                   │  · #1123  CC-3: right-click menus                          ready               │
+  │                                   │  ▶ #1124  CC-4: ? help overlay + palette                   in-flight           │
+  │                                   ├────────────────────────────────────────────────────────────────────────────────┤
+  │                                   │  Dispatch next    Open chat    View DAG    Edit    Open in browser             │
+  │                                   └────────────────────────────────────────────────────────────────────────────────┘
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+  │
+ ⚙│
+ j/k=nav  Enter=detail  Esc=back to list  right-click=menu  ?=help  q=quit

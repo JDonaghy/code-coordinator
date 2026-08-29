@@ -1,0 +1,40 @@
+ B│ APPROVED WORK ITEMS               Submission  Client / Project      Repo(s)         Outcome                         
+ M│  2 ready to pull                  sub_2f6a1c  Heuron Tech / Portal  natal-chart     Customers self-serve billing ad…
+ ▶│  ⚠ 1 missing a repo mapping       sub_77b0e4  Acme Ridge / Ops dash — no mapping —  Single dashboard for shift hand…
+ >│                                   ──────────────────────────────────────────────────────────────────────────────────
+ ▦│                                   ── Submission Detail ─────────────────────────────────────────────────────────────
+ ≣│                                   submission:  sub_2f6a1c                                                           
+ ◆│                                   client:      Heuron Technologies                                                  
+ ◉│                                   project:     proj_9f2a (Portal redesign)                                          
+ §│                                   outcome:     Customers can self-serve a billing address change instead of emailing
+ ▤│                                                support.                                                             
+ ⇅│                                   audience:    Existing subscription customers on the billing portal                
+▎✓│                                   done:        Customer edits and saves a new billing address from their account    
+  │                                                page, sees it reflected immediately, and gets a confirmation email.  
+  │                                   constraints: Must reuse the existing Stripe customer object — no new payment      
+  │                                                fields.                                                              
+  │                                   repos:       natal-chart                                                          
+  │                                   received:    3d ago                                                               
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+ ⚙│                                                                                                                     
+ j/k=nav  Esc=close detail  right-click=menu  q=quit                                                                    

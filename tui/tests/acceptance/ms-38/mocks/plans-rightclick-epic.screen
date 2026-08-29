@@ -1,0 +1,40 @@
+ B│ All repos              [41 ⚠2]    ┌ PLANS ─────────────────────────────────────────────────────────────────────────┐
+ M│ ▼ ◇ claude-coordinator  [38 ⚠1]   │ ★ NORTH STAR  Make coord-tui Plans panel feel like a rich client               │
+ ▶│   ● #38 Plans panel -> rich cl…   │    updated 2026-07-12 · 7d ago                                                 │
+ >│   ○ #37 Oracle loop               │ ▾ claude-coordinator  (2 tracked)   ready=3  blocked=1   ⚠ 1 need attention    │
+ ▦│ ▶ ◇ quadraui              [3 ⚠1]  │ ▸ claude-coordinator  #38  Plans panel -> rich cl…  epic:#1120  [● ready_wait  │
+ ≣│ ▶ ◇ vimcode               [0]     │┌──────────────────────────────────────────────────┐                            │
+▎◆│                                   ││ Open milestone chat                              │                            │
+ ◉│                                   ││ Dispatch milestone                            d  │                            │
+ §│                                   ││ Dispatch next…                                   │                            │
+ $│                                   ││ View order / DAG                                 │                            │
+  │                                   ││ Edit milestone…                                  │                            │
+  │                                   ││ Add issue to milestone…                          │                            │
+  │                                   ││ Remove issue from milestone…                     │                            │
+  │                                   ││ Add sub-issue to epic…                           │                            │
+  │                                   ││ Add sub-issue via chat…                          │                            │
+  │                                   ││ Close / archive plan                             │                            │
+  │                                   ││ ──────────────────────────────────────────────── │                            │
+  │                                   ││ Refresh                                       r  │                            │
+  │                                   │└──────────────────────────────────────────────────┘                            │
+  │                                   │  claude-coordinator  #37  Oracle loop              epic:#1117  [100% done]     │
+  │                                   │    +36 without a work order  (press u to expand)                               │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+  │                                   │                                                                                │
+ ⚙│                                   └────────────────────────────────────────────────────────────────────────────────┘
+ right-click=menu  ?=help  c=capture  q=quit

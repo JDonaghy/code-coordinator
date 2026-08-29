@@ -1,0 +1,40 @@
+▎B│ ⌕ Filter issues…                  ┌ Board — Help ──────────────────────────────────────────────────────────────────┐
+ M│                                   │                                                                                │
+ ▶│▾ claude-coordinator               │ Document tabs                                                                  │
+ >│  ⋮ 1 more above                   │ click row                    open preview tab                                  │
+ ▦│  #102 Auth token refresh bug      │ double-click row             pin tab                                           │
+ ≣│▸ #103 Race condition in poller    │ Ctrl-W                       close active tab                                  │
+ ◆│  #104 Flaky CI on macOS runners   │ Ctrl-Tab / Ctrl-Shift-Tab    cycle tabs                                        │
+ ◉│  #105 Memory leak in watch loop   │ middle-click tab             close tab                                         │
+ §│                                   │ right-click tab              tab menu                                          │
+ ▤│                                   │                                                                                │
+ ⇅│                                   │ Split                                                                          │
+  │                                   │ Ctrl-W v                     split right                                       │
+  │                                   │ Ctrl-W s                     split down                                        │
+  │                                   │ Ctrl-W w                     next pane                                         │
+  │                                   │ Ctrl-W x                     close pane                                        │
+  │                                   │                                                                                │
+  │                                   │                                              [Esc to close]                    │
+  │                                   └────────────────────────────────────────────────────────────────────────────────┘
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+ ⚙│                                                                                                                     
+ Esc=close  q=quit                                                                                                      

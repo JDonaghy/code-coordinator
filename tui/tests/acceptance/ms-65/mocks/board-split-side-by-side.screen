@@ -1,0 +1,40 @@
+▎B│ ⌕ Filter issues…                  [ [A]dd ]  [ [N]otify ]  [ [R]etry ]  [ [P]urge ]                                 
+ M│                                   #101 Fix logi… ×  [#102 Auth tok… ×]    ║[∘ #103 Race con… ×]                     
+ ▶│▾ claude-coordinator               [Board]   Issue    Chat    Terminal     ║[Board]   Issue    Chat    Terminal      
+ >│  ⋮ 1 more above                                                           ║                                         
+ ▦│  #102 Auth token refresh bug       #102 Auth token refresh bug            ║ #103 Race condition in poller           
+ ≣│▸ #103 Race condition in poller      stage: Work                           ║  stage: Refine                          
+ ◆│  #104 Flaky CI on macOS runners                                                                                     
+ ◉│  #105 Memory leak in watch loop                                                                                     
+ §│                                                                                                                     
+ ▤│                                                                                                                     
+ ⇅│                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+  │                                                                                                                     
+ ⚙│                                                                                                                     
+ click=preview  dbl-click=pin  ctrl-w v/s=split  ctrl-w w=next pane  q=quit                                             
