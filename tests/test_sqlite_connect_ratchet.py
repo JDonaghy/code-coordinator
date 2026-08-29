@@ -253,6 +253,21 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "written under the handler thread is visible back on the override "
         "connection, so the two connections are the subject, not an accident.",
     ),
+    "test_client_resource_migration_1946.py": Classification(
+        2, (BUCKET_C,),
+        "#1946's Python-client migration to the #1944 resource routes, driven "
+        "end to end against a live serve app — the same daemon pair as "
+        "test_serve_rest_routes.py, whose fixtures these were copied from. One "
+        "site is the thread-safe rw_db override the write side needs "
+        "(TestClient runs each PATCH handler, and its `issues`/`assignments` "
+        "UPDATE, on a worker thread the autouse :memory: connection is bound "
+        "away from); the other is a separate on-disk file_db the app's own "
+        "SqliteStore opens by path for the read side. The whole point of this "
+        "file is that a row written under the handler thread is read back on "
+        "the override connection — asserting the DB row rather than a mock is "
+        "what catches the three renamed PATCH fields — so the two connections "
+        "are the subject, not an accident.",
+    ),
     "test_review_verdict_relay.py": Classification(
         2, (BUCKET_C,),
         "The standard daemon pair: a thread-safe rw_db override for the write "

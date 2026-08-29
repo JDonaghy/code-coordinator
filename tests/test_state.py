@@ -1921,9 +1921,21 @@ class TestRecordIssueCommentCapture:
                 path=path, payload=payload
             ) or {"ok": True},
         )
+        monkeypatch.setattr(
+            cc, "request_resource",
+            lambda *a, **k: pytest.fail(
+                "an owner/repo-slugged repo_name is not addressable as a "
+                "resource path segment — it must not be attempted (#1946)"
+            ),
+        )
         record_issue_comment_capture(
             repo_name="acme/api", issue_number=1, body="x", gh_comment_id=444,
         )
+        # #1946: capture-at-write keys `issue_comments` on the gh SLUG, and
+        # Starlette's {repo_name} converter cannot match a slash, so this one
+        # seam stays on the RPC route by design — see
+        # board_service.resource_addressable. Its telemetry is NOT evidence of
+        # an unmigrated client.
         assert captured["path"] == "/issue-comments"
         assert captured["payload"]["action"] == "capture"
         assert captured["payload"]["gh_comment_id"] == 444
@@ -2048,13 +2060,17 @@ class TestSyncIssueComments:
         )
         captured: dict = {}
         monkeypatch.setattr(
-            cc, "post_record",
-            lambda svc, path, payload, **kw: captured.update(
-                path=path, payload=payload
-            ) or {"synced": 3},
+            cc, "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"ok": True, "action": "sync", "synced": 3},
         )
         assert sync_issue_comments("api", 7, repo_github="acme/api") == 3
-        assert captured["path"] == "/issue-comments"
+        # #1946: was POST /issue-comments. Unlike the capture seam, `sync`'s
+        # repo_name is the SHORT name, so it is resource-addressable.
+        assert (captured["method"], captured["path"]) == (
+            "POST", "/issue/api/7/comments",
+        )
         assert captured["payload"]["action"] == "sync"
         assert captured["payload"]["repo_github"] == "acme/api"
 

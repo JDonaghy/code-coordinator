@@ -364,16 +364,23 @@ class TestIssueLabel:
         assert "error" in result.output.lower()
 
     def test_thin_client_posts_to_seam(self, config_file: Path) -> None:
-        """On a thin client, label routes to the daemon via POST /issue-label."""
+        """On a thin client, label routes to the daemon.
+
+        #1946: via ``PATCH /issue/{repo}/{n}`` (``add_labels``), replacing the
+        deprecated ``POST /issue-label``.
+        """
         fake_svc = MagicMock()
         fake_svc.url = "http://daemon:7435"
         fake_svc.token = None
 
         with patch("coord.state._board_service", return_value=fake_svc), \
              patch(
-                 "coord.client.post_record",
-                 return_value={"labels": ["bug"], "changed": True},
-             ) as mock_post:
+                 "coord.client.request_resource",
+                 return_value={
+                     "updated": True, "applied": ["labels"],
+                     "labels": ["bug"], "labels_changed": True,
+                 },
+             ) as mock_req:
             result = CliRunner().invoke(
                 main,
                 [
@@ -383,12 +390,11 @@ class TestIssueLabel:
                 ],
             )
         assert result.exit_code == 0, result.output
-        mock_post.assert_called_once()
-        _svc, endpoint, payload = mock_post.call_args[0]
-        assert endpoint == "/issue-label"
-        assert payload["repo_name"] == "api"
-        assert payload["issue_number"] == 10
-        assert "bug" in payload["add"]
+        mock_req.assert_called_once()
+        _svc, method, path, payload = mock_req.call_args[0]
+        assert (method, path) == ("PATCH", "/issue/api/10")
+        assert payload["add_labels"] == ["bug"]
+        assert payload["remove_labels"] == []
 
     def test_gh_failure_exits_nonzero(self, config_file: Path) -> None:
         """A gh RuntimeError surfaces as exit code 1 with an error message."""

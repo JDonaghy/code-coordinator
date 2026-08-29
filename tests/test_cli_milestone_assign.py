@@ -204,9 +204,10 @@ class TestAssignIssueMilestoneRouting:
         captured: dict = {}
         monkeypatch.setattr(
             cc,
-            "post_record",
-            lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-            or {"updated": True},
+            "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"updated": True},
         )
 
         def _boom(*a, **k):
@@ -217,9 +218,9 @@ class TestAssignIssueMilestoneRouting:
         state.assign_issue_milestone(
             "api", 42, 7, milestone_title="v1.0", repo_github="acme/api"
         )
-        assert captured["path"] == "/issue-milestone"
-        assert captured["payload"]["issue_number"] == 42
-        assert captured["payload"]["milestone_number"] == 7
+        # #1946: was POST /issue-milestone {"milestone_number": 7}.
+        assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/42")
+        assert captured["payload"]["milestone"] == 7
         assert captured["payload"]["milestone_title"] == "v1.0"
         assert captured["payload"]["repo_github"] == "acme/api"
 
@@ -551,15 +552,19 @@ class TestMilestoneAssignCli:
         assert row["milestone_title"] == "sprint-1"
 
     def test_assign_thin_client_posts_to_seam(self, config_file: Path) -> None:
-        """On a thin client, assign routes to the daemon via POST /issue-milestone."""
+        """On a thin client, assign routes to the daemon.
+
+        #1946: via ``PATCH /issue/{repo}/{n}``, replacing ``POST
+        /issue-milestone``.
+        """
         fake_svc = MagicMock()
         fake_svc.url = "http://daemon:7435"
         fake_svc.token = None
 
         with patch("coord.state._board_service", return_value=fake_svc), patch(
-            "coord.client.post_record",
-            return_value={"updated": True},
-        ) as mock_post, patch(
+            "coord.client.request_resource",
+            return_value={"updated": True, "applied": ["milestone"]},
+        ) as mock_req, patch(
             "coord.github_ops.get_milestone",
             return_value={"number": 7, "title": "v1.0"},
         ):
@@ -571,12 +576,10 @@ class TestMilestoneAssignCli:
                 ],
             )
         assert result.exit_code == 0, result.output
-        mock_post.assert_called_once()
-        _svc, endpoint, payload = mock_post.call_args[0]
-        assert endpoint == "/issue-milestone"
-        assert payload["repo_name"] == "api"
-        assert payload["issue_number"] == 42
-        assert payload["milestone_number"] == 7
+        mock_req.assert_called_once()
+        _svc, method, path, payload = mock_req.call_args[0]
+        assert (method, path) == ("PATCH", "/issue/api/42")
+        assert payload["milestone"] == 7
         assert payload["milestone_title"] == "v1.0"
 
     def test_assign_gh_failure_exits_nonzero(self, config_file: Path) -> None:

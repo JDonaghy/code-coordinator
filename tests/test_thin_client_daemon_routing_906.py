@@ -52,8 +52,12 @@ class _FakeSvc:
 
 
 def test_get_issue_test_mode_routes_to_daemon(monkeypatch, coord_db) -> None:
-    """Thin-client mode: reads the daemon's /issue-test-mode, NOT the (empty)
-    local `issues` table."""
+    """Thin-client mode: reads the daemon's issue row, NOT the (empty) local
+    `issues` table.
+
+    #1946: the read is now ``GET /issue/{repo}/{n}`` + the shared
+    ``test_mode_from_labels`` derivation, replacing ``POST /issue-test-mode``.
+    """
     from coord.state import get_issue_test_mode
 
     assert get_connection().execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
@@ -61,17 +65,16 @@ def test_get_issue_test_mode_routes_to_daemon(monkeypatch, coord_db) -> None:
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     captured: dict = {}
 
-    def _fake_post_record(svc, path, payload, **kw):
-        captured.update(path=path, payload=payload)
-        return {"test_mode": "smoke"}
+    def _fake_fetch_issue(svc, repo_name, number, **kw):
+        captured.update(repo_name=repo_name, number=number)
+        return {"repo_name": repo_name, "number": number, "labels": ["test-mode:smoke"]}
 
-    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+    monkeypatch.setattr(cc, "fetch_issue", _fake_fetch_issue)
 
     result = get_issue_test_mode("api", 287)
 
     assert result == "smoke"
-    assert captured["path"] == "/issue-test-mode"
-    assert captured["payload"] == {"repo_name": "api", "issue_number": 287}
+    assert (captured["repo_name"], captured["number"]) == ("api", 287)
 
 
 def test_get_issue_test_mode_falls_back_to_local_on_daemon_error(monkeypatch, coord_db) -> None:
@@ -91,8 +94,8 @@ def test_get_issue_test_mode_falls_back_to_local_on_daemon_error(monkeypatch, co
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: (_ for _ in ()).throw(RuntimeError("daemon down")),
+        "fetch_issue",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("daemon down")),
     )
 
     assert get_issue_test_mode("api", 287) == "auto"
@@ -117,14 +120,23 @@ def test_get_issue_test_mode_writes_local_when_no_service(coord_db) -> None:
 
 
 def test_get_issue_test_mode_ignores_garbage_daemon_value(monkeypatch, coord_db) -> None:
-    """An unexpected `test_mode` value from the daemon must not be trusted verbatim."""
+    """A daemon row whose labels name no test-mode policy yields None.
+
+    #1946: the daemon no longer hands back a `test_mode` string to trust or
+    distrust — it hands back the labels and `test_mode_from_labels` derives
+    the policy, so an unrecognised label simply is not a policy.
+    """
     from coord.state import get_issue_test_mode
 
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     monkeypatch.setattr(
-        cc, "post_record", lambda svc, path, payload, **kw: {"test_mode": "garbage"}
+        cc, "fetch_issue", lambda *a, **k: {"labels": ["test-mode:garbage"]}
     )
 
+    assert get_issue_test_mode("api", 1) is None
+
+    # ...and a row with no labels key at all is also not a policy.
+    monkeypatch.setattr(cc, "fetch_issue", lambda *a, **k: {})
     assert get_issue_test_mode("api", 1) is None
 
 
@@ -141,18 +153,17 @@ def test_update_claude_session_id_routes_to_daemon(monkeypatch, coord_db) -> Non
     captured: dict = {}
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-        or {"ok": True},
+        "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
 
     update_assignment_claude_session_id("assign-1", "ses-abc")
 
-    assert captured["path"] == "/assignment-session-id"
-    assert captured["payload"] == {
-        "assignment_id": "assign-1",
-        "claude_session_id": "ses-abc",
-    }
+    # #1946: was POST /assignment-session-id.
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/assign-1")
+    assert captured["payload"] == {"claude_session_id": "ses-abc"}
     # Local DB must NOT have been written (empty local DB, thin-client).
     row = get_connection().execute(
         "SELECT claude_session_id FROM assignments WHERE assignment_id='assign-1'"
@@ -177,10 +188,8 @@ def test_update_claude_session_id_falls_back_to_local_on_daemon_error(monkeypatc
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: (_ for _ in ()).throw(
-            httpx.ConnectError("daemon down")
-        ),
+        "request_resource",
+        lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("daemon down")),
     )
 
     update_assignment_claude_session_id("assign-2", "ses-xyz")
@@ -192,24 +201,43 @@ def test_update_claude_session_id_falls_back_to_local_on_daemon_error(monkeypatc
 
 
 def test_get_test_plan_routes_to_daemon(monkeypatch, coord_db) -> None:
-    import json
-
+    """#1946: the read is now ``GET /assignment/{id}``'s ``test_plan`` field,
+    replacing ``POST /assignment-test-plan``."""
     from coord.state import get_test_plan
 
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     captured: dict = {}
 
-    def _fake_post_record(svc, path, payload, **kw):
-        captured.update(path=path, payload=payload)
-        return {"test_plan": json.dumps({"steps": ["a"], "blockers": []})}
+    def _fake_fetch_assignment(svc, assignment_id, **kw):
+        captured["assignment_id"] = assignment_id
+        return {"assignment_id": assignment_id, "test_plan": {"steps": ["a"], "blockers": []}}
 
-    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+    monkeypatch.setattr(cc, "fetch_assignment", _fake_fetch_assignment)
 
     plan = get_test_plan("assign-1")
 
     assert plan == {"steps": ["a"], "blockers": []}
-    assert captured["path"] == "/assignment-test-plan"
-    assert captured["payload"] == {"assignment_id": "assign-1"}
+    assert captured["assignment_id"] == "assign-1"
+
+
+def test_get_test_plan_decodes_a_json_string_test_plan(monkeypatch, coord_db) -> None:
+    """A daemon that still serves ``test_plan`` as a JSON *string* is decoded.
+
+    ``board_schema`` types it ``dict | None``, but the RPC route this replaces
+    handed back the raw column, so the client keeps accepting both rather than
+    depending on which side of #1849 the daemon is on.
+    """
+    import json
+
+    from coord.state import get_test_plan
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc, "fetch_assignment",
+        lambda svc, aid, **kw: {"test_plan": json.dumps({"steps": ["a"], "blockers": []})},
+    )
+
+    assert get_test_plan("assign-1") == {"steps": ["a"], "blockers": []}
 
 
 def test_get_test_plan_falls_back_to_local_on_daemon_error(monkeypatch, coord_db) -> None:
@@ -229,8 +257,8 @@ def test_get_test_plan_falls_back_to_local_on_daemon_error(monkeypatch, coord_db
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: (_ for _ in ()).throw(RuntimeError("daemon down")),
+        "fetch_assignment",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("daemon down")),
     )
 
     assert get_test_plan("assign-3") == {"steps": [], "blockers": []}
@@ -243,18 +271,18 @@ def test_set_assignment_failure_reason_routes_to_daemon(monkeypatch, coord_db) -
     captured: dict = {}
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-        or {"ok": True},
+        "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
 
     set_assignment_failure_reason("assign-1", "worktree add failed")
 
-    assert captured["path"] == "/assignment-failure-reason"
-    assert captured["payload"] == {
-        "assignment_id": "assign-1",
-        "reason": "worktree add failed",
-    }
+    # #1946: was POST /assignment-failure-reason {"reason": ...}; the resource
+    # route spells the field `failure_reason`.
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/assign-1")
+    assert captured["payload"] == {"failure_reason": "worktree add failed"}
     row = get_connection().execute(
         "SELECT failure_reason FROM assignments WHERE assignment_id='assign-1'"
     ).fetchone()

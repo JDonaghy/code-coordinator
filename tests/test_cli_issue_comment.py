@@ -67,9 +67,10 @@ class TestCommentOnIssueRouting:
         captured: dict = {}
         monkeypatch.setattr(
             cc,
-            "post_record",
-            lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-            or {"updated": True},
+            "request_resource",
+            lambda svc, method, path, payload=None, **kw: captured.update(
+                method=method, path=path, payload=payload
+            ) or {"ok": True, "action": "post"},
         )
 
         def _boom(*a, **k):
@@ -78,8 +79,11 @@ class TestCommentOnIssueRouting:
         monkeypatch.setattr("coord.github_ops.post_issue_comment", _boom)
 
         state.comment_on_issue("api", 42, "correction: X was wrong", repo_github="acme/api")
-        assert captured["path"] == "/issue-comment"
-        assert captured["payload"]["issue_number"] == 42
+        # #1946: was POST /issue-comment.
+        assert (captured["method"], captured["path"]) == (
+            "POST", "/issue/api/42/comments",
+        )
+        assert captured["payload"]["action"] == "post"
         assert captured["payload"]["body"] == "correction: X was wrong"
         assert captured["payload"]["repo_github"] == "acme/api"
 

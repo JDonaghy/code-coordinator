@@ -2348,7 +2348,10 @@ def test_record_dispatched_assignment_unset_writes_local(coord_db, monkeypatch):
 
 
 def test_update_assignment_cost_routes_when_service_set(coord_db, monkeypatch):
-    """update_assignment_cost() POSTs to /assignment-usage when board_service is set."""
+    """update_assignment_cost() PATCHes /assignment/{id} when board_service is set.
+
+    #1946: was ``POST /assignment-usage``; the resource route supersedes it.
+    """
     from coord import client as cc
     from coord import state
 
@@ -2358,12 +2361,13 @@ def test_update_assignment_cost_routes_when_service_set(coord_db, monkeypatch):
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     state.update_assignment_cost("cu01", 0.42)
-    assert captured["path"] == "/assignment-usage"
-    assert captured["payload"]["assignment_id"] == "cu01"
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/cu01")
     assert captured["payload"]["cost_usd"] == 0.42
     # Routed → the local DB row was NOT touched.
     row = coord_db.execute(
@@ -2387,7 +2391,10 @@ def test_update_assignment_cost_unset_writes_local(coord_db, monkeypatch):
 
 
 def test_update_assignment_tokens_routes_when_service_set(coord_db, monkeypatch):
-    """update_assignment_tokens() POSTs to /assignment-usage when board_service is set."""
+    """update_assignment_tokens() PATCHes /assignment/{id} when board_service is set.
+
+    #1946: was ``POST /assignment-usage``.
+    """
     from coord import client as cc
     from coord import state
 
@@ -2397,12 +2404,13 @@ def test_update_assignment_tokens_routes_when_service_set(coord_db, monkeypatch)
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     state.update_assignment_tokens("tu01", input_tokens=100, output_tokens=50)
-    assert captured["path"] == "/assignment-usage"
-    assert captured["payload"]["assignment_id"] == "tu01"
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/tu01")
     assert captured["payload"]["input_tokens"] == 100
     assert captured["payload"]["output_tokens"] == 50
     # Routed → local row untouched.
@@ -2442,8 +2450,8 @@ def test_update_assignment_tokens_unset_writes_local(coord_db, monkeypatch):
 
 
 def test_update_assignment_tokens_routes_num_turns_when_service_set(coord_db, monkeypatch):
-    """#2786: `num_turns` rides the same /assignment-usage POST as the four
-    token counts when a board service is configured."""
+    """#2786: `num_turns` rides the same assignment write as the four token
+    counts when a board service is configured (#1946: now the PATCH)."""
     from coord import client as cc
     from coord import state
 
@@ -2453,11 +2461,13 @@ def test_update_assignment_tokens_routes_num_turns_when_service_set(coord_db, mo
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     state.update_assignment_tokens("tu03", input_tokens=100, output_tokens=50, num_turns=12)
-    assert captured["path"] == "/assignment-usage"
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/tu03")
     assert captured["payload"]["num_turns"] == 12
     # Routed → local row untouched.
     row = coord_db.execute(
@@ -2467,7 +2477,7 @@ def test_update_assignment_tokens_routes_num_turns_when_service_set(coord_db, mo
 
 
 def test_mark_assignment_interactive_routes_when_service_set(coord_db, monkeypatch):
-    """mark_assignment_interactive() POSTs to /assignment-usage when board_service is set."""
+    """mark_assignment_interactive() PATCHes /assignment/{id} (#1946)."""
     from coord import client as cc
     from coord import state
 
@@ -2477,12 +2487,13 @@ def test_mark_assignment_interactive_routes_when_service_set(coord_db, monkeypat
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     state.mark_assignment_interactive("ia01")
-    assert captured["path"] == "/assignment-usage"
-    assert captured["payload"]["assignment_id"] == "ia01"
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/ia01")
     assert captured["payload"]["is_interactive"] is True
     # Routed → local row untouched.
     row = coord_db.execute(
@@ -2655,12 +2666,14 @@ def test_update_assignment_smoke_tests_routes_when_service_set(coord_db, monkeyp
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-        or {"ok": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     state.update_assignment_smoke_tests("aid1", ["run the tests"])
-    assert captured["path"] == "/assignment-usage"
+    # #1946: was POST /assignment-usage.
+    assert (captured["method"], captured["path"]) == ("PATCH", "/assignment/aid1")
     assert captured["payload"]["smoke_tests"] == ["run the tests"]
 
 
@@ -2730,13 +2743,15 @@ def test_update_issue_labels_routes_when_service_set(coord_db, monkeypatch):
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-        or {"updated": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     assert state.update_issue_labels("api", 9, ["coord"]) is True
-    assert captured["path"] == "/issue-labels"
-    assert captured["payload"]["issue_number"] == 9
+    # #1946: was POST /issue-labels.
+    assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/9")
+    assert captured["payload"]["labels"] == ["coord"]
     # Routed → the local issues row is NOT touched (still has status:ready).
     import json as _j
     row = coord_db.execute("SELECT labels FROM issues WHERE number=9").fetchone()
@@ -3040,9 +3055,10 @@ def test_edit_issue_content_routes_when_service_set(coord_db, monkeypatch):
     )
     captured: dict = {}
     monkeypatch.setattr(
-        cc, "post_record",
-        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
-        or {"updated": True},
+        cc, "request_resource",
+        lambda svc, method, path, payload=None, **kw: captured.update(
+            method=method, path=path, payload=payload
+        ) or {"updated": True},
     )
     # When routing to the daemon, the backend write must NOT run client-side.
     def _boom(*a, **k):
@@ -3052,8 +3068,9 @@ def test_edit_issue_content_routes_when_service_set(coord_db, monkeypatch):
     assert (
         state.edit_issue_content("api", 9, title="t", repo_github="owner/api") is True
     )
-    assert captured["path"] == "/issue-edit"
-    assert captured["payload"]["issue_number"] == 9
+    # #1946: was POST /issue-edit.
+    assert (captured["method"], captured["path"]) == ("PATCH", "/issue/api/9")
+    assert captured["payload"]["title"] == "t"
     assert captured["payload"]["repo_github"] == "owner/api"
 
 

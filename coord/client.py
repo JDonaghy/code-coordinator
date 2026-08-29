@@ -221,6 +221,110 @@ def post_record(
     return resp.json()
 
 
+# ── #1946: the resource-shaped routes (#1944) this client now prefers ────────
+#
+# `post_record` above is the RPC verb-per-endpoint transport; the three
+# functions below are its resource-shaped counterparts.  They are deliberately
+# *thin* -- no fallback logic lives here, because "which route do I call" is a
+# routing decision and belongs next to `coord.board_service.route_write`, not
+# in the transport.  See `coord.board_service.route_resource_write`.
+
+
+def request_resource(
+    svc: ServiceConfig,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """Issue *method* against a resource-shaped route and return the JSON body.
+
+    The generic transport behind :func:`patch_issue`, :func:`patch_assignment`
+    and :func:`post_issue_comment`.  Same contract as :func:`post_record`:
+    raises ``httpx.HTTPError`` on transport/HTTP failure, and the caller
+    decides whether that is fatal.  In particular a **404 or 405** here means
+    "this daemon predates #1944" (the RPC-only shape) rather than "your
+    request was wrong" -- every resource handler either succeeds or answers
+    4xx/503 with an ``error`` body, and none of them 404 for the inputs this
+    package sends.  ``coord.board_service.route_resource_write`` is what turns
+    that into a fallback.
+    """
+    resp = httpx.request(
+        method,
+        f"{svc.url}{path}",
+        json=payload,
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def patch_issue(
+    svc: ServiceConfig,
+    repo_name: str,
+    number: int,
+    patch: dict,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """``PATCH /issue/{repo_name}/{number}`` → the ``IssuePatchResult`` body.
+
+    The resource-shaped replacement for ``/issue-edit``, ``/issue-label``,
+    ``/issue-labels``, ``/issue-milestone``, ``/issue-milestone-remove``,
+    ``/issue-close`` and ``/issue-reopen``.  *patch* is the raw partial body
+    (see :class:`coord.rest_schema.IssuePatch`); **absent is not null**, so
+    only send the keys you actually mean to change -- an explicit
+    ``"milestone": None`` clears the milestone, while omitting the key leaves
+    it alone.
+    """
+    return request_resource(
+        svc, "PATCH", f"/issue/{repo_name}/{number}", patch, timeout=timeout
+    )
+
+
+def post_issue_comment(
+    svc: ServiceConfig,
+    repo_name: str,
+    number: int,
+    payload: dict,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """``POST /issue/{repo_name}/{number}/comments`` → ``IssueCommentResult``.
+
+    The resource-shaped replacement for ``/issue-comment`` (``action="post"``)
+    and ``/issue-comments`` (``action="capture"`` / ``"sync"``).
+    """
+    return request_resource(
+        svc,
+        "POST",
+        f"/issue/{repo_name}/{number}/comments",
+        payload,
+        timeout=timeout,
+    )
+
+
+def patch_assignment(
+    svc: ServiceConfig,
+    assignment_id: str,
+    patch: dict,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """``PATCH /assignment/{assignment_id}`` → the ``AssignmentPatchResult`` body.
+
+    The resource-shaped replacement for ``/assignment-usage``,
+    ``/assignment-session-id`` and ``/assignment-failure-reason``.  Like those
+    three, an unknown *assignment_id* is **not** a 404 — the UPDATE simply
+    matches no rows.
+    """
+    return request_resource(
+        svc, "PATCH", f"/assignment/{assignment_id}", patch, timeout=timeout
+    )
+
+
 def fetch_paused_machines(
     svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> set[str]:
