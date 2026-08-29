@@ -54,6 +54,26 @@ agent log, and a status file (:func:`write_gc_status`) the ``cargo_targets``
 health check renders — rather than returning quietly the way it did while 38G
 accumulated.
 
+#2919: the free-space floor above can only ever reclaim from *this* cache,
+but on a machine where a per-checkout ``target/`` dominates the disk (a human
+building directly in ``~/src/<repo>``, invisible to everything above), the
+cache is not what filled the disk and evicting it whole does not fix that —
+it just forces a fleet-wide cold rebuild that buys back, at best, an hour.
+Two changes:
+
+* :func:`sweep` accepts *checkout_target_dirs* — an optional list of
+  per-checkout ``target/`` paths outside the cache root entirely.  When the
+  free-space floor is breached, these are reclaimed *first* (stale + idle
+  ones only, same :func:`build_active` gate), because a dir nothing has
+  touched in weeks and nothing is compiling against costs nothing to lose —
+  unlike any tier of the shared cache, which something reuses this hour.
+* If even zeroing the *entire* cache could not close the remaining shortfall
+  (``cargo_floor_unreachable``), tier-3 whole-cache eviction is skipped: it
+  cannot satisfy the floor either way, so spending it anyway would only buy a
+  fleet-wide rebuild for nothing.  The cheap tiers (1-2) still run.  Either
+  way the verdict — reason, and the biggest non-cache dirs it saw — lands in
+  ``cargo_over_cap_reason`` the same as an ordinary cap breach.
+
 Set ``COORD_SHARED_CARGO_TARGET=0`` to disable the whole feature; an operator
 who exports their own ``CARGO_TARGET_DIR`` also wins (we never override it).
 """
@@ -88,7 +108,18 @@ DEFAULT_CACHE_CAP_GB = 20.0
 # cap can never see because the per-checkout ``target/`` dirs (17G + 13G + 11G
 # on the machine that filled) are outside it. When free space is under this
 # floor the sweep reclaims the shortfall from the cache even if the cache is
-# under its cap — the cache is the cheapest thing on the disk to give up.
+# under its cap — the cache is the cheapest thing on the disk *this module
+# has authority over* to give up.
+#
+# #2919: that framing turned out to be incomplete — a single repo's cache
+# routinely returns to 14-18G within the hour, well above this floor, so
+# evicting it whole buys almost nothing when a stale per-checkout ``target/``
+# dominates the disk instead. Rather than raise this number (there is no
+# value that is both "below one repo's steady state" and "big enough to
+# matter"), the floor path below now reaches the *actually* cheap thing
+# first (a stale, idle per-checkout ``target/``, see ``checkout_target_dirs``
+# on :func:`sweep`) and refuses to spend the cache on a shortfall it cannot
+# close either way. The default stays put until that's shown insufficient.
 DEFAULT_FREE_FLOOR_GB = 10.0
 
 # A profile dir untouched for this long is "stale": its artifacts predate the
@@ -96,9 +127,15 @@ DEFAULT_FREE_FLOOR_GB = 10.0
 # the bytes once we're over the cap.
 DEFAULT_STALE_DAYS = 7.0
 
+# #2919: a *per-checkout* ``target/`` may be a human's working tree they
+# intend to return to, not just a rebuild-speed cache — so the bar for
+# reclaiming one defaults well above a shared-cache profile dir's.
+DEFAULT_CHECKOUT_STALE_DAYS = 30.0
+
 CAP_ENV = "COORD_CARGO_CACHE_CAP_GB"
 FREE_FLOOR_ENV = "COORD_CARGO_FREE_FLOOR_GB"
 STALE_DAYS_ENV = "COORD_CARGO_STALE_DAYS"
+CHECKOUT_STALE_DAYS_ENV = "COORD_CARGO_CHECKOUT_STALE_DAYS"
 ENABLE_ENV = "COORD_SHARED_CARGO_TARGET"
 CARGO_ENV = "CARGO_TARGET_DIR"
 
@@ -228,6 +265,22 @@ def stale_secs(env: dict[str, str] | None = None) -> float | None:
     return days * 86400.0
 
 
+def checkout_stale_secs(env: dict[str, str] | None = None) -> float | None:
+    """Age at which a per-checkout ``target/`` dir counts as stale enough to
+    reclaim (#2919), or ``None`` when disabled.
+
+    Deliberately separate from :func:`stale_secs`: a *shared-cache* profile
+    dir (tier 2) is cheap to lose — cargo rebuilds just that one profile —
+    where a per-checkout ``target/`` may belong to a working tree a human
+    intends to return to, so the default bar is much higher (see
+    :data:`DEFAULT_CHECKOUT_STALE_DAYS`).
+    """
+    days = _float_env(env, CHECKOUT_STALE_DAYS_ENV, DEFAULT_CHECKOUT_STALE_DAYS)
+    if days <= 0:
+        return None
+    return days * 86400.0
+
+
 def dir_size(path: Path) -> int:
     """Total size of the regular files under *path* (symlinks not followed)."""
     total = 0
@@ -278,6 +331,19 @@ def _last_used(path: Path) -> float:
                 except OSError:
                     continue
     return newest
+
+
+def target_dir_age_secs(path: Path, now: float) -> float:
+    """Seconds since *path* — any cargo target dir, shared cache or
+    per-checkout — was last built into (#2919).
+
+    Exposes the same cheap "newest mtime, shallow-sampled" heuristic
+    :func:`sweep`'s own tiers use internally (:func:`_last_used`), so a
+    surface with no business reaching into this module's guts — the
+    ``cargo_targets`` health check reporting how stale a per-checkout
+    ``target/`` is — doesn't have to re-derive it.
+    """
+    return max(0.0, now - _last_used(path))
 
 
 # ── #2137: intra-repo pruning ───────────────────────────────────────────────
@@ -495,6 +561,104 @@ def build_active(repo_dir: Path) -> bool:
         return True
 
 
+# ── #2919: per-checkout ``target/`` dirs, outside the cache root ───────────
+
+
+def stale_checkout_targets(
+    dirs: "list[Path] | tuple[Path, ...]", older_than_secs: float | None, now: float
+) -> list[Path]:
+    """Per-checkout ``target/`` dirs idle longer than *older_than_secs*.
+
+    Unlike everything else in this module, these live outside
+    :func:`cache_root` entirely — a human's own checkout, not a per-machine
+    cache keyed on repo name — so the caller supplies the candidate paths
+    rather than this walking a known root.  Purely a filter: it does not
+    check :func:`build_active`, so a caller that intends to delete anything
+    returned here still has to gate each one itself (:func:`sweep` does).
+    """
+    if not older_than_secs or older_than_secs <= 0:
+        return []
+    out: list[Path] = []
+    for d in dirs:
+        try:
+            if d.is_symlink() or not d.is_dir():
+                continue
+        except OSError:
+            continue
+        if (now - _last_used(d)) >= older_than_secs:
+            out.append(d)
+    return out
+
+
+def _reclaim_checkout_targets(
+    dirs: "list[Path] | tuple[Path, ...]",
+    *,
+    stale_after_secs: float | None,
+    now: float,
+    needed_bytes: int,
+    dry_run: bool,
+    result: dict,
+) -> int:
+    """#2919: reclaim stale, idle per-checkout ``target/`` dirs for the
+    free-space floor, stopping as soon as *needed_bytes* is covered.
+
+    Real bytes on the same filesystem the floor cares about, entirely
+    outside the cache :func:`sweep` otherwise governs — and the cheapest
+    thing on the disk to give back, because nothing has touched it in a
+    long time and (:func:`build_active`) nothing is compiling against it
+    right now. Populates ``result["cargo_checkout_*"]`` and returns bytes
+    freed (or, for a dry run, bytes that *would* be freed).
+    """
+    scanned: list[dict] = []
+    candidates: list[tuple[float, Path, int]] = []
+    for d in dirs:
+        try:
+            if d.is_symlink() or not d.is_dir():
+                continue
+        except OSError:
+            continue
+        last_used = _last_used(d)
+        age = max(0.0, now - last_used)
+        size = dir_size(d)
+        stale = bool(stale_after_secs) and stale_after_secs > 0 and age >= stale_after_secs
+        scanned.append(
+            {
+                "path": str(d),
+                "bytes": size,
+                "last_used": last_used,
+                "age_secs": age,
+                "stale": stale,
+            }
+        )
+        if stale:
+            candidates.append((last_used, d, size))
+    result["cargo_checkout_scanned"] = scanned
+
+    candidates.sort(key=lambda c: (c[0], str(c[1])))
+    freed = 0
+    blocked: list[str] = []
+    pruned: list[dict] = []
+    for _last_used_at, d, size in candidates:
+        if freed >= needed_bytes:
+            break
+        if build_active(d):
+            blocked.append(str(d))
+            continue
+        if size <= 0:
+            continue
+        if not dry_run:
+            try:
+                shutil.rmtree(d)
+            except OSError:
+                continue
+        freed += size
+        pruned.append({"path": str(d), "bytes": size})
+    result["cargo_checkout_pruned"] = pruned
+    result["cargo_checkout_pruned_bytes"] = freed
+    result["cargo_checkout_prune_blocked"] = blocked
+    return freed
+
+
 # ── #2137: the GC's verdict, for operator surfaces ──────────────────────────
 
 
@@ -544,6 +708,8 @@ def sweep(
     dry_run: bool = False,
     free_floor: int | None = None,
     stale_after_secs: float | None = -1.0,
+    checkout_target_dirs: "list[Path] | tuple[Path, ...] | None" = None,
+    checkout_stale_after_secs: float | None = -1.0,
     now: float | None = None,
 ) -> dict:
     """Reclaim cache space until the total is under the cap.
@@ -577,6 +743,19 @@ def sweep(
     *stale_after_secs* defaults to the sentinel ``-1`` meaning "read it from
     the environment" (:func:`stale_secs`); ``None`` disables tier 2.
 
+    *checkout_target_dirs* (#2919, default ``None``) names per-checkout
+    ``target/`` paths on this machine, outside the cache root — the thing the
+    free-space floor could never previously reach. When the floor is
+    breached, stale + idle ones (:func:`stale_checkout_targets`,
+    :func:`build_active`) are reclaimed *before* the cache's own limit is
+    tightened, because losing one costs nothing: nothing has touched it in a
+    long time and nothing is building against it right now. If even the
+    entire cache could not have closed the remaining shortfall on its own,
+    ``cargo_floor_unreachable`` is set and tier-3 whole-cache eviction is
+    skipped — it would not satisfy the floor either way, so there is no
+    reason to spend it. *checkout_stale_after_secs* is the analogous sentinel
+    for :func:`checkout_stale_secs`.
+
     Returns ``{"cargo_cache_bytes": B, "cargo_caches_evicted": N,
     "cargo_evicted_repos": [...], "cargo_cap_bytes": C|None,
     "cargo_over_cap": bool, "cargo_dry_run": bool}`` plus, since #2137,
@@ -586,7 +765,11 @@ def sweep(
     ``cargo_limit_bytes`` (what the sweep actually aimed at — the cap, or
     tighter when the floor bites), ``cargo_disk_free_bytes``,
     ``cargo_disk_floor_bytes`` and ``cargo_disk_low``.  ``cargo_cache_bytes`` is the total *after* the sweep
-    (or, for ``dry_run``, what it would be).
+    (or, for ``dry_run``, what it would be).  Since #2919, also
+    ``cargo_checkout_scanned`` (every candidate seen, with size/age/staleness),
+    ``cargo_checkout_pruned``, ``cargo_checkout_pruned_bytes``,
+    ``cargo_checkout_prune_blocked`` (a live build) and
+    ``cargo_floor_unreachable``.
     """
     limit = cap_bytes() if cap == -1 else cap
     stale_cutoff = stale_secs() if stale_after_secs == -1.0 else stale_after_secs
@@ -612,6 +795,12 @@ def sweep(
         "cargo_disk_free_bytes": None,
         "cargo_disk_floor_bytes": free_floor,
         "cargo_disk_low": False,
+        # #2919.
+        "cargo_checkout_scanned": [],
+        "cargo_checkout_pruned": [],
+        "cargo_checkout_pruned_bytes": 0,
+        "cargo_checkout_prune_blocked": [],
+        "cargo_floor_unreachable": False,
     }
 
     root = cache_root(state_dir)
@@ -637,7 +826,7 @@ def sweep(
     # #2137 item 4: the failure that actually bit was "0 bytes free", not
     # "cache over cap".  A floor on absolute free space tightens the limit so
     # the cache gives back the shortfall — it is the cheapest thing on the
-    # filesystem to lose, and the only thing here we have authority over.
+    # filesystem *this module has authority over* to lose.
     if free_floor:
         try:
             usage = shutil.disk_usage(str(root))
@@ -648,9 +837,41 @@ def sweep(
             shortfall = free_floor - usage.free
             if shortfall > 0:
                 result["cargo_disk_low"] = True
-                disk_limit = max(0, total - shortfall)
-                limit = disk_limit if limit is None else min(limit, disk_limit)
-                result["cargo_limit_bytes"] = limit
+
+                # #2919: reclaim stale, idle per-checkout target/ dirs
+                # first — real bytes on this same filesystem, entirely
+                # outside the cache, and cheaper to lose than anything in
+                # it: nothing has touched them in a long time and nothing
+                # is building against them right now.
+                if checkout_target_dirs:
+                    checkout_cutoff = (
+                        checkout_stale_secs()
+                        if checkout_stale_after_secs == -1.0
+                        else checkout_stale_after_secs
+                    )
+                    shortfall -= _reclaim_checkout_targets(
+                        checkout_target_dirs,
+                        stale_after_secs=checkout_cutoff,
+                        now=clock,
+                        needed_bytes=shortfall,
+                        dry_run=dry_run,
+                        result=result,
+                    )
+
+                if shortfall <= 0:
+                    # The non-cache tier closed the gap on its own — the
+                    # cache is not touched at all.
+                    result["cargo_disk_low"] = False
+                else:
+                    if shortfall >= total:
+                        # #2919: even zeroing the ENTIRE cache would not
+                        # close this gap. Escalating to tier-3 eviction
+                        # below would buy a fleet-wide cold rebuild for
+                        # nothing, so it is skipped and the sweep says why.
+                        result["cargo_floor_unreachable"] = True
+                    disk_limit = max(0, total - shortfall)
+                    limit = disk_limit if limit is None else min(limit, disk_limit)
+                    result["cargo_limit_bytes"] = limit
 
     if limit is None or total <= limit:
         return result
@@ -724,22 +945,28 @@ def sweep(
     # never against a repo with a live assignment.  The build-activity gate
     # applies here too: refusing to prune a busy tree and then rmtree-ing the
     # whole thing two lines later would be the worse of both behaviours.
+    #
+    # #2919: skipped entirely when the free-space floor is unreachable from
+    # the cache alone — spending the whole cache would not close that gap
+    # either, so there is nothing to buy by evicting it, only a fleet-wide
+    # cold rebuild to pay for.
     evicted: list[str] = []
-    for _mtime, name, path, _size in entries:
-        if total <= limit:
-            break
-        if name in protected:
-            continue
-        if not _may_touch(name, path):
-            continue
-        if not dry_run:
-            try:
-                shutil.rmtree(path)
-            except OSError:
+    if not result["cargo_floor_unreachable"]:
+        for _mtime, name, path, _size in entries:
+            if total <= limit:
+                break
+            if name in protected:
                 continue
-        total -= remaining[name]
-        remaining[name] = 0
-        evicted.append(name)
+            if not _may_touch(name, path):
+                continue
+            if not dry_run:
+                try:
+                    shutil.rmtree(path)
+                except OSError:
+                    continue
+            total -= remaining[name]
+            remaining[name] = 0
+            evicted.append(name)
 
     pruned_bytes = sum(int(p["bytes"]) for p in pruned)
     result["cargo_cache_bytes"] = total
@@ -751,7 +978,21 @@ def sweep(
     result["cargo_prune_blocked"] = blocked
     result["cargo_over_cap"] = total > limit
 
-    if result["cargo_over_cap"]:
+    if result["cargo_floor_unreachable"]:
+        # Independent of `cargo_over_cap` below: this is true — and worth
+        # saying — even if tiers 1-2 happened to drain the cache to 0 and
+        # `cargo_over_cap` ends up False.
+        reason = _over_cap_reason(
+            total,
+            limit,
+            floor_unreachable=True,
+            top_consumers=result.get("cargo_checkout_scanned"),
+        )
+        result["cargo_over_cap_reason"] = reason
+        _log.warning(
+            "cargo free-space floor unreachable from the cache alone: %s", reason
+        )
+    elif result["cargo_over_cap"]:
         reason = _over_cap_reason(total, limit, protected, blocked, remaining)
         result["cargo_over_cap_reason"] = reason
         # Escalate rather than return quietly (#2137): this is the exact state
@@ -763,12 +1004,35 @@ def sweep(
 def _over_cap_reason(
     total: int,
     limit: int,
-    protected: "set[str]",
-    blocked: "list[str]",
-    remaining: dict[str, int],
+    protected: "set[str] | None" = None,
+    blocked: "list[str] | None" = None,
+    remaining: "dict[str, int] | None" = None,
+    *,
+    floor_unreachable: bool = False,
+    top_consumers: "list[dict] | None" = None,
 ) -> str:
     """One line an operator can act on: how far over, and what stopped us."""
+    if floor_unreachable:
+        ranked = sorted(
+            (c for c in (top_consumers or []) if c.get("bytes")),
+            key=lambda c: -int(c["bytes"]),
+        )[:3]
+        names = ", ".join(
+            f"{c['path']} {_human(int(c['bytes']))} ({c['age_secs'] / 86400:.0f}d idle)"
+            for c in ranked
+        )
+        detail = f"top non-cache consumers: {names}" if names else (
+            "no non-cache target dirs were passed in to check"
+        )
+        return (
+            f"{_human(total)} cache cannot cover the free-space shortfall on its "
+            f"own — evicting it would not resolve this, so it was left alone; "
+            f"{detail}"
+        )
     over = _human(total - limit)
+    blocked = blocked or []
+    protected = protected or set()
+    remaining = remaining or {}
     if blocked:
         why = f"live build in {', '.join(sorted(blocked))}"
     elif protected:

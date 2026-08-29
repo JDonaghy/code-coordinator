@@ -15,7 +15,21 @@ free on 2026-08-11.  The agent now parks each sweep's result in
 ``~/.coord/cargo-gc-status.json`` and this probe folds it in: over-cap is at
 least a WARN *regardless of the size thresholds*, because "we tried and
 failed to reclaim" is a different, more urgent state than "the total is
-large".
+large".  #2919 adds ``cargo_floor_unreachable`` to the same escalation: the
+GC's own verdict that even zeroing the shared cache could not have closed
+the free-space shortfall, so evicting it was skipped.
+
+#2919: this probe already totals per-checkout ``target/`` dirs (source 2
+below) — what a human building directly in a live checkout leaves behind,
+invisible to ``cargo_cache``'s GC by design (a fixer here never touches one,
+see ``fix_cargo_targets``).  What it did not do is say *how stale* one is.
+The 2026-08-28 incident found 14G sitting in ``~/src/quadraui/target``
+untouched for 63 days two directories away from a sweep that evicted the
+entire shared cache to compensate — the sweep could not see it, and neither
+could an operator without measuring by hand. Each per-checkout dir's age is
+now reported alongside its size (``values["checkout_targets"]``, and in
+``detail`` when at least one is stale) — visibility only; the deletion
+decision for one of these stays opt-in and out of this probe's fixer.
 
 Cost note: this is the one seed probe that can be genuinely slow, because
 "how big is 78G of small files" is a full tree walk.  It is therefore
@@ -108,6 +122,15 @@ def _candidate_dirs(ctx: HealthContext) -> list[Path]:
         _add(expand(raw, ctx.home))
 
     return out
+
+
+def _checkout_target_dirs(ctx: HealthContext) -> set[Path]:
+    """The subset of :func:`_candidate_dirs` that are per-checkout
+    ``target/`` dirs (#2919) — source 2 there — as opposed to the shared
+    cache or an operator's ``cargo_target_extra_dirs``.  Used only to tag
+    entries for the stale/age report below; never to decide whether to touch
+    anything."""
+    return {c.path / "target" for c in ctx.checkouts}
 
 
 # A GC verdict older than this is not evidence about the machine right now —
@@ -268,6 +291,8 @@ def fix_cargo_targets(ctx: HealthContext, result: CheckResult) -> FixOutcome:
 )
 def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
     """One machine-scope result: the total, with the biggest offenders named."""
+    from coord.cargo_cache import checkout_stale_secs, target_dir_age_secs  # noqa: PLC0415
+
     th = ctx.thresholds
     dirs = _candidate_dirs(ctx)
     if not dirs:
@@ -299,17 +324,25 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         # Below WARN but we stopped early: the real total could be anything.
         severity = Severity.UNKNOWN
 
-    # #2137: the GC's own verdict, which used to reach no surface at all.
+    # #2137/#2919: the GC's own verdict, which used to reach no surface at
+    # all.  Either escalation ("gave up on the cap" or "the floor was
+    # unreachable from the cache alone") outranks the size thresholds — both
+    # mean automatic reclamation is beyond what it can fix on its own.
     gc_status, gc_fresh = _gc_verdict(ctx)
     gc_over_cap = bool(gc_status and gc_status.get("cargo_over_cap"))
+    gc_floor_unreachable = bool(gc_status and gc_status.get("cargo_floor_unreachable"))
     detail = ""
-    if gc_over_cap and gc_fresh:
-        # "The GC gave up" outranks the size thresholds: the cache is beyond
-        # what automatic reclamation can fix, so it only grows from here.
+    if gc_fresh and (gc_over_cap or gc_floor_unreachable):
         if severity.rank < Severity.WARN.rank:
             severity = Severity.WARN
         reason = gc_status.get("cargo_over_cap_reason") or "cache over cap"
-        detail = f"fix: cargo cache GC could not get under cap — {reason}"
+        if gc_floor_unreachable:
+            detail = (
+                "fix: cargo free-space floor unreachable from the shared cache "
+                f"alone (evicting it was skipped) — {reason}"
+            )
+        else:
+            detail = f"fix: cargo cache GC could not get under cap — {reason}"
         blocked = gc_status.get("cargo_prune_blocked") or []
         if blocked:
             detail += (
@@ -325,11 +358,48 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         headroom = f"{headroom}  ({breakdown})"
     if not complete:
         headroom = f"{headroom} [partial scan — {th.cargo_scan_budget_secs}s budget hit]"
-    if gc_over_cap and gc_fresh:
+    if gc_fresh and (gc_over_cap or gc_floor_unreachable):
         # Rendered into the headroom, not just `detail`: `coord health`
         # without `--verbose` shows `detail` only for a non-OK row, and this
         # phrase is the whole point of the escalation.
-        headroom = f"{headroom} [GC over cap]"
+        headroom = f"{headroom} [floor unreachable]" if gc_floor_unreachable else (
+            f"{headroom} [GC over cap]"
+        )
+
+    # #2919: per-checkout target/ dirs (source 2 of _candidate_dirs) are
+    # invisible to cargo_cache's GC by design — report how stale each one is
+    # so "14G untouched for 63 days" reaches an operator without them having
+    # to measure it by hand during a disk-full incident.  Visibility only:
+    # nothing here decides to delete one (fix_cargo_targets never touches a
+    # per-checkout dir either).
+    checkout_dirs = _checkout_target_dirs(ctx)
+    stale_cutoff = checkout_stale_secs()
+    checkout_targets = []
+    for p, s in sizes:
+        if p not in checkout_dirs:
+            continue
+        age_secs = target_dir_age_secs(p, ctx.now)
+        stale = stale_cutoff is not None and age_secs >= stale_cutoff
+        checkout_targets.append(
+            {
+                "path": str(p),
+                "bytes": s,
+                "gb": round(gib(s), 2),
+                "age_days": round(age_secs / 86400.0, 1),
+                "stale": stale,
+            }
+        )
+    checkout_targets.sort(key=lambda d: -d["bytes"])
+
+    stale_checkouts = [c for c in checkout_targets if c["stale"]]
+    if stale_checkouts:
+        stale_desc = "; ".join(
+            f"{shorten_path(c['path'], str(ctx.home))} {human_bytes(int(c['bytes']))} "
+            f"idle {c['age_days']:.0f}d"
+            for c in stale_checkouts[:3]
+        )
+        detail = f"{detail}; " if detail else detail
+        detail = f"{detail}stale checkout target(s) not touched by GC: {stale_desc}"
 
     return CheckResult(
         check_id="cargo_targets",
@@ -341,10 +411,12 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         error=None if complete else "scan budget exhausted; total is a lower bound",
         values={
             "total_bytes": total,
-            # #2137: raw GC facts for machine consumers.  `gc_over_cap` is the
-            # escalating bit; `gc_stale` says the verdict predates the
-            # freshness window, so a reader knows not to act on it.
+            # #2137/#2919: raw GC facts for machine consumers.
+            # `gc_over_cap`/`gc_floor_unreachable` are the escalating bits;
+            # `gc_stale` says the verdict predates the freshness window, so a
+            # reader knows not to act on it.
             "gc_over_cap": gc_over_cap,
+            "gc_floor_unreachable": gc_floor_unreachable,
             "gc_stale": bool(gc_status) and not gc_fresh,
             "gc": gc_status or {},
             "total_gb": round(total_gb, 2),
@@ -353,6 +425,9 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
                 {"path": str(p), "bytes": s, "gb": round(gib(s), 2)}
                 for p, s in sorted(sizes, key=lambda pair: pair[1], reverse=True)
             ],
+            # #2919: size + age for every per-checkout target/ dir, reported
+            # (never acted on) so a stale one is visible without a manual du.
+            "checkout_targets": checkout_targets,
             "warn_gb": th.cargo_target_warn_gb,
             "crit_gb": th.cargo_target_crit_gb,
         },
