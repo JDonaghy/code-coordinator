@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 from unittest.mock import MagicMock, patch
 
@@ -276,3 +277,111 @@ class TestCleanWorktrees:
             result = network.clean_worktrees(_m())
         assert result["ok"] is False
         assert "invalid JSON" in result["error"]
+
+
+class TestTailscaleIpMap:
+    """#2912: `tailscale status --json` parsing — best-effort, fails soft."""
+
+    def _fake_run(self, stdout: str, returncode: int = 0):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = stdout
+        return result
+
+    def test_parses_self_and_peers(self) -> None:
+        payload = {
+            "Self": {
+                "HostName": "dellserver",
+                "DNSName": "dellserver.tailf46ef8.ts.net.",
+                "TailscaleIPs": ["100.97.107.88", "fd7a:115c:a1e0::4c3b:6b58"],
+            },
+            "Peer": {
+                "abc": {
+                    "HostName": "dell64",
+                    "DNSName": "dell64.tailf46ef8.ts.net.",
+                    "TailscaleIPs": ["100.118.111.76", "fd7a:115c:a1e0::f430:6f4d"],
+                },
+            },
+        }
+        with patch.object(
+            network.subprocess, "run",
+            return_value=self._fake_run(json.dumps(payload)),
+        ):
+            out = network.tailscale_ip_map()
+        assert out == {
+            "dellserver": ("100.97.107.88", "dellserver.tailf46ef8.ts.net"),
+            "dell64": ("100.118.111.76", "dell64.tailf46ef8.ts.net"),
+        }
+
+    def test_missing_cli_returns_none(self) -> None:
+        with patch.object(network.subprocess, "run", side_effect=FileNotFoundError()):
+            assert network.tailscale_ip_map() is None
+
+    def test_nonzero_exit_returns_none(self) -> None:
+        with patch.object(
+            network.subprocess, "run", return_value=self._fake_run("", returncode=1)
+        ):
+            assert network.tailscale_ip_map() is None
+
+    def test_invalid_json_returns_none(self) -> None:
+        with patch.object(
+            network.subprocess, "run", return_value=self._fake_run("not json")
+        ):
+            assert network.tailscale_ip_map() is None
+
+    def test_timeout_returns_none(self) -> None:
+        with patch.object(
+            network.subprocess, "run",
+            side_effect=network.subprocess.TimeoutExpired(cmd="tailscale", timeout=5),
+        ):
+            assert network.tailscale_ip_map() is None
+
+
+class TestCheckHostResolution:
+    """#2912: is `host:` pointed at the RIGHT tailnet address?"""
+
+    def test_no_tailscale_available_is_unknown(self) -> None:
+        result = network.check_host_resolution(_m(name="dell64", host="dell64"), None)
+        assert result.matches is None
+
+    def test_node_not_in_peer_list_is_unknown(self) -> None:
+        result = network.check_host_resolution(
+            _m(name="dell64", host="dell64"), {"otherbox": ("100.1.1.1", "otherbox.ts.net")}
+        )
+        assert result.matches is None
+
+    def test_matching_address_is_ok(self) -> None:
+        machine = _m(name="dell64", host="dell64.tailf46ef8.ts.net")
+        ts_map = {"dell64": ("100.118.111.76", "dell64.tailf46ef8.ts.net")}
+        with patch.object(network, "resolve_host_ip", return_value="100.118.111.76"):
+            result = network.check_host_resolution(machine, ts_map)
+        assert result.matches is True
+
+    def test_lan_shadow_mismatch_is_flagged(self) -> None:
+        """The exact #2912 scenario: `host: dell64` resolves to the Windows
+        LAN box (192.168.1.183) instead of dell64's own tailnet address."""
+        machine = _m(name="dell64", host="dell64")
+        ts_map = {"dell64": ("100.118.111.76", "dell64.tailf46ef8.ts.net")}
+        with patch.object(network, "resolve_host_ip", return_value="192.168.1.183"):
+            result = network.check_host_resolution(machine, ts_map)
+        assert result.matches is False
+        assert result.tailnet_ip == "100.118.111.76"
+        assert result.magicdns_fqdn == "dell64.tailf46ef8.ts.net"
+        assert "192.168.1.183" in result.reason
+
+    def test_unresolvable_host_is_unknown(self) -> None:
+        machine = _m(name="dell64", host="dell64.invalid")
+        ts_map = {"dell64": ("100.118.111.76", "dell64.tailf46ef8.ts.net")}
+        with patch.object(network, "resolve_host_ip", return_value=None):
+            result = network.check_host_resolution(machine, ts_map)
+        assert result.matches is None
+
+    def test_falls_back_to_host_short_label_when_name_not_found(self) -> None:
+        """`machine.name` doesn't have to match tailscale's `HostName` —
+        e.g. an alias in coordinator.yml — so the host's own short label is
+        tried too before giving up."""
+        machine = _m(name="my-dell-alias", host="dell64.lan")
+        ts_map = {"dell64": ("100.118.111.76", "dell64.tailf46ef8.ts.net")}
+        with patch.object(network, "resolve_host_ip", return_value="100.118.111.76"):
+            result = network.check_host_resolution(machine, ts_map)
+        assert result.matches is True

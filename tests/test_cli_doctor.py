@@ -16,8 +16,13 @@ from coord.commands.status import doctor
 from coord.network import ONLINE, OFFLINE, MachineStatus
 
 
-def _run_doctor(config_path, monkeypatch, statuses, *, extra_args=None):
+def _run_doctor(config_path, monkeypatch, statuses, *, extra_args=None, ts_map=None):
     monkeypatch.setattr(network_mod, "check_all", lambda *a, **k: statuses)
+    # #2912: default the new host-resolution check to "tailscale not
+    # available" (matches=None, silent) so every PRE-EXISTING test here
+    # stays hermetic and unaffected — tests that actually exercise the
+    # check pass their own `ts_map`.
+    monkeypatch.setattr(network_mod, "tailscale_ip_map", lambda *a, **k: ts_map)
     runner = CliRunner()
     # #2082: doctor resolves --expected from PyPI by default now. Default
     # these tests to --no-pypi so they stay hermetic (no real network call);
@@ -99,6 +104,61 @@ def test_doctor_flags_unreachable_machine(valid_config_path, monkeypatch) -> Non
     assert result.exit_code == 1
     assert "unreachable" in result.output
     assert "connection refused" in result.output
+
+
+def test_doctor_names_lan_dns_shadow_even_when_unreachable(
+    valid_config_path, monkeypatch,
+) -> None:
+    """#2912: `laptop`'s `host: laptop.tailnet` resolving to something other
+    than laptop's own tailnet address must be named EVEN on the branch that
+    reports "unreachable" — that's the whole failure mode: a DNS shadow
+    makes a healthy agent look dead with no clue why."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(machine=cfg.machines[0], state=network_mod.TIMEOUT, reason="timed out"),
+        MachineStatus(
+            machine=cfg.machines[1], state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, cfg.machines[1]),
+        ),
+    ]
+    ts_map = {"laptop": ("100.64.0.1", "laptop.tailf46ef8.ts.net")}
+    monkeypatch.setattr(
+        network_mod, "resolve_host_ip", lambda host, **k: "192.168.1.183"
+    )
+    result = _run_doctor(valid_config_path, monkeypatch, statuses, ts_map=ts_map)
+    assert result.exit_code == 1
+    assert "machines.host_resolves_offtailnet" in result.output
+    assert "100.64.0.1" in result.output
+    assert "laptop.tailf46ef8.ts.net" in result.output
+    assert "unreachable" in result.output
+
+
+def test_doctor_is_silent_when_host_matches_tailnet_address(
+    valid_config_path, monkeypatch,
+) -> None:
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    ts_map = {
+        "laptop": ("100.64.0.1", "laptop.tailf46ef8.ts.net"),
+        "server": ("100.64.0.2", "server.tailf46ef8.ts.net"),
+    }
+    monkeypatch.setattr(
+        network_mod, "resolve_host_ip",
+        lambda host, **k: {"laptop.tailnet": "100.64.0.1", "server.tailnet": "100.64.0.2"}[host],
+    )
+    result = _run_doctor(valid_config_path, monkeypatch, statuses, ts_map=ts_map)
+    assert result.exit_code == 0, result.output
+    assert "host_resolves_offtailnet" not in result.output
 
 
 def test_doctor_flags_missing_baseline_tool(valid_config_path, monkeypatch) -> None:
