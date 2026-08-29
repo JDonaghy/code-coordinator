@@ -1925,10 +1925,15 @@ def test_reconcile_thin_client_respects_smoke_mode_via_daemon(
     """#906 regression: reconcile() runs from the thin-client-reachable `coord
     resume` (not just the daemon tick loop, as an earlier #906 allowlist
     comment incorrectly assumed). On a thin client the local `issues` table
-    is an empty stub, so ``get_issue_test_mode`` must route to the daemon's
-    ``/issue-test-mode`` endpoint rather than reading the local (empty) table
-    and silently falling through to auto-dispatching a headless smoke test
-    for an issue explicitly labeled ``test-mode:smoke``.
+    is an empty stub, so ``get_issue_test_mode`` must read the daemon's issue
+    row rather than the local (empty) table and silently falling through to
+    auto-dispatching a headless smoke test for an issue explicitly labeled
+    ``test-mode:smoke``.
+
+    #1946: that read is ``GET /issue/{repo}/{n}`` + ``test_mode_from_labels``,
+    replacing the deprecated ``POST /issue-test-mode`` projection. What must
+    not regress is the *outcome* — the daemon is consulted for this exact
+    issue, and no smoke assignment is dispatched.
     """
     import coord.client as cc
     from unittest.mock import patch as _patch
@@ -1953,13 +1958,14 @@ def test_reconcile_thin_client_respects_smoke_mode_via_daemon(
 
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
 
-    daemon_calls: list[tuple[str, dict]] = []
+    daemon_calls: list[tuple[str, int]] = []
 
-    def _fake_post_record(svc, path, payload, **kw):
-        daemon_calls.append((path, payload))
-        return {"test_mode": "smoke"}
+    def _fake_fetch_issue(svc, repo_name, number, **kw):
+        daemon_calls.append((repo_name, number))
+        return {"repo_name": repo_name, "number": number,
+                "labels": ["coord", "test-mode:smoke"]}
 
-    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+    monkeypatch.setattr(cc, "fetch_issue", _fake_fetch_issue)
 
     def _fake_agent(_host: str, _port: int = 7433, **kw):
         return {
@@ -1971,8 +1977,8 @@ def test_reconcile_thin_client_respects_smoke_mode_via_daemon(
     with _patch("coord.reconcile._query_agent", side_effect=_fake_agent):
         reconcile(board, gtk_and_server_config)
 
-    # The daemon endpoint was consulted for this exact issue.
-    assert ("/issue-test-mode", {"repo_name": "api", "issue_number": 287}) in daemon_calls
+    # The daemon was consulted for this exact issue.
+    assert ("api", 287) in daemon_calls
 
     # No smoke assignment must have been auto-dispatched.
     smoke_assignments = [a for a in board.active if a.type == "smoke"]
@@ -2006,10 +2012,12 @@ def test_reconcile_thin_client_falls_back_to_local_on_daemon_error(
         token = "t"
 
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    # #1946: the read is GET /issue/{repo}/{n} now — the fail-open posture is
+    # what this test pins, not which route fails.
     monkeypatch.setattr(
         cc,
-        "post_record",
-        lambda svc, path, payload, **kw: (_ for _ in ()).throw(RuntimeError("daemon down")),
+        "fetch_issue",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("daemon down")),
     )
 
     def _fake_agent(_host: str, _port: int = 7433, **kw):
