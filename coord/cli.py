@@ -141,8 +141,8 @@ from coord.commands.drive import (
 )
 from coord.commands.drive_queue import drive_queue_group
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
-from coord.commands.milestone import milestone_group
 from coord.commands.machine import machine_group
+from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
 from coord.commands.release import release_group, release_preflight
 # #2220: `coord repo add` / `coord repo doctor` — onboarding a repo, and

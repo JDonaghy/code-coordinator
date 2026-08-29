@@ -1470,13 +1470,20 @@ def doctor(
 
         # #2915: is this MACHINE only half-onboarded? Costs nothing extra —
         # reuses the `/health` body and the `ts_map` already resolved above.
-        # Deliberately only the three layers nothing else in this command
-        # renders (repo clones, graphify, the agent venv); see
-        # `machine_onboard.DOCTOR_LIVE_LAYERS` for why network/agent are not
-        # folded in a second time. Placed BEFORE the tool_versions
-        # early-continue below for the same reason #1712's cross-check is:
-        # "the graph CLI is missing" and "this clone does not exist" must not
-        # be skipped just because the agent is also too old to report probes.
+        # Deliberately only graphify + the agent venv — the two layers
+        # nothing else in this command renders. Repo-clone presence is
+        # deliberately NOT folded in a second time here: the #1712
+        # cross-check immediately above (`_health_vs_config_lines`) already
+        # answers "is a declared repo actually being served" for both the
+        # total-loss and #2219 partial-drift shapes, under its own
+        # `CRIT repos: ...` name — folding `clones` in too printed the same
+        # defect twice under two names (caught in review of #2915). See
+        # `machine_onboard.DOCTOR_LIVE_LAYERS` for the full reasoning, and
+        # for why network/agent are excluded the same way. Placed BEFORE
+        # the tool_versions early-continue below for the same reason #1712's
+        # cross-check is: "the graph CLI is missing" and "this repo isn't
+        # cloned" must not be skipped just because the agent is also too old
+        # to report probes.
         for is_problem, line in _machine_onboarding_lines(cfg, m, statuses, ts_map):
             click.echo(line)
             if is_problem:
