@@ -568,6 +568,25 @@ def _git(cwd, *args):
     )
 
 
+def _seed_git_identity(checkout):
+    """Write the identity into the checkout's own ``.git/config``.
+
+    ``_GIT_ENV`` only covers git invocations *this file* makes. The code under
+    test (`_commit_and_push_settings`) shells out to `git commit` itself, with
+    a plain inherited environment — so on any machine whose ``$HOME`` has no
+    ``user.email`` (a synthesized fleet ``$HOME``, a CI container: the #2269
+    class) that commit dies with "unable to auto-detect email address" and
+    five tests fail for a reason that has nothing to do with what they assert.
+    Repo-local config is what the rest of this suite uses, and it is what the
+    production `git commit` actually reads. ``commit.gpgsign=false`` is here
+    for the mirror-image case: an operator ``$HOME`` that signs every commit
+    globally would otherwise block on a key this test has no business needing.
+    """
+    _git(checkout, "config", "user.email", "test@example.com")
+    _git(checkout, "config", "user.name", "coord test")
+    _git(checkout, "config", "commit.gpgsign", "false")
+
+
 @pytest.fixture
 def settings_checkout(tmp_path, monkeypatch):
     """A real coord-settings checkout with a real upstream.
@@ -587,6 +606,7 @@ def settings_checkout(tmp_path, monkeypatch):
         ["git", *_GIT_ENV, "clone", str(origin), str(clone)],
         capture_output=True, text=True, check=True,
     )
+    _seed_git_identity(clone)
     tracked = clone / "coord" / "coordinator.yml"
     tracked.parent.mkdir(parents=True)
     tracked.write_text(CONFIG)
