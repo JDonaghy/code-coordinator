@@ -53,6 +53,7 @@ from coord.reports import (
     find_decision,
     fold_completed,
     fold_decisions,
+    fold_deprecated_routes,
     fold_drive_queue_status,
     fold_issue_activity,
     fold_queue_outcomes,
@@ -64,6 +65,7 @@ from coord.reports import (
     result_to_csv,
     run_completed,
     run_decisions,
+    run_deprecated_routes,
     run_drive_queue_status,
     run_queue_outcomes,
     run_report,
@@ -934,6 +936,149 @@ class TestRunDriveQueueStatus:
         assert result.rows[0]["attempts"] == 2
 
 
+# ── deprecated-routes (#1945): evidence for RPC retirement ────────────────
+
+_DEP_ROUTES = {"/old-a": "PATCH /new-a", "/old-b": "PATCH /new-b"}
+
+
+def _dep_entry(
+    ts: float, route: str, *, client: str = "coord-py", version: str = "1.0"
+) -> dict:
+    return {
+        "ts": ts,
+        "details": {"route": route, "client": client, "client_version": version},
+    }
+
+
+class TestFoldDeprecatedRoutes:
+    """Pure fold — fixture audit entries in, ``ReportResult`` out."""
+
+    def test_no_entries_at_all_is_no_data_for_every_route(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES)
+        assert result.report_id == "deprecated-routes"
+        assert {r["route"]: r["status"] for r in result.rows} == {
+            "/old-a": "no_data", "/old-b": "no_data",
+        }
+        assert any("no_data" in n or "UNKNOWN" in n for n in result.notes)
+
+    def test_calls_for_one_route_do_not_make_a_silent_route_zero_calls_wrongly(
+        self,
+    ) -> None:
+        """Once ANY deprecation row exists anywhere, telemetry is proven
+        live, so a route with none of its own reads as the real, actionable
+        `zero_calls` — not the ambiguous `no_data`."""
+        result = fold_deprecated_routes(
+            [_dep_entry(500.0, "/old-a")], 1000.0, routes=_DEP_ROUTES
+        )
+        by_route = {r["route"]: r for r in result.rows}
+        assert by_route["/old-a"]["status"] == "in_use"
+        assert by_route["/old-b"]["status"] == "zero_calls"
+        assert not any("no_data" in n for n in result.notes)
+
+    def test_last_call_is_the_max_timestamp_and_count_is_exact(self) -> None:
+        entries = [
+            _dep_entry(100.0, "/old-a"),
+            _dep_entry(900.0, "/old-a"),
+            _dep_entry(500.0, "/old-a"),
+        ]
+        result = fold_deprecated_routes(entries, 1000.0, routes=_DEP_ROUTES)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["last_call"] == 900.0
+        assert row["call_count"] == 3
+
+    def test_distinct_client_version_pairs_deduped_newest_first(self) -> None:
+        entries = [
+            _dep_entry(100.0, "/old-a", client="coord-py", version="1.0"),
+            _dep_entry(300.0, "/old-a", client="coord-tui", version="2.0"),
+            _dep_entry(200.0, "/old-a", client="coord-py", version="1.0"),  # dup
+        ]
+        result = fold_deprecated_routes(entries, 1000.0, routes=_DEP_ROUTES)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["clients"] == ["coord-tui@2.0", "coord-py@1.0"]
+
+    def test_missing_client_or_version_details_read_as_unknown(self) -> None:
+        entries = [{"ts": 1.0, "details": {"route": "/old-a"}}]
+        result = fold_deprecated_routes(entries, 1000.0, routes=_DEP_ROUTES)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["clients"] == ["unknown@unknown"]
+
+    def test_replacement_text_is_carried_through(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["replacement"] == "PATCH /new-a"
+
+    def test_column_meta_matches_columns_one_to_one_same_order(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES)
+        assert [m.id for m in result.column_meta] == result.columns
+
+    def test_rows_are_sorted_by_route(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes={"/z": "r-z", "/a": "r-a"})
+        assert [r["route"] for r in result.rows] == ["/a", "/z"]
+
+    def test_window_is_degenerate_generated_at_generated_at(self) -> None:
+        result = fold_deprecated_routes([], 4242.0, routes=_DEP_ROUTES)
+        assert result.generated_at == 4242.0
+        assert result.window == (4242.0, 4242.0)
+
+    def test_entries_for_an_unknown_route_are_ignored_not_a_crash(self) -> None:
+        entries = [_dep_entry(1.0, "/not-in-the-table")]
+        result = fold_deprecated_routes(entries, 1000.0, routes=_DEP_ROUTES)
+        assert all(r["call_count"] == 0 for r in result.rows)
+
+    def test_defaults_to_the_real_rpc_superseded_by_resource_table(self) -> None:
+        """No ``routes=`` override -- #1945 acceptance: every route marked
+        deprecated in the OpenAPI spec is covered. `RPC_SUPERSEDED_BY_RESOURCE`
+        is exactly the table #1944 stamps `deprecated: true` from, so
+        matching it here (the default) means this report can never silently
+        drop a route the spec calls deprecated."""
+        from coord.serve_app import RPC_SUPERSEDED_BY_RESOURCE
+
+        result = fold_deprecated_routes([], 1000.0)
+        assert {r["route"] for r in result.rows} == set(RPC_SUPERSEDED_BY_RESOURCE)
+
+
+class TestRunDeprecatedRoutes:
+    """The runner — ``fetch=``/``now=``/``routes=`` seams."""
+
+    def test_now_seam_sets_generated_at_and_window(self) -> None:
+        result = run_deprecated_routes(
+            now=555.0, fetch=lambda now: ([], False), routes=_DEP_ROUTES
+        )
+        assert result.generated_at == 555.0
+        assert result.window == (555.0, 555.0)
+
+    def test_fetch_receives_generated_at(self) -> None:
+        seen: list[float] = []
+
+        def fetch(now):
+            seen.append(now)
+            return [], False
+
+        run_deprecated_routes(now=42.0, fetch=fetch, routes=_DEP_ROUTES)
+        assert seen == [42.0]
+
+    def test_entries_fold_through_from_injected_fetch(self) -> None:
+        result = run_deprecated_routes(
+            now=1000.0,
+            fetch=lambda now: ([_dep_entry(500.0, "/old-a")], False),
+            routes=_DEP_ROUTES,
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["status"] == "in_use"
+
+    def test_truncated_fetch_adds_a_note(self) -> None:
+        result = run_deprecated_routes(
+            now=1000.0, fetch=lambda now: ([], True), routes=_DEP_ROUTES
+        )
+        assert any("page cap" in n for n in result.notes)
+
+    def test_not_truncated_adds_no_extra_note(self) -> None:
+        result = run_deprecated_routes(
+            now=1000.0, fetch=lambda now: ([], False), routes=_DEP_ROUTES
+        )
+        assert not any("page cap" in n for n in result.notes)
+
+
 # ── decisions (#2369): escalations + blocked queue roots as cards ─────────
 
 
@@ -1406,14 +1551,14 @@ class TestCatalogue:
     def test_the_registered_reports(self) -> None:
         assert set(REPORTS) == {
             "issue-activity", "completed", "drive-queue-status", "decisions",
-            "usage", "queue-outcomes", "trend",
+            "usage", "queue-outcomes", "trend", "deprecated-routes",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
-            "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "trend", "usage",
+            "completed", "decisions", "deprecated-routes", "drive-queue-status",
+            "issue-activity", "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -1445,6 +1590,13 @@ class TestCatalogue:
         assert set(params) == {"repo"}
         assert params["repo"]["kind"] == "text"
         assert params["repo"]["default"] == ""
+
+    def test_deprecated_routes_catalogue_entry(self) -> None:
+        cat = catalogue()
+        rep = next(r for r in cat["reports"] if r["id"] == "deprecated-routes")
+        assert rep["title"] == "Deprecated RPC Routes"
+        assert rep["description"]
+        assert rep["params"] == []
 
     def test_catalogue_is_json_serialisable(self) -> None:
         json.dumps(catalogue())
@@ -1576,8 +1728,8 @@ class TestCli:
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
-            "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "trend", "usage",
+            "completed", "decisions", "deprecated-routes", "drive-queue-status",
+            "issue-activity", "queue-outcomes", "trend", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -2035,8 +2187,8 @@ class TestDaemonEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
-            "completed", "decisions", "drive-queue-status", "issue-activity",
-            "queue-outcomes", "trend", "usage",
+            "completed", "decisions", "deprecated-routes", "drive-queue-status",
+            "issue-activity", "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -4737,6 +4889,7 @@ class TestRowIdentity:
         # none has a single `(repo, issue)`.
         for report_id in (
             "usage", "decisions", "queue-outcomes", "drive-queue-status", "trend",
+            "deprecated-routes",
         ):
             assert by_id[report_id]["row_identity"] is None
 

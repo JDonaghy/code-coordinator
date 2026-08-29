@@ -1892,6 +1892,13 @@ pub(crate) fn url_is_loopback(url: &str) -> bool {
 /// display-ready error string on any network/parse/non-2xx failure — `ureq`
 /// (built without the `json` feature crate-wide here) already includes the
 /// status code and a body snippet in its `Display` for non-2xx responses.
+///
+/// #1945: every call carries `X-Coord-Client`/`X-Coord-Client-Version` so the
+/// daemon's deprecated-RPC-route telemetry can name coord-tui by its actual
+/// running version when this hits a route `coord.serve_app`'s
+/// `RPC_SUPERSEDED_BY_RESOURCE` marks deprecated (e.g. `apply_issue_labels_remote`'s
+/// `"/issue-label"`) — evidence for retirement instead of a belief that
+/// every locally-built binary in the fleet has upgraded.
 pub(crate) fn post_daemon_json(
     url: &str,
     token: Option<&str>,
@@ -1905,7 +1912,9 @@ pub(crate) fn post_daemon_json(
         .build();
     let mut req = agent
         .post(&format!("{url}{path}"))
-        .set("Content-Type", "application/json");
+        .set("Content-Type", "application/json")
+        .set("X-Coord-Client", "coord-tui")
+        .set("X-Coord-Client-Version", env!("CARGO_PKG_VERSION"));
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
