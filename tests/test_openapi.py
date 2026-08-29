@@ -24,9 +24,7 @@ from coord.db import _ensure_schema
 from coord.models import Machine, Repo
 from coord.openapi import declared_routes, spec_routes, validate_json_schema
 from coord.serve_app import build_app as build_serve_app
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BOARD_FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
+from scripts.gen_board_fixture import fixture_json_text
 
 
 # ── agent ─────────────────────────────────────────────────────────────────
@@ -159,11 +157,17 @@ def test_serve_openapi_fully_specifies_board(tmp_path: Path) -> None:
 
 def test_serve_openapi_board_schema_validates_golden_fixture(tmp_path: Path) -> None:
     """#757 acceptance: the /board schema is validated against the #748
-    committed golden fixture, not just declared."""
-    assert BOARD_FIXTURE_PATH.exists(), (
-        f"{BOARD_FIXTURE_PATH} missing — see scripts/gen_board_fixture.py"
-    )
-    fixture = json.loads(BOARD_FIXTURE_PATH.read_text())
+    golden fixture payload, not just declared.
+
+    #2899: that fixture is no longer a file in this repo. The committed copy
+    moved to coord-tui (`tests/fixtures/board_sample.json`, beside the Rust
+    round-trip test that reads it), so this test now validates the schema
+    against what `scripts/gen_board_fixture.py` produces *right now* — the
+    exact bytes coord-tui commits and its CI freshness gate diffs against.
+    Same subject, one indirection removed; reading a path that does not exist
+    in this checkout would only ever have been a hard error.
+    """
+    fixture = json.loads(fixture_json_text())
 
     client = _serve_client(tmp_path)
     spec = client.get("/openapi.json").json()
