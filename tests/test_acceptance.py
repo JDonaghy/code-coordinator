@@ -8,12 +8,14 @@ from pathlib import Path
 import pytest
 
 from coord.acceptance import (
+    ACCEPTANCE_DIRNAME,
     ForPathResolutionError,
     MANIFEST_FRAGMENTS_DIRNAME,
     MOCK_EXT_TO_DRIVER_KIND,
     ManifestData,
     ManifestError,
     acceptance_capability_gap,
+    acceptance_root_for_driver,
     apply_expected_red,
     build_verdict,
     bug_contract_path,
@@ -40,6 +42,32 @@ from coord.acceptance import (
 from coord.acceptance import test_ids_for_issue as ids_for_issue
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
 from coord.models import Machine, Repo
+
+
+class TestAcceptanceRootForDriver:
+    """#2896: which directory `coord acceptance run`/`record` actually reads
+    a resolved driver's manifests/contracts from — the fix for the bug the
+    hardcoded `base / ACCEPTANCE_DIRNAME` had once the tui-tuidriver route's
+    slices moved out of the shared repo-root tree."""
+
+    def test_no_entrypoint_falls_back_to_shared_tree(self, tmp_path: Path) -> None:
+        """A directory-discovered driver (cli-pytest, no `entrypoint:`) keeps
+        reading the repo-root ACCEPTANCE_DIRNAME — this repo's own ms-37
+        slices never moved."""
+        assert acceptance_root_for_driver(tmp_path, "") == tmp_path / ACCEPTANCE_DIRNAME
+
+    def test_nested_entrypoint_resolves_to_its_sibling_dir(self, tmp_path: Path) -> None:
+        """The tui-tuidriver route's real shape: entrypoint `tui/tests/
+        acceptance.rs` -> manifests under `tui/tests/acceptance/`."""
+        got = acceptance_root_for_driver(tmp_path, "tui/tests/acceptance.rs")
+        assert got == tmp_path / "tui" / "tests" / "acceptance"
+
+    def test_flat_entrypoint_collapses_onto_shared_tree(self, tmp_path: Path) -> None:
+        """A repo whose entrypoint already sits at the tree root (e.g. a
+        future standalone coord-tui repo's `tests/acceptance.rs`) resolves
+        to the exact same directory a directory-discovered driver would."""
+        got = acceptance_root_for_driver(tmp_path, "tests/acceptance.rs")
+        assert got == tmp_path / ACCEPTANCE_DIRNAME
 
 
 class TestLoadManifest:

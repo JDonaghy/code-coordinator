@@ -224,6 +224,12 @@ if [[ "$REPO_NAME" == "code-coordinator" || "$REPO_NAME" == "claude-coordinator"
     else
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
+            # #2896: the tui-tuidriver sealed slices (ms-33/38/65/67) moved
+            # from the repo-root tests/** into tui/tests/acceptance/, so a
+            # diff touching one now falls through to the `tui/*` arm below
+            # (cargo) instead of this one (pytest) — correct, since it's
+            # `tui/tests/acceptance.rs` that `include!`s them. Only the
+            # cli-pytest route's own ms-37 slices remain under tests/**.
             case "$f" in
                 coord/*|tests/*|pyproject.toml|conftest.py) RUN_PY=1 ;;
                 tui/*)                                      RUN_RS=1 ;;

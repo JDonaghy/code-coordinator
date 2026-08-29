@@ -26,10 +26,37 @@ from typing import Any, Callable, Literal
 
 import yaml
 
-from coord.config import Config
+from coord.config import Config, entrypoint_sibling_acceptance_dir
 from coord.models import Machine, Repo
 
 ACCEPTANCE_DIRNAME = "tests/acceptance"
+
+
+def acceptance_root_for_driver(base: Path, entrypoint: str) -> Path:
+    """Where a resolved driver's manifests/contracts actually live under
+    *base* (a repo checkout root) — #2896.
+
+    A directory-discovered driver (``cli-pytest``, no ``entrypoint:``, e.g.
+    this repo's own ``ms-37``) still uses the shared repo-root
+    :data:`ACCEPTANCE_DIRNAME`. An entrypoint-linked driver
+    (``tui-tuidriver``) wires its JIT-authored slices in from the
+    entrypoint's own sibling ``acceptance/`` directory instead — relocated
+    there (from the shared root) so the crate ``include!``s across nothing
+    but its own tree; see :func:`coord.config.entrypoint_sibling_acceptance_dir`,
+    the same derivation :meth:`coord.config.AcceptanceConfig.sealed_paths`
+    uses to seal it.
+
+    Callers that already resolved a ``driver_cfg`` (``coord acceptance run``
+    / ``record``, both routed through the same ``--for-path``-selected
+    driver) pass its ``.entrypoint`` here instead of hardcoding
+    ``base / ACCEPTANCE_DIRNAME`` — the bug the hardcoded form had: a routed
+    repo's OTHER driver's slices (relocated out of the shared root) would
+    silently resolve to an empty/wrong directory and report "no acceptance
+    slice" for an issue that has one, just not there any more.
+    """
+    if not entrypoint:
+        return base / ACCEPTANCE_DIRNAME
+    return base / entrypoint_sibling_acceptance_dir(entrypoint)
 
 
 def ms_dirname(milestone_number: int) -> str:

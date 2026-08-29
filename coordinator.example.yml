@@ -165,6 +165,14 @@ acceptance:
           run: "cargo test --test acceptance -- --format json"
           mock: "*.screen"
           capability: rust
+          # #1552/#2896: `cargo test --test acceptance` can't see a slice at
+          # all until `tui/tests/acceptance.rs` `include!`s it, so that file
+          # is the sealed set's entry point (AcceptanceConfig.sealed_paths)
+          # — and, since #2896 relocated the milestone slices this
+          # entrypoint wires in from the repo-root tests/acceptance/ into
+          # this crate's own tui/tests/acceptance/, that sibling directory
+          # is derived from this path and sealed too.
+          entrypoint: tui/tests/acceptance.rs
 
 smoke_tests:
   # #1021/#1426: auto-dispatch a headless smoke (Test-stage) assignment when

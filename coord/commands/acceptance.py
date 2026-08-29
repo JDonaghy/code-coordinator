@@ -44,8 +44,8 @@ import click
 
 from coord import github_ops
 from coord.acceptance import (
-    ACCEPTANCE_DIRNAME,
     acceptance_capability_gap,
+    acceptance_root_for_driver,
     apply_expected_red,
     build_verdict,
     dump_manifest_error_hint,
@@ -326,6 +326,15 @@ def acceptance_run(
     for line in _checkout_freshness_lines(cwd, repo, default_branch):
         click.echo(line, err=True)
 
+    # #2896: the manifests/contracts a resolved driver actually reads live
+    # beside its own entrypoint when it has one (an entrypoint-linked driver
+    # like tui-tuidriver `include!`s its slices from a sibling `acceptance/`
+    # dir, relocated out of the repo-root tree so the crate is
+    # self-contained) — NOT unconditionally under the shared repo-root
+    # ACCEPTANCE_DIRNAME, which now only holds a directory-discovered
+    # driver's (cli-pytest's) own slices.
+    acceptance_root = acceptance_root_for_driver(cwd, driver_cfg.entrypoint)
+
     # #1125 review finding 2: resolve the `{ms}` template (e.g. a routed
     # `run: "pytest tests/acceptance/{ms}"`) from the issue's manifest-mapped
     # ms-NN dir *before* running, when scoped to one issue. Fails soft to
@@ -335,7 +344,7 @@ def acceptance_run(
     ms: str | None = None
     if issue_number is not None:
         try:
-            ms = ms_dir_for_issue(cwd / ACCEPTANCE_DIRNAME, issue_number)
+            ms = ms_dir_for_issue(acceptance_root, issue_number)
         except Exception:  # noqa: BLE001
             ms = None
 
@@ -358,7 +367,7 @@ def acceptance_run(
         verdict = build_verdict(result.tests, scope="all")
     else:
         verdict = _scoped_verdict(
-            result.tests, cwd / ACCEPTANCE_DIRNAME, issue_number,
+            result.tests, acceptance_root, issue_number,
             entrypoint=driver_cfg.entrypoint,
         )
 
@@ -371,7 +380,7 @@ def acceptance_run(
         # CI failure) the moment the repo had more than one driver kind in
         # use. See coord.acceptance.load_expected_red's docstring.
         expected_red = load_expected_red(
-            cwd / ACCEPTANCE_DIRNAME, driver_kind=driver_cfg.kind,
+            acceptance_root, driver_kind=driver_cfg.kind,
         )
         verdict = apply_expected_red(verdict, set(expected_red))
         click.echo(json.dumps(verdict, indent=2))
@@ -971,13 +980,18 @@ def _acceptance_record_local(
             )
             sys.exit(1)
 
+        # #2896: same per-driver root resolution as `acceptance_run` above —
+        # an entrypoint-linked driver's manifests live beside its entrypoint,
+        # not unconditionally under the shared repo-root ACCEPTANCE_DIRNAME.
+        acceptance_root = acceptance_root_for_driver(wt_path, driver_cfg.entrypoint)
+
         # #1125 review finding 2: resolve `{ms}` from the issue's
         # manifest-mapped ms-NN dir (the worktree just checked out at
         # `sha`) before running — same fail-soft-to-None rationale as
         # `acceptance_run` above.
         ms: str | None = None
         try:
-            ms = ms_dir_for_issue(wt_path / ACCEPTANCE_DIRNAME, issue_number)
+            ms = ms_dir_for_issue(acceptance_root, issue_number)
         except Exception:  # noqa: BLE001
             ms = None
 
@@ -998,7 +1012,7 @@ def _acceptance_record_local(
         # the way out.
         try:
             verdict = _scoped_verdict(
-                result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number,
+                result.tests, acceptance_root, issue_number,
                 entrypoint=driver_cfg.entrypoint,
             )
         except SystemExit:

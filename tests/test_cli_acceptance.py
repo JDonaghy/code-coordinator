@@ -192,8 +192,11 @@ class TestAcceptanceRun:
         blob = json.dumps({"tests": [{"id": "ms01::unrelated", "status": "pass"}]})
         cwd = tmp_path / "repo"
         cwd.mkdir()
+        # #2896: an entrypoint-linked driver's manifests live beside the
+        # entrypoint (tui/tests/acceptance.rs -> tui/tests/acceptance/), not
+        # the repo-root tests/acceptance/ — see acceptance_root_for_driver.
         _write_manifest(
-            cwd / "tests" / "acceptance",
+            cwd / "tui" / "tests" / "acceptance",
             {"ms01::a": 944, "ms01::b": 944, "ms01::unrelated": 900},
         )
         config_path = _write_config(
@@ -222,8 +225,10 @@ class TestAcceptanceRun:
         blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
         cwd = tmp_path / "repo"
         cwd.mkdir()
+        # #2896: see the sibling test above — entrypoint-linked manifests
+        # live under tui/tests/acceptance/, not the repo-root tests/acceptance/.
         _write_manifest(
-            cwd / "tests" / "acceptance", {"ms01::a": 944, "ms01::b": 944},
+            cwd / "tui" / "tests" / "acceptance", {"ms01::a": 944, "ms01::b": 944},
         )
         config_path = _write_config(
             tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'",

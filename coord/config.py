@@ -390,6 +390,26 @@ class AcceptanceDriverConfig:
 SEALED_ACCEPTANCE_DIR = "tests/acceptance/"
 
 
+def entrypoint_sibling_acceptance_dir(entrypoint: str) -> str:
+    """The ``acceptance/`` directory an entrypoint-linked driver ``include!``s
+    its JIT-authored slices from (#2896), derived from the entrypoint path
+    rather than hardcoded: ``"tui/tests/acceptance.rs"`` -> ``"tui/tests/
+    acceptance/"``, ``"tests/acceptance.rs"`` -> ``"tests/acceptance/"``.
+
+    Public (no leading underscore) — :mod:`coord.acceptance` imports this to
+    resolve which directory a resolved driver's manifests/contracts actually
+    live under (:func:`coord.acceptance.acceptance_root_for_driver`), the
+    same derivation :meth:`AcceptanceConfig.sealed_paths` uses to seal it.
+
+    ``_acceptance_entrypoint`` already rejects an ``entrypoint:`` with no
+    basename or a directory (trailing slash), so *entrypoint* is always at
+    least a bare filename here.
+    """
+    directory, _, _ = entrypoint.rpartition("/")
+    prefix = f"{directory}/" if directory else ""
+    return f"{prefix}acceptance/"
+
+
 @dataclass
 class AcceptanceConfig:
     """``acceptance.drivers`` — repo name -> :class:`AcceptanceDriverConfig`."""
@@ -421,12 +441,13 @@ class AcceptanceConfig:
 
     def sealed_paths(self, repo_name: str) -> list[str]:
         """The full sealed-oracle path set for *repo_name* (#944 sealing v1,
-        #1552) — ``[]`` when the repo has no acceptance driver at all.
+        #1552, #2896) — ``[]`` when the repo has no acceptance driver at all.
 
         Two kinds of entry, distinguished by the trailing slash:
 
-        - ``"tests/acceptance/"`` — a directory prefix; everything under it
-          is sealed.
+        - a directory prefix (``"tests/acceptance/"``, and, per below, each
+          entrypoint's own sibling ``.../acceptance/`` dir) — everything
+          under it is sealed.
         - each declared driver ``entrypoint`` (e.g.
           ``"tui/tests/acceptance.rs"``) — an exact file.
 
@@ -439,10 +460,31 @@ class AcceptanceConfig:
         unwired and ship 476 lines of dead code. Deriving the set from the
         driver definition lets each route declare its own entry point
         instead.
+
+        #2896: the repo-root ``tests/acceptance/`` tree no longer holds
+        every milestone's slices — an entrypoint-linked driver's JIT-authored
+        slices now live beside its own entrypoint (``tui/tests/
+        acceptance.rs`` wires in ``tui/tests/acceptance/ms-NN/*.rs``, moved
+        out of the repo root so the crate is self-contained), not under the
+        shared root used by directory-discovered drivers like ``cli-pytest``
+        (whose ``ms-37`` slices are still exactly there). So each entrypoint
+        also seals its own sibling ``acceptance/`` directory — derived from
+        the entrypoint path, not a second hardcoded literal, since a repo
+        whose entrypoint already sits at the tree root (e.g. a future
+        standalone ``coord-tui`` repo's flat ``tests/acceptance.rs``) has
+        that sibling collapse onto ``SEALED_ACCEPTANCE_DIR`` itself — see the
+        dedup below.
         """
         if not self.has_driver(repo_name):
             return []
-        return [SEALED_ACCEPTANCE_DIR, *self.entrypoints(repo_name)]
+        out = [SEALED_ACCEPTANCE_DIR]
+        for ep in self.entrypoints(repo_name):
+            if ep not in out:
+                out.append(ep)
+            sibling = entrypoint_sibling_acceptance_dir(ep)
+            if sibling not in out:
+                out.append(sibling)
+        return out
 
     def driver_for(
         self, repo_name: str, path: str | None = None,

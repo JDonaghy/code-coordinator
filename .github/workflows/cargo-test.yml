@@ -22,24 +22,22 @@ on:
   push:
     branches: [main]
     paths:
+      # #2180 / #2896: tui/tests/acceptance.rs (the sealed oracle's crate
+      # root, `include!`d into `cargo test --test acceptance`) AND the
+      # JIT-authored slices it `include!`s now both live under tui/** —
+      # #2896 relocated the slices out of the repo-root tests/acceptance/
+      # (where the path trigger below used to have to reach for them)
+      # specifically so the crate, and this trigger, are self-contained.
       - 'tui/**'
-      # #2180: tui/tests/acceptance.rs (the sealed oracle's crate root,
-      # `include!`d into `cargo test --test acceptance`) is under tui/** and
-      # already covered above, but the JIT-authored slices it `include!`s
-      # live at the REPO ROOT (tests/acceptance/ms-33/, ms-38/), outside
-      # tui/**. Without this, a worker's fix to a red-by-design slice would
-      # never re-trigger this workflow at all.
-      - 'tests/acceptance/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
-      # Same reasoning as tests/acceptance/** above, for the CI-local config
-      # the new acceptance step (below) reads its driver command from.
+      # Same reasoning as tui/** above, for the CI-local config the new
+      # acceptance step (below) reads its driver command from.
       - '.github/coord-ci-acceptance.yml'
   pull_request:
     branches: [main]
     paths:
       - 'tui/**'
-      - 'tests/acceptance/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
       - '.github/coord-ci-acceptance.yml'
@@ -77,7 +75,8 @@ jobs:
 
       # #2180: the tui-tuidriver sealed acceptance route (acceptance.drivers
       # routes "tui/**" -> tui-tuidriver -> tui/tests/acceptance.rs, which
-      # `include!`s tests/acceptance/ms-33/ and ms-38/) run through the
+      # `include!`s tui/tests/acceptance/ms-33/ and ms-38/, relocated there
+      # from the repo root by #2896) run through the
       # #2164 CI wrapper. Plain `cargo test` above does NOT exercise this —
       # the `acceptance` test target has `required-features = ["test-
       # support"]` (tui/Cargo.toml), so cargo silently skips building it
@@ -105,7 +104,7 @@ jobs:
       #     appending "ago" for very old timestamps. This one is NOT already
       #     documented as expected — it looks like a genuine, ordinary bug a
       #     test-author/fix session should look at, not just declare red.
-      # Both `tests/acceptance/` and its `manifest.yml` files are SEALED
+      # Both `tui/tests/acceptance/` and its `manifest.yml` files are SEALED
       # (coord.config.AcceptanceConfig.sealed_paths) — a `type="work"`
       # session (this one) editing them trips the oracle-tamper gate at
       # review, so this PR deliberately does not add `expected_red:` entries
