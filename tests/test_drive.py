@@ -733,6 +733,18 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
     the Python side — rather than re-deriving their own. A drifted format is
     silent: the driver would wait forever for a contract that actually
     exists at a slightly different path.
+
+    #2896: ``gate_a_status``/``resolve_oracle_decision`` no longer call
+    ``gate_a_contract_path`` directly — they go through
+    ``coord.acceptance.gate_a_contract_candidates`` instead, since a bare
+    milestone number can now resolve to more than one candidate path (the
+    shared repo-root tree, or an entrypoint-linked driver's own relocated
+    sibling dir). ``gate_a_contract_candidates`` is itself built on
+    ``gate_a_contract_path`` (single source of truth preserved, just one
+    layer removed), and for a repo with no entrypoint-linked driver — the
+    Rust TUI side's own ``coordinator.yml`` shape isn't exercised here — it
+    always resolves to exactly the same single legacy path, so the drift
+    check below still holds by construction.
     """
     from coord.acceptance import gate_a_contract_path
 
@@ -763,22 +775,29 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
     rust_path = "/".join(segments).replace("ms-{}", "ms-42")
     assert rust_path == path
 
-    # Python: coord.milestone_dispatch.gate_a_status must call
-    # gate_a_contract_path too, not a private re-derivation.
+    # Python: coord.milestone_dispatch.gate_a_status must go through
+    # gate_a_contract_candidates (#2896) — itself built on
+    # gate_a_contract_path — not a private re-derivation.
     import inspect
 
     from coord import milestone_dispatch
 
-    assert "gate_a_contract_path(milestone_number)" in inspect.getsource(
+    assert "gate_a_contract_candidates(" in inspect.getsource(
         milestone_dispatch.gate_a_status
     )
 
     # coord.drive: resolve_oracle_decision must do the same.
     from coord import drive
 
-    assert "gate_a_contract_path(state.milestone_number)" in inspect.getsource(
+    assert "gate_a_contract_candidates(" in inspect.getsource(
         drive.resolve_oracle_decision
     )
+
+    # And gate_a_contract_candidates itself must be built on
+    # gate_a_contract_path, not a second re-derivation of the convention.
+    from coord.acceptance import gate_a_contract_candidates
+
+    assert "gate_a_contract_path(" in inspect.getsource(gate_a_contract_candidates)
 
 
 # ── decide()/_dispatch_work_stage with an active oracle decision ────────────

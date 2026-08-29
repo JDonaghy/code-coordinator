@@ -263,6 +263,28 @@ class TestBuildBriefing:
         assert "never remove a registration line to narrow your diff" in briefing
         assert "wire into the entry point" in briefing
 
+    def test_entrypoint_paths_point_at_the_relocated_sibling_dir(self) -> None:
+        """#2896: an entrypoint-linked driver's slices, contract, mocks and
+        manifest now live under that entrypoint's OWN sibling `acceptance/`
+        dir (e.g. `tui/tests/acceptance/`), not the shared repo-root
+        `tests/acceptance/` tree — every path this briefing names must
+        reflect that, and the include! snippet must be relative to the
+        entrypoint's own directory (a bare `acceptance/...`, not
+        `../../tests/acceptance/...`, the exact pattern #2896 removed from
+        `tui/tests/acceptance.rs` itself)."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            driver_entrypoint="tui/tests/acceptance.rs",
+            issue_number=101, issue_title="Add foo", issue_body="Body",
+        ))
+        assert "CONTRACT: tui/tests/acceptance/ms-25/contract.md" in briefing
+        assert "MOCKS: tui/tests/acceptance/ms-25/mocks/" in briefing
+        assert "MANIFEST: tui/tests/acceptance/ms-25/manifest.d/101.(yml|json)" in briefing
+        assert 'include!("acceptance/ms-25/<slice>.rs")' in briefing
+        assert "../../tests/acceptance" not in briefing
+        # Never names the (empty, wrong) shared repo-root default.
+        assert "`tests/acceptance/ms-25" not in briefing
+        assert "MANIFEST: tests/acceptance/ms-25" not in briefing
+
     def test_no_entrypoint_says_so_explicitly(self) -> None:
         """Stated in BOTH directions: an author on the pytest route must not
         invent an entry point to wire itself into."""

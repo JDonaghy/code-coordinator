@@ -486,6 +486,29 @@ class AcceptanceConfig:
                 out.append(sibling)
         return out
 
+    def acceptance_search_roots(self, repo_name: str) -> list[str]:
+        """Every directory (repo-relative, trailing-slash) that could hold
+        *repo_name*'s milestone-scoped acceptance slices (#2896) — the
+        directory entries of :meth:`sealed_paths`, i.e. that method's output
+        with each declared ``entrypoint:`` FILE filtered back out, leaving
+        just the repo-root shared tree (``tests/acceptance/`` — still where
+        a directory-discovered driver's slices, e.g. ``cli-pytest``'s
+        ms-37, live) plus each entrypoint-linked driver's own sibling
+        ``acceptance/`` dir (e.g. ``tui/tests/acceptance/``, where a
+        relocated slice like ms-65 now lives instead). ``[]`` when the repo
+        has no acceptance driver at all — mirrors :meth:`sealed_paths`.
+
+        Path-independent by design, like :meth:`has_driver`/
+        :meth:`entrypoints`: for a caller that knows WHICH milestone/issue
+        it's after but not (yet) which route governs it — Gate A signoff,
+        oracle readiness, worker-briefing injection, JIT test-author
+        dispatch (#2896 review) — there is no single path in hand to feed
+        :meth:`driver_for`, so it must search every place that milestone
+        could live rather than guess one. A milestone's slice lives under
+        exactly one of these; callers try each until one has it.
+        """
+        return [p for p in self.sealed_paths(repo_name) if p.endswith("/")]
+
     def driver_for(
         self, repo_name: str, path: str | None = None,
     ) -> AcceptanceDriverConfig | None:

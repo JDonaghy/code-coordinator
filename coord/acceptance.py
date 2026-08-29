@@ -66,19 +66,58 @@ def ms_dirname(milestone_number: int) -> str:
     return f"ms-{milestone_number}"
 
 
-def gate_a_contract_path(milestone_number: int) -> str:
+def gate_a_contract_path(
+    milestone_number: int, acceptance_dir: str = ACCEPTANCE_DIRNAME
+) -> str:
     """Repo-relative path to *milestone_number*'s Gate A contract
     (docs/ORACLE_LOOP.md "Layout": ``tests/acceptance/ms-NN/contract.md``).
 
     Used both by ``coord acceptance mock`` (#930, what it writes) and
     ``coord.milestone_dispatch.gate_a_status`` (what it checks for before
     letting the milestone's issues dispatch).
+
+    *acceptance_dir* (#2896) is the acceptance-tree root to build the path
+    under — defaults to the shared repo-root :data:`ACCEPTANCE_DIRNAME`
+    (unchanged behaviour for a directory-discovered driver, e.g.
+    ``cli-pytest``'s ms-37) but a caller that already knows a specific
+    entrypoint-linked driver's own sibling ``acceptance/`` dir (e.g.
+    ``tui/tests/acceptance``, via
+    :func:`coord.config.entrypoint_sibling_acceptance_dir`) passes that
+    instead. A trailing slash, if present, is stripped. Most callers that
+    don't know which root governs a given milestone ahead of time should go
+    through :func:`gate_a_contract_candidates` instead of guessing one.
     """
-    return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/contract.md"
+    dirname = acceptance_dir.rstrip("/") if acceptance_dir else ACCEPTANCE_DIRNAME
+    return f"{dirname}/{ms_dirname(milestone_number)}/contract.md"
 
 
-def _mocks_dir(milestone_number: int) -> str:
-    return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/mocks"
+def gate_a_contract_candidates(
+    config: Config, repo_name: str, milestone_number: int
+) -> list[str]:
+    """Every repo-relative path *milestone_number*'s Gate-A contract could
+    live at (#2896) — one candidate per
+    :meth:`coord.config.AcceptanceConfig.acceptance_search_roots` this repo
+    declares: the shared repo-root tree first (where a directory-discovered
+    driver's slices, e.g. ms-37's ``cli-pytest`` suite, still live), then
+    each entrypoint-linked driver's own sibling dir (where a relocated
+    slice, e.g. ms-65's ``tui-tuidriver`` suite, now lives instead).
+
+    A milestone's contract lives under exactly one candidate; callers try
+    each in turn since which one governs a bare milestone number isn't
+    knowable ahead of a single path in hand — the same problem
+    :meth:`coord.config.AcceptanceConfig.driver_for` punts on for a routed
+    repo with no *path* (see its docstring). Falls back to the single
+    legacy repo-root candidate when the repo has no acceptance driver
+    configured (or no entrypoint-linked one) at all, so a caller gets a
+    sane single candidate rather than an empty list either way.
+    """
+    roots = config.acceptance.acceptance_search_roots(repo_name) or [ACCEPTANCE_DIRNAME + "/"]
+    return [gate_a_contract_path(milestone_number, root) for root in roots]
+
+
+def _mocks_dir(milestone_number: int, acceptance_dir: str = ACCEPTANCE_DIRNAME) -> str:
+    dirname = acceptance_dir.rstrip("/") if acceptance_dir else ACCEPTANCE_DIRNAME
+    return f"{dirname}/{ms_dirname(milestone_number)}/mocks"
 
 
 def issue_dirname(issue_number: int) -> str:
@@ -183,14 +222,31 @@ def resolve_for_path(
     when the repo IS routed but resolution is ambiguous — no mocks found,
     more than one mock kind present, or zero/more-than-one route declares
     the implied kind. Callers should surface this rather than guess.
+
+    #2896: which directory a routed repo's mocks actually live under is
+    exactly the thing this function is trying to determine (an
+    entrypoint-linked driver's mocks moved to its own sibling ``acceptance/``
+    dir, alongside the rest of its relocated slice) — a bootstrap this
+    can't resolve by asking :func:`acceptance_root_for_driver` first, since
+    that needs the very driver this function exists to pick. So it searches
+    every :meth:`coord.config.AcceptanceConfig.acceptance_search_roots` this
+    repo declares (the shared repo-root tree, then each entrypoint's own
+    sibling dir) and unions whatever mock files each turns up — in practice
+    exactly one root ever has files for a given milestone, so this behaves
+    like "find the one that has them" without needing to guess first.
     """
     entry = config.acceptance.drivers.get(repo_cfg.name)
     if entry is None or not entry.routes:
         return None
 
     lister = list_mock_dir or _default_list_mock_dir
-    mocks_dir = _mocks_dir(milestone_number)
-    names = lister(repo_cfg.github, mocks_dir, repo_cfg.default_branch)
+    search_roots = config.acceptance.acceptance_search_roots(repo_cfg.name) or [
+        ACCEPTANCE_DIRNAME + "/"
+    ]
+    mocks_dirs = [_mocks_dir(milestone_number, root) for root in search_roots]
+    names: list[str] = []
+    for mocks_dir in mocks_dirs:
+        names.extend(lister(repo_cfg.github, mocks_dir, repo_cfg.default_branch))
 
     kinds = {
         MOCK_EXT_TO_DRIVER_KIND[Path(name).suffix]
@@ -202,7 +258,7 @@ def resolve_for_path(
         routes = ", ".join(f"{r.match!r} ({r.kind})" for r in entry.routes)
         return ForPathResolutionError(
             f"repo {repo_cfg.name!r} has a routed acceptance driver ({routes}) "
-            f"but --for-path could not be derived from {mocks_dir!r}'s mock "
+            f"but --for-path could not be derived from {mocks_dirs!r}'s mock "
             f"kind: {reason}. Pass --no-acceptance to skip JIT authoring, or "
             f"dispatch by hand: coord acceptance author {repo_cfg.name} "
             "<tracking_issue> --issue <N> --for-path <glob>"
@@ -580,7 +636,11 @@ def ms_dir_for_issue(acceptance_root: Path, issue_number: int) -> str | None:
 
 
 def oracle_loop_contract_block(
-    acceptance_root: Path, repo_name: str, issue_number: int
+    acceptance_root: Path,
+    repo_name: str,
+    issue_number: int,
+    *,
+    acceptance_dirname: str = ACCEPTANCE_DIRNAME,
 ) -> str:
     """The worker briefing contract (#945, docs/ORACLE_LOOP.md "The worker
     briefing contract") prepended to the TOP of a Work briefing when
@@ -592,6 +652,17 @@ def oracle_loop_contract_block(
     error. Fully fail-soft — mirrors ``coord.state.issue_context_block``
     (#603): this runs on the dispatch hot path, so a manifest hiccup must
     degrade to "no block" rather than break dispatch.
+
+    *acceptance_dirname* (#2896) is the repo-relative dirname the returned
+    text should NAME (``contract.md``/``mocks/`` paths, the "may not edit"
+    line) — defaults to the shared repo-root :data:`ACCEPTANCE_DIRNAME`,
+    unchanged for a directory-discovered driver. *acceptance_root* itself
+    is always the caller-resolved absolute path actually scanned for a
+    manifest; callers driving a repo with an entrypoint-linked driver (#2896
+    relocated its slices to that entrypoint's own sibling ``acceptance/``
+    dir) must pass BOTH together — the local root to scan and the matching
+    repo-relative name to print — or the printed path won't match where the
+    scan actually found the slice.
     """
     try:
         ms_dir = ms_dir_for_issue(acceptance_root, issue_number)
@@ -600,8 +671,9 @@ def oracle_loop_contract_block(
     if ms_dir is None:
         return ""
 
-    contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
-    mocks_dir = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks"
+    dirname = acceptance_dirname.rstrip("/") if acceptance_dirname else ACCEPTANCE_DIRNAME
+    contract_path = f"{dirname}/{ms_dir}/contract.md"
+    mocks_dir = f"{dirname}/{ms_dir}/mocks"
     return (
         "## 🔒 Oracle-loop acceptance contract — READ THIS FIRST\n\n"
         "This issue has a sealed acceptance slice authored for it. Treat "
@@ -611,7 +683,7 @@ def oracle_loop_contract_block(
         "(hand-authored HTML wireframes, one per screen state): the app "
         "must satisfy the sealed assertions written against them, not the "
         "other way around.\n\n"
-        f"- You **may not** edit `{ACCEPTANCE_DIRNAME}/**` (contract, "
+        f"- You **may not** edit `{dirname}/**` (contract, "
         "mocks, or the sealed suite). It is the sealed oracle, authored "
         "independently of your work — touching it fails the gate.\n"
         f"- Run `coord acceptance run --repo {repo_name} --issue "

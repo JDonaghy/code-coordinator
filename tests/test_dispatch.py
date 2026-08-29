@@ -500,6 +500,47 @@ class TestDispatch:
         assert briefing.rstrip().endswith("Fix the auth module")  # original briefing last
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_prepends_oracle_loop_contract_for_a_relocated_slice(
+        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+    ) -> None:
+        """#2896: an entrypoint-linked driver's slice now lives under that
+        entrypoint's own sibling `acceptance/` dir, not the shared
+        repo-root tree — this dispatch call has no single path in hand to
+        pick a route ahead of time, so it must search every root the repo
+        declares and find the slice wherever it actually landed."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        # Nothing at the shared repo-root tree — only the entrypoint's own
+        # sibling dir has the slice.
+        acceptance_dir = tmp_path / "tui" / "tests" / "acceptance" / "ms01"
+        acceptance_dir.mkdir(parents=True)
+        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": str(tmp_path)},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(
+                    kind="tui-tuidriver", run="cargo test",
+                    entrypoint="tui/tests/acceptance.rs",
+                ),
+            }),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "## 🔒 Oracle-loop acceptance contract" in briefing
+        assert "tui/tests/acceptance/ms01/contract.md" in briefing
+        # Never names the (empty, wrong) shared repo-root default.
+        assert "`tests/acceptance/ms01" not in briefing
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_oracle_loop_contract_with_tilde_repo_path(
         self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
         monkeypatch: pytest.MonkeyPatch,

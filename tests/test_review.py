@@ -1029,6 +1029,84 @@ def test_briefing_work_type_trips_tamper_on_relocated_slice() -> None:
     assert "request-changes is mandatory" in briefing
 
 
+def test_briefing_pure_rename_between_two_sealed_paths_is_not_tamper() -> None:
+    """#2896 review: relocating a sealed slice from one already-sealed
+    location to another (both declared by AcceptanceConfig.sealed_paths — a
+    byte-identical `git mv`, git's own `similarity index 100%`) is not
+    tampering. Only the rename hunks are present here — no content-changing
+    hunk touches either path — mirroring the real #2896 PR's relocated
+    slices."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-65/board_tabs_2282.rs "
+        "b/tui/tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "similarity index 100%\n"
+        "rename from tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "rename to tui/tests/acceptance/ms-65/board_tabs_2282.rs\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=2282, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/"],
+        sealed_entrypoints=["tui/tests/acceptance.rs"],
+        assignment_type="work",
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" not in briefing
+
+
+def test_briefing_rename_out_of_the_sealed_tree_still_trips_tamper() -> None:
+    """The narrow carve-out only covers a move between two ALREADY-sealed
+    locations — a rename that moves sealed content somewhere unsealed is
+    exactly the exfiltration case the tamper check exists to catch, so it
+    must still trip."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-65/board_tabs_2282.rs "
+        "b/src/board_tabs_2282.rs\n"
+        "similarity index 100%\n"
+        "rename from tests/acceptance/ms-65/board_tabs_2282.rs\n"
+        "rename to src/board_tabs_2282.rs\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=2282, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/"],
+        sealed_entrypoints=["tui/tests/acceptance.rs"],
+        assignment_type="work",
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" in briefing
+    assert "tests/acceptance/ms-65/board_tabs_2282.rs" in briefing
+
+
+def test_diff_touched_sealed_paths_exempts_sealed_to_sealed_pure_rename() -> None:
+    from coord.review import _diff_touched_sealed_paths
+
+    diff = (
+        "diff --git a/tests/acceptance/ms-65/foo.rs b/tui/tests/acceptance/ms-65/foo.rs\n"
+        "similarity index 100%\n"
+        "rename from tests/acceptance/ms-65/foo.rs\n"
+        "rename to tui/tests/acceptance/ms-65/foo.rs\n"
+    )
+    sealed = ["tests/acceptance/", "tui/tests/acceptance/"]
+    assert _diff_touched_sealed_paths(diff, sealed) == []
+
+
+def test_diff_touched_sealed_paths_still_flags_a_content_edit_at_the_same_path() -> None:
+    """Sanity: the exemption is keyed to git's own rename markers, not to
+    "old path == new path pattern" — a plain content edit (no rename lines)
+    at a sealed path is untouched by the carve-out."""
+    from coord.review import _diff_touched_sealed_paths
+
+    diff = "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+    assert _diff_touched_sealed_paths(diff, ["tests/acceptance/"]) == ["tests/acceptance/"]
+
+
 def test_briefing_pytest_route_has_no_entrypoint_section() -> None:
     """#1552: the pytest route legitimately declares no entry point (pytest
     discovers by directory), so nothing extra is said and #1175's rule is

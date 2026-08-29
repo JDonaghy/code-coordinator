@@ -907,12 +907,18 @@ def resolve_oracle_decision(
             "normal drive",
         )
     if not gate_checker.contract_exists(state.repo, state.milestone_number):
-        from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+        from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
-        path = gate_a_contract_path(state.milestone_number)
+        # #2896: name every root this milestone's contract could live under
+        # (shared repo-root tree, or an entrypoint-linked driver's own
+        # relocated sibling dir) — `contract_exists` above already searched
+        # all of them and found none, so the message should too rather than
+        # naming only the legacy repo-root candidate.
+        candidates = gate_a_contract_candidates(config, state.repo, state.milestone_number)
+        named = " or ".join(repr(p) for p in candidates)
         return OracleDecision(
             False,
-            f"Gate A contract {path!r} not merged yet on "
+            f"Gate A contract {named} not merged yet on "
             f"{state.repo_default_branch!r} — normal drive (run `coord "
             f"acceptance mock {state.repo} {state.milestone_tracking_issue}` "
             "first for the oracle loop, docs/ORACLE_LOOP.md)",
