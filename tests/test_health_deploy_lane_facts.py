@@ -171,7 +171,7 @@ def test_tui_binary_newer_than_source_is_ok(tmp_path) -> None:
     )
     result = dlf.probe_tui_binary(ctx)
     assert result.severity is Severity.OK
-    assert result.headroom == "up to date with tui/ source"
+    assert result.headroom == "up to date with coord-tui source"
     assert result.values["source_mtime"] == pytest.approx(NOW - 3600)
 
 
@@ -231,9 +231,83 @@ def test_resolve_tui_source_dir_prefers_the_configured_path(tmp_path) -> None:
     assert dlf.resolve_tui_source_dir(ctx) == configured
 
 
-def test_resolve_tui_source_dir_falls_back_to_the_first_checkout_with_one(
+# ── #2899: the crate moved to its own repo ───────────────────────────────────
+#
+# Before #2899 this lane's only answer was `<checkout>/tui/src`. The crate is
+# now the `coord-tui` repo, so the primary answer is that checkout's `src/` —
+# with the in-repo layout kept as a fallback, because a machine can still have
+# a `claude-coordinator` checkout parked on a pre-split commit and an
+# UNKNOWN there would be a loss of signal for no gain.
+
+
+def test_resolve_tui_source_dir_finds_the_checkout_named_coord_tui(
     tmp_path,
 ) -> None:
+    """A checkout NAMED coord-tui wins, and it is that checkout's `src/` —
+    not its root. Rooting the mtime walk at the checkout would sweep
+    `target/`, which on a built crate is multi-GB."""
+    checkout_a = tmp_path / "a"
+    checkout_a.mkdir()
+    checkout_b = tmp_path / "coord-tui"
+    (checkout_b / "src").mkdir(parents=True)
+    ctx = make_ctx(
+        tmp_path,
+        checkouts=(
+            Checkout(name="a", path=checkout_a),
+            Checkout(name="coord-tui", path=checkout_b),
+        ),
+    )
+    assert dlf.resolve_tui_source_dir(ctx) == checkout_b / "src"
+
+
+def test_resolve_tui_source_dir_falls_back_to_the_structural_marker(
+    tmp_path,
+) -> None:
+    """A coord-tui checkout under a different directory name is still found.
+
+    A marker that stops matching turns the lane OFF, and an off lane is
+    indistinguishable from a healthy one — the exact failure this whole
+    module exists to prevent.
+    """
+    checkout = tmp_path / "renamed-tui"
+    (checkout / "src" / "app").mkdir(parents=True)
+    (checkout / dlf.COORD_TUI_MARKER).write_text("// data.rs")
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="renamed-tui", path=checkout),)
+    )
+    assert dlf.resolve_tui_source_dir(ctx) == checkout / "src"
+
+
+def test_resolve_tui_source_dir_marker_does_not_match_a_plain_rust_checkout(
+    tmp_path,
+) -> None:
+    """The marker is a file unique to THIS crate, never a bare `Cargo.toml`.
+
+    Every Rust checkout on the machine (quadraui, vimcode) has a
+    `Cargo.toml`; matching on one would point the lane at the wrong tree and
+    MANUFACTURE staleness rather than report it.
+    """
+    other = tmp_path / "quadraui"
+    (other / "src").mkdir(parents=True)
+    (other / "Cargo.toml").write_text("[package]\nname = \"quadraui\"\n")
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="quadraui", path=other),))
+    assert dlf.resolve_coord_tui_checkout(ctx) is None
+    assert dlf.resolve_tui_source_dir(ctx) is None
+
+
+def test_resolve_coord_tui_checkout_prefers_the_configured_path(tmp_path) -> None:
+    configured = tmp_path / "elsewhere"
+    ctx = make_ctx(
+        tmp_path, thresholds=HealthConfig(coord_tui_checkout=str(configured))
+    )
+    assert dlf.resolve_coord_tui_checkout(ctx) == configured
+
+
+def test_resolve_tui_source_dir_falls_back_to_the_pre_split_layout(
+    tmp_path,
+) -> None:
+    """#2899's back-compat half: a `claude-coordinator` checkout parked on a
+    pre-split commit still answers, via `<checkout>/tui/src`."""
     checkout_a = tmp_path / "a"
     checkout_a.mkdir()
     checkout_b = tmp_path / "b"
@@ -246,6 +320,26 @@ def test_resolve_tui_source_dir_falls_back_to_the_first_checkout_with_one(
         ),
     )
     assert dlf.resolve_tui_source_dir(ctx) == checkout_b / "tui" / "src"
+
+
+def test_resolve_tui_source_dir_prefers_coord_tui_over_the_pre_split_layout(
+    tmp_path,
+) -> None:
+    """Both present — a live coord-tui checkout AND a stale in-repo one — must
+    resolve to coord-tui. Comparing the binary against the abandoned tree is
+    how this lane reports the OPPOSITE of the truth (#1806)."""
+    legacy = tmp_path / "claude-coordinator"
+    (legacy / "tui" / "src").mkdir(parents=True)
+    current = tmp_path / "coord-tui"
+    (current / "src").mkdir(parents=True)
+    ctx = make_ctx(
+        tmp_path,
+        checkouts=(
+            Checkout(name="claude-coordinator", path=legacy),
+            Checkout(name="coord-tui", path=current),
+        ),
+    )
+    assert dlf.resolve_tui_source_dir(ctx) == current / "src"
 
 
 def test_resolve_tui_source_dir_is_none_when_no_checkout_has_one(tmp_path) -> None:
