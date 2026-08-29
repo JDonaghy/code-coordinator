@@ -37,7 +37,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 AUTO_RELEASE_YML = WORKFLOW_DIR / "auto-release.yml"
 PUBLISH_YML = WORKFLOW_DIR / "publish.yml"
-RELEASE_TUI_YML = WORKFLOW_DIR / "release-tui.yml"
+# #2898: coord-tui's workflow left this repo's `.github/workflows/` — it is
+# staged inside `tui/` for #2894's move story, fires on its own `v*` push, and
+# is no longer reachable from publish.yml at all. See
+# tests/test_release_unified_1242.py::TestSplitReleaseChannels.
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -156,12 +159,14 @@ class TestAutoReleaseInvokesPublish:
                     "that is the caller's branch, not the tag being released"
                 )
 
-        tui = workflow["jobs"]["build-tui"]
-        assert "plan.outputs.ref" in str((tui.get("with") or {}).get("ref", "")), (
-            "build-tui must pass the ref down too, or the binaries are built "
-            "from main's tip and stamped with the tag's version"
+        # #2898: there is no `build-tui` job to pass the ref down to any more.
+        # coord-tui builds from its own repo's tag push, where the default
+        # checkout ref IS the tag, so the whole class of caller-ref drift this
+        # test guards cannot arise on that side.
+        assert "build-tui" not in workflow["jobs"], (
+            "publish.yml grew a coord-tui build back; #2898 moved that channel "
+            "to coord-tui's own repo"
         )
-        assert "ref" in _triggers(_load(RELEASE_TUI_YML))["workflow_call"]["inputs"]
 
     def test_verify_tag_reads_the_tagged_commit_not_github_sha(self) -> None:
         """`github.sha` under workflow_call is main's tip, which is always an
