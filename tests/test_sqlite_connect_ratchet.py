@@ -201,9 +201,19 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "HTTP write path.",
     ),
     "test_portal_store.py": Classification(
-        3, (BUCKET_C,),
-        "A file board.db opened with check_same_thread=False and also handed "
-        "to SqliteStore by path.",
+        4, (BUCKET_C,),
+        "The portal daemon-endpoint pattern, once per endpoint under test: a "
+        "file board.db opened with check_same_thread=False (TestClient runs "
+        "the handler on a worker thread the autouse connection cannot serve) "
+        "and *the same file* handed to SqliteStore by path for the read side. "
+        "Neither half is optional, which is why scratch_database() does not "
+        "fit: it yields a connection, not a path, and without "
+        "check_same_thread=False the handler thread cannot use it. "
+        "+1 for #2867's test_daemon_portal_note_endpoint, the POST "
+        "`/portal-note` seam — a verbatim copy of the "
+        "test_daemon_portal_decision_endpoint / _ledger_endpoint shape "
+        "directly above it, asserting an operator note written through the "
+        "daemon lands in the real portal_ledger.",
     ),
     "test_milestone_gate.py": Classification(
         3, (BUCKET_C,),
