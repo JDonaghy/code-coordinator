@@ -451,6 +451,123 @@ def test_pause_on_thin_client_reaches_daemon_and_blocks_dispatch(
         assert pick_reviewer_machine("someone-else", "api", board, review_cfg) is None
 
 
+def test_github_backoff_recorded_on_one_host_is_honoured_by_another(
+    file_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#2934 acceptance: a 403 recorded by one machine is honoured by every
+    other machine's next `gh` call, with a real daemon in the loop rather
+    than a unit test alone -- the same black-box shape as
+    `test_pause_on_thin_client_reaches_daemon_and_blocks_dispatch` above,
+    for the sibling daemon-aware seam #2934 adds to `coord.github_throttle`.
+
+    Sequence: (1) "host A" observes a secondary rate limit and calls the
+    REAL `coord.github_throttle.record()` with a board service configured
+    and `coord.client`'s HTTP calls routed to this exact daemon instance;
+    (2) "host B" — no state of its own, just the same board-service routing
+    — calls the REAL `consult()` and must see the SAME backoff, proving the
+    signal crossed the daemon rather than living in a per-host file; (3) the
+    daemon's own in-process view (no board_service — the real daemon never
+    points at itself, `coord.machine_pause`'s documented contract) sees it
+    too via `current()`, with no extra HTTP hop, because it is literally the
+    same file `get_github_backoff` just served from.
+    """
+    from coord import github_throttle
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+
+    with TestClient(app) as cli:
+        # Before any hit: nothing to back off for.
+        sleep_s, backoff = github_throttle.consult()
+        assert (sleep_s, backoff) == (0.0, None)
+
+        # Pin the raw HTTP contract directly, independent of the client-side
+        # wrapper functions: `record()`/`consult()` both silently fall back
+        # to the local file on ANY exception, including a bug in the daemon
+        # handler itself (e.g. an ImportError inside the route), so a test
+        # that only ever calls the wrappers cannot tell a working daemon
+        # round trip from a broken one that happened to fall back onto the
+        # very file this single-process test would read anyway.
+        get_before = cli.get("/github-backoff")
+        assert get_before.status_code == 200
+        assert get_before.json() == {"backoff": None}
+        post_resp = cli.post(
+            "/github-backoff",
+            json={
+                "reason": "secondary_rate_limit", "status": 403,
+                "request_id": "AE80:1EF17E", "retry_after_s": 90.0,
+            },
+        )
+        assert post_resp.status_code == 200
+        posted_backoff = post_resp.json()["backoff"]
+        assert posted_backoff is not None
+        assert posted_backoff["request_id"] == "AE80:1EF17E"
+        get_after = cli.get("/github-backoff")
+        assert get_after.status_code == 200
+        assert get_after.json()["backoff"]["request_id"] == "AE80:1EF17E"
+
+        # Now the same sequence through the REAL client-side wrappers.
+        github_throttle.clear()
+
+        # "host A": a thin client pointed at THIS daemon instance.
+        monkeypatch.setattr(coord_client.httpx, "get", cli.get)
+        monkeypatch.setattr(coord_client.httpx, "post", cli.post)
+        monkeypatch.setattr(
+            coord_client, "resolve_board_service",
+            lambda *a, **k: coord_client.ServiceConfig(url="http://testserver"),
+        )
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="AE80:1EF17E", retry_after_s=90.0,
+        )
+
+        # "host B": same routing, no state of its own -- sees host A's hit.
+        sleep_s, backoff = github_throttle.consult()
+        assert backoff is not None
+        assert backoff.reason == "secondary_rate_limit"
+        assert backoff.request_id == "AE80:1EF17E"
+        assert sleep_s > 0.0
+
+        # The daemon's own tick loop: no board_service, reads its local file
+        # directly -- the SAME file /github-backoff just wrote via host A's
+        # POST and served back for host B's GET.
+        monkeypatch.setattr(coord_client, "resolve_board_service", lambda *a, **k: None)
+        local = github_throttle.current()
+        assert local is not None
+        assert local.request_id == "AE80:1EF17E"
+
+
+def test_github_backoff_falls_back_to_local_file_when_daemon_unreachable(
+    monkeypatch,
+) -> None:
+    """#2934 acceptance: a daemon that can't be reached must never degrade
+    to "no damping" (nor raise) -- `record()`/`consult()` fall back to the
+    per-host file exactly as they did before #2934."""
+    import httpx
+
+    from coord import github_throttle
+
+    monkeypatch.setattr(
+        coord_client, "resolve_board_service",
+        lambda *a, **k: coord_client.ServiceConfig(url="http://unreachable-daemon"),
+    )
+
+    def _raise(*_a, **_k):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(coord_client.httpx, "get", _raise)
+    monkeypatch.setattr(coord_client.httpx, "post", _raise)
+
+    github_throttle.record(
+        reason="secondary_rate_limit", status=403,
+        request_id=None, retry_after_s=45.0, now=1000.0,
+    )
+    sleep_s, backoff = github_throttle.consult(now=1002.0)
+    assert backoff is not None
+    assert backoff.until == pytest.approx(1045.0)
+    assert sleep_s > 0.0
+
+
 def test_serve_merge_passes_show_plan_to_callback(file_db: Path, valid_config_path: Path):
     """#684 regression: ``post_merge`` must pass ``show_plan`` to the merge
     callback.  #684 added ``--plan``/``show_plan`` to ``coord merge`` (routing

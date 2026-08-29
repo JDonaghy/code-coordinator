@@ -1,5 +1,5 @@
 """Tests for coord.github_throttle (#2809: the shared per-machine GitHub
-rate-limit backoff state).
+rate-limit backoff state; #2934: made fleet-wide via the board daemon).
 
 Scope: the module is a small, best-effort, file-backed signal — record a
 hit, consult it before the next call, never shrink an active window, never
@@ -7,14 +7,27 @@ raise into a caller regardless of what the on-disk state looks like. The
 `tests/conftest.py` autouse `_no_real_github_backoff_store` fixture already
 redirects every test's `$COORD_GITHUB_BACKOFF_STATE` to a private tmp file,
 so these tests never touch the operator's real `~/.coord/github_backoff.json`.
+
+Every test above `TestDaemonRouting` runs with no board service configured
+(the default), so `record()`/`consult()` exercise exactly the same local-file
+code path their pre-#2934 counterparts — `local_record()`/`local_consult()` —
+always did; #2934 only added a daemon-first branch in front of it.
+`TestDaemonRouting` below is the unit-level coverage for THAT branch (mocking
+`coord.board_service.resolve()` and the `coord.client` transport functions,
+same pattern as `tests/test_machine_pause.py`'s `_remote()` helper); the full
+cross-process round trip through a real daemon app — one host's `record()`
+observed by another host's `consult()` — is covered separately in
+`tests/test_serve.py::test_github_backoff_recorded_on_one_host_is_honoured_by_another`.
 """
 
 from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
+from coord import client as coord_client
 from coord import github_throttle
 
 
@@ -186,3 +199,132 @@ class TestStatePathOverride:
         assert data["request_id"] == "req-1"
         assert data["retry_after_s"] == 42.0
         assert data["until"] == pytest.approx(542.0)
+
+
+# ── #2934: daemon-aware routing ─────────────────────────────────────────────
+#
+# `record()`/`consult()` route through the board daemon when one is
+# configured (thin client), following the same daemon-aware pattern
+# `coord.machine_pause` established for pause/quiet-hours/cordons. These
+# tests cover the unit-level routing decision in isolation — see the module
+# docstring for where the real cross-process round trip lives.
+
+
+def _remote(monkeypatch, url: str = "http://daemon:7435") -> None:
+    """Make `coord.board_service.resolve()` (and therefore github_throttle's
+    daemon-aware functions) act as a thin client pointed at *url* — same
+    helper `tests/test_machine_pause.py` uses for the identical seam."""
+    monkeypatch.setattr(
+        coord_client, "resolve_board_service",
+        lambda *a, **k: coord_client.ServiceConfig(url=url),
+    )
+
+
+class TestDaemonRouting:
+    def test_record_posts_to_the_daemon_instead_of_the_local_file(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        _remote(monkeypatch)
+        posted = {}
+
+        def _fake_post(svc, **kwargs):
+            posted["url"] = svc.url
+            posted.update(kwargs)
+            return {"backoff": None}
+
+        monkeypatch.setattr(coord_client, "post_github_backoff", _fake_post)
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="req-1", retry_after_s=120.0,
+        )
+        assert posted == {
+            "url": "http://daemon:7435",
+            "reason": "secondary_rate_limit", "status": 403,
+            "request_id": "req-1", "retry_after_s": 120.0,
+        }
+        # Never fell through to the local file.
+        assert github_throttle.current() is None
+
+    def test_record_falls_back_to_the_local_file_when_the_daemon_is_unreachable(
+        self, monkeypatch
+    ) -> None:
+        _remote(monkeypatch)
+
+        def _raise(*_a, **_k):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(coord_client, "post_github_backoff", _raise)
+
+        # Must not raise -- record() is unconditionally best-effort, daemon
+        # routing included (module docstring: "damping must never become a
+        # new way to break `gh` access").
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id=None, retry_after_s=90.0, now=1000.0,
+        )
+        b = github_throttle.current(now=1000.0)
+        assert b is not None
+        assert b.until == pytest.approx(1090.0)
+
+    def test_consult_asks_the_daemon_when_remote(self, monkeypatch) -> None:
+        _remote(monkeypatch)
+        monkeypatch.setattr(
+            coord_client, "fetch_github_backoff",
+            lambda svc, **k: {
+                "until": 1120.0, "reason": "secondary_rate_limit", "status": 403,
+                "request_id": "remote-hit", "retry_after_s": 120.0, "recorded_at": 1000.0,
+            },
+        )
+        sleep_s, backoff = github_throttle.consult(now=1002.0)
+        assert backoff is not None
+        assert backoff.request_id == "remote-hit"
+        # 118s remaining, capped at MAX_PRECALL_SLEEP_S +/- jitter.
+        assert sleep_s <= github_throttle.MAX_PRECALL_SLEEP_S * 1.25
+        # Never touched the local file to answer this.
+        assert github_throttle.current() is None
+
+    def test_consult_reports_no_backoff_when_the_daemon_has_none(self, monkeypatch) -> None:
+        _remote(monkeypatch)
+        monkeypatch.setattr(coord_client, "fetch_github_backoff", lambda svc, **k: None)
+        sleep_s, backoff = github_throttle.consult(now=1000.0)
+        assert sleep_s == 0.0
+        assert backoff is None
+
+    def test_consult_falls_back_to_the_local_file_when_the_daemon_is_unreachable(
+        self, monkeypatch
+    ) -> None:
+        """The other three hosts must still honour their OWN last-known
+        local state when the shared daemon can't be reached -- never 'no
+        damping' just because the network blipped."""
+        _remote(monkeypatch)
+
+        def _raise(*_a, **_k):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(coord_client, "fetch_github_backoff", _raise)
+
+        # Seed the LOCAL file directly (bypassing record(), which would also
+        # try the daemon) to isolate consult()'s own fallback.
+        github_throttle.local_record(
+            reason="secondary_rate_limit", status=403,
+            request_id=None, retry_after_s=60.0, now=1000.0,
+        )
+        sleep_s, backoff = github_throttle.consult(now=1002.0)
+        assert backoff is not None
+        assert backoff.until == pytest.approx(1060.0)
+
+    def test_consult_treats_a_malformed_daemon_response_as_no_backoff(
+        self, monkeypatch
+    ) -> None:
+        """A successful GET carrying junk (not an exception) reads as 'no
+        backoff' -- same fail-open posture `_read()` already has for a
+        corrupt local file -- rather than falling back to the local file,
+        which the daemon DID successfully answer for."""
+        _remote(monkeypatch)
+        monkeypatch.setattr(
+            coord_client, "fetch_github_backoff", lambda svc, **k: {"not": "a backoff"},
+        )
+        sleep_s, backoff = github_throttle.consult(now=1000.0)
+        assert sleep_s == 0.0
+        assert backoff is None

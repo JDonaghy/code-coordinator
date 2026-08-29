@@ -1,4 +1,4 @@
-"""Shared, per-machine GitHub request backoff state (#2809).
+"""Shared, fleet-wide GitHub request backoff state (#2809, #2934).
 
 **The problem.** GitHub's *secondary* (abuse-detection) rate limiter fires on
 request *rate and concurrency*, not cumulative volume — it does not show up
@@ -29,20 +29,39 @@ only decays when request volume drops), and every wait applies jitter so
 pollers that all observed the same 403 don't all wake up and retry in
 lockstep.
 
-**Scope: per-machine, not per-fleet.** The fleet spans multiple machines
-sharing one GitHub token/user, so a *complete* fix routes this through the
-board daemon (the one process every machine already talks to — see
-``coord.machine_pause`` for the daemon-aware pattern this module deliberately
-does NOT yet follow). That is a larger, separable change; this module closes
-the same-host half of #2809 (the incident's own two concrete examples —
-``claude-coordinator#2782``/``#2802`` — were polling from the same host) and
-leaves cross-machine coordination as a documented follow-up rather than
-silently claiming to solve it.
+**Scope: fleet-wide, not just per-machine (#2934).** GitHub's secondary
+limiter is keyed on the *user*, not the host — #2809's own captured 403 reads
+``API rate limit exceeded for user ID 3506413`` — so four individually
+well-behaved machines sharing one token still sum to a rate that trips it,
+each backing off in isolation while the other three keep calling. That is
+exactly the synchronized-poll pattern that keeps a secondary limit tripped
+instead of letting it decay, and it is why the two full days after #2809
+alone went live (36, 48 trips) read at or above its own pre-fix baseline
+(15, 43, 30).
+
+:func:`record` and :func:`consult` — the two functions :func:`coord.
+github_ops._gh` actually calls — now route through the board daemon (the one
+process every machine already talks to) when one is configured, following
+the daemon-aware pattern ``coord.machine_pause`` established: a hit recorded
+on one host is published once to the daemon's local file, and every other
+host's very next ``consult()`` sees it over that same HTTP seam, rather than
+each host only ever learning about its own 403s. :func:`local_record` /
+:func:`local_consult` (and :func:`current` / :func:`clear`, which stay
+local-only — nothing outside tests reads them) are the original same-host
+primitives from #2809, now the fallback :func:`record`/:func:`consult` use
+whenever no board service is configured (solo use, or the daemon's own
+in-process calls — it has no ``board_service`` configured for itself, so its
+own ``gh`` calls read/write the very file its ``/github-backoff`` endpoint
+serves, with no extra hop) **and** whenever the daemon IS configured but
+unreachable: a transport failure on either the read or the write side
+degrades to the per-host file rather than to "no damping" or a raised
+exception — see both functions' docstrings.
 
 **Best-effort, unconditionally.** Every public function here can fail (a
-missing/unwritable state dir, a corrupt file) without ever raising into or
-delaying a caller beyond the bound it already asked for — damping must never
-become a new way to break `gh` access, only a way to reduce it.
+missing/unwritable state dir, a corrupt file, an unreachable daemon) without
+ever raising into or delaying a caller beyond the bound it already asked
+for — damping must never become a new way to break `gh` access, only a way
+to reduce it.
 """
 
 from __future__ import annotations
@@ -127,18 +146,13 @@ def _jitter(seconds: float) -> float:
     return max(0.0, seconds + random.uniform(-spread, spread))
 
 
-def _read(path: Path | None = None) -> Backoff | None:
-    path = path if path is not None else _state_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
+def _backoff_from_mapping(data: dict) -> Backoff | None:
+    """Parse one ``{until, reason, status, request_id, retry_after_s,
+    recorded_at}`` mapping into a :class:`Backoff`, or ``None`` if it isn't
+    one — shared by :func:`_read` (the on-disk JSON) and :func:`consult`
+    (the daemon's ``GET /github-backoff`` JSON body), so the two shapes can
+    never quietly drift apart.
+    """
     until = data.get("until")
     if not isinstance(until, (int, float)):
         return None
@@ -152,6 +166,31 @@ def _read(path: Path | None = None) -> Backoff | None:
     )
 
 
+def _read(path: Path | None = None) -> Backoff | None:
+    path = path if path is not None else _state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _backoff_from_mapping(data)
+
+
+def _resolve_service():  # -> coord.client.ServiceConfig | None
+    """Same seam ``coord.machine_pause._resolve_service`` uses: ``None`` for
+    solo/local use and for the daemon's own in-process calls (it never
+    configures a board service for itself), a ``ServiceConfig`` for a thin
+    client."""
+    from coord.board_service import resolve  # noqa: PLC0415
+
+    return resolve()
+
+
 def record(
     *,
     reason: str,
@@ -160,7 +199,54 @@ def record(
     retry_after_s: float | None,
     now: float | None = None,
 ) -> None:
-    """Record a rate-limit hit as the shared backoff-until timestamp.
+    """Record a rate-limit hit as the shared, fleet-wide backoff-until
+    timestamp (#2934).
+
+    Daemon-first: when a board service is configured, POSTs the hit to the
+    daemon's ``/github-backoff`` endpoint (:func:`coord.client.
+    post_github_backoff`), which records it into *that host's* local file —
+    the same file every other machine's next :func:`consult` reads. Falls
+    back to :func:`local_record` — this host's own file — both when no board
+    service is configured (solo use, or the daemon's own in-process calls)
+    and when one is configured but the POST fails for any reason (network,
+    timeout, an older daemon with no ``/github-backoff`` route): a caller who
+    just got a 403 must never fail a *second* way, over the network, because
+    publishing it fleet-wide didn't work. ``now`` is only honoured on the
+    local fallback path — the daemon's own clock governs its file.
+    """
+    svc = _resolve_service()
+    if svc is not None:
+        try:
+            from coord.client import post_github_backoff  # noqa: PLC0415
+
+            post_github_backoff(
+                svc, reason=reason, status=status, request_id=request_id,
+                retry_after_s=retry_after_s,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 -- fall back to the local file
+            _log.debug("github_throttle: daemon record failed, falling back to local: %s", exc)
+    local_record(
+        reason=reason, status=status, request_id=request_id,
+        retry_after_s=retry_after_s, now=now,
+    )
+
+
+def local_record(
+    *,
+    reason: str,
+    status: int | None,
+    request_id: str | None,
+    retry_after_s: float | None,
+    now: float | None = None,
+) -> None:
+    """Record a rate-limit hit into THIS HOST's own backoff file (#2809).
+
+    The same-host primitive :func:`record` above falls back to when no
+    board service is configured or the daemon is unreachable — see its
+    docstring. Also what the daemon's own ``POST /github-backoff`` handler
+    calls, since that endpoint runs *inside* the daemon and this file IS the
+    shared state a fleet-wide caller is asking to read.
 
     Best-effort (never raises): a caller who just got a 403 must never fail
     a *second* way because bookkeeping about the first one broke.
@@ -233,8 +319,30 @@ def clear() -> None:
         pass
 
 
+def _consult_from(b: Backoff | None, *, now: float) -> tuple[float, Backoff | None]:
+    """Shared sleep/skip computation for both :func:`local_consult` (reading
+    the on-disk *b*) and :func:`consult` (reading a daemon-fetched *b*) — one
+    place decides the jitter and the :data:`MAX_PRECALL_SLEEP_S` cap,
+    regardless of where *b* came from."""
+    if b is None:
+        return 0.0, None
+    remaining = b.until - now
+    return _jitter(min(remaining, MAX_PRECALL_SLEEP_S)), b
+
+
 def consult(*, now: float | None = None) -> tuple[float, Backoff | None]:
-    """``(sleep_s, backoff)`` for a caller about to issue a `gh` call.
+    """``(sleep_s, backoff)`` for a caller about to issue a `gh` call
+    (#2934: fleet-wide).
+
+    Daemon-first: when a board service is configured, GETs the shared
+    backoff from the daemon's ``/github-backoff`` endpoint
+    (:func:`coord.client.fetch_github_backoff`) — so a 403 recorded by
+    *another* machine's :func:`record` is honoured here, on this machine's
+    very next call, without this host having tripped anything itself. Falls
+    back to :func:`local_consult` — this host's own file — both when no
+    board service is configured (solo use, or the daemon's own in-process
+    calls) and when one is configured but the GET fails for any reason:
+    never raises, never silently drops damping to zero.
 
     ``backoff`` is the active :class:`Backoff`, or ``None`` when there isn't
     one (``sleep_s`` is then always ``0.0``). ``sleep_s`` is the jittered
@@ -245,11 +353,33 @@ def consult(*, now: float | None = None) -> tuple[float, Backoff | None]:
     docstring.
 
     Never calls `time.sleep` itself, so this stays a pure, cheaply-testable
-    read — the actual wait/skip decision belongs to the caller.
+    read — the actual wait/skip decision belongs to the caller. The daemon
+    round trip is the one exception to "cheap": a caller on the hot path of
+    every `gh` invocation pays one small HTTP GET per call when a board
+    service is configured, same cost class as every other daemon-routed read
+    in this package.
     """
     now = now if now is not None else time.time()
-    b = current(now=now)
-    if b is None:
-        return 0.0, None
-    remaining = b.until - now
-    return _jitter(min(remaining, MAX_PRECALL_SLEEP_S)), b
+    svc = _resolve_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_github_backoff  # noqa: PLC0415
+
+            raw = fetch_github_backoff(svc)
+        except Exception as exc:  # noqa: BLE001 -- fall back to the local file
+            _log.debug("github_throttle: daemon consult failed, falling back to local: %s", exc)
+        else:
+            b = _backoff_from_mapping(raw) if isinstance(raw, dict) else None
+            return _consult_from(b, now=now)
+    return local_consult(now=now)
+
+
+def local_consult(*, now: float | None = None) -> tuple[float, Backoff | None]:
+    """``(sleep_s, backoff)`` from THIS HOST's own backoff file (#2809).
+
+    The same-host primitive :func:`consult` above falls back to when no
+    board service is configured or the daemon is unreachable — see its
+    docstring for the shape of the return value.
+    """
+    now = now if now is not None else time.time()
+    return _consult_from(current(now=now), now=now)
