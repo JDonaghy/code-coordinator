@@ -648,14 +648,32 @@ run_python_acceptance_ci() {
     local ci_home="$WT/.coord-ci-home"
     mkdir -p "$ci_home"
     log "running: coord acceptance run --all --ci (cli-pytest route, ms-37)"
-    if (env -u COORD_SERVICE_URL -u COORD_TOKEN -u COORD_CONFIG \
+    local rc=0
+    (env -u COORD_SERVICE_URL -u COORD_TOKEN -u COORD_CONFIG \
             HOME="$ci_home" PATH="$venv/bin:$PATH" \
             "$venv/bin/coord" acceptance run \
             --repo claude-coordinator --all --ci \
             --config "$WT/.github/coord-ci-acceptance.yml" \
-            --for-path coord/cli.py --path "$WT") >"$acc_out" 2>&1; then
+            --for-path coord/cli.py --path "$WT") >"$acc_out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
         say "PASS(python): ordinary suite + sealed acceptance suite (ms-37, cli-pytest) both green"
         return 0
+    fi
+    # #2936: 127 is the shell's "command not found" for `$venv/bin/coord`
+    # itself — the SAME infrastructure class as the missing-python3/missing-
+    # fallback-command cases above (#1814), NOT a red suite. This venv is the
+    # one `run_python` just built (or found already usable) and successfully
+    # ran the ordinary pytest suite from moments ago, so a missing
+    # `$venv/bin/coord` here means this package's own console-script entry
+    # point never landed in it — an environment problem, not something the
+    # branch under test can be blamed for. Before this check, "coord:
+    # command not found" (#2936 — a smoke worker unable to resolve `coord` at
+    # all) and a genuinely red sealed suite were indistinguishable here, and
+    # the missing binary silently laundered into `RESULT: FAIL`.
+    if [[ "$rc" -eq 127 ]]; then
+        toolchain_missing coord python-acceptance-cli "\$venv/bin ($venv/bin), then \$PATH"
+        tail -n 20 "$acc_out" | sed 's/^/      /'
+        return 1
     fi
     say "FAIL(python): sealed acceptance suite (cli-pytest route, ms-37) failed under --ci — either a test-id NOT listed in expected_red failed for real, or one listed in expected_red unexpectedly passed (see .github/workflows/test.yml's 'A red result here is attributable, not a mystery' step for the two-cause triage)"
     tail -n 40 "$acc_out" | sed 's/^/      /'
