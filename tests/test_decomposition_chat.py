@@ -27,14 +27,19 @@ def _stub_external_io(monkeypatch):
     ledger (`fetch_running_context`, a real local `coord.db` read). Neither
     is hermetic, and neither is what most of the tests below are
     exercising — stub the low-level `github_ops` calls to a fixed "repo has
-    history and a CLAUDE.md" answer (so `_repo_is_greenfield` itself still
-    runs its real logic, just network-free) and the ledger fetch to "no
-    ledger yet", so most tests stay fast and deterministic. Tests that
-    specifically exercise `_repo_is_greenfield`/`select_discuss_mode`/the
-    ledger render override these locally.
+    real product history beyond what `coord repo create` seeds" answer (so
+    `_repo_is_greenfield` itself still runs its real logic, just
+    network-free) and the ledger fetch to "no ledger yet", so most tests
+    stay fast and deterministic. Tests that specifically exercise
+    `_repo_is_greenfield`/`select_discuss_mode`/the ledger render override
+    these locally.
     """
     monkeypatch.setattr("coord.github_ops.get_branch_sha", lambda repo, branch: "deadbeef")
-    monkeypatch.setattr("coord.github_ops.repo_file_exists", lambda repo, path, branch: True)
+    monkeypatch.setattr(
+        "coord.github_ops.list_repo_dir",
+        lambda repo, path, branch: ["README.md", "CLAUDE.md", "app.py"] if path == "" else [],
+    )
+    monkeypatch.setattr("coord.github_ops.list_repo_subdirs", lambda repo, path, branch: [])
     monkeypatch.setattr(decomposition_chat, "fetch_running_context", lambda submission_id: {})
 
 
@@ -201,8 +206,35 @@ def test_field_missing_true_for_none_empty_and_sentinel():
     assert decomposition_chat._field_missing(f"  {decomposition_chat.NOT_CAPTURED_SENTINEL}  ") is True
 
 
+def test_field_missing_true_for_portal_real_full_sentinel_string():
+    """#2864 bug 1: the portal never sends the bare sentinel — it's the
+    leading clause of a longer sentence, em dash and all. This is the
+    verbatim string the live portal sent for SUB-1EA1D3's `done_definition`
+    and `audience`."""
+    real = (
+        "Not captured at first contact — this came in through the contact "
+        "form, so it still needs to be agreed with the customer."
+    )
+    assert decomposition_chat._field_missing(real) is True
+
+
+def test_field_missing_true_for_case_and_whitespace_variants():
+    assert decomposition_chat._field_missing("  not   CAPTURED at First Contact  ") is True
+    assert decomposition_chat._field_missing("NOT CAPTURED AT FIRST CONTACT — extra tail") is True
+
+
 def test_field_missing_false_for_real_content():
     assert decomposition_chat._field_missing("Existing subscription customers") is False
+
+
+def test_field_missing_false_when_sentinel_only_mentioned_mid_sentence():
+    """A prefix match must not fire when the phrase merely appears somewhere
+    inside otherwise-real content — only a leading match means "missing"."""
+    mid_sentence = (
+        "The client said this was Not captured at first contact previously, "
+        "but confirmed today: existing subscription customers only."
+    )
+    assert decomposition_chat._field_missing(mid_sentence) is False
 
 
 def test_repo_is_greenfield_true_when_unmapped():
@@ -219,16 +251,45 @@ def test_repo_is_greenfield_true_when_no_commits():
 def test_repo_is_greenfield_true_when_commits_but_no_claude_md():
     cfg = Config(repos=[_repo("api")], machines=[])
     with patch("coord.github_ops.get_branch_sha", return_value="deadbeef"), patch(
-        "coord.github_ops.repo_file_exists", return_value=False
-    ):
+        "coord.github_ops.list_repo_dir", return_value=["README.md"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]):
+        assert decomposition_chat._repo_is_greenfield(cfg, "api") is True
+
+
+def test_repo_is_greenfield_true_when_only_seeded_files():
+    """#2864 bug 2: a repo whose default branch contains only what `coord
+    repo create` itself seeds (README.md, CLAUDE.md, the CI workflow,
+    .githooks/*) must still read as greenfield — `coord repo create`'s own
+    genesis commit must never defeat the mode selector it's supposed to
+    feed into."""
+    cfg = Config(repos=[_repo("api")], machines=[])
+
+    def _list_dir(repo, path, branch):
+        return {
+            "": ["README.md", "CLAUDE.md"],
+            ".github": [],
+            ".github/workflows": ["ci.yml"],
+            ".githooks": ["_lib.sh", "post-checkout", "post-commit", "post-merge"],
+        }.get(path, [])
+
+    def _list_subdirs(repo, path, branch):
+        return {
+            "": [".github", ".githooks"],
+            ".github": ["workflows"],
+        }.get(path, [])
+
+    with patch("coord.github_ops.get_branch_sha", return_value="deadbeef"), patch(
+        "coord.github_ops.list_repo_dir", side_effect=_list_dir
+    ), patch("coord.github_ops.list_repo_subdirs", side_effect=_list_subdirs):
         assert decomposition_chat._repo_is_greenfield(cfg, "api") is True
 
 
 def test_repo_is_greenfield_false_when_commits_and_claude_md():
     cfg = Config(repos=[_repo("api")], machines=[])
     with patch("coord.github_ops.get_branch_sha", return_value="deadbeef"), patch(
-        "coord.github_ops.repo_file_exists", return_value=True
-    ):
+        "coord.github_ops.list_repo_dir",
+        return_value=["README.md", "CLAUDE.md", "app.py"],
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]):
         assert decomposition_chat._repo_is_greenfield(cfg, "api") is False
 
 
@@ -279,7 +340,7 @@ def test_select_discuss_mode_auto_true_when_repo_greenfield(monkeypatch):
     discuss, reason = decomposition_chat.select_discuss_mode(cfg, SUBMISSION)
     assert discuss is True
     assert "api" in reason
-    assert "no commits or no CLAUDE.md" in reason
+    assert "coord repo create's seed files" in reason
 
 
 def test_select_discuss_mode_auto_false_when_well_specified(monkeypatch):
@@ -288,6 +349,55 @@ def test_select_discuss_mode_auto_false_when_well_specified(monkeypatch):
     discuss, reason = decomposition_chat.select_discuss_mode(cfg, SUBMISSION)
     assert discuss is False
     assert "captured" in reason
+
+
+def test_select_discuss_mode_true_for_sub_1ea1d3_live_payload(monkeypatch):
+    """Regression test for #2864: SUB-1EA1D3, the greenfield grocery-list
+    submission #2746 was written around, verbatim as captured off the live
+    fleet on 2026-08-28. Before the fix both mechanical triggers failed
+    independently (the sentinel matched by equality, not prefix; the
+    seeded-only `grocery-list` repo read as non-greenfield because
+    `coord repo create` had itself seeded `CLAUDE.md`) and the session
+    picked MODE: FILE. Both must now fire, and the reason must name at
+    least one of them.
+    """
+    live_sentinel_tail = (
+        "Not captured at first contact — this came in through the contact "
+        "form, so it still needs to be agreed with the customer."
+    )
+    sub_1ea1d3 = {
+        "submission_id": "SUB-1EA1D3",
+        "client": "grocery-list customer",
+        "outcome": "A working grocery-list app for the customer's household.",
+        "audience": live_sentinel_tail,
+        "done_definition": live_sentinel_tail,
+        "constraints": "",
+        "repos": ["grocery-list"],
+        "signoff_status": "approved",
+    }
+
+    def _list_dir(repo, path, branch):
+        return {
+            "": ["README.md", "CLAUDE.md"],
+            ".github": [],
+            ".github/workflows": ["ci.yml"],
+            ".githooks": ["_lib.sh", "post-checkout", "post-commit", "post-merge"],
+        }.get(path, [])
+
+    def _list_subdirs(repo, path, branch):
+        return {
+            "": [".github", ".githooks"],
+            ".github": ["workflows"],
+        }.get(path, [])
+
+    cfg = Config(repos=[_repo("grocery-list")], machines=[])
+    with patch("coord.github_ops.get_branch_sha", return_value="deadbeef"), patch(
+        "coord.github_ops.list_repo_dir", side_effect=_list_dir
+    ), patch("coord.github_ops.list_repo_subdirs", side_effect=_list_subdirs):
+        discuss, reason = decomposition_chat.select_discuss_mode(cfg, sub_1ea1d3)
+
+    assert discuss is True
+    assert "done_definition" in reason or "audience" in reason or "grocery-list" in reason
 
 
 # ── #2750 (IL-4): render_running_context_section ────────────────────────────

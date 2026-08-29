@@ -68,17 +68,104 @@ NOT_CAPTURED_SENTINEL = "Not captured at first contact"
 
 def _field_missing(value: Any) -> bool:
     """True when *value* carries no real content — absent, blank, or the
-    portal's own "not captured at first contact" placeholder (#2750)."""
+    portal's own "not captured at first contact" placeholder (#2750).
+
+    #2864: the portal never sends the bare sentinel — it's the leading
+    clause of a longer sentence (e.g. ``"Not captured at first contact —
+    this came in through the contact form, so it still needs to be agreed
+    with the customer."``, em dash and all), so this matches the sentinel
+    as a **prefix**, casefolded and whitespace-normalised, rather than by
+    exact equality. A prefix match still leaves real content that merely
+    *mentions* the phrase mid-sentence reading as present, since the
+    sentinel then isn't at the start.
+    """
     if not isinstance(value, str):
         return True
-    text = value.strip()
-    return not text or text == NOT_CAPTURED_SENTINEL
+    text = " ".join(value.split())
+    if not text:
+        return True
+    sentinel = " ".join(NOT_CAPTURED_SENTINEL.split())
+    return text.casefold().startswith(sentinel.casefold())
+
+
+#: Files `coord repo create` seeds into a brand-new repo as its first
+#: commit(s) (#2747): `README.md` from `create_repo`'s own `--add-readme`,
+#: plus `CLAUDE.md`, a CI workflow, and the ported `.githooks/*` from its
+#: own seed commit (`coord.commands.repo._seed_files`). Kept here rather
+#: than imported from `coord.commands.repo` — this module's briefing scopes
+#: it to `coord/decomposition_chat.py` alone, and the set is small and
+#: unlikely to drift silently (a drift only ever costs one extra spurious
+#: DISCUSS round, never a false FILE).
+_SEEDED_ROOT_FILES = frozenset({"README.md", "CLAUDE.md"})
+_SEEDED_ROOT_DIRS = frozenset({".github", ".githooks"})
+_SEEDED_GITHUB_WORKFLOW_FILES = frozenset({"ci.yml"})
+_SEEDED_GITHOOKS_FILES = frozenset(
+    {"_lib.sh", "post-checkout", "post-commit", "post-merge"}
+)
+
+
+def _dir_entries(repo: str, path: str, branch: str) -> tuple[list[str], list[str]]:
+    """``(files, dirs)`` directly under *path* on *branch* — ``([], [])``
+    when *path* doesn't exist there at all (e.g. a repo that never got
+    `.githooks/` seeded) rather than raising, mirroring `github_ops.
+    repo_file_exists`'s own not-found handling. Any failure that isn't a
+    clean 404 propagates, same reasoning: a caller here must not read
+    "couldn't check" as "empty directory".
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        files = github_ops.list_repo_dir(repo, path, branch)
+        dirs = github_ops.list_repo_subdirs(repo, path, branch)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "404" in msg:
+            return [], []
+        raise
+    return files, dirs
+
+
+def _repo_has_only_seeded_files(repo: str, branch: str) -> bool:
+    """True when every tracked file on *branch* of *repo* is one that
+    `coord repo create` itself seeds (#2864 bug 2) — walks the small, fixed
+    set of directories seeding can ever touch (root, `.github/`,
+    `.github/workflows/`, `.githooks/`); any file or directory outside that
+    set is real product history.
+    """
+    files, dirs = _dir_entries(repo, "", branch)
+    if not set(files) <= _SEEDED_ROOT_FILES:
+        return False
+    if not set(dirs) <= _SEEDED_ROOT_DIRS:
+        return False
+
+    if ".github" in dirs:
+        gh_files, gh_dirs = _dir_entries(repo, ".github", branch)
+        if gh_files or set(gh_dirs) - {"workflows"}:
+            return False
+        if "workflows" in gh_dirs:
+            wf_files, wf_dirs = _dir_entries(repo, ".github/workflows", branch)
+            if not set(wf_files) <= _SEEDED_GITHUB_WORKFLOW_FILES or wf_dirs:
+                return False
+
+    if ".githooks" in dirs:
+        hook_files, hook_dirs = _dir_entries(repo, ".githooks", branch)
+        if not set(hook_files) <= _SEEDED_GITHOOKS_FILES or hook_dirs:
+            return False
+
+    return True
 
 
 def _repo_is_greenfield(cfg: "Config", repo_name: str) -> bool:
     """Mechanical "nothing to decompose against yet" signal for *repo_name*
     (#2750's second mode-selection trigger): no commits on its default
-    branch, or no `CLAUDE.md` there.
+    branch, or every tracked file there is one `coord repo create` itself
+    seeds (:func:`_repo_has_only_seeded_files`).
+
+    #2864: used to be "no `CLAUDE.md` there", which `coord repo create`
+    (#2747) broke — it seeds `CLAUDE.md` as part of a brand-new repo's
+    first commit, so a repo created through the intake lane's own genesis
+    command could never be detected as greenfield by the intake lane's own
+    mode selector.
 
     Fails safe toward ``True`` (i.e. toward MODE: DISCUSS) on an unmapped
     repo or any lookup failure — a false positive here costs one extra
@@ -98,7 +185,10 @@ def _repo_is_greenfield(cfg: "Config", repo_name: str) -> bool:
     sha = github_ops.get_branch_sha(repo_cfg.github, branch)
     if sha is None:
         return True
-    return not github_ops.repo_file_exists(repo_cfg.github, "CLAUDE.md", branch)
+    try:
+        return _repo_has_only_seeded_files(repo_cfg.github, branch)
+    except RuntimeError:
+        return True
 
 
 def select_discuss_mode(
@@ -117,8 +207,9 @@ def select_discuss_mode(
 
     * `done_definition` / `audience` missing, blank, or the portal's own
       "not captured at first contact" sentinel;
-    * any mapped repo with no commits on its default branch or no
-      `CLAUDE.md` there (:func:`_repo_is_greenfield`).
+    * any mapped repo with no commits on its default branch, or whose
+      tracked files are only what `coord repo create` itself seeds
+      (:func:`_repo_is_greenfield`).
 
     Returns ``(discuss, reason)`` — *reason* is always non-empty and is
     meant to be the first thing the operator reads (#2750: "a session that
@@ -140,8 +231,8 @@ def select_discuss_mode(
     greenfield = [r for r in repos if _repo_is_greenfield(cfg, r)]
     if greenfield:
         reasons.append(
-            f"mapped repo(s) {', '.join(greenfield)} have no commits or no "
-            "CLAUDE.md yet — nothing to decompose against"
+            f"mapped repo(s) {', '.join(greenfield)} have no commits or only "
+            "coord repo create's seed files — nothing to decompose against yet"
         )
 
     if reasons:
