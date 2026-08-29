@@ -1984,14 +1984,23 @@ class HealthConfig:
     # exists because it was found three releases stale on 2026-07-29.
     cli_venv_python: str | None = None
     # Absolute path to the built coord-tui binary.  None → ~/.local/bin/coord-tui
-    # (README: `cd tui && cargo build && cp target/debug/coord-tui
+    # (coord-tui's README: `cargo build && cp target/debug/coord-tui
     # ~/.local/bin/coord-tui`).
     tui_binary_path: str | None = None
-    # Directory holding the tui/ Rust sources the binary was built from.  None →
-    # `<checkout>/tui/src` for the first configured local checkout that has one.
+    # Directory holding the coord-tui Rust sources the binary was built from
+    # (#2899; before that split the crate lived at `tui/` inside THIS repo).
+    # None → `<checkout>/src` for this machine's `coord-tui` checkout,
+    # discovered the same way `coord_tui_checkout` is (see
+    # `coord.health.checks.deploy_lane_facts.resolve_coord_tui_checkout`),
+    # falling back to the pre-split `<checkout>/tui/src`.
     # Deliberately points at `src/`, not the crate root: rooting the mtime walk
     # above `target/` would sweep a multi-GB build dir on every refresh.
     tui_source_dir: str | None = None
+    # Root of a local `coord-tui` checkout (#2899). None → discover it from
+    # `repo_paths`/`ctx.checkouts` (a checkout named `coord-tui`, else one
+    # carrying `src/app/data.rs`).  Same convention as the lanes above: None
+    # means "discover it", never "disable the lane".
+    coord_tui_checkout: str | None = None
     # Absolute path to the live `coord web --dist` bundle (#1834 lane 5).
     # None → ~/coord-web-dist — the symlink `deploy/coord-web-dist-build.timer`
     # atomically repoints at each new release (#1543).
@@ -3601,6 +3610,7 @@ _HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
     "cli_venv_python",
     "tui_binary_path",
     "tui_source_dir",
+    "coord_tui_checkout",
     "deploy_dir",
     "systemd_user_dir",
     "webapp_dist_path",

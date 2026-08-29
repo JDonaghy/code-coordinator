@@ -15,7 +15,7 @@ UNKNOWN "no data" while the operator's real CLI venv was on the release
 everyone believed was live).
 
 These two **machine-scope** checks report the same two raw facts (CLI-venv
-version; tui-binary mtime vs. newest ``tui/`` source mtime) from wherever
+version; tui-binary mtime vs. newest ``coord-tui`` source mtime) from wherever
 they actually run — every agent's own ``/health`` poll, the transport #1630
 already built for exactly this "measure locally, judge centrally" split.
 `coord.health.checks.fleet_deploy_lanes` aggregates these across every
@@ -23,7 +23,7 @@ already built for exactly this "measure locally, judge centrally" split.
 ``os.stat`` to answer a fleet-wide question.
 
 Absence is the *common* case here — most machines in a fleet have neither
-an operator's CLI venv nor a local ``tui/`` checkout+build — so both probes
+an operator's CLI venv nor a local ``coord-tui`` checkout+build — so both probes
 report that plainly as ``OK`` ("not present on this machine") rather than
 ``UNKNOWN``/``WARN``: a box that was never meant to have either lane must
 not read as faulty just because it doesn't.
@@ -73,7 +73,7 @@ _DEFAULT_WEBAPP_DIST = "~/coord-web-dist"
 # default `$RELEASES_DIR` sibling to `$BLOCKED_SHA_FILE`.
 _DEFAULT_WEBAPP_BUILD_HEARTBEAT = "~/.coord-web-releases/.last-run-at"
 
-# Cap on the tui/ source walk, mirroring the old daemon-side walk: the tree
+# Cap on the coord-tui source walk, mirroring the old daemon-side walk: the tree
 # is a few hundred .rs files, so anything past this is a misconfigured
 # `tui_source_dir` pointed at something huge, and a machine's own /health
 # tick must not spend its budget discovering that. A partial walk still
@@ -105,8 +105,62 @@ def resolve_tui_binary_path(ctx: HealthContext):
     return expand(_DEFAULT_TUI_BINARY, ctx.home)
 
 
+#: The repo name a `coord-tui` checkout is expected to carry, plus a
+#: structural marker that identifies one even if it is checked out under some
+#: other directory name. The marker is a file unique to THIS crate, not a bare
+#: ``Cargo.toml``: every Rust checkout on the machine (``quadraui``,
+#: ``vimcode``) has one of those, so matching on it would point this lane at
+#: the wrong tree — the "manufacture staleness rather than report it" failure
+#: :func:`resolve_tui_source_dir` warns about. It is also not shared with the
+#: pre-#2899 in-repo layout, whose copy lives at ``tui/src/app/data.rs``, so
+#: the marker can never make a `claude-coordinator` checkout answer here.
+COORD_TUI_REPO_NAME = "coord-tui"
+COORD_TUI_MARKER = "src/app/data.rs"
+
+
+def _norm_repo_name(raw: str) -> str:
+    """Mirror of ``coord_web_ci_pin._norm_dist`` — a checkout directory named
+    ``coord_tui`` or ``Coord-TUI`` is still a coord-tui checkout."""
+    return raw.strip().lower().replace("_", "-")
+
+
+def resolve_coord_tui_checkout(ctx: HealthContext):
+    """This machine's `coord-tui` checkout, if it has one.
+
+    Same convention as :func:`coord.health.checks.coord_web_ci_pin.
+    resolve_coord_web_checkout`: a configured ``health.coord_tui_checkout``
+    wins outright, ``None`` means "discover it", never "disable the lane".
+    """
+    configured = getattr(ctx.thresholds, "coord_tui_checkout", None)
+    if configured:
+        return expand(configured, ctx.home)
+    for checkout in ctx.checkouts:
+        if _norm_repo_name(checkout.name) == COORD_TUI_REPO_NAME:
+            return checkout.path
+    # Fall back to the structural marker so a rename of the repo doesn't
+    # silently turn this lane off — an off lane is indistinguishable from a
+    # healthy one, which is the whole failure mode being guarded against.
+    for checkout in ctx.checkouts:
+        if (checkout.path / COORD_TUI_MARKER).is_file():
+            return checkout.path
+    return None
+
+
 def resolve_tui_source_dir(ctx: HealthContext):
-    """``<checkout>/tui/src`` for the first local checkout that has one.
+    """The coord-tui source tree in the first local checkout that has one.
+
+    Prefers a `coord-tui` checkout (#2899), discovered via
+    :func:`resolve_coord_tui_checkout`. That checkout's ``src/`` is the crate
+    root, not the checkout root — same ``src/``-not-root reasoning as
+    :func:`resolve_webapp_source_dir`: rooting the walk at the checkout would
+    sweep ``target/`` (multi-GB) and ``.git/``, which
+    :func:`_newest_rust_source_mtime`'s budget is not sized for.
+
+    Falls back to ``<checkout>/tui/src`` — the pre-#2899 in-repo layout. Kept
+    for the same reason the webapp lane kept its pre-#2009 fallback: a machine
+    can legitimately still have an older ``claude-coordinator`` checkout parked
+    on a pre-split commit, and this lane reporting UNKNOWN there would be a
+    regression in signal for no gain.
 
     Derived from ``ctx.checkouts`` (the same locally-existing checkouts
     every other checkout-scope probe sees) rather than guessed relative to
@@ -118,8 +172,13 @@ def resolve_tui_source_dir(ctx: HealthContext):
     configured = getattr(ctx.thresholds, "tui_source_dir", None)
     if configured:
         return expand(configured, ctx.home)
-    for checkout in ctx.checkouts:
-        candidate = checkout.path / "tui" / "src"
+    checkout = resolve_coord_tui_checkout(ctx)
+    if checkout is not None:
+        candidate = checkout / "src"
+        if candidate.is_dir():
+            return candidate
+    for checkout_entry in ctx.checkouts:
+        candidate = checkout_entry.path / "tui" / "src"
         if candidate.is_dir():
             return candidate
     return None
@@ -329,7 +388,7 @@ def probe_cli_venv(ctx: HealthContext) -> CheckResult:
     title="tui binary",
     order=43,
     description=(
-        "This machine's locally-built tui/ binary vs. the tui/ source tree "
+        "This machine's locally-built coord-tui binary vs. the coord-tui source tree "
         "it was built from — feeds the fleet_tui_binary check (#1806)."
     ),
 )
@@ -356,7 +415,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         binary_mtime = None
 
     if binary_mtime is None:
-        # Most machines never built a local tui/ binary — absent, not stale.
+        # Most machines never built a local coord-tui binary — absent, not stale.
         return CheckResult(
             check_id="tui_binary",
             scope="machine",
@@ -374,7 +433,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             check_id="tui_binary",
             scope="machine",
             severity=Severity.OK,
-            headroom="binary present (tui/ source tree not found to compare)",
+            headroom="binary present (coord-tui source tree not found to compare)",
             values=values,
         )
 
@@ -385,7 +444,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             check_id="tui_binary",
             scope="machine",
             severity=Severity.OK,
-            headroom="binary present (tui/ source tree not found to compare)",
+            headroom="binary present (coord-tui source tree not found to compare)",
             values=values,
         )
 
@@ -396,8 +455,8 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             check_id="tui_binary",
             scope="machine",
             severity=Severity.WARN,
-            headroom=f"binary is {stale_hours:.1f}h older than tui/ source",
-            detail="rebuild the tui/ binary — source changed since the last local build",
+            headroom=f"binary is {stale_hours:.1f}h older than coord-tui source",
+            detail="rebuild the coord-tui binary — source changed since the last local build",
             threshold="warn when source/ is newer than the built binary",
             values=values,
         )
@@ -406,7 +465,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         check_id="tui_binary",
         scope="machine",
         severity=Severity.OK,
-        headroom="up to date with tui/ source",
+        headroom="up to date with coord-tui source",
         values=values,
     )
 

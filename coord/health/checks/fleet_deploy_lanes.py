@@ -254,7 +254,7 @@ def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:
     title="tui binary",
     order=11,
     description=(
-        "The locally-built tui/ binary is not older than the tui/ source "
+        "The locally-built coord-tui binary is not older than the coord-tui source "
         "tree it was supposedly built from, on every machine that has one."
     ),
 )
@@ -292,7 +292,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         )
 
     # Compare each machine against ITS OWN source tree — a machine with no
-    # tui/ checkout has nothing to compare against and is left out of the
+    # coord-tui checkout has nothing to compare against and is left out of the
     # verdict (present, uncomparable), same as the single-machine case
     # always was; it just no longer speaks for the whole fleet.
     stale: list[tuple[str, float, float]] = []
@@ -317,8 +317,8 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             check_id="fleet_tui_binary",
             scope="fleet",
             severity=Severity.WARN,
-            headroom=f"{names}: binary is {stale_hours:.1f}h older than tui/ source",
-            detail=f"rebuild the tui/ binary on: {names}",
+            headroom=f"{names}: binary is {stale_hours:.1f}h older than coord-tui source",
+            detail=f"rebuild the coord-tui binary on: {names}",
             threshold="warn when any machine's source/ is newer than its built binary",
             values={"machines": facts, "stale": [n for n, _, _ in stale]},
         )
@@ -339,7 +339,7 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         check_id="fleet_tui_binary",
         scope="fleet",
         severity=Severity.OK,
-        headroom=f"up to date with tui/ source on {', '.join(sorted(comparable))}",
+        headroom=f"up to date with coord-tui source on {', '.join(sorted(comparable))}",
         values={"machines": facts},
     )
 

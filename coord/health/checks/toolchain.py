@@ -66,8 +66,8 @@ class ToolchainSpec:
     # A checkout needs this kind if any of these subdirectories exist...
     dir_markers: tuple[str, ...] = ()
     # ...or the checkout ROOT has any of these marker files (a repo that IS
-    # that language, e.g. vimcode/quadraui's root Cargo.toml, vs.
-    # claude-coordinator's nested tui/ subdirectory).
+    # that language, e.g. vimcode/quadraui/coord-tui's root Cargo.toml, vs. a
+    # repo with a nested subdirectory in another language).
     root_markers: tuple[str, ...] = ()
     # GitHub Actions step(s) (the `uses:` name, before the `@`) that install
     # this toolchain in CI.
@@ -95,6 +95,14 @@ TOOLCHAIN_SPECS: tuple[ToolchainSpec, ...] = (
         kind="rustc",
         version_argv=("rustc", "--version"),
         version_regex=r"rustc (\d+(?:\.\d+){1,2})",
+        # #2899 moved coord-tui's crate out of code-coordinator, so its
+        # checkout now matches on the root `Cargo.toml` below like every
+        # other Rust repo. `dir_markers=("tui",)` is KEPT as a pre-split
+        # marker: a machine can legitimately still have a `claude-coordinator`
+        # checkout parked on a pre-#2899 commit, and that tree genuinely does
+        # need rustc. Same reasoning as `resolve_webapp_source_dir`'s
+        # pre-#2009 fallback — a marker that stops matching turns the lane
+        # off, and an off lane is indistinguishable from a healthy one.
         dir_markers=("tui",),
         root_markers=("Cargo.toml",),
         ci_actions=("dtolnay/rust-toolchain", "actions-rs/toolchain"),

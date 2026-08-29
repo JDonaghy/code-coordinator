@@ -14,12 +14,14 @@ The contract now lives in `coord/board_schema.py` as explicit dataclasses.
 This file is the acceptance proof, in two halves:
 
 **Safety** — the change is a no-op on the wire.  The DTO field names, order and
-types were generated from the pre-#1849 spec, and
-`tests/test_board_fixture.py::test_board_sample_fixture_is_up_to_date` asserts
-the projection still reproduces the *unmodified* committed golden fixture
-byte-for-byte.  That fixture is sorted-key JSON, so it cannot see ordering;
-`test_board_wire_key_order_is_the_declared_field_order` below pins the real
-wire order too.
+types were generated from the pre-#1849 spec, and the byte-for-byte comparison
+against the committed golden fixture proved the projection still reproduced it
+unmodified.  Since #2899 that fixture lives in the coord-tui repo, so the
+byte-comparison is coord-tui's CI gate rather than a test here (see
+`tests/test_board_fixture.py`'s header).  That fixture is sorted-key JSON, so
+it could never see ordering anyway; `test_board_wire_key_order_is_the_declared_
+field_order` below pins the real wire order, and is unaffected by the move
+because it projects a seeded DB directly.
 
 **The feature** — adding a nullable column to any of the seven board tables
 changes neither `/board`'s response body nor `GET /openapi.json`.
@@ -48,9 +50,6 @@ from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 from coord.openapi import dataclass_schema, declared_routes, spec_routes, validate_json_schema
 from coord.serve_app import build_app as build_serve_app
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BOARD_FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
 
 #: The board tables whose `/board` shape this issue pinned to a DTO.
 BOARD_TABLES = tuple(BOARD_PROJECTIONS)
@@ -374,8 +373,17 @@ def test_board_dtos_and_projection_cannot_drift(tmp_path: Path) -> None:
 
 
 def test_board_schema_still_validates_the_golden_fixture(tmp_path: Path) -> None:
-    """The generated `/board` schema still fully specifies the real payload."""
-    fixture = json.loads(BOARD_FIXTURE_PATH.read_text())
+    """The generated `/board` schema still fully specifies the real payload.
+
+    #2899: generated in-process rather than read from a committed file. The
+    golden fixture moved to the coord-tui repo with the crate, so there is no
+    on-disk copy in this checkout — and the generator is the thing that
+    produces that copy, so validating its live output is strictly the stronger
+    assertion anyway (it cannot pass against a stale commit).
+    """
+    from scripts.gen_board_fixture import fixture_json_text
+
+    fixture = json.loads(fixture_json_text())
     client = _serve_client(_seeded_db(tmp_path / "coord.db"))
     spec = client.get("/openapi.json").json()
     board = spec["paths"]["/board"]["get"]["responses"]["200"]["content"][

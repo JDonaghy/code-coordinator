@@ -73,21 +73,11 @@ acceptance:
           run: "pytest tests/acceptance"
           mock: "*.out"
           capability: python
-        - match: tui/**
-          kind: tui-tuidriver
-          # Unlike the two routes above, this one is identical to the
-          # fleet's real route: it never referenced `{ms}` even for
-          # `--issue` scoping, since `cargo test --test acceptance` always
-          # runs the whole tui/tests/acceptance.rs entrypoint (which
-          # `include!`s every ms-NN/*.rs slice) regardless of `{ms}`.
-          # RUSTC_BOOTSTRAP=1 + -Z unstable-options: --format json is
-          # nightly-gated; verified working on stable rustc (#1042).
-          # --features test-support: tui/Cargo.toml's `acceptance` test
-          # target has `required-features = ["test-support"]`, so a plain
-          # `cargo test` (no flag) silently skips building/running it
-          # altogether -- that gap is exactly what made this route
-          # unreachable from CI before #2180.
-          run: "cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features test-support -- -Z unstable-options --format json"
-          mock: "*.screen"
-          capability: rust
-          entrypoint: tui/tests/acceptance.rs
+        # #2899: the `tui/**` -> tui-tuidriver route is GONE from this file.
+        # The crate moved to the standalone `coord-tui` repo, taking its
+        # sealed entrypoint (`tui/tests/acceptance.rs` -> `tests/acceptance.rs`)
+        # and the `tui/tests/acceptance/ms-NN/` slices with it. coord-tui
+        # carries its own copy of this CI stand-in, keyed on its own repo
+        # name, so the route did not disappear -- it changed repos. This
+        # file is now single-route, and this repo's sealed set is exactly
+        # `tests/acceptance/**` again.

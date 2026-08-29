@@ -50,20 +50,18 @@ repos:
     build_command: "~/.coord-venv/bin/pip wheel --no-deps --wheel-dir /tmp/coord-test-build ."
     # #1426: point the headless Test stage at the SAME script the (now
     # observer-only) unattended driver used to run locally — `coord drive`
-    # since #1392, scripts/drive-issue.sh before that. This repo is
-    # two codebases (Python under coord/**, Rust under tui/**), so a single
-    # `cargo test` or `pytest` here would either run the wrong suite or miss
-    # one half of the diff — coord-test-runner.sh does the path routing
-    # (coord/**+tests/** -> pytest, tui/** -> cargo test, docs-only -> skip),
-    # the quadraui path-dep symlink for tui/, and flake-tolerant re-runs.
+    # since #1392, scripts/drive-issue.sh before that. The runner does the
+    # path routing (coord/**+tests/** -> pytest, docs-only -> skip), the
+    # populated-$HOME arm, baseline comparison, and flake-tolerant re-runs —
+    # none of which a bare `pytest` in this field would do.
     # `dispatch_smoke` runs this in place on whichever machine it dispatches
-    # to (see the `smoke_tests.capability_rules` rust rule below). #2804:
-    # the Rust arm no longer symlinks a `quadraui` sibling at all —
-    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so
-    # `cargo` resolves it itself and this runner never touches
-    # `~/src/quadraui`. `quadraui` still needs its OWN `repo_paths` entry
-    # below (it's dispatched to directly, as its own repo), just not as a
-    # build-time sibling of tui/.
+    # to.
+    #
+    # #2899: this used to be a TWO-toolchain route, because the repo held the
+    # `coord-tui` Rust crate under `tui/**` alongside the Python. That crate
+    # is its own repo now (see the `coord-tui` entry below), so this repo is
+    # pure Python and the runner's Rust arm is gone. The route itself is kept
+    # deliberately — see scripts/coord-test-runner.sh's header §1.
     test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo code-coordinator"
     # #2091: `ci_command` is the command THIS REPO'S CI actually runs. The
     # Test stage prefers it over `test_command` (and over
@@ -83,6 +81,29 @@ repos:
     # no `ci_command`, naming the verdict as narrower than CI.
     # ci_command: "npm run test:e2e"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
+
+  # #2899 (Phase 4 of #2894): the `coord-tui` TUI, extracted from
+  # code-coordinator's `tui/` subdirectory WITH its git history. It is an
+  # ORDINARY repo entry — one language, one root `Cargo.toml`, one
+  # `test_command` — which is the whole point of the move: the two-codebase
+  # special case in `scripts/coord-test-runner.sh` existed only because this
+  # crate had nowhere else to live.
+  #
+  # Copy `coord-web`'s shape (#2009), not code-coordinator's: no
+  # `--repo`-selected path routing, no `ci_command` override (CI runs the
+  # same `cargo test`), and a `smoke_tests.capability_rules` entry below so
+  # a diff here lands on a machine that actually has a Rust toolchain.
+  - name: coord-tui
+    github: JDonaghy/coord-tui
+    depends_on: []
+    default_branch: main
+    build_command: "cargo build"
+    test_command: "cargo test"
+    # #305: the built binary, stashed before the worktree is removed so
+    # `coord pull-artifact` can rsync it for manual smoke testing without a
+    # local rebuild. Crate-root-relative, so no `tui/` prefix any more.
+    artifact_paths:
+      - target/debug/coord-tui
 
 # #2915: DO NOT hand-write a new entry here — use `coord machine add <name>
 # --host <h> --capabilities ... --repos ...`, then `coord machine doctor
@@ -119,21 +140,29 @@ machines:
   - name: precision
     host: john-precision-3571
     capabilities: [gtk, rust, python]
-    repos: [vimcode, quadraui, code-coordinator]
+    repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
       code-coordinator: ~/src/claude-coordinator
+      # #2899: unlike code-coordinator (whose checkout kept its pre-rename
+      # directory name), coord-tui is a NEW clone, so the key and the value
+      # agree.
+      coord-tui: ~/src/coord-tui
 
   # Desktop B — HP EliteBook, full GTK builds
   - name: elitebook
     host: john-hp-elitebook-830-g7-notebook-pc
     capabilities: [gtk, rust, python]
-    repos: [vimcode, quadraui, code-coordinator]
+    repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
       code-coordinator: ~/src/claude-coordinator
+      # #2899: unlike code-coordinator (whose checkout kept its pre-rename
+      # directory name), coord-tui is a NEW clone, so the key and the value
+      # agree.
+      coord-tui: ~/src/coord-tui
     # #1862: a laptop shouldn't need its operator to remember `coord pause`
     # every night. `quiet_hours` is a RECURRING DAILY window — no new
     # dispatch inside it, unchanged behaviour outside it. It does NOT
@@ -190,19 +219,24 @@ acceptance:
           run: "pytest tests/acceptance/{ms}"
           mock: "*.out"
           capability: python
-        - match: tui/**
-          kind: tui-tuidriver
-          run: "cargo test --test acceptance -- --format json"
-          mock: "*.screen"
-          capability: rust
-          # #1552/#2896: `cargo test --test acceptance` can't see a slice at
-          # all until `tui/tests/acceptance.rs` `include!`s it, so that file
-          # is the sealed set's entry point (AcceptanceConfig.sealed_paths)
-          # — and, since #2896 relocated the milestone slices this
-          # entrypoint wires in from the repo-root tests/acceptance/ into
-          # this crate's own tui/tests/acceptance/, that sibling directory
-          # is derived from this path and sealed too.
-          entrypoint: tui/tests/acceptance.rs
+    # #2899: the `tui/**` -> tui-tuidriver route that used to sit beside the
+    # `coord/**` route above is GONE from this repo's `routes:`, and reappears
+    # below as a FLAT `coord-tui` entry — exactly the shape #2007 gave
+    # `coord-web` when the webapp moved out. A `routes:` list disambiguates
+    # paths WITHIN one repo; coord-tui's repo root IS the crate root, so there
+    # is nothing left for a path glob to disambiguate.
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance -- --format json"
+      mock: "*.screen"
+      capability: rust
+      # #1552/#2896/#2899: `cargo test --test acceptance` can't see a slice at
+      # all until `tests/acceptance.rs` `include!`s it, so that file is the
+      # sealed set's entry point (AcceptanceConfig.sealed_paths) — and the
+      # sibling `tests/acceptance/` directory it wires in is derived from this
+      # path and sealed too. The `tui/` prefix both paths carried is gone with
+      # the move: they are crate-root-relative now.
+      entrypoint: tests/acceptance.rs
 
 smoke_tests:
   # #1021/#1426: auto-dispatch a headless smoke (Test-stage) assignment when
@@ -215,18 +249,29 @@ smoke_tests:
   # Test stage still dispatches for a plain `type="work"` completion, just to
   # any capable-for-repo machine rather than a specifically-capabled one.
   # Add a rule here only when a diff genuinely needs hardware most machines
-  # lack — GTK, a browser for Playwright, etc. — the tui/ rule below is the
-  # worked example: coord-tui's TuiDriver harness needs a Rust toolchain, and
-  # not every machine in this fleet has one (azure-vm doesn't).
+  # lack — GTK, a browser for Playwright, etc. — the coord-tui rule below is
+  # the worked example: coord-tui's TuiDriver harness needs a Rust toolchain,
+  # and not every machine in this fleet has one (azure-vm doesn't).
+  #
+  # #2899, AND THE SHARP EDGE THIS RULE NOW SITS ON: `capability_rules` are
+  # keyed by PATH PREFIX, not by repo (`coord.smoke.match_rules`). While the
+  # crate lived at `tui/` inside this repo, `files: [tui/]` was unambiguous —
+  # no other repo had that prefix. Now that coord-tui is its own repo, its
+  # paths are root-relative (`src/`, `Cargo.toml`), and `src/` is a prefix
+  # MANY repos share. The rule below is therefore deliberately anchored on
+  # `Cargo.toml`/`Cargo.lock` — a marker only a Rust repo carries — plus
+  # `src/app/`, which is coord-tui's own layout rather than a bare `src/`.
+  # Over-matching is not fatal (a rule only ever ADDS a required capability,
+  # narrowing the candidate machines), but it silently narrows dispatch for
+  # an unrelated repo, so prefer the more specific prefix.
   auto_queue: true
   capability_rules:
-    - files: [tui/]
+    - files: [Cargo.toml, Cargo.lock, src/app/]
       requires: [rust]
     # Worked example for a browser-driven suite in ANOTHER repo — the shape
-    # `coord-web` needs now that the webapp is its own repo (#2009). Rules
-    # are matched against a diff's paths, so a repo whose every path needs
-    # a browser wants a bare `files: []`-style prefix that matches its root:
-    # - files: [src/]
+    # `coord-web` needs now that the webapp is its own repo (#2009). Note the
+    # same path-prefix caveat: `src/` here would also match coord-tui.
+    # - files: [src/, playwright.config.ts]
     #   requires: [browser]
 
 pipeline:

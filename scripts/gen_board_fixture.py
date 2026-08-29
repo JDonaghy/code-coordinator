@@ -12,34 +12,81 @@ This script builds a representative, freshly-migrated coord.db (headless +
 interactive assignments, a review, a merge-queue row, a proposal, an open
 issue, a machine) with fully deterministic content (no wall-clock timestamps,
 fixed IDs) and runs it through the exact same `SqliteStore.board_projection()`
-the daemon serves, then writes the result to `tui/tests/fixtures/board_sample.json`.
+the daemon serves, then writes the result into a **coord-tui checkout**.
 
-That committed fixture is read by BOTH sides of the seam:
-- Rust: `tui/src/app/tests.rs::board_payload_deserializes_real_sample` parses
-  it into `BoardPayload` and asserts the round-trip succeeds — runs in CI via
-  `.github/workflows/cargo-test.yml`.
-- Python: `tests/test_board_fixture.py` asserts the checked-in file is byte-
-  identical to what this generator produces *right now*, so the fixture can
-  never silently drift from the schema that created it.
+#2899: THE FIXTURE IS NOT IN THIS REPO ANY MORE.  It lives at coord-tui's
+`tests/fixtures/board_sample.json`, alongside the Rust test that reads it
+(`src/app/tests.rs::board_payload_deserializes_real_sample`).  So this script
+takes its destination the same way `scripts/codegen.py` takes `generated.rs`'s
+(#2897): `--out PATH`, else `$COORD_TUI_SRC` naming a coord-tui checkout root.
+There is deliberately **no fallback default** — a guessed path is either a
+dead file nobody consumes or, worse, one that makes a freshness check pass
+vacuously.  Same reasoning as `codegen.resolve_rust_output_path`.
+
+Who reads the committed fixture:
+- Rust: `src/app/tests.rs::board_payload_deserializes_real_sample` parses it
+  into `BoardPayload` and asserts the round-trip succeeds — runs in coord-tui's
+  own CI.
+- coord-tui CI: the byte-comparison freshness gate, which installs
+  `code-coordinator[server]` from PyPI and re-runs this generator, exactly as
+  the `generated.rs` drift gate does.  Before #2899 that comparison was
+  `tests/test_board_fixture.py` in this repo; it could not survive the split,
+  because there is no committed fixture here to compare against.
+- Python (here): `tests/test_board_fixture.py`, narrowed to what one checkout
+  can still prove — that the generator runs and emits the representative shape
+  the Rust round-trip asserts on.
 
 Regenerate after any `coord/board_schema.py` change that should be reflected
 in the golden fixture (a `coord/db.py` migration on its own no longer moves
 the wire — see tests/test_board_schema.py):
 
-    .venv/bin/python scripts/gen_board_fixture.py
+    COORD_TUI_SRC=~/src/coord-tui .venv/bin/python scripts/gen_board_fixture.py
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FIXTURE_PATH = REPO_ROOT / "tui" / "tests" / "fixtures" / "board_sample.json"
+#: Path of the emitted fixture RELATIVE to a `coord-tui` checkout's root.
+FIXTURE_RELPATH = Path("tests") / "fixtures" / "board_sample.json"
+
+#: Env var naming a `coord-tui` checkout root, used when `--out` is absent.
+#: Deliberately the SAME variable `scripts/codegen.py --rust` reads, because
+#: it names the same checkout — an operator who has to set two env vars for
+#: one repo will eventually set only one of them.
+FIXTURE_ENV_VAR = "COORD_TUI_SRC"
+
+
+class FixtureOutputPathError(Exception):
+    """No destination was named — see :func:`resolve_fixture_path`."""
+
+
+def resolve_fixture_path(explicit: str | Path | None = None) -> Path:
+    """Where to write the fixture: ``--out`` > ``$COORD_TUI_SRC``.
+
+    Raises :class:`FixtureOutputPathError` when neither is set, rather than
+    guessing (#2899): the old hard-coded ``tui/tests/fixtures/board_sample.json``
+    is not in this repo any more, so a guess is always wrong.
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    root = os.environ.get(FIXTURE_ENV_VAR)
+    if root:
+        return Path(root).expanduser() / FIXTURE_RELPATH
+    raise FixtureOutputPathError(
+        "no destination for board_sample.json. Since #2899 the TUI lives in "
+        f"the coord-tui repo, so pass --out PATH or set ${FIXTURE_ENV_VAR} to "
+        f"a coord-tui checkout root (the file is written to its "
+        f"{FIXTURE_RELPATH}). See this script's module docstring."
+    )
 
 
 def build_fixture_db(conn: sqlite3.Connection) -> None:
@@ -209,11 +256,27 @@ def fixture_json_text() -> str:
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
-def main() -> None:
-    FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE_PATH.write_text(fixture_json_text())
-    print(f"wrote {FIXTURE_PATH}")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out",
+        default=None,
+        help=(
+            "destination path for board_sample.json. Defaults to "
+            f"${FIXTURE_ENV_VAR}/{FIXTURE_RELPATH}."
+        ),
+    )
+    args = parser.parse_args(argv)
+    try:
+        dest = resolve_fixture_path(args.out)
+    except FixtureOutputPathError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(fixture_json_text())
+    print(f"wrote {dest}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

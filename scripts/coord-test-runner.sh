@@ -12,29 +12,40 @@
 # actually break anything?").  `coord drive` (#1392, the Python port of the
 # former drive-issue.sh) only OBSERVES the verdict this produces.
 #
-# #1392 kept this as shell on purpose: venv creation and the cargo env are
-# genuinely shell work (see #2 below for why there is no quadraui sibling
-# symlink here as of #2804/#1973).  Its four sharp-edged
+# #1392 kept this as shell on purpose: venv creation is genuinely shell work.
+# Its four sharp-edged
 # parsers were extracted to tested Python in coord/test_report.py (#1436) —
 # that module is the reference behaviour; the grep/awk below still mirrors it.
 #
-# Six things it handles that a bare `pytest && cargo test` does not:
+# Six things it handles that a bare `pytest` does not:
 #
-#  1. PATH ROUTING — code-coordinator ONLY.  That repo is two codebases with
-#     two toolchains, and a single `test_command` in coordinator.yml cannot
-#     express that.  Changes under coord/** or tests/** run pytest; changes
-#     under tui/** run `cargo test`.  A docs-only diff runs neither and
-#     reports SKIP.  This is not just a speed optimisation — running the Rust
-#     suite against a pure-Python diff adds flake risk for zero signal
-#     (observed: #1349's branch, a Python-only change, tripped a tui flake).
+#  1. PATH ROUTING — code-coordinator ONLY.  Changes under coord/** or
+#     tests/** run pytest; a docs-only diff runs nothing and reports SKIP.
+#
+#     #2899 SHRANK THIS ARM.  It used to be a two-toolchain router because
+#     this repo held two codebases: Python under coord/**+tests/**, and the
+#     `coord-tui` Rust crate under tui/**.  A single `test_command` could not
+#     express that, so the repo earned a hardcoded route.  tui/ now lives in
+#     its own `coord-tui` repo, so what is left here is one suite (pytest)
+#     behind a path filter — an ordinary repo in all but name.
+#
+#     The route is DELIBERATELY KEPT rather than collapsed into
+#     `--fallback-command pytest`, because `--repo NAME` is supplied by the
+#     FLEET's coordinator.yml, which lives in a separate checkout and is
+#     updated out-of-band (same reason #2104 made both spellings route here).
+#     Deleting the arm before that config change propagates would send every
+#     code-coordinator Test dispatch straight to the REFUSE branch below —
+#     a red Test gate on every merge, for a config edit nobody had made yet.
+#     It also still buys the docs-only SKIP, which the fallback arm's coarser
+#     `is_doc_only_path` filter approximates but does not match.
 #
 #     `--repo NAME` selects this behaviour, and accepts either spelling of
 #     this repo's name — `code-coordinator` (since #2104) or the pre-rename
-#     `claude-coordinator`, because the fleet config that supplies it lives
-#     in a separate checkout and is updated out-of-band.  It defaults to
+#     `claude-coordinator`.  It defaults to
 #     "code-coordinator" for callers that omit it.  EVERY OTHER REPO has no
 #     hardcoded routing (#1408) — pass `--fallback-command CMD` (the repo's
-#     configured `test_command`, e.g. quadraui's `cargo test --features tui`)
+#     configured `test_command`, e.g. quadraui's `cargo test --features tui`,
+#     or coord-tui's `cargo test`)
 #     and the runner treats it as one suite: skip only on a genuinely
 #     doc/config-only diff, run it otherwise.  `--repo` given with NO
 #     `--fallback-command`, for any repo other than this one, is a
@@ -42,50 +53,50 @@
 #     silently reporting SKIP.  A silent green Test gate on unrun tests is
 #     exactly the failure mode #1408 exists to close.
 #
-#  2. THE quadraui PATH DEP — RETIRED, #2804.  Before #1973, tui/Cargo.toml
-#     pointed straight at `../../quadraui/quadraui`, resolved RELATIVE TO
-#     THE WORKTREE — so a scratch worktree needed a `quadraui` sibling
-#     symlinked in or the build dangled.  This runner used to create that
-#     symlink at `$(dirname "$WT")/quadraui`, ONE location shared by every
-#     worktree this machine ever tests — which is precisely the shared-
-#     mutable-checkout hazard #2804 is about (a concurrent run repointing it
-#     mid-build would silently change what THIS run compiled against).
-#     #1973 pinned `tui/Cargo.toml` to a quadraui git rev instead, so a
-#     normal `cargo build`/`cargo test` from tui/ never touches
-#     `~/src/quadraui` at all — this runner no longer creates or consults
-#     the shared symlink for that reason, not just to dodge #2804.  The one
-#     remaining local-path override (`tui/cargo-config-local-quadraui.toml.
-#     example`, copied to the git-ignored `tui/.cargo/config.toml`) is an
-#     opt-in, human-attended co-dev workflow — see
-#     `coord/skills/tui-quadraui-workflow/SKILL.md` — that must be reverted
-#     before a branch is pushed, so a Test-stage worktree should never see
-#     it; this runner does not special-case it.  (code-coordinator routing
-#     only; a repo run via `--fallback-command` builds itself.)
+#  2. THE quadraui PATH DEP — GONE, #2899.  History, kept short because the
+#     shape recurs: before #1973 `tui/Cargo.toml` pointed at
+#     `../../quadraui/quadraui`, resolved RELATIVE TO THE WORKTREE, so this
+#     runner symlinked a `quadraui` sibling at ONE shared location every
+#     worktree on the machine reused — the shared-mutable-checkout hazard
+#     #2804 is about.  #1973 replaced the path dep with a git-rev pin and
+#     #2804 deleted the symlink; #2899 moved the crate out of this repo
+#     entirely.  coord-tui now builds itself through `--fallback-command`,
+#     like every other repo.  See coord-tui's own CLAUDE.md for the pin.
 #
-#  3. FLAKE FILTERING.  The tui suite has known races under full-parallel
-#     `cargo test` (#1260 tracks 3 in commands::tests; this script also caught
-#     app::tests::plans_panel_capture_key_dispatches_milestone_capture, which
-#     is NOT in that issue — so the set is larger than filed).  On failure we
+#  3. FLAKE FILTERING — PYTHON ARM ONLY as of #2899.  On failure we
 #     re-run ONLY the failed tests, serially and isolated.  If they pass, the
 #     run is reported as a flake-tolerated PASS rather than burning an
 #     escalated fix round on a test the worker never touched.
 #     Build/collection errors are never flake-retried — those are always real.
+#
+#     KNOWN GAP: the cargo arm had its own flake filter (the tui suite has
+#     races under full-parallel `cargo test` — #1260 tracks 3 in
+#     commands::tests, plus at least
+#     app::tests::plans_panel_capture_key_dispatches_milestone_capture, which
+#     is not in that issue).  It went with the arm.  coord-tui now runs
+#     through `run_fallback`, which cannot parse an arbitrary command's
+#     failure report and so treats every failure as genuine.  Re-adding it
+#     means teaching the fallback arm to recognise a `cargo test` command
+#     and reuse the parser — deliberately NOT done here, because it would
+#     silently change quadraui's and vimcode's verdicts too (a real failure
+#     that happens to pass in isolation would start reporting PASS for
+#     repos that never asked for that).  It is a follow-up, not an oversight.
 #
 #  4. `--print-routing` computes the routing decision (which suite(s) would
 #     run, or SKIP/REFUSE) and exits WITHOUT building or testing anything —
 #     used by the regression tests to assert routing cheaply and deterministically.
 #
 #  5. TOOLCHAIN RESOLUTION (#1814).  The daemon that runs this (coord-serve, a
-#     systemd *user* unit) has a PATH that no login shell ever touched, so
-#     `~/.cargo/bin` is simply absent and a bare `cargo` dies with
-#     "command not found".  Before #1814 that surfaced as `FAIL(rust)` — a red
+#     systemd *user* unit) has a PATH that no login shell ever touched, so a
+#     toolchain installed under $HOME can be simply absent and the command
+#     dies with "command not found".  Before #1814 that surfaced as a red
 #     suite for a branch whose tests were never run.  A missing toolchain and a
-#     failing test must never produce the same verdict, so the runner now
-#     resolves each toolchain the way a human would (PATH → the default
-#     install location → the version manager) and, when it genuinely cannot
-#     find one, reports `TOOLCHAIN MISSING` and exits 3 — a distinct,
+#     failing test must never produce the same verdict, so the runner reports
+#     `TOOLCHAIN MISSING` and exits 3 — a distinct
 #     infrastructure exit code that `coord merge --revalidate` renders as
-#     "could not run", never as "SUITE FAILED".
+#     "could not run", never as "SUITE FAILED".  #2899 removed the cargo
+#     resolver along with the Rust arm; see the section header below for why
+#     the remaining arms do not need one.
 #
 #  6. BASELINE COMPARISON (#2170).  "Did the suite pass?" is not the question
 #     the Test gate is asked — "did this branch make anything WORSE than
@@ -137,9 +148,6 @@ REPORT=""
 REPO_NAME="code-coordinator"
 FALLBACK_CMD=""
 PRINT_ROUTING=0
-# Persistent so the 3m12s cold Rust build is paid once, not once per fix round
-# (warm rebuilds land in 10-35s).
-CARGO_TARGET="${COORD_TEST_CARGO_TARGET:-${TMPDIR:-/tmp}/coord-test-cargo-target-$(id -u)}"
 
 WT=""
 while [[ $# -gt 0 ]]; do
@@ -195,9 +203,11 @@ changed_list() { printf '%s' "$CHANGED" | tr '\n' ' ' | sed 's/ *$//'; }
 
 # ── routing: decide what to run ─────────────────────────────────────────────
 #
-# This repo is two codebases in one (python under coord/**, tests/**; rust
-# under tui/**) with no single test_command that covers both, so it gets its
-# own hardcoded path routing (below). EVERY OTHER REPO has exactly one
+# This repo is python only since #2899 moved the Rust crate out to coord-tui,
+# but it keeps its own hardcoded path routing (below) so a docs-only diff
+# still SKIPs precisely, and so the arm survives even if the fleet's
+# coordinator.yml has not yet been taught to pass `--fallback-command`
+# for it — see header §1. EVERY OTHER REPO has exactly one
 # configured test_command (coordinator.yml's `test_command`, passed in here
 # as --fallback-command) — the only question there is whether THIS diff is
 # doc/config-only (skip) or not (run the one command). A repo that is
@@ -214,29 +224,26 @@ changed_list() { printf '%s' "$CHANGED" | tr '\n' ' ' | sed 's/ *$//'; }
 # changed second silently fell through to the REFUSE branch — a red Test
 # gate on every merge, for a config edit nobody had made yet. Accepting both
 # makes the two edits order-independent.
-RUN_PY=0; RUN_RS=0; RUN_FALLBACK=0
+RUN_PY=0; RUN_FALLBACK=0
 ROUTE_MODE="unknown"
 
 if [[ "$REPO_NAME" == "code-coordinator" || "$REPO_NAME" == "claude-coordinator" ]]; then
     ROUTE_MODE="coordinator"
     if [[ "$DIFF_FAILED" -eq 1 ]]; then
-        RUN_PY=1; RUN_RS=1
+        RUN_PY=1
     else
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
-            # #2896: the tui-tuidriver sealed slices (ms-33/38/65/67) moved
-            # from the repo-root tests/** into tui/tests/acceptance/, so a
-            # diff touching one now falls through to the `tui/*` arm below
-            # (cargo) instead of this one (pytest) — correct, since it's
-            # `tui/tests/acceptance.rs` that `include!`s them. Only the
-            # cli-pytest route's own ms-37 slices remain under tests/**.
+            # #2896 moved the tui-tuidriver sealed slices out of the repo-root
+            # tests/** and #2899 moved the whole crate out of this repo, so
+            # the only acceptance slices still under tests/** are the
+            # cli-pytest route's own (ms-37).
             case "$f" in
                 coord/*|tests/*|pyproject.toml|conftest.py) RUN_PY=1 ;;
-                tui/*)                                      RUN_RS=1 ;;
             esac
         done <<<"$CHANGED"
     fi
-    log "routing: repo=$REPO_NAME pytest=$RUN_PY cargo=$RUN_RS"
+    log "routing: repo=$REPO_NAME pytest=$RUN_PY"
 elif [[ -n "$FALLBACK_CMD" ]]; then
     ROUTE_MODE="fallback"
     if [[ "$DIFF_FAILED" -eq 1 ]]; then
@@ -321,8 +328,8 @@ fi
 
 if [[ "$PRINT_ROUTING" -eq 1 ]]; then
     case "$ROUTE_MODE" in
-        coordinator) printf 'ROUTING mode=coordinator pytest=%s cargo=%s populated-home=%s\n' \
-                        "$RUN_PY" "$RUN_RS" "$POPULATED_ARM" ;;
+        coordinator) printf 'ROUTING mode=coordinator pytest=%s populated-home=%s\n' \
+                        "$RUN_PY" "$POPULATED_ARM" ;;
         fallback)    printf 'ROUTING mode=fallback run=%s\n' "$RUN_FALLBACK" ;;
         unknown)     printf 'ROUTING mode=unknown\n' ;;
     esac
@@ -334,7 +341,7 @@ if [[ "$ROUTE_MODE" == "unknown" ]]; then
     exit 1
 fi
 
-if { [[ "$ROUTE_MODE" == "coordinator" ]] && [[ "$RUN_PY" -eq 0 && "$RUN_RS" -eq 0 ]]; } \
+if { [[ "$ROUTE_MODE" == "coordinator" ]] && [[ "$RUN_PY" -eq 0 ]]; } \
    || { [[ "$ROUTE_MODE" == "fallback" ]] && [[ "$RUN_FALLBACK" -eq 0 ]]; }; then
     say "SKIP: nothing to test — no test-bearing paths changed (docs/config only): $(changed_list)"
     exit 0
@@ -537,15 +544,19 @@ baseline_red_covers_all_failures() {
 #
 # `coord serve` is a systemd USER unit. Its PATH is systemd's
 # (`systemctl --user show-environment`), not a login shell's — ~/.profile and
-# the shell rcs that put `~/.cargo/bin` on PATH are never sourced for it. So a
-# bare `cargo` resolves fine over ssh and not at all inside the daemon, and
+# the shell rcs that extend PATH are never sourced for it. So a toolchain that
+# resolves fine over ssh can be entirely absent inside the daemon, and
 # `coord merge --revalidate` reported that as a red suite for a branch CI had
 # already proven green.
 #
-# Resolve explicitly instead, in the order a human debugging this would try:
-# what's on PATH, then the default rustup install location, then rustup's own
-# answer. On success the toolchain's bin dir is PREPENDED to PATH, because
-# `cargo` alone is not enough — it shells out to `rustc`, which lives beside it.
+# #2899 narrowed what this section has to resolve. The original case was
+# `~/.cargo/bin/cargo` for this repo's in-tree Rust arm; that arm left with
+# `tui/` (see header §1/§2). What remains is `python3` for the python arm and
+# whatever `--fallback-command` names for every other repo — and the fallback
+# arm runs through `bash -lc`, a LOGIN shell, which does source the rcs. So
+# cargo-using repos (coord-tui, quadraui, vimcode) get their PATH the ordinary
+# way and need no resolver here; they are still covered against a genuinely
+# missing toolchain by `run_fallback`'s exit-127 check below.
 #
 # `toolchain_missing` is the one and only way this script reports "could not
 # run": one message, naming the tool, the places searched, and the PATH it
@@ -558,32 +569,6 @@ toolchain_missing() {
     say "      PATH=$PATH"
     INFRA_SUITES+=("$suite")
 }
-
-# Echoes the resolved absolute path on success; returns 1 (silently) on failure.
-resolve_cargo() {
-    local home="${CARGO_HOME:-$HOME/.cargo}"
-    local found=""
-    if found="$(command -v cargo 2>/dev/null)" && [[ -n "$found" ]]; then
-        printf '%s\n' "$found"; return 0
-    fi
-    if [[ -x "$home/bin/cargo" ]]; then
-        printf '%s\n' "$home/bin/cargo"; return 0
-    fi
-    # rustup itself may be off PATH for the same reason cargo is.
-    local rustup=""
-    if rustup="$(command -v rustup 2>/dev/null)" && [[ -n "$rustup" ]]; then
-        :
-    elif [[ -x "$home/bin/rustup" ]]; then
-        rustup="$home/bin/rustup"
-    fi
-    if [[ -n "$rustup" ]] && found="$("$rustup" which cargo 2>/dev/null)" \
-        && [[ -n "$found" && -x "$found" ]]; then
-        printf '%s\n' "$found"; return 0
-    fi
-    return 1
-}
-
-CARGO_SEARCHED='PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo`'
 
 # ── python ───────────────────────────────────────────────────────────────────
 
@@ -896,136 +881,6 @@ run_python() {
     return 1
 }
 
-# ── rust / coord-tui ─────────────────────────────────────────────────────────
-
-# #2180 (review fix): attempt the sealed tui-tuidriver acceptance route
-# (ms-33/ms-38) through the #2164 `--ci` wrapper, same shape as
-# run_python_acceptance_ci above — but NON-BLOCKING, deliberately, to match
-# .github/workflows/cargo-test.yml's own step, which carries
-# `continue-on-error: true` (STEP level, not job level — see that file's
-# comment for why). That workflow's continue-on-error is itself temporary:
-# running this route for the first time (2026-08-14) surfaced six
-# pre-existing failures that predate #2180 and aren't yet declared in
-# either manifest's `expected_red:` — writing that is the test-author
-# role's job (#2191), not this fix's, since tests/acceptance/ and its
-# manifest.yml files are sealed paths.
-#
-# NOTE(follow-up needed): unlike the `windows` job's non-blocking gap
-# (tracked as #1156), this one has no tracking issue yet — file one so
-# "REVISIT" doesn't quietly become permanent (review nit on #2180).
-#
-# Until that lands, blocking the Test stage on this route while CI itself
-# doesn't block on it would be the OPPOSITE split from the one #2180 exists
-# to close (Test stage rejecting what CI tolerates) — so this call reports
-# its result visibly but never fails the suite. Once the six failures above
-# are triaged (declared expected_red or fixed), both this function and
-# cargo-test.yml's continue-on-error should be dropped together.
-run_rust_acceptance_ci() {
-    local acc_out="$WT/.cargo-acceptance.out"
-    log "running: coord acceptance run --all --ci (tui-tuidriver route, ms-33/ms-38) — non-blocking, see comment above"
-    # RUSTC_BOOTSTRAP=1 is set by the driver's own `run:` command (see
-    # .github/coord-ci-acceptance.yml's tui-tuidriver route) — not needed
-    # here.
-    if (coord acceptance run --repo claude-coordinator --all --ci \
-            --for-path tui/src/main.rs --path "$WT") >"$acc_out" 2>&1; then
-        say "ACCEPTANCE(rust, non-blocking): sealed suite (ms-33/ms-38, tui-tuidriver) green under --ci"
-    else
-        say "ACCEPTANCE(rust, non-blocking): sealed suite (ms-33/ms-38, tui-tuidriver) red under --ci — NOT failing the Test stage (matches cargo-test.yml's continue-on-error, see run_rust_acceptance_ci's header comment)"
-        tail -n 40 "$acc_out" | sed 's/^/      /'
-    fi
-}
-
-run_rust() {
-    # Resolve the toolchain BEFORE the symlink/build work: a missing cargo is
-    # not a property of the branch, and finding out about it first keeps the
-    # message clean (#1814).
-    local cargo
-    if ! cargo="$(resolve_cargo)"; then
-        toolchain_missing cargo rust "$CARGO_SEARCHED"
-        return 1
-    fi
-    # cargo shells out to rustc/rustdoc, which live beside it — putting the
-    # whole bin dir on PATH is what makes the resolved cargo actually usable.
-    PATH="$(dirname "$cargo"):$PATH"
-    export PATH
-    log "cargo: $cargo"
-
-    # #2804: NO quadraui sibling symlink here — see header comment #2.
-    # `tui/Cargo.toml` has pinned quadraui to a git rev since #1973, so
-    # `cargo` fetches it itself; touching `~/src/quadraui` (or a shared
-    # symlink to it) from here would be exactly the shared-mutable-checkout
-    # hazard this issue is about, for zero build benefit.
-
-    export CARGO_TARGET_DIR="$CARGO_TARGET"
-    local out="$WT/.cargo.out"
-    log "running: cargo test (cold ~3m, warm ~30s)"
-    # #2180: plain `cargo test` (no `--features test-support`) already
-    # excludes the sealed tui-tuidriver acceptance target — its `acceptance`
-    # test has `required-features = ["test-support"]` in tui/Cargo.toml, so
-    # cargo silently skips building it without that flag. That suite is
-    # attempted separately below, through run_rust_acceptance_ci — see its
-    # header comment for why that call is non-blocking (matches
-    # cargo-test.yml's continue-on-error) rather than duplicated here as a
-    # hard gate.
-    if (cd "$WT/tui" && "$cargo" test) >"$out" 2>&1; then
-        say "PASS(rust): $(grep -oE '[0-9]+ passed[^;]*' "$out" | head -1)"
-        run_rust_acceptance_ci
-        return 0
-    fi
-
-    # A compile error is never a flake. But cargo's runtime-failure banner
-    # (`error: test failed, to rerun pass '--lib'`) also starts with
-    # `error:` — it is NOT rustc output, and matching it here misreported a
-    # #1260-class lib-test race as "compile error" and skipped the serial
-    # flake filter below (#2347 fallout). Exclude it; a genuine compile
-    # failure always carries rustc `error[E...]`/`error:` diagnostics plus
-    # cargo's closing `error: could not compile ...` line, which still match.
-    # (Two independent greps, not a `| grep -v` pipeline: the two banners are
-    # mutually exclusive in one `cargo test` run — every target builds before
-    # any test runs — and `grep -qv` on empty input is implementation-defined,
-    # e.g. ugrep exits 0 where GNU grep exits 1.)
-    if grep -qE "^error(\[E[0-9]+\])?:|could not compile" "$out" \
-            && ! grep -qE "^error: test failed" "$out"; then
-        say "FAIL(rust): compile error"
-        grep -E "^error(\[E[0-9]+\])?:|^  -->" "$out" | head -n 20 | sed 's/^/      /'
-        return 1
-    fi
-
-    # The `failures:` summary block lists bare test paths, one per line.
-    local failed
-    failed="$(awk '/^failures:$/{f=1;next} /^test result:/{f=0} f && /^    [a-zA-Z_]+::/{print $1}' "$out" | sort -u || true)"
-    if [[ -z "$failed" ]]; then
-        say "FAIL(rust): non-zero exit with no parseable failure list"
-        tail -n 30 "$out" | sed 's/^/      /'
-        return 1
-    fi
-
-    local count; count="$(printf '%s\n' "$failed" | grep -c . || true)"
-    log "$count test(s) failed — re-running serially to filter the #1260-class races"
-    local all_passed=1
-    local rerun="$WT/.cargo.rerun.out"
-    : >"$rerun"
-    while IFS= read -r t; do
-        [[ -z "$t" ]] && continue
-        if ! (cd "$WT/tui" && "$cargo" test "$t" -- --exact --test-threads=1) >>"$rerun" 2>&1; then
-            all_passed=0
-        fi
-    done <<<"$failed"
-
-    if [[ "$all_passed" -eq 1 ]]; then
-        say "FLAKE(rust): $count test(s) failed under full parallelism but PASS isolated (#1260 class)"
-        printf '%s\n' "$failed" | sed 's/^/      /'
-        FLAKES+=("rust:$count")
-        run_rust_acceptance_ci
-        return 0
-    fi
-
-    say "FAIL(rust): $count test(s) fail on isolated re-run — genuine"
-    printf '%s\n' "$failed" | sed 's/^/      /'
-    tail -n 40 "$rerun" | sed 's/^/      /'
-    return 1
-}
-
 # ── fallback (any repo's own configured test_command) ───────────────────────
 #
 # One suite, no flake filtering — this script does not know the failure-report
@@ -1078,9 +933,6 @@ mark_failed() {
 # requirement). It is only ever read after `run_python` returns non-zero.
 if [[ "$RUN_PY" -eq 1 ]]; then
     run_python || mark_failed "$PY_FAIL_SUITE"
-fi
-if [[ "$RUN_RS" -eq 1 ]]; then
-    run_rust || mark_failed rust
 fi
 if [[ "$RUN_FALLBACK" -eq 1 ]]; then
     run_fallback || mark_failed fallback
