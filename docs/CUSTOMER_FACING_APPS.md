@@ -109,10 +109,23 @@ natal-chart (Preview)  ref=issue-39-transit-page-annual-profections-mock-up
     https://ed9f21ad.natal-chart-3ew.pages.dev
 ```
 
-The hash is not derivable from the branch name, and the branch-alias URL
-Cloudflare also publishes truncates at 28 characters, which these branch names
-exceed. Read it from the forge instead — `cloudflare/pages-action` creates a
-GitHub Deployment per PR whose latest status carries the real URL:
+The hash is not derivable from the branch name, and **there is no branch-alias
+URL to fall back on** — measured 2026-08-29 against this project, aliasing is off
+entirely, `main` included:
+
+```
+404  https://issue-56-transit-chart-add-a.natal-chart-3ew.pages.dev
+404  https://main.natal-chart-3ew.pages.dev
+200  https://f432dd47.natal-chart-3ew.pages.dev
+```
+
+Note the domain too: it is `natal-chart-3ew.pages.dev`, while
+`deploy-cloudflare.yml` says `projectName: natal-chart`. Cloudflare's `-3ew`
+suffix is not derivable from anything coord holds, so a repo's preview host has
+to be *read*, never *constructed* — see #2948, which is this exact assumption
+shipped as a config template. Read it from the forge instead —
+`cloudflare/pages-action` creates a GitHub Deployment per PR whose latest status
+carries the real URL:
 
 ```bash
 gh api "repos/{owner}/{repo}/deployments?ref={branch}" --jq '.[0].id'
@@ -122,21 +135,58 @@ gh api "repos/{owner}/{repo}/deployments/{id}/statuses" --jq '.[0].environment_u
 Match on the **environment name** (`"<project> (Preview)"`), not on recency —
 production deploys are hash URLs too and interleave with previews in that list.
 
-### 2. A `uat` gate between Review and Merge · **NOT BUILT — claude-coordinator#2687**
+### 2. A `uat` gate between Review and Merge · **shipped (#2687) · ON for natal-chart since 2026-08-29**
 
-The gap that lets everything else fail. Today `merge.auto_drain: true` with
-`max_per_tick: 1` means the daemon merges the moment Test + Review + CI go
-green, and the push to `main` fires production. **There is no per-repo,
-pre-merge operator hold anywhere in coord**: `coord pause` only stops agent
-routing, and drive-queue's `--hold-after` (#1757) fires *after* the merge, which
-for an auto-deploying repo is after the customer can already see it.
+This was the gap that let everything else fail, and it is closed. Before it,
+`merge.auto_drain: true` with `max_per_tick: 1` meant the daemon merged the
+moment Test + Review + CI went green and the push to `main` fired production,
+with **no per-repo, pre-merge operator hold anywhere in coord** — `coord pause`
+only stops agent routing, and drive-queue's `--hold-after` (#1757) fires *after*
+the merge, which for an auto-deploying repo is after the customer can already
+see it.
 
-#2687 adds a `uat` gate ordered before `merge`, a
-`coord uat <id> --passed|--failed` verdict modelled on `coord test`, and — the
-part that decides whether it gets used or bypassed — **the preview URL surfaced
-in `coord status` and the TUI**, next to the command that clears the gate. A
-gate that makes the operator go hunting for the link will be routed around
-inside a week.
+`coord merge` now refuses a PR whose UAT verdict is missing or failed, printing
+the preview URL and the exact command to clear it:
+
+```
+uat verdict missing — preview: <url> — run: coord uat <assignment-id> --passed
+```
+
+**Enabling it is a two-part opt-in, and one half alone does nothing:**
+
+```yaml
+pipeline:
+  default_gates: [test, review, uat, merge]   # fleet-wide half — inert on its own
+repos:
+  - name: natal-chart
+    uat_preview: "https://github.com/JDonaghy/natal-chart/pull/{pr_number}"
+```
+
+`coord.merge_queue.requires_uat` demands **both**, so listing `uat` fleet-wide is
+safe: a repo without `uat_preview` never blocks, no matter what `default_gates`
+says. Clear the gate with `coord uat <assignment-id> --passed|--failed` (an
+assignment id, not repo/issue) — modelled on `coord test`.
+
+**Two follow-ups are open, and both matter before you enable this for a second
+repo:**
+
+- **#2948 — `uat_preview` cannot build a working Cloudflare URL.** The
+  `{pr_branch_slug}` placeholder assumes branch aliases that this project does
+  not publish (see §1). It renders a plausible dead link and
+  `resolve_uat_preview_url` never raises, so the failure is silent. natal-chart's
+  template therefore points at the **PR page**, whose timeline carries the live
+  `natal-chart (Preview)` deployment — one click from the real build, and it
+  cannot 404.
+- **#2947 — `coord drive` does not classify the gate.** `_merge_gate_kind`
+  knows `smoke`/`review`/`unknown_head` and returns `None` for a uat block, so an
+  unattended drive spends its merge attempts blind and lands the drive-queue
+  entry in terminal `blocked` rather than parking. Until it lands, expect to
+  `remove` + `add` the queue entry after recording the verdict.
+
+The part #2687 called the deciding one — **the preview URL surfaced in `coord
+status` and the TUI**, next to the command that clears the gate — is what #2947
+and #2948 between them still owe. A gate that makes the operator go hunting for
+the link will be routed around inside a week.
 
 ### 3. Sign-off reaches the customer without you relaying it · **partially built**
 
@@ -148,11 +198,26 @@ explicitly out of scope for #2588 and never filed.
 Until it exists, step 3 is you, by hand, in the runbook below. That is fine at
 one customer and does not survive two.
 
-### 4. Visual regression baselines · **NOT BUILT — natal-chart#47**
+### 4. Visual regression baselines · **shipped (natal-chart#47)**
 
 So the human is the *second* line of defence, not the first. Screenshot the
 core screens against a **fixed fixture** — one hardcoded chart, a frozen clock —
 and diff them in CI.
+
+Built as Playwright screenshot specs in `packages/web/e2e/`, with committed
+baselines beside each spec:
+
+```
+packages/web/playwright.config.ts
+packages/web/e2e/chart-wheel.spec.ts  + chart-wheel.spec.ts-snapshots/chart-wheel-chromium-linux.png
+packages/web/e2e/positions.spec.ts    + positions.spec.ts-snapshots/positions-chromium-linux.png
+packages/web/e2e/zr-tab.spec.ts       + zr-tab.spec.ts-snapshots/zr-tab-chromium-linux.png
+```
+
+**A deliberate restyle of a covered screen therefore fails CI until its baseline
+is re-recorded, and that is the harness working.** Say so in the issue when you
+file one — a worker that reads a red baseline diff as a defect will spend fix
+rounds trying to restore the look you asked it to change.
 
 The honest caveat, worth stating because it is the trap: pixel diffing is flaky
 across font rendering and browser versions, and **font fallback is exactly the
@@ -206,33 +271,41 @@ the preview" is the control that already failed on 2026-08-23. This file
 documents a *mechanism*; where the mechanism does not exist yet it says so, in
 bold, with the issue number.
 
-## The manual runbook — what to do until #2687 lands
-
-For a customer-facing repo, right now, with no gate to help you:
+## The runbook — a repo with the gate on
 
 1. **Queue the work as normal** (`coord drive-queue add`). Nothing special.
-2. **Watch for the PR.** The work leg completing is your cue — the branch is
-   pushed and the PR opens shortly after.
-3. **Get the preview URL** with the two `gh api` calls in step 1 above. The URL
-   does not exist the instant the PR opens; the preview build has to finish.
+2. **Wait for `coord merge` to refuse.** That refusal *is* the notification —
+   it names the gate, the preview link and the command. You are no longer racing
+   `auto_drain`; the merge cannot happen without your verdict.
+3. **Get the real preview URL** with the two `gh api` calls in §1. Until #2948
+   lands the gate's own link points at the PR, so in practice: open the PR and
+   click the `natal-chart (Preview)` deployment in its timeline. The URL does not
+   exist the instant the PR opens; the preview build has to finish.
 4. **Look at it yourself first.** Walk the screens the change touched. You will
    catch most of it here, and it costs a minute.
-5. **Send the customer the URL** and wait for a yes.
-6. **Then let it merge.**
+5. **Send the customer the URL** and wait for a yes. Through the portal, that is
+   `coord portal enqueue-preview <SUB-ID> <url>` then `coord portal
+   enqueue-status <SUB-ID> quality-check`, both on the daemon host, and her
+   answer arrives as a `preview.approved` / `preview.changes_requested` event
+   (`docs/CUSTOMER_PORTAL.md`).
+6. **Record the verdict and let it merge:** `coord uat <assignment-id> --passed`.
 
-Step 6 is the weak one and you should know why: **you cannot reliably hold a
-merge today.** `auto_drain` will take the PR as soon as its gates are green,
-whether or not you have heard back. The available holds are all bad in
-different ways — draft the PR on GitHub (targeted, but strands the merge-queue
-entry in `NEEDS_ATTENTION`), or flip `merge.auto_drain: false` in
-`~/.coord/coordinator.remote.yml` (a hard guarantee that stalls auto-merge for
-every other repo in flight, and is easy to forget to switch back).
+**What is still weak, and why.** Nothing auto-fires off `preview.approved` — it
+is not wired into `coord merge` or the merge queue, so step 6 remains a
+deliberate human act. And per #2947 an unattended drive will have burned its
+merge attempts against the block and parked the queue entry in terminal
+`blocked` by the time you get here, so expect a `remove` + `add` after recording
+the verdict.
 
-**This is exactly why #2687 exists.** Until it lands, on a change where the
-customer's opinion genuinely gates the release, the honest options are to pick
-one of those two holds consciously, or to accept that the merge may win the
-race — as it did on 2026-08-24, when natal-chart#42 merged and deployed to
-production during the conversation about how to review it before it shipped.
+**For a repo with the gate off, you cannot reliably hold a merge at all.**
+`auto_drain` takes the PR as soon as its gates are green, whether or not you
+have heard back. The available holds are all bad in different ways — draft the
+PR on GitHub (targeted, but strands the merge-queue entry in
+`NEEDS_ATTENTION`), or flip `merge.auto_drain: false` (a hard guarantee that
+stalls auto-merge for every other repo in flight, and is easy to forget to
+switch back). That is what the gate replaces, and it is not hypothetical: on
+2026-08-24 natal-chart#42 merged and deployed to production *during the
+conversation about how to review it before it shipped*.
 
 ## Adopting this for a new repo
 
@@ -242,7 +315,10 @@ production during the conversation about how to review it before it shipped.
    per-deploy hashes.
 3. Add the repo's visual-regression harness *before* the first customer-visible
    feature, not after the first complaint. Fixed fixture, frozen clock.
-4. Turn on the `uat` gate for the repo once #2687 ships.
+4. Turn on the `uat` gate for the repo — the two-part opt-in in §2. Resolve its
+   `uat_preview` against a **real** deployment before you trust it (§1): a
+   template that renders a dead link is worse than no gate, because the operator
+   learns to waive it.
 5. Point the repo's own `CLAUDE.md` at this file, and make sure its deployment
    section is **true** — natal-chart's said "GitHub Pages" for a week after
    production moved to Cloudflare (fixed in #47).
