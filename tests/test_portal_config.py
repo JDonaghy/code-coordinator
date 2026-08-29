@@ -141,3 +141,96 @@ def test_has_unexpanded_env_var_false_for_empty_string():
 def test_max_retries_must_be_an_int_not_a_bool():
     with pytest.raises(ConfigError, match="non-negative integer"):
         _parse_portal({**BASE, "max_retries": True})
+
+
+# ── #2903 (phase 1 of #2902): the draft gate's per-kind approval policy ─────
+
+
+def test_absent_approval_block_gates_the_two_prose_kinds():
+    """The whole acceptance bar of the default policy, in one assertion."""
+    cfg = _parse_portal(None)
+    assert cfg.approval.gates("design_round") is True
+    assert cfg.approval.gates("question") is True
+    assert cfg.approval.gates("status") is False
+    assert cfg.approval.gates("preview") is False
+
+
+def test_absent_approval_key_in_a_present_portal_block_is_still_the_default():
+    cfg = _parse_portal({**BASE})
+    assert cfg.approval.gates("design_round") is True
+    assert cfg.approval.gates("status") is False
+
+
+def test_a_present_block_merges_over_the_defaults():
+    """Relaxing one kind must not silently open every other one."""
+    cfg = _parse_portal({**BASE, "approval": {"question": False}})
+    assert cfg.approval.gates("question") is False
+    assert cfg.approval.gates("design_round") is True  # untouched
+
+
+def test_a_mechanical_kind_can_be_gated_too():
+    cfg = _parse_portal({**BASE, "approval": {"status": True}})
+    assert cfg.approval.gates("status") is True
+
+
+def test_an_empty_approval_block_is_the_default():
+    cfg = _parse_portal({**BASE, "approval": None})
+    assert cfg.approval.gates("design_round") is True
+
+
+def test_an_unknown_kind_is_refused():
+    """A typo'd kind that parsed would read as 'not gated' and mail a customer."""
+    with pytest.raises(ConfigError, match="unknown portal.approval kind"):
+        _parse_portal({**BASE, "approval": {"desgin_round": True}})
+
+
+def test_a_non_boolean_value_is_refused():
+    with pytest.raises(ConfigError, match="must be a boolean"):
+        _parse_portal({**BASE, "approval": {"question": "yes"}})
+
+
+def test_approval_must_be_a_mapping():
+    with pytest.raises(ConfigError, match="portal.approval"):
+        _parse_portal({**BASE, "approval": ["question"]})
+
+
+def test_an_unknown_kind_is_not_gated_at_read_time():
+    """`gates()` never fails closed on a kind this build has never heard of —
+    there would be no CLI verb able to approve such a row."""
+    cfg = _parse_portal(None)
+    assert cfg.approval.gates("telepathy") is False
+
+
+def test_portal_outbox_kinds_matches_portal_syncs_kind_constants():
+    """The literal copy in config.py must not drift from portal_sync's KIND_*."""
+    from coord import portal_sync
+    from coord.config import PORTAL_OUTBOX_KINDS
+
+    assert set(PORTAL_OUTBOX_KINDS) == {
+        portal_sync.KIND_STATUS,
+        portal_sync.KIND_DESIGN_ROUND,
+        portal_sync.KIND_QUESTION,
+        portal_sync.KIND_PREVIEW,
+    }
+
+
+def test_approval_survives_a_full_config_load(tmp_path):
+    """End to end through `config.load()`, not just `_parse_portal`."""
+    from coord import config as config_mod
+
+    path = tmp_path / "coordinator.yml"
+    path.write_text(
+        "repos:\n"
+        "  - name: coord\n"
+        "    github: owner/coord\n"
+        "machines:\n"
+        "  - name: dellserver\n"
+        "    host: dellserver\n"
+        "    repos: [coord]\n"
+        "portal:\n"
+        "  approval:\n"
+        "    design_round: false\n"
+    )
+    cfg = config_mod.load(path)
+    assert cfg.portal.approval.gates("design_round") is False
+    assert cfg.portal.approval.gates("question") is True

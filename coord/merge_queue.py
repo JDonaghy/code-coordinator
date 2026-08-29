@@ -6064,12 +6064,27 @@ def _maybe_push_design_round(
             milestone_title=milestone.get("title") or f"ms-{milestone_number}",
             tracking_issue_title=issue_data.get("title") or "",
             tracking_issue_body=issue_data.get("body") or "",
+            # #2903: the same Config this hook already holds, so the draft
+            # gate's policy read does not re-resolve coordinator.yml from
+            # disk and cannot disagree with the config this process was
+            # started with (e.g. a `--config` override).
+            config=config,
         )
     except PortalBridgeError as e:
         return MergeEvent(entry, "design_round_push_failed", f"bundle upload failed: {e}")
     except PortalSyncError as e:
         return MergeEvent(entry, "design_round_push_failed", f"enqueue failed: {e}")
 
+    if row.state == portal_store.STATE_DRAFT:
+        # #2903: it is NOT queued — it is waiting for an operator, and an
+        # event that says "queued" would have somebody waiting for an email
+        # that is sitting behind a gate only they can open.
+        return MergeEvent(
+            entry, "design_round_drafted",
+            f"design round for portal submission {link.submission_id} is "
+            f"awaiting operator approval (seq={row.seq}, "
+            f"bundle_key={bundle_key}) — `coord portal drafts`",
+        )
     return MergeEvent(
         entry, "design_round_queued",
         f"queued design round for portal submission {link.submission_id} "

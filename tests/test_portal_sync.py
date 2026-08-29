@@ -92,6 +92,51 @@ def _design(round_no: int = 1) -> dict:
     return {"round": round_no, "outcome": "a thing", "bundle_url": "r2://b/1"}
 
 
+def _approval(**kinds: bool):
+    """A :class:`coord.config.PortalApprovalConfig` merged over the defaults."""
+    from coord.config import DEFAULT_PORTAL_APPROVAL, PortalApprovalConfig
+
+    return PortalApprovalConfig(kinds={**DEFAULT_PORTAL_APPROVAL, **kinds})
+
+
+class _Cfg:
+    """The one attribute :func:`coord.portal_sync._approval_config` reads."""
+
+    def __init__(self, approval):
+        self.portal = type("_Portal", (), {"approval": approval})()
+
+
+def _ungated():
+    return _Cfg(_approval(design_round=False, question=False))
+
+
+@pytest.fixture(autouse=True)
+def _ungated_when_no_config_is_passed(monkeypatch):
+    """#2903: keep this module's pre-existing tests about what they test.
+
+    Almost everything here is about the DRAIN and the #835 ordering guard,
+    and was written when `enqueue_design_round`/`enqueue_question` went
+    straight to `pending`. The draft gate now holds both by default, which
+    would turn every one of those into a test of the gate instead.
+
+    So: a call that names no *config* reads as ungated here, and a call that
+    passes one gets the REAL policy read. The gate's own tests below
+    (`TestDraftGate`) therefore exercise the genuine
+    :func:`coord.portal_sync._approval_config` path with an explicit config,
+    and the default-when-nothing-is-configured behaviour is pinned in
+    `tests/test_portal_config.py` and `tests/test_cli_portal.py` (which run
+    the real `config.load()`), not stubbed away.
+    """
+    real = portal_sync._approval_config
+
+    def _patched(config=None):
+        if config is not None:
+            return real(config)
+        return _approval(design_round=False, question=False)
+
+    monkeypatch.setattr(portal_sync, "_approval_config", _patched)
+
+
 # ── the ordering rule (#835) ────────────────────────────────────────────────
 
 
@@ -2114,3 +2159,182 @@ class TestConsumeQuestions:
             and entry.question_revision == row.revision
             for entry in portal_store.ledger_for_submission(SUB)
         )
+
+
+# ── #2903 (phase 1 of #2902): the draft gate ────────────────────────────────
+
+
+class TestDraftGate:
+    """No design round or question leaves the outbox unapproved.
+
+    Every test here passes an explicit *config*, so it exercises the real
+    `_approval_config` read rather than the module-level ungating fixture
+    above.
+    """
+
+    def test_default_policy_gates_the_two_prose_kinds(self):
+        gated = _Cfg(_approval())
+        assert portal_sync.initial_outbox_state("design_round", config=gated) == (
+            portal_store.STATE_DRAFT
+        )
+        assert portal_sync.initial_outbox_state("question", config=gated) == (
+            portal_store.STATE_DRAFT
+        )
+        assert portal_sync.initial_outbox_state("status", config=gated) == (
+            portal_store.STATE_PENDING
+        )
+        assert portal_sync.initial_outbox_state("preview", config=gated) == (
+            portal_store.STATE_PENDING
+        )
+
+    def test_a_gated_design_round_lands_in_draft_and_the_drain_never_sends_it(self):
+        row = enqueue_design_round(SUB, _design(), config=_Cfg(_approval()))
+        assert row.state == portal_store.STATE_DRAFT
+        assert portal_store.pending_outbox() == []
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.applied == 0
+
+    def test_a_gated_question_holds_its_own_needs_input_announcement(self):
+        """The #835 guarantee, straight through the gate: the mail cannot
+        overtake the question just because the question is with the operator."""
+        question, status = enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        assert question.state == portal_store.STATE_DRAFT
+        assert status.state == portal_store.STATE_PENDING
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.held == 1
+        held = [r for r in portal_store.outbox_for_submission(SUB) if r.seq == status.seq][0]
+        assert "unapproved draft" in held.reason
+
+    def test_status_and_preview_are_unchanged_by_the_gate(self):
+        gated = _Cfg(_approval())
+        preview = enqueue_preview(SUB, "https://pr-1.example.pages.dev", config=gated)
+        status = enqueue_status(SUB, "quality-check", config=gated)
+        assert preview.state == portal_store.STATE_PENDING
+        assert status.state == portal_store.STATE_PENDING
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushed_kinds == ["preview_url", "status"]
+        assert result.applied == 2
+
+    def test_approving_a_draft_lets_the_next_drain_send_it_in_order(self):
+        gated = _Cfg(_approval())
+        enqueue_design_round(SUB, _design(), config=gated)
+        enqueue_status(SUB, "awaiting-signoff", config=gated)
+
+        assert sync_tick(client=FakeClient()).applied == 0  # gated
+
+        portal_store.approve_draft(SUB, 1, actor="john")
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushed_kinds == ["design_round", "status"]
+        assert result.applied == 2
+
+    def test_ordering_block_reason_names_the_unapproved_draft(self):
+        gated = _Cfg(_approval())
+        enqueue_design_round(SUB, _design(), config=gated)
+        announcement = enqueue_status(SUB, "awaiting-signoff", config=gated)
+
+        reason = ordering_block_reason(announcement)
+        assert reason is not None
+        assert "unapproved draft" in reason
+        assert "coord portal drafts" in reason
+
+    def test_a_relaxed_policy_sends_a_design_round_straight_through(self):
+        row = enqueue_design_round(SUB, _design(), config=_ungated())
+        assert row.state == portal_store.STATE_PENDING
+
+        client = FakeClient()
+        assert sync_tick(client=client).applied == 1
+
+    def test_a_gated_status_is_possible_too(self):
+        row = enqueue_status(SUB, "in-design", config=_Cfg(_approval(status=True)))
+        assert row.state == portal_store.STATE_DRAFT
+
+    def test_the_drain_refuses_a_non_pending_row_even_if_handed_one(self, monkeypatch):
+        """The belt-and-braces guard in `_push`: `pending_outbox()` already
+        filters, so this can only fire if that query is ever loosened — which
+        is exactly the regression the acceptance bar ("by any path") is
+        about."""
+        draft = enqueue_design_round(SUB, _design(), config=_Cfg(_approval()))
+        monkeypatch.setattr(portal_store, "pending_outbox", lambda limit=None: [draft])
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.applied == 0
+
+    def test_rejecting_a_draft_question_also_rejects_its_announcement(self):
+        """Otherwise the `needs-input` behind it is held forever."""
+        _question, status = enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        portal_store.reject_draft(SUB, 1, "already answered in intake")
+
+        rows = portal_store.outbox_for_submission(SUB)
+        assert [r.state for r in rows] == [
+            portal_store.STATE_REJECTED,
+            portal_store.STATE_REJECTED,
+        ]
+        assert portal_store.pending_outbox() == []
+        # ...and the drain has nothing left to hold forever.
+        assert sync_tick(client=FakeClient()).held == 0
+        assert status.seq == 2
+
+    def test_a_draft_blocks_rows_queued_behind_it_on_the_same_submission(self):
+        """It keeps its seq, so per-submission FIFO still holds. Correct: a
+        later status must not describe a submission state the customer was
+        never told about."""
+        enqueue_design_round(SUB, _design(), config=_Cfg(_approval()))
+        later = enqueue_status(SUB, "in-design", config=_Cfg(_approval()))
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.held == 1
+        held = [r for r in portal_store.outbox_for_submission(SUB) if r.seq == later.seq][0]
+        assert "an earlier design_round (seq 1) is an unapproved draft" in held.reason
+        # It is a HOLD, not a failure: nothing was sent, so nothing counts as
+        # an attempt.
+        assert held.attempts == 0
+
+    def test_a_gated_submission_does_not_stall_another_customers(self):
+        enqueue_design_round(SUB, _design(), config=_Cfg(_approval()))
+        enqueue_status("sub-002", "in-design", config=_Cfg(_approval()))
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushed_kinds == ["status"]
+        assert result.applied == 1
+
+
+class TestApprovalConfigRead:
+    def test_an_object_with_no_portal_block_reads_as_the_default(self, monkeypatch):
+        monkeypatch.undo()  # drop the module-level ungating fixture
+        assert portal_sync.initial_outbox_state(
+            "question", config=object()
+        ) == portal_store.STATE_DRAFT
+
+    def test_an_unreadable_config_falls_back_to_the_defaults(self, monkeypatch):
+        monkeypatch.undo()
+        from coord import config as config_mod
+
+        def _boom(*_a, **_k):
+            raise config_mod.ConfigError("no coordinator.yml anywhere")
+
+        monkeypatch.setattr(config_mod, "load", _boom)
+        assert portal_sync.initial_outbox_state("design_round") == (
+            portal_store.STATE_DRAFT
+        )
+        assert portal_sync.initial_outbox_state("status") == portal_store.STATE_PENDING

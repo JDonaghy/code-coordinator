@@ -1771,12 +1771,21 @@ class TestDesignRoundPushOnMerge:
         return Board(active=[], completed=list(completed or []))
 
     @staticmethod
-    def _config(*, portal_enabled: bool = True):
+    def _config(*, portal_enabled: bool = True, gate_design_rounds: bool = True):
         """A minimal config-like object carrying only what
         `_maybe_push_design_round` and the ordinary merge-gate defaults
         read — same "build the smallest _Cfg that satisfies the gate
-        reads" pattern `TestReviewGate._config` uses just above."""
-        from coord.config import PortalConfig
+        reads" pattern `TestReviewGate._config` uses just above.
+
+        *gate_design_rounds* is #2903's draft gate: True (the shipped
+        default) holds the auto-pushed round for an operator, False is the
+        pre-#2903 straight-to-`pending` behaviour.
+        """
+        from coord.config import (
+            DEFAULT_PORTAL_APPROVAL,
+            PortalApprovalConfig,
+            PortalConfig,
+        )
 
         @dataclass
         class _Cfg:
@@ -1788,6 +1797,9 @@ class TestDesignRoundPushOnMerge:
             base_url="https://intake.example.com",
             bridge_client_id="id-123",
             bridge_client_secret="secret-456",
+            approval=PortalApprovalConfig(
+                kinds={**DEFAULT_PORTAL_APPROVAL, "design_round": gate_design_rounds}
+            ),
         )
         return cfg
 
@@ -1868,7 +1880,10 @@ class TestDesignRoundPushOnMerge:
             config=cfg, board=self._board(),
         )
 
-        assert events[-1].kind == "design_round_queued"
+        # #2903: the round is uploaded and enqueued, but it is DRAFTED, not
+        # queued — an operator has to read it before the customer does.
+        assert events[-1].kind == "design_round_drafted"
+        assert "awaiting operator approval" in events[-1].message
         assert "sub_1" in events[-1].message
         assert seen_upload["url"] == "https://intake.example.com/api/bridge/upload"
         assert seen_upload["json"]["submission_id"] == "sub_1"
@@ -1880,6 +1895,37 @@ class TestDesignRoundPushOnMerge:
         assert rows[0].kind == "design_round"
         assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
         assert "Ship the thing." in rows[0].fields["design_round"]["outcome_definition"]
+        assert rows[0].state == portal_store.STATE_DRAFT
+        assert portal_store.pending_outbox() == []
+
+    def test_an_ungated_design_round_is_queued_outright(self, monkeypatch) -> None:
+        """#2903: `portal.approval.design_round: false` restores the
+        pre-gate behaviour exactly."""
+        self._link(submission_id="sub_1", milestone_number=9)
+        cfg = self._config(gate_design_rounds=False)
+
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+        )
+        monkeypatch.setattr(
+            "httpx.post",
+            lambda url, json=None, headers=None, timeout=None: _StubResponse(
+                200, {"bundle_key": "bundles/sub_1/r1.tar"}
+            ),
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_queued"
+
+        from coord import portal_store
+        assert [r.state for r in portal_store.outbox_for_submission("sub_1")] == [
+            portal_store.STATE_PENDING
+        ]
 
     def test_no_bundle_files_yields_a_skip_event(self, monkeypatch) -> None:
         self._link()
