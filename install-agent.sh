@@ -75,6 +75,16 @@ if [ -d "$VENV_DIR" ] && [ -x "$VENV_DIR/bin/pip" ]; then
 else
     if [ -d "$VENV_DIR" ]; then
         echo "Existing $VENV_DIR has no bin/pip (partial or failed install) - recreating..."
+        # Note: if a `coord agent update` blue/green swap (coord/agent_update.py)
+        # has ever run here, $VENV_DIR is normally a symlink to
+        # .coord-venv.blue/.coord-venv.green, not a plain directory — but a
+        # symlink with a working bin/pip would have taken the branch above,
+        # so reaching here means it's either a plain broken directory (the
+        # common first-install case this fix targets) or an already-broken
+        # symlink. `rm -rf` on a symlink unlinks just the symlink, not its
+        # target, which would strand the real blue/green slot on disk; that's
+        # an existing-corruption corner case outside a first-install script's
+        # scope, not something this fix introduces.
         rm -rf "$VENV_DIR"
     fi
     echo "Creating virtual environment at $VENV_DIR..."
@@ -96,6 +106,16 @@ fi
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install --upgrade "$INSTALL_SOURCE" -q
 echo "Installed: $("$VENV_DIR/bin/coord" version)"
+
+# The venv is now fully installed and verified working (coord version printed
+# above). Disarm the cleanup trap here: everything from this point on
+# (machine-name detection, the systemd unit, node shims, systemctl,
+# loginctl) is unrelated to venv creation, and a failure in any of it must
+# NOT delete a venv that already works — that would poison the retry with a
+# from-scratch pip re-install just to get back to the same later failure
+# (#2911 review).
+trap - EXIT
+CREATED_VENV=0
 
 # Detect machine name if not provided
 if [ -z "$MACHINE_NAME" ]; then

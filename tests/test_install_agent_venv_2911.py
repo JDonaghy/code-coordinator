@@ -22,6 +22,14 @@ Three scenarios, matching the issue:
   poisoned one behind for the next retry;
 * an already-good venv (``bin/pip`` present) is left alone and just
   updated in place — no spurious recreation.
+* a failure *after* the venv is fully installed (e.g. ``systemctl
+  --user daemon-reload`` failing with "Failed to connect to bus" because
+  the SSH session has no lingering user session yet — the exact reason
+  the next line is ``loginctl enable-linger``) must NOT delete the
+  now-working venv: only a failure during venv creation/pip install
+  should trigger cleanup, otherwise the retry has to re-download and
+  re-install everything from scratch just to reach the same later
+  failure again.
 """
 
 from __future__ import annotations
@@ -33,6 +41,8 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import POSIX_BASH
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = REPO_ROOT / "install-agent.sh"
 
@@ -42,7 +52,7 @@ def _write_exe(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _make_fake_bin(tmp_path: Path, *, venv_fails: bool) -> Path:
+def _make_fake_bin(tmp_path: Path, *, venv_fails: bool, systemctl_fails: bool = False) -> Path:
     """A directory of stub commands so the script never touches the real system."""
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -87,7 +97,20 @@ exit 1
 """,
     )
 
-    for noop in ("systemctl", "loginctl", "claude"):
+    if systemctl_fails:
+        # Simulate the real-world "Failed to connect to bus" error: on a
+        # brand-new SSH session there is no lingering user session yet, so
+        # `systemctl --user ...` fails until `loginctl enable-linger` runs
+        # (which is the *next* line in install-agent.sh — too late for this
+        # call).
+        _write_exe(
+            fake_bin / "systemctl",
+            '#!/usr/bin/env bash\necho "Failed to connect to bus: No such file or directory" >&2\nexit 1\n',
+        )
+    else:
+        _write_exe(fake_bin / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
+
+    for noop in ("loginctl", "claude"):
         _write_exe(fake_bin / noop, "#!/usr/bin/env bash\nexit 0\n")
 
     return fake_bin
@@ -104,7 +127,7 @@ def _run_installer(tmp_path: Path, fake_bin: Path, *, extra_path: str = "") -> s
     env["PATH"] = ":".join(path_parts)
     env["HOME"] = str(home)
     return subprocess.run(
-        ["bash", str(INSTALLER), "--machine", "testhost"],
+        [POSIX_BASH, str(INSTALLER), "--machine", "testhost"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -175,3 +198,28 @@ def test_already_good_venv_is_updated_in_place_not_recreated(tmp_path: Path) -> 
     assert "recreating" not in result.stdout
     # untouched by a `python3 -m venv` recreation (the fake would overwrite it)
     assert marker.read_bytes() == before
+
+
+def test_failure_after_venv_installed_does_not_delete_the_working_venv(tmp_path: Path) -> None:
+    """The cleanup trap must be scoped to venv creation/pip install, not the
+    whole script (#2911 review). `systemctl --user daemon-reload` failing
+    with "Failed to connect to bus" — the ordinary first-run case before
+    `loginctl enable-linger` has ever run — happens *after* the venv is
+    fully created and installed into. That must exit non-zero but leave the
+    now-working venv alone: deleting it would force the retry to re-download
+    and re-install code-coordinator from scratch just to reach the exact
+    same systemd failure again."""
+    fake_bin = _make_fake_bin(tmp_path, venv_fails=False, systemctl_fails=True)
+
+    result = _run_installer(tmp_path, fake_bin)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    home = tmp_path / "home"
+    venv_dir = home / ".coord-venv"
+    assert venv_dir.exists(), (
+        "a venv that finished creation and pip install successfully must "
+        "survive a later, unrelated failure (systemd here) instead of being "
+        "deleted by the cleanup trap"
+    )
+    assert (venv_dir / "bin" / "pip").exists()
+    assert (venv_dir / "bin" / "coord").exists()
