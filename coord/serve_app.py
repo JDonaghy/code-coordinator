@@ -4510,6 +4510,49 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/github-backoff": {
+            "get": {
+                "summary": (
+                    "#2934: the daemon's own view of the shared GitHub "
+                    "secondary-rate-limit backoff — the state every "
+                    "machine's `coord.github_throttle.consult()` reads "
+                    "before its next `gh` call, fleet-wide rather than "
+                    "per-host."
+                ),
+                "responses": {
+                    "200": {"description": "OK"},
+                },
+            },
+            "post": {
+                "summary": (
+                    "#2934: record a rate-limit hit into the daemon's "
+                    "shared backoff store, so every OTHER machine's next "
+                    "`gh` call honours it too, not just the host that "
+                    "observed the 403."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "reason": {"type": "string"},
+                                    "status": {"type": "integer", "nullable": True},
+                                    "request_id": {"type": "string", "nullable": True},
+                                    "retry_after_s": {"type": "number", "nullable": True},
+                                },
+                                "required": ["reason"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field: reason"},
+                },
+            },
+        },
         "/issue-comments": {
             "get": {
                 "summary": "#873: read an issue's captured comments (oldest-first) from the durable mirror",
@@ -7730,6 +7773,47 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         else:
             return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_github_backoff(request: Request) -> Response:  # noqa: ARG001
+        # #2934: the daemon's own view of the shared GitHub rate-limit
+        # backoff — ALWAYS the local-only file (coord.github_throttle.
+        # current()), never routed back out over HTTP, for the same reason
+        # get_pause() above never routes: this endpoint runs *inside* the
+        # daemon, the one host whose file a fleet-wide `consult()` call is
+        # actually asking about, and whose own `gh` calls already read that
+        # exact file directly with no HTTP round trip of their own.
+        from coord.github_throttle import current  # noqa: PLC0415
+
+        b = current()
+        return JSONResponse({"backoff": b._asdict() if b is not None else None})
+
+    async def post_github_backoff(request: Request) -> Response:
+        # #2934: record a rate-limit hit into the daemon's shared backoff
+        # file — the fleet-wide half of #2809. See get_github_backoff()
+        # above for why this always uses the local-only writer: one host
+        # publishes the hit once, here, and every OTHER host's next
+        # `consult()` GETs it back via get_github_backoff() above.
+        from coord.github_throttle import current, local_record  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        reason = body.get("reason")
+        if not reason or not isinstance(reason, str):
+            return JSONResponse({"error": "missing field: reason"}, status_code=400)
+        status = body.get("status")
+        request_id = body.get("request_id")
+        retry_after_s = body.get("retry_after_s")
+        local_record(
+            reason=reason,
+            status=status if isinstance(status, int) else None,
+            request_id=request_id if isinstance(request_id, str) else None,
+            retry_after_s=(
+                float(retry_after_s) if isinstance(retry_after_s, (int, float)) else None
+            ),
+        )
+        b = current()
+        return JSONResponse({"backoff": b._asdict() if b is not None else None})
+
     async def get_issue_comments(request: Request) -> Response:
         # #873: read an issue's captured comments (oldest-first) from the
         # durable mirror.
@@ -9668,6 +9752,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/drive-queue", post_drive_queue, methods=["POST"]),
         Route("/pause", get_pause, methods=["GET"]),
         Route("/pause", post_pause, methods=["POST"]),
+        Route("/github-backoff", get_github_backoff, methods=["GET"]),
+        Route("/github-backoff", post_github_backoff, methods=["POST"]),
         Route("/issue-comments", get_issue_comments, methods=["GET"]),
         Route("/issue-comments", post_issue_comments, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),

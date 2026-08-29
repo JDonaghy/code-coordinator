@@ -474,6 +474,62 @@ def post_pause(
     return post_record(svc, "/pause", {"machine": machine, "action": action}, timeout=timeout)
 
 
+def fetch_github_backoff(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict | None:
+    """GET /github-backoff → the daemon's shared GitHub rate-limit backoff
+    state, or ``None`` when there isn't an active one (#2934).
+
+    The read side of the fleet-wide half of #2809: a 403 recorded by ANY
+    machine's `coord.github_throttle.record()` lands here, so every other
+    machine's next `coord.github_throttle.consult()` — the seam every `gh`
+    call funnels through — sees it before making its own call, rather than
+    only ever learning about its own host's hits. Raises ``httpx.HTTPError``
+    on transport/HTTP failure — `coord.github_throttle.consult()` catches
+    that itself and falls back to the local per-host file (this module stays
+    strict, same posture as `fetch_paused_machines`, so a caller that DOES
+    want to distinguish "confirmed none" from "couldn't ask" still can).
+
+    Returns the raw ``{until, reason, status, request_id, retry_after_s,
+    recorded_at}`` mapping (or ``None``) rather than a `Backoff` — parsing
+    that shape is `coord.github_throttle`'s job, the same division client.py
+    keeps for `fetch_cordons`/`fetch_quiet_hours` above.
+    """
+    resp = httpx.get(f"{svc.url}/github-backoff", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    backoff = data.get("backoff") if isinstance(data, dict) else None
+    return dict(backoff) if isinstance(backoff, dict) else None
+
+
+def post_github_backoff(
+    svc: ServiceConfig,
+    *,
+    reason: str,
+    status: int | None,
+    request_id: str | None,
+    retry_after_s: float | None,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """POST /github-backoff {reason, status, request_id, retry_after_s} —
+    publish a rate-limit hit to the daemon's shared backoff state (#2934).
+
+    Raises ``httpx.HTTPError`` on transport/HTTP failure —
+    `coord.github_throttle.record()` catches that itself and falls back to
+    writing this host's own local file, the same fail-soft posture the
+    module's docstring requires of every public function here: a caller
+    that just got a 403 must never fail a *second* way because publishing it
+    fleet-wide didn't work.
+    """
+    payload = {
+        "reason": reason,
+        "status": status,
+        "request_id": request_id,
+        "retry_after_s": retry_after_s,
+    }
+    return post_record(svc, "/github-backoff", payload, timeout=timeout)
+
+
 def fetch_remote_config(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> Path:
     """GET /config, cache it to ``~/.coord/coordinator.remote.yml``, return the path.
 
