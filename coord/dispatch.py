@@ -683,16 +683,31 @@ def dispatch(
 
         oracle_contract = ""
         if config.acceptance.has_driver(proposal.repo_name):
-            from coord.acceptance import (  # noqa: PLC0415
-                ACCEPTANCE_DIRNAME,
-                oracle_loop_contract_block,
-            )
+            from coord.acceptance import oracle_loop_contract_block  # noqa: PLC0415
 
-            oracle_contract = oracle_loop_contract_block(
-                Path(repo_path).expanduser() / ACCEPTANCE_DIRNAME,
-                proposal.repo_name,
-                proposal.issue_number,
-            )
+            # #2896: the issue's slice may live under the shared repo-root
+            # tree (a directory-discovered driver, e.g. ms-37's cli-pytest
+            # suite) OR under an entrypoint-linked driver's own sibling
+            # `acceptance/` dir (e.g. ms-65's tui-tuidriver suite, relocated
+            # out of the repo root) — this dispatch call has no single path
+            # in hand to pick a route ahead of time (proposal.issue_number
+            # alone doesn't say which), so it tries every search root this
+            # repo declares and uses whichever one actually has the slice.
+            # A local checkout scan (no `gh`), so trying more than one root
+            # costs nothing but a stat/read against a directory that
+            # usually doesn't exist.
+            repo_root = Path(repo_path).expanduser()
+            for search_root in config.acceptance.acceptance_search_roots(
+                proposal.repo_name
+            ):
+                oracle_contract = oracle_loop_contract_block(
+                    repo_root / search_root,
+                    proposal.repo_name,
+                    proposal.issue_number,
+                    acceptance_dirname=search_root,
+                )
+                if oracle_contract:
+                    break
 
         # #1720: dispatch-time file-overlap fence — the union of file
         # footprints of every OTHER currently-running work-like assignment

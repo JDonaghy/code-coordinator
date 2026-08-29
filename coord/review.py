@@ -1368,14 +1368,51 @@ def _path_is_sealed(path: str, sealed: str) -> bool:
     return path == sealed
 
 
+def _sealed_to_sealed_rename_exemptions(
+    diff_text: str, sealed_paths: list[str]
+) -> set[str]:
+    """Paths *diff_text* touches only as one side of a pure (100%-similarity)
+    rename whose OTHER side is also sealed (#2896 review).
+
+    Relocating a sealed slice from one declared-sealed location to another
+    (e.g. ``tests/acceptance/ms-65/board_tabs_2282.rs`` ->
+    ``tui/tests/acceptance/ms-65/board_tabs_2282.rs``, both covered by
+    :meth:`coord.config.AcceptanceConfig.sealed_paths` once the driver's
+    ``entrypoint:`` sibling dir is declared) is not tampering — content is
+    byte-identical, confirmed by git itself
+    (:func:`coord.github_ops.diff_pure_renames`), not merely claimed by the
+    diff. A rename that moves sealed content somewhere UNSEALED, or brings
+    unsealed content INTO the sealed tree, still trips the check on the
+    unsealed side — this only exempts the narrow case where both endpoints
+    were already part of the oracle. A content-changing edit at either path
+    (no ``rename from``/``rename to`` + ``similarity index 100%`` in the
+    diff) is never exempted, no matter how similar the paths look.
+    """
+    exempt: set[str] = set()
+    for old, new in github_ops.diff_pure_renames(diff_text):
+        old_sealed = any(_path_is_sealed(old, s) for s in sealed_paths)
+        new_sealed = any(_path_is_sealed(new, s) for s in sealed_paths)
+        if old_sealed and new_sealed:
+            exempt.add(old)
+            exempt.add(new)
+    return exempt
+
+
 def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[str]:
     """Return the sealed path prefixes actually touched by *diff_text*.
 
     Cheap, dependency-free tamper detection (#944 sealing v1). Pure function,
-    easy to test.
+    easy to test. #2896: excludes a path that's only present as one side of
+    a sealed-to-sealed pure rename (see
+    :func:`_sealed_to_sealed_rename_exemptions`) — everything else about the
+    check, including the exact-match rule for a driver ``entrypoint:`` file
+    that's genuinely edited rather than renamed, is unchanged.
     """
+    exempt = _sealed_to_sealed_rename_exemptions(diff_text, sealed_paths)
     touched: set[str] = set()
     for c in github_ops.diff_file_paths(diff_text):
+        if c in exempt:
+            continue
         for sealed in sealed_paths:
             if _path_is_sealed(c, sealed):
                 touched.add(sealed)

@@ -428,6 +428,66 @@ class TestGateAStatus:
         assert reason is None
 
 
+class TestGateAStatusRelocatedSlices:
+    """#2896: a repo with an entrypoint-linked route (the relocated
+    tui-tuidriver slices) must be checked at BOTH the shared repo-root tree
+    AND that route's own sibling dir — a bare milestone number doesn't say
+    which one a given milestone's contract actually lives under."""
+
+    def _cfg(self) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        return Config(
+            repos=[Repo(name="claude-coordinator", github="acme/claude-coordinator")],
+            machines=[_machine("laptop", ["claude-coordinator"])],
+            acceptance=AcceptanceConfig(drivers={
+                "claude-coordinator": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+                    AcceptanceDriverConfig(
+                        match="tui/**", kind="tui-tuidriver", run="cargo test",
+                        entrypoint="tui/tests/acceptance.rs",
+                    ),
+                ]),
+            }),
+        )
+
+    def test_passes_when_only_the_relocated_root_has_the_contract(self) -> None:
+        """The shared repo-root candidate is missing (ms-65 lives under
+        tui/tests/acceptance/ instead) — Gate A must still pass rather than
+        reporting a false "not satisfied" for a contract that exists, just
+        not at the legacy path."""
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+
+        def _check(repo_github: str, path: str, branch: str) -> bool:
+            return path == "tui/tests/acceptance/ms-65/contract.md"
+
+        assert gate_a_status(repo, cfg, 65, file_exists=_check) is None
+
+    def test_checks_both_candidates_in_order(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        calls: list[str] = []
+
+        def _check(repo_github: str, path: str, branch: str) -> bool:
+            calls.append(path)
+            return False
+
+        gate_a_status(repo, cfg, 65, file_exists=_check)
+        assert calls == [
+            "tests/acceptance/ms-65/contract.md",
+            "tui/tests/acceptance/ms-65/contract.md",
+        ]
+
+    def test_reason_names_every_candidate_when_none_exist(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        reason = gate_a_status(repo, cfg, 65, file_exists=lambda *a: False)
+        assert reason is not None
+        assert "tests/acceptance/ms-65/contract.md" in reason
+        assert "tui/tests/acceptance/ms-65/contract.md" in reason
+
+
 # ── issue_oracle_ready (#1138, docs/ORACLE_LOOP.md issue-level gate) ─────────
 
 
@@ -805,6 +865,70 @@ class TestIssueOracleReady:
         mock_fetch.assert_any_call(
             "acme/api", "tests/acceptance/ms-37/manifest.yml", branch="main",
         )
+
+
+class TestIssueOracleReadyRelocatedSlices:
+    """#2896: ms-65's contract/manifest live under
+    `tui/tests/acceptance/ms-65/` (the tui-tuidriver route's own sibling
+    dir), not the shared repo-root tree — the #1138 hard gate must find
+    them there, not report a false "no acceptance slice yet"."""
+
+    def _cfg(self) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        return Config(
+            repos=[Repo(name="claude-coordinator", github="acme/claude-coordinator")],
+            machines=[_machine("laptop", ["claude-coordinator"])],
+            acceptance=AcceptanceConfig(drivers={
+                "claude-coordinator": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+                    AcceptanceDriverConfig(
+                        match="tui/**", kind="tui-tuidriver", run="cargo test",
+                        entrypoint="tui/tests/acceptance.rs",
+                    ),
+                ]),
+            }),
+        )
+
+    def test_ok_when_slice_authored_at_the_relocated_path(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        mapping = {
+            "tui/tests/acceptance/ms-65/contract.md": CONTRACT,
+            "tui/tests/acceptance/ms-65/manifest.yml": "tests:\n  ms65::a: 2282\n",
+        }
+
+        def fetch(repo_github: str, path: str, branch: str) -> str | None:
+            return mapping.get(path)
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 65, 2282,
+            fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(repo_name="claude-coordinator", milestone=65),
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is True
+        assert readiness.reason is None
+
+    def test_blocked_when_no_slice_at_either_root(self) -> None:
+        """Gate A is satisfied (contract exists at the relocated path) but
+        no manifest maps this issue anywhere — the #1138 refusal must still
+        fire, same as the un-relocated case."""
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        mapping = {"tui/tests/acceptance/ms-65/contract.md": CONTRACT}
+
+        def fetch(repo_github: str, path: str, branch: str) -> str | None:
+            return mapping.get(path)
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 65, 2282,
+            fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(repo_name="claude-coordinator", milestone=65),
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is False
+        assert readiness.reason is not None
 
 
 # ── fetch_milestone_context ──────────────────────────────────────────────────

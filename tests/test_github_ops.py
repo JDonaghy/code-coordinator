@@ -2863,3 +2863,68 @@ class TestPrChecksJsonFieldsAreValid:
             f"{sorted(missing)} requested by github_ops.PR_CHECKS_JSON_FIELDS "
             f"but not advertised by this gh's `--json` help ({sorted(advertised)})"
         )
+
+
+class TestDiffPureRenames:
+    """#2896 review: coord.review's sealed-tamper carve-out needs to tell a
+    byte-identical `git mv` apart from an ordinary two-sided edit — this is
+    where that fact is recovered from the diff text itself."""
+
+    def test_pure_rename_is_detected(self) -> None:
+        diff = (
+            "diff --git a/tests/acceptance/ms-65/foo.rs b/tui/tests/acceptance/ms-65/foo.rs\n"
+            "similarity index 100%\n"
+            "rename from tests/acceptance/ms-65/foo.rs\n"
+            "rename to tui/tests/acceptance/ms-65/foo.rs\n"
+        )
+        assert github_ops.diff_pure_renames(diff) == [
+            ("tests/acceptance/ms-65/foo.rs", "tui/tests/acceptance/ms-65/foo.rs"),
+        ]
+
+    def test_partial_similarity_rename_is_not_a_pure_rename(self) -> None:
+        """Content changed too (similarity < 100%) — must NOT be treated as
+        a no-op move; the tamper check still needs to see this file."""
+        diff = (
+            "diff --git a/tests/acceptance/ms-65/foo.rs b/tui/tests/acceptance/ms-65/foo.rs\n"
+            "similarity index 87%\n"
+            "rename from tests/acceptance/ms-65/foo.rs\n"
+            "rename to tui/tests/acceptance/ms-65/foo.rs\n"
+            "--- a/tests/acceptance/ms-65/foo.rs\n"
+            "+++ b/tui/tests/acceptance/ms-65/foo.rs\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-cheated\n"
+            "+still cheated\n"
+        )
+        assert github_ops.diff_pure_renames(diff) == []
+
+    def test_in_place_content_edit_is_not_a_rename(self) -> None:
+        """Same path both sides, no `rename from`/`rename to` lines at all —
+        an ordinary edit, however textually similar old and new content."""
+        diff = (
+            "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+            "--- a/tui/tests/acceptance.rs\n"
+            "+++ b/tui/tests/acceptance.rs\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-include!(\"../../tests/acceptance/ms-33/audit_1039.rs\");\n"
+            "+include!(\"acceptance/ms-33/audit_1039.rs\");\n"
+        )
+        assert github_ops.diff_pure_renames(diff) == []
+
+    def test_multiple_renames_in_one_diff(self) -> None:
+        diff = (
+            "diff --git a/a.rs b/tui/a.rs\n"
+            "similarity index 100%\n"
+            "rename from a.rs\n"
+            "rename to tui/a.rs\n"
+            "diff --git a/b.rs b/tui/b.rs\n"
+            "similarity index 100%\n"
+            "rename from b.rs\n"
+            "rename to tui/b.rs\n"
+        )
+        assert github_ops.diff_pure_renames(diff) == [
+            ("a.rs", "tui/a.rs"), ("b.rs", "tui/b.rs"),
+        ]
+
+    def test_no_renames_in_a_plain_diff(self) -> None:
+        diff = "diff --git a/src/foo.py b/src/foo.py\n"
+        assert github_ops.diff_pure_renames(diff) == []

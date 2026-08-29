@@ -226,18 +226,29 @@ def gate_a_status(
     the contract file already exists on the repo's default branch. Returns a
     human-readable block reason otherwise, naming the missing path and the
     command that produces it.
+
+    #2896: a bare *milestone_number* doesn't say which acceptance search
+    root its contract lives under (the shared repo-root tree, or an
+    entrypoint-linked driver's own relocated sibling dir) — this tries
+    every candidate :func:`coord.acceptance.gate_a_contract_candidates`
+    returns for this repo and passes as soon as any one exists, rather than
+    checking only the legacy repo-root path and reporting a false "Gate A
+    not satisfied" for a milestone whose contract already exists, just
+    somewhere else.
     """
     if not config.acceptance.has_driver(repo_cfg.name):
         return None
 
-    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
-    path = gate_a_contract_path(milestone_number)
+    candidates = gate_a_contract_candidates(config, repo_cfg.name, milestone_number)
     check = file_exists or _default_gate_a_file_exists
-    if check(repo_cfg.github, path, repo_cfg.default_branch):
-        return None
+    for path in candidates:
+        if check(repo_cfg.github, path, repo_cfg.default_branch):
+            return None
+    named = " or ".join(repr(p) for p in candidates)
     return (
-        f"Gate A not satisfied: {path!r} does not exist yet on "
+        f"Gate A not satisfied: {named} does not exist yet on "
         f"{repo_cfg.default_branch!r}. Run `coord acceptance mock {repo_cfg.name} "
         "<tracking_issue>` (docs/ORACLE_LOOP.md) to render the mock + write "
         "the contract before dispatching this milestone's issues."
@@ -265,6 +276,7 @@ def _fetch_manifest_data(
     fetch: ManifestFetch,
     *,
     issue_number: int | None = None,
+    roots: Iterable[str] | None = None,
 ):
     """*milestone_number*'s manifest data via *fetch* (a raw-content GitHub
     fetch, no local checkout, no directory listing) — the legacy single-file
@@ -290,6 +302,16 @@ def _fetch_manifest_data(
     blocks (:func:`gate_a_signoff_status`, which has no single issue in
     scope) pass no *issue_number* and get exactly the legacy-only reads
     this always did.
+
+    *roots* (#2896) is every candidate acceptance-tree root to try, in
+    order — normally ``config.acceptance.acceptance_search_roots(repo_name)``
+    from the caller, since a bare *milestone_number* doesn't say whether
+    it's a directory-discovered driver's slice (shared repo-root tree) or an
+    entrypoint-linked driver's relocated one (that driver's own sibling
+    dir). Defaults to the legacy single repo-root candidate when omitted,
+    unchanged from before #2896. Tries each root until one actually has a
+    legacy manifest and/or fragment file; a milestone's data lives under
+    exactly one, so the first root that produces anything wins.
     """
     from coord.acceptance import (  # noqa: PLC0415
         ACCEPTANCE_DIRNAME,
@@ -301,31 +323,42 @@ def _fetch_manifest_data(
         parse_manifest_text,
     )
 
-    def _fetch_one(dir_path: str, filename_stem: str) -> "ManifestData":
+    def _fetch_one(dir_path: str, filename_stem: str) -> "tuple[ManifestData, bool]":
         for ext in (".yml", ".yaml", ".json"):
             path = f"{dir_path}/{filename_stem}{ext}"
             content = fetch(repo_github, path, branch)
             if content is None:
                 continue
             try:
-                return parse_manifest_text(content, source=path)
+                return parse_manifest_text(content, source=path), True
             except ManifestError:
                 # Malformed manifest degrades to "no slice authored" rather
                 # than crashing dispatch — same fail-soft posture as
                 # oracle_loop_contract_block (#945).
-                return ManifestData()
-        return ManifestData()
+                return ManifestData(), True
+        return ManifestData(), False
 
     ms_dir = ms_dirname(milestone_number)
-    legacy = _fetch_one(f"{ACCEPTANCE_DIRNAME}/{ms_dir}", "manifest")
-    if issue_number is None:
-        return legacy
+    search_roots = [r.rstrip("/") for r in roots] if roots else [ACCEPTANCE_DIRNAME]
 
-    fragment = _fetch_one(
-        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
-        str(issue_number),
-    )
-    return merge_manifest_data(legacy, fragment)
+    legacy = ManifestData()
+    fragment = ManifestData()
+    for root_dir in search_roots:
+        legacy, legacy_found = _fetch_one(f"{root_dir}/{ms_dir}", "manifest")
+        if issue_number is None:
+            if legacy_found:
+                return legacy
+            continue
+        fragment, fragment_found = _fetch_one(
+            f"{root_dir}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
+            str(issue_number),
+        )
+        if legacy_found or fragment_found:
+            return merge_manifest_data(legacy, fragment)
+
+    # No root produced anything — degrade to empty data, same as the old
+    # single-root "not found" behaviour.
+    return legacy if issue_number is None else merge_manifest_data(legacy, fragment)
 
 
 def _unsupported_driver_kinds(entry: "AcceptanceDriverConfig") -> tuple[str, ...]:
@@ -366,6 +399,7 @@ def _default_fetch_gate_a_approval(repo_name: str, milestone_number: int):
 
 def gate_a_signoff(
     repo_cfg: Repo,
+    config: "Config",
     milestone_number: int,
     manifest,
     *,
@@ -387,15 +421,25 @@ def gate_a_signoff(
     check ever sees it. Refusing where the contract is *consumed* means an
     unapproved contract merging is harmless — nothing is authored and no
     work dispatches until a human records a verdict.
+
+    *config* (#2896) resolves which of this repo's acceptance search roots
+    (:func:`coord.acceptance.gate_a_contract_candidates`) the contract
+    actually lives under — same reason :func:`gate_a_status` needs it: a
+    bare *milestone_number* doesn't say whether it's a directory-discovered
+    driver's slice (shared repo-root tree) or an entrypoint-linked driver's
+    relocated one. Tries each candidate and hashes whichever one actually
+    has content; when none do, ``contract_text`` is ``None`` (the first
+    candidate's path stands in for messaging, matching pre-#2896 behaviour
+    for the common single-candidate case).
     """
     from coord import gate_a as gate_a_mod  # noqa: PLC0415
-    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
-    contract_text = fetch(
-        repo_cfg.github,
-        gate_a_contract_path(milestone_number),
-        repo_cfg.default_branch,
-    )
+    contract_text: str | None = None
+    for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
+        contract_text = fetch(repo_cfg.github, path, repo_cfg.default_branch)
+        if contract_text is not None:
+            break
     return gate_a_mod.evaluate(
         repo_name=repo_cfg.name,
         milestone_number=milestone_number,
@@ -454,9 +498,11 @@ def gate_a_signoff_status(
         return None
     manifest = _fetch_manifest_data(
         repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
+        roots=config.acceptance.acceptance_search_roots(repo_cfg.name),
     )
     decision = gate_a_signoff(
         repo_cfg,
+        config,
         milestone_number,
         manifest,
         fetch=fetch,
@@ -566,6 +612,7 @@ def issue_oracle_ready(
     manifest = _fetch_manifest_data(
         repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
         issue_number=issue_number,
+        roots=config.acceptance.acceptance_search_roots(repo_cfg.name),
     )
     has_slice = bool(test_ids_for_issue(manifest.tests, issue_number))
     exempt = issue_number in manifest.exempt or "oracle:exempt" in set(issue_labels)
@@ -582,6 +629,7 @@ def issue_oracle_ready(
     # the manifest (`gate_a: {exempt: true}`), which `gate_a_signoff` honours.
     signoff = gate_a_signoff(
         repo_cfg,
+        config,
         milestone_number,
         manifest,
         fetch=fetch,

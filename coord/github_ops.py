@@ -2440,6 +2440,40 @@ def diff_file_paths(diff_text: str) -> list[str]:
 
 
 _DIFF_FILE_BOUNDARY_RE = re.compile(r"^diff --git ", re.MULTILINE)
+_RENAME_FROM_RE = re.compile(r"^rename from (.+)$", re.MULTILINE)
+_RENAME_TO_RE = re.compile(r"^rename to (.+)$", re.MULTILINE)
+
+
+def diff_pure_renames(diff_text: str) -> list[tuple[str, str]]:
+    """Every ``(old_path, new_path)`` pair *diff_text* renames with NO
+    content change — git's own ``similarity index 100%`` marker, not a
+    caller's claim (#2896 review).
+
+    A sealed-oracle relocation (``git mv`` of a byte-identical file) is
+    textually indistinguishable from "delete old + add new" to a reader
+    that only looks at :func:`diff_file_paths`'s flat a/b-side list — both
+    the old and new paths show up as "touched" with no signal that they're
+    the same content moving, not two independent edits. This recovers the
+    narrower fact ``coord.review``'s sealed-tamper carve-out needs: a rename
+    block only counts here when git *itself* reports the two sides as
+    identical (``rename from``/``rename to`` lines plus ``similarity index
+    100%`` — anything less than 100% means content changed too, and must
+    keep tripping the tamper check same as any other edit).
+
+    A ``diff --git a/X b/X`` block for an in-place edit (no move at all)
+    has no ``rename from``/``rename to`` lines regardless of how similar
+    old and new content are, so it's correctly excluded even when the path
+    happens to be unchanged either side.
+    """
+    renames: list[tuple[str, str]] = []
+    for block in _DIFF_FILE_BOUNDARY_RE.split(diff_text)[1:]:
+        if "similarity index 100%" not in block:
+            continue
+        from_match = _RENAME_FROM_RE.search(block)
+        to_match = _RENAME_TO_RE.search(block)
+        if from_match and to_match:
+            renames.append((from_match.group(1).strip(), to_match.group(1).strip()))
+    return renames
 
 
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:

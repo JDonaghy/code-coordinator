@@ -628,6 +628,50 @@ def test_sealed_paths_empty_for_unconfigured_repo(tmp_path: Path) -> None:
     assert cfg.acceptance.entrypoints("coord-tui") == []
 
 
+# ── #2896: acceptance_search_roots — every root a bare milestone number
+# could resolve under, for a caller with no single path in hand ───────────
+
+
+def test_acceptance_search_roots_empty_for_unconfigured_repo(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE)
+    cfg = load(p)
+    assert cfg.acceptance.acceptance_search_roots("coord-tui") == []
+
+
+def test_acceptance_search_roots_without_entrypoint_is_just_the_tree(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: cli-pytest
+      run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.acceptance_search_roots("coord-tui") == ["tests/acceptance/"]
+
+
+def test_acceptance_search_roots_includes_entrypoint_sibling_dir(
+    tmp_path: Path,
+) -> None:
+    """#2896: the directory ENTRIES of sealed_paths() — the entrypoint FILE
+    itself is filtered out, since a caller searching for a milestone's
+    manifest/contract wants directories to look under, not the crate-root
+    file the driver links slices through."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_WITH_ENTRYPOINT)
+    cfg = load(p)
+    assert cfg.acceptance.acceptance_search_roots("claude-coordinator") == [
+        "tests/acceptance/", "tui/tests/acceptance/",
+    ]
+
+
 def test_entrypoint_absolute_path_raises(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(

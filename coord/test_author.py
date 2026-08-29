@@ -41,7 +41,7 @@ import httpx
 
 from coord import github_ops
 from coord.acceptance import ACCEPTANCE_DIRNAME
-from coord.config import Config
+from coord.config import Config, entrypoint_sibling_acceptance_dir
 from coord.dispatch import AGENT_PORT, DispatchRefused
 from coord.machine_pause import paused_set
 from coord.milestone_dispatch import (
@@ -300,7 +300,20 @@ def build_test_author_briefing(
     ``page.route()`` interception (see :data:`TEST_AUTHOR_SYSTEM_PROMPT`
     step 1c).
     """
-    contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
+    # #2896: an entrypoint-linked driver's slices (and their contract/mocks/
+    # manifest) live under that entrypoint's OWN sibling `acceptance/` dir,
+    # not the shared repo-root tree — relocated out of the repo root so the
+    # crate is self-contained (the same rule
+    # `coord.config.AcceptanceConfig.sealed_paths` already seals by). A
+    # directory-discovered driver (no entrypoint, e.g. cli-pytest) is
+    # unaffected and keeps using the shared repo-root tree exactly as
+    # before.
+    dirname = (
+        entrypoint_sibling_acceptance_dir(driver_entrypoint).rstrip("/")
+        if driver_entrypoint
+        else ACCEPTANCE_DIRNAME
+    )
+    contract_path = f"{dirname}/{ms_dir}/contract.md"
     # #2543: per-issue manifest fragments — each issue writes ONLY its own
     # `manifest.d/<issue>.yml`, never the shared `manifest.yml` (which now
     # carries just milestone-level `gate_a:`/`exempt:` declarations, if any).
@@ -308,13 +321,13 @@ def build_test_author_briefing(
     # milestone mode point at the pattern, since one fragment per work-order
     # issue is expected.
     manifest_glob = (
-        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/{issue_number}.(yml|json)"
+        f"{dirname}/{ms_dir}/manifest.d/{issue_number}.(yml|json)"
         if issue_number is not None
-        else f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/<issue-number>.(yml|json)"
+        else f"{dirname}/{ms_dir}/manifest.d/<issue-number>.(yml|json)"
         " (one fragment file PER issue in the work-order list below)"
     )
-    mocks_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/{driver_mock}" if driver_mock else (
-        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/ (glob not declared)"
+    mocks_glob = f"{dirname}/{ms_dir}/mocks/{driver_mock}" if driver_mock else (
+        f"{dirname}/{ms_dir}/mocks/ (glob not declared)"
     )
 
     parts: list[str] = []
@@ -326,7 +339,7 @@ def build_test_author_briefing(
     parts.append(f"MOCKS: {mocks_glob}")
     if driver_kind == "web-playwright":
         parts.append(
-            f"FIXTURES: {ACCEPTANCE_DIRNAME}/{ms_dir}/fixtures/<name>.json "
+            f"FIXTURES: {dirname}/{ms_dir}/fixtures/<name>.json "
             "(at most one file — schema: coord/dashboard/fixture.py, worked "
             "example: tests/fixtures/board-pipeline-basic.json). Seed your "
             "slice with this instead of page.route() — #1818."
@@ -339,10 +352,12 @@ def build_test_author_briefing(
             f"  This driver links its slices through `{driver_entrypoint}` — "
             "your slice files are INVISIBLE to the run command above until "
             "they are registered there (for cargo: an "
-            f"`include!(\"../../{ACCEPTANCE_DIRNAME}/{ms_dir}/<slice>.rs\");` "
-            "line). Adding those registration lines is part of your job and "
-            "is explicitly allowed even though the file sits outside "
-            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/` — it is part of the sealed "
+            f"`include!(\"acceptance/{ms_dir}/<slice>.rs\");` line, relative "
+            f"to `{driver_entrypoint}`'s own directory — #2896 relocated the "
+            "sealed slices to live beside the entrypoint, not across the "
+            "repo root). Adding those registration lines is part of your "
+            "job and is explicitly allowed even though the file sits "
+            f"outside `{dirname}/{ms_dir}/` — it is part of the sealed "
             "oracle, declared as this driver's `entrypoint:` (#1552). ADD "
             "only; do not rewrite, reorder, or delete what is already there, "
             "and never remove a registration line to narrow your diff."
@@ -351,7 +366,7 @@ def build_test_author_briefing(
         parts.append(
             "ENTRY POINT: (none — this driver discovers tests by directory, "
             "so there is nothing to wire up and nothing to touch outside "
-            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/`)"
+            f"`{dirname}/{ms_dir}/`)"
         )
     parts.append(
         f"MILESTONE WORK-ORDER ISSUES: {milestone_issue_numbers or '(none recorded yet)'}"
@@ -361,11 +376,11 @@ def build_test_author_briefing(
     if issue_number is None:
         parts.append(
             "MODE: full milestone authoring (Gate A). Author the initial red "
-            f"acceptance suite under `{ACCEPTANCE_DIRNAME}/{ms_dir}/` covering "
+            f"acceptance suite under `{dirname}/{ms_dir}/` covering "
             "the whole black-box surface in the contract, with at least one "
             "test per issue in the work-order list above, and write ONE "
             "manifest fragment PER issue "
-            f"(`{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/<issue-number>.yml`, "
+            f"(`{dirname}/{ms_dir}/manifest.d/<issue-number>.yml`, "
             "#2543) mapping that issue's own test ids — never a single "
             "manifest.yml covering all of them."
         )
@@ -375,7 +390,7 @@ def build_test_author_briefing(
             "Extend the existing suite with tests covering ONLY this issue's "
             "slice of the black-box surface — leave other issues' tests, and "
             "their manifest fragments, alone. Your manifest data goes ONLY in "
-            f"YOUR OWN `{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/"
+            f"YOUR OWN `{dirname}/{ms_dir}/manifest.d/"
             f"{issue_number}.yml` (#2543)."
         )
         parts.append("")
@@ -398,7 +413,7 @@ def build_test_author_briefing(
             "so that specific collision (two slices' manifest edits landing "
             "in the same file) can no longer happen at all. If it merges "
             "clean, proceed to commit/push as normal. If it conflicts:\n"
-            f"  - Confined to `{ACCEPTANCE_DIRNAME}/{ms_dir}/**` (the sealed "
+            f"  - Confined to `{dirname}/{ms_dir}/**` (the sealed "
             "suite YOU already have authoring rights over) AND a clean "
             "additive collision (e.g. an entry-point registration line "
             "alongside a sibling's own) — resolve it yourself: rebase onto "
@@ -407,7 +422,7 @@ def build_test_author_briefing(
             "resolve. Re-run step 4's red-check afterward — a rebase can "
             "shift what the tests see underneath them.\n"
             "  - Anything else — a conflict that reaches outside "
-            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/**`, or isn't a clean additive "
+            f"`{dirname}/{ms_dir}/**`, or isn't a clean additive "
             "collision — do NOT guess a resolution. Abort the merge/rebase, "
             "leave the branch as it was, and STOP with:\n"
             f"      STUCK: merge conflict against {default_branch} in "
@@ -415,7 +430,7 @@ def build_test_author_briefing(
             "additive merge\n"
             "(same posture a `conflict-fix` session takes for a "
             "non-rebaseable conflict — you are simply the only dispatch "
-            f"type structurally allowed to touch `{ACCEPTANCE_DIRNAME}/` "
+            f"type structurally allowed to touch `{dirname}/` "
             "at all, so a conflict confined there is yours to resolve, not "
             "conflict-fix's)."
         )

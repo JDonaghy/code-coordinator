@@ -45,18 +45,24 @@ def _actor() -> str:
         return "unknown"
 
 
-def _fetch_contract(repo_cfg, milestone_number: int) -> str | None:
+def _fetch_contract(repo_cfg, config, milestone_number: int) -> str | None:
+    """*milestone_number*'s Gate-A contract text, trying every acceptance
+    search root *config* declares for *repo_cfg* (#2896) — a bare milestone
+    number doesn't say whether it's a directory-discovered driver's slice
+    (shared repo-root tree) or an entrypoint-linked driver's relocated one,
+    so this checks each candidate :func:`coord.acceptance.
+    gate_a_contract_candidates` returns until one exists."""
     from coord import github_ops  # noqa: PLC0415
-    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
-    try:
-        return github_ops.get_repo_file(
-            repo_cfg.github,
-            gate_a_contract_path(milestone_number),
-            branch=repo_cfg.default_branch,
-        )
-    except RuntimeError:
-        return None
+    for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
+        try:
+            return github_ops.get_repo_file(
+                repo_cfg.github, path, branch=repo_cfg.default_branch,
+            )
+        except RuntimeError:
+            continue
+    return None
 
 
 @click.command(
@@ -124,12 +130,14 @@ def gate_a(
         sys.exit(2)
     milestone_number = int(milestone_number)
 
-    contract_text = _fetch_contract(repo_cfg, milestone_number)
+    contract_text = _fetch_contract(repo_cfg, cfg, milestone_number)
     if contract_text is None:
-        from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+        from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
+        candidates = gate_a_contract_candidates(cfg, repo_cfg.name, milestone_number)
+        named = " or ".join(repr(p) for p in candidates)
         click.echo(
-            f"error: {gate_a_contract_path(milestone_number)!r} does not exist "
+            f"error: {named} does not exist "
             f"on {repo_cfg.github}@{repo_cfg.default_branch} yet — there is no "
             "contract to approve. Run `coord acceptance mock "
             f"{repo} {tracking_issue}` first, and merge its PR.",

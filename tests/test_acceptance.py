@@ -26,6 +26,8 @@ from coord.acceptance import (
     expected_red_failure_summary,
     failure_summary,
     find_ms_manifest_for_issue_via_api,
+    gate_a_contract_candidates,
+    gate_a_contract_path,
     issue_dirname,
     list_expected_red_via_api,
     load_expected_red,
@@ -1110,6 +1112,73 @@ class TestOracleLoopContractBlock:
         assert "must satisfy" in block
         assert "not the other way around" in block
 
+    def test_acceptance_dirname_names_a_relocated_slices_paths(
+        self, tmp_path: Path
+    ) -> None:
+        """#2896: a caller driving an entrypoint-linked driver's relocated
+        acceptance tree (e.g. `tui/tests/acceptance/`) passes BOTH the local
+        root to scan (here `tmp_path / "tui/tests/acceptance"`) and the
+        matching repo-relative name to print (`acceptance_dirname`) — the
+        printed contract/mocks paths and the "may not edit" line must name
+        the ACTUAL location, not the shared repo-root default."""
+        root = tmp_path / "tui" / "tests" / "acceptance"
+        (root / "ms65").mkdir(parents=True)
+        (root / "ms65" / "manifest.yml").write_text("tests:\n  ms65::a: 2282\n")
+        block = oracle_loop_contract_block(
+            root, "coord-tui", 2282, acceptance_dirname="tui/tests/acceptance/",
+        )
+        assert "tui/tests/acceptance/ms65/contract.md" in block
+        assert "tui/tests/acceptance/ms65/mocks/" in block
+        assert "edit `tui/tests/acceptance/**`" in block
+        # Never names the (wrong, unrelated) repo-root default.
+        assert "`tests/acceptance/" not in block
+
+
+class TestGateAContractCandidates:
+    """#2896: a bare milestone number doesn't say which acceptance search
+    root its contract lives under — gate_a_contract_candidates tries every
+    root the repo declares instead of guessing the legacy repo-root one."""
+
+    def _cfg_with_entrypoint(self) -> Config:
+        return Config(
+            repos=[Repo(name="claude-coordinator", github="acme/claude-coordinator")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers={
+                "claude-coordinator": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+                    AcceptanceDriverConfig(
+                        match="tui/**", kind="tui-tuidriver", run="cargo test",
+                        entrypoint="tui/tests/acceptance.rs",
+                    ),
+                ]),
+            }),
+        )
+
+    def test_single_candidate_when_no_entrypoint_declared(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest"),
+            }),
+        )
+        assert gate_a_contract_candidates(cfg, "api", 9) == [
+            "tests/acceptance/ms-9/contract.md",
+        ]
+
+    def test_two_candidates_when_repo_has_an_entrypoint_linked_route(self) -> None:
+        cfg = self._cfg_with_entrypoint()
+        assert gate_a_contract_candidates(cfg, "claude-coordinator", 65) == [
+            "tests/acceptance/ms-65/contract.md",
+            "tui/tests/acceptance/ms-65/contract.md",
+        ]
+
+    def test_falls_back_to_legacy_single_candidate_for_unconfigured_repo(self) -> None:
+        cfg = Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+        assert gate_a_contract_candidates(cfg, "api", 9) == [
+            gate_a_contract_path(9),
+        ]
+
 
 class TestIssueDirnameAndBugContractPath:
     """#1964 (docs/TEST_FIRST_BUG_LANE.md): the bug lane's single-issue
@@ -1369,6 +1438,63 @@ class TestResolveForPath:
             list_mock_dir=lambda *a: ("README.md", "a.screen"),
         )
         assert result == "tui/**"
+
+    # ── #2896: relocated slices — mocks may live under an entrypoint's own
+    # sibling dir, not the shared repo-root tree this function used to
+    # assume unconditionally.
+
+    @staticmethod
+    def _routed_config_with_entrypoint() -> Config:
+        return Config(
+            repos=[Repo(name="claude-coordinator", github="john/claude-coordinator")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={
+                    "claude-coordinator": AcceptanceDriverConfig(
+                        routes=[
+                            AcceptanceDriverConfig(
+                                match="coord/**", kind="cli-pytest", run="pytest",
+                            ),
+                            AcceptanceDriverConfig(
+                                match="tui/**", kind="tui-tuidriver", run="cargo test",
+                                entrypoint="tui/tests/acceptance.rs",
+                            ),
+                        ]
+                    )
+                }
+            ),
+        )
+
+    def test_searches_every_root_and_finds_a_relocated_slices_mocks(self) -> None:
+        """ms-65's mocks now live under `tui/tests/acceptance/ms-65/mocks/`
+        (relocated out of the shared repo-root tree, #2896) — the lister
+        returns nothing at the legacy repo-root path and the relocated
+        `.screen` files at the sibling one; resolution must still succeed."""
+        cfg = self._routed_config_with_entrypoint()
+
+        def lister(repo_github: str, path: str, branch: str) -> tuple[str, ...]:
+            if path == "tui/tests/acceptance/ms-65/mocks":
+                return ("board-tabs.screen",)
+            return ()
+
+        result = resolve_for_path(cfg, cfg.repo("claude-coordinator"), 65, list_mock_dir=lister)
+        assert result == "tui/**"
+
+    def test_queries_both_the_shared_tree_and_the_entrypoint_sibling_dir(self) -> None:
+        cfg = self._routed_config_with_entrypoint()
+        calls: list[tuple] = []
+        # Neither candidate has any mocks in this test — resolution can't
+        # succeed, but both roots must still have been queried before it
+        # gives up (the thing under test here).
+        with pytest.raises(ForPathResolutionError):
+            resolve_for_path(
+                cfg, cfg.repo("claude-coordinator"), 65,
+                list_mock_dir=lambda *a: calls.append(a) or (),
+            )
+        assert calls == [
+            ("john/claude-coordinator", "tests/acceptance/ms-65/mocks", "main"),
+            ("john/claude-coordinator", "tui/tests/acceptance/ms-65/mocks", "main"),
+        ]
 
     def test_no_recognized_mocks_raises(self) -> None:
         cfg = self._routed_config()
