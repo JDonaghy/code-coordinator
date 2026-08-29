@@ -230,6 +230,19 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "cannot serve) plus a separate on-disk file_db that the serve app's "
         "SqliteStore opens by path for the read side.",
     ),
+    "test_deprecation_telemetry.py": Classification(
+        2, (BUCKET_C,),
+        "#1945's deprecated-RPC telemetry middleware, black-boxed through the "
+        "serve app — the same daemon pair as test_serve_rest_routes.py, which "
+        "this file's fixtures were copied from and whose rw_db docstring says "
+        "so explicitly. One site is the thread-safe rw_db override the write "
+        "side needs (TestClient runs the middleware and its audit_log INSERT "
+        "on a worker thread the autouse :memory: connection is bound away "
+        "from); the other is a separate on-disk file_db that the app's own "
+        "SqliteStore opens by path for the read side. The test asserts a row "
+        "written under the handler thread is visible back on the override "
+        "connection, so the two connections are the subject, not an accident.",
+    ),
     "test_review_verdict_relay.py": Classification(
         2, (BUCKET_C,),
         "The standard daemon pair: a thread-safe rw_db override for the write "
