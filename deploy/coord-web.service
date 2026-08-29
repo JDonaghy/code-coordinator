@@ -92,11 +92,24 @@
 # (#1830), even though the underlying reason differs (that one protects a
 # spawned tmux server from this unit's own cgroup teardown; this one avoids
 # ever having to signal a nonexistent auxiliary process group at all).
+#
+# #2938: Restart=always (was on-failure), + a StartLimitIntervalSec/
+# StartLimitBurst backstop — see deploy/coord-agent.service's header for the
+# full incident this closes (a clean stop that Restart=on-failure correctly
+# declines to act on, with no other recovery path, leaving the unit
+# `enabled`/`inactive` forever). coord-web restarts through the same
+# `_restart_sibling_unit` caller as coord-agent's own self-restart
+# (coord/agent_app.py, #2069), so it is exposed to the identical failure
+# shape if that restart request is ever lost. 5 restarts / 5 minutes before
+# systemd gives up and lands the unit in `failed` (`start-limit-hit`) —
+# visible, not a silent crash-loop.
 
 [Unit]
 Description=coord web — phone/web control-center dashboard (#700)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -118,7 +131,7 @@ ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host
 # setting it here too ensures any other subprocess spawned by coord web also
 # has a sane terminal type without requiring a code fix for each callsite.
 Environment=TERM=xterm-256color
-Restart=on-failure
+Restart=always
 RestartSec=3
 # #2095 — see the header comment above. Bounds the SSE-drain hang that took
 # the dashboard down during the 2026-08-10 fleet roll.

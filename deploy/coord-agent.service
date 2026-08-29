@@ -74,15 +74,40 @@
 #   systemctl --user restart coord-agent
 #
 # See docs/AGENT_OPERATIONS.md → "Install a new agent (first time)".
-
+#
+# #2938: Restart=always, not on-failure. `POST /update` stops this unit's
+# own process so it can come back on the swapped venv — the agent IS its own
+# recovery channel here, via an explicit `systemctl --user restart` the
+# process fires at itself just before exiting (coord/agent_app.py's
+# `_default_exec_restart`). When that explicit restart lands, this process
+# exits 0 either way (a clean stop) and `Restart=on-failure` — correctly, by
+# its own definition — declines to act on a clean exit. If the explicit
+# restart request is ever lost (a dropped systemd/D-Bus call, a race with
+# the process's own exit, anything), NOTHING brings the unit back: it sits
+# `enabled`/`inactive` forever, port 7433 refused, and the fleet has lost
+# its only remote-control channel to that host. `Restart=always` makes
+# systemd itself the backstop for a clean exit, independent of whether the
+# self-restart call landed — dell64, 2026-08-29, ~23 minutes of that exact
+# outage, recovered only because someone could walk to the machine.
+#
+# StartLimitIntervalSec/StartLimitBurst (#2938) bound it: 5 restarts inside
+# 5 minutes and systemd stops trying, landing the unit in `failed` with
+# `Result: start-limit-hit` — visible in `systemctl --user status` and the
+# journal — rather than crash-looping forever. A binary that is genuinely
+# broken (not just "the explicit restart didn't land") must fail loud, not
+# spin silently; `Restart=always` without a limit would trade one silent
+# failure (never restarts) for another (restarts forever with no signal
+# anything is wrong).
 [Unit]
 Description=Coordinator agent server (port <PORT>)
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%h/.coord-venv/bin/coord agent --machine <MACHINE_NAME> --port <PORT>
-Restart=on-failure
+Restart=always
 RestartSec=5
 Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
