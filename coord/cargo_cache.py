@@ -609,6 +609,12 @@ def _reclaim_checkout_targets(
     right now. Populates ``result["cargo_checkout_*"]`` and returns bytes
     freed (or, for a dry run, bytes that *would* be freed).
     """
+    # The staleness predicate is `stale_checkout_targets` — computed once,
+    # up front, rather than re-derived inline here, so there is exactly one
+    # answer to "is this checkout target stale enough to reclaim" instead of
+    # two implementations that only agree because they were written together.
+    stale_dirs = set(stale_checkout_targets(dirs, stale_after_secs, now))
+
     scanned: list[dict] = []
     candidates: list[tuple[float, Path, int]] = []
     for d in dirs:
@@ -620,7 +626,7 @@ def _reclaim_checkout_targets(
         last_used = _last_used(d)
         age = max(0.0, now - last_used)
         size = dir_size(d)
-        stale = bool(stale_after_secs) and stale_after_secs > 0 and age >= stale_after_secs
+        stale = d in stale_dirs
         scanned.append(
             {
                 "path": str(d),
@@ -764,8 +770,12 @@ def sweep(
     (repos left untouched because a build is live), ``cargo_over_cap_reason``,
     ``cargo_limit_bytes`` (what the sweep actually aimed at — the cap, or
     tighter when the floor bites), ``cargo_disk_free_bytes``,
-    ``cargo_disk_floor_bytes`` and ``cargo_disk_low``.  ``cargo_cache_bytes`` is the total *after* the sweep
-    (or, for ``dry_run``, what it would be).  Since #2919, also
+    ``cargo_disk_floor_bytes`` and ``cargo_disk_low``.  ``cargo_disk_low`` can
+    flip back to ``False`` mid-function (#2919): it is set ``True`` as soon as
+    the floor is breached, then reset if reclaiming stale checkout
+    ``target/`` dirs alone closes the shortfall, so the cache tiers below
+    never had to give anything back.  ``cargo_cache_bytes`` is the total
+    *after* the sweep (or, for ``dry_run``, what it would be).  Since #2919, also
     ``cargo_checkout_scanned`` (every candidate seen, with size/age/staleness),
     ``cargo_checkout_pruned``, ``cargo_checkout_pruned_bytes``,
     ``cargo_checkout_prune_blocked`` (a live build) and
@@ -873,7 +883,12 @@ def sweep(
                     limit = disk_limit if limit is None else min(limit, disk_limit)
                     result["cargo_limit_bytes"] = limit
 
-    if limit is None or total <= limit:
+    if limit is None:
+        # GC disabled entirely.  Note this cannot skip the floor-unreachable
+        # reason/log below: `limit` only stays `None` here when the free-disk
+        # floor never set `disk_limit` in the first place (see the
+        # `if free_floor:` block above), which means `cargo_floor_unreachable`
+        # is `False` too — there is nothing for this early return to lose.
         return result
 
     # Oldest-used first; ties broken by name so the sweep is deterministic.
@@ -881,6 +896,7 @@ def sweep(
     remaining = {name: size for _m, name, _p, size in entries}
     pruned: list[dict] = []
     blocked: list[str] = []
+    evicted: list[str] = []
     # A repo's build-activity verdict is probed at most once per sweep: the
     # /proc scan is not free and the answer cannot usefully change mid-sweep.
     idle: dict[str, bool] = {}
@@ -918,55 +934,64 @@ def sweep(
         )
         return size
 
-    # Tier 1 then tier 2, each across every repo before the next escalates —
-    # "cheapest to recreate first" is a property of the whole cache, not of one
-    # repo, so an incremental dir on a hot repo goes before a stale profile dir
-    # on a cold one.
-    for tier in ("incremental", "stale"):
-        for _mtime, name, path, _size in entries:
-            if total <= limit:
-                break
-            if not _may_touch(name, path):
-                continue
-            if tier == "incremental":
-                subtrees = incremental_dirs(path)
-            elif stale_cutoff is None:
-                subtrees = []
-            else:
-                subtrees = stale_profile_dirs(path, stale_cutoff, clock)
-            for subtree in subtrees:
+    # Everything below is the reclaim work itself, skipped outright when the
+    # cache is already at/under the limit (including the common post-#2919
+    # case of a prior sweep having already drained it to 0) — but the
+    # aggregation and floor-unreachable/over-cap reporting after it always
+    # runs, even then: `cargo_floor_unreachable` can be `True` with nothing
+    # left here to reclaim, and that verdict must still reach
+    # `cargo_over_cap_reason` and the log rather than being lost to an early
+    # return, which was the bug (#2919 review).
+    if total > limit:
+        # Tier 1 then tier 2, each across every repo before the next
+        # escalates — "cheapest to recreate first" is a property of the whole
+        # cache, not of one repo, so an incremental dir on a hot repo goes
+        # before a stale profile dir on a cold one.
+        for tier in ("incremental", "stale"):
+            for _mtime, name, path, _size in entries:
                 if total <= limit:
                     break
-                total -= _reclaim(name, subtree, tier)
-        if total <= limit:
-            break
-
-    # Tier 3: whole-directory eviction, as since #1402 — the last resort, and
-    # never against a repo with a live assignment.  The build-activity gate
-    # applies here too: refusing to prune a busy tree and then rmtree-ing the
-    # whole thing two lines later would be the worse of both behaviours.
-    #
-    # #2919: skipped entirely when the free-space floor is unreachable from
-    # the cache alone — spending the whole cache would not close that gap
-    # either, so there is nothing to buy by evicting it, only a fleet-wide
-    # cold rebuild to pay for.
-    evicted: list[str] = []
-    if not result["cargo_floor_unreachable"]:
-        for _mtime, name, path, _size in entries:
+                if not _may_touch(name, path):
+                    continue
+                if tier == "incremental":
+                    subtrees = incremental_dirs(path)
+                elif stale_cutoff is None:
+                    subtrees = []
+                else:
+                    subtrees = stale_profile_dirs(path, stale_cutoff, clock)
+                for subtree in subtrees:
+                    if total <= limit:
+                        break
+                    total -= _reclaim(name, subtree, tier)
             if total <= limit:
                 break
-            if name in protected:
-                continue
-            if not _may_touch(name, path):
-                continue
-            if not dry_run:
-                try:
-                    shutil.rmtree(path)
-                except OSError:
+
+        # Tier 3: whole-directory eviction, as since #1402 — the last resort,
+        # and never against a repo with a live assignment.  The
+        # build-activity gate applies here too: refusing to prune a busy tree
+        # and then rmtree-ing the whole thing two lines later would be the
+        # worse of both behaviours.
+        #
+        # #2919: skipped entirely when the free-space floor is unreachable
+        # from the cache alone — spending the whole cache would not close
+        # that gap either, so there is nothing to buy by evicting it, only a
+        # fleet-wide cold rebuild to pay for.
+        if not result["cargo_floor_unreachable"]:
+            for _mtime, name, path, _size in entries:
+                if total <= limit:
+                    break
+                if name in protected:
                     continue
-            total -= remaining[name]
-            remaining[name] = 0
-            evicted.append(name)
+                if not _may_touch(name, path):
+                    continue
+                if not dry_run:
+                    try:
+                        shutil.rmtree(path)
+                    except OSError:
+                        continue
+                total -= remaining[name]
+                remaining[name] = 0
+                evicted.append(name)
 
     pruned_bytes = sum(int(p["bytes"]) for p in pruned)
     result["cargo_cache_bytes"] = total

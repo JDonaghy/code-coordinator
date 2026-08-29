@@ -545,6 +545,62 @@ def test_fix_cargo_targets_evicts_the_same_repo_once_it_goes_idle(
     assert not (coord_dir / "cargo-target" / "repo1").exists()
 
 
+def test_fix_cargo_targets_wires_checkout_target_dirs_into_the_sweep(
+    tmp_path, monkeypatch
+) -> None:
+    """#2919 review: ``fix_cargo_targets`` must feed ``_checkout_target_dirs``
+    into ``sweep()``'s ``checkout_target_dirs`` — otherwise the whole
+    non-cache reclaim tier the free-space floor depends on is dead code here
+    too (the automatic ``AgentServer._gc_cargo_cache`` sweep had the same gap,
+    fixed alongside this one). Without the wiring, a stale per-checkout
+    ``target/`` this fixer already reports on (``checkout_targets`` in the
+    probe's ``values``) would never actually be reclaimed when the free-space
+    floor is breached.
+    """
+    import os
+    import time
+    from types import SimpleNamespace
+
+    from coord import cargo_cache
+
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
+    _gc_status(coord_dir)
+    monkeypatch.setenv(cargo_cache.FREE_FLOOR_ENV, "1")
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_000, free=1000),
+    )
+
+    checkout_path = tmp_path / "repo1"
+    checkout_target = checkout_path / "target"
+    _write_bytes(checkout_target / "blob", 20_000)
+    old = time.time() - 60 * 86400
+    os.utime(checkout_target / "blob", (old, old))
+    os.utime(checkout_target, (old, old))
+
+    ctx = make_ctx(
+        tmp_path,
+        coord_dir=coord_dir,
+        checkouts=(Checkout(name="repo1", path=checkout_path),),
+    )
+    result = cargo_targets.probe_cargo_targets(ctx)
+    assert result.values["gc_over_cap"] is True
+
+    outcome = cargo_targets.fix_cargo_targets(ctx, result)
+
+    assert outcome.status == "applied"
+    # The stale per-checkout target/ was actually reclaimed — not just
+    # reported — which requires the checkout paths to have reached sweep().
+    assert not checkout_target.exists()
+    status = cargo_cache.read_gc_status(coord_dir)
+    assert status["cargo_checkout_pruned_bytes"] == 20_000
+    assert status["cargo_checkout_pruned"] == [
+        {"path": str(checkout_target), "bytes": 20_000}
+    ]
+
+
 def test_fix_cargo_targets_no_action_without_an_over_cap_verdict(tmp_path) -> None:
     coord_dir = tmp_path / ".coord"
     _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
