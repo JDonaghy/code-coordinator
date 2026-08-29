@@ -313,6 +313,96 @@ def test_cargo_targets_does_not_follow_symlinked_subdirs(tmp_path) -> None:
     assert result.values["total_bytes"] == 16
 
 
+# ── #2919: per-checkout target/ dirs are reported, never touched ───────────
+
+
+def _age_path(path: Path, seconds_ago: float, now: float = NOW) -> None:
+    import os
+
+    ts = now - seconds_ago
+    for p in sorted(path.rglob("*"), reverse=True):
+        os.utime(p, (ts, ts))
+    os.utime(path, (ts, ts))
+
+
+def test_cargo_targets_reports_stale_checkout_target_age(tmp_path) -> None:
+    """The 2026-08-28 incident: 14G sat untouched for 63 days in a
+    per-checkout ``target/`` two directories away from a sweep that could not
+    see it.  This must be visible without measuring it by hand — and, per
+    the fixer's own docstring, never acted on here."""
+    coord_dir = tmp_path / ".coord"
+    checkout = tmp_path / "src" / "quadraui"
+    _write_bytes(checkout / "target" / "blob", 4096)
+    (checkout / ".git").mkdir(parents=True, exist_ok=True)
+    _age_path(checkout / "target", 63 * 86400)
+
+    ctx = make_ctx(
+        tmp_path,
+        coord_dir=coord_dir,
+        checkouts=(Checkout(name="quadraui", path=checkout),),
+    )
+    result = cargo_targets.probe_cargo_targets(ctx)
+
+    (entry,) = result.values["checkout_targets"]
+    assert entry["path"] == str(checkout / "target")
+    assert entry["bytes"] == 4096
+    assert entry["stale"] is True
+    assert entry["age_days"] == pytest.approx(63.0, abs=1.0)
+    assert "stale checkout target" in result.detail
+    # Visibility only: reporting a stale checkout target never escalates
+    # severity or deletes anything on its own.
+    assert result.severity is Severity.OK
+    assert (checkout / "target").exists()
+
+
+def test_cargo_targets_recent_checkout_target_is_not_flagged_stale(tmp_path) -> None:
+    coord_dir = tmp_path / ".coord"
+    checkout = tmp_path / "src" / "quadraui"
+    _write_bytes(checkout / "target" / "blob", 4096)
+    (checkout / ".git").mkdir(parents=True, exist_ok=True)
+    # ``NOW`` is a fixed sentinel timestamp, not real time — age the dir
+    # relative to it explicitly rather than relying on its real mtime.
+    _age_path(checkout / "target", 1 * 3600)
+
+    ctx = make_ctx(
+        tmp_path,
+        coord_dir=coord_dir,
+        checkouts=(Checkout(name="quadraui", path=checkout),),
+    )
+    result = cargo_targets.probe_cargo_targets(ctx)
+
+    (entry,) = result.values["checkout_targets"]
+    assert entry["stale"] is False
+    assert "stale checkout target" not in result.detail
+
+
+def test_cargo_targets_escalates_when_the_floor_is_unreachable(tmp_path) -> None:
+    """#2919: the sweep's own verdict that even zeroing the cache could not
+    close the free-space shortfall must reach an operator surface, the same
+    way ``cargo_over_cap`` already does — and say what it could not reclaim."""
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "quadraui" / "blob", 4096)
+    _gc_status(
+        coord_dir,
+        cargo_over_cap=False,
+        cargo_over_cap_reason=(
+            "1.5K cache cannot cover the free-space shortfall on its own — "
+            "evicting it would not resolve this, so it was left alone; top "
+            "non-cache consumers: /home/x/src/quadraui/target 14.0G (63d idle)"
+        ),
+        cargo_floor_unreachable=True,
+        cargo_prune_blocked=[],
+    )
+
+    result = cargo_targets.probe_cargo_targets(make_ctx(tmp_path, coord_dir=coord_dir))
+
+    assert result.severity is Severity.WARN
+    assert result.values["gc_floor_unreachable"] is True
+    assert "floor unreachable" in result.headroom
+    assert "floor unreachable" in result.detail
+    assert "top non-cache consumers" in result.detail
+
+
 # ── worktrees ────────────────────────────────────────────────────────────────
 
 

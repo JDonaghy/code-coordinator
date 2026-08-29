@@ -602,6 +602,199 @@ def test_free_floor_and_stale_env_overrides() -> None:
     assert cargo_cache.stale_secs({cargo_cache.STALE_DAYS_ENV: "0"}) is None
 
 
+# ── #2919: per-checkout target/ dirs, outside the cache root ───────────────
+#
+# The free-space floor could previously only ever reclaim from the shared
+# cache — but the 2026-08-28 incident found 14G sitting untouched for 63
+# days in a per-checkout ``target/`` two directories away, while the sweep
+# evicted the *entire* shared cache (which grew back within the hour) to
+# compensate for bytes it structurally could not see.
+
+
+def test_checkout_stale_env_override() -> None:
+    assert cargo_cache.checkout_stale_secs({}) == int(
+        cargo_cache.DEFAULT_CHECKOUT_STALE_DAYS * 86400
+    )
+    assert (
+        cargo_cache.checkout_stale_secs({cargo_cache.CHECKOUT_STALE_DAYS_ENV: "5"})
+        == 5 * 86400
+    )
+    assert (
+        cargo_cache.checkout_stale_secs({cargo_cache.CHECKOUT_STALE_DAYS_ENV: "0"})
+        is None
+    )
+
+
+def test_stale_checkout_targets_filters_by_age(tmp_path: Path) -> None:
+    old = tmp_path / "old" / "target"
+    _fill(old, 10)
+    _age(old, 40 * 86400)
+    new = tmp_path / "new" / "target"
+    _fill(new, 10)
+
+    result = cargo_cache.stale_checkout_targets([old, new], 30 * 86400, time.time())
+
+    assert result == [old]
+
+
+def test_free_floor_reclaims_stale_checkout_target_before_touching_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cheapest thing on the disk — a stale, idle per-checkout target/ —
+    is reclaimed before the shared cache's own limit is ever tightened."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=5000)
+    checkout_target = tmp_path / "src" / "quadraui" / "target"
+    _fill(checkout_target, 4000)
+    _age(checkout_target, 60 * 86400)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=97_000, free=3000),
+    )
+
+    r = cargo_cache.sweep(
+        tmp_path,
+        cap=1_000_000,
+        free_floor=5000,
+        checkout_target_dirs=[checkout_target],
+    )
+
+    assert r["cargo_checkout_pruned_bytes"] == 4000
+    assert r["cargo_checkout_pruned"] == [{"path": str(checkout_target), "bytes": 4000}]
+    assert not checkout_target.exists()
+    # The gap (2000) was fully closed by the checkout tier alone.
+    assert r["cargo_disk_low"] is False
+    assert r["cargo_pruned"] == []  # the cache itself was never touched
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+
+
+def test_free_floor_checkout_reclaim_dry_run_deletes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    _repo_cache(root, "quadraui", warm=5000)
+    checkout_target = tmp_path / "src" / "quadraui" / "target"
+    _fill(checkout_target, 4000)
+    _age(checkout_target, 60 * 86400)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=97_000, free=3000),
+    )
+
+    r = cargo_cache.sweep(
+        tmp_path,
+        cap=1_000_000,
+        free_floor=5000,
+        dry_run=True,
+        checkout_target_dirs=[checkout_target],
+    )
+
+    assert r["cargo_checkout_pruned_bytes"] == 4000  # what it *would* free
+    assert checkout_target.exists()
+
+
+def test_free_floor_checkout_target_with_live_build_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``build_active`` gates the new tier exactly the way it gates the
+    shared cache's own tiers: a live build lock means "do not touch this",
+    even though the dir is otherwise stale and would qualify."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cargo_cache, "fcntl", _FakeFcntlHeld())
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+    checkout_target = tmp_path / "src" / "quadraui" / "target"
+    _fill(checkout_target, 4000)
+    (checkout_target / cargo_cache.BUILD_LOCK_NAME).write_text("")
+    _age(checkout_target, 60 * 86400)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_000, free=1000),
+    )
+
+    r = cargo_cache.sweep(
+        tmp_path,
+        cap=1_000_000,
+        free_floor=3000,
+        checkout_target_dirs=[checkout_target],
+    )
+
+    assert checkout_target.exists()
+    assert r["cargo_checkout_pruned"] == []
+    assert r["cargo_checkout_prune_blocked"] == [str(checkout_target)]
+    # Falls through to the cache's own tiers for the shortfall instead.
+    assert r["cargo_pruned_bytes"] == 3000
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+
+
+def test_free_floor_unreachable_skips_eviction_and_reports_top_consumers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2919 item 3: when even zeroing the entire cache could not close the
+    shortfall, tier-3 whole-cache eviction buys nothing and is skipped — the
+    cheap tiers still run, and the reason names the top non-cache dirs."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=500)
+    # Not stale (freshly created) -- too recent to reclaim, but still the
+    # biggest thing on the disk and worth naming.
+    checkout_target = tmp_path / "src" / "quadraui" / "target"
+    _fill(checkout_target, 9000)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=98_000, free=2000),
+    )
+
+    r = cargo_cache.sweep(
+        tmp_path,
+        cap=1_000_000,
+        free_floor=20_000,
+        checkout_target_dirs=[checkout_target],
+    )
+
+    assert r["cargo_floor_unreachable"] is True
+    assert r["cargo_evicted_repos"] == []  # tier 3 skipped: it couldn't help
+    assert repo.exists()
+    # Tiers 1-2 (the cheap ones) still ran.
+    assert r["cargo_pruned_bytes"] == 500
+    assert r["cargo_cache_bytes"] == 1000
+    assert "top non-cache consumers" in r["cargo_over_cap_reason"]
+    assert str(checkout_target) in r["cargo_over_cap_reason"]
+
+
+def test_free_floor_reachable_still_evicts_when_cache_is_the_dominant_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance: existing #2137 floor behaviour is unchanged when the
+    shortfall *can* be closed by the cache alone."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    _repo_cache(root, "quadraui", warm=4000)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_500, free=500),
+    )
+
+    r = cargo_cache.sweep(tmp_path, cap=1_000_000, free_floor=3000)
+
+    assert r["cargo_floor_unreachable"] is False
+    assert r["cargo_evicted_repos"] == ["quadraui"]
+    assert r["cargo_cache_bytes"] == 0
+
+
 def test_pruning_never_follows_a_symlink_out_of_the_cache(tmp_path: Path) -> None:
     """The #1402 guard, re-asserted against the new tiers: an ``incremental``
     symlink pointing outside the cache is not a prune candidate."""
