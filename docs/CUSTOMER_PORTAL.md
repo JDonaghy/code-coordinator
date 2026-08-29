@@ -316,27 +316,48 @@ have to exist before the customer can be shown anything.
 | # | Step | Where | Needs |
 |---|---|---|---|
 | 1 | Promote lead → request; assign or create the client + project | portal UI | — |
-| 1a | Create the repo, if none exists yet | `coord repo add` | — |
-| 2 | Map the portal project to that repo | `coordinator.yml` | 1a |
+| 1a+2 | Create the repo *and* map the project, in one motion | `coord repo create … --for-submission` | the submission id |
 | 3 | Click **Start work** on the submission | portal UI | submission still at `describing` |
-| 4 | Pull it into a decomposition session | TUI, or `coord portal decompose-chat` | 2 + 3 |
+| 4 | Pull it into a decomposition session | TUI, or `coord portal decompose-chat` | 1a+2 + 3 |
 | 5 | Author the Gate-A mocks | `coord acceptance mock` | the milestone + tracking issue from 4 |
 | 6 | Publish the mocks to the customer | PR merge, or `coord portal publish-mocks` | the `coord portal link` from 4 |
 | 7 | Customer approves or requests changes | portal UI | — |
 | 8 | Pipeline runs; status folds itself | automatic | the link from 4 |
 
-**1a — creating a repo.** `coord repo add <name> --github owner/repo --machines dellserver,elitebook`
-writes the `coordinator.yml` entry into the coord-settings checkout, adds the repo to those
-machines, creates the `coord` and tier labels, then prints the residue it deliberately did *not* do
-(the clone itself, mostly). Follow with `coord repo doctor <repo>` — a repo with no graphify graph
-on any machine that runs workers is CRIT and fails that gate.
+**1a+2 — repo genesis, one command (#2861).**
 
-Do this **before** step 4. `dispatch_decomposition_chat` refuses outright when a submission has no
-mapped repo, and refuses again when no *single* machine claims *every* mapped repo — a session that
-can only reach some of the repos it is meant to decompose into is treated as worse than no session.
+```bash
+coord repo create <name> --github owner/repo --private \
+  --machines dellserver,elitebook --for-submission SUB-XXXXXX
+```
 
-**2 — the project↔repo mapping.** `portal.project_repos`, hand-edited. No `coord` subcommand writes
-it:
+Run it **before** step 4, on the machine that has the coord-settings checkout. It does the whole
+motion, each step failing loudly and leaving the previous ones intact:
+
+1. **Refuses if the coord-settings checkout is behind its upstream** (`git fetch` + compare). This
+   guard is unconditional — it runs for a plain `coord repo add`/`coord repo create` too. Before it
+   existed, an entry written onto a five-commits-behind base produced a diff that looked perfectly
+   clean, and the recovery cost two extra motions.
+2. Creates + seeds the repo on GitHub (CLAUDE.md, a `pull_request`-triggered CI workflow,
+   `.githooks/`) and writes `repos[<name>]` + the machine lists.
+3. Resolves the submission's `project_id` from its customer mirror and appends the
+   `portal.project_repos` entry. Refuses, naming the conflict, on an unknown submission id, a
+   mirror with no `project_id` (the #2585 clobber shape — repair with `coord portal remirror`), or
+   a project already mapped to a *different* repo.
+4. Commits + pushes coord-settings with a message naming the repo and submission.
+5. Distributes: `git pull --ff-only` on every machine serving the repo (and here), reporting
+   **per machine** rather than failing silently on one host, then reconciles each machine's live
+   `~/.coord/coordinator.yml` (see below).
+6. Runs `coord repo doctor <name> --fix` and prints its report.
+
+`--dry-run` prints all six steps and writes nothing. What is left afterwards is **one** human step:
+clone the repo to `~/src/<name>` on each machine — the worker worktree base, which `coord repo
+doctor` keeps reporting until it exists.
+
+`coord repo add --for-submission …` does the same for a repo that already exists on GitHub; it
+seeds nothing, so CLAUDE.md, the CI workflow and the `.githooks/` port stay on you.
+
+The mapping it writes is the one you would otherwise hand-edit:
 
 ```yaml
 portal:
@@ -345,10 +366,28 @@ portal:
       repos: [natal-chart]
 ```
 
-The live file is `~/.coord/coordinator.yml` on the daemon host, which is a **symlink into the
-`coord-settings` checkout** (`~/src/coord-settings/coord/coordinator.yml` — see
-`coord.fleet_config_health`). Edit it there and commit; editing through the symlink works but
-leaves the change untracked on one machine.
+**Where the live config actually is — the symlink claim used to be wrong here.** The *intended*
+arrangement is that `~/.coord/coordinator.yml` on the daemon host is a **symlink** into
+`~/src/coord-settings/coord/coordinator.yml` (`coord.fleet_config_health`, #1779/#1832), and
+`coord diagnose --config-provenance` reports a REGRESSION when it is not. But on this fleet it has
+in fact been a **regular copy** on at least one host, so "commit, push, `git pull`" did *not* by
+itself refresh what the daemon reads — which is how a genesis run ended up diffing the live file by
+hand and nearly discarding a comment that existed only there.
+
+`--for-submission` therefore **owns the copy explicitly and never converts between the two
+arrangements**. Per machine: a symlinked live config is left alone (the pull already refreshed it);
+a byte-identical copy is left alone; a copy that *diverges* is backed up to
+`~/.coord/coordinator.yml.bak-<stamp>` and then overwritten from the checkout. Pass
+`--no-refresh-live-config` to have the divergence reported and left for you to reconcile. Restoring
+the symlink everywhere is a reasonable thing to want, but it widens the blast radius of every
+coord-settings commit, so it is a deliberate fleet-wide decision — not something `coord repo
+create` makes on your behalf. Thin clients need nothing forced: they re-fetch `GET /config` from
+the daemon on essentially every command (`coord.client.REMOTE_CONFIG_CACHE`).
+
+Also do this **before** step 4 for the other reason: `dispatch_decomposition_chat` refuses outright
+when a submission has no mapped repo, and refuses again when no *single* machine claims *every*
+mapped repo — a session that can only reach some of the repos it is meant to decompose into is
+treated as worse than no session.
 
 `project_id` is the portal's own opaque identifier, carried on `submission.created` and never
 re-sent by a later event. There is no human-readable project name on the wire, by design — see
@@ -362,7 +401,7 @@ design round, this is not the button you want.
 
 **4 — the decomposition session.** In the TUI: open the **Approved work items** panel (`✓` in the
 activity bar), right-click the row, **Pull into decomposition session**. That menu item is a
-one-item context menu, greyed with a `no repo mapping` hint until step 2 is done — a disabled item
+one-item context menu, greyed with a `no repo mapping` hint until step 1a+2 is done — a disabled item
 is inert, so nothing happening on click is the mapping telling you it is missing. CLI equivalent:
 `coord portal decompose-chat <submission_id>`.
 
