@@ -24,6 +24,7 @@ from coord.agent import (
     _pinned_venv_bin_dirs,
     _strip_venv_bins_from_path,
     _worker_subprocess_env,
+    worker_coord_reachable,
 )
 
 # #2684: every PATH fixture below must be joined/split on `os.pathsep`
@@ -179,3 +180,89 @@ def test_no_worker_env_ever_carries_pinned_venv_on_path(path_value: str) -> None
         base_prefix="/usr",
     )
     assert "/home/john/.coord-venv/bin" not in env["PATH"].split(os.pathsep)
+
+
+# ── #2936: `worker_coord_reachable` — the shim gap, caught at agent startup ──
+#
+# #402/#2569's strip above is correct and must stay (the whole point of this
+# file). But it also means a worker's PATH no longer carries `coord` unless
+# SOMETHING ELSE puts it there (the `~/.local/bin/coord` shim install-agent.sh
+# now installs). dell64 had no such shim: a smoke worker there ran its whole
+# suite, passed, and had no way to call `coord test <id> --passed` — the
+# missing verdict read as a TEST FAILURE and escalated the model for a PATH
+# gap (#2897). These tests are about the DETECTION this function adds, not
+# the strip itself — see the tests above for that.
+
+
+def _touch_executable(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_worker_coord_reachable_true_when_a_shim_is_on_the_stripped_path(
+    tmp_path: Path,
+) -> None:
+    """The success case: `~/.local/bin/coord` (install-agent.sh's shim, or
+    any other non-pinned-venv location) survives the #2569 strip and is what
+    a real worker would resolve `coord` to."""
+    home = tmp_path
+    shim_dir = home / ".local" / "bin"
+    _touch_executable(shim_dir / "coord")
+
+    ok, msg = worker_coord_reachable(
+        {
+            "HOME": str(home),
+            "PATH": _path(f"{home}/.coord-venv/bin", str(shim_dir), "/usr/bin"),
+        }
+    )
+
+    assert ok is True
+    assert str(shim_dir / "coord") in msg
+    assert "WARNING" not in msg
+
+
+def test_worker_coord_reachable_false_when_only_the_pinned_venv_has_it(
+    tmp_path: Path,
+) -> None:
+    """The #2936/dell64 failure mode: `coord` exists ONLY inside the fleet's
+    pinned venv, which #2569's strip removes from every worker's PATH — so a
+    worker can never resolve it at all, exactly like dell64 with no
+    `~/.local/bin/coord` shim."""
+    home = tmp_path
+    pinned_bin = home / ".coord-venv" / "bin"
+    _touch_executable(pinned_bin / "coord")
+
+    ok, msg = worker_coord_reachable(
+        {"HOME": str(home), "PATH": _path(str(pinned_bin), "/usr/bin")}
+    )
+
+    assert ok is False
+    assert "WARNING" in msg
+    assert "does NOT resolve on a WORKER's PATH" in msg
+    assert "/usr/bin" in msg  # the (stripped) PATH actually searched
+    assert "#2936" in msg
+
+
+def test_worker_coord_reachable_false_message_names_the_fix(tmp_path: Path) -> None:
+    """The message must be actionable, matching the bar #1671's PATH
+    diagnostics already set for this codebase: what broke, and how to fix
+    it — not just that it broke."""
+    home = tmp_path
+    ok, msg = worker_coord_reachable({"HOME": str(home), "PATH": "/usr/bin"})
+
+    assert ok is False
+    assert "coord test <id> --passed" in msg
+    assert "install-agent.sh" in msg
+    assert "~/.local/bin/coord" in msg
+    assert "blue/green" in msg
+
+
+def test_worker_coord_reachable_defaults_to_this_processs_environ() -> None:
+    """`base_env=None` (the production call shape) must resolve against the
+    real environment, exactly like `_worker_subprocess_env` itself — not
+    silently no-op or require a caller to always pass one explicitly."""
+    ok, msg = worker_coord_reachable()
+
+    assert isinstance(ok, bool)
+    assert "coord agent:" in msg

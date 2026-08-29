@@ -1742,6 +1742,53 @@ def _worker_subprocess_env(
     return env
 
 
+def worker_coord_reachable(base_env: dict[str, str] | None = None) -> tuple[bool, str]:
+    """#2936: does ``coord`` resolve on a WORKER's PATH — not this agent
+    process's own?
+
+    Built on the exact env a real worker is spawned into
+    (:func:`_worker_subprocess_env`, whose #402/#2569 strip removes the
+    fleet's pinned ``~/.coord-venv/bin`` from PATH). A worker that cannot
+    resolve ``coord`` can run its entire suite, PASS, and be structurally
+    unable to record that verdict (``coord test <id> --passed``) — the
+    missing verdict then reads as a TEST FAILURE and walks the
+    ``models.escalation`` ladder, re-dispatching already-correct work on a
+    more expensive model for a PATH gap, not a weak one (#2897 cost one
+    instance of this an extra opus rerun on top of an already-passing
+    sonnet leg).
+
+    Before this, the gap was discovered only when a smoke worker's own
+    final-turn transcript happened to mention it (as #2897's did) — this
+    function exists so the agent can say so ITSELF, at startup, in
+    ``journalctl --user -u coord-agent``, mirroring #1671's PATH diagnostics
+    for capability probes.
+
+    Returns ``(ok, message)`` rather than logging directly, so the check is
+    testable with a synthetic *base_env* with no mocking of ``shutil.which``
+    or the logging module required. ``base_env=None`` (the production
+    default) resolves against this process's real ``os.environ``, exactly
+    like :func:`_worker_subprocess_env` itself.
+    """
+    worker_path = _worker_subprocess_env(base_env).get("PATH", "")
+    resolved = shutil.which("coord", path=worker_path)
+    if resolved:
+        return True, (
+            f"coord agent: worker PATH check OK — 'coord' resolves at {resolved} "
+            "(a smoke/test worker on this machine can record its verdict, #2936)"
+        )
+    return False, (
+        "coord agent: WARNING 'coord' does NOT resolve on a WORKER's PATH — "
+        f"searched: {worker_path!r}. A smoke/test worker on this machine can "
+        "run its whole suite, PASS, and be structurally unable to record the "
+        "verdict via `coord test <id> --passed`; the missing verdict then "
+        "reads as a TEST FAILURE and escalates the model for an "
+        "infrastructure gap, not a weak one (#2936). Fix: re-run "
+        "install-agent.sh on this machine so ~/.local/bin/coord exists and "
+        "symlinks to $HOME/.coord-venv/bin/coord (the blue/green symlink "
+        "itself, never a resolved .blue/.green path)."
+    )
+
+
 def _slugify(text: str, max_len: int = 40) -> str:
     """Convert *text* to a URL/branch-safe slug."""
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -5443,6 +5490,18 @@ class AgentServer:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
+
+        # #2936: verify AT STARTUP — not a suite-run later — that a worker
+        # this agent spawns will be able to resolve `coord` on its own PATH
+        # to record a test/smoke verdict. Only the failure case is logged:
+        # this file configures no logging handler of its own (`coord agent`
+        # never calls `configure_daemon_logging`, unlike `coord serve` —
+        # #2862), so a bare `_log.info` here would be a silent no-op on the
+        # real daemon while `_log.warning` reaches `journalctl` via Python's
+        # stderr handler-of-last-resort with zero configuration needed.
+        _coord_reachable, _coord_reachable_msg = worker_coord_reachable()
+        if not _coord_reachable:
+            _log.warning(_coord_reachable_msg)
 
     # ── #2299: hot config reload ────────────────────────────────────────────
 
