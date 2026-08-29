@@ -2882,6 +2882,153 @@ def test_dispatch_scoped_reviews_for_queue_respects_per_pass_cap(
     assert len(dispatched) == 1
 
 
+# ── #916: composed regression for the full rebase-bounce handoff ───────────
+#
+# Each piece below (has_approved_review/scan_approved_reviews's patch-id
+# discriminator, evaluate_smoke_verdict's own separate patch-id discriminator,
+# merge_gate_failures' reason wording, find_scoped_review_candidate /
+# only_conflict_fix_since_review's eligibility walk, dispatch_scoped_reviews_
+# for_queue's selection+dispatch, and process()'s merge decision) already has
+# dedicated unit tests. Nothing until now drove all of them in sequence
+# against the SAME evolving board — exactly the seam #2814 named as this
+# repo's actual defect surface: every component behaves as designed and the
+# COMPOSITION still misbehaves.
+
+def test_rebase_bounce_composed_regression_non_trivial(
+    two_machine_config: Config,
+) -> None:
+    """#916 non-trivial path: a rebase that resolves a real conflict changes
+    the branch's patch-id. Walk the whole handoff in order — approval voided,
+    smoke independently stale, merge gate refuses naming the staleness,
+    scoped review selected + dispatched, then a fresh approval + fresh smoke
+    verdict on the rebased patch-id clears the gate and merges.
+    """
+    from tests.test_merge_queue import FakeGh
+
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+        test_state="passed", test_head_sha="oldsha",
+        test_patch_id="patchid-old", test_base_sha="main-sha",
+    )
+    prior_review = _scoped_prior_review()  # approve @ oldsha/patchid-old
+    conflict_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior_review, conflict_fix])
+
+    entry = _scoped_entry()
+    entry.branch_head_sha = "newsha"           # rebase moved the head
+    entry.branch_patch_id = "patchid-new"      # conflict resolution changed content
+    entry.target_branch_head_sha = "main-sha"  # base unchanged — isolates the content check
+
+    # 1. has_approved_review: the prior approval is voided by the
+    #    content-changing rebase (patch-id discriminator #1).
+    assert mq.has_approved_review(entry, board) is False
+
+    # 2. evaluate_smoke_verdict: independently stale — a SECOND, separately
+    #    implemented patch-id discriminator must agree.
+    smoke = mq.evaluate_smoke_verdict(entry, board)
+    assert smoke.ok is False
+    assert smoke.kind == mq.SMOKE_STALE
+
+    # 3. the merge gate refuses, and the reason names the staleness rather
+    #    than reporting a generic block.
+    failures = mq.merge_gate_failures(entry, two_machine_config, board)
+    blocked_gates = {f.gate for f in failures}
+    assert "review" in blocked_gates
+    assert "smoke" in blocked_gates
+    smoke_failure = next(f for f in failures if f.gate == "smoke")
+    assert "stale" in smoke_failure.reason.lower()
+
+    events = mq.process([entry], FakeGh(), config=two_machine_config, board=board)
+    assert not any(e.kind == "merged" for e in events)
+    assert entry.state != mq.MERGED
+
+    # 4. the ordinary reconcile()/coord notify polling path selects this
+    #    exact entry and dispatches a review scoped to the rebase delta.
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-916"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        patch_id_computer=lambda diff_text: "patchid-new",
+    )
+    assert len(dispatched) == 1
+    scoped_review = dispatched[0]
+    assert scoped_review.review_scoped is True
+    assert scoped_review.review_of_assignment_id == "w1"
+    assert scoped_review.review_scope_base_sha == "oldsha"
+    assert scoped_review in board.active
+
+    # 5. a fresh approval lands on the rebased patch-id (coord report-result,
+    #    simulated the same way the file's other scoped-review tests do)
+    #    and a fresh smoke verdict is recorded against the same rebased
+    #    content — the gate reads clear and the entry merges.
+    scoped_review.status = "done"
+    scoped_review.review_verdict = "approve"
+    assert scoped_review.review_head_sha == "newsha"
+    assert scoped_review.review_patch_id == "patchid-new"
+
+    work.test_head_sha = "newsha"
+    work.test_patch_id = "patchid-new"
+
+    assert mq.has_approved_review(entry, board) is True
+    assert mq.evaluate_smoke_verdict(entry, board).ok is True
+    assert mq.merge_gate_failures(entry, two_machine_config, board) == []
+
+    events = mq.process([entry], FakeGh(), config=two_machine_config, board=board)
+    assert any(e.kind == "merged" for e in events)
+    assert entry.state == mq.MERGED
+
+
+def test_rebase_bounce_composed_regression_trivial(
+    two_machine_config: Config,
+) -> None:
+    """#916 trivial-path companion: a clean replay moves the SHA but not the
+    patch-id. The approval and smoke verdict both survive, no scoped review
+    is ever dispatched, and the entry merges straight through."""
+    from tests.test_merge_queue import FakeGh
+
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+        test_state="passed", test_head_sha="oldsha",
+        test_patch_id="patchid-same", test_base_sha="main-sha",
+    )
+    review = _scoped_prior_review(review_patch_id="patchid-same")
+    board = Board(completed=[work, review])
+
+    entry = _scoped_entry()
+    entry.branch_head_sha = "replayed-sha"     # SHA moved (clean rebase replay)
+    entry.branch_patch_id = "patchid-same"     # content identical
+    entry.target_branch_head_sha = "main-sha"  # base unchanged
+
+    assert mq.has_approved_review(entry, board) is True
+    assert mq.evaluate_smoke_verdict(entry, board).ok is True
+    assert mq.merge_gate_failures(entry, two_machine_config, board) == []
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "should-not-dispatch"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []  # nothing voided — nothing to scope a review around
+    assert board.active == []
+
+    events = mq.process([entry], FakeGh(), config=two_machine_config, board=board)
+    assert any(e.kind == "merged" for e in events)
+    assert entry.state == mq.MERGED
+
+
 def test_find_scoped_review_candidate_picks_most_recently_dispatched_approval() -> None:
     """Non-blocking finding: when more than one approved review exists in
     the work chain, the most-recently-dispatched one should be picked as the
