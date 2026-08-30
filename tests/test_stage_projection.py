@@ -10,7 +10,20 @@ from __future__ import annotations
 
 from coord import stage_projection as sp
 from coord.merge_queue import QueuedMerge
-from coord.models import Assignment
+from coord.models import Assignment, Repo
+
+
+class _StubConfig:
+    """Minimal ``config.repo(name)`` duck-type for the #2951 UAT-projection
+    tests — ``stage_projection.py`` never touches anything else on
+    ``config``, matching ``coord.merge_queue._uat_repo_for``'s own contract.
+    """
+
+    def __init__(self, repos: list[Repo]) -> None:
+        self._by_name = {r.name: r for r in repos}
+
+    def repo(self, name):
+        return self._by_name.get(name)
 
 
 def _work(**kw) -> Assignment:
@@ -463,6 +476,222 @@ def test_request_changes_is_not_approved():
         _review(review_of_assignment_id="w1", review_verdict="request-changes"),
     ]
     assert sp.issue_has_any_approved_review(a) is False
+
+
+# ── uat_stage_status_for / UAT projection (#2951) ───────────────────────────
+
+
+def test_uat_stage_work_not_done_is_pending():
+    a = [_work(status="running")]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.PENDING
+
+
+def test_uat_stage_no_work_closed_issue_is_skipped():
+    assert sp.uat_stage_status_for([], is_closed=True, require_plan=False) == sp.SKIPPED
+
+
+def test_uat_stage_work_done_no_verdict_is_pending():
+    a = [_work(status="done", dispatched_at=1.0)]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.PENDING
+
+
+def test_uat_stage_passed_verdict_is_done():
+    a = [_work(status="done", dispatched_at=1.0, uat_state="passed")]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.DONE
+
+
+def test_uat_stage_failed_verdict_is_failed():
+    a = [_work(status="done", dispatched_at=1.0, uat_state="failed", uat_reason="visual defect")]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.FAILED
+
+
+def test_uat_stage_latest_by_dispatch_wins():
+    """A bounce/fix round's fresh work assignment resets the verdict,
+    mirroring `test_stage_status_for`'s own latest-by-dispatch rule."""
+    a = [
+        _work(assignment_id="w1", status="done", dispatched_at=1.0, uat_state="failed"),
+        _work(assignment_id="w2", status="done", dispatched_at=2.0, uat_state="passed"),
+    ]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.DONE
+
+
+def test_stage_status_for_dispatches_uat_to_dedicated_function():
+    """#2951 cause 2: before this branch existed, `stage_status_for` matched
+    on `type == "uat"`, which no assignment is ever created with, so the
+    generic path could never see a verdict stamped on the work row."""
+    a = [_work(status="done", dispatched_at=1.0, uat_state="passed")]
+    assert sp.stage_status_for(
+        a, "uat", stage_names=["work", "uat"], is_closed=False, require_plan=False,
+    ) == sp.DONE
+
+
+# ── pipeline_stage_names / issue_stage_names: uat_enabled (#2951) ──────────
+
+
+def test_pipeline_stage_names_hides_uat_by_default():
+    """The two-part opt-in's fleet-wide half alone (`"uat" in default_gates`)
+    is NOT sufficient — `uat_enabled` defaults to False so a caller that
+    forgets to resolve the per-repo half fails toward "hidden", not toward
+    a fleet-wide false badge (#2951 cause 1)."""
+    assert sp.pipeline_stage_names(["test", "review", "uat", "merge"]) == [
+        "work", "test", "review", "merge",
+    ]
+
+
+def test_pipeline_stage_names_shows_uat_when_enabled():
+    assert sp.pipeline_stage_names(["test", "review", "uat", "merge"], uat_enabled=True) == [
+        "work", "test", "review", "uat", "merge",
+    ]
+
+
+def test_pipeline_stage_names_hides_uat_when_not_in_default_gates_even_if_enabled():
+    """The fleet-wide half still gates too — a repo with `uat_preview`
+    configured must not show the badge if "uat" was never added to
+    `pipeline.default_gates` at all."""
+    assert sp.pipeline_stage_names(["test", "review", "merge"], uat_enabled=True) == [
+        "work", "test", "review", "merge",
+    ]
+
+
+def test_issue_stage_names_threads_uat_enabled():
+    assert sp.issue_stage_names([], ["test", "uat", "merge"], uat_enabled=True) == [
+        "work", "test", "uat", "merge",
+    ]
+    assert sp.issue_stage_names([], ["test", "uat", "merge"], uat_enabled=False) == [
+        "work", "test", "merge",
+    ]
+
+
+# ── compute_issue_projection: uat badge visibility (#2951) ─────────────────
+
+
+def test_compute_issue_projection_hides_uat_badge_when_repo_not_opted_in():
+    a = [_work(status="done", dispatched_at=1.0)]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False,
+        default_gates=["test", "review", "uat", "merge"],
+        uat_enabled=False,
+    )
+    assert "uat" not in out["stages"]
+    assert out["uat_preview_url"] is None
+
+
+def test_compute_issue_projection_shows_uat_badge_states_when_enabled():
+    default_gates = ["test", "review", "uat", "merge"]
+
+    pending = sp.compute_issue_projection(
+        [_work(status="done", dispatched_at=1.0)], None,
+        is_closed=False, require_plan=False, default_gates=default_gates, uat_enabled=True,
+    )
+    assert pending["stages"]["uat"] == sp.PENDING
+
+    done = sp.compute_issue_projection(
+        [_work(status="done", dispatched_at=1.0, uat_state="passed")], None,
+        is_closed=False, require_plan=False, default_gates=default_gates, uat_enabled=True,
+    )
+    assert done["stages"]["uat"] == sp.DONE
+
+    failed = sp.compute_issue_projection(
+        [_work(status="done", dispatched_at=1.0, uat_state="failed")], None,
+        is_closed=False, require_plan=False, default_gates=default_gates, uat_enabled=True,
+    )
+    assert failed["stages"]["uat"] == sp.FAILED
+
+
+def test_compute_issue_projection_carries_preview_url_only_when_enabled():
+    a = [_work(status="done", dispatched_at=1.0)]
+    enabled = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False,
+        default_gates=["test", "uat", "merge"], uat_enabled=True,
+        uat_preview_url="https://issue-1.example.pages.dev/",
+    )
+    assert enabled["uat_preview_url"] == "https://issue-1.example.pages.dev/"
+
+    disabled = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False,
+        default_gates=["test", "uat", "merge"], uat_enabled=False,
+        uat_preview_url="https://issue-1.example.pages.dev/",
+    )
+    assert disabled["uat_preview_url"] is None
+
+
+# ── compute_board_stage_projection: repo-scoped uat opt-in (#2951) ─────────
+
+
+def test_board_projection_shows_uat_badge_only_for_opted_in_repo():
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_preview="https://{pr_branch_slug}.example.dev/"),
+        Repo(name="other", github="acme/other"),  # uat_preview unset — not opted in
+    ])
+    issues = [
+        {"repo_name": "api", "number": 1, "title": "t", "state": "open"},
+        {"repo_name": "other", "number": 2, "title": "t2", "state": "open"},
+    ]
+    assignments = [
+        _work(repo_name="api", issue_number=1, status="done", dispatched_at=1.0, uat_state="passed"),
+        _work(repo_name="other", issue_number=2, status="done", dispatched_at=1.0),
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "uat", "merge"],
+        config=config,
+    )
+    by_issue = {(e["repo_name"], e["issue_number"]): e for e in out}
+    assert by_issue[("api", 1)]["stages"]["uat"] == sp.DONE
+    assert "uat" not in by_issue[("other", 2)]["stages"]
+    assert by_issue[("other", 2)]["uat_preview_url"] is None
+
+
+def test_board_projection_hides_uat_badge_for_every_repo_without_config():
+    """#2951: `config=None` (the default for any caller that hasn't wired
+    it through) must not regress to the old fleet-wide behaviour — no repo
+    is ever treated as opted in without a config to confirm it."""
+    issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
+    assignments = [_work(status="done", dispatched_at=1.0, uat_state="passed")]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "uat", "merge"],
+    )
+    assert "uat" not in out[0]["stages"]
+
+
+def test_board_projection_hides_uat_when_gate_not_in_default_gates():
+    """Guards the fleet-wide half: a repo WITH `uat_preview` configured
+    still shows nothing when "uat" was never added to `default_gates`."""
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_preview="https://preview.example.dev/"),
+    ])
+    issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
+    assignments = [_work(status="done", dispatched_at=1.0, uat_state="passed")]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "merge"],
+        config=config,
+    )
+    assert "uat" not in out[0]["stages"]
+
+
+def test_board_projection_resolves_preview_url_for_opted_in_issue():
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_preview="https://{pr_branch_slug}.example.dev/"),
+    ])
+    issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
+    assignments = [_work(status="done", dispatched_at=1.0)]
+    mq_items = [_entry(state="open", branch="issue-1-impl")]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=mq_items,
+        default_gates=["test", "review", "uat", "merge"],
+        config=config,
+    )
+    assert out[0]["uat_preview_url"] == "https://issue-1-impl.example.dev/"
 
 
 # ── compute_board_stage_projection ──────────────────────────────────────────

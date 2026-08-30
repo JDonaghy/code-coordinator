@@ -2518,6 +2518,15 @@ def _board_response_schema(components: dict) -> dict:
                             "additionalProperties": {"type": "string"},
                         },
                         "has_approved_review": {"type": "boolean"},
+                        "uat_preview_url": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "#2951: rendered UAT preview URL for this issue's "
+                                "PR, when the repo has opted in (Repo.uat_preview) "
+                                "and one could be resolved — null otherwise, "
+                                "including for every repo that hasn't opted in."
+                            ),
+                        },
                     },
                     "required": ["repo_name", "issue_number", "stages", "has_approved_review"],
                 },
@@ -5432,6 +5441,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     default_gates=list(_cfg.pipeline.default_gates),
                     require_plan=bool(_cfg.dispatch.require_plan),
                     ci_store=_ci,
+                    # #2951: resolves the UAT gate's per-repo opt-in
+                    # (Repo.uat_preview) so the "uat" badge only appears for
+                    # a repo that actually configured it, not fleet-wide
+                    # merely from "uat" in pipeline.default_gates.
+                    config=_cfg,
                 )
             except Exception:  # noqa: BLE001 — projection failure must not blank the board
                 projection["issue_stage_projection"] = []
