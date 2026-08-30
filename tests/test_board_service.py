@@ -169,3 +169,115 @@ class TestRouteWrite:
         resp = board_service.route_write(svc, "/assignment-usage", {"a": 1})
         assert resp == {"ok": True}
         assert captured == {"path": "/assignment-usage", "payload": {"a": 1}}
+
+
+class TestPostRecordErrorSurfacing:
+    """#2907: ``post_record`` used to call ``resp.raise_for_status()`` and
+    discard the response body — where ``serve_app.py``'s handlers put the
+    actual reason (e.g. a GitHub rate-limit backoff). Every one of
+    ``post_record``'s ~10 callers just catches ``httpx.HTTPError``/
+    ``Exception`` and renders ``str(e)``, so a bare "503 Service Unavailable"
+    was all an operator ever saw. Mirrors ``TestDispatchErrorSurfacing`` in
+    ``tests/test_dispatch.py`` (#1527), the same fix for the sibling
+    ``agent_app.py`` assign-rejection body.
+    """
+
+    @staticmethod
+    def _svc():
+        from coord import client as cc
+
+        return cc.ServiceConfig("http://d:7435")
+
+    def test_detail_is_surfaced_and_preferred_over_error(self, monkeypatch):
+        import httpx
+
+        from coord import client as cc
+
+        request = httpx.Request("POST", "http://d:7435/issue-create")
+        response = httpx.Response(
+            503,
+            json={
+                "error": "issue-create failed",
+                "detail": "GitHub secondary_rate_limit backoff active for 60s more",
+            },
+            request=request,
+        )
+        monkeypatch.setattr(cc.httpx, "post", lambda *a, **k: response)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            cc.post_record(self._svc(), "/issue-create", {})
+        assert "GitHub secondary_rate_limit backoff active for 60s more" in str(
+            exc_info.value
+        )
+
+    def test_error_is_surfaced_when_no_detail(self, monkeypatch):
+        import httpx
+
+        from coord import client as cc
+
+        request = httpx.Request("POST", "http://d:7435/board")
+        response = httpx.Response(
+            400, json={"error": "missing field: assignment_id"}, request=request,
+        )
+        monkeypatch.setattr(cc.httpx, "post", lambda *a, **k: response)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            cc.post_record(self._svc(), "/board", {})
+        assert "missing field: assignment_id" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "response_kwargs",
+        [
+            pytest.param({"text": "<html>Bad Gateway</html>"}, id="non_json_body"),
+            pytest.param({}, id="empty_body"),
+        ],
+    )
+    def test_non_json_or_empty_body_falls_back_to_httpx_message(
+        self, monkeypatch, response_kwargs,
+    ):
+        import httpx
+
+        from coord import client as cc
+
+        request = httpx.Request("POST", "http://d:7435/board")
+        response = httpx.Response(502, request=request, **response_kwargs)
+        monkeypatch.setattr(cc.httpx, "post", lambda *a, **k: response)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            cc.post_record(self._svc(), "/board", {})
+        # No crash while handling the failure, and the original status-line
+        # message survives unchanged (no daemon reason to fold in).
+        assert "502" in str(exc_info.value)
+
+    def test_transport_failure_is_unchanged(self, monkeypatch):
+        import httpx
+
+        from coord import client as cc
+
+        def _raise(*a, **k):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(cc.httpx, "post", _raise)
+        with pytest.raises(httpx.ConnectError):
+            cc.post_record(self._svc(), "/board", {})
+
+    def test_callers_status_code_and_json_readback_still_work(self, monkeypatch):
+        """Callers like ``coord.issue_store.post_result`` and
+        ``coord.state.close_issue`` catch ``httpx.HTTPStatusError`` themselves
+        and read ``exc.response.status_code`` / ``exc.response.json()`` to
+        decide their own fatal/best-effort handling — the re-raised exception
+        must keep supporting both, or #2907's compatibility guarantee (no
+        caller changes its fatal/best-effort behaviour) breaks."""
+        import httpx
+
+        from coord import client as cc
+
+        request = httpx.Request("POST", "http://d:7435/result")
+        response = httpx.Response(
+            400,
+            json={"error": "cannot claim done from a chat session"},
+            request=request,
+        )
+        monkeypatch.setattr(cc.httpx, "post", lambda *a, **k: response)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            cc.post_record(self._svc(), "/result", {})
+        exc = exc_info.value
+        assert exc.response.status_code == 400
+        assert exc.response.json()["error"] == "cannot claim done from a chat session"
