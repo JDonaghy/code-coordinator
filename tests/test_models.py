@@ -158,3 +158,44 @@ def test_is_policy_refusal_reason_fails_open_on_anything_else(text):
     from coord.models import is_policy_refusal_reason
 
     assert is_policy_refusal_reason(text) is False
+
+
+# ── #2966: coordinator_owned_docs — "only the coordinator writes docs" ──────
+
+
+def test_coordinator_owned_docs_defaults_to_claude_md_when_unconfigured():
+    """coordinator_only_files was set by zero repos fleet-wide — the fleet
+    default must not depend on it."""
+    from coord.models import coordinator_owned_docs
+
+    repo = Repo(name="api", github="acme/api")
+    assert coordinator_owned_docs(repo) == ["CLAUDE.md"]
+
+
+def test_coordinator_owned_docs_unions_configured_files_after_default():
+    from coord.models import coordinator_owned_docs
+
+    repo = Repo(
+        name="api", github="acme/api",
+        coordinator_only_files=["README.md", "CLAUDE.md", "CHANGELOG.md"],
+    )
+    # Dedupe: CLAUDE.md is already in the default, so it must not repeat.
+    assert coordinator_owned_docs(repo) == ["CLAUDE.md", "README.md", "CHANGELOG.md"]
+
+
+def test_coordinator_owned_docs_handles_none_repo():
+    from coord.models import coordinator_owned_docs
+
+    assert coordinator_owned_docs(None) == ["CLAUDE.md"]
+
+
+def test_coordinator_owned_docs_fails_open_on_repo_stand_in_missing_attribute():
+    """#1388-style stand-in: a Repo-shaped object predating this field must
+    not raise AttributeError — same fail-open discipline as develop_branch."""
+    from coord.models import coordinator_owned_docs
+
+    class _StandInRepo:
+        name = "api"
+        github = "acme/api"
+
+    assert coordinator_owned_docs(_StandInRepo()) == ["CLAUDE.md"]

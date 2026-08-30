@@ -300,7 +300,11 @@ def test_dispatch_includes_coordinator_only_files_in_forbidden() -> None:
         assert payload["files_forbidden"] == ["CLAUDE.md", "coordinator.yml"]
 
 
-def test_dispatch_with_no_coordinator_only_files_sends_empty_forbidden() -> None:
+def test_dispatch_with_no_coordinator_only_files_still_forbids_claude_md() -> None:
+    """#2966: coordinator_only_files was set by zero repos fleet-wide, so
+    files_forbidden must not depend on it to protect the repo's own
+    rulebook — see coord.models.coordinator_owned_docs. The source list is
+    never actually empty any more, unlike pre-#2966."""
     from coord.dispatch import dispatch
 
     repo = Repo(name="api", github="acme/api")
@@ -315,4 +319,4 @@ def test_dispatch_with_no_coordinator_only_files_sends_empty_forbidden() -> None
         dispatch(proposal, cfg)
 
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["files_forbidden"] == []
+        assert payload["files_forbidden"] == ["CLAUDE.md"]

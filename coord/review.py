@@ -48,6 +48,7 @@ from coord.models import (
     Assignment,
     Board,
     Machine,
+    coordinator_owned_docs,
     trust_issue_closed_for,
 )
 from coord.refine_chat import MAX_CLAUDE_MD_CHARS
@@ -1558,6 +1559,7 @@ def build_review_briefing(
     diff_text: str | None = None,
     sealed_paths: list[str] | None = None,
     sealed_entrypoints: list[str] | None = None,
+    coordinator_doc_paths: list[str] | None = None,
     assignment_type: str = "work",
     provider_same_as_worker: bool = False,
     review_provider: str | None = None,
@@ -1632,6 +1634,18 @@ def build_review_briefing(
     is expected and non-blocking. Every other type (default ``"work"``) keeps
     the original rule unchanged: any touch to *sealed_paths* is mandatory
     ``request-changes``.
+
+    *coordinator_doc_paths* (#2966) is the repo's coordinator-owned doc set —
+    :func:`coord.models.coordinator_owned_docs`, the repo's own CLAUDE.md plus
+    anything it additionally lists under ``coordinator_only_files``. CLAUDE.md
+    already states "only the coordinator writes docs" for every worker, but
+    that was prose-only: nothing structurally backstopped it, and two workers
+    independently rewriting the same CLAUDE.md section produced a semantic
+    merge conflict that stalled a five-issue chain (#2966). Unlike
+    *sealed_paths*, this rule never inverts — no assignment type's job is
+    ever editing the repo's own rulebook, so any diff that touches one of
+    these paths is mandatory ``request-changes`` regardless of
+    *assignment_type*.
     """
 
     lines: list[str] = []
@@ -1828,6 +1842,43 @@ def build_review_briefing(
                     + ". If the diff modifies any of them, **request-changes** — "
                     "this is a hard rule, not a suggestion (docs/ORACLE_LOOP.md)."
                 )
+
+    if coordinator_doc_paths:
+        # #2966: "only the coordinator writes docs" was prose-only — nothing
+        # backstopped it structurally, and two workers independently
+        # rewrote the same CLAUDE.md section in the same week, producing a
+        # semantic (prose) merge conflict that stalled a five-issue chain.
+        # This rule never inverts by assignment_type (unlike sealed_paths
+        # above): no dispatched worker type's job is ever editing the
+        # repo's own rulebook.
+        lines.append("")
+        touched_docs = (
+            _diff_touched_sealed_paths(diff_text, coordinator_doc_paths)
+            if diff_text else []
+        )
+        if touched_docs:
+            lines.append("## \U0001f6a8 COORDINATOR-OWNED DOC EDITED")
+            lines.append("")
+            lines.append(
+                "The diff modifies a coordinator-owned doc: "
+                + ", ".join(f"`{p}`" for p in touched_docs)
+                + ". \"Only the coordinator writes docs\" — a worker must "
+                "never edit the repo's own rulebook or other shared docs; "
+                "parallel doc edits from independent workers collide "
+                "(#2966). **request-changes is mandatory here**, regardless "
+                "of anything else in this diff — even if the edit itself "
+                "looks correct in isolation."
+            )
+        else:
+            lines.append("## Coordinator-owned docs (do not touch)")
+            lines.append("")
+            lines.append(
+                "This repo reserves "
+                + ", ".join(f"`{p}`" for p in coordinator_doc_paths)
+                + " for the coordinator (#2966). If the diff modifies any of "
+                "them, **request-changes** — this is a hard rule, not a "
+                "suggestion, regardless of assignment type."
+            )
 
     lines.append("")
     lines.append("## What to do")
@@ -2637,6 +2688,12 @@ def dispatch_review(
     sealed_paths = config.acceptance.sealed_paths(completed.repo_name)
     sealed_entrypoints = config.acceptance.entrypoints(completed.repo_name)
 
+    # #2966: coordinator-owned docs (repo's own CLAUDE.md plus anything it
+    # additionally lists under coordinator_only_files) — see
+    # coordinator_owned_docs' docstring for why this doesn't depend on the
+    # repo actually configuring coordinator_only_files.
+    coordinator_doc_paths = coordinator_owned_docs(repo)
+
     client = http_client or httpx
 
     # Iterate candidates in priority order.  On agent rejection (4xx from a
@@ -2706,6 +2763,7 @@ def dispatch_review(
             diff_text=diff_text,
             sealed_paths=sealed_paths,
             sealed_entrypoints=sealed_entrypoints,
+            coordinator_doc_paths=coordinator_doc_paths,
             assignment_type=completed.type,
         )
 
