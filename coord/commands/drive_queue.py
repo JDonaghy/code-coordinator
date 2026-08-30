@@ -1545,7 +1545,7 @@ def _unreachable_wait_alert_dict(rows: list[Mapping[str, Any]]) -> dict | None:
     return {
         "reason": synthetic.reason,
         "gate_readings": " | ".join(synthetic.details),
-        "command": synthetic.command,
+        "proposed_command": synthetic.command,
     }
 
 
