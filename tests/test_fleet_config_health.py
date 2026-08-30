@@ -17,12 +17,16 @@ from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.fleet_config_health import (
     CapabilityRuleFinding,
     ConfigProvenance,
+    FeatureCoverageFinding,
     capability_rule_health,
     capability_rule_summary_line,
     config_provenance,
     default_live_config_path,
     default_settings_dir,
+    feature_coverage_findings,
+    feature_coverage_summary_line,
     format_capability_rule_lines,
+    format_feature_coverage_lines,
     format_provenance_lines,
     local_repo_checkouts,
     summary_line,
@@ -669,4 +673,162 @@ def test_capability_rule_finding_dataclass_defaults_are_not_dead_or_healthy() ->
     assert f.checked_repos == ()
     assert f.dead is False
     assert f.partial is False
-    assert f.healthy is False
+
+
+# ── feature_coverage_findings: build_command vs effective test command (#2967) ──
+
+
+def test_test_command_coverage_flags_the_live_quadraui_shape() -> None:
+    """The exact live incident (#2967): build_command enables
+    tui+gtk+terminal, test_command enables only tui — gtk and terminal are
+    reported missing, and the finding says so explicitly."""
+    cfg = _config(
+        [
+            Repo(
+                name="quadraui",
+                github="acme/quadraui",
+                build_command="cargo build --features tui --features gtk --features terminal",
+                test_command="cargo test --features tui",
+            )
+        ],
+        [],
+    )
+
+    findings = feature_coverage_findings(cfg)
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.repo == "quadraui"
+    assert f.build_features == ("gtk", "terminal", "tui")
+    assert f.test_features == ("tui",)
+    assert f.missing_features == ("gtk", "terminal")
+    assert f.gap is True
+    assert f.test_command_source == "repos[quadraui].test_command"
+    assert f.ci_equivalent is False
+
+    lines = format_feature_coverage_lines(findings)
+    joined = "\n".join(lines)
+    assert "GAP" in joined
+    assert "gtk, terminal" in joined
+    assert feature_coverage_summary_line(findings) == (
+        "TEST_COMMAND_COVERAGE: repos_checked=1 gap=1"
+    )
+
+
+def test_test_command_coverage_healthy_when_test_covers_every_build_feature() -> None:
+    cfg = _config(
+        [
+            Repo(
+                name="quadraui",
+                github="acme/quadraui",
+                build_command="cargo build --features tui --features gtk",
+                test_command="cargo test --features tui,gtk",
+            )
+        ],
+        [],
+    )
+
+    findings = feature_coverage_findings(cfg)
+
+    assert len(findings) == 1
+    assert findings[0].gap is False
+    assert findings[0].missing_features == ()
+    joined = "\n".join(format_feature_coverage_lines(findings))
+    assert "GAP" not in joined
+    assert "✓" in joined
+    assert feature_coverage_summary_line(findings) == (
+        "TEST_COMMAND_COVERAGE: repos_checked=1 gap=0"
+    )
+
+
+def test_test_command_coverage_prefers_ci_command_over_test_command() -> None:
+    """`ci_command` outranks `test_command` for the Test stage's actual
+    command (`coord.smoke.resolve_smoke_command`'s precedence) — a repo
+    whose `ci_command` closes the gap must report healthy even though its
+    bare `test_command` alone would be a gap."""
+    cfg = _config(
+        [
+            Repo(
+                name="quadraui",
+                github="acme/quadraui",
+                build_command="cargo build --features tui --features gtk",
+                test_command="cargo test --features tui",
+                ci_command="cargo test --features tui --features gtk",
+            )
+        ],
+        [],
+    )
+
+    findings = feature_coverage_findings(cfg)
+
+    assert len(findings) == 1
+    assert findings[0].gap is False
+    assert findings[0].ci_equivalent is True
+    assert findings[0].test_command_source == "repos[quadraui].ci_command"
+
+
+def test_test_command_coverage_skips_repos_with_no_explicit_features() -> None:
+    """vimcode/coord-tui shape: plain `cargo build`/`cargo test`, no
+    `--features` on either side — nothing to compare, so the repo is
+    silently omitted rather than reported as a (vacuous) match."""
+    cfg = _config(
+        [Repo(name="vimcode", github="acme/vimcode", build_command="cargo build",
+              test_command="cargo test")],
+        [],
+    )
+
+    assert feature_coverage_findings(cfg) == []
+    lines = format_feature_coverage_lines([])
+    assert lines == [
+        "· no repo's build_command names an explicit `--features` value "
+        "— nothing to check (this only applies to cargo feature-flagged "
+        "builds)"
+    ]
+    assert feature_coverage_summary_line([]) == "TEST_COMMAND_COVERAGE: repos_checked=0 gap=0"
+
+
+def test_test_command_coverage_skips_repos_with_no_build_command() -> None:
+    cfg = _config(
+        [Repo(name="quadraui", github="acme/quadraui", test_command="cargo test --features tui")],
+        [],
+    )
+
+    assert feature_coverage_findings(cfg) == []
+
+
+def test_test_command_coverage_unconfigured_test_command_is_a_full_gap() -> None:
+    cfg = _config(
+        [
+            Repo(
+                name="quadraui",
+                github="acme/quadraui",
+                build_command="cargo build --features tui --features gtk",
+            )
+        ],
+        [],
+    )
+
+    findings = feature_coverage_findings(cfg)
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.gap is True
+    assert f.effective_test_command is None
+    assert f.missing_features == ("gtk", "tui")
+    joined = "\n".join(format_feature_coverage_lines(findings))
+    assert "(unconfigured)" in joined
+
+
+def test_test_coverage_finding_dataclass_defaults_are_not_a_gap() -> None:
+    """Sanity: a bare finding built with no `missing_features` is
+    (vacuously) healthy — `gap`/`healthy` key off `missing_features` alone,
+    not off whether `build_features`/`test_features` were populated."""
+    f = FeatureCoverageFinding(
+        repo="quadraui",
+        build_command="cargo build --features tui",
+        effective_test_command="cargo test --features tui",
+        test_command_source="repos[quadraui].test_command",
+        ci_equivalent=False,
+    )
+    assert f.gap is False
+    assert f.healthy is True

@@ -57,6 +57,7 @@ precedent as :func:`config_provenance` applies per repo.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -615,3 +616,166 @@ def capability_rule_summary_line(
         f"prefixes={len(findings)} dead={dead} partial={partial} "
         f"unclaimed_caps={len(unclaimed)}"
     )
+
+
+# ── Test-command feature-flag coverage vs build_command (#2967) ─────────────
+#
+# quadraui is configured `test_command: cargo test --features tui` against
+# `build_command: cargo build --features tui --features gtk --features
+# terminal` — the Test gate never compiles `src/gtk/**` or the terminal
+# backend, so a `passed` verdict on a change confined to either carries no
+# information at all. Nothing previously compared the two commands; this is
+# the same "config looks right in review but silently does less than it
+# claims" shape as #2953's dead capability_rules prefixes, one seam over:
+# there it was a `files` prefix matching nothing, here it's a `--features`
+# flag the build enables that the effective Test-stage command never turns
+# on. Pure string comparison against the already-loaded config — no local
+# checkout required, so (unlike `capability_rule_health`) this runs the same
+# everywhere, including a thin client with no repo checkouts at all.
+
+
+def _cargo_features(command: str | None) -> set[str]:
+    """Every value named by a `--features`/`-F`/`--features=...` token in
+    *command*, comma- or space-separated, deduped.
+
+    Returns the empty set for a falsy, unparseable (unbalanced quoting), or
+    feature-less command — treated as "no feature-flag signal to compare",
+    never as a gap by itself. That is what keeps a plain `cargo build` /
+    `cargo test` pair (vimcode, coord-tui) and non-cargo commands (npm/pnpm
+    repos) out of the findings entirely: both sides parse to an empty set,
+    which is equal, not missing.
+    """
+    if not command:
+        return set()
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return set()
+    features: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        value: str | None = None
+        if tok in ("--features", "-F"):
+            if i + 1 < len(tokens):
+                value = tokens[i + 1]
+                i += 1
+        elif tok.startswith("--features="):
+            value = tok[len("--features=") :]
+        if value is not None:
+            features.update(part for part in value.replace(",", " ").split() if part)
+        i += 1
+    return features
+
+
+@dataclass
+class FeatureCoverageFinding:
+    """Feature-flag coverage of one repo's effective Test-stage command
+    against its ``build_command`` (#2967).
+
+    ``effective_test_command``/``test_command_source``/``ci_equivalent``
+    mirror ``coord.smoke.resolve_smoke_command`` — the SAME precedence
+    (``ci_command`` > ``smoke_tests.default_command`` > ``test_command``)
+    the Test stage itself uses, so this reports on the command that will
+    actually gate the repo, not always the raw ``repos[].test_command``.
+    """
+
+    repo: str
+    build_command: str
+    effective_test_command: str | None
+    test_command_source: str
+    ci_equivalent: bool
+    build_features: tuple[str, ...] = ()
+    test_features: tuple[str, ...] = ()
+    missing_features: tuple[str, ...] = ()
+
+    @property
+    def gap(self) -> bool:
+        """``build_command`` enables a feature the effective test command
+        never turns on — a passed verdict didn't compile that code."""
+        return bool(self.missing_features)
+
+    @property
+    def healthy(self) -> bool:
+        return not self.gap
+
+
+def feature_coverage_findings(config: "Config") -> list[FeatureCoverageFinding]:
+    """Cargo `--features` coverage of every configured repo's effective
+    Test-stage command against its ``build_command`` (#2967).
+
+    Only repos whose ``build_command`` names at least one `--features` value
+    are considered — a repo with no explicit features (or a non-cargo build,
+    e.g. npm/pnpm) parses to an empty set on both sides and is silently
+    omitted, matching :func:`capability_rule_health`'s "no signal, no
+    finding" precedent. The effective test command is resolved with
+    ``coord.smoke.resolve_smoke_command`` (deferred import: `coord.smoke`
+    pulls in ``httpx``/``github_ops``, which this otherwise-light,
+    network-free module avoids at import time), so a repo that already
+    covers the gap via ``ci_command`` or ``smoke_tests.default_command``
+    correctly reports healthy rather than flagging the raw
+    ``test_command`` alone.
+    """
+    from coord.smoke import resolve_smoke_command  # noqa: PLC0415
+
+    findings: list[FeatureCoverageFinding] = []
+    for repo_cfg in config.repos:
+        build_command = repo_cfg.build_command
+        if not build_command:
+            continue
+        build_features = _cargo_features(build_command)
+        if not build_features:
+            continue
+        smoke_cmd = resolve_smoke_command(repo_cfg, config.smoke_tests)
+        test_features = _cargo_features(smoke_cmd.command)
+        missing = tuple(sorted(build_features - test_features))
+        findings.append(
+            FeatureCoverageFinding(
+                repo=repo_cfg.name,
+                build_command=build_command,
+                effective_test_command=smoke_cmd.command,
+                test_command_source=smoke_cmd.source,
+                ci_equivalent=smoke_cmd.ci_equivalent,
+                build_features=tuple(sorted(build_features)),
+                test_features=tuple(sorted(test_features)),
+                missing_features=missing,
+            )
+        )
+    return findings
+
+
+def format_feature_coverage_lines(findings: list[FeatureCoverageFinding]) -> list[str]:
+    """Human-readable report lines for *findings* (used by ``coord diagnose
+    --test-coverage``)."""
+    if not findings:
+        return [
+            "· no repo's build_command names an explicit `--features` value "
+            "— nothing to check (this only applies to cargo feature-flagged "
+            "builds)"
+        ]
+
+    lines: list[str] = []
+    for f in findings:
+        if f.gap:
+            lines.append(
+                f"✗ GAP: {f.repo} — build_command (`{f.build_command}`) enables "
+                f"[{', '.join(f.build_features)}], but the effective Test-stage "
+                f"command ({f.test_command_source}: "
+                f"`{f.effective_test_command or '(unconfigured)'}`) enables "
+                f"[{', '.join(f.test_features) or '(none)'}]. Missing: "
+                f"{', '.join(f.missing_features)} — a `passed` verdict never "
+                "compiled that code (#2967)."
+            )
+        else:
+            lines.append(
+                f"✓ {f.repo} — {f.test_command_source} covers every feature "
+                f"build_command enables ([{', '.join(f.build_features)}])"
+            )
+    return lines
+
+
+def feature_coverage_summary_line(findings: list[FeatureCoverageFinding]) -> str:
+    """The machine-readable trailer ``coord diagnose --test-coverage``
+    prints, mirroring ``GRAPH_HEALTH:``/``CAPABILITY_RULES:``."""
+    gap = sum(1 for f in findings if f.gap)
+    return f"TEST_COMMAND_COVERAGE: repos_checked={len(findings)} gap={gap}"

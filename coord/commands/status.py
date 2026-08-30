@@ -1922,6 +1922,21 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
     ),
 )
 @click.option(
+    "--test-coverage",
+    "test_coverage_check",
+    is_flag=True,
+    help=(
+        "#2967: report repos whose effective Test-stage command (same "
+        "ci_command > smoke_tests.default_command > test_command precedence "
+        "the Test gate itself uses) enables fewer cargo `--features` than "
+        "the repo's build_command — e.g. quadraui building "
+        "tui+gtk+terminal but testing only tui, so a `passed` verdict never "
+        "compiled the gtk/terminal code. Repos with no explicit "
+        "`--features` on either side are silently skipped (no signal). "
+        "Read-only, no checkout or network required."
+    ),
+)
+@click.option(
     "--self",
     "self_check",
     is_flag=True,
@@ -1980,6 +1995,7 @@ def diagnose(
     graph_health: bool = False,
     config_provenance_check: bool = False,
     capability_rules_check: bool = False,
+    test_coverage_check: bool = False,
     self_check: bool = False,
     self_no_fetch: bool = False,
     forge_availability: bool = False,
@@ -2004,6 +2020,11 @@ def diagnose(
     # ── #2953: dead/partial capability_rules prefixes (read-only) ───────────
     if capability_rules_check:
         _diagnose_capability_rules(config_path)
+        return
+
+    # ── #2967: test_command feature-flag coverage vs build_command ──────────
+    if test_coverage_check:
+        _diagnose_test_coverage(config_path)
         return
 
     # ── #2436: THIS process's own editable coord install freshness ──────────
@@ -2234,6 +2255,29 @@ def _diagnose_capability_rules(config_path: Path) -> None:
     for line in format_capability_rule_lines(findings, unclaimed):
         click.echo(f"  {line}")
     click.echo(capability_rule_summary_line(findings, unclaimed))
+
+
+def _diagnose_test_coverage(config_path: Path) -> None:
+    """Report repos whose effective Test-stage command enables fewer cargo
+    ``--features`` than their ``build_command`` (#2967).
+
+    Read-only, local-machine only, same family as ``--capability-rules``.
+    Unlike ``--capability-rules`` this needs no repo checkout at all — it's
+    a pure comparison of two command strings already in ``coordinator.yml``
+    — so it reports identically wherever it's run, including a thin client
+    with no local checkouts (see ``coord/fleet_config_health.py``).
+    """
+    from coord.fleet_config_health import (  # noqa: PLC0415
+        feature_coverage_findings,
+        feature_coverage_summary_line,
+        format_feature_coverage_lines,
+    )
+
+    cfg = _load_config(config_path)
+    findings = feature_coverage_findings(cfg)
+    for line in format_feature_coverage_lines(findings):
+        click.echo(f"  {line}")
+    click.echo(feature_coverage_summary_line(findings))
 
 
 def _diagnose_self(*, fetch: bool) -> None:
