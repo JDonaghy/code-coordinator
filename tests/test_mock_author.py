@@ -352,6 +352,39 @@ def test_dispatch_success_records_assignment(tmp_path):
     mock_record.assert_called_once()
 
 
+def test_dispatch_briefs_full_issue_bodies_uncapped(tmp_path):
+    """#2969: Gate A's contract is authored straight from these bodies —
+    reusing milestone_chat's 1500-char cohort-inference cap here silently
+    fed the mock-author 36-82% of each issue's spec. The dispatched
+    briefing must carry every body in full, past that cap."""
+    from coord.models import Board
+
+    long_body = "y" * (2000) + " END-OF-BODY-MARKER"
+    cfg = _cfg_with_driver(tmp_path)
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    open_issues = [
+        {
+            "number": 5, "title": "Child", "body": long_body,
+            "milestone": {"number": 9},
+        },
+    ]
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+         patch("coord.board_service.read_board", return_value=Board()), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}) as mock_dispatch, \
+         patch("coord.dispatch.post_briefing"), \
+         patch("coord.state.record_dispatched"):
+        mock_author.dispatch_acceptance_mock("api", 100, cfg)
+
+    proposal = mock_dispatch.call_args[0][0]
+    assert len(long_body) > 1500  # sanity: this reproduces only past the old cap
+    assert long_body in proposal.briefing
+    assert "(truncated)" not in proposal.briefing
+
+
 # ── build_mock_author_amend_briefing / --amend dispatch (#1315) ─────────────
 
 
