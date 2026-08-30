@@ -1434,6 +1434,61 @@ def test_the_outside_reach_message_names_the_manual_remedy(
     assert "coord release cordon --clear laptop" in result.output
 
 
+def test_a_stale_unit_advisory_names_the_units_remedy_not_agent_update(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2963: a `unit ...` lane finding (`coord.health.checks.unit_drift`,
+    #1831/#1927) got the exact same fixed remedy as every other advisory —
+    `coord agent update --machine <host>` — even though that command only
+    swaps the venv and never touches `~/.config/systemd/user/`. Followed
+    literally it does nothing for a stale unit, which is how #2938's
+    `Restart=always` fix (shipped four releases ago) reached zero hosts'
+    live systemd: every `--lane python` run reported '✓ verified' with the
+    units gap present only as a silenced advisory pointing at the wrong fix.
+
+    The health check itself already computes the correct, host-specific
+    remedy into `Finding.detail` (see `unit_drift.py`'s `cp ... &&
+    systemctl --user restart ...` / templated-`sed` remedies) — this must be
+    surfaced instead of a fabricated one."""
+    from coord import release_verify as rv
+
+    _stub_lanes(monkeypatch)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        daemon="server",
+        findings=[
+            rv.Finding(
+                severity="warn",
+                host="laptop",
+                lane="unit coord-agent.service",
+                summary="stale — installed 240h ago, 39 line(s) differ",
+                detail=(
+                    "cp /deploy/coord-agent.service "
+                    "~/.config/systemd/user/coord-agent.service && "
+                    "systemctl --user daemon-reload && systemctl --user "
+                    "restart coord-agent   # reference: packaged coord 0.4.111"
+                ),
+            ),
+        ],
+    )
+    # #1831: units are rolled by their OWN lane (`POST /deploy-units`), never
+    # by the python lane — `--lane python` here reproduces the exact
+    # invocation from #2963's repro, which is also this fleet's normal
+    # manual-release habit (the auto timer is disabled, per
+    # docs/AGENT_OPERATIONS.md). The units lane is therefore never part of
+    # this run's `attempted_scope`, so the finding lands as advisory.
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--lane", "python"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "advisory" in result.output
+    assert "coord agent update --machine laptop" not in result.output
+    assert "systemctl --user restart coord-agent" in result.output
+
+
 def test_a_crit_on_a_lane_this_run_rolled_still_reverts(valid_config_path, state_dir,
                                                         no_network, monkeypatch):
     """Scoping the gate is not removing it."""
