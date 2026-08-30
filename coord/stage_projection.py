@@ -79,6 +79,8 @@ class _AssignmentLike(Protocol):
     acceptance_state: str | None
     acceptance_total: int | None
     acceptance_passed: int | None
+    uat_state: str | None
+    uat_reason: str | None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -319,6 +321,49 @@ def test_stage_status_for(
     return PENDING
 
 
+def uat_stage_status_for(
+    assignments_for_issue: list,
+    *,
+    is_closed: bool,
+    require_plan: bool,
+) -> str:
+    """The UAT box's status (#2687/#2951) — modelled directly on
+    :func:`test_stage_status_for`, which solves the identical "verdict is
+    stamped onto the work row, not a dedicated ``type="uat"`` assignment"
+    shape: ``coord uat <id> --passed|--failed`` writes ``uat_state``/
+    ``uat_reason`` straight onto the work row exactly the way ``coord test``
+    writes ``test_state``/``test_reason`` (see ``coord.state.
+    record_uat_verdict``).
+
+    Simpler than Test in two ways that both trace back to #2687's design
+    (see ``coord.merge_queue.evaluate_uat_verdict``'s docstring): there is
+    no ``"running"``/ACTIVE transient — ``coord uat`` records a human's
+    one-shot judgment on a rendered preview, not a re-runnable driver — and
+    no staleness re-check, since a UAT verdict isn't a measurement that a
+    moved SHA could invalidate the way a Test/Review verdict can.
+
+    Before this existed, ``stage_status_for``'s generic dispatcher matched
+    on assignment *type*, and nothing ever creates a ``type="uat"``
+    assignment — the badge sat PENDING forever regardless of the recorded
+    verdict (#2951 cause 2).
+    """
+    work_status = stage_status_for_internal_work(
+        assignments_for_issue, is_closed=is_closed, require_plan=require_plan
+    )
+    if work_status != DONE:
+        return SKIPPED if is_closed else PENDING
+
+    work = assignments_for_stage(assignments_for_issue, "work", require_plan=require_plan)
+    with_verdict = [a for a in work if (a.uat_state or "") != ""]
+    verdict_assignment = _latest_by_dispatch(with_verdict)
+    verdict = verdict_assignment.uat_state if verdict_assignment else None
+    if verdict == "passed":
+        return DONE
+    if verdict == "failed":
+        return FAILED
+    return PENDING
+
+
 def acceptance_stage_status_for(assignments_for_issue: list) -> str:
     """The Acceptance box's status (#932/#944) — reported and gated
     *separately* from the Test box (docs/ORACLE_LOOP.md), so this mirrors
@@ -448,6 +493,10 @@ def stage_status_for(
         return test_stage_status_for(
             assignments_for_issue, is_closed=is_closed, require_plan=require_plan
         )
+    if stage == "uat":
+        return uat_stage_status_for(
+            assignments_for_issue, is_closed=is_closed, require_plan=require_plan
+        )
 
     matching = assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan)
     if stage == "review":
@@ -550,9 +599,68 @@ def issue_has_any_approved_review(
 # ── Board-level projection ──────────────────────────────────────────────
 
 
-def pipeline_stage_names(default_gates: list[str]) -> list[str]:
+def _repo_for(repo_name: str, config: Any | None) -> Any | None:
+    """Best-effort ``config.repo(repo_name)`` lookup, duck-typed the same
+    fail-soft way as ``coord.merge_queue._uat_repo_for`` — an unknown repo
+    name or a config stand-in without ``.repo()`` (a minimal test double)
+    is "can't confirm this repo opted in", not a crash. ``config`` is
+    already fully loaded by the caller (no file/network I/O happens here),
+    so this stays inside the module's "pure computation" contract."""
+    if config is None:
+        return None
+    try:
+        return config.repo(repo_name)
+    except Exception:  # noqa: BLE001 — unknown/malformed repo: no signal
+        return None
+
+
+def repo_has_uat_preview(repo_name: str, config: Any | None) -> bool:
+    """The per-repo half of ``coord.merge_queue.requires_uat``'s two-part
+    UAT opt-in (#2687) — the fleet-wide half (``"uat" in default_gates``) is
+    threaded separately as ``uat_enabled`` (see :func:`pipeline_stage_names`).
+    """
+    repo = _repo_for(repo_name, config)
+    return bool(repo is not None and getattr(repo, "uat_preview", None))
+
+
+def uat_preview_url_for(
+    repo_name: str,
+    issue_number: int | None,
+    merge_entry: Any | None,
+    config: Any | None,
+) -> str | None:
+    """Best-effort rendered UAT preview URL for this issue's PR (#2951 item
+    3) — mirrors the preview-resolution half of ``coord.merge_queue.
+    evaluate_uat_verdict`` (minus its ``coord uat`` command text, which the
+    caller can build itself from the assignment id it already has). Returns
+    ``None`` when the repo isn't configured or hasn't opted in."""
+    repo = _repo_for(repo_name, config)
+    if repo is None:
+        return None
+    return repo.resolve_uat_preview_url(
+        branch=getattr(merge_entry, "branch", None),
+        issue_number=issue_number,
+        pr_number=getattr(merge_entry, "pr_number", None),
+    )
+
+
+def pipeline_stage_names(default_gates: list[str], *, uat_enabled: bool = False) -> list[str]:
     """Mirrors ``pipeline.rs::pipeline_stage_names`` (module-default, no
-    per-issue plan-assignment prepend — see ``issue_stage_names``)."""
+    per-issue plan-assignment prepend — see ``issue_stage_names``), plus the
+    #2951 repo-awareness half ``pipeline.rs`` does not have yet (see that
+    issue's "The Rust mirror" section — ``coord-tui`` isn't a dispatchable
+    fleet repo, so this drifts from the Rust mirror on purpose until it is).
+
+    ``"uat"`` is a two-part opt-in (``coord.merge_queue.requires_uat``):
+    ``default_gates`` alone is only the FLEET-WIDE half. ``uat_enabled``
+    carries the caller's already-resolved per-repo half (``bool(repo and
+    repo.uat_preview)``) — this module has no config/repo lookup of its own
+    (see module docstring: pure computation, no I/O) — so a repo that
+    hasn't set ``uat_preview`` never gets the badge, no matter what
+    ``default_gates`` says. Defaults to ``False`` (hidden) rather than
+    ``True`` so a caller that forgets to resolve it fails toward "no repo
+    opted in" — the common case — not toward a fleet-wide false badge.
+    """
     stages = ["work"]
     for g in default_gates:
         # #1429: "merge" is restored to the per-issue stage-name ordering as
@@ -561,14 +669,20 @@ def pipeline_stage_names(default_gates: list[str]) -> list[str]:
         # affordance, not observation; merge is still initiated solely from
         # the Merge Queue panel). "work"/"plan" stay excluded here since
         # they're prepended explicitly above / by the caller.
-        if g not in ("work", "plan"):
-            stages.append(g)
+        if g in ("work", "plan"):
+            continue
+        if g == "uat" and not uat_enabled:
+            continue
+        stages.append(g)
     return stages
 
 
-def issue_stage_names(assignments_for_issue: list, default_gates: list[str]) -> list[str]:
-    """Mirrors ``pipeline.rs::pipeline_stage_names_for_issue``."""
-    stages = pipeline_stage_names(default_gates)
+def issue_stage_names(
+    assignments_for_issue: list, default_gates: list[str], *, uat_enabled: bool = False
+) -> list[str]:
+    """Mirrors ``pipeline.rs::pipeline_stage_names_for_issue`` (see
+    :func:`pipeline_stage_names` for the #2951 ``uat_enabled`` addendum)."""
+    stages = pipeline_stage_names(default_gates, uat_enabled=uat_enabled)
     if stages[0] != "plan" and _issue_has_plan_assignment(assignments_for_issue):
         stages = ["plan", *stages]
     return stages
@@ -582,6 +696,8 @@ def compute_issue_projection(
     require_plan: bool,
     default_gates: list[str],
     ci_store: Any | None = None,
+    uat_enabled: bool = False,
+    uat_preview_url: str | None = None,
 ) -> dict[str, Any]:
     """Compute the full per-issue stage badge dict.
 
@@ -592,8 +708,17 @@ def compute_issue_projection(
     loop below already produces the correct value) — plus a redundant explicit
     ``merge`` assignment as a defensive fallback in case ``merge`` is ever
     absent from ``names`` again (e.g. a future ``default_gates`` without it).
+
+    ``uat_enabled`` (#2951) is the caller's already-resolved per-repo half of
+    ``requires_uat``'s two-part opt-in — see :func:`pipeline_stage_names` —
+    so ``"uat"`` only appears in ``stages`` for a repo that actually
+    configured ``Repo.uat_preview``. ``uat_preview_url`` is the rendered
+    preview link for THIS issue's PR when available (``None`` otherwise);
+    carried through unconditionally so a caller can show it next to the
+    badge instead of sending the operator to ``coord merge``'s refusal
+    message to find it (#2951 item 3).
     """
-    names = issue_stage_names(assignments_for_issue, default_gates)
+    names = issue_stage_names(assignments_for_issue, default_gates, uat_enabled=uat_enabled)
     stages: dict[str, str] = {}
     for name in names:
         stages[name] = stage_status_for(
@@ -619,6 +744,7 @@ def compute_issue_projection(
     return {
         "stages": stages,
         "acceptance_progress": acceptance_progress_for(assignments_for_issue),
+        "uat_preview_url": uat_preview_url if uat_enabled else None,
         "has_approved_review": issue_has_any_approved_review(
             assignments_for_issue,
             seed_work_id=merge_entry.assignment_id if merge_entry is not None else None,
@@ -634,6 +760,7 @@ def compute_board_stage_projection(
     default_gates: list[str],
     require_plan: bool = False,
     ci_store: Any | None = None,
+    config: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Compute the per-issue stage projection for every issue that appears
     on the board — the payload injected into ``GET /board`` as
@@ -643,6 +770,15 @@ def compute_board_stage_projection(
     ``issues`` table (open + recently-synced) and every assignment's
     ``(repo_name, issue_number)`` (so closed issues with assignment history
     still get a projection, matching what the TUI's Pipeline tab shows).
+
+    ``config`` (#2951) is the ONLY place in this module that resolves the
+    per-repo half of the UAT gate's two-part opt-in — every issue on a given
+    repo shares the same ``repo_has_uat_preview`` answer, so it's resolved
+    once here (not re-derived per-issue by lower functions, which take the
+    already-resolved ``uat_enabled``/``uat_preview_url`` as plain values).
+    ``None`` (the default — e.g. a caller with no config loaded) means no
+    repo is treated as opted in, matching :func:`pipeline_stage_names`'s own
+    fail-toward-hidden default.
     """
     is_closed_by_key: dict[tuple[str, int], bool] = {
         (i["repo_name"], i["number"]): str(i.get("state", "")).lower() == "closed"
@@ -681,17 +817,29 @@ def compute_board_stage_projection(
 
     keys = set(is_closed_by_key) | set(assignments_by_key)
 
+    uat_enabled_by_repo: dict[str, bool] = {}
+
     result: list[dict[str, Any]] = []
     for repo_name, issue_number in keys:
         key = (repo_name, issue_number)
         issue_assignments = assignments_by_key.get(key, [])
+        merge_entry = merge_by_key.get(key)
+        if repo_name not in uat_enabled_by_repo:
+            uat_enabled_by_repo[repo_name] = repo_has_uat_preview(repo_name, config)
+        uat_enabled = uat_enabled_by_repo[repo_name]
         entry = compute_issue_projection(
             issue_assignments,
-            merge_by_key.get(key),
+            merge_entry,
             is_closed=is_closed_by_key.get(key, False),
             require_plan=require_plan,
             default_gates=default_gates,
             ci_store=ci_store,
+            uat_enabled=uat_enabled,
+            uat_preview_url=(
+                uat_preview_url_for(repo_name, issue_number, merge_entry, config)
+                if uat_enabled
+                else None
+            ),
         )
         entry["repo_name"] = repo_name
         entry["issue_number"] = issue_number
