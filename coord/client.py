@@ -199,6 +199,44 @@ def post_board(svc: ServiceConfig, board: Board, *, timeout: float = _WRITE_TIME
     post_record(svc, "/board", serialize_board(board), timeout=timeout)
 
 
+def _reraise_with_detail(exc: httpx.HTTPStatusError) -> httpx.HTTPStatusError:
+    """#2907: fold the daemon's own ``{"error", "detail"}`` error body into the
+    raised exception's message.
+
+    ``serve_app.py``'s handlers answer a failure with the HTTP status code and
+    a ``{"error": "<label>", "detail": "<reason>"}`` body (see e.g.
+    ``post_assignment_session_id``) — plain ``resp.raise_for_status()``
+    discards that body, so every one of :func:`post_record`'s ~10 callers,
+    which all just catch ``httpx.HTTPError``/``Exception`` and render
+    ``str(e)``, only ever saw the generic status line ("503 Service
+    Unavailable"), never the daemon's own reason (e.g. a GitHub rate-limit
+    backoff active for another N seconds).
+
+    Mirrors ``coord.dispatch._reraise_with_body`` (#1527), the same fix for
+    the sibling ``agent_app.py`` assign-rejection body: always returns a
+    **new** ``httpx.HTTPStatusError`` carrying the *same* ``request``/
+    ``response`` as *exc*, so every existing ``except httpx.HTTPStatusError``
+    that itself inspects ``exc.response.status_code`` / ``exc.response.json()``
+    (e.g. ``coord.issue_store.post_result``, ``coord.state.close_issue``)
+    keeps working unchanged — only the message gains the detail.
+
+    ``detail`` is preferred over ``error`` when both are present, since it
+    carries the specific cause rather than the handler's own short label. A
+    non-JSON/empty body, or one with neither key, falls back to *exc*'s
+    original status-line message unchanged — degrading, never crashing,
+    while handling a failure that's already in flight.
+    """
+    reason = None
+    try:
+        body = exc.response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        reason = body.get("detail") or body.get("error")
+    message = f"{exc} — {reason}" if reason else str(exc)
+    return httpx.HTTPStatusError(message, request=exc.request, response=exc.response)
+
+
 def post_record(
     svc: ServiceConfig,
     path: str,
@@ -213,11 +251,20 @@ def post_record(
     writing the local DB, so a thin client's result lands on the one shared DB.
     Raises ``httpx.HTTPError`` on transport/HTTP failure — the seam decides
     whether that is fatal (``post_result``) or best-effort (``post_completion``).
+
+    #2907: an HTTP error response's message carries the daemon's own
+    ``detail``/``error`` reason (see :func:`_reraise_with_detail`) rather than
+    just the generic status line — a transport failure (connection refused,
+    timeout) never reaches this and is unaffected, since there is no response
+    body to read.
     """
     resp = httpx.post(
         f"{svc.url}{path}", json=payload, headers=_headers(svc), timeout=timeout
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _reraise_with_detail(exc) from exc
     return resp.json()
 
 
