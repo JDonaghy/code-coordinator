@@ -323,7 +323,13 @@ def dispatch_acceptance_mock(
             required_gates=list(config.pipeline.default_gates),
         )
     else:
-        issues = _fetch_milestone_issues(repo_cfg.github, milestone_number)
+        # #2969: Gate A's contract IS the spec — anything truncated here
+        # becomes silent guesswork in `contract.md`. Unlike milestone-chat's
+        # own cohort/dependency-inference use of this fetcher, hand the
+        # mock-author every body in full (no `max_body_chars` cap).
+        issues = _fetch_milestone_issues(
+            repo_cfg.github, milestone_number, max_body_chars=None
+        )
 
         briefing = build_mock_author_briefing(
             repo_slug=repo_cfg.github,

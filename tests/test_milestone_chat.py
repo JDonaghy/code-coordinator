@@ -223,6 +223,18 @@ def test_fetch_milestone_issues_returns_empty_on_failure():
     assert out == []
 
 
+def test_fetch_milestone_issues_max_body_chars_none_disables_truncation():
+    """#2969: Gate A's mock-author passes `max_body_chars=None` so it sees
+    every issue body in full — the cap below is this module's own default,
+    not a hard-coded floor other callers are stuck with."""
+    long_body = "x" * (milestone_chat.MAX_ISSUE_BODY_CHARS + 500)
+    issues = [{"number": 1, "title": "T", "body": long_body, "milestone": {"number": 9}}]
+    with patch("coord.github_ops.get_open_issues", return_value=issues):
+        out = milestone_chat._fetch_milestone_issues("acme/api", 9, max_body_chars=None)
+    assert out[0]["body"] == long_body
+    assert "(truncated)" not in out[0]["body"]
+
+
 # ── pick_milestone_chat_machine ──────────────────────────────────────────────
 
 

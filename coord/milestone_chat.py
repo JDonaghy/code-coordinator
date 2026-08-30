@@ -57,15 +57,28 @@ def pick_milestone_chat_machine(cfg: Config, repo: str) -> Machine | None:
     return pick_refinement_machine(cfg, repo)
 
 
-def _fetch_milestone_issues(slug: str, milestone_number: int) -> list[dict]:
+def _fetch_milestone_issues(
+    slug: str,
+    milestone_number: int,
+    *,
+    max_body_chars: int | None = MAX_ISSUE_BODY_CHARS,
+) -> list[dict]:
     """Best-effort fetch of open issues under *milestone_number*.
 
-    Returns a list of ``{"number", "title", "body"}`` dicts (bodies
-    truncated to ``MAX_ISSUE_BODY_CHARS`` so cohort/dependency inference has
-    signal without blowing the prompt budget), capped at ``MAX_ISSUES``.
-    Returns an empty list on any failure so the seed briefing still works
-    without issue context — the operator can still chat, just with less to
-    go on.
+    Returns a list of ``{"number", "title", "body"}`` dicts, capped at
+    ``MAX_ISSUES``. Returns an empty list on any failure so the seed
+    briefing still works without issue context — the operator can still
+    chat, just with less to go on.
+
+    *max_body_chars* defaults to ``MAX_ISSUE_BODY_CHARS`` (bodies truncated
+    so cohort/dependency inference has signal without blowing the prompt
+    budget) — that trade is right for *this* module's job, a chat session
+    inferring dependencies from a digest. It is wrong for a caller whose
+    entire output is derived from the body text itself: #2969 found Gate A's
+    mock-author (`coord/mock_author.py`) reusing this same cap, silently
+    handing it 36-82% of each issue's spec and leaving it to notice and flag
+    the gap in its own contract. Pass ``max_body_chars=None`` for callers
+    like that, where a body must arrive in full or not at all.
     """
     try:
         issues = github_ops.get_open_issues(slug)
@@ -78,8 +91,8 @@ def _fetch_milestone_issues(slug: str, milestone_number: int) -> list[dict]:
     out: list[dict] = []
     for issue in under_milestone[:MAX_ISSUES]:
         body = (issue.get("body") or "").strip()
-        if len(body) > MAX_ISSUE_BODY_CHARS:
-            body = body[:MAX_ISSUE_BODY_CHARS] + "\n...(truncated)"
+        if max_body_chars is not None and len(body) > max_body_chars:
+            body = body[:max_body_chars] + "\n...(truncated)"
         out.append({
             "number": issue.get("number"),
             "title": issue.get("title") or "",
