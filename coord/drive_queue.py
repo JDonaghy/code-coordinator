@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
+from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
     PLAN_READY,
@@ -3425,6 +3426,42 @@ def _reconcile_running(
             None,
         )
 
+    # #2977: `coord assign` exited because `_gh`'s pre-call guard found a
+    # shared GitHub rate-limit backoff already active and skipped the call
+    # entirely (`GhRateLimitError(from_cache=True)`) — no `gh` call was ever
+    # attempted for this launch. That is neither a permanent refusal (the
+    # `is_policy_refusal_reason`/`is_gate_a_refusal_reason` shapes above —
+    # nothing about the ISSUE was rejected) nor a genuine dispatch failure
+    # (the generic `_dispatch_produced_nothing` note below, which would
+    # spend an attempt): it is a fleet-wide, known-duration condition this
+    # entry had nothing to do with. Parks WITHOUT spending an attempt
+    # (`Reconcile.updates` carries no `attempts` key, same as every other
+    # park above) — the wall-clock `until=` timestamp
+    # `github_ops.format_throttle_skip_reason` embedded in `own_reason` is
+    # what lets `plan_tick`'s parked-entry sweep resume it the moment the
+    # backoff clears, with no live re-check and no operator action, unlike
+    # the gate_a/policy parks just above which need one.
+    if own_reason and is_throttle_skip_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt; the queue "
+            "resumes it automatically once the backoff clears, no operator "
+            "needed (#2977)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     permanent: tuple[str, str] | None = None
     if own_reason and (exit_refused or {}).get(entry.key):
         permanent = (
@@ -5007,6 +5044,59 @@ def plan_tick(
         # bounce this check exists to prevent. Stays parked until a human
         # clears it (`coord drive-queue remove`, same as `blocked`).
         if is_policy_refusal_reason(entry.last_reason):
+            continue
+        # #2977: a throttle-skip park (`github_ops.is_throttle_skip_reason`)
+        # carries its OWN known wall-clock expiry (`until=<epoch>`, embedded
+        # by `github_ops.format_throttle_skip_reason` at park time) — unlike
+        # the CI-park default below, which needs a live re-check because it
+        # has no way to know in advance when checks will report, this park
+        # can resume on a plain clock comparison, no I/O at all. `now is
+        # None` (a pure-logic caller with no clock) degrades to "never
+        # resume this tick", same posture #1794's grace window uses for the
+        # same input. An unparseable `until` (should not happen for text
+        # this module itself wrote) or a wait that has run well past
+        # `PARK_STALE_SECONDS` — far longer than any real backoff
+        # (`coord.github_throttle.MAX_BACKOFF_S` is 900s) — resumes anyway
+        # rather than parking indefinitely on a reading nothing can refresh,
+        # the same finite-wait guarantee #2158 already gives the CI park.
+        if is_throttle_skip_reason(entry.last_reason):
+            if now is None:
+                continue
+            until = parse_throttle_skip_until(entry.last_reason)
+            age = now - entry.reason_at if entry.reason_at is not None else None
+            cleared = until is not None and now >= until
+            stale = until is None or (age is not None and age > PARK_STALE_SECONDS)
+            if not cleared and not stale:
+                continue
+            reason = (
+                (
+                    f"the GitHub rate-limit backoff that parked {entry.key} "
+                    "has cleared — resuming without spending an attempt "
+                    "(#2977)"
+                )
+                if cleared
+                else (
+                    f"{entry.last_reason} — this throttle-skip park has run "
+                    f"{PARK_STALE_SECONDS / 60:.0f}m+ with no refreshable "
+                    "expiry left to trust — resuming rather than parking "
+                    "indefinitely (#2977)"
+                )
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "resumed",
+                    reason,
+                    occupies=False,
+                    updates={
+                        "state": STATE_WAITING,
+                        "attempts": 0,
+                        "last_reason": reason,
+                    },
+                )
+            )
+            states[entry.key] = STATE_WAITING
+            effective_attempts[entry.key] = 0
             continue
         if park_expired is not None:
             # Deliberately does NOT claim CI has reported — nothing here knows

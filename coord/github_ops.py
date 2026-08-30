@@ -100,6 +100,108 @@ class GhRateLimitError(GhTransientError):
         self.from_cache = from_cache
 
 
+# ── #2977: coord-assign-side signal for a throttle-SKIPPED gh call ─────────
+#
+# `_gh`'s pre-call guard above raises `GhRateLimitError(from_cache=True)`
+# WITHOUT ever making a network call, whenever a shared backoff
+# (:mod:`coord.github_throttle`) is already known active — see that raise's
+# own comment. Before this, that distinction was lost the moment it crossed
+# the `coord assign` subprocess boundary: the caller (`coord/drive.py`)
+# just saw a bare non-zero exit and folded it into the same generic "drive
+# died" bucket as a real infrastructure failure, so `coord/drive_queue.py`'s
+# tick spent one of the entry's two launch attempts on a call that never
+# even reached GitHub (the 2026-08-30 `coord-portal#161` incident this
+# closes — see the issue for the full trace).
+#
+# `EX_TEMPFAIL` is the conventional (sysexits.h) code for "temporary
+# failure, retry later" — used by :mod:`coord.commands.dispatch`'s `assign`
+# command to give this ONE failure shape a distinct exit status. That is
+# necessary but not sufficient for `coord/drive_queue.py`'s pure tick logic
+# to act on: the exit code alone carries no expiry, and by the time a
+# `drive_exited` audit row is read back the file that raised the original
+# `GhRateLimitError` is long gone, so there is nothing left to re-consult.
+# `format_throttle_skip_reason` instead embeds everything the tick needs —
+# the marker, and an absolute `until=<epoch>` wall-clock timestamp — directly
+# in the human-readable reason text that already survives the subprocess
+# boundary unmodified (`coord.drive.Driver._spawn` captures the child's
+# stdout+stderr verbatim into `_last_run_output`, which flows straight into
+# the `drive_exited` audit summary `coord/commands/drive_queue.py`'s
+# `_fetch_exit_reasons` reads back as `own_reason` — no protocol change
+# needed on that path at all). `is_throttle_skip_reason`/
+# `parse_throttle_skip_until` are `coord/drive_queue.py`'s read side: pure
+# text parsing, no I/O, so `_reconcile_running`'s park (and its wall-clock
+# resume, no live re-check needed) stay exactly as pure as every other
+# branch in that module.
+THROTTLE_SKIP_MARKER = "[gh-throttle-skipped #2977]"
+
+#: The conventional sysexits.h "temporary failure, please try again" code —
+#: distinct from every other exit status `coord assign` uses (see
+#: `coord.drive.EXIT_DISPATCH_REFUSED`/`EXIT_DEAD_END` for the other two
+#: exit codes a downstream reader must be able to tell apart from "died").
+EX_TEMPFAIL = 75
+
+_THROTTLE_SKIP_UNTIL_RE = re.compile(r"until=([0-9]+(?:\.[0-9]+)?)")
+
+
+def format_throttle_skip_reason(exc: GhRateLimitError, *, now: float | None = None) -> str:
+    """Canonical, parseable text for a ``coord assign`` refusal caused by a
+    throttle-SKIPPED ``gh`` call (``exc.from_cache`` — see
+    :class:`GhRateLimitError`'s docstring).  Wraps ``str(exc)`` (already
+    carries the reason/status/request-id `_gh` recovered) with
+    :data:`THROTTLE_SKIP_MARKER` and an absolute ``until=`` epoch timestamp
+    that :func:`parse_throttle_skip_until` recovers later, with no clock of
+    its own and no access to :mod:`coord.github_throttle` needed.
+
+    ``exc.retry_after_s`` is "seconds remaining AT THE MOMENT ``_gh`` raised"
+    — a value that goes stale the instant it's read back, which is exactly
+    why an absolute timestamp is embedded here (computed once, at the one
+    point in this whole path that has both a fresh clock and the exception)
+    rather than a duration re-derived downstream. Falls back to
+    :data:`coord.github_throttle.DEFAULT_BACKOFF_S` when ``retry_after_s``
+    is ``None`` (the pre-call guard's own fallback wording already reads
+    "GitHub's guidance" in that case, so this mirrors it rather than
+    inventing a shorter window with no evidence behind it).
+    """
+    now = now if now is not None else time.time()
+    retry_after = (
+        exc.retry_after_s if exc.retry_after_s is not None else github_throttle.DEFAULT_BACKOFF_S
+    )
+    until = now + max(0.0, retry_after)
+    return (
+        f"{THROTTLE_SKIP_MARKER} {exc} — no gh call was made for this launch "
+        f"attempt, so it should not spend one (#2977); until={until:.3f}"
+    )
+
+
+def is_throttle_skip_reason(text: str | None) -> bool:
+    """``True`` when *text* is (or contains) a :func:`format_throttle_skip_reason`
+    result — the same marker-based convention as
+    ``coord.models.is_policy_refusal_reason``/``coord.gate_a.
+    is_gate_a_refusal_reason``, so ``coord/drive_queue.py`` can recognise this
+    park from plain reason text with no I/O.
+    """
+    return bool(text) and THROTTLE_SKIP_MARKER in text
+
+
+def parse_throttle_skip_until(text: str | None) -> float | None:
+    """The absolute epoch ``until=`` timestamp embedded by
+    :func:`format_throttle_skip_reason`, or ``None`` when *text* doesn't
+    carry the marker at all, or carries it without a parseable timestamp
+    (defensive — should not happen for text this module itself wrote, but a
+    hand-edited row or a future format change must degrade to "unknown",
+    never a wrong resume time).
+    """
+    if not is_throttle_skip_reason(text):
+        return None
+    m = _THROTTLE_SKIP_UNTIL_RE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 class GhTooOldForJsonChecks(GhError):
     """Raised when the installed ``gh`` doesn't support ``gh pr checks --json``
     *at all* (#1564 Addendum 2), as opposed to supporting ``--json`` but

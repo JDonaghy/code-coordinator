@@ -495,6 +495,68 @@ class TestAssignDispatch:
         assert result.exit_code == 1
         assert "could not fetch issue" in result.output
 
+    def test_issue_fetch_throttle_skip_exits_distinctly(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#2977: a `GhRateLimitError(from_cache=True)` — `_gh`'s pre-call
+        guard skipped this `gh issue view` call WITHOUT making a network
+        call because a shared rate-limit backoff was already known active
+        — is a categorically different failure from an ordinary fetch error
+        (the generic `RuntimeError` case just above, still exit `1`). It
+        must exit `github_ops.EX_TEMPFAIL`, and the printed message must
+        carry `THROTTLE_SKIP_MARKER` plus an absolute `until=` timestamp, so
+        `coord drive-queue`'s tick (`coord/drive_queue.py`'s
+        `is_throttle_skip_reason`/`parse_throttle_skip_until`) can park this
+        launch without spending one of its two attempts instead of treating
+        it like a genuine dispatch failure (the `coord-portal#161`
+        incident)."""
+        from coord.github_ops import EX_TEMPFAIL, GhRateLimitError, THROTTLE_SKIP_MARKER
+
+        with patch(
+            "coord.github_ops.get_issue",
+            side_effect=GhRateLimitError(
+                "gh issue view 999 --repo acme/api --json ... skipped: GitHub "
+                "secondary_rate_limit backoff active for 59s more "
+                "(status=403, request_id=abc123)",
+                status_code=403, request_id="abc123", retry_after_s=59.0,
+                secondary=True, from_cache=True,
+            ),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "999", "--config", str(config_file)],
+            )
+        assert result.exit_code == EX_TEMPFAIL
+        assert result.exit_code != 1
+        assert "could not fetch issue" in result.output
+        assert THROTTLE_SKIP_MARKER in result.output
+        assert "until=" in result.output
+
+    def test_issue_fetch_real_rate_limit_hit_keeps_the_generic_exit(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """The counterpart: a `GhRateLimitError` from an ACTUAL network call
+        (`from_cache=False`) is a genuine observation, not a skip — it must
+        keep exiting the generic `1` the `RuntimeError` case above does, not
+        `EX_TEMPFAIL`, so it is never mistaken for the zero-attempt-cost
+        skip class this issue fixes."""
+        from coord.github_ops import GhRateLimitError
+
+        with patch(
+            "coord.github_ops.get_issue",
+            side_effect=GhRateLimitError(
+                "gh issue view 999 --repo acme/api --json ... failed: API "
+                "rate limit exceeded",
+                status_code=403, retry_after_s=60.0, from_cache=False,
+            ),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "999", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "could not fetch issue" in result.output
+
     def test_briefing_post_failure_is_nonfatal(
         self, config_file: Path, coord_dir: Path
     ) -> None:

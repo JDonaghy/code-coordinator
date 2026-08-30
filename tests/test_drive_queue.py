@@ -2853,6 +2853,165 @@ def test_a_policy_refusal_still_reconciles_to_done_if_it_lands_by_hand():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2977: a throttle-SKIPPED `gh` call — `_gh`'s pre-call guard found a shared
+# GitHub rate-limit backoff (coord.github_throttle) already active and
+# raised `GhRateLimitError(from_cache=True)` WITHOUT ever making a network
+# call — must not be charged like a real dispatch failure. It parks (like
+# Gate-A/policy above) rather than blocking, spends no attempt, AND —
+# unlike Gate-A/policy, which wait on an external verdict — resumes itself
+# the instant the embedded wall-clock `until=` timestamp passes, no live
+# re-check and no operator action needed. coord-portal#161, 2026-08-30: two
+# such skips in a row parked the keystone of a 9-entry milestone.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _throttle_skip_reason(*, now: float, retry_after_s: float = 59.0) -> str:
+    """A realistic `own_reason` string for a `running` entry whose launch
+    died on a throttle-skipped `coord assign` — i.e. exactly what
+    `coord/commands/drive_queue.py`'s `_fetch_exit_reasons` would read back
+    from the `drive_exited` audit row once `coord.drive.Driver._spawn`
+    folds the child's stderr (built by `coord/commands/dispatch.py`'s
+    `assign` command from `github_ops.format_throttle_skip_reason`) into
+    the summary — see this module's own #2977 comment for the full chain.
+    """
+    from coord.github_ops import GhRateLimitError, format_throttle_skip_reason
+
+    exc = GhRateLimitError(
+        "gh issue view 161 --repo JDonaghy/coord-portal --json "
+        "number,title,body,state,milestone,labels skipped: GitHub "
+        "secondary_rate_limit backoff active for "
+        f"{retry_after_s:.0f}s more (status=403, "
+        "request_id=A654:2496C0:1E674B6:66A49BB:6A94A599)",
+        status_code=403,
+        request_id="A654:2496C0:1E674B6:66A49BB:6A94A599",
+        retry_after_s=retry_after_s,
+        secondary=True,
+        from_cache=True,
+    )
+    skip_reason = format_throttle_skip_reason(exc, now=now)
+    return (
+        f"drive exited for {REPO}#161 (exit_code=75): coord assign precision "
+        f"{REPO} 161 --driven-by drive:{REPO}#161 exited 75\n   output: "
+        f"error: could not fetch issue #161: {skip_reason}"
+    )
+
+
+def test_format_and_parse_throttle_skip_reason_round_trip():
+    """The seam `coord/drive_queue.py` actually depends on: the marker and
+    the absolute `until=` timestamp `format_throttle_skip_reason` embeds
+    must survive being read back by `is_throttle_skip_reason`/
+    `parse_throttle_skip_until` with no clock and no I/O."""
+    from coord.github_ops import (
+        GhRateLimitError,
+        format_throttle_skip_reason,
+        is_throttle_skip_reason,
+        parse_throttle_skip_until,
+    )
+
+    exc = GhRateLimitError(
+        "gh ... skipped: GitHub secondary_rate_limit backoff active for "
+        "10s more (status=403, request_id=abc)",
+        retry_after_s=10.0, secondary=True, from_cache=True,
+    )
+    reason = format_throttle_skip_reason(exc, now=NOW)
+    assert is_throttle_skip_reason(reason)
+    assert parse_throttle_skip_until(reason) == pytest.approx(NOW + 10.0)
+    assert not is_throttle_skip_reason("an ordinary death, nothing to do with gh")
+    assert parse_throttle_skip_until("an ordinary death") is None
+
+
+def test_a_throttle_skipped_gh_call_parks_without_spending_an_attempt():
+    reason = _throttle_skip_reason(now=NOW)
+    entries = [entry(161, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 161): reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == STATE_PARKED
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()  # NOT terminal `blocked`
+    assert plan.launch is None
+
+
+def test_a_throttle_skipped_gh_call_deep_into_the_attempt_budget_still_spends_none():
+    reason = _throttle_skip_reason(now=NOW)
+    entries = [entry(161, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 161): reason},
+    )
+    assert plan.reconciles[0].outcome == "parked"  # not "exhausted"
+    assert plan.blocked == ()
+
+
+def test_a_parked_throttle_skip_stays_parked_before_the_backoff_clears():
+    reason = _throttle_skip_reason(now=NOW, retry_after_s=120.0)
+    entries = [
+        entry(161, position=3, state="parked", attempts=0,
+              last_reason=reason, reason_at=NOW)
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW + 30.0)
+    assert plan.reconciles == ()  # still parked — backoff has not cleared yet
+    assert plan.launch is None
+
+
+def test_a_parked_throttle_skip_resumes_the_instant_the_backoff_clears():
+    """The acceptance criterion: no operator action, no `remove`+`add` — the
+    entry wakes itself exactly when `Backoff.until` passes."""
+    reason = _throttle_skip_reason(now=NOW, retry_after_s=59.0)
+    entries = [
+        entry(161, position=3, state="parked", attempts=1,
+              last_reason=reason, reason_at=NOW)
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW + 60.0)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+
+
+def test_a_parked_throttle_skip_with_no_clock_never_resumes():
+    """`now=None` (a pure-logic caller) must never guess a resume — same
+    fail-closed posture #1794's grace window uses for the same input."""
+    reason = _throttle_skip_reason(now=NOW, retry_after_s=1.0)
+    entries = [
+        entry(161, position=3, state="parked", attempts=0, last_reason=reason)
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()
+
+
+def test_a_parked_throttle_skip_with_unparseable_until_resumes_past_the_2158_ceiling():
+    """Defensive: text carrying the marker with no parseable `until=` (a
+    hand-edited row, or a future format change) must still be FINITE — never
+    a silent infinite park — bounded by the same `PARK_STALE_SECONDS`
+    ceiling #2158 already gives the CI park."""
+    from coord.github_ops import THROTTLE_SKIP_MARKER
+
+    reason = f"drive exited: {THROTTLE_SKIP_MARKER} gh skipped, no until recorded"
+    entries = [
+        entry(161, position=3, state="parked", attempts=0,
+              last_reason=reason, reason_at=NOW - PARK_STALE_SECONDS - 60)
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+
+
+def test_a_throttle_skip_still_reconciles_to_done_if_it_lands_by_hand():
+    reason = _throttle_skip_reason(now=NOW)
+    entries = [entry(161, position=3, state="parked", attempts=0,
+                      last_reason=reason)]
+    plan = plan_tick(entries, board(merged=(161,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #2850: a drive that exits 0 having MERGED must reconcile straight to
 # `done`, never `retry` — before this fix, `own_reason` carried the drive's
 # own "✓ MERGED — … has landed" text but `_reconcile_running` never read it
