@@ -278,6 +278,102 @@ def _probe_playwright_browsers(prereq: Prereq, _timeout: float) -> ToolProbe:
     )
 
 
+# --- `windows` capability: the msvc cross-target lives per-toolchain (#2952) --
+#
+# dell64's Windows toolchain is a WSL-side cross-compile: `rustup target add
+# x86_64-pc-windows-msvc` plus `cargo install cargo-xwin` (for the MSVC
+# CRT/SDK cargo-xwin downloads and caches). `cargo-xwin` is an ordinary
+# binary probe, same shape as `cargo`/`opencode` below. The target is not —
+# `rustup target list --installed` is scoped to whichever toolchain is
+# *active*, and quadraui pins a specific one in `rust-toolchain.toml`
+# (`1.97.1` at the time of writing). Adding the target only to the default
+# toolchain leaves the pinned one without it, and a probe that only checked
+# the default would report MET while quadraui's own build still fails —
+# laundering an unbacked claim into a verified one, which is worse than no
+# probe at all. So this asserts the target against EVERY installed
+# toolchain and names the offending one in `what_breaks` when it's missing
+# from any of them.
+WINDOWS_MSVC_TARGET = "x86_64-pc-windows-msvc"
+
+
+def _rustup_toolchains(timeout: float) -> list[str]:
+    """Names of every installed rustup toolchain (`rustup toolchain list`).
+
+    Returns `[]` if `rustup` itself is missing or the call fails — the
+    caller treats that as "cannot confirm the target is installed" rather
+    than raising.
+    """
+    if shutil.which("rustup") is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["rustup", "toolchain", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    toolchains = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `rustup toolchain list` suffixes the active one with "(default)"
+        # (and possibly "(override)") — strip it, `--toolchain` wants the
+        # bare name.
+        toolchains.append(line.split()[0])
+    return toolchains
+
+
+def _toolchain_has_target(toolchain: str, target: str, timeout: float) -> bool:
+    try:
+        result = subprocess.run(
+            ["rustup", "target", "list", "--installed", "--toolchain", toolchain],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    installed = {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    return target in installed
+
+
+def _probe_windows_msvc_target(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `windows` capability's cross-target check
+    (#2952). See the module comment above `WINDOWS_MSVC_TARGET` for why this
+    cannot be a plain binary probe."""
+    toolchains = _rustup_toolchains(timeout)
+    if not toolchains:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                "rustup reports no installed toolchains (or rustup itself "
+                f"is missing on PATH) — {prereq.what_breaks}"
+            ),
+        )
+    missing = [
+        tc for tc in toolchains
+        if not _toolchain_has_target(tc, WINDOWS_MSVC_TARGET, timeout)
+    ]
+    if missing:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"{WINDOWS_MSVC_TARGET} missing from toolchain(s) "
+                f"{', '.join(missing)} — {prereq.what_breaks}"
+            ),
+        )
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=", ".join(sorted(toolchains)), min_version=prereq.min_version,
+        meets_floor=None, what_breaks=prereq.what_breaks,
+    )
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -377,6 +473,33 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "or drop `provider:opencode` from this machine's capabilities"
         ),
         custom_probe=_probe_opencode,
+    ),
+    # #2952: backs the `windows` capability — dell64's WSL-side cross-compile
+    # to `x86_64-pc-windows-msvc` via cargo-xwin, routing quadraui's
+    # `src/win/` (and vimcode's equivalent) Win-GUI work. Two independent
+    # things can silently regress in that one home directory: the
+    # `cargo-xwin` binary (`~/.cargo/bin`) and the rustup target (see
+    # `_probe_windows_msvc_target` above for why that one needs its own
+    # custom probe rather than a plain binary check).
+    Prereq(
+        tool="cargo-xwin", binary="cargo-xwin", version_args=("--version",),
+        version_re=r"(\d+\.\d+\.\d+\S*)", min_version=None, capability="windows",
+        what_breaks=(
+            "quadraui's `--target x86_64-pc-windows-msvc` cross-compile "
+            "cannot link against the MSVC CRT/SDK — `cargo install "
+            "cargo-xwin`"
+        ),
+    ),
+    Prereq(
+        tool="windows-msvc-target", binary="", version_args=(), version_re="",
+        min_version=None, capability="windows",
+        what_breaks=(
+            f"`rustup target add {WINDOWS_MSVC_TARGET}` is missing from an "
+            "installed toolchain — quadraui pins one in rust-toolchain.toml, "
+            "so add the target to it explicitly, not just the default "
+            "toolchain (#2952)"
+        ),
+        custom_probe=_probe_windows_msvc_target,
     ),
 )
 

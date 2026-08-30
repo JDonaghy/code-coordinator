@@ -534,6 +534,171 @@ class TestProviderOpencodeCapabilityManifest:
         assert "not found" in unmet["provider:opencode"][0]
 
 
+class TestWindowsCapabilityManifest:
+    """#2952: `windows` (dell64's WSL-side cross-compile to
+    x86_64-pc-windows-msvc) is backed by two independent prereqs — the
+    `cargo-xwin` binary and the rustup target, checked per-toolchain."""
+
+    def _windows_prereqs(self):
+        return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "windows"]
+
+    def test_backed_by_cargo_xwin_and_the_msvc_target(self) -> None:
+        assert {p.tool for p in self._windows_prereqs()} == {
+            "cargo-xwin", "windows-msvc-target",
+        }
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["windows"])
+        assert {"cargo-xwin", "windows-msvc-target"} <= set(probes)
+        assert "cargo" not in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "cargo-xwin" not in probes_undeclared
+        assert "windows-msvc-target" not in probes_undeclared
+
+    def test_cargo_xwin_missing_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["windows"])
+        assert probes["cargo-xwin"].found is False
+        assert probes["cargo-xwin"].ok is False
+
+    def test_cargo_xwin_present_extracts_version(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/root/.cargo/bin/cargo-xwin"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="cargo-xwin 0.17.5\n", returncode=0),
+             ):
+            probes = prereqs.probe_all(["windows"])
+        assert probes["cargo-xwin"].found is True
+        assert probes["cargo-xwin"].version == "0.17.5"
+        assert probes["cargo-xwin"].ok is True
+
+    def test_target_probe_is_a_custom_probe_not_a_binary_check(self) -> None:
+        """No single binary's `--version` answers "is the target
+        installed" — this prereq must delegate entirely to a custom probe,
+        never fall through to the generic `shutil.which` path."""
+        target_prereq = next(
+            p for p in self._windows_prereqs() if p.tool == "windows-msvc-target"
+        )
+        assert target_prereq.custom_probe is not None
+
+    def test_target_missing_when_rustup_itself_is_absent(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["windows"])
+        assert probes["windows-msvc-target"].found is False
+        assert "no installed toolchains" in probes["windows-msvc-target"].what_breaks
+
+    def test_target_present_on_the_only_installed_toolchain(self) -> None:
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["rustup", "toolchain"]:
+                return _Result(stdout="stable-x86_64-unknown-linux-gnu (default)\n", returncode=0)
+            if cmd[:2] == ["rustup", "target"]:
+                return _Result(
+                    stdout="x86_64-pc-windows-msvc\nx86_64-unknown-linux-gnu\n",
+                    returncode=0,
+                )
+            return _Result(returncode=0)
+
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/rustup"), \
+             patch("coord.prereqs.subprocess.run", side_effect=fake_run):
+            probes = prereqs.probe_all(["windows"])
+        assert probes["windows-msvc-target"].found is True
+        assert probes["windows-msvc-target"].ok is True
+
+    def test_target_missing_from_the_pinned_toolchain_reports_unmet(self) -> None:
+        """The #2952 trap: the target was added to the default toolchain
+        but not to quadraui's `rust-toolchain.toml` pin (1.97.1) — a probe
+        that only checked the default toolchain would report MET while
+        quadraui's own build still fails. Must check every toolchain and
+        name the offending one."""
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["rustup", "toolchain"]:
+                return _Result(
+                    stdout=(
+                        "stable-x86_64-unknown-linux-gnu (default)\n"
+                        "1.97.1-x86_64-unknown-linux-gnu\n"
+                    ),
+                    returncode=0,
+                )
+            if cmd[:2] == ["rustup", "target"]:
+                toolchain = cmd[cmd.index("--toolchain") + 1]
+                if toolchain == "1.97.1-x86_64-unknown-linux-gnu":
+                    return _Result(stdout="x86_64-unknown-linux-gnu\n", returncode=0)
+                return _Result(
+                    stdout="x86_64-pc-windows-msvc\nx86_64-unknown-linux-gnu\n",
+                    returncode=0,
+                )
+            return _Result(returncode=0)
+
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/rustup"), \
+             patch("coord.prereqs.subprocess.run", side_effect=fake_run):
+            probes = prereqs.probe_all(["windows"])
+        result = probes["windows-msvc-target"]
+        assert result.found is False
+        assert result.ok is False
+        assert "1.97.1-x86_64-unknown-linux-gnu" in result.what_breaks
+
+    def test_target_probe_never_raises_on_a_broken_rustup(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/rustup"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 side_effect=subprocess.TimeoutExpired(cmd="rustup", timeout=10),
+             ):
+            probes = prereqs.probe_all(["windows"])
+        assert probes["windows-msvc-target"].found is False
+        assert probes["windows-msvc-target"].ok is False
+
+    def test_unmet_when_cargo_xwin_missing(self) -> None:
+        probes = {
+            "cargo-xwin": prereqs.ToolProbe(
+                tool="cargo-xwin", capability="windows", found=False, version=None,
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+            "windows-msvc-target": prereqs.ToolProbe(
+                tool="windows-msvc-target", capability="windows", found=True,
+                version="stable", min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["windows"], probes)
+        assert "windows" in unmet
+        assert len(unmet["windows"]) == 1
+        assert "cargo-xwin not found" in unmet["windows"][0]
+
+    def test_unmet_when_target_missing(self) -> None:
+        probes = {
+            "cargo-xwin": prereqs.ToolProbe(
+                tool="cargo-xwin", capability="windows", found=True, version="0.17.5",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+            "windows-msvc-target": prereqs.ToolProbe(
+                tool="windows-msvc-target", capability="windows", found=False,
+                version=None, min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["windows"], probes)
+        assert "windows" in unmet
+        assert "windows-msvc-target not found" in unmet["windows"][0]
+
+    def test_met_when_both_probes_pass(self) -> None:
+        probes = {
+            tool: prereqs.ToolProbe(
+                tool=tool, capability="windows", found=True, version="x",
+                min_version=None, meets_floor=None, what_breaks="",
+            )
+            for tool in ("cargo-xwin", "windows-msvc-target")
+        }
+        assert prereqs.unmet_capabilities(["windows"], probes) == {}
+
+    def test_all_capability_names_includes_windows(self) -> None:
+        """#2952 acceptance: `ALL_CAPABILITY_NAMES` is derived from
+        `CAPABILITY_PREREQS`, so adding these two entries must pick
+        `windows` up automatically — no separate registration needed for a
+        config-free agent to probe it too (see TestAllCapabilityNames)."""
+        assert "windows" in prereqs.ALL_CAPABILITY_NAMES
+
+
 class TestGhFloorIsSingleSourceOfTruth:
     def test_baseline_gh_prereq_imports_the_floor(self) -> None:
         """#1564's constant stays the single source of truth — this module
