@@ -652,6 +652,88 @@ def test_diff_touched_sealed_paths_no_match() -> None:
     assert _diff_touched_sealed_paths(diff, ["tests/acceptance/"]) == []
 
 
+# ── #2966: coordinator-owned doc tamper check ───────────────────────────────
+#
+# "Only the coordinator writes docs" was prose-only — repo.coordinator_only_
+# files was set by zero repos fleet-wide, so nothing structurally backstopped
+# a worker rewriting the repo's own CLAUDE.md. Mirrors the #944 sealed-paths
+# tamper checks above, but the rule never inverts by assignment_type: no
+# dispatched type's job is ever editing the rulebook.
+
+def test_briefing_no_coordinator_doc_paths_by_default() -> None:
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    assert "COORDINATOR-OWNED" not in briefing
+    assert "Coordinator-owned docs" not in briefing
+
+
+def test_briefing_coordinator_doc_reminder_when_diff_untouched() -> None:
+    diff = (
+        "diff --git a/src/foo.py b/src/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+added_line = 1\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=2966, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        coordinator_doc_paths=["CLAUDE.md"],
+    )
+    assert "## Coordinator-owned docs (do not touch)" in briefing
+    assert "CLAUDE.md" in briefing
+    assert "COORDINATOR-OWNED DOC EDITED" not in briefing
+
+
+def test_briefing_flags_tamper_when_diff_touches_coordinator_doc() -> None:
+    diff = (
+        "diff --git a/CLAUDE.md b/CLAUDE.md\n"
+        "--- a/CLAUDE.md\n"
+        "+++ b/CLAUDE.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+some rewritten rule\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=2966, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        coordinator_doc_paths=["CLAUDE.md"],
+    )
+    assert "COORDINATOR-OWNED DOC EDITED" in briefing
+    assert "CLAUDE.md" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_coordinator_doc_tamper_does_not_invert_for_test_author() -> None:
+    """Unlike sealed_paths, this rule never flips for test-author/mock-author
+    — no dispatched type's job is ever editing the repo's own rulebook."""
+    diff = (
+        "diff --git a/CLAUDE.md b/CLAUDE.md\n"
+        "--- a/CLAUDE.md\n"
+        "+++ b/CLAUDE.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+some rewritten rule\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=2966, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        coordinator_doc_paths=["CLAUDE.md"],
+        assignment_type="test-author",
+    )
+    assert "COORDINATOR-OWNED DOC EDITED" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
 # ── #1175: test-author/mock-author inverse tamper check ────────────────────
 
 
@@ -1831,6 +1913,34 @@ def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
     _, payload = client.calls[0]
     assert "Sealed paths (do not touch)" in payload["briefing"]
     assert "tests/acceptance/" in payload["briefing"]
+
+
+def test_dispatch_review_flags_coordinator_owned_docs_without_config(
+    two_machine_config: Config,
+) -> None:
+    """#2966: dispatch_review must thread coordinator_doc_paths through to
+    the briefing for EVERY repo, not just ones that configure
+    coordinator_only_files — two_machine_config's "api" repo sets neither."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert "Coordinator-owned docs (do not touch)" in payload["briefing"]
+    assert "CLAUDE.md" in payload["briefing"]
 
 
 def test_dispatch_review_threads_assignment_type_for_test_author_exemption(

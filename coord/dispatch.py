@@ -17,7 +17,7 @@ from coord.comments import (
     format_refused_policy,
 )
 from coord.config import Config
-from coord.models import Proposal, Repo
+from coord.models import Proposal, Repo, coordinator_owned_docs
 
 AGENT_PORT = 7433
 
@@ -582,9 +582,14 @@ def dispatch(
         deny_commands = repo.worker_permissions.deny
 
     # Resolve coordinator-only files (workers must not read or modify these).
-    files_forbidden: list[str] = []
-    if repo is not None and repo.coordinator_only_files:
-        files_forbidden = list(repo.coordinator_only_files)
+    # #2966: coordinator_only_files was set by zero repos fleet-wide, so this
+    # started empty for every work dispatch and only ever grew sealed
+    # acceptance paths below — never a doc. coordinator_owned_docs() unions
+    # in a fleet-wide default (the repo's own CLAUDE.md) regardless of
+    # whether coordinator_only_files is configured, so "only the coordinator
+    # writes docs" is enforced (advisory, like every non-oracle
+    # files_forbidden entry) without depending on 10 repos' worth of config.
+    files_forbidden: list[str] = coordinator_owned_docs(repo)
 
     # #944 sealing v1 (docs/ORACLE_LOOP.md): the acceptance oracle is
     # read-only/run-only for the worker — it's authored by an independent

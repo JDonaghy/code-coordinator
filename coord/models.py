@@ -423,6 +423,50 @@ CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 # which must also list it since it mutates GitHub via `gh pr create`.
 PR_HELPER_TYPE = "pr-helper"
 
+# #2966: "only the coordinator writes docs" (this repo's CLAUDE.md says so
+# for every worker) was text-only enforcement — `Repo.coordinator_only_files`
+# is the config key that was clearly designed to seed a work dispatch's
+# `files_forbidden` with the repo's shared docs (see `coord.dispatch.dispatch`
+# lines around #587), but it was set by ZERO of the fleet's 10 repos, so
+# `files_forbidden` started empty for every work dispatch and only ever
+# gained sealed acceptance paths (#944), never a doc. Two workers in the same
+# repo consequently rewrote the same CLAUDE.md section in the same week,
+# producing a semantic (prose) merge conflict that stalled a five-issue
+# cross-repo chain for ~98 ticks until an operator intervened.
+#
+# Mirror the #944 sealed-paths fix for the same class of problem: don't
+# depend on every operator remembering to configure this per repo. A repo's
+# own rulebook is auto-forbidden unconditionally — `coordinator_owned_docs()`
+# below UNIONS this default in regardless of what `coordinator_only_files`
+# says, the same way sealed acceptance paths are auto-added regardless of
+# `coordinator_only_files` (`coord.dispatch.dispatch`'s #944 comment).
+COORDINATOR_OWNED_DOC_DEFAULTS: tuple[str, ...] = ("CLAUDE.md",)
+
+
+def coordinator_owned_docs(repo: "Repo | None") -> list[str]:
+    """Coordinator-only doc paths for *repo* (#2966).
+
+    Returns :data:`COORDINATOR_OWNED_DOC_DEFAULTS` UNIONED with *repo*'s own
+    ``coordinator_only_files`` (if any), deduped and order-preserving
+    (defaults first). Callers use this instead of reading
+    ``repo.coordinator_only_files`` directly so the fleet-wide default keeps
+    applying even for the common case — today, every repo — where
+    ``coordinator_only_files`` is unset.
+
+    #1388-style fail-open: some ``Repo``-shaped stand-ins (a
+    wire-reconstructed object, or a stale install predating this field)
+    don't carry ``coordinator_only_files`` at all — ``getattr`` with a
+    default treats that the same as "unset" rather than raising, matching
+    how ``dispatch_review`` already tolerates a stand-in missing
+    ``develop_branch``.
+    """
+    result: list[str] = list(COORDINATOR_OWNED_DOC_DEFAULTS)
+    if repo is not None:
+        for f in getattr(repo, "coordinator_only_files", None) or []:
+            if f not in result:
+                result.append(f)
+    return result
+
 
 def trust_issue_closed_for(assignment_type: str | None) -> bool:
     """Whether :func:`coord.github_ops.work_is_terminal` may trust

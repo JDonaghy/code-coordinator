@@ -302,7 +302,10 @@ class TestDispatch:
         )
         dispatch(proposal, cfg)
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["files_forbidden"] == ["README.md", "CHANGELOG.md"]
+        # #2966: CLAUDE.md is unioned in as a fleet-wide default ahead of
+        # the repo's own configured coordinator_only_files — see
+        # coord.models.coordinator_owned_docs.
+        assert payload["files_forbidden"] == ["CLAUDE.md", "README.md", "CHANGELOG.md"]
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_auto_seals_acceptance_dir_when_driver_configured(
@@ -404,7 +407,33 @@ class TestDispatch:
         mock_post.return_value = mock_resp
         dispatch(proposal, config)
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["files_forbidden"] == []
+        # #2966: no acceptance driver and no coordinator_only_files configured
+        # still carries the fleet-wide doc default (CLAUDE.md) — the source
+        # list is never actually empty, unlike pre-#2966.
+        assert payload["files_forbidden"] == ["CLAUDE.md"]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_forbids_claude_md_by_default(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#2966: repo.coordinator_only_files is set by zero repos fleet-wide,
+        so files_forbidden must not depend on it to protect the repo's own
+        rulebook — CLAUDE.md is auto-forbidden the same way sealed acceptance
+        paths are auto-added regardless of config (#944)."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "CLAUDE.md" in payload["files_forbidden"]
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_acceptance_seal_dedupes_with_coordinator_only_files(
