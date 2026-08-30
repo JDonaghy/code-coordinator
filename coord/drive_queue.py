@@ -2260,6 +2260,129 @@ def is_unsatisfiable_prereq_reason(text: str | None) -> bool:
     return _is_unsatisfiable_prereq_reason(text)
 
 
+# ── #2944: the guaranteed-false wait ─────────────────────────────────────────
+#
+# An entry with `attempts == 0` has never been dispatched: no `coord drive`
+# ever ran for it, so it has no branch, no PR, and no merge-queue row — and
+# never can have one, because nothing was ever built. A `blocked` or `parked`
+# entry in that state is not waiting on a gate that MIGHT clear; it is
+# waiting on a gate that structurally cannot exist. Whatever swept this row
+# last (#2230's merge-gate probe, #2935's after= graph, anything future)
+# cannot ever answer "yes" for it — the only exit is an operator's `remove` +
+# `add`.
+#
+# Deliberately independent of #2935/#2230: those fix (or will fix) individual
+# sweeps so they stop MISTAKING this shape for a real probe target. This
+# predicate does not care which sweep produced the block, or whether one
+# exists at all — it is the backstop that makes the NEXT undiscovered
+# instance of "a sweep declines to guess and therefore never terminates"
+# visible, instead of silent for another 32 hours (claude-coordinator#2900/
+# #2907: 207 and 186 deferrals, 0 attempts, ~10h and 22.7h blocked
+# respectively, `alert: (none)` the entire time — see #2944).
+#
+# `min_deferrals` is grace, not evidence: `deferrals` on a `blocked`/`parked`
+# row is whatever it had accumulated before the transition (subsequent ticks
+# do not bump it further — neither `_reconcile_blocked` nor
+# `_reconcile_blocked_unreadable` touches `deferrals`), so a fresh entry that
+# races straight from `waiting` to `blocked` on its very first tick reads
+# `deferrals=0` here regardless of how long it then sits. ~5 ticks (~15
+# minutes at the fleet's ~3-minute cadence) is enough that a row flagged here
+# has genuinely been sitting, not merely landed there this instant.
+UNREACHABLE_WAIT_MIN_DEFERRALS = 5
+
+
+@dataclass(frozen=True)
+class UnreachableWait:
+    """One queue entry stuck in the #2944 guaranteed-false wait.
+
+    See :func:`detect_unreachable_waits` for the predicate. Carries just
+    enough for a caller to build an operator-facing message without
+    re-deriving anything: the key names the entry, `deferrals` is the
+    evidence a genuine transient wouldn't have, and `last_reason` is
+    whatever the last sweep to touch this row recorded — useful context,
+    never re-interpreted here.
+    """
+
+    key: str
+    state: str
+    deferrals: int
+    last_reason: str
+
+
+def detect_unreachable_waits(
+    entries: Iterable[QueueEntry],
+    *,
+    min_deferrals: int = UNREACHABLE_WAIT_MIN_DEFERRALS,
+) -> list[UnreachableWait]:
+    """Entries sitting in the #2944 guaranteed-false wait.
+
+    ``state in (blocked, parked) AND attempts == 0 AND deferrals >
+    min_deferrals`` — see the module comment above this function for why
+    that combination can never resolve itself. Pure and cheap (a predicate
+    over already-loaded rows, no clock, no I/O), so the same function backs
+    both `coord drive-queue status`'s `alert:` line
+    (`coord.commands.drive_queue._queue_alert`) and the `coord doctor` WARN
+    (`coord.health.checks.wedged_drive_queue`) — one definition of "wedged",
+    not two that could drift apart.
+
+    An entry with ``attempts > 0`` is excluded unconditionally, however long
+    it has sat: it WAS dispatched at least once, so it has (or had) a real
+    branch/PR/merge-queue row for a sweep to have a genuine opinion about —
+    that is a legitimate wait, not an unreachable one.
+    """
+    return [
+        UnreachableWait(
+            key=e.key, state=e.state, deferrals=e.deferrals, last_reason=e.last_reason
+        )
+        for e in entries
+        if e.state in (STATE_BLOCKED, STATE_PARKED)
+        and e.attempts == 0
+        and e.deferrals > min_deferrals
+    ]
+
+
+def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
+    """The queue-level record #2944's predicate raises, in :func:`_hold_alert`'s
+    shape — a message naming the entry (or entries), the deferral count that
+    is the evidence, and the ONE remedy that actually clears it.
+
+    ``add`` alone does not clear ``blocked`` (the queue list already
+    documents this as a footgun elsewhere) — only ``remove`` then ``add``
+    does, so that is the command surfaced here rather than the generic
+    ``coord drive-queue list`` other alerts fall back on; naming the wrong
+    remedy on a state this non-obvious defeats the point of alerting at all.
+    Named INLINE in ``reason`` (not only in ``command``, which
+    ``drive-queue status``'s plain-text rendering never echoes — only its
+    ``gate_readings``/``details`` lines are printed) so the remedy is visible
+    wherever this alert's ``reason`` is, not just to a caller that also reads
+    the structured field.
+    """
+    names = ", ".join(
+        f"{w.key} ({w.state}, {w.deferrals} deferrals)" for w in waits[:5]
+    )
+    more = ", ..." if len(waits) > 5 else ""
+    plural = len(waits) != 1
+    return QueueAlert(
+        reason=(
+            f"{len(waits)} queue entr{'ies' if plural else 'y'} stuck in a "
+            "guaranteed-false wait — never dispatched (attempts=0) yet "
+            f"blocked/parked past {UNREACHABLE_WAIT_MIN_DEFERRALS} deferrals; "
+            f"no sweep can ever clear this on its own: {names}{more}. Fix: "
+            "coord drive-queue remove <repo> <issue> && "
+            "coord drive-queue add <repo> <issue> for each entry named above."
+        ),
+        details=tuple(
+            f"{w.key}: {w.state}, {w.deferrals} deferrals, "
+            f"last_reason={w.last_reason!r}"
+            for w in waits
+        ),
+        command=(
+            "coord drive-queue remove <repo> <issue> && "
+            "coord drive-queue add <repo> <issue> — for each entry named above"
+        ),
+    )
+
+
 def _reconcile_blocked_after(
     entry: QueueEntry,
     board: BoardView,

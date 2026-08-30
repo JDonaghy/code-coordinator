@@ -72,6 +72,7 @@ from coord.drive_queue import (
     TickPlan,
     add_preflight_notice,
     build_board_view,
+    detect_unreachable_waits,
     diagnose_blocked_after,
     effective_max_fix_rounds,
     entries_from_rows,
@@ -87,6 +88,7 @@ from coord.drive_queue import (
     pending_probe_targets,
     plan_tick,
     render_plan,
+    unreachable_wait_alert,
     validate_enqueue,
 )
 from coord.overlap_predict import (
@@ -1523,6 +1525,30 @@ def _queue_alert() -> dict | None:
     return get_drive_escalation(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
 
 
+def _unreachable_wait_alert_dict(rows: list[Mapping[str, Any]]) -> dict | None:
+    """#2944's synthetic queue-level alert, or ``None`` when nothing qualifies.
+
+    Computed fresh from the CURRENT queue rows on every call — deliberately
+    independent of :func:`_queue_alert`'s per-tick escalation record, which a
+    busy queue overwrites (and clears — see the tick's own ``else:
+    _clear_queue_alert()`` branch) every single tick it finds *something*
+    else to launch. A wedged entry with `attempts=0` sits in `blocked`/
+    `parked` for as long as it likes regardless of what else the queue is
+    doing, so its visibility must not depend on a tick ever having nothing
+    better to report — see :func:`coord.drive_queue.detect_unreachable_waits`
+    for the predicate and the #2900/#2907 incident this closes.
+    """
+    waits = detect_unreachable_waits(entries_from_rows(rows))
+    if not waits:
+        return None
+    synthetic = unreachable_wait_alert(waits)
+    return {
+        "reason": synthetic.reason,
+        "gate_readings": " | ".join(synthetic.details),
+        "command": synthetic.command,
+    }
+
+
 @drive_queue_group.command("status")
 @click.option("--json", "output_json", is_flag=True, default=False, help="Emit counts + alert as JSON.")
 @_CONFIG_OPTION
@@ -1532,7 +1558,13 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
 
     rows = list_drive_queue()
     counts = _counts(rows)
-    alert = _queue_alert()
+    # #2944: a tick-raised alert (a HELD gate, "nothing eligible to launch")
+    # takes priority when one exists — it is fresher and, on a busy queue,
+    # `_unreachable_wait_alert_dict` would silently win-and-hide it every
+    # time a real, actionable alert IS present. Only when the tick has
+    # nothing to say (the common, dangerous case a queue with free slots
+    # sits in for hours) does the guaranteed-false-wait check get to speak.
+    alert = _queue_alert() or _unreachable_wait_alert_dict(rows)
     held = fired_holds(entries_from_rows(rows))
     # #2587: read directly from the marker file, not from the last tick's
     # `TickPlan` — `status` may run between ticks (or on a machine that never
