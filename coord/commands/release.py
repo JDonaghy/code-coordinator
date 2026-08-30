@@ -1449,12 +1449,33 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # operator got — "fix by hand" with no hand to follow. When the
         # finding names a host, name the two commands that actually clear
         # it, so nobody has to derive them from scratch under time pressure.
-        remedy = (
-            f" — run `coord agent update --machine {host}` then "
-            f"`coord release cordon --clear {host}`"
-            if host
-            else ""
-        )
+        #
+        # #2963: that fixed remedy is `coord agent update` — which swaps
+        # the venv and nothing else — for EVERY advisory finding, including
+        # ones on the `units` lane (`unit coord-agent.service`, #1831/#1927).
+        # `coord agent update` never installs a unit file, so printing it
+        # for a stale-unit finding sent an operator to run the one command
+        # guaranteed not to fix it (#2938's `Restart=always` fix shipped in
+        # four releases and reached zero hosts' live systemd). The units
+        # lane's own health check (`coord.health.checks.unit_drift`) already
+        # computed the exact per-host, per-unit remedy into `detail` — reuse
+        # it here instead of fabricating a wrong one.
+        lane = str(finding.get("lane") or "")
+        if rp.verify_lane_kind(lane) == rp.LANE_UNITS:
+            own_detail = str(finding.get("detail") or "").strip()
+            remedy = (
+                f" — {own_detail}"
+                if own_detail
+                else " — run `coord release propagate --lane units` to "
+                "install it (mask-safe since #2812)"
+            )
+        else:
+            remedy = (
+                f" — run `coord agent update --machine {host}` then "
+                f"`coord release cordon --clear {host}`"
+                if host
+                else ""
+            )
         click.echo(
             f"  ~ advisory [{finding.get('severity')}] {host} "
             f"{finding.get('lane')}: {finding.get('summary')} "
