@@ -27,18 +27,21 @@ from coord.drive_queue import (
     HOLD_SCOPE_ENTRY,
     HOLD_SCOPE_FLEET,
     PARK_STALE_SECONDS,
-    ProbeResult,
     STATE_BLOCKED,
     STATE_DONE,
     STATE_FAILED,
+    STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
+    UNREACHABLE_WAIT_MIN_DEFERRALS,
     BoardView,
     IssueFacts,
+    ProbeResult,
     QueueEntry,
     QueueError,
     add_preflight_notice,
     build_board_view,
+    detect_unreachable_waits,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -47,6 +50,7 @@ from coord.drive_queue import (
     parse_key,
     plan_tick,
     render_plan,
+    unreachable_wait_alert,
     validate_enqueue,
 )
 from coord.models import MERGE_LANDED_MARKER
@@ -5131,3 +5135,80 @@ def test_a_running_entrys_ordinary_death_gets_no_zero_commit_note():
 def test_is_empty_branch_death_reason_matches_the_drive_advisory_text():
     assert is_empty_branch_death_reason(_EMPTY_BRANCH_REASON) is True
     assert is_empty_branch_death_reason(None) is False
+
+
+# ── #2944: the guaranteed-false wait — `state ∈ {blocked, parked}`, ─────────
+# `attempts == 0`, past the grace window. See claude-coordinator#2900/#2907:
+# both sat this way for 10h/22.7h with `coord drive-queue status` reading
+# `alert: (none)` the entire time, because nothing was ever launched for
+# them, so no sweep — #2230's merge-gate probe included — could ever have
+# anything positive to report.
+
+
+def test_detect_unreachable_waits_flags_a_never_dispatched_blocked_entry():
+    stuck = entry(
+        2900,
+        state=STATE_BLOCKED,
+        attempts=0,
+        deferrals=207,
+        last_reason="exhausted 2/2 attempts",
+    )
+    waits = detect_unreachable_waits([stuck])
+    assert [w.key for w in waits] == [entry_key(REPO, 2900)]
+    assert waits[0].deferrals == 207
+    assert waits[0].state == STATE_BLOCKED
+
+
+def test_detect_unreachable_waits_flags_a_never_dispatched_parked_entry():
+    # `parked` realistically implies `attempts > 0` (a park is only ever set
+    # after a real merge attempt), but the predicate is defined over the
+    # state alone — see the module docstring on why this checks the SHAPE,
+    # not the mechanism that is known to produce it today.
+    stuck = entry(2907, state=STATE_PARKED, attempts=0, deferrals=186)
+    waits = detect_unreachable_waits([stuck])
+    assert [w.key for w in waits] == [entry_key(REPO, 2907)]
+
+
+def test_detect_unreachable_waits_does_not_trip_below_the_grace_threshold():
+    """A genuinely transient block — freshly blocked, few deferrals — must
+    not trip: that would false-positive on the very first tick a `waiting`
+    entry lands in `blocked` at all."""
+    fresh = entry(1, state=STATE_BLOCKED, attempts=0, deferrals=0)
+    at_threshold = entry(
+        2, state=STATE_BLOCKED, attempts=0, deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS
+    )
+    assert detect_unreachable_waits([fresh, at_threshold]) == []
+    just_past = entry(
+        3,
+        state=STATE_BLOCKED,
+        attempts=0,
+        deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+    )
+    assert [w.key for w in detect_unreachable_waits([just_past])] == [
+        entry_key(REPO, 3)
+    ]
+
+
+def test_detect_unreachable_waits_does_not_trip_for_a_real_attempt():
+    """`attempts > 0` means the entry WAS dispatched at least once — it has
+    (or had) a real branch/PR/merge-queue row, so a long `blocked` wait is a
+    legitimate wait on a real gate, not an unreachable one."""
+    real_attempt = entry(4, state=STATE_BLOCKED, attempts=1, deferrals=500)
+    assert detect_unreachable_waits([real_attempt]) == []
+
+
+def test_detect_unreachable_waits_ignores_waiting_and_running_states():
+    waiting = entry(5, state=STATE_WAITING, attempts=0, deferrals=500)
+    running = entry(6, state=STATE_RUNNING, attempts=0, deferrals=500)
+    assert detect_unreachable_waits([waiting, running]) == []
+
+
+def test_unreachable_wait_alert_names_the_entry_deferrals_and_remedy():
+    waits = detect_unreachable_waits(
+        [entry(2900, state=STATE_BLOCKED, attempts=0, deferrals=207)]
+    )
+    alert = unreachable_wait_alert(waits)
+    assert f"{REPO}#2900" in alert.reason
+    assert "207 deferrals" in alert.reason
+    assert "coord drive-queue remove" in alert.command
+    assert "coord drive-queue add" in alert.command

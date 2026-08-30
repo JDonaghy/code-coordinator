@@ -3613,6 +3613,76 @@ def test_status_on_an_empty_queue_says_so(cli):
     assert "alert: (none)" in result.output
 
 
+# ── #2944: `status`'s `alert:` line for a guaranteed-false wait ─────────────
+#
+# claude-coordinator#2900/#2907: an entry with `attempts=0` sat `blocked` for
+# 10h/22.7h with `status` reading `alert: (none)` the whole time — because
+# the per-tick alert this line otherwise shows only fires when a tick has
+# NOTHING to launch anywhere, and a busy queue kept launching other entries
+# fine. These drive the real CLI end to end with no tick at all (the alert
+# must be visible from `status` alone, not conditional on ever running one),
+# manipulating only the tick-owned columns a real tick would eventually
+# write, via the same seam `update_drive_queue_entry` uses.
+
+
+def test_status_alert_reports_a_wedged_never_dispatched_blocked_entry(cli):
+    cli("add", REPO, "2900")
+    state._update_drive_queue_entry_local(
+        REPO, 2900, state="blocked", attempts=0, deferrals=207,
+        last_reason="exhausted 2/2 attempts",
+    )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" not in result.output
+    assert f"{REPO}#2900" in result.output
+    assert "207 deferrals" in result.output
+    assert "coord drive-queue remove" in result.output
+    assert "coord drive-queue add" in result.output
+
+
+def test_status_alert_json_also_carries_the_wedged_entry(cli):
+    cli("add", REPO, "2900")
+    state._update_drive_queue_entry_local(
+        REPO, 2900, state="blocked", attempts=0, deferrals=207,
+    )
+
+    result = cli("status", "--json")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["alert"] is not None
+    assert f"{REPO}#2900" in payload["alert"]["reason"]
+
+
+def test_status_alert_does_not_trip_for_a_fresh_transient_block(cli):
+    """Below the grace threshold (deferrals), a `blocked attempts=0` entry
+    reads exactly like it did before #2944 — a real alert here on the FIRST
+    tick an entry lands in `blocked` at all would be a false positive, not a
+    signal."""
+    cli("add", REPO, "2901")
+    state._update_drive_queue_entry_local(
+        REPO, 2901, state="blocked", attempts=0, deferrals=2,
+    )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" in result.output
+
+
+def test_status_alert_does_not_trip_for_a_real_merge_gate_wait(cli):
+    """`attempts > 0` means the entry WAS dispatched — a long `blocked` wait
+    is a legitimate wait on a real merge gate, never this alert's business."""
+    cli("add", REPO, "2902")
+    state._update_drive_queue_entry_local(
+        REPO, 2902, state="blocked", attempts=2, deferrals=500,
+        last_reason="merge gate still shut",
+    )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" in result.output
+
+
 # ── deploy gates (#1757) ─────────────────────────────────────────────────────
 #
 # The acceptance bar for `--hold-after`.  `merged != live`: a queue that
