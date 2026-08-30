@@ -495,6 +495,17 @@ def confirm_lock_path(repo_name: str, branch: str) -> Path:
 #: mid-cleanup). Generous relative to :data:`CONFIRM_DEFAULT_TIMEOUT_SECONDS`
 #: (20 min) so this never races a confirmation that is still legitimately
 #: in flight.
+#:
+#: Footgun to remember if either ceiling ever moves: the margin here is
+#: relative, not enforced. `sweep_stale_confirm_worktrees` doesn't know
+#: whether a given `confirm-worktrees/<repo>-<branch>` entry has a
+#: `confirm_branch` call still running against it — it reclaims purely on
+#: directory mtime. If `CONFIRM_DEFAULT_TIMEOUT_SECONDS` (or a future
+#: per-repo override of it) is ever raised to within a few hours of this
+#: constant, a still-in-flight confirmation's worktree (and its `.lock`
+#: file) could be `rmtree`'d out from under it by this sweep. Keep this
+#: comfortably above whatever the longest configured confirmation timeout
+#: is, not just the current default.
 STALE_WORKTREE_MAX_AGE_HOURS = 6.0
 
 
