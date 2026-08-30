@@ -24,7 +24,13 @@ def _print_housekeeping_result(resp: dict) -> None:
     archived_a = resp.get("archived_assignments", 0)
     archived_n = resp.get("archived_notifications", 0)
     days = resp.get("retention_days")
-    if not archived_a and not archived_n:
+    # #2974: the confirm-worktree sweep runs on its own age window,
+    # independent of `retention_days` above, and must be reported even when
+    # there was nothing terminal to archive — that used to be the ONLY thing
+    # this sweep did, so a run that only reclaimed leaked worktrees must not
+    # print "nothing to archive" and hide it.
+    removed_wt = resp.get("removed_confirm_worktrees", 0)
+    if not archived_a and not archived_n and not removed_wt:
         click.echo(
             f"housekeeping: nothing to archive (no terminal rows older than {days}d)."
         )
@@ -35,6 +41,12 @@ def _print_housekeeping_result(resp: dict) -> None:
         f"housekeeping: {verb} {archived_a} assignment(s) + "
         f"{archived_n} notification(s) (terminal, older than {days}d).{suffix}"
     )
+    if removed_wt:
+        wt_verb = "would remove" if dry else "removed"
+        click.echo(
+            f"housekeeping: {wt_verb} {removed_wt} stale confirm-worktree(s) "
+            "(#2974)."
+        )
 
 
 @click.command(

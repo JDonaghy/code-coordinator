@@ -104,6 +104,7 @@ existed.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -482,6 +483,95 @@ def confirm_lock_path(repo_name: str, branch: str) -> Path:
 
     safe = f"{repo_name}-{branch}".replace("/", "-")
     return COORD_DIR / "confirm-worktrees" / f"{safe}.lock"
+
+
+#: #2974: default age (hours) a directory under ``confirm-worktrees/`` may sit
+#: unremoved before :func:`sweep_stale_confirm_worktrees` reclaims it outright.
+#: Every entry under that root is throwaway by construction (#561) and
+#: `confirm_branch`'s own `finally` now removes its worktree on every exit —
+#: so anything still here this long survived something worse than an ordinary
+#: failure (a hard kill of the whole process, `coord-agent`/`coord-serve`
+#: restarting mid-run before #2974's `finally` fix ever ran, a full disk
+#: mid-cleanup). Generous relative to :data:`CONFIRM_DEFAULT_TIMEOUT_SECONDS`
+#: (20 min) so this never races a confirmation that is still legitimately
+#: in flight.
+STALE_WORKTREE_MAX_AGE_HOURS = 6.0
+
+
+def sweep_stale_confirm_worktrees(
+    *,
+    max_age_hours: float = STALE_WORKTREE_MAX_AGE_HOURS,
+    dry_run: bool = False,
+    now: float | None = None,
+) -> dict:
+    """Reclaim ``confirm-worktrees/`` entries older than *max_age_hours* (#2974).
+
+    Belt-and-suspenders over the `finally`-based cleanup in
+    :func:`confirm_branch`: that fix stops the leak going forward, but does
+    nothing about the hundreds of directories (189G measured on one host,
+    #2974) a build that never reaches this fix — or any future bug in the
+    cleanup path itself — can still leave behind. This sweep is the backstop
+    that ages them out regardless of cause.
+
+    Deliberately filesystem-only: it reclaims disk with a plain
+    ``shutil.rmtree`` keyed on directory mtime, and does **not** attempt a
+    ``git worktree prune`` in the originating repo's checkout (that would
+    need to map each ``<repo>-<branch>`` directory name back to a configured
+    repo, which is ambiguous when a repo or branch name itself contains a
+    ``-``). The admin metadata that leaves behind in the base checkout's
+    ``.git/worktrees/`` is a few KB per entry — negligible next to the build
+    trees this reclaims — and self-heals the next time :func:`confirm_branch`
+    or :func:`coord.revalidate.revalidate` runs `git worktree prune` for that
+    repo anyway.
+
+    Called from :func:`coord.housekeeping.sweep`'s existing low-cadence
+    daemon tick and ``coord housekeeping``, so it needs no new wiring or
+    schedule of its own. Returns
+    ``{"removed": [names], "dry_run": bool, "max_age_hours": float}`` —
+    ``removed`` lists what was (or, for ``dry_run``, would be) deleted.
+    Silently a no-op if the directory does not exist yet.
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    root = COORD_DIR / "confirm-worktrees"
+    result: dict = {
+        "removed": [],
+        "dry_run": dry_run,
+        "max_age_hours": max_age_hours,
+    }
+    if not root.exists():
+        return result
+
+    cutoff = (now if now is not None else time.time()) - max_age_hours * 3600.0
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return result
+
+    for entry in entries:
+        # Lock files (`confirm_lock_path`) are tiny and self-explanatory by
+        # name; only the worktree directories themselves are the disk cost
+        # this sweep exists to reclaim. A stray lock with no matching
+        # worktree directory is harmless — the next `confirm_branch` call for
+        # that (repo, branch) simply re-creates and re-locks it.
+        if entry.name.endswith(".lock") or not entry.is_dir():
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        result["removed"].append(entry.name)
+        if dry_run:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        lock_path = root / f"{entry.name}.lock"
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return result
 
 
 def branch_touched_files(repo_dir: Path, branch: str, base_branch: str) -> list[str]:
@@ -915,9 +1005,9 @@ def confirm_branch(
                 test_command,
             )
 
-        # Green, and observed rather than reported. Clean up: nothing to
-        # inspect.
-        _remove_worktree(repo_dir, wt_path)
+        # Green, and observed rather than reported. Nothing to inspect —
+        # cleanup happens in `finally` below, same as every other exit from
+        # this block.
         return ConfirmationResult(
             kind=KIND_OK,
             reason=(
@@ -928,6 +1018,31 @@ def confirm_branch(
             returncode=0,
         )
     finally:
+        # #2974: EVERY exit from the block above — including KIND_TIMEOUT
+        # (a hung/slow suite), KIND_SIGNAL (a coord-agent/coord-serve restart
+        # landing mid-run, #2527), and a genuine refutation (KIND_BUILD/
+        # KIND_SUITE) — must remove this worktree, not just the green path.
+        #
+        # `coord.revalidate`'s sibling helper deliberately KEEPS a failed
+        # worktree "for inspection" (see its `_remove_worktree` docstring and
+        # `format_failure`'s "worktree kept for inspection" line) because
+        # `coord merge --revalidate` is opt-in, operator-initiated, and rare —
+        # a human is watching and can go look at the tree it names.
+        # `confirm_branch` is the opposite shape: it runs unattended, on every
+        # PASS claim, inside the automatic reap path, keyed by (repo, branch)
+        # — and a branch is rarely revisited, so nothing was ever going to
+        # remove a "kept for inspection" tree here. That is exactly how this
+        # leaked to 189G / 346 dirs on one host in nine days (#2974): the
+        # biggest trees came from the slowest repos, i.e. precisely the
+        # KIND_TIMEOUT/KIND_SIGNAL runs that used to fall through this
+        # `finally` without cleanup.
+        #
+        # Nothing of diagnostic value is lost: the captured output tail
+        # (`ConfirmationResult.output`) is already persisted to
+        # `test_output/<assignment_id>.txt` by `write_confirmation_output`
+        # regardless of outcome — the worktree itself was never the thing an
+        # operator actually inspected.
+        _remove_worktree(repo_dir, wt_path)
         lock.release()
 
 
@@ -942,6 +1057,7 @@ __all__ = [
     "NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS",
     "PERMISSION_DENIED_EXIT",
     "REFUTING_KINDS",
+    "STALE_WORKTREE_MAX_AGE_HOURS",
     "ConfirmationResult",
     "begin_confirmation_pass",
     "branch_touched_files",
@@ -952,6 +1068,7 @@ __all__ = [
     "confirmation_timeout",
     "notify_client_timeout_seconds",
     "spend_confirmation_budget",
+    "sweep_stale_confirm_worktrees",
     "unmet_confirmation_capabilities",
     "write_confirmation_output",
 ]

@@ -739,7 +739,9 @@ def _audit_housekeeping_sweep(swept: dict) -> None:
             f"housekeeping: archived {swept.get('archived_assignments', 0)} "
             f"assignment(s), {swept.get('archived_notifications', 0)} "
             f"notification(s), {swept.get('archived_merge_queue', 0)} "
-            "merge_queue entry(ies)"
+            "merge_queue entry(ies), removed "
+            f"{swept.get('removed_confirm_worktrees', 0)} stale "
+            "confirm-worktree(s) (#2974)"
         ),
         details=swept,
     )
@@ -9477,13 +9479,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             swept.get("archived_assignments")
                             or swept.get("archived_notifications")
                             or swept.get("archived_merge_queue")
+                            or swept.get("removed_confirm_worktrees")
                         ):
                             log.info(
                                 "housekeeping: archived %d assignment(s), "
-                                "%d notification(s), %d merge_queue entry(ies)",
+                                "%d notification(s), %d merge_queue entry(ies), "
+                                "removed %d stale confirm-worktree(s)",
                                 swept["archived_assignments"],
                                 swept["archived_notifications"],
                                 swept.get("archived_merge_queue", 0),
+                                swept.get("removed_confirm_worktrees", 0),
                             )
                             _audit_housekeeping_sweep(swept)
                     except Exception:  # noqa: BLE001

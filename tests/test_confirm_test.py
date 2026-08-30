@@ -25,6 +25,7 @@ behaviour rather than fail every branch in the fleet.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -547,15 +548,161 @@ class TestConfirmBranch:
             "worktrees piling up in the reap path"
         )
 
-    def test_refuted_run_keeps_its_worktree_for_inspection(
-        self, checkout: Path
+    @pytest.mark.parametrize(
+        "runner_kwargs, why",
+        [
+            (
+                {"default": _FakeProc(1, stdout="FAILED test_x", stderr="")},
+                "a genuine refutation",
+            ),
+            (
+                {
+                    "default": subprocess.TimeoutExpired(
+                        cmd="run-the-suite", timeout=1,
+                    ),
+                },
+                "a timeout",
+            ),
+            (
+                {"default": _FakeProc(-15, stdout="killed")},
+                "an external signal kill (#2527)",
+            ),
+        ],
+    )
+    def test_every_outcome_still_cleans_up_its_worktree(
+        self, checkout: Path, runner_kwargs: dict, why: str,
     ) -> None:
+        """#2974: `confirm_branch` used to keep a failed/timed-out/signal-killed
+        run's worktree "for inspection" — mirroring `coord.revalidate`'s
+        operator-initiated sibling, which really is watched by a human running
+        `coord merge --revalidate` by hand. Nobody watches an unattended
+        reap-path confirmation the same way, so nothing ever removed those
+        directories: 346 of them / 189G on one host after nine days (#2974).
+        Every outcome must clean up now — the captured output tail is already
+        persisted separately via `write_confirmation_output`, so the worktree
+        itself was never the thing actually inspected.
+        """
+        runner = _ScriptedRunner(**runner_kwargs)
         result = ct.confirm_branch(
-            "api", BRANCH, _StubConfig(repo_path=str(checkout)),
-            runner=_ScriptedRunner(default=_FakeProc(1)),
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
         )
-        assert result.worktree is not None
-        assert result.worktree.exists()
+        assert not ct.confirm_worktree_path("api", BRANCH).exists(), (
+            f"{why}: worktree must not survive confirm_branch (#2974) — got "
+            f"kind={result.kind!r}"
+        )
+
+
+# ── #2974: the backstop sweep over whatever still leaked ─────────────────────
+#
+# `confirm_branch`'s own `finally` (above) is the fix going forward; this is
+# the belt-and-suspenders reclaim for anything that leaked before that fix
+# existed, or that some future bug in the cleanup path leaves behind again.
+
+
+class TestSweepStaleConfirmWorktrees:
+    def test_no_root_directory_is_a_silent_no_op(self) -> None:
+        result = ct.sweep_stale_confirm_worktrees()
+        assert result == {
+            "removed": [],
+            "dry_run": False,
+            "max_age_hours": ct.STALE_WORKTREE_MAX_AGE_HOURS,
+        }
+
+    def test_removes_only_entries_older_than_max_age(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        root = isolated_coord_dir / "confirm-worktrees"
+        stale = root / "api-issue-1-old"
+        fresh = root / "api-issue-2-new"
+        for d in (stale, fresh):
+            d.mkdir(parents=True)
+            (d / "marker").write_text("x")
+
+        now = 1_000_000.0
+        old_mtime = now - 10 * 3600.0  # 10h old
+        new_mtime = now - 1 * 3600.0  # 1h old
+        os.utime(stale, (old_mtime, old_mtime))
+        os.utime(fresh, (new_mtime, new_mtime))
+
+        result = ct.sweep_stale_confirm_worktrees(max_age_hours=6.0, now=now)
+
+        assert result["removed"] == [stale.name]
+        assert not stale.exists()
+        assert fresh.exists(), "an entry inside the age window must survive"
+
+    def test_dry_run_reports_without_deleting(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        root = isolated_coord_dir / "confirm-worktrees"
+        stale = root / "api-issue-1-old"
+        stale.mkdir(parents=True)
+        now = 1_000_000.0
+        os.utime(stale, (now - 10 * 3600.0, now - 10 * 3600.0))
+
+        result = ct.sweep_stale_confirm_worktrees(
+            max_age_hours=6.0, dry_run=True, now=now,
+        )
+
+        assert result["removed"] == [stale.name]
+        assert stale.exists(), "dry-run must not delete anything"
+
+    def test_removes_the_matching_lock_file_too(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        root = isolated_coord_dir / "confirm-worktrees"
+        stale = root / "api-issue-1-old"
+        stale.mkdir(parents=True)
+        lock = root / f"{stale.name}.lock"
+        lock.write_text("")
+        now = 1_000_000.0
+        os.utime(stale, (now - 10 * 3600.0, now - 10 * 3600.0))
+
+        ct.sweep_stale_confirm_worktrees(max_age_hours=6.0, now=now)
+
+        assert not stale.exists()
+        assert not lock.exists()
+
+    def test_lock_files_themselves_are_never_treated_as_worktrees(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        """A lock file with no matching worktree directory (the lock survived
+        a run that never got as far as creating one) must not be reported as
+        a removed *worktree* — it is a few bytes, not the disk cost #2974 is
+        about, and the next `confirm_branch` call simply reuses/recreates it.
+        """
+        root = isolated_coord_dir / "confirm-worktrees"
+        root.mkdir(parents=True)
+        lonely_lock = root / "api-issue-9-orphan.lock"
+        lonely_lock.write_text("")
+        now = 1_000_000.0
+        os.utime(lonely_lock, (now - 10 * 3600.0, now - 10 * 3600.0))
+
+        result = ct.sweep_stale_confirm_worktrees(max_age_hours=6.0, now=now)
+
+        assert result["removed"] == []
+        assert lonely_lock.exists()
+
+    def test_wired_into_the_housekeeping_sweep(
+        self, isolated_coord_dir: Path, monkeypatch,
+    ) -> None:
+        """#2974: this must ride the existing daemon/CLI housekeeping cadence
+        rather than needing a new timer of its own."""
+        from coord import housekeeping as hk
+
+        root = isolated_coord_dir / "confirm-worktrees"
+        stale = root / "api-issue-1-old"
+        stale.mkdir(parents=True)
+        now = 1_000_000.0
+        os.utime(stale, (now - 10 * 3600.0, now - 10 * 3600.0))
+
+        # DB archiving disabled — isolate this test to just the worktree sweep.
+        monkeypatch.setenv("COORD_ARCHIVE_RETENTION_DAYS", "0")
+        # Deliberately not stubbing get_connection: with archiving disabled,
+        # `hk.sweep` must return before ever touching the DB.
+        result = hk.sweep(now=now)
+
+        assert result["removed_confirm_worktrees"] == 1
+        assert not stale.exists()
 
 
 # ── locking: two overlapping notify passes must not race on one worktree ──────
