@@ -382,6 +382,162 @@ def test_disabled_linger_crits_and_names_the_delayed_symptom():
     assert "enable-linger" in (finding.fix or "")
 
 
+# ── #2937: coord must resolve on a WORKER-shaped PATH, not just the agent's ──
+
+
+def test_probe_coord_on_worker_path_parses_a_found_binary():
+    with patch("subprocess.run", return_value=_ssh_result(
+        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
+    )):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is True
+    assert error is None
+    assert version == "coord, version 0.9.0"
+
+
+def test_probe_coord_on_worker_path_reports_absence_as_a_defect_not_unknown():
+    """`found=False` is the whole point of #2937 — it must never collapse
+    into the fail-soft UNKNOWN path the way an SSH outage does."""
+    with patch("subprocess.run", return_value=_ssh_result("COORD_ON_WORKER_PATH_OK=0\n")):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is False
+    assert error is None
+    assert version is None
+
+
+def test_probe_coord_on_worker_path_delegates_to_the_canonical_agent_function():
+    """#2937 review: this must not be a second, hand-rolled reimplementation
+    of the #402/#2569 PATH strip — it has to invoke the exact same
+    `coord.agent.worker_coord_reachable()` a real worker spawn's environment
+    is built from, on the worker host's own pinned interpreter, so the two
+    checks can never silently disagree (e.g. on a trailing slash, or a PATH
+    entry that's already a resolved `.blue`/`.green` path)."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
+    )) as run:
+        machine_onboard.probe_coord_on_worker_path("host")
+    args, kwargs = run.call_args
+    argv = args[0]
+    assert argv[0] == "ssh"
+    assert argv[-1] == "$HOME/.coord-venv/bin/python3 -"
+    script = kwargs["input"]
+    assert "from coord.agent import worker_coord_reachable" in script
+    assert "worker_coord_reachable()" in script
+
+
+def test_probe_coord_on_worker_path_fails_soft_when_the_pinned_interpreter_is_gone():
+    """If `~/.coord-venv/bin/python3` itself doesn't resolve on the remote
+    shell (e.g. the venv was never installed), the remote shell reports a
+    nonzero exit — same fail-soft UNKNOWN discipline as any other SSH-layer
+    trouble, never a fabricated found/absent."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "", returncode=127, stderr="bash: line 1: .coord-venv/bin/python3: No such file or directory"
+    )):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is None
+    assert "No such file" in error
+    assert version is None
+
+
+def test_probe_coord_on_worker_path_fails_soft_on_ssh_trouble():
+    """Same discipline as `probe_linger`: an SSH-layer failure is UNKNOWN,
+    never fabricated as either a pass or the #2937 defect."""
+    with patch("subprocess.run",
+               return_value=_ssh_result("", returncode=255, stderr="No route to host")):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is None
+    assert "No route to host" in error
+    assert version is None
+
+    with patch("subprocess.run", return_value=_ssh_result("garbage, no marker\n")):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is None
+    assert "no parseable output" in error
+    assert version is None
+
+
+def test_coord_absent_from_worker_path_crits():
+    """The #2937 regression itself: dell64 shape — the agent is perfectly
+    healthy (runtime.agent_venv is OK, /health answers fine) but `coord`
+    cannot be found once ~/.coord-venv/bin is stripped from PATH, so a
+    worker dispatched here can never run `coord test` to record a verdict."""
+    facts = MachineFacts(
+        name="dell64", configured=True, host="dell64.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        coord_on_worker_path=False,
+    )
+    finding = _by_check(machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_missing")
+    assert finding.severity == CRIT
+    assert "worker" in finding.summary.lower()
+    assert "~/.coord-venv" in finding.fix
+
+
+def test_coord_on_worker_path_unknown_without_the_ssh_probe(cfg):
+    """Mirrors `runtime.linger_unknown`: /health cannot see this either — the
+    agent process answering a probe still has its own venv on PATH, which
+    proves nothing about a worker's shell."""
+    report = machine_onboard.evaluate(_facts(cfg))
+    finding = _by_check(report, "runtime.coord_on_worker_path_unknown")
+    assert finding.severity == UNKNOWN
+    assert "--ssh" in finding.summary
+
+
+def test_coord_on_worker_path_matching_the_agent_version_is_ok():
+    facts = MachineFacts(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        version="0.9.0",
+        coord_on_worker_path=True,
+        coord_on_worker_path_version="coord, version 0.9.0",
+    )
+    finding = _by_check(machine_onboard.evaluate(facts), "runtime.coord_on_worker_path")
+    assert finding.severity == OK
+
+
+def test_coord_on_worker_path_version_skew_from_the_agent_warns():
+    """A worker-PATH `coord` that answers but on a DIFFERENT version than the
+    agent's own /health is real residue — a worker could be recording
+    verdicts from a stale or unrelated install — but not the #2937 total-loss
+    case, so it warns rather than CRITs."""
+    facts = MachineFacts(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        version="0.9.0",
+        coord_on_worker_path=True,
+        coord_on_worker_path_version="coord, version 0.7.1",
+    )
+    finding = _by_check(
+        machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_version_mismatch"
+    )
+    assert finding.severity == WARN
+    assert "0.9.0" in finding.summary
+    assert "0.7.1" in finding.summary
+
+
+def test_coord_on_worker_path_version_comparison_is_exact_not_substring():
+    """#2937 review: `expected in reported` is a substring test, and this
+    project's own version scheme makes it a trap — "0.5.29" IS a substring
+    of "coord, version 0.5.290" even though those are different releases.
+    A genuinely-skewed patch version must still warn."""
+    facts = MachineFacts(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        version="0.5.29",
+        coord_on_worker_path=True,
+        coord_on_worker_path_version="coord, version 0.5.290",
+    )
+    finding = _by_check(
+        machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_version_mismatch"
+    )
+    assert finding.severity == WARN
+    assert "0.5.29" in finding.summary
+    assert "0.5.290" in finding.summary
+
+
 # ── The doctor fold-in must not duplicate what `coord doctor` already prints ─
 
 

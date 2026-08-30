@@ -51,6 +51,7 @@ one distinct, *named* finding per defect, with no network and no live agents.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -183,6 +184,13 @@ class MachineFacts:
     linger: bool | None = None
     linger_error: str | None = None
 
+    # ── Layer 6: coord resolvable from a WORKER-shaped PATH (needs SSH —
+    # `/health` cannot see it either: it answers from the AGENT's own
+    # process, which still has ~/.coord-venv/bin on PATH) ────────────────
+    coord_on_worker_path: bool | None = None
+    coord_on_worker_path_error: str | None = None
+    coord_on_worker_path_version: str | None = None
+
     def check(self, check_id: str, subject: str | None = None) -> HealthCheckFact | None:
         for row in self.health_checks:
             if row.check_id == check_id and (subject is None or row.subject == subject):
@@ -288,6 +296,108 @@ def probe_linger(host: str, *, timeout: float = 20.0) -> tuple[bool | None, str 
     return None, "`loginctl` did not report a Linger property (not systemd?)"
 
 
+# #2937 review: this probe must answer "can a worker resolve `coord`?" using
+# the exact same algorithm the agent itself uses to spawn a worker — not a
+# second, hand-rolled PATH-stripping implementation that can silently
+# disagree with it (e.g. on a trailing slash, or a PATH entry that's already
+# an unresolved `.blue`/`.green` path rather than the `~/.coord-venv`
+# symlink name). `coord.agent.worker_coord_reachable()` (#2936) is the
+# canonical, already-shipped answer to that exact question — built on
+# `_worker_subprocess_env`'s realpath-based strip
+# (`coord.agent._pinned_venv_bin_dirs`), the same function every real worker
+# spawn goes through. So instead of re-deriving the strip over SSH, this
+# probe SSHes in and asks the remote host's own pinned interpreter to import
+# and call that function directly — the machine-doctor check and the agent's
+# own startup check are then provably the same code, not two
+# implementations that happen to agree today. The script is sent over
+# stdin (`python3 -`) rather than embedded as a `-c` argument so no
+# shell-quoting layer stands between it and the interpreter.
+_COORD_ON_WORKER_PATH_PROBE_SCRIPT = """\
+import subprocess
+from coord.agent import worker_coord_reachable, _worker_subprocess_env
+
+ok, _msg = worker_coord_reachable()
+version = ""
+if ok:
+    env = _worker_subprocess_env()
+    try:
+        result = subprocess.run(
+            ["coord", "--version"], env=env, capture_output=True, text=True, timeout=10
+        )
+        version = (result.stdout or result.stderr or "").strip()
+    except Exception:
+        version = ""
+print("COORD_ON_WORKER_PATH_OK=" + ("1" if ok else "0"))
+print("VERSION=" + version.replace("\\n", " "))
+"""
+
+
+def probe_coord_on_worker_path(
+    host: str, *, timeout: float = 20.0
+) -> tuple[bool | None, str | None, str | None]:
+    """Can a WORKER-shaped shell on *host* resolve ``coord`` at all?
+
+    This is #2937's whole gap: workers are spawned with ``~/.coord-venv/bin``
+    stripped from ``PATH`` (#402, hardened by #2569) so a `pip install` in a
+    worktree can never land in the agent's own runtime venv — but nothing
+    upstream of that check ever asks whether ``coord`` is *still resolvable*
+    once that directory is gone. dell64 passed every existing layer of
+    ``coord machine doctor`` — including ``runtime.agent_venv`` (which only
+    proves the AGENT can find its own venv) — while being structurally
+    incapable of recording a single test verdict, because the agent's PATH
+    was the only PATH anything had checked.
+
+    Delegates the actual found/absent decision to
+    :func:`coord.agent.worker_coord_reachable` (#2936), invoked on *host* via
+    its own pinned interpreter (``~/.coord-venv/bin/python3``) — see
+    :data:`_COORD_ON_WORKER_PATH_PROBE_SCRIPT`. This is deliberately NOT a
+    reimplementation of the PATH strip: it is the same function every real
+    worker spawn's environment is built from, run where it matters (the
+    worker host), so this check and the agent's own startup warning
+    (``worker_coord_reachable`` logged at ``AgentServer`` init) can never
+    silently disagree.
+
+    Returns ``(found, error, version)``. Fail-soft, same discipline as
+    :func:`probe_linger`: this needs SSH, which ``/health`` structurally
+    cannot substitute for (the agent process answering a probe still has its
+    own venv on PATH — proving nothing about a worker's shell) — so an SSH
+    failure, or the pinned interpreter itself being unreachable/absent,
+    reports ``(None, reason, None)``, UNKNOWN, never a fabricated CRIT.
+    ``found=False`` — the actual defect this check exists to catch — is the
+    one outcome that must never collapse into UNKNOWN.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            [
+                "ssh", "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={max(1, int(timeout))}",
+                host, "$HOME/.coord-venv/bin/python3 -",
+            ],
+            input=_COORD_ON_WORKER_PATH_PROBE_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"ssh probe failed: {exc}", None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()[-1:]
+        return None, f"ssh probe failed: {detail[0] if detail else 'no output'}", None
+
+    text = (result.stdout or "").strip()
+    if "COORD_ON_WORKER_PATH_OK=1" in text:
+        version = None
+        for line in text.splitlines():
+            if line.startswith("VERSION="):
+                version = line[len("VERSION="):].strip() or None
+        return True, None, version
+    if "COORD_ON_WORKER_PATH_OK=0" in text:
+        return False, None, None
+    return None, "worker-PATH probe produced no parseable output", None
+
+
 def gather_facts(
     cfg: "Config",
     machine_name: str,
@@ -382,6 +492,11 @@ def gather_facts(
         facts.linger, facts.linger_error = probe_linger(
             machine.host, timeout=ssh_timeout
         )
+        (
+            facts.coord_on_worker_path,
+            facts.coord_on_worker_path_error,
+            facts.coord_on_worker_path_version,
+        ) = probe_coord_on_worker_path(machine.host, timeout=ssh_timeout)
     return facts
 
 
@@ -938,6 +1053,24 @@ def evaluate_graph(facts: MachineFacts) -> list[Finding]:
 # ── Layer 6: runtime ─────────────────────────────────────────────────────────
 
 
+_VERSION_NUMBER_RE = re.compile(r"\d+(?:\.\d+)+")
+
+
+def _extract_version_number(text: str | None) -> str | None:
+    """Pull the dotted version number out of free-form text, e.g.
+    ``"coord, version 0.5.290"`` -> ``"0.5.290"``.
+
+    Used so version comparisons here are an EXACT match on the number, never
+    a substring test (``"0.5.29" in "coord, version 0.5.290"`` is ``True``
+    even though those are different releases — #2937 review). Returns
+    ``None`` when no dotted number is found.
+    """
+    if not text:
+        return None
+    match = _VERSION_NUMBER_RE.search(text)
+    return match.group(0) if match else None
+
+
 def evaluate_runtime(facts: MachineFacts) -> list[Finding]:
     """The agent's own installation: its venv, and whether it survives logout.
 
@@ -947,9 +1080,12 @@ def evaluate_runtime(facts: MachineFacts) -> list[Finding]:
     because an editable one pins the live fleet's runtime to whatever branch a
     worktree happens to have checked out.
 
-    ``linger`` is the one thing ``/health`` structurally cannot see (the agent
-    answering the probe is proof only that the user manager is up *right
-    now*), so it is UNKNOWN unless the caller opted into the SSH probe.
+    ``linger`` and ``coord_on_worker_path`` are the two things ``/health``
+    structurally cannot see: the agent answering a probe is proof only that
+    the AGENT's own user manager / PATH is fine *right now*, not that a
+    WORKER spawned on this host (with ``~/.coord-venv/bin`` stripped from
+    PATH, #402/#2569) can survive logout or resolve ``coord`` at all. Both
+    are UNKNOWN unless the caller opted into the SSH probe.
     """
     out: list[Finding] = []
 
@@ -989,6 +1125,74 @@ def evaluate_runtime(facts: MachineFacts) -> list[Finding]:
                     ),
                 )
             )
+
+    if facts.coord_on_worker_path is False:
+        out.append(
+            Finding(
+                layer="runtime", check="runtime.coord_on_worker_path_missing", severity=CRIT,
+                summary=(
+                    "`coord` does not resolve on a WORKER-shaped PATH (with "
+                    "~/.coord-venv/bin stripped, as #402/#2569 spawn workers) — "
+                    "this machine can dispatch and run a worker, but that worker "
+                    "cannot run `coord test` to record a verdict. This is exactly "
+                    "the #2937 gap: every other layer here, and `/health` itself, "
+                    "only ever sees the AGENT's own PATH"
+                ),
+                subject=facts.name,
+                fix=(
+                    "install `coord` somewhere on the agent user's PATH outside "
+                    "~/.coord-venv (e.g. `pipx install code-coordinator`, or a "
+                    "system-wide non-editable install) — the fix must survive "
+                    "~/.coord-venv/bin being removed from PATH, because that is "
+                    "exactly what a worker's shell does."
+                ),
+            )
+        )
+    elif facts.coord_on_worker_path is True:
+        expected_raw = (facts.version or "").strip()
+        reported_raw = facts.coord_on_worker_path_version or ""
+        expected = _extract_version_number(expected_raw)
+        reported = _extract_version_number(reported_raw)
+        # #2937 review: an EXACT comparison of the extracted version numbers,
+        # not `expected in reported` — a substring test reads a genuine skew
+        # as a match whenever the shorter string happens to be a substring of
+        # the longer one (this project's own scheme: "0.5.29" in "coord,
+        # version 0.5.290" is True even though those are different releases).
+        if expected and expected != (reported or ""):
+            out.append(
+                Finding(
+                    layer="runtime", check="runtime.coord_on_worker_path_version_mismatch",
+                    severity=WARN,
+                    summary=(
+                        f"`coord` on the worker PATH reports {reported_raw!r}, but the "
+                        f"agent's own /health reports version {expected_raw!r} — a "
+                        "worker may record verdicts against a stale or unrelated "
+                        "install"
+                    ),
+                    subject=facts.name,
+                    fix="reinstall/upgrade the worker-PATH `coord` to match the agent's version.",
+                )
+            )
+        else:
+            out.append(
+                Finding(
+                    layer="runtime", check="runtime.coord_on_worker_path", severity=OK,
+                    summary=f"`coord` resolves on a worker-shaped PATH ({reported_raw or 'version unreported'})",
+                    subject=facts.name,
+                )
+            )
+    else:
+        out.append(
+            Finding(
+                layer="runtime", check="runtime.coord_on_worker_path_unknown", severity=UNKNOWN,
+                summary=(
+                    "worker-PATH `coord` resolution not checked — /health cannot "
+                    f"see it (it only proves the AGENT can find coord); "
+                    f"{facts.coord_on_worker_path_error or 'pass --ssh to probe it'}"
+                ),
+                subject=facts.name,
+            )
+        )
 
     if facts.linger is True:
         out.append(
