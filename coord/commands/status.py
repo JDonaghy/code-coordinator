@@ -1906,6 +1906,22 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
     ),
 )
 @click.option(
+    "--capability-rules",
+    "capability_rules_check",
+    is_flag=True,
+    help=(
+        "#2953: report dead/partial smoke_tests.capability_rules[].files "
+        "prefixes — a prefix that matches no tracked file in any repo "
+        "checkout available on this machine (a #1072-shaped stray '**' or "
+        "typo), or matches in some repos but not others where the same "
+        "directory shape exists deeper in the tree (#2953's own "
+        "src/gtk/ vs. <crate>/src/gtk/ shape). Also flags a `requires:` "
+        "capability no machine declares at all. Repos with no local "
+        "checkout are skipped, never reported as dead. Read-only, no "
+        "network required."
+    ),
+)
+@click.option(
     "--self",
     "self_check",
     is_flag=True,
@@ -1963,6 +1979,7 @@ def diagnose(
     orphan_worktrees: bool = False,
     graph_health: bool = False,
     config_provenance_check: bool = False,
+    capability_rules_check: bool = False,
     self_check: bool = False,
     self_no_fetch: bool = False,
     forge_availability: bool = False,
@@ -1982,6 +1999,11 @@ def diagnose(
     # ── #1779: fleet coordinator.yml provenance (read-only) ─────────────────
     if config_provenance_check:
         _diagnose_config_provenance()
+        return
+
+    # ── #2953: dead/partial capability_rules prefixes (read-only) ───────────
+    if capability_rules_check:
+        _diagnose_capability_rules(config_path)
         return
 
     # ── #2436: THIS process's own editable coord install freshness ──────────
@@ -2184,6 +2206,34 @@ def _diagnose_config_provenance() -> None:
     for line in format_provenance_lines(prov):
         click.echo(f"  {line}")
     click.echo(summary_line(prov))
+
+
+def _diagnose_capability_rules(config_path: Path) -> None:
+    """Report dead/partial ``smoke_tests.capability_rules[].files`` prefixes
+    (#2953).
+
+    Read-only, local-machine only — same family as ``--graph``/
+    ``--config-provenance``. Unlike ``--config-provenance`` this DOES read
+    ``coordinator.yml`` for its repo list (like ``--graph``), because a
+    prefix's health is judged against every configured repo's local
+    checkout, not one fixed pair of paths. A repo with no local checkout on
+    this machine is skipped, never reported as dead — #1779's precedent,
+    applied per repo instead of per config file (see
+    ``coord/fleet_config_health.py``).
+    """
+    from coord.fleet_config_health import (  # noqa: PLC0415
+        capability_rule_health,
+        capability_rule_summary_line,
+        format_capability_rule_lines,
+        unclaimed_capability_requirements,
+    )
+
+    cfg = _load_config(config_path)
+    findings = capability_rule_health(cfg)
+    unclaimed = unclaimed_capability_requirements(cfg)
+    for line in format_capability_rule_lines(findings, unclaimed):
+        click.echo(f"  {line}")
+    click.echo(capability_rule_summary_line(findings, unclaimed))
 
 
 def _diagnose_self(*, fetch: bool) -> None:

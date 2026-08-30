@@ -13,14 +13,22 @@ from pathlib import Path
 
 import pytest
 
+from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.fleet_config_health import (
+    CapabilityRuleFinding,
     ConfigProvenance,
+    capability_rule_health,
+    capability_rule_summary_line,
     config_provenance,
     default_live_config_path,
     default_settings_dir,
+    format_capability_rule_lines,
     format_provenance_lines,
+    local_repo_checkouts,
     summary_line,
+    unclaimed_capability_requirements,
 )
+from coord.models import Machine, Repo
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -57,6 +65,22 @@ def _make_checkout(root: Path, *, push: bool = True) -> Path:
         _git("init", "-q", "--bare", str(remote), cwd=root)
         _git("remote", "add", "origin", str(remote), cwd=checkout)
         _git("push", "-q", "-u", "origin", "HEAD:main", cwd=checkout)
+    return checkout
+
+
+def _make_repo_checkout(root: Path, name: str, files: list[str]) -> Path:
+    """A minimal git checkout at ``root/name`` with each of *files* created
+    and committed (tracked) — the fixture the #2953 dead-rule detector reads
+    via ``git ls-files``."""
+    checkout = root / name
+    checkout.mkdir(parents=True)
+    for rel in files:
+        p = checkout / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+    _git("init", "-q", ".", cwd=checkout)
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
     return checkout
 
 
@@ -341,3 +365,308 @@ def test_config_provenance_dataclass_defaults_are_unhealthy_and_not_skipped() ->
     prov = ConfigProvenance(live_path=Path("/x"), checkout_dir=Path("/y"))
     assert prov.skip is True  # checkout_present defaults False -> correctly a skip
     assert prov.healthy is False
+
+
+# ── capability_rule_health: dead/partial capability_rules prefixes (#2953) ──
+
+
+def _config(repos: list[Repo], rules: list[SmokeRule], *, machines: list[Machine] | None = None) -> Config:
+    return Config(
+        repos=repos,
+        machines=machines if machines is not None else [],
+        smoke_tests=SmokeTestsConfig(capability_rules=rules),
+    )
+
+
+def test_capability_rule_health_empty_when_no_rules_configured(tmp_path: Path) -> None:
+    cfg = _config([Repo(name="vimcode", github="acme/vimcode")], [])
+    assert capability_rule_health(cfg) == []
+
+
+def test_capability_rule_health_dead_matches_nothing_anywhere(tmp_path: Path) -> None:
+    """#1072's exact shape: a stray `**`-suffixed prefix under a plain-prefix
+    matcher matches no real path, in any repo — the loudest finding."""
+    coordinator = _make_repo_checkout(
+        tmp_path, "code-coordinator", ["coord/dashboard/webapp/src/App.tsx"]
+    )
+    other = _make_repo_checkout(tmp_path, "other-repo", ["src/main.py"])
+    cfg = _config(
+        [Repo(name="code-coordinator", github="x/code-coordinator"),
+         Repo(name="other-repo", github="x/other-repo")],
+        [SmokeRule(files=["coord/dashboard/webapp/**"], requires=["browser"])],
+    )
+
+    findings = capability_rule_health(
+        cfg, repo_checkouts={"code-coordinator": coordinator, "other-repo": other}
+    )
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.prefix == "coord/dashboard/webapp/**"
+    assert f.dead is True
+    assert f.partial is False
+    assert f.healthy is False
+    assert f.matched_repos == ()
+    assert set(f.checked_repos) == {"code-coordinator", "other-repo"}
+
+    lines = format_capability_rule_lines(findings, [])
+    joined = "\n".join(lines)
+    assert "DEAD" in joined
+    assert "coord/dashboard/webapp/**" in joined
+    assert capability_rule_summary_line(findings, []) == (
+        "CAPABILITY_RULES: prefixes=1 dead=1 partial=0 unclaimed_caps=0"
+    )
+
+
+def test_capability_rule_health_partial_when_prefix_missing_a_directory_level(
+    tmp_path: Path,
+) -> None:
+    """#2953's exact shape: `src/gtk/` matches vimcode's layout but not
+    quadraui's, where the GTK backend is nested one level deeper under the
+    crate directory. A bare "matches somewhere" check would call this
+    healthy; the deeper-occurrence check must not."""
+    vimcode = _make_repo_checkout(tmp_path, "vimcode", ["src/gtk/window.c"])
+    quadraui = _make_repo_checkout(
+        tmp_path, "quadraui", ["quadraui/src/gtk/backend.rs"]
+    )
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode"), Repo(name="quadraui", github="x/quadraui")],
+        [SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+    )
+
+    findings = capability_rule_health(
+        cfg, repo_checkouts={"vimcode": vimcode, "quadraui": quadraui}
+    )
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.matched_repos == ("vimcode",)
+    assert f.suspect_repos == ("quadraui",)
+    assert f.dead is False
+    assert f.partial is True
+    assert f.healthy is False
+
+    lines = format_capability_rule_lines(findings, [])
+    joined = "\n".join(lines)
+    assert "PARTIAL" in joined
+    assert "vimcode" in joined
+    assert "quadraui" in joined
+    assert capability_rule_summary_line(findings, []) == (
+        "CAPABILITY_RULES: prefixes=1 dead=0 partial=1 unclaimed_caps=0"
+    )
+
+
+def test_capability_rule_health_healthy_when_prefix_matches_everywhere_checked(
+    tmp_path: Path,
+) -> None:
+    """A rule matching in every repo it was checked against is silent — no
+    dead/partial finding, matching the acceptance bar: 'A rule whose prefix
+    matches in every repo it plausibly targets is silent.'"""
+    repo_a = _make_repo_checkout(tmp_path, "repo-a", ["shared/thing.py"])
+    repo_b = _make_repo_checkout(tmp_path, "repo-b", ["shared/other.py"])
+    cfg = _config(
+        [Repo(name="repo-a", github="x/repo-a"), Repo(name="repo-b", github="x/repo-b")],
+        [SmokeRule(files=["shared/"], requires=["python"])],
+    )
+
+    findings = capability_rule_health(
+        cfg, repo_checkouts={"repo-a": repo_a, "repo-b": repo_b}
+    )
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.healthy is True
+    assert f.dead is False
+    assert f.partial is False
+    assert set(f.matched_repos) == {"repo-a", "repo-b"}
+
+    lines = format_capability_rule_lines(findings, [])
+    joined = "\n".join(lines)
+    assert "DEAD" not in joined
+    assert "PARTIAL" not in joined
+    assert "✓" in joined
+
+
+def test_capability_rule_health_skips_repos_with_no_local_checkout(tmp_path: Path) -> None:
+    """#1779's precedent, applied per repo: a repo with no checkout present
+    on this machine is skipped, never counted toward dead — acceptance:
+    'Absent checkouts are skipped, not reported as dead.'"""
+    vimcode = _make_repo_checkout(tmp_path, "vimcode", ["src/gtk/window.c"])
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode"), Repo(name="quadraui", github="x/quadraui")],
+        [SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+    )
+
+    # quadraui deliberately absent from repo_checkouts — no local checkout.
+    findings = capability_rule_health(cfg, repo_checkouts={"vimcode": vimcode})
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.matched_repos == ("vimcode",)
+    assert f.suspect_repos == ()
+    assert f.skipped_repos == ("quadraui",)
+    assert f.dead is False
+    assert f.healthy is True  # nothing suspicious among the repos we COULD check
+
+    lines = format_capability_rule_lines(findings, [])
+    joined = "\n".join(lines)
+    assert "no local checkout" in joined
+    assert "quadraui" in joined
+
+
+def test_capability_rule_health_all_repos_absent_is_not_dead(tmp_path: Path) -> None:
+    """No checkout ANYWHERE must read as unverifiable, not dead — the
+    module's existing 'no checkout at all is not a problem' precedent."""
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode")],
+        [SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+    )
+
+    findings = capability_rule_health(cfg, repo_checkouts={})
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.checked_repos == ()
+    assert f.dead is False
+    assert f.healthy is False
+    assert f.skipped_repos == ("vimcode",)
+
+
+def test_capability_rule_health_clean_miss_is_not_partial(tmp_path: Path) -> None:
+    """A rule that legitimately only applies to one repo (its path simply
+    doesn't exist, at any depth, in the other repo) must not be flagged
+    PARTIAL — only a genuinely SUSPECT deeper occurrence should trip it."""
+    repo_a = _make_repo_checkout(tmp_path, "repo-a", ["only/here/thing.py"])
+    repo_b = _make_repo_checkout(tmp_path, "repo-b", ["totally/unrelated.py"])
+    cfg = _config(
+        [Repo(name="repo-a", github="x/repo-a"), Repo(name="repo-b", github="x/repo-b")],
+        [SmokeRule(files=["only/here/"], requires=["python"])],
+    )
+
+    findings = capability_rule_health(
+        cfg, repo_checkouts={"repo-a": repo_a, "repo-b": repo_b}
+    )
+
+    f = findings[0]
+    assert f.matched_repos == ("repo-a",)
+    assert f.suspect_repos == ()
+    assert f.clean_miss_repos == ("repo-b",)
+    assert f.partial is False
+    assert f.healthy is True
+
+
+def test_capability_rule_health_multiple_prefixes_on_one_rule_tracked_independently(
+    tmp_path: Path,
+) -> None:
+    repo_a = _make_repo_checkout(tmp_path, "repo-a", ["src/gtk/window.c"])
+    cfg = _config(
+        [Repo(name="repo-a", github="x/repo-a")],
+        [SmokeRule(files=["src/gtk/", "src/tui_main/"], requires=["gtk"])],
+    )
+
+    findings = capability_rule_health(cfg, repo_checkouts={"repo-a": repo_a})
+
+    assert len(findings) == 2
+    by_prefix = {f.prefix: f for f in findings}
+    assert by_prefix["src/gtk/"].dead is False
+    assert by_prefix["src/tui_main/"].dead is True
+
+
+def test_local_repo_checkouts_finds_existing_checkouts_and_skips_missing(
+    tmp_path: Path,
+) -> None:
+    vimcode = _make_repo_checkout(tmp_path, "vimcode", ["src/gtk/window.c"])
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode"), Repo(name="ghost-repo", github="x/ghost")],
+        [],
+        machines=[
+            Machine(
+                name="m1", host="m1.tail", capabilities=[],
+                repos=["vimcode", "ghost-repo"],
+                repo_paths={
+                    "vimcode": str(vimcode),
+                    "ghost-repo": str(tmp_path / "does-not-exist"),
+                },
+            ),
+        ],
+    )
+
+    found = local_repo_checkouts(cfg)
+
+    assert found == {"vimcode": vimcode}
+
+
+def test_local_repo_checkouts_first_machine_wins_when_repo_path_declared_twice(
+    tmp_path: Path,
+) -> None:
+    vimcode_a = _make_repo_checkout(tmp_path, "vimcode-a", ["src/gtk/window.c"])
+    vimcode_b = _make_repo_checkout(tmp_path, "vimcode-b", ["src/gtk/window.c"])
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode")],
+        [],
+        machines=[
+            Machine(
+                name="m1", host="m1.tail", capabilities=[], repos=["vimcode"],
+                repo_paths={"vimcode": str(vimcode_a)},
+            ),
+            Machine(
+                name="m2", host="m2.tail", capabilities=[], repos=["vimcode"],
+                repo_paths={"vimcode": str(vimcode_b)},
+            ),
+        ],
+    )
+
+    found = local_repo_checkouts(cfg)
+
+    assert found == {"vimcode": vimcode_a}
+
+
+# ── unclaimed_capability_requirements: `requires:` naming an undeclared cap ──
+
+
+def test_unclaimed_capability_requirements_flags_capability_no_machine_declares() -> None:
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode")],
+        [SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        machines=[
+            Machine(name="m1", host="m1.tail", capabilities=["python"], repos=["vimcode"]),
+        ],
+    )
+
+    unclaimed = unclaimed_capability_requirements(cfg)
+
+    assert unclaimed == ["gtk"]
+    lines = format_capability_rule_lines([], unclaimed)
+    joined = "\n".join(lines)
+    assert "UNCLAIMED CAPABILITY" in joined
+    assert "'gtk'" in joined
+    assert capability_rule_summary_line([], unclaimed) == (
+        "CAPABILITY_RULES: prefixes=0 dead=0 partial=0 unclaimed_caps=1"
+    )
+
+
+def test_unclaimed_capability_requirements_empty_when_every_capability_is_declared() -> None:
+    cfg = _config(
+        [Repo(name="vimcode", github="x/vimcode")],
+        [SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        machines=[
+            Machine(name="m1", host="m1.tail", capabilities=["gtk"], repos=["vimcode"]),
+        ],
+    )
+
+    assert unclaimed_capability_requirements(cfg) == []
+
+
+def test_format_capability_rule_lines_reports_nothing_configured_neutrally() -> None:
+    lines = format_capability_rule_lines([], [])
+    assert lines == ["· no smoke_tests.capability_rules configured — nothing to check"]
+
+
+def test_capability_rule_finding_dataclass_defaults_are_not_dead_or_healthy() -> None:
+    """Sanity: a bare finding (nothing checked at all) must not silently
+    read as dead=True (no signal isn't "no match") or healthy=True."""
+    f = CapabilityRuleFinding(rule_index=0, prefix="x/")
+    assert f.checked_repos == ()
+    assert f.dead is False
+    assert f.partial is False
+    assert f.healthy is False
