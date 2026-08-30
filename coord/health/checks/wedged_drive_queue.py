@@ -16,9 +16,8 @@ waiting on a gate that MIGHT clear; it is waiting on a gate that structurally
 cannot exist. ``coord.drive_queue.detect_unreachable_waits`` is the one
 predicate for that shape (also what backs the ``status`` alert line itself,
 so this check and that line can never say different things) — this probe
-just re-derives it, live, from the local ``drive_queue`` table every time
-``coord doctor`` runs, independent of whatever the last tick happened to
-report.
+just re-derives it, live, from ``drive_queue`` state every time ``coord
+doctor`` runs, independent of whatever the last tick happened to report.
 
 This is deliberately independent of #2935 (which fixes the specific sweep
 that produced the #2900/#2907 incident) and #2230 (the sweep's origin): both
@@ -28,12 +27,20 @@ being wedged *at all*, whatever sweep — present or future — produced it.
 WARN, not CRIT: the fix costs an operator ~10 seconds (``coord drive-queue
 remove`` + ``add``) once they know, and this check exists to make sure they
 know — it is not itself an outage.
+
+``cost=COST_NETWORK``, not ``COST_CHEAP``: ``coord.state.list_drive_queue``
+routes to the daemon over HTTP whenever ``board_service`` is set, which is
+the common case on a thin-client fleet machine (same situation
+``release_cordon.py`` documents for its own board-state read) — so this is a
+real network call on most of the fleet, not a local DB read, and must be
+skippable by ``--no-network``/timer runs and the automatic per-agent health
+poll exactly like the other network-costed checks.
 """
 
 from __future__ import annotations
 
 from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import COST_CHEAP, check
+from coord.health.registry import COST_NETWORK, check
 
 
 @check(
@@ -41,14 +48,19 @@ from coord.health.registry import COST_CHEAP, check
     scope="machine",
     title="wedged drive-queue entries",
     order=23,
-    cost=COST_CHEAP,
+    cost=COST_NETWORK,
     description=(
         "Drive-queue rows in `coord.drive_queue`'s #2944 guaranteed-false "
         "wait: `blocked`/`parked`, `attempts == 0` (never dispatched — no "
         "branch, no PR, no merge-queue row ever existed or ever can), "
-        "sitting past a few ticks of grace. A cheap local DB read (`coord."
-        "state.list_drive_queue`), no network, no `gh` — excluded from "
-        "nothing."
+        "sitting past a few ticks of grace. Reads via `coord.state."
+        "list_drive_queue`, which — per its own docstring — routes to the "
+        "daemon over HTTP when `board_service` is set (the common case on a "
+        "thin-client fleet machine, see `release_cordon.py`) and only reads "
+        "the local DB directly otherwise; `cost=network` so `--no-network`/"
+        "timer runs and the automatic per-agent health poll skip it exactly "
+        "like the other network-costed checks, same precedent as "
+        "`release_cordon`."
     ),
 )
 def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:

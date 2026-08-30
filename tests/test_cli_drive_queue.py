@@ -3652,6 +3652,13 @@ def test_status_alert_json_also_carries_the_wedged_entry(cli):
     payload = json.loads(result.output)
     assert payload["alert"] is not None
     assert f"{REPO}#2900" in payload["alert"]["reason"]
+    # Same key a tick-raised escalation uses (coord.state's `drive_escalations`
+    # shape — see tests/test_cli_drive_queue.py's other `proposed_command`
+    # assertions) so a JSON consumer of `alert` has one shape regardless of
+    # which of the two sources produced it (#2096).
+    assert "coord drive-queue remove" in payload["alert"]["proposed_command"]
+    assert "coord drive-queue add" in payload["alert"]["proposed_command"]
+    assert "command" not in payload["alert"]
 
 
 def test_status_alert_does_not_trip_for_a_fresh_transient_block(cli):
