@@ -2585,81 +2585,57 @@ def build_app(
         """The wire shape for a :class:`coord.portal_store.LedgerEntry` — same
         field set ``coord/serve_app.py``'s ``/portal-note``/``/portal-answer``
         responses already use, so a client that talks to either surface parses
-        one shape. ``payload_json`` is a JSON *string* on purpose (mirrors the
-        raw DB column) rather than a nested object.
+        one shape. Delegates to :func:`coord.portal_store.ledger_entry_wire`
+        — the one place that shape is defined, rather than a fourth
+        near-verbatim copy.
         """
-        return {
-            "id": entry.id,
-            "submission_id": entry.submission_id,
-            "seq": entry.seq,
-            "kind": entry.kind,
-            "question_revision": entry.question_revision,
-            "text": entry.text,
-            "actor": entry.actor,
-            "source_event_id": entry.source_event_id,
-            "payload_json": json.dumps(entry.payload, sort_keys=True),
-            "recorded_at": entry.recorded_at,
-        }
+        from coord import portal_store  # noqa: PLC0415
+
+        return portal_store.ledger_entry_wire(entry)
 
     async def api_portal_needs_input(request: Request) -> JSONResponse:
         """GET /api/portal/needs-input — submissions currently awaiting a
         relayed answer, each with its open question text and revision (#2990).
 
-        Thin read wrapper over #2986's own pairing rule
-        (``portal_store._current_open_question_revision``) — reimplements
-        none of it. A ``needs-input`` submission whose question has since
-        been answered out of band (the #2986 fold nudge is best-effort, so
-        this can lag by a beat) has no current open question and is left out
-        rather than shown with a stale/empty one.
+        Routed through :func:`coord.portal_store.needs_input_submissions`,
+        which resolves ``board_service`` itself and GETs the daemon's
+        ``/portal-needs-input`` when this ``coord web`` process is a thin
+        client — reading ``portal_store``'s tables directly here would
+        silently answer "nothing pending" off the daemon host, per that
+        module's own docstring ("this module runs on the daemon host, where
+        the local DB is canonical").
         """
         from coord import portal_store  # noqa: PLC0415
 
-        submissions = []
-        for sub in portal_store.list_submissions():
-            if sub.last_status != "needs-input":
-                continue
-            revision = portal_store._current_open_question_revision(
-                sub.submission_id
-            )
-            if revision is None:
-                continue
-            question_text = sub.open_question
-            for entry in portal_store.ledger_for_submission(sub.submission_id):
-                if (
-                    entry.kind == portal_store.LEDGER_KIND_QUESTION_PUSHED
-                    and entry.question_revision == revision
-                ):
-                    question_text = entry.text
-            submissions.append({
-                "submission_id": sub.submission_id,
-                "question_revision": revision,
-                "question": question_text,
-            })
+        submissions = portal_store.needs_input_submissions()
         return JSONResponse({"submissions": submissions})
 
     def _matching_relayed_answer(
-        submission_id: str, revision: int, text: str, source: str
+        preflight: dict, revision: int, text: str, source: str
     ):
         """An already-recorded relayed answer identical to this request, or
-        ``None``.
+        ``None`` — scanned from *preflight*'s already-routed
+        ``relayed_answers`` (:func:`coord.portal_store.answer_preflight`,
+        #2990) rather than a fresh direct ledger read.
 
         #2990 acceptance: a browser client retrying on a flaky phone
         connection must converge on the one ledger row, not append a second.
-        Only matches ``relayed`` rows (this endpoint's own writes) — never an
-        inbound customer answer that happens to share the same text, which
-        would be a coincidence, not a retry.
+        ``relayed_answers`` only ever contains ``relayed`` rows (this
+        endpoint's own writes) — never an inbound customer answer that
+        happens to share the same text, which would be a coincidence, not a
+        retry.
         """
-        from coord import portal_store  # noqa: PLC0415
-
         norm_text = text.strip()
         norm_source = (source or "").strip().lower()
-        for entry in portal_store.ledger_for_submission(submission_id):
+        for entry in preflight["relayed_answers"]:
+            try:
+                payload = json.loads(entry["payload_json"])
+            except (ValueError, TypeError):
+                payload = {}
             if (
-                entry.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
-                and entry.question_revision == revision
-                and bool(entry.payload.get("relayed"))
-                and entry.payload.get("source") == norm_source
-                and entry.text == norm_text
+                entry["question_revision"] == revision
+                and payload.get("source") == norm_source
+                and entry["text"] == norm_text
             ):
                 return entry
         return None
@@ -2682,6 +2658,13 @@ def build_app(
         AFTER the idempotency match below, so a retry of an already-recorded
         answer still converges even though its revision closed the moment
         the first attempt landed.
+
+        The existence check, the idempotency scan, and the 409 check all
+        read via :func:`coord.portal_store.answer_preflight` — routed to the
+        daemon exactly like the write below already was, so all three agree
+        with the actual write even when this process is a thin client. Only
+        the write itself (``portal_store.answer_question``) reaches the real
+        daemon-canonical data when this dashboard is running there directly.
         """
         try:
             body = await request.json()
@@ -2709,16 +2692,17 @@ def build_app(
 
         from coord import portal_store  # noqa: PLC0415
 
-        if portal_store.get_submission(submission_id) is None:
+        preflight = portal_store.answer_preflight(submission_id)
+        if preflight is None:
             return JSONResponse(
                 {"error": f"unknown submission {submission_id!r}"}, status_code=404
             )
 
-        existing = _matching_relayed_answer(submission_id, revision, text, source)
+        existing = _matching_relayed_answer(preflight, revision, text, source)
         if existing is not None:
-            return JSONResponse({"entry": _serialize_ledger_entry(existing)})
+            return JSONResponse({"entry": existing})
 
-        current_open = portal_store._current_open_question_revision(submission_id)
+        current_open = preflight["current_open_revision"]
         if current_open != revision:
             return JSONResponse(
                 {

@@ -3485,6 +3485,49 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-needs-input": {
+            "get": {
+                "summary": (
+                    "#2990: submissions currently in needs-input with a "
+                    "still-open pushed question — backs the dashboard's "
+                    "`GET /api/portal/needs-input` off the daemon host"
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — {'submissions': [{'submission_id', "
+                            "'question_revision', 'question'}, ...]}"
+                        )
+                    },
+                },
+            },
+        },
+        "/portal-answer-preflight": {
+            "get": {
+                "summary": (
+                    "#2990: the reads gating a relayed-answer write — "
+                    "current open question revision + previously-recorded "
+                    "relayed answers — backs the dashboard's "
+                    "`POST /api/portal/answer` off the daemon host"
+                ),
+                "parameters": [
+                    {
+                        "name": "submission_id", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — {'preflight': {'current_open_revision', "
+                            "'relayed_answers'}}"
+                        )
+                    },
+                    "400": {"description": "Missing submission_id"},
+                    "404": {"description": "Unknown submission"},
+                },
+            },
+        },
         "/dispatched": {
             "post": {
                 "summary": "Record a thin client's review/fix/rework/merge dispatch (#590 Phase 2)",
@@ -6591,6 +6634,52 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 status_code=503,
             )
         return JSONResponse({"payload": payload})
+
+    async def get_portal_needs_input(request: Request) -> Response:
+        # #2990: submissions currently awaiting a relayed answer, on the
+        # daemon — the dashboard's `GET /api/portal/needs-input`
+        # (`coord/dashboard/server.py`) routes here when `board_service` is
+        # configured (`coord web` running off the daemon host), same
+        # reasoning as `/portal-ledger` right above:
+        # `coord.portal_store._needs_input_submissions_local` reads tables
+        # that are only correct on THIS host.
+        from coord import portal_store  # noqa: PLC0415
+
+        try:
+            submissions = portal_store._needs_input_submissions_local()
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-needs-input read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"submissions": submissions})
+
+    async def get_portal_answer_preflight(request: Request) -> Response:
+        # #2990: the reads the dashboard's `POST /api/portal/answer` needs
+        # to gate a relayed-answer write (existence, current open question
+        # revision, previously-recorded relayed answers for idempotency) —
+        # bundled into one round trip and routed here for the same reason
+        # `/portal-needs-input` right above is. A 404 here (unknown
+        # submission) is the caller's own 404, not a transport failure.
+        from coord import portal_store  # noqa: PLC0415
+
+        submission_id = request.query_params.get("submission_id")
+        if not submission_id:
+            return JSONResponse(
+                {"error": "submission_id is required"}, status_code=400
+            )
+        try:
+            preflight = portal_store._answer_preflight_local(submission_id)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-answer-preflight read failed", "detail": str(e)},
+                status_code=503,
+            )
+        if preflight is None:
+            return JSONResponse(
+                {"error": f"unknown submission {submission_id!r}"}, status_code=404
+            )
+        return JSONResponse({"preflight": preflight})
 
     async def post_dispatched(request: Request) -> Response:
         # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
@@ -9907,6 +9996,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/portal-note", post_portal_note, methods=["POST"]),
         Route("/portal-answer", post_portal_answer, methods=["POST"]),
         Route("/portal-ledger", get_portal_ledger, methods=["GET"]),
+        Route("/portal-needs-input", get_portal_needs_input, methods=["GET"]),
+        Route(
+            "/portal-answer-preflight", get_portal_answer_preflight, methods=["GET"]
+        ),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/uat-verdict", post_uat_verdict, methods=["POST"]),
