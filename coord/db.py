@@ -591,7 +591,10 @@ def retry_on_locked(
 #
 # #2786: bumped 5 -> 6 for the `assignments.num_turns` column appended to
 # `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 6
+#
+# #2987: bumped 6 -> 7 for the two `portal_sync_state.relayed_answer_
+# watermark_*` columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 7
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1237,7 +1240,17 @@ _SCHEMA_SQL = """
             verdict_watermark_at    REAL,
             verdict_watermark_rowid TEXT,
             question_watermark_at    REAL,
-            question_watermark_rowid TEXT
+            question_watermark_rowid TEXT,
+            -- #2987: the relayed-answer CONFIRMATION consumer's own read
+            -- position — same shape and same reason as
+            -- `question_watermark_at`/`question_watermark_rowid` just above
+            -- (a private watermark, independent of `handled_at`, so the
+            -- never-marked backlog every OTHER event kind leaves behind
+            -- cannot starve this consumer of a `relayed_answer.confirmed`
+            -- event newer than it). See
+            -- `coord.portal_sync._consume_relayed_answer_confirmations`.
+            relayed_answer_watermark_at    REAL,
+            relayed_answer_watermark_rowid TEXT
         );
 
         -- #2749 (IL-3, epic #2746): the running-context ledger — the record
@@ -1755,6 +1768,18 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # `question_answered` event a no-op rather than a duplicate ledger row.
     "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_at REAL",
     "ALTER TABLE portal_sync_state ADD COLUMN question_watermark_rowid TEXT",
+    # #2987: the relayed-answer confirmation consumer's own read position
+    # into `portal_events` — same reason and same shape as
+    # `question_watermark_at`/`question_watermark_rowid` above. NULL (read
+    # as `(0.0, "")`, before every real event) for every database predating
+    # this migration, which replays the full existing inbox exactly once on
+    # upgrade — safe for the same reason replaying it is safe for the
+    # question consumer: `append_ledger_entry`'s `(submission_id, kind,
+    # source_event_id)` dedupe makes a re-observed event a no-op rather than
+    # a duplicate ledger row. See
+    # `coord.portal_sync._consume_relayed_answer_confirmations`.
+    "ALTER TABLE portal_sync_state ADD COLUMN relayed_answer_watermark_at REAL",
+    "ALTER TABLE portal_sync_state ADD COLUMN relayed_answer_watermark_rowid TEXT",
     # #2786: worker-reported turn count, parsed off the final stream-json
     # `result` event into `WorkerSummary.num_turns` (coord/worker_events.py)
     # alongside the four token columns above, but never persisted until now.

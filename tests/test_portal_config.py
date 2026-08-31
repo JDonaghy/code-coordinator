@@ -211,6 +211,7 @@ def test_portal_outbox_kinds_matches_portal_syncs_kind_constants():
         portal_sync.KIND_DESIGN_ROUND,
         portal_sync.KIND_QUESTION,
         portal_sync.KIND_PREVIEW,
+        portal_sync.KIND_RELAYED_ANSWER,
     }
 
 

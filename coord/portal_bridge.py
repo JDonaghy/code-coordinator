@@ -95,6 +95,10 @@ COORD_OWNED_FIELDS = (
     "artifacts",
     "onhold_since",
     "preview_url",
+    # #2987: a relayed answer coord recorded on the client's behalf
+    # (`coord portal answer`, #2986), pushed OUT so the client can see and
+    # confirm/correct it — the wire shape coord-portal#159 specifies.
+    "relayed_answer",
 )
 
 

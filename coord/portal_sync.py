@@ -33,15 +33,27 @@ One pass, in this order:
    an immutable ``portal_ledger`` row pairing the answer with the question
    that prompted it, then nudge the submission's customer status off
    ``needs-input``. See :func:`_consume_questions`.
-4. **Fold status** (#2588) — every linked milestone (``coord portal link``,
+4. **Ledger relayed-answer confirmations** (#2987) — the client's half of
+   the loop #2986 started: walk events pulled but not yet scanned by THIS
+   consumer (again its own watermark) and, for each
+   ``relayed_answer.confirmed`` event, append an immutable
+   ``portal_ledger`` row marking the relayed answer client-confirmed, then
+   nudge the submission's customer status off ``needs-input`` the same way
+   step 3 does. A CORRECTION needs no consumer here — it arrives as an
+   ordinary ``question.answered`` event and step 3 above already ledgers it
+   as a normal client-authored answer, which is exactly "lands as a normal
+   answer that supersedes it, both remain visible". See
+   :func:`_consume_relayed_answer_confirmations`.
+5. **Fold status** (#2588) — every linked milestone (``coord portal link``,
    #2507/PDR-1) has its issues folded into one customer status
    (:func:`fold_submission_status`: planned / in-progress / shipped) and,
    if it changed since the last push, enqueued — the automatic caller
    `enqueue_status` never had before this issue. See
    :func:`sync_submission_statuses`.
-5. **Push** — coord-authored facts from the outbox (design rounds · status ·
-   open questions), one row at a time, in per-submission FIFO order.
-6. **Heartbeat** — say the daemon is alive.
+6. **Push** — coord-authored facts from the outbox (design rounds · status ·
+   open questions · relayed answers), one row at a time, in per-submission
+   FIFO order.
+7. **Heartbeat** — say the daemon is alive.
 
 Each phase is independently guarded: a portal outage, a rejected field, or a
 malformed event can never crash the tick or silence the other two phases (the
@@ -67,7 +79,12 @@ screen. So an announcing row names the row it announces
 (:data:`ANNOUNCING_STATUSES`), and this loop will not send it until that row
 is **confirmed applied** — not enqueued, not attempted, applied. A crash
 between the two leaves the announcement pending and retries it next tick;
-there is no window in which the mail goes out ahead of its content.
+there is no window in which the mail goes out ahead of its content. #2987
+applies this same rule to a relayed answer: ``needs-input`` also announces
+``relayed_answer`` (:func:`enqueue_relayed_answer` names it explicitly via
+:func:`enqueue_status`'s ``requires_kind`` override), so the client can never
+be told "confirm what you told us" before the row naming what they said has
+actually landed.
 
 **The draft gate (#2903, phase 1 of #2902), which sits in FRONT of all of
 this.** An agent-authored ``design_round`` or ``question`` is enqueued into
@@ -98,6 +115,7 @@ before can be confirmed that way.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 from dataclasses import dataclass, field
@@ -130,6 +148,14 @@ class PortalSyncError(RuntimeError):
 #: Everything not listed here is a passive display change and needs no
 #: prerequisite. Keep this in step with coord-portal's ``src/notifications.ts``
 #: — a status that starts sending mail must be added here on the same day.
+#: Each status maps to the DEFAULT `requires_kind` a caller gets by not
+#: passing an explicit one to :func:`enqueue_status` — not the only kind that
+#: status can ever require. `needs-input` also announces a #2987 relayed
+#: answer (:func:`enqueue_relayed_answer` passes `requires_kind=
+#: KIND_RELAYED_ANSWER` explicitly): the row itself carries `requires_kind`
+#: (see `ordering_block_reason`, which reads it off the row, never off this
+#: dict directly), so two different `needs-input` rows on the same
+#: submission can legitimately require two different prior kinds.
 ANNOUNCING_STATUSES: dict[str, str] = {
     # "your design is ready — approve it or tell us what to change"
     "awaiting-signoff": "design_round",
@@ -149,6 +175,9 @@ KIND_STATUS = "status"
 KIND_DESIGN_ROUND = "design_round"
 KIND_QUESTION = "question"
 KIND_PREVIEW = "preview"
+#: #2987: a #2986 relayed answer, pushed OUT so the client can confirm or
+#: correct it.
+KIND_RELAYED_ANSWER = "relayed_answer"
 
 #: Event keys that are bookkeeping rather than customer-authored content —
 #: excluded from the mirror because they describe the envelope, not the
@@ -204,6 +233,13 @@ MAX_VERDICT_PAGES = 10
 MAX_QUESTION_EVENTS_PER_TICK = 100
 MAX_QUESTION_PAGES = 10
 
+#: The relayed-answer CONFIRMATION consumer's per-tick page size / page
+#: count (#2987) — same shape and same reasoning as
+#: `MAX_QUESTION_EVENTS_PER_TICK`/`MAX_QUESTION_PAGES` just above. See
+#: :func:`_consume_relayed_answer_confirmations`.
+MAX_RELAYED_ANSWER_EVENTS_PER_TICK = 100
+MAX_RELAYED_ANSWER_PAGES = 10
+
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -215,6 +251,9 @@ class SyncResult:
     #: `question.answered` events ledgered this pass (#2749) — see
     #: :func:`_consume_questions`.
     questions_consumed: int = 0
+    #: `relayed_answer.confirmed` events ledgered this pass (#2987) — see
+    #: :func:`_consume_relayed_answer_confirmations`.
+    relayed_answer_confirmations_consumed: int = 0
     applied: int = 0
     rejected: int = 0
     held: int = 0
@@ -230,6 +269,7 @@ class SyncResult:
         """True when this pass actually moved a row in either direction."""
         return bool(
             self.pulled or self.verdicts_consumed or self.questions_consumed
+            or self.relayed_answer_confirmations_consumed
             or self.applied or self.rejected or self.status_queued
         )
 
@@ -245,6 +285,8 @@ class SyncResult:
             f"pulled={self.pulled}",
             f"verdicts_consumed={self.verdicts_consumed}",
             f"questions_consumed={self.questions_consumed}",
+            f"relayed_answer_confirmations_consumed="
+            f"{self.relayed_answer_confirmations_consumed}",
             f"applied={self.applied}",
             f"rejected={self.rejected}",
             f"held={self.held}",
@@ -464,6 +506,7 @@ def enqueue_status(
     *,
     config: Any = None,
     now: float | None = None,
+    requires_kind: str | None = None,
 ) -> portal_store.OutboxRow:
     """Queue an up-mapped customer status for *submission_id*.
 
@@ -473,13 +516,21 @@ def enqueue_status(
     safety property — it is the difference between a caller learning it has
     the order wrong immediately, and a row sitting held in the queue while
     someone wonders why the customer was never told.
+
+    *requires_kind*, when given, overrides :data:`ANNOUNCING_STATUSES`'s
+    default for *status* — needed because more than one kind can share the
+    same announcing status (#2987: `needs-input` announces either a
+    `question` or a relayed `answer`, and only the caller enqueueing THIS
+    row knows which). ``None`` (the default) keeps the existing
+    one-status-one-kind lookup every other caller relies on.
     """
     if status not in SUBMISSION_STATUSES:
         raise PortalSyncError(
             f"{status!r} is not in the pinned portal status vocabulary: "
             f"{SUBMISSION_STATUSES}"
         )
-    requires_kind = ANNOUNCING_STATUSES.get(status, "")
+    if requires_kind is None:
+        requires_kind = ANNOUNCING_STATUSES.get(status, "")
     if requires_kind:
         prior = [
             r
@@ -503,6 +554,81 @@ def enqueue_status(
         state=initial_outbox_state(KIND_STATUS, config=config),
         now=now,
     )
+
+
+def _iso_date(recorded_at: float) -> str:
+    """``recorded_at`` (a wall-clock epoch stamp) as a bare ``YYYY-MM-DD``,
+    UTC — the "date" half of the relayed-answer wire shape (#2987,
+    coord-portal#159). Coord never asks the operator for a date separately;
+    the ledger's own timestamp of *when the answer was actually recorded* IS
+    the date, same as every other ledger fact.
+    """
+    return datetime.datetime.fromtimestamp(
+        recorded_at, tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%d")
+
+
+def enqueue_relayed_answer(
+    submission_id: str,
+    entry: "portal_store.LedgerEntry",
+    *,
+    config: Any = None,
+    now: float | None = None,
+) -> tuple[portal_store.OutboxRow, portal_store.OutboxRow]:
+    """Queue a #2986 relayed answer OUT to the portal, plus the announcement
+    that summons the client to confirm or correct it (#2987).
+
+    *entry* is the :class:`coord.portal_store.LedgerEntry` :func:`coord.
+    portal_store.answer_question` just appended — a ``question_answered``
+    row flagged ``{"relayed": True, ...}`` — never an arbitrary ledger row;
+    this function is the outbound HALF of that same call, not a general
+    "push any answer" API.
+
+    Same shape as :func:`enqueue_question`: the fact row, then its own
+    ``needs-input`` announcement in the SAME call, so a caller cannot queue
+    one and forget the other (#2901's exact failure mode, reproduced for
+    THIS kind would leave the client never told a relayed answer is waiting
+    to confirm). `requires_kind` is passed explicitly as
+    :data:`KIND_RELAYED_ANSWER` — see :func:`enqueue_status`'s docstring for
+    why `needs-input`'s default lookup alone is not enough here: this
+    announcement must be held on THIS answer being confirmed applied, not on
+    whatever `question` row happens to be latest.
+
+    Returns ``(answer_row, status_row)`` in that seq order.
+    """
+    if (
+        entry.kind != portal_store.LEDGER_KIND_QUESTION_ANSWERED
+        or not entry.payload.get("relayed")
+    ):
+        raise PortalSyncError(
+            "enqueue_relayed_answer needs a #2986 relayed-answer ledger entry "
+            f"(kind={entry.kind!r}, payload={entry.payload!r})"
+        )
+    if not entry.text or not entry.text.strip():
+        raise PortalSyncError("relayed answer must be non-empty")
+    source = entry.payload.get("source") or portal_store.DEFAULT_RELAYED_ANSWER_SOURCE
+    answer_row = portal_store.enqueue(
+        submission_id,
+        KIND_RELAYED_ANSWER,
+        {
+            "relayed_answer": {
+                "text": entry.text,
+                "question_revision": entry.question_revision,
+                "source": source,
+                "date": _iso_date(entry.recorded_at),
+            }
+        },
+        state=initial_outbox_state(KIND_RELAYED_ANSWER, config=config),
+        now=now,
+    )
+    status_row = enqueue_status(
+        submission_id,
+        "needs-input",
+        config=config,
+        now=now,
+        requires_kind=KIND_RELAYED_ANSWER,
+    )
+    return answer_row, status_row
 
 
 # ── automatic status fold (#2588) ───────────────────────────────────────────
@@ -949,11 +1075,12 @@ def sync_tick(
     (``coord.serve_app._portal_sync_tick``) always passes a freshly-built
     board; the ``coord portal sync`` CLI and most tests don't need to.
 
-    Six phases, independently isolated, deliberately in this order: pull
-    first (a sign-off verdict — or a question's answer — pulled now can be
-    acted on this same tick), then verdict consumption (#2509), then
-    question-answer ledgering (#2749) — its own status nudge feeds the fold
-    right after it — then the automatic status fold (#2588 — runs BEFORE
+    Seven phases, independently isolated, deliberately in this order: pull
+    first (a sign-off verdict — or a question's answer, or a relayed
+    answer's confirmation — pulled now can be acted on this same tick), then
+    verdict consumption (#2509), then question-answer ledgering (#2749),
+    then relayed-answer confirmation ledgering (#2987) — both feed the fold
+    right after them — then the automatic status fold (#2588 — runs BEFORE
     push so a status it just enqueued goes out with this same tick's push
     rather than waiting a full cycle), then push, heartbeat last but
     unconditionally — a pass that failed everything else still proves the
@@ -1005,6 +1132,23 @@ def sync_tick(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"questions: {exc}")
         logger.warning("portal sync: question consumption failed", exc_info=True)
+
+    # #2987: ledger every `relayed_answer.confirmed` event pulled above (or
+    # by an earlier tick) — isolated exactly like question-answer ledgering
+    # just above: a bad event must not silence the status fold, push, or
+    # heartbeat below.
+    relayed_answer_confirmations_consumed = 0
+    try:
+        relayed_answer_confirmations_consumed, confirmation_errors = (
+            _consume_relayed_answer_confirmations(config, now=now)
+        )
+        errors.extend(confirmation_errors)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"relayed_answer_confirmations: {exc}")
+        logger.warning(
+            "portal sync: relayed-answer confirmation consumption failed",
+            exc_info=True,
+        )
 
     # #2588: fold every linked milestone's issues into a customer status and
     # enqueue it if it changed — BEFORE push, so a freshly-folded row goes
@@ -1067,6 +1211,7 @@ def sync_tick(
         pulled=pulled,
         verdicts_consumed=verdicts_consumed,
         questions_consumed=questions_consumed,
+        relayed_answer_confirmations_consumed=relayed_answer_confirmations_consumed,
         applied=applied,
         rejected=rejected,
         held=held,
@@ -1694,6 +1839,193 @@ def _consume_questions(
 
     if (commit_at, commit_rowid) != (initial_at, initial_rowid):
         portal_store.set_question_watermark(commit_at, commit_rowid)
+    return consumed, errors
+
+
+# ── consuming a relayed answer's client confirmation (#2987) ───────────────
+#
+# The counterpart to `enqueue_relayed_answer` above: that puts a #2986
+# relayed answer on the outbound queue for the client to see, this acts on
+# the client tapping "confirm" once they have. A CORRECTION needs no
+# consumer of its own — it arrives as an ordinary `question.answered` event
+# and `_consume_questions`/`_record_question_answer` above already ledger it
+# as a normal (non-`relayed`) answer, which is exactly "lands as a normal
+# client-authored answer that supersedes it" (this issue's acceptance bar):
+# the ledger is append-only, so the relayed answer and the correction both
+# stay visible under the same `question_revision`, oldest first.
+
+
+def _relayed_answer_confirmation_fields(
+    event: "portal_store.PortalEvent",
+) -> dict[str, Any] | None:
+    """The confirmation *event* carries, or ``None`` if it isn't a
+    ``relayed_answer.confirmed`` event.
+
+    Same posture as :func:`_question_answer_fields` — coord-portal's event
+    contract for this isn't shared with this repo as a schema, so this reads
+    every plausible field name rather than betting on one, and returns
+    ``None`` (never raises) on anything that doesn't look like a
+    confirmation, leaving the event unhandled for a human to look at rather
+    than mis-filed.
+    """
+    kind = (event.kind or "").strip().lower()
+    if kind not in (
+        "relayed_answer.confirmed",
+        "relayed_answer_confirmed",
+        "answer.confirmed",
+        "answer_confirmed",
+    ):
+        return None
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    nested = payload.get("data")
+    if not isinstance(nested, dict):
+        nested = payload.get("fields")
+    sources = [s for s in (nested, payload) if isinstance(s, dict)]
+
+    def _first_str(*keys: str) -> str:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _first_int(*keys: str) -> int | None:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                    return int(value.strip())
+        return None
+
+    return {
+        "question_revision": _first_int("question_revision", "revision"),
+        "confirmed_by": _first_str(
+            "confirmed_by", "actor", "customer_name", "author"
+        )
+        or "customer",
+    }
+
+
+def _record_relayed_answer_confirmation(
+    config: Any, event: "portal_store.PortalEvent"
+) -> None:
+    """Ledger one relayed answer's client confirmation and nudge the
+    submission off ``needs-input`` (#2987). Raises only on a genuine
+    ledger-write failure — the caller marks the event consumed only then,
+    matching :func:`_record_question_answer`'s discipline exactly.
+
+    "no matching relayed answer on file" is not raise-worthy here, same
+    reasoning as that function: the confirmation is durably recorded either
+    way (via ``question_revision``), just possibly unpaired if the answer
+    it confirms was never queued (a portal-side inconsistency this side
+    cannot fix by refusing to record what the client actually did).
+    """
+    fields = _relayed_answer_confirmation_fields(event)
+    if fields is None:
+        return
+    portal_store.append_ledger_entry(
+        event.submission_id,
+        portal_store.LEDGER_KIND_ANSWER_CONFIRMED,
+        question_revision=fields["question_revision"],
+        actor=fields["confirmed_by"],
+        source_event_id=event.event_id,
+        payload={"event": event.payload},
+    )
+
+    # Best-effort nudge, same reasoning and same isolation as
+    # `_record_question_answer`'s own courtesy fold right above it.
+    if config is None:
+        return
+    try:
+        link = portal_store.get_link_by_submission(event.submission_id)
+        if link is None:
+            return
+        repo_cfg = config.repo(link.repo_name)
+        if repo_cfg is None:
+            return
+        if link.issue_number is not None:
+            fold_status_for_issue(config, link.repo_name, link.issue_number)
+        else:
+            fold_status_for_milestone(config, link.repo_name, link.milestone_number)
+    except Exception:  # noqa: BLE001 — a courtesy nudge, not the recorded fact itself
+        logger.warning(
+            "portal sync: could not fold status after relayed-answer "
+            "confirmation for %s",
+            event.submission_id,
+            exc_info=True,
+        )
+
+
+def _consume_relayed_answer_confirmations(
+    config: Any,
+    *,
+    limit: int = MAX_RELAYED_ANSWER_EVENTS_PER_TICK,
+    pages: int = MAX_RELAYED_ANSWER_PAGES,
+    now: float | None = None,
+) -> tuple[int, list[str]]:
+    """Walk the inbox from this consumer's OWN watermark, ledgering every
+    ``relayed_answer.confirmed`` event found (#2987).
+
+    Identical shape to :func:`_consume_questions` — its own private
+    watermark, freeze-on-failure within a page, bounded pages per tick — see
+    that function's docstring for the full rationale, which applies here
+    unchanged: every event kind this consumer ignores must not pile up
+    ahead of the next genuine confirmation forever.
+    """
+    consumed = 0
+    errors: list[str] = []
+
+    initial_at, initial_rowid = portal_store.get_relayed_answer_watermark()
+    commit_at, commit_rowid = initial_at, initial_rowid
+    scan_at, scan_rowid = initial_at, initial_rowid
+    blocked = False
+
+    for _page_num in range(pages):
+        page = portal_store.events_after_relayed_answer_watermark(
+            scan_at, scan_rowid, limit=limit
+        )
+        if not page:
+            break
+        for rowid, event in page:
+            scan_at, scan_rowid = event.received_at, rowid
+            if event.handled_at is not None:
+                if not blocked:
+                    commit_at, commit_rowid = scan_at, scan_rowid
+                continue
+            try:
+                fields = _relayed_answer_confirmation_fields(event)
+                if fields is None:
+                    if not blocked:
+                        commit_at, commit_rowid = scan_at, scan_rowid
+                    continue
+                _record_relayed_answer_confirmation(config, event)
+            except Exception as exc:  # noqa: BLE001 — one bad event must not stop the page
+                errors.append(
+                    f"relayed_answer confirmation {event.event_id} "
+                    f"({event.submission_id}): {exc}"
+                )
+                logger.warning(
+                    "portal sync: could not ledger relayed-answer "
+                    "confirmation event for submission %s",
+                    event.submission_id,
+                    exc_info=True,
+                )
+                blocked = True
+                continue
+            portal_store.mark_event_handled(event.event_id, now=now)
+            consumed += 1
+            if not blocked:
+                commit_at, commit_rowid = scan_at, scan_rowid
+        if blocked or len(page) < limit:
+            break
+
+    if (commit_at, commit_rowid) != (initial_at, initial_rowid):
+        portal_store.set_relayed_answer_watermark(commit_at, commit_rowid)
     return consumed, errors
 
 

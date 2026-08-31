@@ -1587,7 +1587,12 @@ class TestOperatorNotes:
             }
         ]
         assert payload["qa"] == [
-            {"question_revision": 1, "question": "Q1", "answers": []}
+            {
+                "question_revision": 1,
+                "question": "Q1",
+                "answers": [],
+                "confirmations": [],
+            }
         ]
         assert payload["unpaired_answers"] == []
         assert payload["decisions"] == []
