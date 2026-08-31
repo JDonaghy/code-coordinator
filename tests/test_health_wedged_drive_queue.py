@@ -98,6 +98,55 @@ def test_ok_when_blocked_with_real_attempts_spent(monkeypatch) -> None:
     assert result.severity == Severity.OK
 
 
+_DISPATCH_FAILURE_REASON = (
+    "drive session died without landing the work (2/2 attempts) — giving up "
+    "— no assignment was ever created for this run (#2273): likely an "
+    "infrastructure/dispatch-layer failure, not a code defect"
+)
+
+
+def test_warn_for_an_exhausted_dispatch_layer_root_despite_attempts_spent(
+    monkeypatch,
+) -> None:
+    """#2978: `attempts > 0` no longer buys an unconditional pass — an entry
+    that exhausted its retry budget without #2273's dispatch layer ever
+    producing an assignment has the identical "no branch/PR for a sweep to
+    act on" shape as the original attempts=0 case."""
+    monkeypatch.setattr(
+        "coord.state.list_drive_queue",
+        lambda: [
+            _row(161, state="blocked", attempts=2, deferrals=1, last_reason=_DISPATCH_FAILURE_REASON)
+        ],
+    )
+    result = probe_wedged_drive_queue(_health_ctx())
+    assert result.severity == Severity.WARN
+    assert "claude-coordinator#161" in result.detail
+
+
+def test_ok_for_a_dependent_blocked_on_an_unsatisfiable_after_prereq(
+    monkeypatch,
+) -> None:
+    """#2978: a dependent chained behind a blocked root — `_reconcile_
+    blocked_after`'s to self-heal (#2756) — must never warn here, no matter
+    how many deferrals it has piled up."""
+    root_key = "claude-coordinator#161"
+    monkeypatch.setattr(
+        "coord.state.list_drive_queue",
+        lambda: [
+            _row(
+                162,
+                state="blocked",
+                attempts=0,
+                deferrals=40,
+                after_json=f'["{root_key}"]',
+                last_reason=f"pre-req {root_key} is queued but blocked — it will never satisfy",
+            )
+        ],
+    )
+    result = probe_wedged_drive_queue(_health_ctx())
+    assert result.severity == Severity.OK
+
+
 def test_unknown_when_the_queue_read_raises(monkeypatch) -> None:
     def _boom():
         raise RuntimeError("db is locked")
