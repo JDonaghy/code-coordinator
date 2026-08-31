@@ -80,9 +80,12 @@ from coord.drive_queue import (
     find_cycle,
     fired_holds,
     is_dispatch_failure_reason,
+    is_merge_gate_block_reason,
     is_permanent_block_reason,
     is_pre_dispatch_block_reason,
     is_unsatisfiable_prereq_reason,
+    merge_gate_remedy_command,
+    merge_plan_inspect_command,
     parse_after_spec,
     parse_key,
     pending_probe_targets,
@@ -4526,6 +4529,30 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     )
 
 
+def _blocked_escalation_command(entry: QueueEntry | None, key: str, reason: str) -> str:
+    """The command a `blocked`/`oscillating` escalation should propose
+    (#3016) — `_requeue_command` ONLY for a genuinely never-dispatched entry;
+    a gate-specific remedy (or the safe read-only inspect fallback) whenever
+    *reason* already names a merge-gate block.
+
+    `_requeue_command` is right exactly once: nothing was ever dispatched
+    for this row (or every dispatch attempt died before an assignment
+    existed), so there is nothing left to lose by dropping and re-adding it.
+    But `is_merge_gate_block_reason` names the other shape — Work/Test/
+    Review already completed and it is the MERGE stage that is stuck — where
+    the same requeue would discard that completed cycle instead of fixing
+    the one gate actually blocking it. `merge_gate_remedy_command` is the
+    one place that maps a merge-gate reason to its safe one-line fix (or, if
+    none is known blind, the inspect command); this only decides WHICH of
+    the two families applies.
+    """
+    if is_merge_gate_block_reason(reason):
+        parsed = parse_key(key)
+        if parsed is not None:
+            return merge_gate_remedy_command(reason, parsed[0], parsed[1])
+    return _requeue_command(entry, key)
+
+
 @drive_queue_group.command("tick")
 @click.option(
     "--max-parallel",
@@ -5071,7 +5098,7 @@ def drive_queue_tick(
                     f"{entry.position if entry else '?'} | after="
                     f"{','.join(entry.after) if entry and entry.after else '(none)'}"
                 ),
-                command=_requeue_command(entry, item.key),
+                command=_blocked_escalation_command(entry, item.key, item.reason),
             )
 
         # #2230: an entry #2230's sweep would have resumed, but has already
@@ -5098,7 +5125,7 @@ def drive_queue_tick(
                     f"/{MAX_BLOCKED_RESUMES} | position="
                     f"{entry.position if entry else '?'}"
                 ),
-                command=_requeue_command(entry, item.key),
+                command=_blocked_escalation_command(entry, item.key, item.reason),
             )
 
         # #2806: a `blocked` entry #2230's sweep targeted this tick, but whose
@@ -5117,6 +5144,14 @@ def drive_queue_tick(
             if parsed is None:
                 continue
             entry = by_key.get(item.key)
+            # #3016: NEVER the `remove && add` requeue here — `item.reason`
+            # already says "the next tick re-probes rather than guessing"
+            # (#2806); a destructive requeue directly contradicts that, and
+            # would additionally discard a completed Work/Test/Review cycle
+            # for no reason connected to what actually failed (a probe, not
+            # a gate). The read-only inspect command is the only thing safe
+            # to propose when the tick itself does not yet know what shape
+            # this block is.
             _escalate(
                 parsed[0],
                 parsed[1],
@@ -5125,7 +5160,7 @@ def drive_queue_tick(
                     f"queue_state=blocked | gate_reading=unreadable | "
                     f"position={entry.position if entry else '?'}"
                 ),
-                command=_requeue_command(entry, item.key),
+                command=merge_plan_inspect_command(parsed[0]),
             )
 
         if plan.alert is not None:
