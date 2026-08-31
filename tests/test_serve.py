@@ -5472,6 +5472,89 @@ def test_sync_issues_tick_completes_despite_continuously_rearmed_latch(
     assert issues_sync_status.status_for("shared").last_success_at == now
 
 
+# ── #2994: _sync_issues_tick dormant-repo skip ───────────────────────────────
+
+
+def test_sync_issues_tick_skips_dormant_repo(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2994: a repo with no open assignment, no drive-queue entry, and no
+    coord-authored open PR is skipped once it has had a baseline sweep --
+    saving the gh call the normal cadence would otherwise spend on it every
+    tick regardless of activity."""
+    from coord import github_ops, repo_dormancy
+    from coord.serve_app import _sync_issues_tick
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+
+    # 'shared' has no assignment and no drive-queue entry -- dormant. Give it
+    # a baseline sweep so the floor actually applies (a repo that has never
+    # been swept is always due -- see
+    # coord.repo_dormancy.should_skip_sweep / test_repo_dormancy.py).
+    repo_dormancy.record_swept("shared", now=time.time())
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops, "get_open_issues",
+        lambda repo, **kwargs: calls.append(repo) or [],
+    )
+
+    cfg = load_config(valid_config_path)
+    total = _sync_issues_tick(cfg)
+
+    assert total == 0
+    assert calls == ["acme/api"]
+
+
+def test_sync_issues_tick_wakes_dormant_repo_when_work_is_queued(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2994 acceptance: queuing work for a dormant repo puts it back on the
+    normal cadence on the very next tick, not after the floor
+    (DORMANT_SWEEP_FLOOR_S) expires."""
+    from coord import github_ops, repo_dormancy
+    from coord.serve_app import _sync_issues_tick
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+
+    now = time.time()
+    repo_dormancy.record_swept("api", now=now)
+    repo_dormancy.record_swept("shared", now=now)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops, "get_open_issues",
+        lambda repo, **kwargs: calls.append(repo) or [],
+    )
+
+    cfg = load_config(valid_config_path)
+    _sync_issues_tick(cfg)
+    # Both repos idle, both just swept -- well inside the floor, both skipped.
+    assert calls == []
+
+    # Work gets queued for 'shared' -- an open assignment now on the board.
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("w-shared", "laptop", "shared", "acme/shared", 7, "New work",
+         "pending", "work"),
+    )
+    rw_db.commit()
+
+    calls.clear()
+    _sync_issues_tick(cfg)
+
+    assert calls == ["acme/shared"]
+
+
 # ── #1220: _clean_worktrees_tick — fleet-wide orphaned-worktree sweep ────────
 
 
