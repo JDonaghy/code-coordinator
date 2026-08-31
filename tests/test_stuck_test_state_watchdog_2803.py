@@ -394,7 +394,16 @@ def test_run_drain_invokes_the_sweep_before_smoke_dispatch(monkeypatch, config) 
     """The daemon's own clock (`_run_drain_locked`) must call the sweep
     itself, not only the optional `coord notify` CLI/timer path — #2803's
     whole point is that this fires without a human or a `coord drive`
-    session in the loop."""
+    session in the loop.
+
+    The load-bearing ordering invariant is that the sweep precedes EVERY
+    smoke dispatch in the pass, so a row it clears is redispatched in this
+    same pass rather than the next one. #2975 added a head-start smoke
+    dispatch ahead of transition detection (so a slow confirmation cannot
+    serialize another repo's Test dispatch behind it), which means smoke
+    dispatch now runs twice per pass — the sweep moved ahead of the head
+    start so it still comes first.
+    """
     from coord import notify
 
     order: list[str] = []
@@ -414,7 +423,14 @@ def test_run_drain_invokes_the_sweep_before_smoke_dispatch(monkeypatch, config) 
 
     notify._run_drain_locked(config)
 
-    assert order == ["sweep", "smoke_dispatch"]
+    assert order.count("sweep") == 1, f"sweep must run exactly once per pass: {order}"
+    assert order[0] == "sweep", (
+        "the stuck-test_state sweep must run before every smoke dispatch in "
+        f"the pass (#2803), including #2975's head start: {order}"
+    )
+    assert "smoke_dispatch" in order[1:], (
+        f"a row the sweep clears must still be dispatched in this pass: {order}"
+    )
 
 
 # ── config parsing ───────────────────────────────────────────────────────────

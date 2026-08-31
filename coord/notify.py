@@ -4249,7 +4249,25 @@ def _run_drain_locked(config: Config) -> DrainResult:
 
     begin_confirmation_pass()
 
-    # Step 0 (#2975): dispatch pending Test-stage smoke / PR-opens / reviews
+    # Step 0a (#2803, moved up by #2975): clear any work row wedged at
+    # test_state='running' well past its Test-stage child's own terminal
+    # resolution (or absence) — a lost verdict write, never a fabricated one
+    # (see `sweep_stuck_test_state_rows`'s docstring). It still runs BEFORE
+    # every smoke dispatch in this pass, which is #2803's invariant: a row
+    # this clears is picked up and redispatched in THIS SAME pass, not the
+    # next one. It now runs before step 0b's head start as well, so a row it
+    # clears gets that head start too rather than waiting behind step 1's
+    # confirmations. Nothing is lost by sweeping before transition detection:
+    # every case the sweep acts on is gated on
+    # `STUCK_TEST_STATE_GRACE_SECONDS` (10 minutes) having elapsed since the
+    # child's own resolution, so a child that only just went terminal in
+    # THIS pass is out of scope either way.
+    try:
+        _sweep_stuck_test_state(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: stuck test_state sweep failed")
+
+    # Step 0b (#2975): dispatch pending Test-stage smoke / PR-opens / reviews
     # from the board exactly as it reads RIGHT NOW — before step 1 below gets
     # anywhere near a `confirm_branch` call. A confirmation re-runs one
     # repo's real build+test synchronously inside THIS pass and can
@@ -4259,10 +4277,10 @@ def _run_drain_locked(config: Config) -> DrainResult:
     # must not queue behind that: a slow suite on one repo should delay only
     # its own confirmation, never another repo's Test/Review dispatch.
     #
-    # Steps 2-4 below repeat these same three calls after the transition
-    # detection has had a chance to add anything newly eligible (a row the
-    # stuck-test-state sweep clears, a work leg that just finished, a PR
-    # that just opened) — this head start is additive, not a replacement.
+    # Steps 2-3 below repeat these same three calls after the transition
+    # detection has had a chance to add anything newly eligible (a work leg
+    # that just finished, a PR that just opened) — this head start is
+    # additive, not a replacement.
     # All three are idempotent (`_dispatch_board_pending_pr_opens`'s and
     # `_dispatch_board_pending_smoke`'s own docstrings: "safe to call even
     # when the board file doesn't exist", find-or-create PRs, dedupe via
@@ -4312,18 +4330,7 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: detect_transitions failed")
 
-    # Step 2 (#2803): clear any work row wedged at test_state='running' well
-    # past its Test-stage child's own terminal resolution (or absence) — a
-    # lost verdict write, never a fabricated one (see `sweep_stuck_test_
-    # state_rows`'s docstring). Runs BEFORE step 3's smoke dispatch so a row
-    # this clears is picked up and redispatched in THIS SAME pass, not the
-    # next one.
-    try:
-        _sweep_stuck_test_state(config)
-    except Exception:  # noqa: BLE001
-        log.exception("notify drain: stuck test_state sweep failed")
-
-    # Step 2.5 (#2844): open PRs for work-leg completions still missing one —
+    # Step 2 (#2844): open PRs for work-leg completions still missing one —
     # BEFORE the Test-stage dispatch below, so the pull_request CI run starts
     # overlapping smoke instead of waiting for review dispatch to open the
     # PR ~20 minutes later.
