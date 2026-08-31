@@ -1896,3 +1896,169 @@ def test_note_routes_through_the_daemon_on_a_thin_client(thin_client, monkeypatc
     assert calls[0][0] == "/portal-note"
     assert calls[0][1]["submission_id"] == "sub_1"
     assert calls[0][1]["text"] == "Client prefers web-only"
+
+
+# ── #2986: `coord portal answer` — an out-of-band answer ────────────────────
+
+
+def test_answer_is_registered_on_the_portal_group():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "answer" in result.output
+
+
+def test_answer_pairs_to_the_current_open_question_and_is_attributed(monkeypatch):
+    from coord import portal_store
+
+    monkeypatch.setattr("coord.commands.portal._actor", lambda: "jane")
+    row = portal_store.enqueue("sub_1", "question", {"question": "Offline-first?"})
+    portal_store.mark_applied(row)
+
+    result = run("portal", "answer", "sub_1", "Yes, offline-first.")
+    assert result.exit_code == 0, result.output
+    assert f"answered: sub_1 Q[{row.revision}]" in result.output
+    assert "via verbal" in result.output
+    assert "operator:jane" in result.output
+
+    ledger_result = run("portal", "ledger", "sub_1")
+    assert ledger_result.exit_code == 0, ledger_result.output
+    assert "RELAYED via verbal" in ledger_result.output
+    assert "operator:jane" in ledger_result.output
+    assert "Yes, offline-first." in ledger_result.output
+    assert "unanswered" not in ledger_result.output
+
+
+def test_answer_defaults_source_to_verbal_and_validates_choice():
+    from coord import portal_store
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "SQLite?"})
+    portal_store.mark_applied(row)
+
+    bad = run("portal", "answer", "sub_1", "Yes.", "--source", "carrier-pigeon")
+    assert bad.exit_code != 0
+    assert "Invalid value" in bad.output or "invalid choice" in bad.output.lower()
+
+    ok = run("portal", "answer", "sub_1", "Yes.", "--source", "email")
+    assert ok.exit_code == 0, ok.output
+    assert "via email" in ok.output
+
+
+def test_answer_rejects_an_unknown_submission_with_a_clear_error():
+    from coord import portal_store
+
+    result = run("portal", "answer", "sub_nope", "Yes.")
+    assert result.exit_code == 2
+    assert "unknown submission" in result.output
+    assert portal_store.ledger_for_submission("sub_nope") == []
+
+
+def test_answer_rejects_empty_text():
+    from coord import portal_store
+
+    row = portal_store.enqueue("sub_1", "question", {"question": "Offline-first?"})
+    portal_store.mark_applied(row)
+    result = run("portal", "answer", "sub_1", "   ")
+    assert result.exit_code == 2
+    assert "non-empty" in result.output
+
+
+def test_answer_with_no_open_question_reports_a_clear_error():
+    from coord import portal_store
+
+    portal_store.seed_revision("sub_1", 1)
+    result = run("portal", "answer", "sub_1", "Yes.")
+    assert result.exit_code == 2
+    assert "no open question" in result.output
+
+
+def test_answer_revision_backfills_an_older_reasked_question():
+    """SUB-1EA1D3's fixture case (#2986): Q[11] answered verbally after
+    Q[13] was already re-asked — `--revision` must land on Q[11], not
+    whatever is currently open."""
+    from coord import portal_store
+
+    q11 = portal_store.enqueue(
+        "sub_1", "question", {"question": "Who will use this, and how?"}
+    )
+    portal_store.mark_applied(q11)
+    q13 = portal_store.enqueue("sub_1", "question", {"question": "And the rest?"})
+    portal_store.mark_applied(q13)
+
+    result = run(
+        "portal", "answer", "sub_1", "Household of two.",
+        "--revision", str(q11.revision),
+    )
+    assert result.exit_code == 0, result.output
+    assert f"Q[{q11.revision}]" in result.output
+
+    ledger_result = run("portal", "ledger", "sub_1")
+    assert ledger_result.exit_code == 0, ledger_result.output
+    assert "Household of two." in ledger_result.output
+    # Q[13] is still open — the backfill must not touch it.
+    q13_section = ledger_result.output.split(f"Q[{q13.revision}]", 1)[1]
+    assert "(unanswered — needs-input)" in q13_section.split("Q[", 1)[0]
+
+
+def test_answer_routes_through_the_daemon_on_a_thin_client(thin_client, monkeypatch):
+    """Same #2751 exception `note`/`decision`/`link`/`ledger` get: the
+    operator may be relaying this from any machine in the fleet, so this
+    must POST `/portal-answer` rather than write a thin client's own
+    (empty, wrong) local DB."""
+    from coord import client as cc
+
+    calls = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        calls.append((path, payload))
+        return {
+            "entry": {
+                "id": 1,
+                "submission_id": payload["submission_id"],
+                "seq": 5,
+                "kind": "question_answered",
+                "question_revision": 1,
+                "text": payload["text"],
+                "actor": "operator:jane",
+                "source_event_id": None,
+                "payload_json": '{"relayed": true, "source": "phone"}',
+                "recorded_at": 100.0,
+            }
+        }
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    result = run(
+        "portal", "answer", "sub_1", "Client said yes", "--source", "phone",
+    )
+    assert result.exit_code == 0, result.output
+    assert "answered: sub_1 Q[1]" in result.output
+    assert len(calls) == 1
+    assert calls[0][0] == "/portal-answer"
+    assert calls[0][1]["submission_id"] == "sub_1"
+    assert calls[0][1]["text"] == "Client said yes"
+    assert calls[0][1]["source"] == "phone"
+
+
+def test_answer_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+
+    def _boom_post_record(svc, path, payload, **kw):
+        raise RuntimeError("simulated unreachable daemon")
+
+    monkeypatch.setattr(cc, "post_record", _boom_post_record)
+    try:
+        result = run("portal", "answer", "sub_1", "Yes.")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0
+    assert calls == []

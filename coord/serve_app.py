@@ -3419,6 +3419,53 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-answer": {
+            "post": {
+                "summary": (
+                    "#2986: record an answer received OUT OF BAND (verbal/"
+                    "phone/email) against a submission's open question, "
+                    "paired to its question_revision and flagged relayed. "
+                    "Executed HERE on the daemon, same reason /portal-note "
+                    "is — `coord portal answer`"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "submission_id": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "source": {
+                                        "type": "string",
+                                        "enum": ["verbal", "phone", "email"],
+                                    },
+                                    "revision": {
+                                        "type": "integer",
+                                        "description": (
+                                            "Backfill an older question instead "
+                                            "of the current open one."
+                                        ),
+                                    },
+                                    "actor": {"type": "string"},
+                                },
+                                "required": ["submission_id", "text"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK — {'entry': <serialized LedgerEntry>}"},
+                    "400": {
+                        "description": (
+                            "Missing submission_id, empty text, unknown source, "
+                            "unknown submission, or no open question on file"
+                        )
+                    },
+                },
+            },
+        },
         "/portal-ledger": {
             "get": {
                 "summary": (
@@ -6453,6 +6500,69 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     # `_ledger_from_row` (which the client feeds this dict
                     # back into) parses this key as a JSON *string*, exactly
                     # as it comes off a DB row — not as a nested object.
+                    "payload_json": _json.dumps(entry.payload, sort_keys=True),
+                    "recorded_at": entry.recorded_at,
+                }
+            }
+        )
+
+    async def post_portal_answer(request: Request) -> Response:
+        # #2986: record an out-of-band answer (verbal/phone/email) against a
+        # submission's open question. Same seam shape and same rationale as
+        # `/portal-note`/`/portal-decision` right above — the operator may be
+        # relaying this from any machine in the fleet — but unlike a note,
+        # this pairs to a question's own `question_revision` and folds the
+        # customer status off `needs-input` HERE, on the daemon, using this
+        # process's own `config` (the closure variable `build_app` sets up
+        # and `_refresh_config` keeps current) rather than anything the
+        # caller could hand over the wire.
+        import json as _json  # noqa: PLC0415
+
+        from coord import portal_store  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        submission_id = body.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return JSONResponse(
+                {"error": "portal-answer needs a 'submission_id'"}, status_code=400
+            )
+        revision = body.get("revision")
+        if revision is not None and not isinstance(revision, int):
+            return JSONResponse(
+                {"error": "portal-answer 'revision' must be an integer"},
+                status_code=400,
+            )
+        try:
+            entry = portal_store._answer_question_local(
+                submission_id,
+                body.get("text") or "",
+                source=body.get("source") or portal_store.DEFAULT_RELAYED_ANSWER_SOURCE,
+                revision=revision,
+                actor=body.get("actor") or "",
+                config=config,
+            )
+        except ValueError as e:
+            return JSONResponse({"error": f"bad portal-answer: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-answer write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "entry": {
+                    "id": entry.id,
+                    "submission_id": entry.submission_id,
+                    "seq": entry.seq,
+                    "kind": entry.kind,
+                    "question_revision": entry.question_revision,
+                    "text": entry.text,
+                    "actor": entry.actor,
+                    "source_event_id": entry.source_event_id,
+                    # Same reconstruction contract as `/portal-note` above —
+                    # `_ledger_from_row` parses this as a JSON *string*.
                     "payload_json": _json.dumps(entry.payload, sort_keys=True),
                     "recorded_at": entry.recorded_at,
                 }
@@ -9795,6 +9905,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/portal-link", post_portal_link, methods=["POST"]),
         Route("/portal-decision", post_portal_decision, methods=["POST"]),
         Route("/portal-note", post_portal_note, methods=["POST"]),
+        Route("/portal-answer", post_portal_answer, methods=["POST"]),
         Route("/portal-ledger", get_portal_ledger, methods=["GET"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
