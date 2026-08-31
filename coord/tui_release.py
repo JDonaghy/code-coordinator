@@ -3,7 +3,7 @@
 
 ``release-tui.yml`` builds ``coord-tui`` for linux/macOS/Windows on every
 ``vX.Y.Z`` tag push and attaches ``coord-tui-<target>`` assets to a GitHub
-Release, with ``tui/Cargo.toml``'s version stamped from that tag. This module
+Release, with coord-tui's own ``Cargo.toml``'s version stamped from that tag. This module
 is the client half: find the release to install, detect which of that
 workflow's build-matrix targets this host needs, and install the binary
 without a human ever visiting the Releases page by hand.
@@ -50,9 +50,9 @@ Two invariants drive the design:
   interrupted download, can only ever observe the old binary or the new
   one — never a partial file at the destination path.
 
-* **Never clobber a dev build silently.** ``tui/Cargo.toml``'s committed
-  ``[package] version`` is the ``0.1.0`` placeholder — see
-  ``tui/src/main.rs``'s ``version_string()`` docstring — and only
+* **Never clobber a dev build silently.** coord-tui's own committed
+  ``Cargo.toml``'s ``[package] version`` is the ``0.1.0`` placeholder — see
+  ``src/main.rs``'s ``version_string()`` docstring in that repo — and only
   ``release-tui.yml``'s CI build stamps a real ``vX.Y.Z`` over it, as a
   build-time edit that is never committed back. A binary built locally with
   a bare ``cargo build`` therefore *always* reports exactly ``coord-tui
@@ -61,6 +61,23 @@ Two invariants drive the design:
   destination is a developer's own local build, not a stale release —
   :func:`is_dev_build` checks for it, and ``coord tui update`` refuses to
   overwrite it without ``--force``.
+
+  #2984: version-equality is a *guess*, not a provenance check, and it has
+  exactly one collision — the sentinel is coord-tui's committed placeholder,
+  so a real CI-built binary reports it verbatim on precisely the tag that
+  reproduces the placeholder (``v0.1.0``, which is also where any new release
+  channel's tag line starts). ``coord tui update`` does not try to resolve
+  that collision by inspecting the binary harder; it sidesteps it by checking
+  "is the destination already at the version this run would install?"
+  *before* asking "does the destination look like a dev build?" — when they
+  already match there is nothing this run would change by installing again,
+  dev build or not, so refusing serves no purpose. The one case that stays
+  irreducibly ambiguous — a genuine local dev build sitting at the
+  destination while coord-tui's latest release *also* happens to be
+  ``0.1.0`` — is a real gap, not a bug in this check: nothing short of a
+  provenance marker neither path can fake (out of scope here; see issue
+  #2984's "alternative" fix) can tell those two apart from the version
+  string alone.
 """
 
 from __future__ import annotations
@@ -98,9 +115,13 @@ DEFAULT_API_BASE = "https://api.github.com"
 DEFAULT_INSTALL_PATH = "~/.local/bin/coord-tui"
 
 #: See the module docstring's "never clobber a dev build" invariant:
-#: `tui/Cargo.toml`'s committed `[package] version` field, which a plain
-#: `cargo build` always reports verbatim because only release-tui.yml's CI
-#: stamps a real version over it (and never commits that stamp back).
+#: coord-tui's own `Cargo.toml`'s committed `[package] version` field, which a
+#: plain `cargo build` always reports verbatim because only release-tui.yml's
+#: CI stamps a real version over it (and never commits that stamp back).
+#:
+#: #2984: this value collides with coord-tui's real `v0.1.0` release tag —
+#: see the module docstring's "#2984" paragraph for how `coord tui update`
+#: avoids misreading that collision as a dev build.
 DEV_BUILD_SENTINEL_VERSION = "0.1.0"
 
 #: release-tui.yml's build matrix, keyed by (system, machine) as reported by
@@ -354,7 +375,8 @@ def install_atomically(tmp_path: Path, dest_path: Path) -> None:
 def read_installed_version(binary_path: Path, timeout: float = 5.0) -> str | None:
     """Parse ``<binary_path> --version``'s ``coord-tui <version>`` output,
     or ``None`` when the path doesn't exist, isn't runnable, or its output
-    doesn't match that shape (see ``tui/src/main.rs``'s ``version_string``)."""
+    doesn't match that shape (see coord-tui's own ``src/main.rs``'s
+    ``version_string``)."""
     if not binary_path.exists():
         return None
     try:
@@ -378,7 +400,22 @@ def read_installed_version(binary_path: Path, timeout: float = 5.0) -> str | Non
     return None
 
 
-def is_dev_build(binary_path: Path) -> bool:
-    """True when *binary_path* reports the :data:`DEV_BUILD_SENTINEL_VERSION`
-    — see the module docstring's "never clobber a dev build" invariant."""
-    return read_installed_version(binary_path) == DEV_BUILD_SENTINEL_VERSION
+def is_dev_build(binary_path: Path, *, target_version: str | None = None) -> bool:
+    """True when *binary_path* reports :data:`DEV_BUILD_SENTINEL_VERSION` in
+    a way that isn't already explained by the destination holding
+    *target_version* — see the module docstring's "#2984" paragraph.
+
+    #2984: the sentinel collides with coord-tui's real ``v0.1.0`` release, so
+    version-equality alone cannot always tell a genuine local ``cargo build``
+    apart from a CI-built binary of that one release. It doesn't have to: pass
+    *target_version* — the version this run resolved as "the one to install"
+    (bare, e.g. via :func:`normalize_version`) — and a destination that
+    already reports exactly that version is never reported as a dev build,
+    sentinel or not, because there is nothing a refusal would protect there.
+    Omitting *target_version* falls back to the old, collision-prone,
+    version-only check — the most a bare *binary_path* can ever support.
+    """
+    installed = read_installed_version(binary_path)
+    if installed != DEV_BUILD_SENTINEL_VERSION:
+        return False
+    return target_version is None or installed != target_version

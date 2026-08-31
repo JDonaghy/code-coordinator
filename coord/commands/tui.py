@@ -240,7 +240,7 @@ def _print_skew_notice(
         "release publishes one) before an atomic rename into place -- so a "
         "running coord-tui, or an interrupted download, never observes a "
         "partial binary.\n\n"
-        "Dev-checkout guard: tui/Cargo.toml's committed [package] version "
+        "Dev-checkout guard: coord-tui's own Cargo.toml's committed [package] version "
         f"is the {DEV_BUILD_SENTINEL_VERSION!r} placeholder that only "
         "release-tui.yml's CI build stamps a real version over (never "
         "committed back) -- so a plain local `cargo build` always reports "
@@ -340,11 +340,32 @@ def tui_update(
 
     if dest_path.exists() and not force:
         installed = read_installed_version(dest_path)
+        # #2984: check "already at the target version" BEFORE "looks like a
+        # dev build", not after. DEV_BUILD_SENTINEL_VERSION is coord-tui's
+        # committed placeholder, and it collides with coord-tui's real
+        # `v0.1.0` release tag -- a CI-built v0.1.0 binary reports the exact
+        # same string a bare `cargo build` always does. Version-equality
+        # can't tell those apart, but it doesn't need to here: if what's
+        # installed already matches what this run would install, installing
+        # again changes nothing, so there is nothing worth refusing over --
+        # dev build or not. This ordering is what makes the check stop
+        # depending on the release tag differing from the placeholder (see
+        # is_dev_build's docstring and the module docstring's "#2984"
+        # paragraph in tui_release.py); it does NOT resolve the one case
+        # that stays genuinely ambiguous -- a real dev build sitting at the
+        # destination while coord-tui's latest release also happens to be
+        # 0.1.0 -- which is a documented, self-limiting gap, not a bug here.
+        if normalize_version(installed) == target_version:
+            click.echo(
+                f"coord-tui is already v{target_version} at {dest_path} -- "
+                "nothing to do (--force to reinstall)."
+            )
+            return
         if installed == DEV_BUILD_SENTINEL_VERSION:
             click.echo(
                 f"refusing to overwrite {dest_path}: it reports version "
                 f"{DEV_BUILD_SENTINEL_VERSION!r}, the sentinel a locally "
-                "`cargo build`'d coord-tui always carries (coord-tui's "
+                "`cargo build`'d coord-tui always carries (coord-tui's own "
                 "Cargo.toml "
                 "committed version is only stamped for real in CI release "
                 "builds). This looks like a dev build someone is iterating "
@@ -354,12 +375,6 @@ def tui_update(
                 err=True,
             )
             sys.exit(3)
-        if normalize_version(installed) == target_version:
-            click.echo(
-                f"coord-tui is already v{target_version} at {dest_path} -- "
-                "nothing to do (--force to reinstall)."
-            )
-            return
 
     click.echo(f"Detected platform target: {target}")
     click.echo(f"Resolving coord-tui v{target_version} from {repo}...")
