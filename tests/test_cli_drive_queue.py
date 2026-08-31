@@ -3690,6 +3690,49 @@ def test_status_alert_does_not_trip_for_a_real_merge_gate_wait(cli):
     assert "alert: (none)" in result.output
 
 
+# ── #2978: a wedged root with dependents chained behind it — the alert must
+# name the root only, not the dependents, and the fix is remove+add on the
+# root alone. This is the exact claude-coordinator#2978 ms-5 incident: an
+# `attempts > 0` root that exhausted its budget on #2273 dispatch-layer
+# deaths (never got as far as creating an assignment), with eight dependents
+# blocked behind it on an unsatisfiable `after=` — a shape #2756's
+# `_reconcile_blocked_after` self-heals on its own the moment the root
+# clears, so it must never be named here either.
+
+
+def test_status_alert_names_the_root_only_not_the_chained_dependents(cli):
+    cli("add", REPO, "161")
+    state._update_drive_queue_entry_local(
+        REPO, 161, state="blocked", attempts=2, deferrals=1,
+        last_reason=(
+            "drive session died without landing the work (2/2 attempts) — "
+            "giving up — no assignment was ever created for this run "
+            "(#2273): likely an infrastructure/dispatch-layer failure, not "
+            "a code defect"
+        ),
+    )
+    root_key = f"{REPO}#161"
+    for issue in range(162, 170):
+        cli("add", REPO, str(issue), "--after", "161")
+        state._update_drive_queue_entry_local(
+            REPO, issue, state="blocked", attempts=0, deferrals=40,
+            last_reason=(
+                f"pre-req {root_key} is queued but blocked — it will never "
+                "satisfy"
+            ),
+        )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" not in result.output
+    assert root_key in result.output
+    for issue in range(162, 170):
+        assert f"{REPO}#{issue}" not in result.output
+    assert "coord drive-queue remove" in result.output
+    assert "coord drive-queue add" in result.output
+    assert "self-heal" in result.output
+
+
 # ── deploy gates (#1757) ─────────────────────────────────────────────────────
 #
 # The acceptance bar for `--hold-after`.  `merged != live`: a queue that

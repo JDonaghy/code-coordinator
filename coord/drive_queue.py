@@ -2302,12 +2302,20 @@ class UnreachableWait:
     evidence a genuine transient wouldn't have, and `last_reason` is
     whatever the last sweep to touch this row recorded — useful context,
     never re-interpreted here.
+
+    `dependents` (#2978) is the count of OTHER queue entries whose `after=`
+    names this one — computed against the full entry set the caller passed
+    to :func:`detect_unreachable_waits`, not just the flagged subset, so it
+    is accurate even though those dependents themselves never appear in the
+    result (see the predicate's own docstring for why). `0` for an entry
+    nothing is chained behind.
     """
 
     key: str
     state: str
     deferrals: int
     last_reason: str
+    dependents: int = 0
 
 
 def detect_unreachable_waits(
@@ -2317,35 +2325,73 @@ def detect_unreachable_waits(
 ) -> list[UnreachableWait]:
     """Entries sitting in the #2944 guaranteed-false wait.
 
-    ``state in (blocked, parked) AND attempts == 0 AND deferrals >
-    min_deferrals`` — see the module comment above this function for why
-    that combination can never resolve itself. Pure and cheap (a predicate
-    over already-loaded rows, no clock, no I/O), so the same function backs
-    both `coord drive-queue status`'s `alert:` line
-    (`coord.commands.drive_queue._queue_alert`) and the `coord doctor` WARN
-    (`coord.health.checks.wedged_drive_queue`) — one definition of "wedged",
-    not two that could drift apart.
+    Two independent shapes, either of which qualifies a `blocked`/`parked`
+    entry — both provably have no branch/PR/merge-queue row for any sweep to
+    ever form an opinion about, which is the actual invariant this predicate
+    is checking, not "attempts == 0" as a proxy for it (#2978 found the proxy
+    wrong for the second shape):
 
-    An entry with ``attempts > 0`` is excluded unconditionally, however long
-    it has sat: it WAS dispatched at least once, so it has (or had) a real
-    branch/PR/merge-queue row for a sweep to have a genuine opinion about —
-    that is a legitimate wait, not an unreachable one.
+    * ``attempts == 0`` and ``deferrals > min_deferrals`` — never dispatched
+      at all. The original #2944 shape.
+    * ``attempts > 0``, ``state == blocked``, and the entry's own
+      `last_reason` carries #2273's "no assignment was ever created for this
+      run" marker (:func:`_is_dispatch_failure_reason`) — every dispatch
+      attempt died before `coord assign` produced a board-visible row, and
+      the entry has now exhausted its retry budget (the only way to reach
+      `blocked` with that reason: see `_reconcile_running`'s `exhausted`
+      branch). Exhaustion is its own grace period — there is no next attempt
+      left to wait out — so `min_deferrals` is not applied here.
+
+    A `blocked`/`parked` entry whose `last_reason` is instead one of
+    `_resolve_prereqs`'s unsatisfiable-`after=` verdict shapes
+    (:func:`_is_unsatisfiable_prereq_reason`) is excluded UNCONDITIONALLY,
+    regardless of attempts/deferrals — #2978: that shape is
+    :func:`_reconcile_blocked_after`'s to resolve (#2362, widened #2756),
+    not an operator's, and flagging it here directly contradicts that
+    function's own documented behaviour. This is what keeps a chain's
+    dependents (each blocked with "pre-req X is queued but blocked — it will
+    never satisfy") out of the result entirely, leaving only the root that
+    actually needs a human.
+
+    Pure and cheap (a predicate over already-loaded rows, no clock, no I/O),
+    so the same function backs both `coord drive-queue status`'s `alert:`
+    line (`coord.commands.drive_queue._queue_alert`) and the `coord doctor`
+    WARN (`coord.health.checks.wedged_drive_queue`) — one definition of
+    "wedged", not two that could drift apart.
     """
-    return [
-        UnreachableWait(
-            key=e.key, state=e.state, deferrals=e.deferrals, last_reason=e.last_reason
+    entries = list(entries)
+    dependents_of: dict[str, int] = {}
+    for e in entries:
+        for dep in e.after:
+            dependents_of[dep] = dependents_of.get(dep, 0) + 1
+
+    waits: list[UnreachableWait] = []
+    for e in entries:
+        if e.state not in (STATE_BLOCKED, STATE_PARKED):
+            continue
+        if _is_unsatisfiable_prereq_reason(e.last_reason):
+            continue
+        if e.attempts == 0:
+            if e.deferrals <= min_deferrals:
+                continue
+        elif not (e.state == STATE_BLOCKED and _is_dispatch_failure_reason(e.last_reason)):
+            continue
+        waits.append(
+            UnreachableWait(
+                key=e.key,
+                state=e.state,
+                deferrals=e.deferrals,
+                last_reason=e.last_reason,
+                dependents=dependents_of.get(e.key, 0),
+            )
         )
-        for e in entries
-        if e.state in (STATE_BLOCKED, STATE_PARKED)
-        and e.attempts == 0
-        and e.deferrals > min_deferrals
-    ]
+    return waits
 
 
 def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     """The queue-level record #2944's predicate raises, in :func:`_hold_alert`'s
-    shape — a message naming the entry (or entries), the deferral count that
-    is the evidence, and the ONE remedy that actually clears it.
+    shape — a message naming the entry (or entries), the evidence that
+    qualified it, and the ONE remedy that actually clears it.
 
     ``add`` alone does not clear ``blocked`` (the queue list already
     documents this as a footgun elsewhere) — only ``remove`` then ``add``
@@ -2357,29 +2403,52 @@ def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     ``gate_readings``/``details`` lines are printed) so the remedy is visible
     wherever this alert's ``reason`` is, not just to a caller that also reads
     the structured field.
+
+    #2978: each name also carries its `dependents` count when non-zero — the
+    entries chained behind a flagged root never appear in `waits` (see
+    `detect_unreachable_waits`), so without this an operator has no way to
+    know a fix to the one row named here will also resolve N others they
+    never see mentioned. Explicitly says those dependents need no remedy of
+    their own, since #2944's original wording ("for each entry named above")
+    read, on a real incident, as an instruction to `remove`+`add` entries
+    that were never named — but easy to mis-generalize to "the dependents
+    too" by an operator who does not already know #2756 self-heals them.
     """
-    names = ", ".join(
-        f"{w.key} ({w.state}, {w.deferrals} deferrals)" for w in waits[:5]
-    )
+    def _name(w: UnreachableWait) -> str:
+        base = f"{w.key} ({w.state}, {w.deferrals} deferrals)"
+        if w.dependents:
+            plural = "ies" if w.dependents != 1 else "y"
+            base += (
+                f" — {w.dependents} dependent entr{plural} chained behind it "
+                "will self-heal automatically once this clears (#2756), no "
+                "remedy needed on them"
+            )
+        return base
+
+    names = ", ".join(_name(w) for w in waits[:5])
     more = ", ..." if len(waits) > 5 else ""
     plural = len(waits) != 1
     return QueueAlert(
         reason=(
             f"{len(waits)} queue entr{'ies' if plural else 'y'} stuck in a "
-            "guaranteed-false wait — never dispatched (attempts=0) yet "
-            f"blocked/parked past {UNREACHABLE_WAIT_MIN_DEFERRALS} deferrals; "
+            "guaranteed-false wait — blocked/parked with no branch/PR/"
+            "merge-queue row any sweep could ever act on (never dispatched, "
+            "or every dispatch attempt died before creating an assignment); "
             f"no sweep can ever clear this on its own: {names}{more}. Fix: "
             "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> for each entry named above."
+            "coord drive-queue add <repo> <issue> for each ROOT entry named "
+            "above — never on a dependent chained behind one."
         ),
         details=tuple(
             f"{w.key}: {w.state}, {w.deferrals} deferrals, "
-            f"last_reason={w.last_reason!r}"
+            f"dependents={w.dependents}, last_reason={w.last_reason!r}"
             for w in waits
         ),
         command=(
             "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> — for each entry named above"
+            "coord drive-queue add <repo> <issue> — for each ROOT entry "
+            "named above; any dependents chained behind it self-heal on "
+            "their own (#2756)"
         ),
     )
 

@@ -19,6 +19,15 @@ so this check and that line can never say different things) — this probe
 just re-derives it, live, from ``drive_queue`` state every time ``coord
 doctor`` runs, independent of whatever the last tick happened to report.
 
+#2978: the predicate also flags an ``attempts > 0`` entry that exhausted its
+retry budget without ever getting a #2273 dispatch-layer death past `coord
+assign` (same "no branch/PR ever existed" invariant, just reached a
+different way) — and excludes an entry blocked solely on an unsatisfiable
+``after=`` pre-req, since that one is ``_reconcile_blocked_after``'s to
+self-heal (#2362/#2756), not an operator's. See
+``coord.drive_queue.detect_unreachable_waits`` for the exact predicate; this
+probe does not duplicate it, only renders its result.
+
 This is deliberately independent of #2935 (which fixes the specific sweep
 that produced the #2900/#2907 incident) and #2230 (the sweep's origin): both
 are about *why* a row gets wedged this way; this check is about the row
@@ -51,16 +60,19 @@ from coord.health.registry import COST_NETWORK, check
     cost=COST_NETWORK,
     description=(
         "Drive-queue rows in `coord.drive_queue`'s #2944 guaranteed-false "
-        "wait: `blocked`/`parked`, `attempts == 0` (never dispatched — no "
-        "branch, no PR, no merge-queue row ever existed or ever can), "
-        "sitting past a few ticks of grace. Reads via `coord.state."
-        "list_drive_queue`, which — per its own docstring — routes to the "
-        "daemon over HTTP when `board_service` is set (the common case on a "
-        "thin-client fleet machine, see `release_cordon.py`) and only reads "
-        "the local DB directly otherwise; `cost=network` so `--no-network`/"
-        "timer runs and the automatic per-agent health poll skip it exactly "
-        "like the other network-costed checks, same precedent as "
-        "`release_cordon`."
+        "wait: `blocked`/`parked` with no branch/PR/merge-queue row any "
+        "sweep could ever act on — either `attempts == 0` (never dispatched) "
+        "past a few ticks of grace, or `attempts > 0` with an exhausted "
+        "#2273 dispatch-layer death (#2978). Excludes an entry blocked "
+        "solely on an unsatisfiable `after=` pre-req — that one is "
+        "`_reconcile_blocked_after`'s to self-heal (#2756), not an "
+        "operator's. Reads via `coord.state.list_drive_queue`, which — per "
+        "its own docstring — routes to the daemon over HTTP when "
+        "`board_service` is set (the common case on a thin-client fleet "
+        "machine, see `release_cordon.py`) and only reads the local DB "
+        "directly otherwise; `cost=network` so `--no-network`/timer runs "
+        "and the automatic per-agent health poll skip it exactly like the "
+        "other network-costed checks, same precedent as `release_cordon`."
     ),
 )
 def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
@@ -92,7 +104,10 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
         )
 
     sample = ", ".join(
-        f"{w.key} ({w.state}, {w.deferrals} deferrals)" for w in waits[:5]
+        f"{w.key} ({w.state}, {w.deferrals} deferrals"
+        + (f", {w.dependents} dependents self-heal (#2756)" if w.dependents else "")
+        + ")"
+        for w in waits[:5]
     )
     return CheckResult(
         check_id="wedged_drive_queue",
@@ -104,11 +119,17 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
         ),
         detail=(
             f"e.g. {sample}" + (", ..." if len(waits) > 5 else "")
-            + " — never dispatched (attempts=0), cannot clear on its own; "
-            "fix: coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue>"
+            + " — no branch/PR/merge-queue row any sweep could ever act on "
+            "(never dispatched, or every dispatch attempt died before "
+            "creating an assignment); cannot clear on its own. fix (root "
+            "only — any dependents self-heal, #2756): coord drive-queue "
+            "remove <repo> <issue> && coord drive-queue add <repo> <issue>"
         ),
-        threshold="warn when any entry is blocked/parked, attempts=0, past a few ticks of grace",
+        threshold=(
+            "warn when any entry is blocked/parked with no branch/PR a sweep "
+            "could ever act on: attempts=0 past a few ticks of grace, or "
+            "attempts>0 with an exhausted #2273 dispatch-layer death"
+        ),
         values={
             "count": len(waits),
             "entries": [
@@ -116,6 +137,7 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
                     "key": w.key,
                     "state": w.state,
                     "deferrals": w.deferrals,
+                    "dependents": w.dependents,
                     "last_reason": w.last_reason,
                 }
                 for w in waits

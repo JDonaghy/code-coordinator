@@ -5371,3 +5371,100 @@ def test_unreachable_wait_alert_names_the_entry_deferrals_and_remedy():
     assert "207 deferrals" in alert.reason
     assert "coord drive-queue remove" in alert.command
     assert "coord drive-queue add" in alert.command
+
+
+# ── #2978: root-only, and the #2273-exhausted root is no longer excluded ────
+#
+# #2944's alert got today's ms-5 incident exactly backwards: it named eight
+# dependents that needed nothing (each blocked on an unsatisfiable `after=`
+# pre-req — #2756's to self-heal) and omitted the one entry — the root,
+# `attempts > 0` — that actually needed an operator. These tests pin both
+# halves of the fix plus the exact incident shape as a regression.
+
+_DISPATCH_FAILURE_REASON = (
+    "drive session died without landing the work (2/2 attempts) — giving up "
+    "— no assignment was ever created for this run (#2273): likely an "
+    "infrastructure/dispatch-layer failure, not a code defect"
+)
+
+
+def test_detect_unreachable_waits_excludes_an_unsatisfiable_after_block():
+    """#2756 owns this shape (`_reconcile_blocked_after` self-heals it the
+    moment the named pre-req clears) — it must never also be a #2944
+    target, no matter how many deferrals it has accumulated."""
+    dep_key = entry_key(REPO, 161)
+    dependent = entry(
+        162,
+        state=STATE_BLOCKED,
+        attempts=0,
+        deferrals=40,
+        after=(dep_key,),
+        last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+    )
+    assert detect_unreachable_waits([dependent]) == []
+
+
+def test_detect_unreachable_waits_flags_an_exhausted_dispatch_layer_root():
+    """#2978: an entry that exhausted its attempts without #2273's dispatch
+    layer ever producing a board-visible assignment IS the #2944 shape —
+    `attempts > 0` alone must no longer exclude it."""
+    root = entry(
+        161,
+        state=STATE_BLOCKED,
+        attempts=2,
+        deferrals=1,
+        last_reason=_DISPATCH_FAILURE_REASON,
+    )
+    waits = detect_unreachable_waits([root])
+    assert [w.key for w in waits] == [entry_key(REPO, 161)]
+
+
+def test_detect_unreachable_waits_still_ignores_a_real_dispatched_attempt():
+    """An ordinary `blocked` entry with `attempts > 0` and a last_reason that
+    does NOT carry #2273's dispatch-failure marker is still excluded — it
+    was dispatched, has (or had) a real branch/PR, and is a legitimate wait,
+    not an unreachable one."""
+    real_attempt = entry(
+        4, state=STATE_BLOCKED, attempts=1, deferrals=500, last_reason="CI red"
+    )
+    assert detect_unreachable_waits([real_attempt]) == []
+
+
+def test_detect_unreachable_waits_reproduces_the_ms5_incident_shape():
+    """The exact claude-coordinator#2978 incident: one root `blocked
+    attempts=2` with a #2273 dispatch-layer death, and eight dependents
+    chained behind it via `after=`, each blocked with the frozen
+    unsatisfiable-pre-req caption. The alert must name the root only — none
+    of the eight dependents, and the root's `dependents` count must be 8 so
+    the rendered alert can tell the operator they self-heal."""
+    root_key = entry_key(REPO, 161)
+    root = entry(
+        161,
+        state=STATE_BLOCKED,
+        attempts=2,
+        deferrals=1,
+        last_reason=_DISPATCH_FAILURE_REASON,
+    )
+    dependents = [
+        entry(
+            issue,
+            state=STATE_BLOCKED,
+            attempts=0,
+            deferrals=40,
+            after=(root_key,),
+            last_reason=f"pre-req {root_key} is queued but blocked — it will never satisfy",
+        )
+        for issue in range(162, 170)
+    ]
+    assert len(dependents) == 8
+
+    waits = detect_unreachable_waits([root, *dependents])
+    assert [w.key for w in waits] == [root_key]
+    assert waits[0].dependents == 8
+
+    alert = unreachable_wait_alert(waits)
+    assert root_key in alert.reason
+    for dep in dependents:
+        assert dep.key not in alert.reason
+    assert "8 dependent entries" in alert.reason
+    assert "self-heal" in alert.reason
