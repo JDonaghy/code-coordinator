@@ -55,6 +55,15 @@ machine can be briefed without a prior session's transcript, so ``ledger``
 ``POST /portal-decision`` — both through :mod:`coord.portal_store`, which
 checks ``board_service`` itself rather than calling
 :func:`_refuse_if_thin_client`. See that section below for the detail.
+
+**``note`` (#2867) and ``answer`` (#2986) are the ledger's two operator-only
+writes.** ``note`` records background with no pairing and no status effect;
+``answer`` records a client's answer that arrived OUT OF BAND — verbally, on
+a call, by email — pairs it to the open question's ``question_revision``
+exactly like an inbound ``question.answered`` event does, flags it relayed
+so it never reads as the client's own words, and folds the submission off
+``needs-input``. Same daemon-routed shape (``POST /portal-note`` /
+``POST /portal-answer``) and the same reason.
 """
 
 from __future__ import annotations
@@ -1792,6 +1801,25 @@ def portal_draft_reject(
 # it's set).
 
 
+def _render_answer_line(a: dict, *, indent: str) -> str:
+    """One rendered answer line — plain when it's the client's own words,
+    visibly RELAYED (source + date + operator actor) when it isn't (#2986's
+    acceptance bar: a relayed answer must never be presentable as something
+    the client typed themselves). ``.get`` throughout because a thin client
+    talking to a daemon that predates #2986 returns a payload with neither
+    key."""
+    if not a.get("relayed"):
+        return f"{indent}A: {a['text']}  (by {a['actor'] or 'customer'})"
+    when = datetime.datetime.fromtimestamp(
+        a["recorded_at"], tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+    source = a.get("source") or "unknown"
+    return (
+        f"{indent}A [RELAYED via {source}, {when}, by {a['actor'] or 'operator'}]: "
+        f"{a['text']}"
+    )
+
+
 def _render_ledger_text(payload: dict) -> str:
     """The human-readable rendering of :func:`coord.portal_store.
     render_ledger_payload`'s dict shape — used identically whether *payload*
@@ -1807,12 +1835,13 @@ def _render_ledger_text(payload: dict) -> str:
         lines.append(f"- Q[{label}] {entry['question']}")
         if entry["answers"]:
             for a in entry["answers"]:
-                lines.append(f"    A: {a['text']}  (by {a['actor'] or 'customer'})")
+                lines.append(_render_answer_line(a, indent="    "))
         else:
             lines.append("    (unanswered — needs-input)")
     for a in unpaired:
+        tag = " RELAYED" if a.get("relayed") else ""
         lines.append(
-            f"- A (unpaired, question_revision={a['question_revision']}): "
+            f"- A{tag} (unpaired, question_revision={a['question_revision']}): "
             f"{a['text']}  (by {a['actor'] or 'customer'})"
         )
 
@@ -1994,4 +2023,91 @@ def portal_decision_supersede(submission_id: str, seq: int, by_seq: int) -> None
         raise SystemExit(2) from exc
     click.secho(
         f"superseded: {submission_id} #{entry.seq} -> #{by_seq}", fg="green"
+    )
+
+
+# ── #2986: `coord portal answer` — record an out-of-band answer ────────────
+
+
+@portal_group.command("answer")
+@_CONFIG_OPTION
+@click.argument("submission_id")
+@click.argument("text")
+@click.option(
+    "--source",
+    type=click.Choice(("verbal", "phone", "email")),
+    default="verbal",
+    show_default=True,
+    help="How the answer actually reached you.",
+)
+@click.option(
+    "--revision",
+    "revision",
+    type=int,
+    default=None,
+    help=(
+        "Target an older question's revision instead of the current open "
+        "one — backfills a question answered before this command existed."
+    ),
+)
+def portal_answer(
+    config_path, submission_id: str, text: str, source: str, revision: int | None
+) -> None:
+    """Record an answer SUBMISSION_ID's client gave OUT OF BAND — in
+    person, on a call, by email (#2986).
+
+    The ledger's own writer, ``coord/portal_sync.py:_record_question_
+    answer``, only ever fires off an inbound ``question.answered`` event —
+    so an answer that arrives any other way had nowhere to land as an
+    ANSWER, and the ledger kept rendering the question ``(unanswered —
+    needs-input)`` long after it was actually answered. This pairs TEXT to
+    the same open question (by ``question_revision``) that consumer pairs
+    to, flags it as relayed (never presentable as the client's own words —
+    see ``coord portal ledger``'s rendering), and nudges the submission off
+    ``needs-input`` the same way the inbound consumer does.
+
+    With no ``--revision``, targets whatever question is currently open. A
+    submission with no open question (everything already answered, or no
+    question ever pushed) is a clear error — pass ``--revision`` to backfill
+    an older, already-superseded question instead (SUB-1EA1D3's Q[11], asked
+    alongside Q[13] and answered before Q[13] was).
+
+    Like ``note``/``decision``/``link`` (#2751) this is not thin-client-
+    refused — it routes through the daemon's ``/portal-answer`` seam when
+    ``board_service`` is configured, so it works from wherever the operator
+    happens to be.
+    """
+    from coord import portal_store  # noqa: PLC0415
+    from coord.board_service import resolve  # noqa: PLC0415
+
+    # Config is only needed for the "leave needs-input" fold nudge, and only
+    # when THIS process is the one that will actually run it — i.e. it is
+    # not a thin client (a thin client's write routes through
+    # `/portal-answer`, and the daemon folds status there with its OWN
+    # config; see `coord.serve_app`'s handler). Loading it unconditionally
+    # would cost a thin client an extra `fetch_remote_config` round trip for
+    # a value it would never use. Best-effort either way — a config that
+    # fails to resolve degrades to no fold nudge, same as passing `None`.
+    config = None
+    if resolve() is None:
+        try:
+            config = _load_config(config_path)
+        except Exception:  # noqa: BLE001 — the nudge is best-effort, not this command
+            config = None
+    try:
+        entry = portal_store.answer_question(
+            submission_id,
+            text,
+            source=source,
+            revision=revision,
+            actor=_actor(),
+            config=config,
+        )
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(2) from exc
+    click.secho(
+        f"answered: {submission_id} Q[{entry.question_revision}] via {source} "
+        f"(by {entry.actor}) — {entry.text}",
+        fg="green",
     )

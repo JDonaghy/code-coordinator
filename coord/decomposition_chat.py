@@ -37,6 +37,7 @@ posture every other dispatcher in this file already uses.
 """
 from __future__ import annotations
 
+import datetime
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -271,6 +272,34 @@ def fetch_running_context(submission_id: str) -> dict[str, Any]:
     return portal_store.render_ledger_payload(submission_id)
 
 
+def _render_answer_line(a: dict[str, Any]) -> str:
+    """One rendered answer line — mirrors :func:`coord.commands.portal.
+    _render_answer_line` exactly (kept as a separate copy since the two
+    modules render different surrounding structure — a plain-text agent
+    briefing here, ``coord portal ledger``'s CLI output there).
+
+    #2986: a relayed (out-of-band) answer must never read as something the
+    client typed themselves — a session briefed from this text has no other
+    way to tell the difference, so the RELAYED tag, its source, and when it
+    was recorded are load-bearing here, not cosmetic. ``.get`` throughout
+    because a thin client's daemon may predate #2986 and never sets either
+    key."""
+    if not a.get("relayed"):
+        return f"A: {a.get('text', '')}  (by {a.get('actor') or 'customer'})"
+    recorded_at = a.get("recorded_at")
+    when = (
+        datetime.datetime.fromtimestamp(recorded_at, tz=datetime.timezone.utc)
+        .strftime("%Y-%m-%d %H:%M UTC")
+        if recorded_at
+        else "unknown date"
+    )
+    source = a.get("source") or "unknown"
+    return (
+        f"A [RELAYED via {source}, {when}, by {a.get('actor') or 'operator'}]: "
+        f"{a.get('text', '')}"
+    )
+
+
 def render_running_context_section(payload: dict[str, Any]) -> str:
     """Render *payload* (:func:`fetch_running_context`'s shape) as the
     briefing's RUNNING CONTEXT section — every question asked and its
@@ -295,14 +324,13 @@ def render_running_context_section(payload: dict[str, Any]) -> str:
         answers = entry.get("answers") or []
         if answers:
             for a in answers:
-                lines.append(
-                    f"      A: {a.get('text', '')}  (by {a.get('actor') or 'customer'})"
-                )
+                lines.append(f"      {_render_answer_line(a)}")
         else:
             lines.append("      (unanswered — needs-input)")
     for a in unpaired:
+        tag = " RELAYED" if a.get("relayed") else ""
         lines.append(
-            f"  - A (unpaired, question_revision={a.get('question_revision')}): "
+            f"  - A{tag} (unpaired, question_revision={a.get('question_revision')}): "
             f"{a.get('text', '')}  (by {a.get('actor') or 'customer'})"
         )
 

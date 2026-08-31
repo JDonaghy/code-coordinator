@@ -1704,3 +1704,307 @@ def test_daemon_portal_note_endpoint(tmp_path) -> None:
     [stored] = operator_notes_for_submission("sub_1")
     assert stored.text == "Household of two; no logins needed."
     assert stored.actor == "operator:jane"
+
+
+# ── #2986: `coord portal answer` — an out-of-band answer's ledger seam ──────
+
+
+class TestAnswerQuestion:
+    def test_answers_the_current_open_question(self, coord_db) -> None:
+        from coord.portal_store import (
+            LEDGER_KIND_QUESTION_ANSWERED,
+            answer_question,
+            enqueue,
+            ledger_for_submission,
+            mark_applied,
+        )
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+
+        entry = answer_question("sub_1", "Yes, offline-first.", actor="jane")
+
+        assert entry.kind == LEDGER_KIND_QUESTION_ANSWERED
+        assert entry.question_revision == row.revision
+        assert entry.text == "Yes, offline-first."
+        assert entry.actor == "operator:jane"
+        assert entry.payload == {"relayed": True, "source": "verbal"}
+        [stored] = [
+            e for e in ledger_for_submission("sub_1")
+            if e.kind == LEDGER_KIND_QUESTION_ANSWERED
+        ]
+        assert stored == entry
+
+    def test_source_defaults_to_verbal_and_validates_choice(self, coord_db) -> None:
+        from coord.portal_store import answer_question, enqueue, mark_applied
+
+        row = enqueue("sub_1", "question", {"question": "SQLite or Postgres?"})
+        mark_applied(row)
+
+        with pytest.raises(ValueError, match="unknown --source"):
+            answer_question("sub_1", "SQLite.", source="carrier-pigeon")
+
+        entry = answer_question("sub_1", "SQLite.", source="PHONE")
+        assert entry.payload["source"] == "phone"
+
+    def test_unknown_submission_is_rejected(self, coord_db) -> None:
+        from coord.portal_store import answer_question, ledger_for_submission
+
+        with pytest.raises(ValueError, match="unknown submission"):
+            answer_question("sub_nope", "Yes.")
+        assert ledger_for_submission("sub_nope") == []
+
+    def test_empty_text_is_rejected(self, coord_db) -> None:
+        from coord.portal_store import answer_question, enqueue, mark_applied
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+        with pytest.raises(ValueError, match="non-empty"):
+            answer_question("sub_1", "   ")
+
+    def test_no_open_question_is_a_clear_error(self, coord_db) -> None:
+        from coord.portal_store import answer_question, seed_revision
+
+        seed_revision("sub_1", 1)
+        with pytest.raises(ValueError, match="no open question"):
+            answer_question("sub_1", "Yes.")
+
+    def test_revision_backfills_an_older_already_reasked_question(
+        self, coord_db
+    ) -> None:
+        """SUB-1EA1D3's fixture case (#2986): Q[11] asked two things, the
+        client answered verbally, and the operator re-asked the rest as
+        Q[13] — so by the time the operator backfills Q[11]'s answer, Q[13]
+        is the CURRENT open question. `--revision 11` must land on Q[11]
+        regardless."""
+        from coord.portal_store import (
+            answer_question,
+            enqueue,
+            mark_applied,
+            render_ledger_payload,
+        )
+
+        q11 = enqueue(
+            "sub_1", "question", {"question": "Who will use this, and how?"}
+        )
+        mark_applied(q11)
+        q13 = enqueue("sub_1", "question", {"question": "And the rest?"})
+        mark_applied(q13)
+
+        entry = answer_question(
+            "sub_1", "Household of two.", revision=q11.revision
+        )
+        assert entry.question_revision == q11.revision
+
+        payload = render_ledger_payload("sub_1")
+        by_revision = {qa["question_revision"]: qa for qa in payload["qa"]}
+        assert by_revision[q11.revision]["answers"][0]["text"] == "Household of two."
+        assert by_revision[q13.revision]["answers"] == []
+
+    def test_relayed_answer_is_flagged_in_the_rendered_payload(
+        self, coord_db
+    ) -> None:
+        from coord.portal_store import answer_question, enqueue, mark_applied, render_ledger_payload
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+        answer_question("sub_1", "Yes.", source="email", actor="jane")
+
+        payload = render_ledger_payload("sub_1")
+        [answer] = payload["qa"][0]["answers"]
+        assert answer["relayed"] is True
+        assert answer["source"] == "email"
+        assert answer["actor"] == "operator:jane"
+
+    def test_later_inbound_answer_is_additive_not_a_conflict(self, coord_db) -> None:
+        """#2986 acceptance: a later inbound `question.answered` for the same
+        revision must not erase or error against an earlier relayed answer —
+        both coexist, in recorded order, under the same question."""
+        from coord.portal_store import (
+            LEDGER_KIND_QUESTION_ANSWERED,
+            answer_question,
+            append_ledger_entry,
+            enqueue,
+            mark_applied,
+            render_ledger_payload,
+        )
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+        answer_question("sub_1", "Relayed: yes.", source="phone", actor="jane")
+        append_ledger_entry(
+            "sub_1",
+            LEDGER_KIND_QUESTION_ANSWERED,
+            question_revision=row.revision,
+            text="Yes, offline-first please.",
+            actor="customer",
+            source_event_id="evt-1",
+        )
+
+        payload = render_ledger_payload("sub_1")
+        [qa] = payload["qa"]
+        assert [a["text"] for a in qa["answers"]] == [
+            "Relayed: yes.",
+            "Yes, offline-first please.",
+        ]
+        assert qa["answers"][0]["relayed"] is True
+        assert qa["answers"][1]["relayed"] is False
+
+    def test_fold_status_after_answer_is_best_effort_with_no_config(
+        self, coord_db
+    ) -> None:
+        """`config=None` (the CLI's own default when this process is a thin
+        client, or simply not supplied) must never turn the fold nudge into
+        a crash — it is a courtesy, not the recorded fact."""
+        from coord.portal_store import answer_question, enqueue, mark_applied
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+        entry = answer_question("sub_1", "Yes.", config=None)
+        assert entry.text == "Yes."
+
+    def test_fold_status_after_answer_never_raises_on_a_broken_fold(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import portal_sync, state
+        from coord.portal_store import answer_question, enqueue, mark_applied
+
+        row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+        mark_applied(row)
+        state._save_portal_link_local(
+            {"repo_name": "api", "milestone_number": 3, "submission_id": "sub_1"}
+        )
+
+        class _FakeConfig:
+            def repo(self, name):
+                return object()
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated GitHub failure")
+
+        monkeypatch.setattr(portal_sync, "fold_status_for_milestone", _boom)
+
+        entry = answer_question("sub_1", "Yes.", config=_FakeConfig())
+        assert entry.text == "Yes."
+
+    def test_routes_to_the_daemon_when_board_service_is_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+        from coord.portal_store import answer_question, ledger_for_submission
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+
+        def fake_post_record(svc, path, payload, **kw):
+            calls.append((path, payload))
+            return {
+                "entry": {
+                    "id": 1,
+                    "submission_id": payload["submission_id"],
+                    "seq": 3,
+                    "kind": "question_answered",
+                    "question_revision": 1,
+                    "text": payload["text"],
+                    "actor": "operator:jane",
+                    "source_event_id": None,
+                    "payload_json": '{"relayed": true, "source": "phone"}',
+                    "recorded_at": 100.0,
+                }
+            }
+
+        monkeypatch.setattr(cc, "post_record", fake_post_record)
+
+        result = answer_question("sub_1", "Routed answer", source="phone", actor="jane")
+        assert calls == [
+            (
+                "/portal-answer",
+                {
+                    "submission_id": "sub_1",
+                    "text": "Routed answer",
+                    "source": "phone",
+                    "revision": None,
+                    "actor": "jane",
+                },
+            )
+        ]
+        assert result.seq == 3
+        assert result.question_revision == 1
+        assert result.payload == {"relayed": True, "source": "phone"}
+        # ...and nothing was written into this (thin client's) own local DB.
+        assert ledger_for_submission("sub_1") == []
+
+
+def test_daemon_portal_answer_endpoint(tmp_path) -> None:
+    """#2986: POST `/portal-answer` — the relayed-answer daemon seam,
+    mirroring `test_daemon_portal_note_endpoint` above."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import enqueue, ledger_for_submission, mark_applied
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-answer.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+    mark_applied(row)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_submission = cli.post("/portal-answer", json={"text": "hi"})
+        unknown_submission = cli.post(
+            "/portal-answer", json={"submission_id": "sub_nope", "text": "hi"}
+        )
+        empty_text = cli.post(
+            "/portal-answer", json={"submission_id": "sub_1", "text": "   "}
+        )
+        bad_source = cli.post(
+            "/portal-answer",
+            json={"submission_id": "sub_1", "text": "Yes.", "source": "carrier-pigeon"},
+        )
+        answered = cli.post(
+            "/portal-answer",
+            json={
+                "submission_id": "sub_1",
+                "text": "Yes, offline-first.",
+                "source": "phone",
+                "actor": "jane",
+            },
+        )
+
+    assert missing_submission.status_code == 400
+    assert unknown_submission.status_code == 400
+    assert "unknown submission" in unknown_submission.json()["error"]
+    assert empty_text.status_code == 400
+    assert bad_source.status_code == 400
+    assert answered.status_code == 200
+    entry = answered.json()["entry"]
+    assert entry["kind"] == "question_answered"
+    assert entry["question_revision"] == row.revision
+    assert entry["text"] == "Yes, offline-first."
+    assert entry["actor"] == "operator:jane"
+    assert entry["payload_json"] == '{"relayed": true, "source": "phone"}'
+
+    [stored] = [
+        e for e in ledger_for_submission("sub_1") if e.kind == "question_answered"
+    ]
+    assert stored.text == "Yes, offline-first."

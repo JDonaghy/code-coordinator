@@ -439,6 +439,53 @@ def test_render_running_context_section_unanswered_question():
     assert "unanswered — needs-input" in out
 
 
+def test_render_running_context_section_flags_a_relayed_answer(monkeypatch):
+    """#2986: a session briefed from this text has no other way to tell a
+    relayed (out-of-band) answer from something the client typed themselves
+    — the RELAYED tag, source, and date must show up here, not just in
+    `coord portal ledger`'s own CLI rendering."""
+    payload = {
+        "qa": [
+            {
+                "question_revision": 11,
+                "question": "Who will use this, and how?",
+                "answers": [
+                    {
+                        "text": "Household of two.",
+                        "actor": "operator:jane",
+                        "recorded_at": 1_700_000_000.0,
+                        "relayed": True,
+                        "source": "phone",
+                    }
+                ],
+            }
+        ],
+        "unpaired_answers": [],
+    }
+    out = decomposition_chat.render_running_context_section(payload)
+    assert "RELAYED via phone" in out
+    assert "operator:jane" in out
+    assert "Household of two." in out
+    assert "2023-11-14" in out  # the formatted `recorded_at`
+
+
+def test_render_running_context_section_unflagged_answer_reads_as_before():
+    """No `relayed`/`source` keys at all (a pre-#2986 payload, or a
+    genuine client answer) must render exactly as it always has."""
+    payload = {
+        "qa": [
+            {
+                "question_revision": 2,
+                "question": "Postgres or SQLite?",
+                "answers": [{"text": "Postgres", "actor": "client"}],
+            }
+        ]
+    }
+    out = decomposition_chat.render_running_context_section(payload)
+    assert "A: Postgres  (by client)" in out
+    assert "RELAYED" not in out
+
+
 # ── #2750 (IL-4): resolve_approved_submission (local vs daemon-routed) ──────
 
 

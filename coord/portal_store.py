@@ -39,12 +39,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from coord import sql
+
+_log = logging.getLogger(__name__)
 
 #: A DB-API row as the three ``_*_from_row`` helpers below need it: index by
 #: column name (``row["col"]``). ``sqlite3.Row`` and psycopg's ``dict_row``
@@ -1756,6 +1759,16 @@ LEDGER_KIND_OPERATOR_NOTE = "operator_note"
 #: the client actually wrote. See :func:`operator_actor`.
 OPERATOR_ACTOR_PREFIX = "operator:"
 
+#: #2986: how an out-of-band answer actually reached the operator —
+#: ``coord portal answer --source``. Recorded in the ledger row's
+#: ``payload`` (``{"relayed": True, "source": ...}``) so a renderer can
+#: attribute it as relayed rather than presenting it as the client's own
+#: words (this issue's acceptance bar). "verbal" (in person or a call the
+#: operator wasn't dialing in from, i.e. no better label applies) is the
+#: default — the common case for a small engagement.
+RELAYED_ANSWER_SOURCES = ("verbal", "phone", "email")
+DEFAULT_RELAYED_ANSWER_SOURCE = "verbal"
+
 
 def operator_actor(name: str = "") -> str:
     """The ``actor`` string for an operator-authored ledger row.
@@ -1979,6 +1992,198 @@ def append_operator_note(
     if routed is not None:
         return _ledger_from_row(routed["entry"])
     return _append_operator_note_local(submission_id, text, actor=actor, now=now)
+
+
+# ── layer 1b: relayed answers (#2986) ────────────────────────────────────────
+#
+# The one write path this issue adds: an answer the operator received OUT OF
+# BAND — in person, on a call, by email — and needs paired to the question's
+# own ``question_revision`` exactly the way an inbound ``question.answered``
+# event already is (:func:`coord.portal_sync._record_question_answer`). Still
+# ledger-class (see this section's ownership note above): a human relaying
+# what the customer told them is coord-observed the same way an operator note
+# (#2867) is, not an agent's say-so. Unlike a note, this DOES pair to a
+# question and DOES nudge the submission off ``needs-input`` — the two things
+# `note` deliberately does not do (see `append_operator_note`'s docstring).
+
+
+def _current_open_question_revision(submission_id: str) -> int | None:
+    """The most recently pushed question for *submission_id* that has no
+    ledgered answer yet, or ``None`` if every pushed question already has
+    one (or none has ever been pushed).
+
+    Mirrors the pairing :func:`render_ledger_payload` does for display —
+    keyed on ``question_revision``, oldest push first — but only needs the
+    "still open" half, not the full answers list.
+    """
+    pushed_revisions: list[int | None] = []
+    answered_revisions: set[int | None] = set()
+    for entry in ledger_for_submission(submission_id):
+        if entry.kind == LEDGER_KIND_QUESTION_PUSHED:
+            pushed_revisions.append(entry.question_revision)
+        elif entry.kind == LEDGER_KIND_QUESTION_ANSWERED:
+            answered_revisions.add(entry.question_revision)
+    open_revisions = [r for r in pushed_revisions if r not in answered_revisions]
+    if not open_revisions:
+        return None
+    return open_revisions[-1]
+
+
+def _fold_status_after_answer(config: Any, submission_id: str) -> None:
+    """Best-effort nudge off ``needs-input`` after a relayed answer lands
+    (#2986) — the same courtesy :func:`coord.portal_sync._record_question_
+    answer` performs for an inbound ``question.answered`` event, so an
+    out-of-band answer leaves ``needs-input`` on the same tick as the write
+    rather than waiting on the next unconditional status fold.
+
+    Never raises: a courtesy nudge, not the recorded fact itself. ``config``
+    is optional the same way :func:`coord.portal_sync._record_question_
+    answer`'s is — the CLI-local path always has one, but a test exercising
+    just the ledger write can omit it and get a no-op here instead of an
+    import-time failure.
+    """
+    if config is None:
+        return
+    try:
+        from coord import portal_sync  # noqa: PLC0415
+
+        link = get_link_by_submission(submission_id)
+        if link is None:
+            return
+        repo_cfg = config.repo(link.repo_name)
+        if repo_cfg is None:
+            return
+        if link.issue_number is not None:
+            portal_sync.fold_status_for_issue(config, link.repo_name, link.issue_number)
+        else:
+            portal_sync.fold_status_for_milestone(
+                config, link.repo_name, link.milestone_number
+            )
+    except Exception:  # noqa: BLE001 — a courtesy nudge, not the recorded fact itself
+        _log.warning(
+            "portal answer: could not fold status after relayed answer for %s",
+            submission_id,
+            exc_info=True,
+        )
+
+
+def _answer_question_local(
+    submission_id: str,
+    text: str,
+    *,
+    source: str = DEFAULT_RELAYED_ANSWER_SOURCE,
+    revision: int | None = None,
+    actor: str = "",
+    config: Any = None,
+    now: float | None = None,
+) -> LedgerEntry:
+    """Write half of :func:`answer_question` — runs on the daemon host
+    (either directly, or via ``/portal-answer`` on behalf of a thin client).
+
+    Same "validate the submission HERE" reasoning as
+    :func:`_append_operator_note_local`. ``revision=None`` targets whatever
+    :func:`_current_open_question_revision` currently considers open;
+    passing an explicit ``revision`` backfills an older, already-superseded
+    question (SUB-1EA1D3's Q[11] fixture case, #2986) and skips that lookup
+    entirely — even a revision with no matching pushed question is still
+    ledgered (it lands in ``unpaired_answers``, same tolerance
+    :func:`coord.portal_sync._record_question_answer` already has for a
+    malformed inbound event).
+    """
+    if not submission_id or not submission_id.strip():
+        raise ValueError("answer needs a submission_id")
+    if not text or not text.strip():
+        raise ValueError("answer needs non-empty text")
+    if get_submission(submission_id) is None:
+        raise ValueError(
+            f"unknown submission {submission_id!r} — no portal submission with "
+            "that id (check `coord portal status` for the current ids)"
+        )
+    src = (source or DEFAULT_RELAYED_ANSWER_SOURCE).strip().lower()
+    if src not in RELAYED_ANSWER_SOURCES:
+        raise ValueError(
+            f"unknown --source {source!r} — choose one of "
+            f"{', '.join(RELAYED_ANSWER_SOURCES)}"
+        )
+    target_revision = revision
+    if target_revision is None:
+        target_revision = _current_open_question_revision(submission_id)
+        if target_revision is None:
+            raise ValueError(
+                f"no open question on file for {submission_id!r} — nothing to "
+                "answer (pass --revision to backfill an older question)"
+            )
+    entry = append_ledger_entry(
+        submission_id,
+        LEDGER_KIND_QUESTION_ANSWERED,
+        question_revision=target_revision,
+        text=text.strip(),
+        actor=operator_actor(actor),
+        payload={"relayed": True, "source": src},
+        now=now,
+    )
+    _fold_status_after_answer(config, submission_id)
+    return entry
+
+
+def _route_answer(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST *payload* to the daemon's ``/portal-answer`` seam, or ``None`` if
+    this process IS the daemon host — the relayed-answer twin of
+    :func:`_route_note`, daemon-routed for the same #2751 reason: the
+    operator relaying an out-of-band answer may be sitting at any machine in
+    the fleet, and a write into a thin client's own empty ``portal_ledger``
+    would be silently lost.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    return board_service.route_write(svc, "/portal-answer", payload)
+
+
+def answer_question(
+    submission_id: str,
+    text: str,
+    *,
+    source: str = DEFAULT_RELAYED_ANSWER_SOURCE,
+    revision: int | None = None,
+    actor: str = "",
+    config: Any = None,
+    now: float | None = None,
+) -> LedgerEntry:
+    """Record an answer the operator received OUT OF BAND (#2986) —
+    ``coord portal answer`` — routed to the daemon when ``board_service`` is
+    configured, else written (and folded) locally.
+
+    Raises :class:`ValueError` for an unknown submission, empty text, an
+    unknown ``source``, or (with no ``revision`` given) no open question on
+    file. The stored text is VERBATIM and flagged ``relayed`` in the ledger
+    row's payload, never presentable as the client's own words (see
+    :func:`render_ledger_payload`'s ``qa[*]["answers"][*]["relayed"]``). A
+    later inbound ``question.answered`` for the same revision
+    (:func:`coord.portal_sync._record_question_answer`) is additive, not a
+    conflict: the ledger is append-only, so both rows coexist under the same
+    ``question_revision`` in the order they were recorded.
+    """
+    routed = _route_answer(
+        {
+            "submission_id": submission_id,
+            "text": text,
+            "source": source,
+            "revision": revision,
+            "actor": actor,
+        }
+    )
+    if routed is not None:
+        return _ledger_from_row(routed["entry"])
+    return _answer_question_local(
+        submission_id,
+        text,
+        source=source,
+        revision=revision,
+        actor=actor,
+        config=config,
+        now=now,
+    )
 
 
 # ── layer 2: decisions (agent-authored, operator-confirmed) ─────────────────
@@ -2356,7 +2561,18 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
                 "question_revision": revision,
                 "question": qa["question"].text,
                 "answers": [
-                    {"text": a.text, "actor": a.actor, "recorded_at": a.recorded_at}
+                    {
+                        "text": a.text,
+                        "actor": a.actor,
+                        "recorded_at": a.recorded_at,
+                        # #2986: attribution for an out-of-band answer — set
+                        # only by `answer_question`/`coord portal answer`, so
+                        # a renderer can tell "the client's own words" from
+                        # "the operator relayed this" rather than the two
+                        # looking identical.
+                        "relayed": bool(a.payload.get("relayed")),
+                        "source": a.payload.get("source", ""),
+                    }
                     for a in qa["answers"]
                 ],
             }
@@ -2368,6 +2584,8 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
                 "text": a.text,
                 "actor": a.actor,
                 "recorded_at": a.recorded_at,
+                "relayed": bool(a.payload.get("relayed")),
+                "source": a.payload.get("source", ""),
             }
             for a in unpaired_answers
         ],
