@@ -27,6 +27,14 @@ from coord.merge_queue import (
     sequence,
 )
 from coord.models import Assignment
+from coord import db as db_mod
+from coord import sql
+from tests import backends
+from tests.test_db import (
+    AbortOnErrorConn,
+    abort_simulating_connection,
+    schema_migrated_sqlite_connection,
+)
 
 
 def _check(
@@ -11696,3 +11704,90 @@ class TestForgeAvailabilityRefusalRecording:
         events = process(items, gh, ci_store=_Ci())  # must not raise
 
         assert "checks_failed" in [e.kind for e in events]
+
+
+# ── #2983: a missing merge_queue_archive must not poison the connection ─────
+#
+# `_archived_merged_issue_keys` catches "no such table" (the archive only
+# exists once `housekeeping.sweep()` has archived a row) and returns
+# `set()` -- but `conn` is the process-lived `get_connection()` singleton,
+# and on Postgres the swallowed `UndefinedTable` aborted its transaction for
+# every statement that came afterwards.
+
+
+def _abort_conn_with_merged_row(monkeypatch: pytest.MonkeyPatch) -> AbortOnErrorConn:
+    """The `get_connection()` singleton, replaced by an abort-simulating stub
+    over a real schema-migrated SQLite connection holding one MERGED row.
+
+    `merge_queue_archive` is created by `coord.housekeeping`, not
+    `_ensure_schema`, so it is genuinely absent -- no drop needed.
+    """
+    real = schema_migrated_sqlite_connection()
+    sql.execute(
+        real,
+        "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, branch, "
+        "target_branch, issue_number, issue_title, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("a-1", "demo", "o/demo", "issue-42-x", "main", 42, "Demo issue", MERGED),
+    )
+    real.commit()
+    conn = abort_simulating_connection(monkeypatch, real)
+    monkeypatch.setattr(db_mod, "_conn", conn)
+    return conn
+
+
+class TestArchivedMergedIssueKeysRollsBack:
+    def test_returns_live_keys_and_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = _abort_conn_with_merged_row(monkeypatch)
+
+        assert mq.merged_issue_keys() == {("demo", 42)}
+        assert conn.rollbacks == 1
+
+        # The acceptance criterion: a further operation on the same
+        # connection.  Pre-fix this raises "current transaction is aborted",
+        # and since it is the shared singleton, so did every later caller —
+        # `enqueue_approved_work()` / `staging_items()` are the real ones.
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_a_second_lookup_through_the_same_singleton_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _abort_conn_with_merged_row(monkeypatch)
+
+        mq.merged_issue_keys()
+
+        assert mq.merged_issue_keys() == {("demo", 42)}
+
+
+class TestArchivedMergedIssueKeysOnRealPostgres:
+    """The same regression against an actual Postgres server, when one is
+    reachable -- `psycopg.errors.UndefinedTable` then
+    `InFailedSqlTransaction`, the real shapes the stub above simulates."""
+
+    def test_missing_archive_table_does_not_poison_the_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            db_mod._ensure_schema(session.conn)
+            sql.execute(
+                session.conn,
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("a-1", "demo", "o/demo", "issue-42-x", "main", 42, "Demo issue", MERGED),
+            )
+            session.conn.commit()
+            monkeypatch.setattr(db_mod, "_conn", session.conn)
+
+            assert mq.merged_issue_keys() == {("demo", 42)}
+            assert sql.execute(session.conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+        finally:
+            monkeypatch.undo()
+            session.close()

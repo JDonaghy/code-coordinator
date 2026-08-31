@@ -393,6 +393,15 @@ class SqliteStore:
         forward-compatible stand-in the issue asks for (#1039 can replace the
         semantics without a wire-shape change — it's still one integer).
         Fail-open to 0 so a missing/pre-migration table never 503s the board.
+
+        #2983: that fail-open needs a rollback to actually be fail-open on
+        Postgres. This runs inside a caller's ``with closing(self._connect())``
+        block alongside many other reads (``_board_meta``, ``_round_number``,
+        every ``_table`` call in ``board_projection``), and Postgres aborts the
+        whole transaction on a failed statement — so a missing ``audit_log``
+        took out every *sibling* read on that connection too, producing
+        precisely the 503 this guard exists to prevent. Nothing uncommitted
+        can be lost: ``SqliteStore``'s connections are opened read-only.
         """
         try:
             cutoff = time.time() - _AUDIT_RECENT_WINDOW_SECONDS
@@ -400,7 +409,8 @@ class SqliteStore:
                 conn, "SELECT COUNT(*) AS n FROM audit_log WHERE ts >= ?", (cutoff,)
             ).fetchone()
             return int(row["n"]) if row else 0
-        except sql.driver_error(conn):
+        except sql.driver_error(conn) as exc:
+            db_mod.rollback_after_driver_error(conn, exc)  # #2983: caller reuses `conn`
             return 0
 
     # ── public reads ────────────────────────────────────────────────────────────

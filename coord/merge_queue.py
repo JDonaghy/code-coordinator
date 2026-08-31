@@ -42,7 +42,7 @@ from coord.ci_store import (
     summarize,
     summarize_counts,
 )
-from coord.db import get_connection, retry_on_locked
+from coord.db import get_connection, retry_on_locked, rollback_after_driver_error
 from coord.forge_availability import MERGE_GATE_REFUSAL_KINDS, record_merge_gate_refusal
 from coord.models import (
     CLOSES_ISSUE_TYPES,
@@ -3812,11 +3812,23 @@ def _archived_merged_issue_keys(conn: sqlite3.Connection) -> set[tuple[str, int]
             "SELECT repo_name, issue_number FROM merge_queue_archive WHERE state = ?",
             (MERGED,),
         ).fetchall()
-    except sql.driver_errors():  # #2784: not just sqlite3.OperationalError
+    except sql.driver_errors() as exc:  # #2784: not just sqlite3.OperationalError
         # "no such table" surfaces as a *different* driver-named exception
         # per backend (sqlite3.OperationalError vs psycopg.errors.
         # UndefinedTable), so this must go through the dialect seam or the
         # not-yet-archived case becomes an uncaught crash on Postgres.
+        #
+        # #2983: and catching it is only half the job. `conn` here is the
+        # process-lived `get_connection()` singleton, which the caller
+        # (`merged_issue_keys`, and in turn `enqueue_approved_work` /
+        # `staging_items`) keeps writing and reading through long after this
+        # returns — on Postgres the swallowed UndefinedTable aborts that
+        # connection's transaction, so the "archive doesn't exist yet"
+        # degrade turned every subsequent statement into
+        # InFailedSqlTransaction. Nothing uncommitted is at risk: this
+        # function only reads, and on Postgres the abort had already
+        # discarded anything pending regardless.
+        rollback_after_driver_error(conn, exc)
         return set()
     return {(r["repo_name"], r["issue_number"]) for r in rows}
 
