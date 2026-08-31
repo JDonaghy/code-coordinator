@@ -127,6 +127,25 @@ class ReleaseAssetNotFoundError(RuntimeError):
     """The release exists but doesn't carry the asset this host needs."""
 
 
+class EmptyReleaseChannelError(RuntimeError):
+    """The channel has never published a release at all (#2981).
+
+    Distinct from :class:`ReleaseAssetNotFoundError` on purpose: that one
+    means a real release exists but is missing something (an asset, a usable
+    ``tag_name``); this one means there is **no release to even look at** —
+    ``/releases/latest`` 404s because the repo has zero releases and zero
+    tags, not because of a network problem or a malformed one.
+
+    The distinction matters to callers precisely because the two are not
+    graded the same way: "nothing has been published yet" is a fact about
+    the channel, not about whatever this run tried to do, so it must never
+    be treated as evidence that an install/roll attempt itself failed (see
+    ``coord/commands/tui.py``'s ``tui update`` and
+    ``coord/commands/release.py``'s ``_roll_tui``, which special-case this
+    exact exception type rather than string-matching an error message).
+    """
+
+
 @dataclass(frozen=True)
 class ReleaseAsset:
     name: str
@@ -220,9 +239,21 @@ def fetch_latest_release_tag(
     invocation, or worse, an accidental match on an unrelated release that
     happened to share a number.
 
-    Raises on any HTTP/network failure, or when the channel has no release at
-    all — callers decide whether that is fatal (``coord tui update`` has
-    nothing to install) or a soft "could not check" (``coord tui status``).
+    Raises :class:`EmptyReleaseChannelError` when the channel has no release
+    at all — a bare 404 from ``/releases/latest`` (GitHub's own signal for
+    "this repo has never published a release"), or a 200 whose body carries
+    no usable ``tag_name`` (belt-and-braces; not observed from the real API
+    but no less "nothing to resolve" if it ever happened). Any *other*
+    HTTP/network failure (5xx, auth, timeout, DNS) is left to raise as-is —
+    that is a real "could not check", not "nothing published yet".
+
+    #2981: this distinction is exactly what callers need to decide whether
+    an empty channel is fatal (``coord tui update`` has nothing to install)
+    or a soft "could not check" (``coord tui status``) *without* also
+    swallowing a genuine failure into the same bucket. Before this, a bare
+    404 escaped as an undifferentiated ``httpx.HTTPStatusError`` — callers
+    that wanted to tell "empty channel" apart from "the roll failed" had
+    nothing but the error message to match against.
     """
     import httpx  # noqa: PLC0415 — keep import cost off the non-network path
 
@@ -231,11 +262,16 @@ def fetch_latest_release_tag(
     if token:
         headers["Authorization"] = f"Bearer {token}"
     response = httpx.get(url, timeout=timeout, headers=headers, follow_redirects=True)
+    if response.status_code == 404:
+        raise EmptyReleaseChannelError(
+            f"{repo} has no published release to resolve a latest version "
+            f"from (GET {url} -> 404 — this repo has zero releases/tags)"
+        )
     response.raise_for_status()
     data = response.json()
     version = normalize_version((data or {}).get("tag_name"))
     if not version:
-        raise ReleaseAssetNotFoundError(
+        raise EmptyReleaseChannelError(
             f"{repo} has no published release to resolve a latest version from"
         )
     return version

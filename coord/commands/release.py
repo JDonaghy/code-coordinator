@@ -2319,10 +2319,26 @@ def _roll_tui(machine, *, local_name: str | None) -> tuple[bool | None, str]:
     (:func:`coord.tui_release.fetch_latest_release_tag`) — that is the
     :data:`~coord.release_propagate.CHANNEL_TUI` channel doing its own version
     selection, not this run guessing across a channel boundary.
+
+    #2981 — AN EMPTY CHANNEL IS NOT A FAILED ROLL.
+    A channel with zero releases/tags 404s on every ``coord tui update``
+    forever, until someone cuts a first release — that is a fact about
+    ``coord-tui``'s Releases, not about whatever this host just attempted.
+    ``coord tui update`` exits :data:`~coord.commands.tui.EXIT_EMPTY_CHANNEL`
+    specifically for that case (``EmptyReleaseChannelError``, raised at the
+    source in :func:`coord.tui_release.fetch_latest_release_tag`), so this
+    reads that exact exit code and returns ``ok=None`` — the same "no channel
+    to roll" treatment already given to a remote host above, which
+    :func:`coord.release_propagate.scope_verification` excludes from the
+    gate that ``--rollback-on-red`` acts on. A *genuine* failure (a real
+    release exists but the asset/checksum/install step fails) still exits
+    ``1`` here and stays ``ok=False`` — still blocking, still eligible to
+    trigger a rollback.
     """
     import subprocess  # noqa: PLC0415
 
     from coord import release_propagate as rp  # noqa: PLC0415
+    from coord.commands.tui import EXIT_EMPTY_CHANNEL  # noqa: PLC0415
 
     if local_name is None or machine.name != local_name:
         return None, (
@@ -2343,7 +2359,13 @@ def _roll_tui(machine, *, local_name: str | None) -> tuple[bool | None, str]:
             if installed
             else f"coord-tui updated from the {rp.CHANNEL_TUI} channel"
         )
-    return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
+    detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
+    if proc.returncode == EXIT_EMPTY_CHANNEL:
+        return None, (
+            f"{rp.CHANNEL_TUI} channel has no published release yet — "
+            f"nothing to install, not a roll failure (#2981): {detail}"
+        )
+    return False, detail
 
 
 def _installed_tui_version(stdout: str) -> str | None:

@@ -284,17 +284,44 @@ def test_tui_update_default_version_comes_from_coord_tui_not_the_coordinator(
     assert os.popen(f"{dest} --version").read().strip() == f"coord-tui {TUI_VERSION}"
 
 
-def test_tui_update_fails_loudly_when_the_channel_is_unreachable(
+def test_tui_update_reports_an_empty_channel_distinctly(
     stub_server, tmp_path: Path
 ) -> None:
-    """Unlike `tui status`, this one is fatal: there is nothing to install,
-    and silently falling back to some other version (the coordinator's, say)
-    is precisely the cross-channel guess the split exists to prevent."""
+    """#2981: a repo with zero releases/tags 404s on `/releases/latest` on
+    every run, forever, until someone cuts a first release (this is
+    JDonaghy/coord-tui's actual state at the time of writing). This is still
+    fatal for `tui update` itself -- there is nothing to install, and
+    silently falling back to some other version (the coordinator's, say) is
+    precisely the cross-channel guess the split exists to prevent -- but it
+    must exit with `EXIT_EMPTY_CHANNEL`, not the generic `1` a real failure
+    uses, so a caller like `coord release propagate` can tell "nothing
+    published yet" apart from "the roll actually failed" by exit code alone
+    (`coord/commands/release.py`'s `_roll_tui` is the caller that cares)."""
+    from coord.commands.tui import EXIT_EMPTY_CHANNEL
+
     dest = tmp_path / "bin" / "coord-tui"
     result = CliRunner().invoke(
         main,
         ["tui", "update", "--repo", REPO, "--api-base", _api_base(stub_server),
          "--dest", str(dest), "--timeout", "5"],
+    )
+
+    assert result.exit_code == EXIT_EMPTY_CHANNEL, result.output
+    assert result.exit_code != 1
+    assert "has no published release" in result.output
+    assert not dest.exists()
+
+
+def test_tui_update_fails_loudly_on_a_genuine_network_failure(tmp_path: Path) -> None:
+    """A real network failure -- nothing is listening on this port, so the
+    connection itself is refused -- is NOT the #2981 empty-channel case
+    above and must keep the generic exit code `1`: there is a real
+    "could not check" here, not "nothing published yet"."""
+    dest = tmp_path / "bin" / "coord-tui"
+    result = CliRunner().invoke(
+        main,
+        ["tui", "update", "--repo", REPO, "--api-base", "http://127.0.0.1:1",
+         "--dest", str(dest), "--timeout", "2"],
     )
 
     assert result.exit_code == 1, result.output
