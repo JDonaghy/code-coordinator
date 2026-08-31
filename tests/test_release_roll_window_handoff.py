@@ -888,8 +888,13 @@ class TestNotifyDispatchesNoNewLegsWhilePending:
              patch.object(notify_mod, "_sweep_stalled_pipeline", return_value=[]) as stalled, \
              patch.object(notify_mod, "_agent_status", return_value={"active": [], "completed": []}):
             notify_mod.run(notify_config)
-        smoke.assert_called_once()
-        review.assert_called_once()
+        # #2975: `run()` takes a head-start dispatch pass before its own
+        # transition-detection loop (so a slow repo's out-of-band test
+        # confirmation can never queue another repo's Test/Review dispatch
+        # behind it), then repeats the same two calls in their usual place —
+        # two calls per un-gated run, not one.
+        assert smoke.call_count == 2
+        assert review.call_count == 2
         stalled.assert_called_once()
 
     def test_a_live_marker_blocks_every_new_dispatch_call(self, notify_config, coord_db):
@@ -920,8 +925,10 @@ class TestNotifyDispatchesNoNewLegsWhilePending:
              patch.object(notify_mod, "_sweep_stalled_pipeline", return_value=[]) as stalled, \
              patch.object(notify_mod, "_agent_status", return_value={"active": [], "completed": []}):
             notify_mod.run(notify_config)
-        smoke.assert_called_once()
-        review.assert_called_once()
+        # #2975: see the head-start comment in test_no_marker_dispatches_normally
+        # above — two calls per un-gated run, not one.
+        assert smoke.call_count == 2
+        assert review.call_count == 2
         stalled.assert_called_once()
         # And read-only, as promised — notify never touches the file itself.
         assert dq_cmd.read_roll_pending() is not None

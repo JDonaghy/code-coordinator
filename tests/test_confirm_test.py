@@ -1698,3 +1698,196 @@ class TestConfirmationRespectsCapabilityRouting:
         read that as 'gate not applicable', never as 'nothing required'
         collapsing into a refusal."""
         assert ct.branch_touched_files(tmp_path, BRANCH, "main") == []
+
+
+# ── #2975: per-repo measured duration, so a chronically-too-slow repo stops
+#    re-learning the same lesson on every PASS claim ─────────────────────────
+
+
+class TestExpectedConfirmationDurationHistory:
+    """quadraui's `cargo test --features tui` builds every example/test
+    executable (#305 in coordinator.yml) and structurally cannot finish
+    inside any ceiling this module hands out from the reap path. Before
+    #2975, every PASS claim on that repo spent the FULL pass budget
+    rediscovering that identical fact, serialising every other repo's
+    Test/Review dispatch behind it each time (#2975's reported symptom:
+    coord-tui#17 sat idle ~20 minutes with three machines free). Remembering
+    the last measured duration lets `confirmation_timeout` recognise a
+    doomed run and skip it instead of repeating it.
+    """
+
+    def test_never_measured_reports_no_expectation(self) -> None:
+        assert ct.expected_confirmation_seconds("quadraui") is None
+
+    def test_records_and_reads_back_a_measured_duration(self) -> None:
+        ct.record_confirmation_duration("quadraui", 1234.5)
+        assert ct.expected_confirmation_seconds("quadraui") == 1234.5
+
+    def test_recording_is_per_repo(self) -> None:
+        ct.record_confirmation_duration("quadraui", 1200.0)
+        ct.record_confirmation_duration("claude-coordinator", 360.0)
+        assert ct.expected_confirmation_seconds("quadraui") == 1200.0
+        assert ct.expected_confirmation_seconds("claude-coordinator") == 360.0
+
+    def test_a_later_measurement_overwrites_the_earlier_one(self) -> None:
+        """The LAST attempt is a better estimate of the CURRENT suite than an
+        average across however long ago the suite was this size — no
+        averaging, straight overwrite."""
+        ct.record_confirmation_duration("quadraui", 1200.0)
+        ct.record_confirmation_duration("quadraui", 90.0)
+        assert ct.expected_confirmation_seconds("quadraui") == 90.0
+
+    def test_a_non_positive_duration_is_never_recorded(self) -> None:
+        ct.record_confirmation_duration("quadraui", 0.0)
+        ct.record_confirmation_duration("quadraui", -5.0)
+        assert ct.expected_confirmation_seconds("quadraui") is None
+
+    def test_recordable_kinds_are_exactly_the_ones_that_ran_for_real(self) -> None:
+        """`KIND_OK`/`KIND_BUILD`/`KIND_SUITE`/`KIND_BASELINE_RED`/
+        `KIND_NO_OUTPUT` ran to completion; `KIND_TIMEOUT` ran for at least
+        its ceiling — all six are a trustworthy signal. `KIND_SETUP`/
+        `KIND_INFRA`/`KIND_SIGNAL` never ran the command for a representative
+        duration and must stay excluded, or a single lock-contention hiccup
+        or missing checkout would erase a hard-won 'this one is slow'
+        expectation back down to near zero."""
+        assert ct.RECORDABLE_DURATION_KINDS == {
+            KIND_OK, KIND_BUILD, KIND_SUITE, KIND_BASELINE_RED,
+            ct.KIND_NO_OUTPUT, KIND_TIMEOUT,
+        }
+        for excluded in (KIND_SETUP, KIND_INFRA, ct.KIND_SIGNAL):
+            assert excluded not in ct.RECORDABLE_DURATION_KINDS
+
+    def test_a_corrupt_history_file_reads_as_never_measured(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        history_path = isolated_coord_dir / "confirm_test_history.json"
+        history_path.write_text("not json{{{", encoding="utf-8")
+        assert ct.expected_confirmation_seconds("quadraui") is None
+
+    def test_history_survives_being_read_back_from_a_fresh_process_view(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        """The store is a plain file, not process memory — write it once and
+        a completely separate read must see it, exactly like
+        `coord.commands.drive_queue`'s roll-pending marker."""
+        import json
+
+        history_path = isolated_coord_dir / "confirm_test_history.json"
+        ct.record_confirmation_duration("quadraui", 777.0)
+        assert json.loads(history_path.read_text())["quadraui"] == 777.0
+
+
+class TestConfirmationTimeoutSkipsAKnownDoomedRepo:
+    """`confirmation_timeout`'s *expected_seconds* parameter — the wiring
+    that turns a measured history entry into an actual skip."""
+
+    def test_expected_well_below_the_ceiling_still_hands_out_the_ceiling(
+        self,
+    ) -> None:
+        ct.begin_confirmation_pass(600)
+        assert ct.confirmation_timeout(expected_seconds=100) == 600
+
+    def test_expected_at_the_ceiling_skips_the_run(self) -> None:
+        ct.begin_confirmation_pass(600)
+        assert ct.confirmation_timeout(expected_seconds=600) is None
+
+    def test_expected_past_the_ceiling_skips_the_run(self) -> None:
+        ct.begin_confirmation_pass(600)
+        assert ct.confirmation_timeout(expected_seconds=900) is None
+
+    def test_no_expectation_falls_back_to_the_ordinary_ceiling(self) -> None:
+        ct.begin_confirmation_pass(600)
+        assert ct.confirmation_timeout(expected_seconds=None) == 600
+        assert ct.confirmation_timeout() == 600
+
+    def test_expectation_is_irrelevant_outside_a_pass(self) -> None:
+        """No `begin_confirmation_pass()` call — the full per-run ceiling
+        applies regardless of history, exactly like calling this with no
+        argument at all."""
+        assert ct.confirmation_timeout(expected_seconds=10**9) == int(
+            ct.CONFIRM_DEFAULT_TIMEOUT_SECONDS
+        )
+
+    def test_a_shrinking_budget_can_flip_a_previously_eligible_repo_to_skipped(
+        self,
+    ) -> None:
+        """Spending most of the pass on other rows first must make the SAME
+        expectation newly disqualifying — this is what protects every OTHER
+        repo's confirmation from a known-slow one eating the tail of the
+        budget on a run that was already unlikely to finish."""
+        ct.begin_confirmation_pass(600)
+        assert ct.confirmation_timeout(expected_seconds=500) == 600
+        ct.spend_confirmation_budget(550)
+        assert ct.confirmation_timeout(expected_seconds=500) is None
+
+
+class TestNotifyReapSkipsAKnownDoomedConfirmation:
+    """Integration: `coord.notify._run_pass_confirmation` actually consults
+    the history and actually records into it — the two ends of #2975's fix
+    wired together, not just the pure functions in isolation."""
+
+    @staticmethod
+    def _transition():
+        from coord.notify import EVENT_COMPLETION, Transition
+
+        return Transition(
+            assignment_id="smoke-1", machine_name="laptop", repo_name="api",
+            issue_number=42, event=EVENT_COMPLETION, exit_code=0,
+        )
+
+    def test_a_timeout_is_remembered_and_the_next_attempt_skips_the_run(
+        self,
+    ) -> None:
+        from coord.notify import _run_pass_confirmation
+
+        entry = {"branch": BRANCH}
+        ct.begin_confirmation_pass(600)
+        clock = _FakeClock()
+
+        def _timed_out(*_a, **_k):
+            # The real `confirm_branch` blocks until it hits its deadline —
+            # simulate that by advancing the fake clock the same amount
+            # `_run_pass_confirmation`'s `finally` will charge to the budget.
+            clock.now += 600.0
+            return ct.ConfirmationResult(
+                kind=KIND_TIMEOUT,
+                reason="confirmation suite timed out after 600s",
+            )
+
+        # First attempt: nothing measured yet for 'api', so it really runs —
+        # and this one times out, the #2975 shape (a suite that structurally
+        # cannot finish inside the ceiling).
+        with (
+            patch("coord.config.load", return_value=_StubConfig()),
+            patch("coord.notify.time.monotonic", side_effect=clock),
+            patch(
+                "coord.confirm_test.confirm_branch", side_effect=_timed_out,
+            ) as confirm,
+        ):
+            result = _run_pass_confirmation(self._transition(), entry)
+
+        assert result is not None and result.kind == KIND_TIMEOUT
+        confirm.assert_called_once()
+        assert ct.expected_confirmation_seconds("api") == 600.0, (
+            "a KIND_TIMEOUT result must be remembered as (at least) how long "
+            "it ran — it's a valid lower bound on how long this repo's "
+            "suite takes"
+        )
+
+        # Second attempt, same repo, a FRESH pass with a full budget again —
+        # so the skip below is attributable to the measured expectation
+        # alone, not to a budget the first attempt happened to exhaust.
+        ct.begin_confirmation_pass(600)
+        with (
+            patch("coord.config.load", return_value=_StubConfig()),
+            patch(
+                "coord.confirm_test.confirm_branch",
+                return_value=ct.ConfirmationResult(
+                    kind=KIND_OK, reason="should not be reached",
+                ),
+            ) as confirm2,
+        ):
+            result2 = _run_pass_confirmation(self._transition(), entry)
+
+        confirm2.assert_not_called()
+        assert result2 is None
