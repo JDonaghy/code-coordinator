@@ -49,6 +49,7 @@ from coord.tui_release import (
     DEFAULT_INSTALL_PATH,
     DEFAULT_REPO,
     DEV_BUILD_SENTINEL_VERSION,
+    EmptyReleaseChannelError,
     ReleaseAssetNotFoundError,
     UnsupportedPlatformError,
     detect_target,
@@ -62,6 +63,15 @@ from coord.tui_release import (
     read_installed_version,
     sha256_file,
 )
+
+#: `tui update`'s exit code when the channel has never published a release
+#: (#2981) — distinct from the generic ``1`` used for every other failure so
+#: `coord/commands/release.py`'s `_roll_tui` can tell "nothing to install
+#: yet" apart from "the roll actually failed" by exit code alone, with no
+#: string-matching of the error message. Kept here (not in `tui_release.py`)
+#: because it is a detail of *this command's* process-exit contract, the
+#: same reason `3` (the dev-build refusal below) lives here too.
+EXIT_EMPTY_CHANNEL = 4
 
 
 def _dest_path(dest: str | None) -> Path:
@@ -310,6 +320,15 @@ def tui_update(
             target_version = fetch_latest_release_tag(
                 repo=repo, api_base=api_base, timeout=timeout
             )
+        except EmptyReleaseChannelError as exc:
+            # #2981: this channel has never published a release -- there is
+            # nothing to install, but that is a fact about the CHANNEL, not
+            # evidence that this run's attempt failed. A distinct exit code
+            # (rather than the generic `1` below) lets a caller such as
+            # `coord release propagate` grade the two differently without
+            # parsing this message.
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(EXIT_EMPTY_CHANNEL)
         except Exception as exc:  # noqa: BLE001 -- surface any network/HTTP failure plainly
             click.echo(
                 f"error: could not resolve coord-tui's latest release from "

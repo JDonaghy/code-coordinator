@@ -1393,6 +1393,99 @@ def test_2026_08_09_a_good_roll_is_not_reverted_by_lanes_it_cannot_roll(
     assert "advisory" in result.output
 
 
+def test_2981_an_empty_tui_channel_does_not_roll_back_the_python_lanes(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """THE #2981 regression, end to end.
+
+    `JDonaghy/coord-tui` had zero releases/tags, so `coord tui update` 404s
+    from `/releases/latest` on every run, forever, until someone cuts a
+    first release. `_roll_tui` on the one host that actually has an install
+    path (`dellserver` in the real incident, `server` here) used to read
+    that 404 exactly like a genuine install failure and report `ok=False` —
+    a BLOCKING result. That put `(tui, server)` inside this run's attempted
+    scope, so a merely-advisory "coord-tui is stale" verify finding on that
+    same host turned blocking, `gate.red` went true, and
+    `--rollback-on-red` reverted the two good python rolls right alongside
+    the tui lane that was never actually broken — a fleet rolled forward
+    and straight back for nothing, twice in a row, per the issue.
+
+    `coord tui update` now exits `EXIT_EMPTY_CHANNEL` for exactly this case
+    (`EmptyReleaseChannelError`, raised at the source in
+    `fetch_latest_release_tag`), and `_roll_tui` reads that exit code back
+    into `ok=None` — the same "no channel to roll" treatment already given
+    to a remote host with no install path at all. `ok=None` excludes the
+    lane from `attempted_scope`, so the verify finding below stays
+    advisory, the gate stays green, and nothing gets rolled back."""
+    from coord import release_verify as rv
+
+    calls = _stub_lanes(monkeypatch)
+
+    def _tui(machine, **kwargs):
+        calls.append(("tui", machine.name))
+        if machine.name == "server":
+            # What `_roll_tui` itself now returns when `coord tui update`
+            # exits `EXIT_EMPTY_CHANNEL` — see its #2981 docstring section.
+            return None, (
+                f"{rp.CHANNEL_TUI} channel has no published release yet — "
+                "nothing to install, not a roll failure (#2981): "
+                "404 Not Found"
+            )
+        return None, "coord-tui is a per-host binary with no remote install path"
+
+    monkeypatch.setattr(release_cmd, "_roll_tui", _tui)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        findings=[
+            # Even a CRIT finding, on the very host that attempted this
+            # lane, must not turn the gate red once the attempt itself is
+            # `ok=None` — that is the whole point of #2052's scoping.
+            rv.Finding(severity="crit", host="server", lane="coord-tui",
+                       summary="coord-tui is 40h older than source"),
+        ],
+    )
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda *a, **k: pytest.fail(
+            "an empty coord-tui channel is not a failed roll — it must "
+            "never trigger --rollback-on-red"
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+
+    record = _records(state_dir)[0]
+    # The run completed and verified — it was never reverted.
+    assert record["status"] == rp.STATUS_VERIFIED
+    # The python lanes for BOTH hosts stayed rolled.
+    for host in ("server", "laptop"):
+        python_lane = next(
+            l for l in record["lanes"] if l["lane"] == "python" and l["host"] == host
+        )
+        assert python_lane["ok"] is True, f"{host}'s good python roll must survive"
+
+    # The tui lane itself is recorded as unrollable, not failed.
+    server_tui = next(
+        l for l in record["lanes"] if l["lane"] == "tui" and l["host"] == "server"
+    )
+    assert server_tui["ok"] is None
+    assert server_tui["unrollable"] is True
+
+    # The verify finding is still journalled in full...
+    assert record["verification"]["severity"] == "crit"
+    assert len(record["verification"]["findings"]) == 1
+    # ...but the gate that `--rollback-on-red` actually acts on is clean.
+    assert record["gate"]["severity"] == "ok"
+    assert len(record["gate"]["blocking"]) == 0
+    assert len(record["gate"]["advisory"]) == 1
+    assert "advisory" in result.output
+
+
 def test_the_outside_reach_message_names_the_manual_remedy(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
@@ -2386,3 +2479,47 @@ def test_roll_tui_surfaces_a_failed_update(monkeypatch):
     ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
     assert ok is False
     assert "could not resolve" in detail
+
+
+def test_roll_tui_treats_an_empty_channel_as_unrollable_not_failed(monkeypatch):
+    """#2981: `coord tui update` exits `EXIT_EMPTY_CHANNEL` (not the generic
+    `1`) specifically when the channel has never published a release —
+    `JDonaghy/coord-tui`'s actual state, which 404s from `/releases/latest`
+    on every run forever. `_roll_tui` must read that exit code back into
+    `ok=None`, exactly like the "no remote install path" case, so this
+    lane never lands inside a run's attempted scope and can never be
+    grounds for `--rollback-on-red` — see
+    `test_2981_an_empty_tui_channel_does_not_roll_back_the_python_lanes` for
+    the full propagate-level regression this unlocks."""
+    from coord.commands.tui import EXIT_EMPTY_CHANNEL
+
+    class _Proc:
+        returncode = EXIT_EMPTY_CHANNEL
+        stdout = ""
+        stderr = (
+            "error: JDonaghy/coord-tui has no published release to resolve "
+            "a latest version from (GET .../releases/latest -> 404 — this "
+            "repo has zero releases/tags)"
+        )
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: _Proc())
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+    assert ok is None
+    assert "not a roll failure" in detail
+    assert "no published release" in detail
+
+
+def test_roll_tui_a_real_failure_still_blocks_after_the_2981_fix(monkeypatch):
+    """The other half of the #2981 acceptance bar: a GENUINE failure (a real
+    release exists, but e.g. the asset/checksum/install step failed) must
+    still exit the generic `1`, and `_roll_tui` must still report `ok=False`
+    -- still blocking, still eligible to trigger a rollback."""
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "error: checksum mismatch for coord-tui-x86_64-linux"
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: _Proc())
+    ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
+    assert ok is False
+    assert "checksum mismatch" in detail
