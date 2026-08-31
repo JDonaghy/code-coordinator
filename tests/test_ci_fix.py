@@ -592,3 +592,80 @@ class TestNoopCiFixRefund:
             merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
 
         dispatch.assert_called_once()
+
+    def test_active_fix_in_flight_is_not_treated_as_noop(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The blocking gap from review: a ci-fix leg stays PENDING for its
+        WHOLE lifetime, so on the very next tick after dispatch — before the
+        worker has had any chance to push — `entry.branch_head_sha` still
+        equals `entry.ci_fix_head_sha` exactly like a genuine no-op would.
+        `_has_active_fix` must be checked FIRST: while the fix worker is
+        still running/pending, this must not be refunded, must not bump the
+        noop streak, and must not dispatch a fresh attempt — the entry is
+        left untouched for the next tick, same as the generic "already in
+        flight" decline in `TestDispatchCiFixesWrapper`.
+        """
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        board.completed.append(_work_assignment())
+        # The in-flight ci-fix worker itself — chained to the original work
+        # assignment via review_of_assignment_id, same linkage
+        # `dispatch_ci_fix` records (see `test_returns_none_when_a_fix_is_
+        # already_in_flight` in TestDispatchCiFix).
+        board.active.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="prior-ci-fix", status="running",
+            type="work", review_of_assignment_id="w1",
+        ))
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        # The SHA the still-running leg was dispatched at — unchanged, just
+        # like the genuine in-flight case, since the worker hasn't pushed
+        # yet.
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with patch("coord.ci_fix.dispatch_ci_fix") as dispatch:
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        dispatch.assert_not_called()
+        assert entry.ci_fix_dispatches == 1
+        assert entry.ci_fix_noop_streak == 0
+        assert entry.ci_fix_head_sha == "abc123"
+        assert entry.state == PENDING
+
+    def test_active_fix_in_flight_is_echoed(
+        self, two_machine_config: Config, coord_db, capsys,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        board.completed.append(_work_assignment())
+        board.active.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="prior-ci-fix", status="running",
+            type="work", review_of_assignment_id="w1",
+        ))
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with patch("coord.ci_fix.dispatch_ci_fix"):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "already in flight" in out
+        assert f"#{entry.issue_number}" in out
