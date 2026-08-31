@@ -31,6 +31,7 @@ plain values — no I/O, no side effects.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Protocol, runtime_checkable
 
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, effective_issue_number
@@ -196,7 +197,24 @@ def _leg_count_for_stage(
     * ``"test"`` has no ``type="test"`` assignment — the Test-stage's
       dispatched worker is ``type="smoke"`` (``coord.smoke``).
     * ``"merge"`` has no ``type="merge"`` assignment either — repeated
-      landing attempts show up as ``type="conflict-fix"`` legs (#241).
+      landing attempts show up as ``type="conflict-fix"`` legs (#241). Note
+      the counting convention this implies differs from every other stage:
+      a clean single merge with no conflict reports ``0`` (no *retry* was
+      needed), whereas one ordinary ``"work"``/``"review"``/``"test"`` leg
+      reports ``1`` (one attempt happened). A client applying one uniform
+      "suppress the number at <= 1" rule across every stage — as the
+      ``/board`` schema description implies — will suppress a single
+      conflict-fix leg (``count == 1``, arguably the most useful case to
+      surface: "this needed a rebase") exactly like "no problem at all". No
+      code path here can distinguish the two without a wire-schema change,
+      so this is flagged for the client rather than fixed on this side.
+    * ``"acceptance"`` (review fix, #3013) has no dedicated assignment type
+      either — like ``test_state``/``uat_state``, ``acceptance_state`` is
+      stamped directly onto the ``type="work"`` row a
+      ``coord acceptance record`` verdict belongs to (see
+      :func:`acceptance_stage_status_for`, which reads the same rows), so a
+      generic ``assignments_for_stage(..., "acceptance", ...)`` scan would
+      always return zero.
 
     Every other stage (``"plan"``, ``"review"``, ``"uat"``, ...) already has
     a 1:1 assignment ``type``, so :func:`assignments_for_stage` alone gives
@@ -215,7 +233,40 @@ def _leg_count_for_stage(
         return sum(1 for a in assignments_for_issue if (a.type or "work") == "smoke")
     if stage == "merge":
         return sum(1 for a in assignments_for_issue if (a.type or "work") == "conflict-fix")
+    if stage == "acceptance":
+        return sum(
+            1
+            for a in assignments_for_issue
+            if (a.type or "work") == "work" and (a.acceptance_state or "") != ""
+        )
     return len(assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan))
+
+
+def _widen_work_like_types(assignments: list) -> list:
+    """Return *assignments* with every :data:`WORK_LIKE_TYPES` row (#3013:
+    ``mock-author``/``test-author``, not just literal ``type="work"``)
+    presented as ``type="work"`` to the generic per-stage dispatcher
+    (:func:`stage_status_for`, :func:`assignments_for_stage`,
+    :func:`acceptance_stage_status_for`, ...), all of which key strictly off
+    ``a.type``.
+
+    Used ONLY by :func:`compute_board_stage_projection`'s phantom-entry
+    fallback (see that function's docstring) — without it, a slice whose
+    only rows are ``test-author``/``mock-author`` legs got
+    ``stage_counts["work"] == 4`` (via :func:`_leg_count_for_stage`, which
+    already widens the same way) sitting next to ``stages["work"] ==
+    "pending"`` forever, since the strict-``type`` dispatcher never
+    recognised those rows as "work" activity. Every other field (status,
+    dispatched_at, test_state, acceptance_state, ...) is preserved
+    unchanged — this only relabels the ``type`` a downstream ``==`` check
+    sees.
+    """
+    out = []
+    for a in assignments:
+        t = a.type or "work"
+        widen = t in WORK_LIKE_TYPES and t != "work"
+        out.append(dataclasses.replace(a, type="work") if widen else a)
+    return out
 
 
 def upstream_max_dispatched_at(
@@ -807,6 +858,16 @@ def compute_issue_projection(
     stage_counts.setdefault(
         "merge", _leg_count_for_stage(count_source, "merge", require_plan=require_plan)
     )
+    # Review fix (#3013): `stages` always carries "acceptance" (added
+    # unconditionally above, outside `names`/`default_gates`), but
+    # `stage_counts` was built only from `names` plus an explicit "merge"
+    # fallback — so it silently dropped "acceptance", contradicting the
+    # `/board` schema's documented "same key set as `stages`" guarantee
+    # (coord/serve_app.py) and leaving a client that indexes `stage_counts`
+    # by every key in `stages` with a plain `KeyError`.
+    stage_counts.setdefault(
+        "acceptance", _leg_count_for_stage(count_source, "acceptance", require_plan=require_plan)
+    )
     return {
         "stages": stages,
         "stage_counts": stage_counts,
@@ -856,12 +917,34 @@ def compute_board_stage_projection(
     ``coord gates <repo> <slice>``, which resolves the same way). Reusing
     ``assignments_by_key`` for the count would leave a slice's own
     ``stage_counts`` reading 0 forever — the same keying trap noted in the
-    #3013 issue's "drive-queue sweep bug" reference. This does NOT touch
-    ``stages`` itself: that stays keyed on the raw ``issue_number`` on
-    purpose (#1652 — re-attributing status by ``for_issue_number`` moved a
-    false "merged" green from the epic onto the child; a leg *count* carries
-    no such false-green risk, so the two fields are allowed to disagree on
-    which issue owns which rows).
+    #3013 issue's "drive-queue sweep bug" reference. For an issue that ALSO
+    has its own raw-keyed rows, this does NOT touch ``stages``: that stays
+    keyed on the raw ``issue_number`` on purpose (#1652 — re-attributing
+    status by ``for_issue_number`` moved a false "merged" green from the
+    epic onto a child that already had its own, separately-tracked state; a
+    leg *count* carries no such false-green risk, so the two fields are
+    allowed to disagree on which issue owns which rows in that case).
+
+    Review fix (#3013): a *phantom* entry — ANY key whose raw-keyed
+    assignment list is empty, whether it exists in ``issues`` with no
+    assignments of its own (the coord-portal#164 test below: the slice IS
+    already synced, but every one of its legs is booked to the tracking
+    issue) or exists ONLY via the effective-key union (never synced at all:
+    not yet caught up by ``_sync_issues_tick``, or a closed slice pruned
+    from ``issues`` after 7 days while assignment retention runs 14, see
+    ``coord/state.py``) — has nothing raw-keyed to protect from the #1652
+    clobber, because there IS no separately-tracked state for it to
+    conflict with. Rendering ``stages`` from the empty raw list anyway
+    produced a self-contradictory row: every stage PENDING (acceptance
+    SKIPPED) right next to a ``stage_counts`` proving real legs ran. So for
+    that case only, ``stages``/``acceptance``/``has_approved_review`` fall
+    back to the same effective-keyed list ``stage_counts`` already uses,
+    widened through :func:`_widen_work_like_types` so a `test-author`/
+    `mock-author` leg registers as "work" activity to the generic
+    per-stage dispatcher — see the ``projection_assignments`` fallback
+    below. ``issue_title`` still reads ``""`` for a phantom entry that
+    isn't itself in ``issues`` (genuinely unknown — not fabricated from the
+    tracking issue's own title, which would be actively wrong).
     """
     is_closed_by_key: dict[tuple[str, int], bool] = {
         (i["repo_name"], i["number"]): str(i.get("state", "")).lower() == "closed"
@@ -921,12 +1004,25 @@ def compute_board_stage_projection(
     for repo_name, issue_number in keys:
         key = (repo_name, issue_number)
         issue_assignments = assignments_by_key.get(key, [])
+        effective_assignments = assignments_by_effective_key.get(key, [])
+        # Review fix (#3013): a phantom entry (see docstring) has no
+        # raw-keyed rows at all, so falling back to the effective-keyed list
+        # here — instead of leaving `stages` computed from `[]` — keeps
+        # `stages`/`acceptance`/`has_approved_review` consistent with the
+        # non-zero `stage_counts` this same entry reports below. Widened
+        # through `_widen_work_like_types` so a `test-author`/`mock-author`
+        # leg (WORK_LIKE_TYPES, not literal `type="work"`) registers with
+        # the generic per-stage dispatcher's strict `type` check the same
+        # way `_leg_count_for_stage` already widens it for `stage_counts`.
+        # A no-op for every ordinary issue: `issue_assignments or ...` only
+        # reaches the fallback when the raw list is empty.
+        projection_assignments = issue_assignments or _widen_work_like_types(effective_assignments)
         merge_entry = merge_by_key.get(key)
         if repo_name not in uat_enabled_by_repo:
             uat_enabled_by_repo[repo_name] = repo_has_uat_preview(repo_name, config)
         uat_enabled = uat_enabled_by_repo[repo_name]
         entry = compute_issue_projection(
-            issue_assignments,
+            projection_assignments,
             merge_entry,
             is_closed=is_closed_by_key.get(key, False),
             require_plan=require_plan,
@@ -938,7 +1034,7 @@ def compute_board_stage_projection(
                 if uat_enabled
                 else None
             ),
-            stage_count_assignments=assignments_by_effective_key.get(key, []),
+            stage_count_assignments=effective_assignments,
         )
         entry["repo_name"] = repo_name
         entry["issue_number"] = issue_number
