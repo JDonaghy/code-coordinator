@@ -326,7 +326,7 @@ class TestCommentLandsInMirrorAndLeavesStateAlone:
     wrong."""
 
     def _stub_gh(self, comment_url: str):
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             if args[:2] == ("issue", "comment"):
                 return comment_url
             if args[:2] == ("api", "user"):

@@ -43,8 +43,9 @@ they are pure denominator for the uptime-% math, not signal. Every
 actually says something about forge/CI availability) is still written
 per-observation exactly as before; ``ok`` observations instead accumulate
 in-process (see :class:`_OkAggregate`) and flush as a single aggregate row
-per bucket (:data:`_OK_BUCKET_S`, per ``argv0`` for ``gh_call`` / per
-``(repo, number)`` for ``ci_check_fetch``) carrying ``count``/
+per bucket (:data:`_OK_BUCKET_S`, per ``(caller, shape)`` for ``gh_call``
+(#2988; was per ``argv0`` alone pre-#2988) / per ``(repo, number)`` for
+``ci_check_fetch``) carrying ``count``/
 ``duration_s_total``/``first_ts``/``last_ts`` (plus a summed check-level
 ``conclusions`` distribution for ``ci_check_fetch``). Flushed on bucket
 roll, on process exit (``atexit``), and immediately before any interesting
@@ -73,6 +74,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import sys
 import threading
 import time
 from typing import Any
@@ -119,8 +121,181 @@ RETENTION_DAYS = 90.0
 _last_prune_at = 0.0
 
 
+# ── #2988: attributable call keys — normalised shape + caller tag ──────────
+#
+# Pre-#2988, `record_gh_call` stored only `argv[0]` (the literal strings
+# "api"/"pr"/"issue") -- enough to say the forge was called, never enough to
+# say WHO called it or at WHAT endpoint class. Four rate-limit issues
+# (#2809/#2858/#2934/#2977) were all filed about *surviving* the throttle;
+# none could reduce call volume, because nothing in the telemetry could say
+# where it came from. Identifying the caller behind a 502,000-call/day
+# demand spike took per-second call-pattern analysis, per-process CPU
+# sampling, and finally a fake `gh` on PATH -- the wrong cost for a question
+# this basic. Two independent axes fix that:
+#
+# 1. `gh_call_shape` -- `argv[0]` plus a normalised `argv[1]`/`argv[2]`,
+#    templating out the volatile parts (branch names, issue/PR numbers,
+#    owner/repo pairs) so e.g. 851 distinct branch refs collapse to ONE
+#    shape key (`api repos/{owner}/{repo}/git/refs/heads/{branch}`) instead
+#    of 851 -- the endpoint CLASS, not the literal URL (which would defeat
+#    the #2654 `ok`-aggregate bucketing and bloat `audit_log` right back up).
+# 2. `caller` -- a short tag identifying the code path, threaded explicitly
+#    from the call site (`coord.github_ops._gh`'s `caller` parameter, see
+#    its docstring) rather than inferred by walking the stack on every call
+#    -- explicit survives refactors, is greppable, and costs nothing at
+#    runtime. `_infer_caller_tag` below is only the fallback for a call site
+#    that hasn't been given one yet (or a direct test call, as in this
+#    module's own test suite) -- see its docstring.
+#
+# Together: `SELECT caller_tag, SUM(count) FROM audit_log WHERE
+# category='forge_availability' GROUP BY 1` answers "who made the most
+# GitHub calls in the last 24h" directly (the issue's acceptance bar).
+
+# Path segments that are part of the endpoint's identity, not a variable --
+# kept verbatim by `_template_gh_path`. Everything else encountered while
+# walking a `gh api` path is volatile (an id, a branch/tag/label name, an
+# owner/repo pair, ...) and gets templated to a placeholder.
+_KNOWN_GH_PATH_SEGMENTS = frozenset({
+    "repos", "issues", "pulls", "commits", "branches", "git", "refs", "heads",
+    "tags", "milestones", "sub_issues", "sub_issue", "labels", "comments",
+    "merges", "statuses", "checks", "contents", "releases", "actions", "runs",
+    "jobs", "workflows", "rerun", "rerun-failed", "rate_limit", "graphql",
+    "users", "orgs", "teams", "assignees", "reviews", "requested_reviewers",
+    "timeline", "events", "reactions", "parent", "compare",
+})
+
+# The placeholder a volatile segment gets, keyed by the KNOWN segment that
+# immediately preceded it (e.g. ".../refs/heads/main" -> ".../heads/{branch}").
+# A volatile segment with no such match (an id straight off "repos/{owner}/
+# {repo}/<here>", or a leaf this table hasn't named yet) falls back to the
+# generic "{id}" in `_template_gh_path`.
+_GH_PATH_PLACEHOLDER_BY_PREV = {
+    "issues": "{issue}",
+    "pulls": "{pr}",
+    "sub_issues": "{issue}",
+    "sub_issue": "{issue}",
+    "heads": "{branch}",
+    "tags": "{tag}",
+    "milestones": "{milestone}",
+    "runs": "{run_id}",
+    "jobs": "{job_id}",
+    "workflows": "{workflow}",
+    "labels": "{label}",
+    "comments": "{comment_id}",
+    "reviews": "{review_id}",
+    "teams": "{team}",
+    "users": "{user}",
+    "orgs": "{org}",
+}
+
+
+def _template_gh_path(path: str) -> str:
+    """Normalise the volatile parts of a ``gh api`` path into stable
+    placeholders (module docstring above) -- so e.g. 851 distinct branch
+    refs (``repos/o/r/git/refs/heads/issue-1-x``, ``...-issue-851-y``, ...)
+    collapse to the ONE shape key ``repos/{owner}/{repo}/git/refs/heads/
+    {branch}`` rather than 851 separate ones, which is what would defeat
+    both the #2654 ``ok``-aggregate bucketing and this issue's "rows must
+    not grow materially" acceptance bar.
+
+    Strips any query string outright (``?per_page=100`` etc. -- may vary
+    run to run without adding real identity, and is exactly the kind of
+    volatile suffix this function exists to drop).
+    """
+    path = path.split("?", 1)[0]
+    segments = [s for s in path.split("/") if s]
+    out: list[str] = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg == "repos" and i + 2 < len(segments):
+            # `repos/{owner}/{repo}/...` -- the one two-segment template in
+            # this walk; every other known segment consumes exactly one.
+            out.append("repos")
+            out.append("{owner}")
+            out.append("{repo}")
+            i += 3
+            continue
+        if seg in _KNOWN_GH_PATH_SEGMENTS:
+            out.append(seg)
+            i += 1
+            continue
+        prev = out[-1] if out else ""
+        out.append(_GH_PATH_PLACEHOLDER_BY_PREV.get(prev, "{id}"))
+        i += 1
+    return "/".join(out)
+
+
+def _shape_segment(s: str) -> str:
+    """One ``argv`` element normalised for :func:`gh_call_shape`: a
+    ``gh api``-style path gets :func:`_template_gh_path`'d, a bare number
+    (a positional issue/PR number, e.g. ``gh pr view 123``) becomes
+    ``"{n}"``, anything else (a subcommand word like ``"view"``/``"list"``)
+    is returned verbatim.
+    """
+    if not s:
+        return s
+    if "/" in s:
+        return _template_gh_path(s)
+    if s.isdigit():
+        return "{n}"
+    return s
+
+
+def gh_call_shape(argv: tuple[str, ...]) -> str:
+    """The normalised subcommand shape for one ``gh`` invocation: ``argv[0]``
+    plus a normalised ``argv[1]``/``argv[2]`` (module docstring above) --
+    enough to identify the endpoint CLASS (``api repos/{owner}/{repo}/git/
+    refs/heads/{branch}``, ``pr view {n}``, ``issue list``, ...) without
+    ever containing a literal branch name, issue number, or full URL.
+
+    Stops at the first flag (an ``argv`` element starting with ``-``) beyond
+    position 0, so a flag's VALUE (``--repo owner/name``, ``--json
+    labels,state``, a PR body passed to ``--body``, ...) never enters the
+    shape -- only the flag word itself would, and even that only if it
+    happened to land within the first three positions, which none of this
+    module's flags do (they always follow at least one bare subcommand
+    word). This is also what keeps a real URL, token, or private path out
+    of the shape (#2988's explicit "do not log" bar): those only ever
+    appear as flag VALUES in this codebase's ``gh`` invocations, never as
+    one of the first three bare positional words.
+    """
+    if not argv:
+        return "(no args)"
+    shaped: list[str] = []
+    for i, part in enumerate(argv[:3]):
+        if i > 0 and part.startswith("-"):
+            break
+        shaped.append(_shape_segment(part))
+    return " ".join(shaped) if shaped else "(no args)"
+
+
+def _infer_caller_tag() -> str:
+    """Fallback ``caller`` tag for a :func:`record_gh_call` invocation that
+    didn't pass one explicitly: the immediate calling module's dotted name
+    (e.g. ``"coord.github_ops"``, or a test module calling this directly).
+
+    Coarser than an explicit tag (can't distinguish two call sites in the
+    same module) -- design intent is explicit tags threaded from the call
+    site (see :func:`coord.github_ops._gh`'s ``caller`` parameter and its
+    docstring for why), this is only the safety net so that NO row can ever
+    carry an empty caller, which is the acceptance bar (#2988), not the
+    common path once a call site has been tagged.
+
+    ``sys._getframe(2)``: frame 0 is this function, frame 1 is
+    ``record_gh_call`` (the only caller of this helper), frame 2 is
+    whoever called ``record_gh_call`` without a ``caller``.
+    """
+    try:
+        frame = sys._getframe(2)
+        name = frame.f_globals.get("__name__", "")
+        return name or "unknown"
+    except Exception:  # noqa: BLE001 -- best-effort; never break a gh call over this
+        return "unknown"
+
+
 def record_gh_call(
-    argv: tuple[str, ...], *, outcome: str, duration_s: float, detail: str = "",
+    argv: tuple[str, ...], *, outcome: str, duration_s: float, detail: str = "", caller: str = "",
 ) -> None:
     """Best-effort: one row per :func:`coord.github_ops._gh` invocation --
     except ``"ok"`` outcomes, which accumulate into a per-bucket aggregate
@@ -132,17 +307,28 @@ def record_gh_call(
     ``github_ops._is_transient_error`` -- auth, rate-limit, network), or
     ``"unreachable"`` (the ``gh`` binary was missing, the call timed out, or
     raised some other ``OSError`` before it could even run).
+
+    ``caller`` (#2988) is a short tag identifying the code path that made
+    this call (e.g. ``"github_ops.get_issue"``, ``"coord.claim"``) --
+    resolved via :func:`_infer_caller_tag` when not given explicitly, so
+    this NEVER records an empty tag. Every row now carries both this tag
+    and :func:`gh_call_shape`'s normalised ``argv[0]``/``argv[1]``/
+    ``argv[2]`` in place of the pre-#2988 ``argv0``-only key -- the
+    ``ok``-aggregate below buckets on ``(caller, shape)`` instead of
+    ``argv0`` alone.
     """
-    argv0 = argv[0] if argv else ""
+    caller = caller or _infer_caller_tag()
+    shape = gh_call_shape(argv)
     if outcome == "ok":
-        _record_ok(EVENT_GH_CALL, argv0, duration_s=duration_s)
+        _record_ok(EVENT_GH_CALL, (caller, shape), duration_s=duration_s)
         return
     _flush_all_ok_aggregates()
     _safe_record(
         event_type=EVENT_GH_CALL,
-        summary=f"gh {argv0 or '(no args)'}: {outcome}",
+        summary=f"gh {shape} ({caller}): {outcome}",
         details={
-            "argv0": argv0,
+            "caller": caller,
+            "shape": shape,
             "outcome": outcome,
             "duration_s": round(duration_s, 3),
             "detail": detail[:200] if detail else "",
@@ -242,8 +428,9 @@ def _safe_record(
 # ~99% of gh_call/ci_check_fetch observations are "ok" -- pure denominator
 # for uptime%, not signal (see module docstring). Rather than one audit_log
 # row per "ok" observation, this buffers them in memory and flushes one
-# aggregate row per (event_type, key) bucket -- `key` is `argv0` for
-# `gh_call`, `"{repo}#{number}"` (one bucket per PR) for `ci_check_fetch`.
+# aggregate row per (event_type, key) bucket -- `key` is `(caller, shape)`
+# for `gh_call` (#2988; was `argv0` alone pre-#2988), `"{repo}#{number}"`
+# (one bucket per PR) for `ci_check_fetch`.
 
 # Bucket width. Suggested by the issue; not exposed as a config knob -- like
 # _PRUNE_INTERVAL_S below, this is an implementation cheapness knob, not a
@@ -258,11 +445,11 @@ class _OkAggregate:
     ``repo``/``issue`` are carried through for ``ci_check_fetch`` aggregates
     (bucketed per-PR — see ``_record_ok``'s ``key`` for ``EVENT_CI_CHECK_
     FETCH`` — so every observation folded into one aggregate shares the same
-    repo/issue, unlike ``gh_call``'s per-``argv0`` bucketing which spans
-    whatever repo each call happened to target). ``conclusions_total`` sums
-    the check-level conclusion distribution across the bucket -- for a
-    single-observation bucket this is byte-for-byte the pre-#2654 per-call
-    distribution.
+    repo/issue, unlike ``gh_call``'s per-``(caller, shape)`` bucketing (#2988;
+    was per-``argv0`` pre-#2988) which spans whatever repo each call happened
+    to target). ``conclusions_total`` sums the check-level conclusion
+    distribution across the bucket -- for a single-observation bucket this is
+    byte-for-byte the pre-#2654 per-call distribution.
     """
 
     __slots__ = (
@@ -297,7 +484,7 @@ class _OkAggregate:
         for k, v in (conclusions or {}).items():
             self.conclusions_total[k] = self.conclusions_total.get(k, 0) + v
 
-    def to_details(self, *, event_type: str, key: str) -> dict[str, Any]:
+    def to_details(self, *, event_type: str, key: Any) -> dict[str, Any]:
         details: dict[str, Any] = {
             "outcome": "ok",
             "count": self.count,
@@ -306,13 +493,15 @@ class _OkAggregate:
             "last_ts": self.last_ts,
         }
         if event_type == EVENT_GH_CALL:
-            details["argv0"] = key
+            caller, shape = key
+            details["caller"] = caller
+            details["shape"] = shape
         elif event_type == EVENT_CI_CHECK_FETCH:
             details["conclusions"] = self.conclusions_total
         return details
 
 
-_ok_aggregates: dict[tuple[str, str], _OkAggregate] = {}
+_ok_aggregates: dict[tuple[str, Any], _OkAggregate] = {}
 _ok_aggregates_lock = threading.Lock()
 # A *strong reference* to the connection pending aggregates belong to --
 # not id(conn). id() is a memory address; once the previous connection is
@@ -364,7 +553,7 @@ def _drop_ok_aggregates_if_conn_changed() -> None:
 
 def _record_ok(
     event_type: str,
-    key: str,
+    key: Any,
     *,
     duration_s: float,
     repo: str | None = None,
@@ -372,6 +561,11 @@ def _record_ok(
     conclusions: dict[str, int] | None = None,
 ) -> None:
     """Accumulate one ``outcome="ok"`` observation into its bucket.
+
+    ``key`` is ``(caller, shape)`` for ``gh_call`` (#2988) or ``"{repo}#
+    {number}"`` for ``ci_check_fetch`` -- see :func:`record_gh_call`/
+    :func:`record_ci_check_fetch`. Just a dict key here; this function
+    doesn't interpret it.
 
     Best-effort like every other entry point in this module: bucket
     bookkeeping is a handful of dict/lock operations, but a caller here must
@@ -381,7 +575,7 @@ def _record_ok(
         _register_atexit_flush()
         _drop_ok_aggregates_if_conn_changed()
         now = time.time()
-        rolled: tuple[tuple[str, str], _OkAggregate] | None = None
+        rolled: tuple[tuple[str, Any], _OkAggregate] | None = None
         bucket_key = (event_type, key)
         with _ok_aggregates_lock:
             agg = _ok_aggregates.get(bucket_key)
@@ -402,11 +596,12 @@ def _record_ok(
         _log.debug("forge_availability: ok-aggregate bookkeeping failed: %s", exc)
 
 
-def _flush_ok_aggregate(bucket_key: tuple[str, str], agg: _OkAggregate) -> None:
+def _flush_ok_aggregate(bucket_key: tuple[str, Any], agg: _OkAggregate) -> None:
     event_type, key = bucket_key
     details = agg.to_details(event_type=event_type, key=key)
     if event_type == EVENT_GH_CALL:
-        summary = f"gh {key or '(no args)'}: ok x{agg.count}"
+        caller, shape = key
+        summary = f"gh {shape} ({caller}): ok x{agg.count}"
     else:
         summary = f"{agg.repo}#{agg.issue}: CI checks ok x{agg.count}"
     _safe_record(

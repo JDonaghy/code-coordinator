@@ -384,6 +384,7 @@ class TestGithubOpsMergePrDeleteBranch:
         assert message == "ok"
         gh.assert_called_once_with(
             "pr", "merge", "7", "--repo", "acme/api", "--squash", "--delete-branch=false",
+            caller="github_ops.merge_pr",
         )
 
     def test_delete_branch_true_passes_through(self) -> None:
@@ -394,6 +395,7 @@ class TestGithubOpsMergePrDeleteBranch:
 
         gh.assert_called_once_with(
             "pr", "merge", "7", "--repo", "acme/api", "--squash", "--delete-branch=true",
+            caller="github_ops.merge_pr",
         )
 
 
