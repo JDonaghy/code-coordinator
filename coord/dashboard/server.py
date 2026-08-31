@@ -577,6 +577,37 @@ def openapi_spec() -> dict:
             "pane_dead": {"type": "boolean", "description": "claude has exited but the tmux session is still up"},
         },
     }
+    # #2990: the dashboard's expose of #2986's `coord portal answer` write
+    # path. `portal_ledger_entry` mirrors `coord/serve_app.py`'s own
+    # `/portal-note`/`/portal-answer` response shape byte-for-byte — a
+    # client that talks to either surface parses one schema.
+    portal_ledger_entry = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "submission_id": {"type": "string"},
+            "seq": {"type": "integer"},
+            "kind": {"type": "string"},
+            "question_revision": {"type": ["integer", "null"]},
+            "text": {"type": "string"},
+            "actor": {"type": "string"},
+            "source_event_id": {"type": ["string", "null"]},
+            "payload_json": {
+                "type": "string",
+                "description": "JSON-encoded object, e.g. {\"relayed\": true, \"source\": \"phone\"}",
+            },
+            "recorded_at": {"type": "number"},
+        },
+    }
+    portal_needs_input_item = {
+        "type": "object",
+        "properties": {
+            "submission_id": {"type": "string"},
+            "question_revision": {"type": "integer"},
+            "question": {"type": "string"},
+        },
+        "required": ["submission_id", "question_revision", "question"],
+    }
     paths = {
         "/": {
             "get": {
@@ -909,6 +940,106 @@ def openapi_spec() -> dict:
                     "400": {"description": "Missing/unknown field"},
                     "404": {"description": "Assignment not found"},
                     "501": {"description": "Action not yet implemented"},
+                },
+            }
+        },
+        "/api/portal/needs-input": {
+            "get": {
+                "summary": (
+                    "#2990: submissions currently sitting in needs-input, "
+                    "each with its open question text and revision"
+                ),
+                "description": (
+                    "Thin read wrapper over #2986's ledger pairing rule — a "
+                    "submission is included only while it both (a) has "
+                    "last_status == 'needs-input' and (b) still has a "
+                    "currently open (unanswered) question on file."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "submissions": {
+                                            "type": "array",
+                                            "items": portal_needs_input_item,
+                                        }
+                                    },
+                                    "required": ["submissions"],
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/portal/answer": {
+            "post": {
+                "summary": (
+                    "#2990: record a client's out-of-band answer — thin "
+                    "wrapper over #2986's portal_store.answer_question"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "submission_id": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "source": {
+                                        "type": "string",
+                                        "enum": ["verbal", "phone", "email"],
+                                    },
+                                    "revision": {
+                                        "type": "integer",
+                                        "description": (
+                                            "The question_revision this answers. "
+                                            "Must be the submission's CURRENT open "
+                                            "question — a stale/wrong revision is "
+                                            "rejected (409)."
+                                        ),
+                                    },
+                                    "actor": {"type": "string"},
+                                },
+                                "required": ["submission_id", "text", "source", "revision"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — recorded, or converged on an already-"
+                            "recorded identical answer (idempotent retry)"
+                        ),
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"entry": portal_ledger_entry},
+                                    "required": ["entry"],
+                                }
+                            }
+                        },
+                    },
+                    "400": {
+                        "description": (
+                            "Missing/invalid submission_id, text, source or "
+                            "revision, or an unknown --source-equivalent value"
+                        )
+                    },
+                    "404": {"description": "Unknown submission"},
+                    "409": {
+                        "description": (
+                            "revision is not the submission's current open "
+                            "question"
+                        )
+                    },
                 },
             }
         },
@@ -2450,6 +2581,169 @@ def build_app(
                 {"error": f"unknown action: {action!r}"}, status_code=400
             )
 
+    def _serialize_ledger_entry(entry) -> dict:  # noqa: ANN001
+        """The wire shape for a :class:`coord.portal_store.LedgerEntry` — same
+        field set ``coord/serve_app.py``'s ``/portal-note``/``/portal-answer``
+        responses already use, so a client that talks to either surface parses
+        one shape. ``payload_json`` is a JSON *string* on purpose (mirrors the
+        raw DB column) rather than a nested object.
+        """
+        return {
+            "id": entry.id,
+            "submission_id": entry.submission_id,
+            "seq": entry.seq,
+            "kind": entry.kind,
+            "question_revision": entry.question_revision,
+            "text": entry.text,
+            "actor": entry.actor,
+            "source_event_id": entry.source_event_id,
+            "payload_json": json.dumps(entry.payload, sort_keys=True),
+            "recorded_at": entry.recorded_at,
+        }
+
+    async def api_portal_needs_input(request: Request) -> JSONResponse:
+        """GET /api/portal/needs-input — submissions currently awaiting a
+        relayed answer, each with its open question text and revision (#2990).
+
+        Thin read wrapper over #2986's own pairing rule
+        (``portal_store._current_open_question_revision``) — reimplements
+        none of it. A ``needs-input`` submission whose question has since
+        been answered out of band (the #2986 fold nudge is best-effort, so
+        this can lag by a beat) has no current open question and is left out
+        rather than shown with a stale/empty one.
+        """
+        from coord import portal_store  # noqa: PLC0415
+
+        submissions = []
+        for sub in portal_store.list_submissions():
+            if sub.last_status != "needs-input":
+                continue
+            revision = portal_store._current_open_question_revision(
+                sub.submission_id
+            )
+            if revision is None:
+                continue
+            question_text = sub.open_question
+            for entry in portal_store.ledger_for_submission(sub.submission_id):
+                if (
+                    entry.kind == portal_store.LEDGER_KIND_QUESTION_PUSHED
+                    and entry.question_revision == revision
+                ):
+                    question_text = entry.text
+            submissions.append({
+                "submission_id": sub.submission_id,
+                "question_revision": revision,
+                "question": question_text,
+            })
+        return JSONResponse({"submissions": submissions})
+
+    def _matching_relayed_answer(
+        submission_id: str, revision: int, text: str, source: str
+    ):
+        """An already-recorded relayed answer identical to this request, or
+        ``None``.
+
+        #2990 acceptance: a browser client retrying on a flaky phone
+        connection must converge on the one ledger row, not append a second.
+        Only matches ``relayed`` rows (this endpoint's own writes) — never an
+        inbound customer answer that happens to share the same text, which
+        would be a coincidence, not a retry.
+        """
+        from coord import portal_store  # noqa: PLC0415
+
+        norm_text = text.strip()
+        norm_source = (source or "").strip().lower()
+        for entry in portal_store.ledger_for_submission(submission_id):
+            if (
+                entry.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+                and entry.question_revision == revision
+                and bool(entry.payload.get("relayed"))
+                and entry.payload.get("source") == norm_source
+                and entry.text == norm_text
+            ):
+                return entry
+        return None
+
+    async def api_portal_answer(request: Request) -> JSONResponse:
+        """POST /api/portal/answer — record a client's out-of-band answer
+        (#2990), thin wrapper over #2986's ``portal_store.answer_question``.
+
+        Body: {"submission_id", "text", "source", "revision"} — ``source``
+        and ``revision`` are both required (unlike the CLI, which defaults
+        source to "verbal" and revision to whatever question is currently
+        open): a browser client always knows exactly which question it is
+        answering, from the GET above, so a missing revision here is a bug
+        in the caller, not a normal default to paper over.
+
+        The stated ``revision`` must be the submission's CURRENT open
+        question — a stale or wrong revision is rejected (409) rather than
+        silently recorded against the wrong question, one tick before this
+        check would otherwise have to race #2986's own fold nudge. Checked
+        AFTER the idempotency match below, so a retry of an already-recorded
+        answer still converges even though its revision closed the moment
+        the first attempt landed.
+        """
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+        submission_id = body.get("submission_id")
+        text = body.get("text")
+        source = body.get("source")
+        revision = body.get("revision")
+
+        if not isinstance(submission_id, str) or not submission_id.strip():
+            return JSONResponse(
+                {"error": "submission_id is required"}, status_code=400
+            )
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse({"error": "text is required"}, status_code=400)
+        if not isinstance(source, str) or not source.strip():
+            return JSONResponse({"error": "source is required"}, status_code=400)
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            return JSONResponse(
+                {"error": "revision is required and must be an integer"},
+                status_code=400,
+            )
+
+        from coord import portal_store  # noqa: PLC0415
+
+        if portal_store.get_submission(submission_id) is None:
+            return JSONResponse(
+                {"error": f"unknown submission {submission_id!r}"}, status_code=404
+            )
+
+        existing = _matching_relayed_answer(submission_id, revision, text, source)
+        if existing is not None:
+            return JSONResponse({"entry": _serialize_ledger_entry(existing)})
+
+        current_open = portal_store._current_open_question_revision(submission_id)
+        if current_open != revision:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"revision {revision} is not {submission_id!r}'s current "
+                        f"open question (open revision is {current_open!r})"
+                    )
+                },
+                status_code=409,
+            )
+
+        try:
+            entry = portal_store.answer_question(
+                submission_id,
+                text,
+                source=source,
+                revision=revision,
+                actor=body.get("actor") or "",
+                config=config,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        return JSONResponse({"entry": _serialize_ledger_entry(entry)})
+
     async def terminal_ws(websocket: WebSocket) -> None:
         """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
 
@@ -2574,6 +2868,8 @@ def build_app(
         Route("/api/chat", api_chat, methods=["POST"]),
         Route("/api/pipeline", api_pipeline, methods=["GET"]),
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
+        Route("/api/portal/needs-input", api_portal_needs_input, methods=["GET"]),
+        Route("/api/portal/answer", api_portal_answer, methods=["POST"]),
         build_events_route(event_source),
         WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]
