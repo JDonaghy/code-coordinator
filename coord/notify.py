@@ -2033,9 +2033,12 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
     that cannot run must degrade to pre-#2464 behaviour, never break the reap.
     """
     from coord.confirm_test import (  # noqa: PLC0415
+        RECORDABLE_DURATION_KINDS,
         confirm_branch,
         confirmation_enabled,
         confirmation_timeout,
+        expected_confirmation_seconds,
+        record_confirmation_duration,
         spend_confirmation_budget,
     )
 
@@ -2066,15 +2069,34 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
     # `/notify` request the thin client is blocked on — scale with board
     # activity. Exhausted budget means UNCONFIRMED, which is pre-#2464
     # behaviour, and it is said out loud rather than truncating silently.
-    timeout = confirmation_timeout()
+    #
+    # #2975: also hand in whatever this repo's OWN last confirmation measured
+    # (`expected_confirmation_seconds`) — a repo whose suite structurally
+    # cannot finish inside the budget (quadraui's `cargo test --features
+    # tui`) would otherwise spend the full ceiling relearning that identical
+    # fact on every single PASS claim, serialising every other repo's Test/
+    # Review dispatch behind it each time. Knowing the answer already lets
+    # `confirmation_timeout` skip straight to UNCONFIRMED instead.
+    expected = expected_confirmation_seconds(transition.repo_name)
+    timeout = confirmation_timeout(expected)
     if timeout is None:
-        log.warning(
-            "smoke %s: this notify pass has spent its confirmation budget "
-            "(coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS) — recording the "
-            "worker's own claim for %s UNCONFIRMED rather than holding "
-            "notify.lock any longer (#2464).",
-            transition.assignment_id, transition.repo_name,
-        )
+        if expected is not None:
+            log.warning(
+                "smoke %s: %s's last measured confirmation took about %.0fs, "
+                "at or beyond what this pass has left to spend — skipping "
+                "the run and recording the worker's own claim UNCONFIRMED "
+                "rather than repeating a run already known not to finish "
+                "(#2975).",
+                transition.assignment_id, transition.repo_name, expected,
+            )
+        else:
+            log.warning(
+                "smoke %s: this notify pass has spent its confirmation budget "
+                "(coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS) — recording the "
+                "worker's own claim for %s UNCONFIRMED rather than holding "
+                "notify.lock any longer (#2464).",
+                transition.assignment_id, transition.repo_name,
+            )
         return None
 
     branch = entry.get("branch")
@@ -2084,10 +2106,12 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         transition.assignment_id, transition.repo_name, branch, timeout,
     )
     started = time.monotonic()
+    result: ConfirmationResult | None = None
     try:
-        return confirm_branch(
+        result = confirm_branch(
             transition.repo_name, branch, config, timeout=timeout,
         )
+        return result
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "smoke %s: confirmation run raised (%s) — falling back to the "
@@ -2100,7 +2124,15 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         # It really did hold the drain (and `notify.lock`) for those seconds,
         # and a run that reliably blows up after ten minutes must not be able
         # to repeat that for every row on the board free of charge.
-        spend_confirmation_budget(time.monotonic() - started)
+        elapsed = time.monotonic() - started
+        spend_confirmation_budget(elapsed)
+        # #2975: only remember the duration when the result is actually a
+        # trustworthy measurement (see RECORDABLE_DURATION_KINDS) — an
+        # exception, a disabled config load, or a KIND_SETUP/INFRA/SIGNAL
+        # short-circuit tells us nothing about how long the real suite takes
+        # and must never overwrite a previously-learned expectation.
+        if result is not None and result.kind in RECORDABLE_DURATION_KINDS:
+            record_confirmation_duration(transition.repo_name, elapsed)
 
 
 def _confirmed_pass_verdict(
@@ -4155,6 +4187,20 @@ def run_drain(
     *notifications*, not pipeline advancement, and giving the daemon a
     periodic detector is #1632's job (which is blocked on this).
 
+    **Dispatch order (#2975).** Smoke/review/PR-open dispatch also runs as a
+    HEAD START right at the top of the pass, before this pass's own
+    transition detection (which is where a #2464 out-of-band confirmation
+    runs — see :mod:`coord.confirm_test`). A confirmation re-runs a repo's
+    real build+test synchronously and can hold this very lock for the whole
+    confirmation-pass budget, several timer fires' worth for a repo whose
+    suite is structurally too slow. Every row already eligible for dispatch
+    as of the top of the pass must not queue behind that — a slow suite on
+    one repo must delay only its own confirmation, never another repo's
+    Test/Review dispatch. The three dispatch functions run a second time
+    afterward too, in their historical place, to pick up anything the
+    transition-detection step below made newly eligible; all three are
+    idempotent, so the repeat costs only a second, mostly-empty scan.
+
     **Concurrency.**  The whole pass runs under ``~/.coord/notify.lock`` —
     literally :class:`coord.filelock.FileLock`, the same class on the same
     path ``coord drive``'s ``run_notify()`` takes — so a drive's nudge and the
@@ -4202,6 +4248,38 @@ def _run_drain_locked(config: Config) -> DrainResult:
     from coord.confirm_test import begin_confirmation_pass  # noqa: PLC0415
 
     begin_confirmation_pass()
+
+    # Step 0 (#2975): dispatch pending Test-stage smoke / PR-opens / reviews
+    # from the board exactly as it reads RIGHT NOW — before step 1 below gets
+    # anywhere near a `confirm_branch` call. A confirmation re-runs one
+    # repo's real build+test synchronously inside THIS pass and can
+    # legitimately hold `notify.lock` for the whole `CONFIRM_PASS_BUDGET_
+    # SECONDS` ceiling — several `coord-notify.timer` fires' worth (#2975).
+    # Every row already eligible for dispatch as of the top of this pass
+    # must not queue behind that: a slow suite on one repo should delay only
+    # its own confirmation, never another repo's Test/Review dispatch.
+    #
+    # Steps 2-4 below repeat these same three calls after the transition
+    # detection has had a chance to add anything newly eligible (a row the
+    # stuck-test-state sweep clears, a work leg that just finished, a PR
+    # that just opened) — this head start is additive, not a replacement.
+    # All three are idempotent (`_dispatch_board_pending_pr_opens`'s and
+    # `_dispatch_board_pending_smoke`'s own docstrings: "safe to call even
+    # when the board file doesn't exist", find-or-create PRs, dedupe via
+    # `has_active_followup`), so calling each twice in one pass costs
+    # nothing beyond a second, mostly-empty scan.
+    try:
+        _dispatch_board_pending_pr_opens(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: head-start PR-open dispatch failed")
+    try:
+        _dispatch_board_pending_smoke(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: head-start smoke dispatch failed")
+    try:
+        _dispatch_board_pending_reviews(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: head-start review dispatch failed")
 
     # Step 1: post completion/failure/advisory/plan/review comments for rows
     # the agent reports terminal.  This is what stamps `finished_at` (via
@@ -4446,6 +4524,31 @@ def run(
     # is waiting for; see `_roll_pending_blocks_new_dispatch`'s docstring for
     # why this reads the marker but never writes it.
     _roll_pending = _roll_pending_blocks_new_dispatch()
+
+    # Step 0 (#2975): same head start `_run_drain_locked` takes, and for the
+    # identical reason — dispatch pending Test-stage smoke / PR-opens /
+    # reviews from the board exactly as it reads RIGHT NOW, before the
+    # transition-detection loop below gets anywhere near a `confirm_branch`
+    # call that can hold `notify.lock` for up to `CONFIRM_PASS_BUDGET_
+    # SECONDS`. Gated on `_roll_pending` like every other NEW-leg dispatch in
+    # this function (#2587) — the later calls to the same three functions,
+    # a few dozen lines down, repeat this after the loop below has had a
+    # chance to add anything newly eligible; this is a head start, not a
+    # replacement, and all three are idempotent so calling each twice costs
+    # only a second, mostly-empty scan.
+    if not _roll_pending:
+        try:
+            _dispatch_board_pending_pr_opens(config)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _dispatch_board_pending_smoke(config)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _dispatch_board_pending_reviews(config)
+        except Exception:  # noqa: BLE001
+            pass
 
     # #522: one terminal-state cache shared across every gh-hitting check in
     # this notify run (the auto-loop review/fix dispatches below, and the

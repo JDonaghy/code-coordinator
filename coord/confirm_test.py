@@ -171,6 +171,23 @@ CONFIRM_DEFAULT_TIMEOUT_SECONDS = 60 * 20
 #: so a pass can confirm ~4 branches back to back) while the daemon-side worst
 #: case stays a number the thin client can actually be given — see
 #: :func:`notify_client_timeout_seconds`.
+#:
+#: #2975: that "~6 min serial" sizing is calibrated on THIS repo and does not
+#: hold everywhere — quadraui's ``cargo test --features tui`` builds every
+#: example/test executable (#305 in coordinator.yml) and blows straight past
+#: it, and every ceiling in this module (this one, ``CONFIRM_DEFAULT_
+#: TIMEOUT_SECONDS``, ``deploy/coord-notify.service``'s ``TimeoutStartSec``)
+#: is bigger than ``coord-notify.timer``'s 5-minute cadence, so one such
+#: confirmation can span several fires. Two changes close that without
+#: shrinking this constant (which would just make the COMMON case degrade to
+#: UNCONFIRMED instead): ``coord.notify``'s drain now dispatches pending
+#: Test/Review/PR-opens BEFORE running any confirmation each pass, so a slow
+#: suite on one repo can no longer queue another repo's dispatch behind it;
+#: and :func:`expected_confirmation_seconds` remembers how long a repo's
+#: confirmation last took, so :func:`confirmation_timeout` can recognise a
+#: repo whose suite structurally cannot fit this budget and skip straight to
+#: UNCONFIRMED instead of re-discovering that identical fact — and re-paying
+#: the full ceiling for it — on every single PASS claim.
 CONFIRM_PASS_BUDGET_SECONDS = 60 * 25
 
 #: Don't *start* a confirmation with less than this left in the pass budget.
@@ -232,6 +249,31 @@ KIND_NO_OUTPUT = "no_output"
 #: docstring's fail-direction section — this frozenset IS that safety property.
 REFUTING_KINDS = frozenset({KIND_BUILD, KIND_SUITE})
 
+#: #2975: kinds whose elapsed wall-clock time is a trustworthy signal of how
+#: long THIS repo's confirmation genuinely takes, worth remembering for next
+#: time via :func:`record_confirmation_duration`.
+#:
+#: ``KIND_OK``/``KIND_BUILD``/``KIND_SUITE``/``KIND_BASELINE_RED``/
+#: ``KIND_NO_OUTPUT`` all ran the command to actual completion — a real
+#: measurement. ``KIND_TIMEOUT`` ran for at least the ceiling it was given —
+#: not exact, but a valid LOWER BOUND, and a lower bound is exactly what lets
+#: a chronically-too-slow repo (quadraui's ``cargo test --features tui``
+#: builds every example/test executable, #305 in coordinator.yml) be
+#: recognised as such after a single attempt instead of re-discovering it on
+#: every PASS claim — see :func:`expected_confirmation_seconds`.
+#:
+#: ``KIND_SETUP``/``KIND_INFRA``/``KIND_SIGNAL`` are deliberately excluded:
+#: none of them ran the real command for a representative duration (no
+#: checkout, no toolchain, or killed externally mid-run), and recording their
+#: near-zero elapsed time would silently erase a previously-learned
+#: expectation — exactly the failure mode that would make a single lock
+#: contention hiccup or a missing checkout reset a repo's hard-won "this one
+#: is slow" memory back to "assume it's fast."
+RECORDABLE_DURATION_KINDS = frozenset({
+    KIND_OK, KIND_BUILD, KIND_SUITE, KIND_BASELINE_RED, KIND_NO_OUTPUT,
+    KIND_TIMEOUT,
+})
+
 #: Kinds meaning "the check could not reach a verdict". The caller falls back to
 #: the worker's own claim on any of these, which is pre-#2464 behaviour.
 INCONCLUSIVE_KINDS = frozenset({
@@ -270,7 +312,7 @@ def begin_confirmation_pass(total: float = CONFIRM_PASS_BUDGET_SECONDS) -> None:
     _pass_state.remaining = float(total)
 
 
-def confirmation_timeout() -> int | None:
+def confirmation_timeout(expected_seconds: float | None = None) -> int | None:
     """Seconds the next confirmation in this pass may take, or ``None``.
 
     ``None`` means the pass budget is spent (or too nearly spent to be worth
@@ -279,13 +321,31 @@ def confirmation_timeout() -> int | None:
 
     Outside a pass — a direct :func:`confirm_branch` call, a unit test — there
     is no budget to draw down and the full per-run ceiling applies.
+
+    *expected_seconds* (#2975) is the caller's best estimate of how long THIS
+    repo's confirmation will actually take — see
+    :func:`expected_confirmation_seconds`, which reads it back from what
+    :func:`record_confirmation_duration` learned last time. When it is
+    already at or past what this pass has left to spend, starting the run
+    would only spend the remainder re-discovering a fact already on record —
+    this repo cannot be confirmed in what is left — so this returns ``None``
+    immediately instead of paying for that discovery again. This is what
+    turns a repo whose suite structurally cannot fit the ceiling (quadraui's
+    ``cargo test --features tui``, #2975) from a repeated worst-case cost —
+    every PASS claim spending the full budget to learn the identical lesson —
+    into a one-time one: the FIRST attempt still spends up to the full
+    ceiling discovering the suite is too slow, and every attempt after that
+    skips straight to UNCONFIRMED.
     """
     remaining = getattr(_pass_state, "remaining", None)
     if remaining is None:
         return int(CONFIRM_DEFAULT_TIMEOUT_SECONDS)
     if remaining < CONFIRM_MIN_RUN_SECONDS:
         return None
-    return int(min(float(CONFIRM_DEFAULT_TIMEOUT_SECONDS), remaining))
+    ceiling = min(float(CONFIRM_DEFAULT_TIMEOUT_SECONDS), remaining)
+    if expected_seconds is not None and expected_seconds >= ceiling:
+        return None
+    return int(ceiling)
 
 
 def spend_confirmation_budget(seconds: float) -> None:
@@ -298,6 +358,112 @@ def spend_confirmation_budget(seconds: float) -> None:
     if remaining is None:
         return
     _pass_state.remaining = max(0.0, remaining - max(0.0, float(seconds)))
+
+
+#: #2975: filename under ``COORD_DIR`` for the per-repo measured-duration map
+#: :func:`record_confirmation_duration` / :func:`expected_confirmation_seconds`
+#: read and write. A tiny flat file, not a lock-guarded store: the worst case
+#: of a torn read/write is one stale or missing estimate, which degrades to
+#: exactly pre-#2975 behaviour (attempt the run, learn the hard way) — never
+#: a correctness problem, so it does not warrant the ceremony
+#: ``confirm_lock_path`` needs for the worktree lifecycle it guards.
+_CONFIRM_HISTORY_FILENAME = "confirm_test_history.json"
+
+
+def _confirm_history_path() -> Path:
+    """Where per-repo measured confirmation durations are persisted (#2975).
+
+    Resolved against ``coord.state.COORD_DIR`` freshly on every call — the
+    same discipline :func:`confirm_worktree_path` /
+    :func:`write_confirmation_output` already use above — so a test's
+    ``monkeypatch.setattr("coord.state.COORD_DIR", ...)`` is honoured rather
+    than this module caching a stale path at import time.
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    return COORD_DIR / _CONFIRM_HISTORY_FILENAME
+
+
+def _load_confirm_history() -> dict[str, float]:
+    """Best-effort read of the persisted per-repo duration map.
+
+    Fail-soft on everything — a missing file, corrupt JSON, an unexpected
+    shape, a hand-edited value — because this is purely an optimisation hint
+    for :func:`confirmation_timeout`, never a correctness dependency. A file
+    this cannot make sense of must read as "nothing learned yet", the same
+    posture as :func:`coord.commands.drive_queue.read_roll_pending`.
+    """
+    import json  # noqa: PLC0415
+
+    try:
+        raw = _confirm_history_path().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in data.items():
+        if isinstance(key, str) and isinstance(value, (int, float)) and value > 0:
+            out[key] = float(value)
+    return out
+
+
+def record_confirmation_duration(repo_name: str, seconds: float) -> None:
+    """Remember how long *repo_name*'s confirmation attempt just took (#2975).
+
+    Callers pass this only results whose ``kind`` is in
+    :data:`RECORDABLE_DURATION_KINDS` — see that frozenset's docstring for
+    which outcomes are a trustworthy signal of real suite duration.
+
+    Overwrites any previous value for this repo outright, with no averaging:
+    the LAST attempt is a better estimate of the CURRENT suite than a rolling
+    average across however long ago the repo's test suite was this size.
+
+    Best-effort and atomic (tempfile-then-rename, mirroring
+    :func:`coord.commands.drive_queue.write_roll_pending`) — a full disk, an
+    unwritable ``COORD_DIR``, or a concurrent writer must not break the
+    confirmation this is charging against; the caller already has its real
+    result, this is purely a hint for next time.
+    """
+    if seconds <= 0:
+        return
+    import json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    path = _confirm_history_path()
+    history = _load_confirm_history()
+    history[repo_name] = float(seconds)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".confirm_test_history.", suffix=".tmp", dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(history, fh)
+            os.replace(tmp_name, path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def expected_confirmation_seconds(repo_name: str) -> float | None:
+    """The most recently measured confirmation duration for *repo_name*.
+
+    ``None`` when this repo has never produced a
+    :data:`RECORDABLE_DURATION_KINDS` result — the common case for most
+    repos most of the time, and the caller's cue to fall back to the
+    un-informed ceiling exactly as before #2975.
+    """
+    return _load_confirm_history().get(repo_name)
 
 
 def notify_client_timeout_seconds(
@@ -1067,6 +1233,7 @@ __all__ = [
     "KIND_SIGNAL",
     "NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS",
     "PERMISSION_DENIED_EXIT",
+    "RECORDABLE_DURATION_KINDS",
     "REFUTING_KINDS",
     "STALE_WORKTREE_MAX_AGE_HOURS",
     "ConfirmationResult",
@@ -1077,7 +1244,9 @@ __all__ = [
     "confirm_worktree_path",
     "confirmation_enabled",
     "confirmation_timeout",
+    "expected_confirmation_seconds",
     "notify_client_timeout_seconds",
+    "record_confirmation_duration",
     "spend_confirmation_budget",
     "sweep_stale_confirm_worktrees",
     "unmet_confirmation_capabilities",

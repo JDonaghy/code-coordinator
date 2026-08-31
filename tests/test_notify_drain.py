@@ -218,7 +218,8 @@ class TestDrainAdvancesWithNoDrive:
 
         def _fake_dispatch(completed, board, config, **kwargs):  # noqa: ANN001, ANN202
             dispatched.append(completed.assignment_id)
-            return None
+            completed.review_state = "dispatched"
+            return completed
 
         with patch.object(notify_mod, "_agent_status", return_value=None), \
              patch("coord.review.dispatch_review", _fake_dispatch):
@@ -242,7 +243,8 @@ class TestDrainAdvancesWithNoDrive:
 
         def _fake_dispatch(completed, board, config, **kwargs):  # noqa: ANN001, ANN202
             dispatched.append(completed.assignment_id)
-            return None
+            completed.review_state = "dispatched"
+            return completed
 
         with patch.object(notify_mod, "_agent_status", return_value=None), \
              patch("coord.review.dispatch_review", _fake_dispatch), \
@@ -770,7 +772,8 @@ class TestDrainIsNonFatal:
 
         def _fake_dispatch(completed, board, config, **kwargs):  # noqa: ANN001, ANN202
             dispatched.append(completed.assignment_id)
-            return None
+            completed.review_state = "dispatched"
+            return completed
 
         with patch.object(notify_mod, "_agent_status", return_value=None), \
              patch.object(
@@ -794,7 +797,8 @@ class TestDrainIsNonFatal:
 
         def _fake_dispatch(completed, board, config, **kwargs):  # noqa: ANN001, ANN202
             dispatched.append(completed.assignment_id)
-            return None
+            completed.review_state = "dispatched"
+            return completed
 
         with patch.object(
             notify_mod, "detect_transitions", side_effect=RuntimeError("agents down")
@@ -802,6 +806,76 @@ class TestDrainIsNonFatal:
             notify_mod.run_drain(cfg, lock_path=lock_path)
 
         assert dispatched == ["still-reviewed"]
+
+
+# ── #2975: dispatch gets a head start ahead of transition detection ─────────
+#
+# A #2464 confirmation runs *inside* `detect_transitions`/`post_transition`
+# (step 1) and can legitimately hold `notify.lock` for the whole pass budget
+# — several `coord-notify.timer` fires' worth for a repo whose suite is
+# structurally too slow. Every row already eligible for Test/Review/PR-open
+# dispatch as of the top of the pass must not queue behind that.
+
+
+class TestDispatchGetsAHeadStartOverTransitionDetection:
+    def test_smoke_dispatch_runs_before_transition_detection(
+        self, coord_dir: Path, lock_path: Path,
+    ) -> None:
+        order: list[str] = []
+        cfg = _test_gate_config()
+
+        def _mark_smoke(*_a, **_k):
+            order.append("smoke")
+
+        def _mark_detect(*_a, **_k):
+            order.append("detect_transitions")
+            return iter(())
+
+        with (
+            patch.object(
+                notify_mod, "_dispatch_board_pending_smoke", side_effect=_mark_smoke,
+            ),
+            patch.object(notify_mod, "detect_transitions", side_effect=_mark_detect),
+            patch.object(notify_mod, "_dispatch_board_pending_reviews"),
+            patch.object(notify_mod, "_dispatch_board_pending_pr_opens"),
+        ):
+            notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert order == ["smoke", "detect_transitions", "smoke"], (
+            "smoke dispatch must get a head start before this pass's "
+            "transition detection (and therefore before any confirm_branch "
+            "call that detection may trigger), and must still run again in "
+            "its usual place afterward (#2975)"
+        )
+
+    def test_review_dispatch_runs_before_transition_detection(
+        self, coord_dir: Path, lock_path: Path,
+    ) -> None:
+        order: list[str] = []
+        cfg = _test_gate_config()
+
+        def _mark_review(*_a, **_k):
+            order.append("review")
+
+        def _mark_detect(*_a, **_k):
+            order.append("detect_transitions")
+            return iter(())
+
+        with (
+            patch.object(notify_mod, "_dispatch_board_pending_smoke"),
+            patch.object(notify_mod, "detect_transitions", side_effect=_mark_detect),
+            patch.object(
+                notify_mod, "_dispatch_board_pending_reviews", side_effect=_mark_review,
+            ),
+            patch.object(notify_mod, "_dispatch_board_pending_pr_opens"),
+        ):
+            notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert order[0] == "review", (
+            "review dispatch must also get a head start before transition "
+            "detection (#2975) — an unrelated repo's confirmation must "
+            "never delay it either"
+        )
 
 
 # ── #1663: the verdict must reach the parent WORK row ────────────────────────
