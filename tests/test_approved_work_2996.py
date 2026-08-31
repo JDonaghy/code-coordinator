@@ -109,3 +109,55 @@ class TestDisqualifyingStatus:
         )
         _set_last_status("sub_walked_back", "planned", now=3.0)
         assert disqualifying_status("sub_walked_back") is None
+
+
+class TestDescribeUnapprovedSubmissionNeverRaises:
+    """`describe_unapproved_submission` only *phrases* a failure its callers
+    have already decided on, so an exception escaping its best-effort
+    enrichment lookup would replace a clear, actionable error with a
+    traceback about an unrelated subsystem (an unreadable/locked portal
+    store, a schema older than `disqualifying_status` expects). It must
+    degrade to the plain generic message instead."""
+
+    def test_falls_back_to_the_generic_message_when_the_store_read_raises(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import approved_work, decomposition_chat
+
+        def _boom(_submission_id: str) -> str | None:
+            raise RuntimeError("portal store unreadable")
+
+        monkeypatch.setattr(approved_work, "disqualifying_status", _boom)
+
+        msg = decomposition_chat.describe_unapproved_submission(None, "sub_boom")
+
+        assert "is not a currently-approved portal submission" in msg
+        assert "its last_status is" not in msg
+        assert "portal store unreadable" not in msg
+
+    def test_falls_back_when_board_service_resolution_itself_raises(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import board_service, decomposition_chat
+
+        def _boom():
+            raise RuntimeError("client.toml is corrupt")
+
+        monkeypatch.setattr(board_service, "resolve", _boom)
+
+        msg = decomposition_chat.describe_unapproved_submission(None, "sub_boom")
+
+        assert "is not a currently-approved portal submission" in msg
+        assert "client.toml is corrupt" not in msg
+
+    def test_still_names_the_status_on_the_happy_path(self, coord_db) -> None:
+        """The fallback must not have swallowed the enrichment itself."""
+        from coord import decomposition_chat
+
+        _approve("sub_enriched")
+        _set_last_status("sub_enriched", "planned", now=2.0)
+
+        msg = decomposition_chat.describe_unapproved_submission(None, "sub_enriched")
+
+        assert "its last_status is 'planned'" in msg
+        assert "in-design" in msg
