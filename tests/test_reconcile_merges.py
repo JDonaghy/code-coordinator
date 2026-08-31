@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from coord import github_ops
@@ -905,6 +907,139 @@ def test_stale_pr_sweep_integrated_into_reconcile_board_merges(
     actions = reconcile_board_merges(board, config)
 
     assert any("close PR #44" in s for s in actions)
+
+
+# ── #2994: dormant-repo skip ──────────────────────────────────────────────────
+
+
+@pytest.fixture
+def two_repo_config() -> Config:
+    return Config(
+        repos=[
+            Repo(name="api", github="acme/api", default_branch="main"),
+            Repo(name="idle", github="acme/idle", default_branch="main"),
+        ],
+        machines=[],
+    )
+
+
+def test_close_stale_prs_skips_dormant_repo_when_opted_in(
+    monkeypatch, two_repo_config
+) -> None:
+    """#2994: with skip_dormant_repos=True and a board showing activity on
+    'api' but nothing at all on 'idle', the sweep must not call
+    list_open_prs for 'idle' -- and must say so in its actions."""
+    from coord import repo_dormancy
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops,
+        "list_open_prs",
+        lambda repo: calls.append(repo) or [],
+    )
+
+    # 'idle' already had a baseline sweep, well inside the floor -- only a
+    # repo that has been swept before is even eligible to be skipped (see
+    # test_never_swept_repo_is_not_skipped in test_repo_dormancy.py).
+    repo_dormancy.record_swept("idle", now=time.time())
+
+    board = Board(
+        active=[],
+        completed=[_done_work(assignment_id="w1", branch="issue-1-x")],
+    )
+    board.completed[0].repo_name = "api"
+
+    actions = close_stale_prs(two_repo_config, board=board, skip_dormant_repos=True)
+
+    assert calls == ["acme/api"]
+    assert any("skipped 1 dormant repo" in s for s in actions)
+
+
+def test_close_stale_prs_default_does_not_skip_idle_repo(
+    monkeypatch, two_repo_config
+) -> None:
+    """Without opting in (the manual `coord reconcile-merges` path), every
+    repo is still swept even when a board is supplied and shows no
+    activity anywhere -- skip_dormant_repos defaults to False."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops,
+        "list_open_prs",
+        lambda repo: calls.append(repo) or [],
+    )
+
+    board = Board(active=[], completed=[])
+
+    actions = close_stale_prs(two_repo_config, board=board)
+
+    assert calls == ["acme/api", "acme/idle"]
+    assert not any("dormant" in s for s in actions)
+
+
+def test_close_stale_prs_dormant_repo_swept_again_past_the_floor(
+    monkeypatch, config
+) -> None:
+    """A dormant repo is only skipped inside DORMANT_SWEEP_FLOOR_S of its
+    last real sweep -- past that, the next tick sweeps it for real again so
+    out-of-band activity is still noticed eventually."""
+    from coord import repo_dormancy
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops,
+        "list_open_prs",
+        lambda repo: calls.append(repo) or [],
+    )
+
+    now = time.time()
+    repo_dormancy.record_swept("api", now=now - repo_dormancy.DORMANT_SWEEP_FLOOR_S - 1.0)
+
+    board = Board(active=[], completed=[])  # no activity -- 'api' is idle
+
+    actions = close_stale_prs(config, board=board, skip_dormant_repos=True)
+
+    assert calls == ["acme/api"]
+    assert not any("dormant" in s for s in actions)
+
+
+def test_reconcile_board_merges_wakes_dormant_repo_when_work_is_queued(
+    monkeypatch, two_repo_config
+) -> None:
+    """#2994 acceptance: queuing work for a dormant repo puts it back on the
+    normal cadence on the very next tick, not after the floor expires."""
+    from coord import repo_dormancy
+
+    _patch_probes(monkeypatch, remote_branches=set(), terminal=False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops,
+        "list_open_prs",
+        lambda repo: calls.append(repo) or [],
+    )
+
+    now = time.time()
+    # Both repos need a baseline sweep before dormancy skip applies at all
+    # ('never swept' always sweeps -- see test_never_swept_repo_is_not_skipped
+    # in test_repo_dormancy.py). 'api' has real activity below so it's never
+    # skipped regardless; 'idle' was just swept -- well inside the floor.
+    repo_dormancy.record_swept("api", now=now)
+    repo_dormancy.record_swept("idle", now=now)
+
+    api_assignment = _done_work(assignment_id="w-api", status="running")
+    api_assignment.repo_name = "api"
+    board = Board(active=[api_assignment], completed=[])
+    reconcile_board_merges(board, two_repo_config, skip_dormant_repos=True)
+    assert calls == ["acme/api"]  # 'idle' skipped -- still inside the floor
+
+    # Work gets queued for 'idle' (an open assignment appears on the board).
+    calls.clear()
+    idle_assignment = _done_work(assignment_id="w-idle", status="pending")
+    idle_assignment.repo_name = "idle"
+    board.active.append(idle_assignment)
+
+    reconcile_board_merges(board, two_repo_config, skip_dormant_repos=True)
+
+    assert calls == ["acme/api", "acme/idle"]
 
 
 # ── #732 prune stale merge_queue entries ─────────────────────────────────────

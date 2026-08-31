@@ -2791,9 +2791,11 @@ def _extract_issue_number(branch: str) -> int | None:
 def close_stale_prs(
     config: Config,
     *,
+    board: Board | None = None,
     repo: str | None = None,
     issue: int | None = None,
     dry_run: bool = False,
+    skip_dormant_repos: bool = False,
 ) -> list[str]:
     """Close open PRs whose work is already on main or whose issue is closed.
 
@@ -2808,14 +2810,34 @@ def close_stale_prs(
 
     Stale PRs are closed with an explanatory comment.  Non-stale PRs are left
     untouched.  *dry_run* lists what would change without writing.  Idempotent.
+
+    #2994: when *skip_dormant_repos* is set (the daemon tick's opt-in — see
+    ``coord.serve_app._reconcile_merges_tick``; a manual ``coord
+    reconcile-merges`` leaves this False), a repo with no open assignment, no
+    drive-queue entry, and no coord-authored open PR (``coord.repo_dormancy.
+    should_skip_sweep``) is skipped this call rather than costing a
+    ``list_open_prs`` call — bounded by ``coord.repo_dormancy.
+    DORMANT_SWEEP_FLOOR_S`` so it's still swept eventually. Requires *board*
+    to evaluate; with *board* left ``None`` this is a no-op regardless of
+    *skip_dormant_repos* (no activity signal to check against, so never
+    skip).
     """
     from coord import github_ops  # noqa: PLC0415
 
     actions: list[str] = []
+    dormant_skipped = 0
 
     for repo_cfg in config.repos:
         if repo is not None and repo_cfg.name != repo:
             continue
+
+        if skip_dormant_repos and board is not None:
+            from coord import repo_dormancy  # noqa: PLC0415
+
+            if repo_dormancy.should_skip_sweep(repo_cfg.name, board):
+                dormant_skipped += 1
+                continue
+            repo_dormancy.record_swept(repo_cfg.name)
 
         try:
             open_prs = github_ops.list_open_prs(repo_cfg.github)
@@ -2891,6 +2913,14 @@ def close_stale_prs(
                 except Exception as exc:  # noqa: BLE001
                     actions.append(f"  ↳ error closing PR #{pr_number}: {exc}")
 
+    if dormant_skipped:
+        # #2994: one aggregate line rather than one per repo — visible
+        # without being noisy on a fleet with many idle repos.
+        actions.append(
+            f"stale-PR sweep: skipped {dormant_skipped} dormant repo(s) "
+            "(no open assignment, drive-queue entry, or open PR)"
+        )
+
     return actions
 
 
@@ -2926,6 +2956,7 @@ def reconcile_board_merges(
     issue: int | None = None,
     dry_run: bool = False,
     throttle_false_merge_audit: bool = False,
+    skip_dormant_repos: bool = False,
 ) -> list[str]:
     """Reconcile done work assignments against git/GitHub reality.
 
@@ -2995,7 +3026,13 @@ def reconcile_board_merges(
     the daemon's 30s tick (97% of a pass's ``gh`` calls). Set
     *throttle_false_merge_audit* to run that sweep at most hourly; the
     daemon tick does, a manual ``coord reconcile-merges`` deliberately does
-    not. See the inline block above ``_false_merge_candidates``.)
+    not. See the inline block above ``_false_merge_candidates``.
+
+    #2994: *skip_dormant_repos* (also daemon-tick-only, also off for a
+    manual ``coord reconcile-merges``) is threaded through to sweep (c),
+    :func:`close_stale_prs` — see its own docstring — so a repo with no open
+    assignment, no drive-queue entry, and no coord-authored open PR doesn't
+    cost a ``list_open_prs`` call on every tick either.)
     """
     from coord import github_ops, state  # noqa: PLC0415
 
@@ -3139,7 +3176,16 @@ def reconcile_board_merges(
                     state.mark_work_review_settled(a.assignment_id or "")
 
     # (c) #721 — close open PRs whose work has already landed.
-    actions.extend(close_stale_prs(config, repo=repo, issue=issue, dry_run=dry_run))
+    actions.extend(
+        close_stale_prs(
+            config,
+            board=board,
+            repo=repo,
+            issue=issue,
+            dry_run=dry_run,
+            skip_dormant_repos=skip_dormant_repos,
+        )
+    )
 
     # (d) #732 — prune stale merge_queue entries for closed issues / merged PRs.
     # Runs after the board sweeps so a just-marked-merged assignment doesn't

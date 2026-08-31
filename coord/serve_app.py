@@ -991,7 +991,13 @@ def _reconcile_merges_tick(config: Config) -> list[str]:
     # candidate set proportional to project history — 97% of a reconcile
     # pass's `gh` calls, and the demand behind the fleet-wide secondary rate
     # limiting. A manual `coord reconcile-merges` still sweeps every time.
-    actions = reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+    # #2994: same daemon-only opt-in for `skip_dormant_repos` — the stale-PR
+    # sweep (close_stale_prs, sweep c) otherwise lists open PRs for every
+    # registered repo every tick regardless of activity. A manual
+    # `coord reconcile-merges` still sweeps every repo.
+    actions = reconcile_board_merges(
+        board, config, throttle_false_merge_audit=True, skip_dormant_repos=True
+    )
     save_board(board)
     if actions:
         # #1038: one coarse operational row per tick that did something —
@@ -1035,11 +1041,19 @@ def _sync_issues_tick(config: Config) -> int:
     sample for 39 minutes straight, even though a direct ``gh`` call
     succeeded in under a second the whole time. See
     ``coord.github_ops._gh``'s docstring for exactly what the flag changes.
+
+    #2994: before spending a call on a repo, consult
+    ``coord.repo_dormancy.should_skip_sweep`` — a repo with no open
+    assignment, no drive-queue entry, and no coord-authored open PR is
+    dormant, and dormant repos are only swept once per
+    ``coord.repo_dormancy.DORMANT_SWEEP_FLOOR_S`` rather than every tick.
+    Queuing work for a dormant repo un-skips it on the very next tick (the
+    check is live against board + drive-queue state, never cached).
     """
     import logging  # noqa: PLC0415
 
-    from coord import github_ops, issues_sync_status  # noqa: PLC0415
-    from coord.state import _upsert_open_issues_local  # noqa: PLC0415
+    from coord import github_ops, issues_sync_status, repo_dormancy  # noqa: PLC0415
+    from coord.state import _upsert_open_issues_local, build_board  # noqa: PLC0415
 
     # Use the private _upsert_open_issues_local (underscore-prefixed) rather
     # than the public upsert_open_issues, because the public variant routes
@@ -1047,8 +1061,14 @@ def _sync_issues_tick(config: Config) -> int:
     # configured.  Since this function IS the daemon, we must write directly
     # to the local DB to avoid a self-referential HTTP call.
     log = logging.getLogger("coord.serve")
+    board = build_board()
     total = 0
+    skipped_dormant = 0
     for repo in config.repos:
+        if repo_dormancy.should_skip_sweep(repo.name, board):
+            skipped_dormant += 1
+            continue
+        repo_dormancy.record_swept(repo.name)
         starved = issues_sync_status.is_starved(repo.name)
         issues_sync_status.record_attempt(repo.name)
         try:
@@ -1065,7 +1085,16 @@ def _sync_issues_tick(config: Config) -> int:
                 " (starvation-floor bypass already attempted)" if starved else "",
                 exc_info=True,
             )
-    log.debug("issues-sync tick: %d open issues across %d repos", total, len(config.repos))
+    if skipped_dormant:
+        log.info(
+            "issues-sync tick: skipped %d dormant repo(s) (no open assignment, "
+            "drive-queue entry, or open PR)",
+            skipped_dormant,
+        )
+    log.debug(
+        "issues-sync tick: %d open issues across %d repos (%d dormant-skipped)",
+        total, len(config.repos), skipped_dormant,
+    )
     return total
 
 

@@ -762,6 +762,29 @@ def _no_real_issues_sync_status_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_repo_dormancy_store(monkeypatch, tmp_path):
+    """#2994: never let a test write the OPERATOR'S real
+    ``~/.coord/repo_dormancy_status.json``.
+
+    Same hazard as ``_no_real_issues_sync_status_store`` immediately above,
+    one file over: this one is the per-repo dormant-sweep floor timer
+    (``coord.repo_dormancy``) that both ``coord.serve_app._sync_issues_tick``
+    and ``coord.reconcile.close_stale_prs`` consult before spending a real
+    ``gh`` call on a repo. A leaked test write could plant a fake recent
+    sweep timestamp that spuriously skips a real fleet's dormant repo past
+    its floor, or clear one and force an extra sweep early.
+
+    ``coord.repo_dormancy._state_path`` reads
+    ``$COORD_REPO_DORMANCY_STATE`` first for exactly this redirect, the same
+    env-var seam ``_no_real_issues_sync_status_store`` uses, not a
+    monkeypatched private function.
+    """
+    monkeypatch.setenv(
+        "COORD_REPO_DORMANCY_STATE", str(tmp_path / "repo-dormancy-status.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_roll_pending_store(monkeypatch, tmp_path):
     """#2587: never let a test write the OPERATOR'S real
     ``~/.coord/roll_pending.json``.
