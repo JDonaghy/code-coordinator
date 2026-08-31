@@ -50,6 +50,18 @@ _log = logging.getLogger(__name__)
 # same exhausted budget the way an unbounded conflict-fix retry would.
 MAX_CI_FIX_DISPATCHES = 2
 
+# #3011: a ci-fix leg that finishes with the branch HEAD unchanged (see
+# `dispatch_was_noop`) is refunded and does NOT count toward
+# MAX_CI_FIX_DISPATCHES above — but that refund must itself be bounded, or
+# two workers that keep (correctly) declining could cycle forever without
+# ever reaching a verdict. Same magnitude as MAX_CI_FIX_DISPATCHES for the
+# same "a couple of genuine signals is enough" reasoning: once this many
+# CONSECUTIVE legs come back having pushed nothing, that itself is the
+# verdict — the failure is not attributable to this branch — and
+# `coord.commands.merge._dispatch_ci_fixes` escalates to HUMAN_REQUIRED
+# with a reason that says so, distinct from the generic retry-cap message.
+MAX_CI_FIX_NOOP_STREAK = 2
+
 # Prefix on the dispatched fix worker's issue_title — mirrors
 # `conflict_fix.SEMANTIC_FIX_TITLE_PREFIX`'s visibility purpose: the TUI
 # Pipeline row and the fix briefing itself both make it obvious WHY this
@@ -123,6 +135,47 @@ def _has_active_fix(board: Board, entry: QueuedMerge) -> bool:
     return False
 
 
+def dispatch_was_noop(entry: QueuedMerge) -> bool:
+    """True when the LAST ci-fix dispatch for *entry* completed with the
+    branch HEAD unchanged — the worker correctly concluded the CI failure
+    wasn't its to fix and pushed no commit, rather than genuinely attempting
+    a fix. Compares the live, per-tick-refreshed ``entry.branch_head_sha``
+    (see ``coord.merge_queue.process``'s freshness-anchor refresh, which
+    runs before a ``checks_failed`` event is ever emitted) against
+    ``entry.ci_fix_head_sha``, the sha :func:`dispatch_ci_fix` snapshotted
+    at the moment of that dispatch.
+
+    Both empty (no ci-fix ever dispatched for this streak, or a probe
+    failure left the current SHA unknown) reads as ``False`` — fails
+    closed, same as every other SHA-staleness check in this codebase
+    (#821): "we can't tell" must never be treated as "we can tell it
+    didn't move".
+    """
+    return (
+        bool(entry.ci_fix_head_sha)
+        and bool(entry.branch_head_sha)
+        and entry.ci_fix_head_sha == entry.branch_head_sha
+    )
+
+
+def refund_noop_ci_fix(entry: QueuedMerge) -> None:
+    """Undo the attempt :func:`dispatch_ci_fix` speculatively spent for a
+    leg that turned out to be a no-op (:func:`dispatch_was_noop` is
+    ``True``), and track the no-op streak separately so it cannot cycle
+    forever without ever reaching a verdict — see
+    :data:`MAX_CI_FIX_NOOP_STREAK`.
+
+    Called by ``coord.commands.merge._dispatch_ci_fixes`` BEFORE it decides
+    whether to dispatch again for this entry's event; the caller is
+    responsible for checking ``entry.ci_fix_noop_streak`` against the cap
+    afterwards and escalating/persisting as needed, same division of
+    responsibility as :func:`dispatch_ci_fix` itself.
+    """
+    entry.ci_fix_dispatches = max(0, entry.ci_fix_dispatches - 1)
+    entry.ci_fix_noop_streak += 1
+    entry.ci_fix_head_sha = ""
+
+
 def dispatch_ci_fix(
     entry: QueuedMerge,
     board: Board,
@@ -146,6 +199,14 @@ def dispatch_ci_fix(
     only a successful dispatch spends the budget, mirroring how
     ``ci_infra_reruns``/``ci_flaky_reruns`` are only bumped when their
     respective remedy actually fired.
+
+    #3011: a successful dispatch also snapshots ``entry.branch_head_sha``
+    into ``entry.ci_fix_head_sha`` so a later tick can tell whether this
+    leg actually moved the branch — see ``dispatch_was_noop``/
+    ``refund_noop_ci_fix``. Callers are expected to check
+    ``dispatch_was_noop(entry)`` and route through ``refund_noop_ci_fix``
+    BEFORE calling this function again for the same entry, so a worker
+    that pushed nothing doesn't silently spend a second real attempt.
     """
     if entry.ci_fix_dispatches >= MAX_CI_FIX_DISPATCHES:
         return None
@@ -180,6 +241,29 @@ def dispatch_ci_fix(
     # round apart from an ordinary review-bounce fix at a glance, same
     # purpose as conflict_fix's SEMANTIC_FIX_TITLE_PREFIX.
     fix.issue_title = f"{CI_FIX_TITLE_PREFIX} {work.issue_title}"
+
+    # #3011: if a PRIOR dispatch's snapshot is still on the entry and the
+    # branch has since moved past it, that prior leg was a genuine attempt
+    # (not a no-op) — clear any no-op streak it may have left behind so it
+    # doesn't linger into this fresh attempt. (When the branch has NOT
+    # moved, the caller — `coord.commands.merge._dispatch_ci_fixes` — is
+    # expected to have already routed through `dispatch_was_noop`/
+    # `refund_noop_ci_fix` instead of reaching here; this is a harmless
+    # no-op in that case too, since `entry.ci_fix_noop_streak` would already
+    # be 0 for a caller that follows the intended sequencing.)
+    if (
+        entry.ci_fix_head_sha
+        and entry.branch_head_sha
+        and entry.ci_fix_head_sha != entry.branch_head_sha
+    ):
+        entry.ci_fix_noop_streak = 0
+
+    # Snapshot the current branch HEAD so a later tick can tell whether
+    # THIS dispatch's leg actually moved the branch (see
+    # `dispatch_was_noop`). `branch_head_sha` may itself be None (a probe
+    # failure) — falls back to "" so an unknown SHA never spuriously reads
+    # as "no ci-fix dispatch pending" on the next comparison.
+    entry.ci_fix_head_sha = entry.branch_head_sha or ""
 
     entry.ci_fix_dispatches += 1
 
