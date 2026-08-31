@@ -473,49 +473,69 @@ def _repo_stack_signals(repo_github: str, branch: str) -> list[str]:
     failure, or a repo with nothing recognisable, returns `[]` rather than a
     guess — this feeds an informational briefing section, not a gate, so
     silence is always the safe failure mode.
+
+    "Any lookup failure" is meant literally, hence the deliberately broad
+    ``except Exception`` guards below rather than the narrow
+    ``RuntimeError``/``ValueError`` pair an earlier revision used. The
+    Contents-API seam this walks is not exception-typed end to end:
+    ``github_ops.list_repo_dir`` indexes ``entry["name"]`` on whatever JSON
+    came back (``KeyError``/``TypeError`` on a malformed or
+    unexpectedly-shaped payload), and ``_gh`` itself is a subprocess
+    boundary that a caller lower in the stack can surface as ``OSError``.
+    None of those are worth turning an *informational* paragraph into a
+    hard failure of ``coord portal decompose-chat`` for — a crash here
+    costs the operator the whole intake session, while a swallowed lookup
+    costs one unweighed line.
     """
     from coord import github_ops  # noqa: PLC0415
 
     try:
         root_files, root_dirs = _dir_entries(repo_github, "", branch)
-    except RuntimeError:
+    except Exception:  # noqa: BLE001 - informational section, never a gate
         return []
 
     signals = [label for marker, label in _ROOT_STACK_MARKERS.items() if marker in root_files]
 
-    if "wrangler.toml" in root_files:
+    def _file_text(path: str) -> str:
+        """*path*'s contents on *branch*, or ``""`` on any lookup failure."""
         try:
-            wrangler_text = github_ops.get_repo_file(repo_github, "wrangler.toml", branch)
-        except (RuntimeError, ValueError):
-            # ValueError also catches `binascii.Error` (a ValueError subclass)
-            # from `get_repo_file_with_sha`'s `base64.b64decode` on a
-            # malformed Contents-API response — this feeds an informational
-            # section, not a gate, so any lookup failure degrades to "no
-            # signal" rather than blowing up the briefing build.
-            wrangler_text = ""
+            text = github_ops.get_repo_file(repo_github, path, branch)
+            # `isinstance` rather than a bare return: a Contents-API payload
+            # that decodes to something other than text must not turn a
+            # substring probe below into a `TypeError`.
+            return text if isinstance(text, str) else ""
+        except Exception:  # noqa: BLE001 - see the docstring
+            # Covers `binascii.Error` (a ValueError subclass) from
+            # `get_repo_file_with_sha`'s `base64.b64decode` on a malformed
+            # Contents-API response, `GhError` from the subprocess boundary,
+            # and anything else the seam can surface: this feeds an
+            # informational section, not a gate, so a failed read degrades
+            # to "no signal" rather than blowing up the briefing build.
+            return ""
+
+    def _entries(path: str) -> tuple[list[str], list[str]]:
+        """``(files, dirs)`` under *path*, or ``([], [])`` on any failure."""
+        try:
+            return _dir_entries(repo_github, path, branch)
+        except Exception:  # noqa: BLE001 - see the docstring
+            return [], []
+
+    if "wrangler.toml" in root_files:
+        wrangler_text = _file_text("wrangler.toml")
         signals += [
             label for key, label in _WRANGLER_BINDING_MARKERS.items() if key in wrangler_text
         ]
 
     if "CLAUDE.md" in root_files:
-        try:
-            claude_md_text = github_ops.get_repo_file(repo_github, "CLAUDE.md", branch).casefold()
-        except (RuntimeError, ValueError):
-            claude_md_text = ""
+        claude_md_text = _file_text("CLAUDE.md").casefold()
         signals += [
             label for key, label in _CLAUDE_MD_KEYWORD_MARKERS.items() if key in claude_md_text
         ]
 
     if ".github" in root_dirs:
-        try:
-            _, gh_dirs = _dir_entries(repo_github, ".github", branch)
-        except RuntimeError:
-            gh_dirs = []
+        _, gh_dirs = _entries(".github")
         if "workflows" in gh_dirs:
-            try:
-                wf_files, _ = _dir_entries(repo_github, ".github/workflows", branch)
-            except RuntimeError:
-                wf_files = []
+            wf_files, _ = _entries(".github/workflows")
             signals += [
                 label for marker, label in _WORKFLOW_STACK_MARKERS.items() if marker in wf_files
             ]
@@ -540,6 +560,13 @@ def house_stack_context(cfg: "Config", exclude_repos: list[str] | None = None) -
     wrong guess. When *no* repo in the fleet contributes anything, the whole
     section reads as empty rather than asserting a managed-services list or
     a host-coupled gate that nothing here actually evidences.
+
+    One sick repo never costs the operator the whole intake session: each
+    repo's probe is isolated, so a lookup that blows up for `acme/api`
+    still leaves `acme/coord-portal`'s Cloudflare signal in the rendered
+    section. This section is built on the critical path of *every*
+    `coord portal decompose-chat` (headless and `--interactive` alike) —
+    an informational paragraph must never be able to abort a dispatch.
     """
     exclude = set(exclude_repos or [])
     per_repo: list[str] = []
@@ -548,7 +575,10 @@ def house_stack_context(cfg: "Config", exclude_repos: list[str] | None = None) -
         if repo_cfg.name in exclude:
             continue
         branch = repo_cfg.default_branch or "main"
-        signals = _repo_stack_signals(repo_cfg.github, branch)
+        try:
+            signals = _repo_stack_signals(repo_cfg.github, branch)
+        except Exception:  # noqa: BLE001 - one repo must not sink the section
+            continue
         if not signals:
             continue
         per_repo.append(f"- {repo_cfg.name} ({repo_cfg.github}): {'; '.join(signals)}")

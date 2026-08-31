@@ -489,6 +489,122 @@ def test_dispatch_forwards_house_stack_context_into_the_briefing(monkeypatch):
     assert "- api (" not in house_stack_section
 
 
+# ── #2997 CI-fix round: the HOUSE STACK probe is informational, so NO
+# lookup failure of any type may abort an intake dispatch ──────────────────
+#
+# The `gh`-backed Contents-API seam this walks is not exception-typed end to
+# end: `github_ops.list_repo_dir` indexes `entry["name"]` on whatever JSON
+# came back, so a malformed/unexpectedly-shaped payload surfaces as
+# `KeyError`/`TypeError`, not `RuntimeError`. The first revision caught only
+# `RuntimeError`/`ValueError`, which meant one odd repo could crash
+# `coord portal decompose-chat` outright — an informational paragraph taking
+# down the whole session.
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [KeyError("name"), TypeError("not subscriptable"), OSError("gh vanished")],
+)
+def test_repo_stack_signals_empty_on_non_runtime_lookup_failure(boom):
+    with patch("coord.github_ops.list_repo_dir", side_effect=boom):
+        assert decomposition_chat._repo_stack_signals("acme/api", "main") == []
+
+
+def test_repo_stack_signals_keeps_root_markers_when_file_read_raises_non_valueerror():
+    """A `wrangler.toml` whose *contents* can't be read still contributes the
+    root-marker signal its mere presence implies — partial degradation, not
+    total."""
+    with patch(
+        "coord.github_ops.list_repo_dir", return_value=["wrangler.toml"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file", side_effect=KeyError("content")
+    ):
+        signals = decomposition_chat._repo_stack_signals("acme/coord-portal", "main")
+    assert any("Cloudflare Workers/Pages" in s for s in signals)
+    # ...but no binding is asserted, since nothing was actually read.
+    assert not any("Cloudflare D1" in s for s in signals)
+
+
+def test_repo_stack_signals_tolerates_non_text_file_payload():
+    """`get_repo_file` returning something that isn't `str` must not turn the
+    substring probes into a `TypeError`."""
+    with patch(
+        "coord.github_ops.list_repo_dir", return_value=["CLAUDE.md"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file", return_value=b"\x00binary"
+    ):
+        assert decomposition_chat._repo_stack_signals("acme/api", "main") == []
+
+
+def test_repo_stack_signals_survives_a_broken_workflows_listing():
+    """The `.github/workflows` walk is a second, independent lookup — its
+    failure must cost only the deploy-lane signal, not the root markers."""
+
+    def _list_dir(repo, path, branch):
+        if path == "":
+            return ["package.json"]
+        raise KeyError("name")
+
+    with patch("coord.github_ops.list_repo_dir", side_effect=_list_dir), patch(
+        "coord.github_ops.list_repo_subdirs",
+        side_effect=lambda repo, path, branch: {"": [".github"], ".github": ["workflows"]}.get(
+            path, []
+        ),
+    ):
+        signals = decomposition_chat._repo_stack_signals("acme/natal-chart", "main")
+    assert any("Node/TypeScript" in s for s in signals)
+    assert not any("deploy" in s for s in signals)
+
+
+def test_house_stack_context_keeps_healthy_repos_when_one_repo_blows_up():
+    """One sick repo must not sink the whole section — the fleet's Cloudflare
+    signal still reaches the briefing."""
+    cfg = Config(repos=[_repo("api"), _repo("coord-portal")], machines=[])
+
+    def _list_dir(repo, path, branch):
+        if repo == "acme/api":
+            raise KeyError("name")
+        return ["wrangler.toml"] if path == "" else []
+
+    with patch("coord.github_ops.list_repo_dir", side_effect=_list_dir), patch(
+        "coord.github_ops.list_repo_subdirs", return_value=[]
+    ), patch("coord.github_ops.get_repo_file", return_value=""):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "coord-portal" in out
+    assert "- api (" not in out
+
+
+def test_house_stack_context_degrades_to_empty_when_every_repo_blows_up():
+    cfg = Config(repos=[_repo("api"), _repo("coord-portal")], machines=[])
+    with patch("coord.github_ops.list_repo_dir", side_effect=TypeError("boom")), patch(
+        "coord.github_ops.list_repo_subdirs", side_effect=TypeError("boom")
+    ):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "no recognisable stack/deploy signal" in out
+
+
+def test_dispatch_still_dispatches_when_the_house_stack_probe_explodes(monkeypatch):
+    """End-to-end guard: an intake dispatch must survive a HOUSE STACK probe
+    that raises an un-typed failure, falling back to the empty section rather
+    than propagating out of `dispatch_decomposition_chat`."""
+    cfg = Config(
+        repos=[_repo("api"), _repo("coord-portal")],
+        machines=[_machine("a", ["api", "coord-portal"])],
+    )
+    monkeypatch.setattr(decomposition_chat, "_repo_is_greenfield", lambda cfg, r: False)
+    with patch(
+        "coord.approved_work.approved_submissions", return_value=[SUBMISSION]
+    ), patch(
+        "coord.dispatch.dispatch_with_retry", return_value={"id": "asg-hs"}
+    ) as mock_dispatch, patch("coord.state.record_dispatched_assignment"), patch(
+        "coord.github_ops.list_repo_dir", side_effect=KeyError("name")
+    ), patch("coord.github_ops.list_repo_subdirs", side_effect=KeyError("name")):
+        decomposition_chat.dispatch_decomposition_chat("sub_2f6a1c", cfg)
+    briefing = mock_dispatch.call_args[0][0].briefing
+    assert "HOUSE STACK" in briefing
+    assert "no recognisable stack/deploy signal" in briefing
+
+
 def test_select_discuss_mode_override_wins_true(monkeypatch):
     monkeypatch.setattr(decomposition_chat, "_repo_is_greenfield", lambda cfg, r: False)
     cfg = Config(repos=[_repo("api")], machines=[])
@@ -1337,6 +1453,13 @@ def test_cli_interactive_computes_and_writes_house_stack_section(tmp_path, monke
 
     from coord.commands.portal import portal_group
 
+    # #2170 posture: the CLI drops its briefing in `tempfile.gettempdir()`,
+    # a process-global shared path keyed only on the submission id. Point it
+    # at this test's own tmp_path so the assertions below can never read a
+    # neighbouring test's leftovers (or trip over an unwritable ambient
+    # $TMPDIR on some other host).
+    monkeypatch.setattr(_tempfile, "tempdir", str(tmp_path))
+
     local = _machine("here", ["api"])
     cfg = Config(repos=[_repo("api"), _repo("coord-portal")], machines=[local])
 
@@ -1379,3 +1502,53 @@ def test_cli_interactive_computes_and_writes_house_stack_section(tmp_path, monke
     assert "- api (" not in house_stack_section
     # ...and the seed prompt pointer now names it too.
     assert "house stack" in result.output.lower() or "house stack" in briefing_on_disk.lower()
+
+
+def test_cli_interactive_survives_a_house_stack_probe_that_explodes(tmp_path, monkeypatch):
+    """#2997 CI-fix round, black-box half: drive the real CLI and assert on
+    what it renders. An attended intake session must still start — and still
+    write its briefing — when the fleet-stack probe raises an un-typed
+    lookup failure, instead of dying with a traceback and costing the
+    operator the whole session over an informational paragraph.
+    """
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    # Same #2170 isolation as the sibling test above.
+    monkeypatch.setattr(_tempfile, "tempdir", str(tmp_path))
+
+    local = _machine("here", ["api"])
+    cfg = Config(repos=[_repo("api"), _repo("coord-portal")], machines=[local])
+
+    def _boom(repo, path, branch):
+        raise KeyError("name")
+
+    monkeypatch.setattr("coord.github_ops.list_repo_dir", _boom)
+    monkeypatch.setattr("coord.github_ops.list_repo_subdirs", _boom)
+
+    brief_path = _Path(_tempfile.gettempdir()) / "coord-intake-sub_2f6a1c.md"
+
+    runner = CliRunner()
+    with patch("coord.commands.portal._load_config", return_value=cfg), patch(
+        "coord.decomposition_chat.resolve_approved_submission", return_value=SUBMISSION
+    ), patch("coord.test_orchestrator.local_machine", return_value=local), patch(
+        "coord.board_service.resolve", return_value=None
+    ), patch(
+        "coord.state.record_dispatched_assignment"
+    ), patch(
+        "coord.interactive.launch_human_attended_interactive"
+    ):
+        result = runner.invoke(
+            portal_group,
+            ["decompose-chat", "sub_2f6a1c", "--interactive", "--discuss", "--dry-run"],
+        )
+    assert result.exit_code == 0, result.output
+    assert "INTAKE SESSION" in result.output
+
+    briefing_on_disk = brief_path.read_text(encoding="utf-8")
+    assert "HOUSE STACK" in briefing_on_disk
+    assert "no recognisable stack/deploy signal" in briefing_on_disk
