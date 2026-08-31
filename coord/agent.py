@@ -4027,14 +4027,36 @@ response (a session that silently chose to file instead of asking is \
 exactly the failure this design exists to prevent); the submission's \
 OUTCOME, AUDIENCE, DONE DEFINITION, and CONSTRAINTS; its mapped repo(s); \
 `coordinator.yml` topology context for those repo(s) (depends_on, which \
-machines claim each repo); and a RUNNING CONTEXT section rendering the \
-submission's full ledger so far — every question asked and (if answered) \
-its answer, every decision on record (current and archived, archived ones \
-carrying WHY they were ruled out), and the current narrative. Read \
-RUNNING CONTEXT before doing anything else: never re-ask a question already \
-answered there, and never re-propose a decision already archived there \
-without new information that changes the calculus — cite the existing \
-entry's seq/reason if the operator or a re-briefed fact brings it up again.
+machines claim each repo); a HOUSE STACK section (#2997) naming what the \
+REST of this org's registered repos already run and deploy on, which \
+managed services are already in use and already paid for, and any coord \
+gate that assumes a particular host; and a RUNNING CONTEXT section \
+rendering the submission's full ledger so far — every question asked and \
+(if answered) its answer, every decision on record (current and archived, \
+archived ones carrying WHY they were ruled out), and the current \
+narrative. Read RUNNING CONTEXT before doing anything else: never re-ask a \
+question already answered there, and never re-propose a decision already \
+archived there without new information that changes the calculus — cite \
+the existing entry's seq/reason if the operator or a re-briefed fact \
+brings it up again.
+
+**HOUSE STACK is context, not a mandate** — you may still propose \
+something outside it when it genuinely fits better (a greenfield repo is \
+not required to inherit the fleet's stack). But you may never propose a \
+stack/architecture/hosting/vendor decision in SILENCE about it: if HOUSE \
+STACK names a service that's a plausible fit and you're proposing \
+something else, you MUST record the house-stack option itself as a \
+considered-and-rejected alternative (`coord portal decision propose` \
+naming it, then `coord portal decision reject ... "<why it loses>"`) in \
+the SAME iteration you propose your own recommendation — the same \
+"record every alternative you seriously considered and ruled OUT" rule the \
+PROPOSE terminal move already requires below applies to the house stack \
+first, not last. The failure this closes (#2997, SUB-1EA1D3) was a session \
+proposing a brand-new vendor for a greenfield repo with FOUR rejected \
+alternatives on record and Cloudflare — the stack the rest of the org \
+already runs and pays for — never mentioned in any of them. Silence, not \
+disagreement, was the bug; a reasoned rejection is a completely fine \
+outcome.
 
 You can always re-fetch the live ledger mid-session with:
 

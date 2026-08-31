@@ -293,6 +293,202 @@ def test_repo_is_greenfield_false_when_commits_and_claude_md():
         assert decomposition_chat._repo_is_greenfield(cfg, "api") is False
 
 
+# ── #2997: HOUSE STACK — brief the intake session with the fleet's stack ────
+
+
+def test_repo_stack_signals_empty_on_lookup_failure():
+    """Degrades gracefully: a repo lookup that raises (not a clean 404, some
+    other `gh` failure) must contribute nothing rather than crash the whole
+    briefing build."""
+    with patch("coord.github_ops.list_repo_dir", side_effect=RuntimeError("boom")):
+        assert decomposition_chat._repo_stack_signals("acme/api", "main") == []
+
+
+def test_repo_stack_signals_empty_when_nothing_recognisable():
+    with patch(
+        "coord.github_ops.list_repo_dir",
+        return_value=["README.md", "notes.txt"],
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]):
+        assert decomposition_chat._repo_stack_signals("acme/api", "main") == []
+
+
+def test_repo_stack_signals_detects_root_marker_files():
+    with patch(
+        "coord.github_ops.list_repo_dir",
+        return_value=["README.md", "Cargo.toml"],
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]):
+        signals = decomposition_chat._repo_stack_signals("acme/tui", "main")
+    assert any("Rust" in s for s in signals)
+
+
+def test_repo_stack_signals_detects_cloudflare_pages_workflow():
+    def _list_dir(repo, path, branch):
+        return {
+            "": ["README.md", "package.json"],
+            ".github/workflows": ["deploy-cloudflare.yml", "ci.yml"],
+        }.get(path, [])
+
+    def _list_subdirs(repo, path, branch):
+        return {"": [".github"], ".github": ["workflows"]}.get(path, [])
+
+    with patch("coord.github_ops.list_repo_dir", side_effect=_list_dir), patch(
+        "coord.github_ops.list_repo_subdirs", side_effect=_list_subdirs
+    ):
+        signals = decomposition_chat._repo_stack_signals("acme/natal-chart", "main")
+    assert any("Cloudflare Pages deploy" in s for s in signals)
+
+
+def test_repo_stack_signals_detects_wrangler_bindings():
+    with patch(
+        "coord.github_ops.list_repo_dir",
+        return_value=["wrangler.toml"],
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file",
+        return_value='[[d1_databases]]\nbinding = "DB"\n\n[[r2_buckets]]\nbinding = "ASSETS"\n',
+    ):
+        signals = decomposition_chat._repo_stack_signals("acme/coord-portal", "main")
+    assert any("Cloudflare D1" in s for s in signals)
+    assert any("Cloudflare R2" in s for s in signals)
+
+
+def test_repo_stack_signals_detects_claude_md_keyword():
+    with patch(
+        "coord.github_ops.list_repo_dir",
+        return_value=["CLAUDE.md"],
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file",
+        return_value="This repo deploys via Cloudflare Access for authentication.",
+    ):
+        signals = decomposition_chat._repo_stack_signals("acme/coord-portal", "main")
+    assert any("Cloudflare Access" in s for s in signals)
+
+
+def test_house_stack_context_empty_when_no_repo_has_signals():
+    cfg = Config(repos=[_repo("api")], machines=[])
+    with patch("coord.github_ops.list_repo_dir", return_value=["README.md"]), patch(
+        "coord.github_ops.list_repo_subdirs", return_value=[]
+    ):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "no recognisable stack/deploy signal" in out
+
+
+def test_house_stack_context_excludes_the_submission_own_mapped_repos():
+    """The point is "what does the REST of the fleet run" — the submission's
+    own mapped repo(s) must not appear in the per-repo list even when they
+    themselves show a signal."""
+    cfg = Config(
+        repos=[_repo("greenfield-app"), _repo("coord-portal")], machines=[]
+    )
+
+    def _list_dir(repo, path, branch):
+        if path == "":
+            return ["wrangler.toml"] if repo == "acme/coord-portal" else ["package.json"]
+        return []
+
+    with patch("coord.github_ops.list_repo_dir", side_effect=_list_dir), patch(
+        "coord.github_ops.list_repo_subdirs", return_value=[]
+    ), patch("coord.github_ops.get_repo_file", return_value=""):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=["greenfield-app"])
+    assert "coord-portal" in out
+    assert "greenfield-app" not in out
+
+
+def test_house_stack_context_names_the_preview_gate_when_cloudflare_seen():
+    """#2997 acceptance: a session choosing a stack must SEE the
+    `enqueue-preview`/Pages-preview coupling, not just a generic Cloudflare
+    mention."""
+    cfg = Config(repos=[_repo("coord-portal")], machines=[])
+    with patch(
+        "coord.github_ops.list_repo_dir", return_value=["wrangler.toml"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file", return_value=""
+    ):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "enqueue-preview" in out
+    assert "Cloudflare Pages PREVIEW" in out
+
+
+def test_house_stack_context_no_preview_gate_line_without_cloudflare_signal():
+    cfg = Config(repos=[_repo("tui")], machines=[])
+    with patch(
+        "coord.github_ops.list_repo_dir", return_value=["Cargo.toml"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "enqueue-preview" not in out
+
+
+def test_house_stack_context_frames_itself_as_context_not_mandate():
+    cfg = Config(repos=[_repo("coord-portal")], machines=[])
+    with patch(
+        "coord.github_ops.list_repo_dir", return_value=["wrangler.toml"]
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file", return_value=""
+    ):
+        out = decomposition_chat.house_stack_context(cfg, exclude_repos=[])
+    assert "considered-and-rejected" in out
+
+
+def test_briefing_includes_house_stack_section():
+    out = decomposition_chat.build_decomposition_chat_briefing(
+        submission=SUBMISSION,
+        topology_context="(none)",
+        discuss=True,
+        discuss_reason="x",
+        house_stack_context_section="HOUSE STACK (fleet-wide, #2997):\n- coord-portal: Cloudflare",
+    )
+    assert "HOUSE STACK" in out
+    assert "coord-portal" in out
+
+
+def test_briefing_default_house_stack_when_none_given():
+    out = decomposition_chat.build_decomposition_chat_briefing(
+        submission=SUBMISSION,
+        topology_context="(none)",
+        discuss=False,
+        discuss_reason="x",
+    )
+    assert "HOUSE STACK" in out
+    assert "not computed for this briefing" in out
+
+
+def test_dispatch_forwards_house_stack_context_into_the_briefing(monkeypatch):
+    """Regression case for SUB-1EA1D3 (#2997's own measured example): the
+    dispatcher must actually compute and forward the HOUSE STACK section,
+    excluding the submission's own mapped repo(s), so a greenfield
+    submission's briefing surfaces the fleet's Cloudflare stack as at least
+    a weighed alternative instead of omitting it."""
+    cfg = Config(
+        repos=[_repo("api"), _repo("coord-portal")],
+        machines=[_machine("a", ["api", "coord-portal"])],
+    )
+
+    def _list_dir(repo, path, branch):
+        if path == "" and repo == "acme/coord-portal":
+            return ["wrangler.toml"]
+        return []
+
+    monkeypatch.setattr(decomposition_chat, "_repo_is_greenfield", lambda cfg, r: False)
+    with patch(
+        "coord.approved_work.approved_submissions", return_value=[SUBMISSION]
+    ), patch(
+        "coord.dispatch.dispatch_with_retry", return_value={"id": "asg-hs"}
+    ) as mock_dispatch, patch("coord.state.record_dispatched_assignment"), patch(
+        "coord.github_ops.list_repo_dir", side_effect=_list_dir
+    ), patch("coord.github_ops.list_repo_subdirs", return_value=[]), patch(
+        "coord.github_ops.get_repo_file", return_value=""
+    ):
+        decomposition_chat.dispatch_decomposition_chat("sub_2f6a1c", cfg)
+    proposal = mock_dispatch.call_args[0][0]
+    assert "coord-portal" in proposal.briefing
+    assert "Cloudflare" in proposal.briefing
+    # The submission's own mapped repo ("api") must not appear in the
+    # HOUSE STACK per-repo list — only as MAPPED REPO(S)/topology.
+    house_stack_section = proposal.briefing.split("HOUSE STACK", 1)[1].split(
+        "RUNNING CONTEXT", 1
+    )[0]
+    assert "- api (" not in house_stack_section
+
+
 def test_select_discuss_mode_override_wins_true(monkeypatch):
     monkeypatch.setattr(decomposition_chat, "_repo_is_greenfield", lambda cfg, r: False)
     cfg = Config(repos=[_repo("api")], machines=[])
@@ -767,6 +963,29 @@ def test_system_prompt_decompose_step_writes_decisions_archive():
 def test_system_prompt_mentions_running_context_and_ledger_reread():
     assert "RUNNING CONTEXT" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
     assert "never re-ask a question already" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+
+
+# ── #2997: system prompt requires weighing (never silently skipping) the
+# HOUSE STACK section the briefing now carries ─────────────────────────────
+
+
+def test_system_prompt_mentions_house_stack_section():
+    assert "HOUSE STACK" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+    assert "#2997" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+
+
+def test_system_prompt_house_stack_framed_as_context_not_mandate():
+    assert "context, not a mandate" in DECOMPOSITION_CHAT_SYSTEM_PROMPT.lower()
+
+
+def test_system_prompt_requires_recording_house_stack_alternative():
+    """#2997 acceptance: a session proposing a stack outside the house stack
+    must record the house alternative as a considered-and-rejected decision
+    with a reason, rather than silently omitting it — the SUB-1EA1D3
+    failure was silence, not disagreement."""
+    assert "considered-and-rejected alternative" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+    assert "coord portal decision reject" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
+    assert "SUB-1EA1D3" in DECOMPOSITION_CHAT_SYSTEM_PROMPT
 
 
 def test_deny_list_blocks_self_confirming_a_proposal():
