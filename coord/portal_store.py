@@ -948,6 +948,9 @@ class DraftGateError(ValueError):
 EDITABLE_DRAFT_FIELDS: dict[str, tuple[str, ...]] = {
     "question": ("question",),
     "design_round": ("design_round.outcome_definition",),
+    # #2987: the operator's own relayed text — the exact prose the draft
+    # gate exists to let a human read before it reaches the client.
+    "relayed_answer": ("relayed_answer.text",),
 }
 
 
@@ -1450,6 +1453,63 @@ def events_after_question_watermark(
     return [(r["event_id"], _event_from_row(r)) for r in rows]
 
 
+def get_relayed_answer_watermark() -> tuple[float, str]:
+    """The relayed-answer CONFIRMATION consumer's own read position (#2987)
+    — ``(0.0, "")`` if never set. A private watermark, independent of
+    ``verdict_watermark_*``/``question_watermark_*`` above, for the same
+    reason those two are independent of each other: this consumer walks the
+    same ``portal_events`` inbox at its own pace, and every event kind it
+    ignores must not pile up ahead of the next ``relayed_answer.confirmed``
+    event forever. See :func:`get_verdict_watermark`'s docstring for why the
+    sentinel is ``(0.0, "")`` and not ``(0.0, 0)``.
+    """
+    row = sql.execute(
+        _conn(),
+        "SELECT relayed_answer_watermark_at, relayed_answer_watermark_rowid "
+        "FROM portal_sync_state WHERE id = 1",
+    ).fetchone()
+    if row is None or row["relayed_answer_watermark_at"] is None:
+        return (0.0, "")
+    return (
+        row["relayed_answer_watermark_at"],
+        row["relayed_answer_watermark_rowid"] or "",
+    )
+
+
+def set_relayed_answer_watermark(received_at: float, event_id: str) -> None:
+    """Advance the relayed-answer confirmation consumer's read position past
+    ``(received_at, event_id)`` — called after a scan has looked at that
+    row, whatever kind it turned out to be, same reasoning as
+    :func:`set_verdict_watermark`.
+    """
+    _update_sync_state(
+        relayed_answer_watermark_at=received_at,
+        relayed_answer_watermark_rowid=event_id,
+    )
+
+
+def events_after_relayed_answer_watermark(
+    received_at: float, after_event_id: str, *, limit: int = 100
+) -> list[tuple[str, "PortalEvent"]]:
+    """The relayed-answer confirmation consumer's own paginated scan —
+    identical query to :func:`events_after_question_watermark`, against this
+    consumer's own watermark instead. See
+    :func:`coord.portal_sync._consume_relayed_answer_confirmations`.
+    """
+    rows = sql.execute(
+        _conn(),
+        """
+        SELECT * FROM portal_events
+         WHERE received_at > ?
+            OR (received_at = ? AND event_id > ?)
+         ORDER BY received_at ASC, event_id ASC
+         LIMIT ?
+        """,
+        (received_at, received_at, after_event_id, limit),
+    ).fetchall()
+    return [(r["event_id"], _event_from_row(r)) for r in rows]
+
+
 def note_push(*, now: float | None = None) -> None:
     _update_sync_state(last_push_at=time.time() if now is None else now)
 
@@ -1753,6 +1813,18 @@ LEDGER_KIND_DRAFT_REJECTED = "draft_rejected"
 #: Stored VERBATIM and never folded into the narrative (#2746: "a ledger that
 #: IS a narrative cannot be regenerated — that asymmetry is the design").
 LEDGER_KIND_OPERATOR_NOTE = "operator_note"
+
+#: #2987: the client tapped "confirm" on a relayed answer the portal showed
+#: them. A new row, not a mutation of the #2986 answer row it confirms — the
+#: ledger has no UPDATE path (see :func:`append_ledger_entry`'s docstring) —
+#: paired to the same ``question_revision`` so :func:`render_ledger_payload`
+#: can fold it into the same Q&A bucket. A CORRECTION needs no kind of its
+#: own: it arrives as an ordinary inbound ``question.answered`` event and
+#: lands as a normal (non-``relayed``) :data:`LEDGER_KIND_QUESTION_ANSWERED`
+#: row in the same bucket via the existing #2749 consumer — append-only, so
+#: both the relayed answer and the correction that supersedes it stay
+#: visible, in the order they were recorded.
+LEDGER_KIND_ANSWER_CONFIRMED = "answer_confirmed"
 
 #: Marks a ledger ``actor`` as a human at coord's CLI rather than the portal
 #: wire, so a later session can tell operator-relayed context from something
@@ -2093,6 +2165,30 @@ def _fold_status_after_answer(config: Any, submission_id: str) -> None:
         )
 
 
+def _push_relayed_answer(config: Any, submission_id: str, entry: LedgerEntry) -> None:
+    """Best-effort: queue *entry* — a #2986 relayed answer just ledgered —
+    for the portal to see, so the client can confirm or correct it (#2987).
+
+    Never raises. The ledger write above is the durable, coord-side record
+    of the fact; this is the OUTBOUND half of it, and a failure here (a
+    stale/missing config, the draft-gate policy read finding nothing to
+    read) must never make the ledger append look like it failed — same
+    posture as :func:`_fold_status_after_answer` right above, and the same
+    #2179 failure posture the rest of this bridge holds to: the answer
+    stays recorded locally either way.
+    """
+    try:
+        from coord import portal_sync  # noqa: PLC0415
+
+        portal_sync.enqueue_relayed_answer(submission_id, entry, config=config)
+    except Exception:  # noqa: BLE001 — outbound queuing is best-effort here
+        _log.warning(
+            "portal answer: could not enqueue outbound relayed_answer for %s",
+            submission_id,
+            exc_info=True,
+        )
+
+
 def _answer_question_local(
     submission_id: str,
     text: str,
@@ -2149,6 +2245,7 @@ def _answer_question_local(
         now=now,
     )
     _fold_status_after_answer(config, submission_id)
+    _push_relayed_answer(config, submission_id, entry)
     return entry
 
 
@@ -2189,6 +2286,12 @@ def answer_question(
     (:func:`coord.portal_sync._record_question_answer`) is additive, not a
     conflict: the ledger is append-only, so both rows coexist under the same
     ``question_revision`` in the order they were recorded.
+
+    Also queues the answer OUTBOUND (#2987, best-effort — see
+    :func:`_push_relayed_answer`), draft-gated like ``design_round``/
+    ``question`` so nothing customer-facing sends without operator approval,
+    so the client sees exactly what was recorded and can confirm or correct
+    it in one tap.
     """
     routed = _route_answer(
         {
@@ -2668,6 +2771,14 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
     ``operator_notes`` key, in ledger ``seq`` order — deliberately NOT mixed
     into ``qa`` (they answer no question) and NOT folded into ``narrative``
     (they are ledger-class facts, and the narrative is regenerable).
+
+    A relayed answer's client CONFIRMATION (#2987,
+    :data:`LEDGER_KIND_ANSWER_CONFIRMED`) folds into the same bucket as
+    ``confirmations`` — never merged into ``answers`` itself, so a renderer
+    can tell "the client said this" from "the client confirmed what we said
+    they said" without inspecting payloads. A correction needs no such
+    folding: it arrives as an ordinary (non-``relayed``) row in ``answers``
+    and both stay visible in ``seq`` order, same as any other append.
     """
     ledger = ledger_for_submission(submission_id)
     decisions = decisions_for_submission(submission_id)
@@ -2681,7 +2792,7 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
             operator_notes.append(entry)
         elif entry.kind == LEDGER_KIND_QUESTION_PUSHED:
             questions.setdefault(
-                entry.question_revision, {"question": entry, "answers": []}
+                entry.question_revision, {"question": entry, "answers": [], "confirmations": []}
             )
         elif entry.kind == LEDGER_KIND_QUESTION_ANSWERED:
             bucket = questions.get(entry.question_revision)
@@ -2689,6 +2800,10 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
                 bucket["answers"].append(entry)
             else:
                 unpaired_answers.append(entry)
+        elif entry.kind == LEDGER_KIND_ANSWER_CONFIRMED:
+            bucket = questions.get(entry.question_revision)
+            if bucket is not None:
+                bucket["confirmations"].append(entry)
 
     current_decisions = [d for d in decisions if d.is_current]
     archived_decisions = [d for d in decisions if not d.is_current]
@@ -2713,6 +2828,12 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
                         "source": a.payload.get("source", ""),
                     }
                     for a in qa["answers"]
+                ],
+                # #2987: every time the client confirmed a relayed answer for
+                # this question — empty when none has been (yet, or ever).
+                "confirmations": [
+                    {"actor": c.actor, "recorded_at": c.recorded_at}
+                    for c in qa["confirmations"]
                 ],
             }
             for revision, qa in questions.items()

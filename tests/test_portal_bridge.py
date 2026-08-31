@@ -332,3 +332,18 @@ def test_bridge_update_rejects_negative_revision():
 def test_bridge_update_rejects_empty_fields():
     with pytest.raises(PortalBridgeError, match="fields"):
         BridgeUpdate(submission_id="sub_1", revision=1, fields={})
+
+
+# ── COORD_OWNED_FIELDS (#2987) ──────────────────────────────────────────────
+
+
+def test_relayed_answer_is_a_coord_owned_field():
+    """#2987: a relayed answer (#2986) is pushed OUT under the top-level
+    `relayed_answer` key (`coord.portal_sync.KIND_RELAYED_ANSWER`) — it must
+    be in the ownership allowlist or every push of it degrades to
+    `rejected:not_owned:relayed_answer` (see `_facts_from_payload`, which
+    also relies on this set to keep coord's own field out of the customer
+    mirror)."""
+    from coord.portal_bridge import COORD_OWNED_FIELDS
+
+    assert "relayed_answer" in COORD_OWNED_FIELDS

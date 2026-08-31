@@ -1838,6 +1838,13 @@ def _render_ledger_text(payload: dict) -> str:
                 lines.append(_render_answer_line(a, indent="    "))
         else:
             lines.append("    (unanswered — needs-input)")
+        # #2987: `.get` — a thin client may be talking to a daemon that
+        # predates this key.
+        for c in entry.get("confirmations") or []:
+            when = datetime.datetime.fromtimestamp(
+                c["recorded_at"], tz=datetime.timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC")
+            lines.append(f"    [CONFIRMED by {c['actor'] or 'customer'}, {when}]")
     for a in unpaired:
         tag = " RELAYED" if a.get("relayed") else ""
         lines.append(
@@ -2076,6 +2083,14 @@ def portal_answer(
     refused — it routes through the daemon's ``/portal-answer`` seam when
     ``board_service`` is configured, so it works from wherever the operator
     happens to be.
+
+    Also queues the answer OUTBOUND to the portal (#2987, coord-portal#159,
+    best-effort) — draft-gated like a question or design round under the
+    default ``portal.approval`` policy, so it sits in ``coord portal
+    drafts`` until approved. Once sent, the client sees exactly what was
+    recorded and can confirm or correct it in one tap; a confirm marks this
+    ledger row client-confirmed, a correction lands as a normal answer
+    alongside it.
     """
     from coord import portal_store  # noqa: PLC0415
     from coord.board_service import resolve  # noqa: PLC0415

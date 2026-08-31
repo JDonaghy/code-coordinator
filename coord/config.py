@@ -2173,7 +2173,12 @@ class PortalProjectRepo:
 #: imports ``coord.db``, and config must stay importable by everything.
 #: ``tests/test_portal_config.py`` pins the two lists together so the copy
 #: cannot silently drift.
-PORTAL_OUTBOX_KINDS = ("status", "design_round", "question", "preview")
+PORTAL_OUTBOX_KINDS = (
+    "status", "design_round", "question", "preview",
+    # #2987: a relayed answer (#2986) pushed outbound for the client to
+    # confirm/correct — see `coord.portal_sync.KIND_RELAYED_ANSWER`.
+    "relayed_answer",
+)
 
 #: The draft gate's default policy (#2903, phase 1 of #2902): the two kinds
 #: that carry **agent-authored prose to a customer** are held for an
@@ -2184,11 +2189,16 @@ PORTAL_OUTBOX_KINDS = ("status", "design_round", "question", "preview")
 #: read and rewrite, and gating them would produce a rubber-stamp queue of
 #: "In progress" ×N that trains the operator to approve without reading,
 #: which is the failure mode this gate exists to prevent (see epic #2902).
+#: #2987: a relayed answer is prose an operator typed on the client's
+#: behalf — "the most worth reading before it sends" (the issue's own
+#: framing) — so it is gated like the other two prose kinds, not left
+#: ungated like `status`/`preview`.
 DEFAULT_PORTAL_APPROVAL: dict[str, bool] = {
     "status": False,
     "design_round": True,
     "question": True,
     "preview": False,
+    "relayed_answer": True,
 }
 
 

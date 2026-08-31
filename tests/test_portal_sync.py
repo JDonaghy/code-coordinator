@@ -20,6 +20,7 @@ from coord.portal_sync import (
     enqueue_design_round,
     enqueue_preview,
     enqueue_question,
+    enqueue_relayed_answer,
     enqueue_status,
     ordering_block_reason,
     sync_tick,
@@ -2338,3 +2339,404 @@ class TestApprovalConfigRead:
             portal_store.STATE_DRAFT
         )
         assert portal_sync.initial_outbox_state("status") == portal_store.STATE_PENDING
+
+
+# ── #2987: relayed answers pushed OUT, and their client confirmation ───────
+#
+# The coord half of coord-portal#159. #2986 already records an out-of-band
+# answer in the ledger; this is the OUTBOUND half that lets the client see
+# it and confirm/correct it, draft-gated and ordering-guarded like every
+# other prose kind.
+
+
+def _relayed_answer_entry(
+    *,
+    question_revision: int = 1,
+    text: str = "Yes, offline-first.",
+    source: str = "phone",
+    actor: str = "operator:jane",
+) -> portal_store.LedgerEntry:
+    """A #2986 relayed-answer ledger row, built directly
+    (`append_ledger_entry`, not `answer_question`) so these tests exercise
+    `enqueue_relayed_answer` in isolation from the #2987 auto-push hook
+    `portal_store._push_relayed_answer` wires into `answer_question` itself
+    — that integration has its own test below
+    (`TestAnswerQuestionPushesOutbound`)."""
+    return portal_store.append_ledger_entry(
+        SUB,
+        portal_store.LEDGER_KIND_QUESTION_ANSWERED,
+        question_revision=question_revision,
+        text=text,
+        actor=actor,
+        payload={"relayed": True, "source": source},
+    )
+
+
+def _relayed_answer_confirmed_page(
+    *, question_revision: int = 1, event_id: str = "e1", confirmed_by: str = "jane",
+) -> dict:
+    return {
+        "events": [
+            {
+                "id": event_id,
+                "submission_id": SUB,
+                "type": "relayed_answer.confirmed",
+                "data": {
+                    "question_revision": question_revision,
+                    "confirmed_by": confirmed_by,
+                },
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+
+
+def _relayed_answer_ungated():
+    """Unlike the module-level `_ungated()` (which only relaxes
+    `design_round`/`question`), this ALSO relaxes `relayed_answer` — needed
+    whenever a test wants `enqueue_relayed_answer`'s two rows to land
+    `pending` and actually reach the drain, rather than exercising the
+    #2903 draft gate."""
+    return _Cfg(_approval(relayed_answer=False))
+
+
+class TestEnqueueRelayedAnswer:
+    def test_queues_the_answer_and_its_own_needs_input_announcement(self):
+        entry = _relayed_answer_entry()
+        answer_row, status_row = enqueue_relayed_answer(SUB, entry, config=_ungated())
+
+        assert answer_row.kind == portal_sync.KIND_RELAYED_ANSWER
+        assert answer_row.fields["relayed_answer"]["text"] == "Yes, offline-first."
+        assert answer_row.fields["relayed_answer"]["question_revision"] == 1
+        assert answer_row.fields["relayed_answer"]["source"] == "phone"
+        assert status_row.kind == portal_sync.KIND_STATUS
+        assert status_row.fields["status"] == "needs-input"
+        assert status_row.requires_kind == portal_sync.KIND_RELAYED_ANSWER
+        assert status_row.announces == "needs-input"
+        assert answer_row.seq < status_row.seq
+
+    def test_refuses_a_non_relayed_ledger_entry(self):
+        entry = portal_store.append_ledger_entry(
+            SUB,
+            portal_store.LEDGER_KIND_QUESTION_ANSWERED,
+            question_revision=1,
+            text="Yes.",
+            actor="customer",
+            payload={},
+        )
+        with pytest.raises(PortalSyncError, match="relayed-answer ledger entry"):
+            enqueue_relayed_answer(SUB, entry)
+
+    def test_refuses_an_empty_answer(self):
+        entry = _relayed_answer_entry(text="   ")
+        with pytest.raises(PortalSyncError, match="non-empty"):
+            enqueue_relayed_answer(SUB, entry)
+
+    def test_default_policy_gates_the_relayed_answer_too(self):
+        gated = _Cfg(_approval())
+        assert portal_sync.initial_outbox_state(
+            portal_sync.KIND_RELAYED_ANSWER, config=gated
+        ) == portal_store.STATE_DRAFT
+
+    def test_a_gated_relayed_answer_lands_in_draft_and_is_never_sent_unapproved(self):
+        entry = _relayed_answer_entry()
+        answer_row, _status_row = enqueue_relayed_answer(
+            SUB, entry, config=_Cfg(_approval())
+        )
+        assert answer_row.state == portal_store.STATE_DRAFT
+        assert answer_row not in portal_store.pending_outbox()
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+        assert "relayed_answer" not in client.pushed_kinds
+        assert result.applied == 0
+
+    def test_editable_draft_field_is_the_answer_text(self):
+        entry = _relayed_answer_entry()
+        answer_row, _status = enqueue_relayed_answer(SUB, entry, config=_Cfg(_approval()))
+        assert portal_store.EDITABLE_DRAFT_FIELDS[answer_row.kind] == (
+            "relayed_answer.text",
+        )
+
+
+class TestRelayedAnswerOrdering:
+    """#835, applied to `relayed_answer`: the mail cannot outrun the row it
+    announces."""
+
+    def test_answer_is_pushed_before_the_status_that_announces_it(self):
+        entry = _relayed_answer_entry()
+        enqueue_relayed_answer(SUB, entry, config=_relayed_answer_ungated())
+        client = FakeClient()
+
+        result = sync_tick(client=client)
+
+        assert client.pushed_kinds == ["relayed_answer", "status"]
+        assert result.applied == 2
+        assert result.held == 0
+
+    def test_announcement_is_held_while_the_answer_is_unconfirmed(self):
+        """The crash-window case, #835's exact shape reproduced for
+        `relayed_answer`: the answer push fails, so the mail must not go."""
+        entry = _relayed_answer_entry()
+        enqueue_relayed_answer(SUB, entry, config=_relayed_answer_ungated())
+        client = FakeClient(push_error=PortalBridgeError("portal is down"))
+
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.applied == 0
+        assert result.errors  # the failure is surfaced, not swallowed
+
+        # Next tick, the portal is back: the answer goes first, then the
+        # announcement — same revisions, no duplicates.
+        client2 = FakeClient()
+        result2 = sync_tick(client=client2)
+        assert client2.pushed_kinds == ["relayed_answer", "status"]
+        assert result2.applied == 2
+
+    def test_second_relayed_answer_cannot_ride_on_the_first_confirmation(self):
+        first = _relayed_answer_entry(question_revision=1, text="First.")
+        answer1, _status1 = enqueue_relayed_answer(SUB, first, config=_ungated())
+        portal_store.mark_applied(answer1)
+
+        second = _relayed_answer_entry(question_revision=1, text="Second.")
+        answer2, status2 = enqueue_relayed_answer(SUB, second, config=_ungated())
+
+        # answer2 is still PENDING (unconfirmed) — the announcement behind it
+        # must wait on IT, the latest, not answer1's already-applied state.
+        reason = ordering_block_reason(status2)
+        assert reason is not None
+        assert f"seq {answer2.seq}" in reason
+
+    def test_gated_relayed_answer_holds_its_own_needs_input_announcement(self):
+        entry = _relayed_answer_entry()
+        answer_row, status_row = enqueue_relayed_answer(
+            SUB, entry, config=_Cfg(_approval())
+        )
+        assert answer_row.state == portal_store.STATE_DRAFT
+        assert status_row.state == portal_store.STATE_PENDING
+
+        client = FakeClient()
+        result = sync_tick(client=client)
+
+        assert client.pushes == []
+        assert result.held == 1
+        held = [
+            r for r in portal_store.outbox_for_submission(SUB) if r.seq == status_row.seq
+        ][0]
+        assert "unapproved draft" in held.reason
+
+
+class TestRelayedAnswerConfirmationFields:
+    def test_recognizes_dotted_kind_with_nested_data(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="relayed_answer.confirmed",
+            occurred_at="", payload={"data": {"question_revision": 1}},
+            received_at=1.0,
+        )
+        fields = portal_sync._relayed_answer_confirmation_fields(event)
+        assert fields == {"question_revision": 1, "confirmed_by": "customer"}
+
+    def test_recognizes_underscore_kind_and_top_level_fields(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="relayed_answer_confirmed",
+            occurred_at="",
+            payload={"revision": "3", "actor": "jane"},
+            received_at=1.0,
+        )
+        fields = portal_sync._relayed_answer_confirmation_fields(event)
+        assert fields == {"question_revision": 3, "confirmed_by": "jane"}
+
+    def test_non_matching_kind_is_none(self) -> None:
+        event = portal_store.PortalEvent(
+            event_id="e1", submission_id=SUB, kind="question.answered",
+            occurred_at="", payload={}, received_at=1.0,
+        )
+        assert portal_sync._relayed_answer_confirmation_fields(event) is None
+
+
+class TestConsumeRelayedAnswerConfirmations:
+    def test_confirmation_is_ledgered_paired_with_its_answer_and_event_marked_handled(
+        self,
+    ) -> None:
+        entry = _relayed_answer_entry(question_revision=1)
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+        client = FakeClient(pages=[_relayed_answer_confirmed_page(question_revision=1)])
+
+        result = sync_tick(client=client)
+
+        assert result.relayed_answer_confirmations_consumed == 1
+        confirmations = [
+            e for e in portal_store.ledger_for_submission(SUB)
+            if e.kind == portal_store.LEDGER_KIND_ANSWER_CONFIRMED
+        ]
+        assert len(confirmations) == 1
+        assert confirmations[0].question_revision == 1
+        assert confirmations[0].actor == "jane"
+        assert portal_store.unhandled_events() == []
+
+    def test_confirmation_and_answer_both_stay_visible_in_the_briefing(self) -> None:
+        pushed = _push_and_apply_question()
+        entry = _relayed_answer_entry(
+            question_revision=pushed.revision, text="Yes, offline-first."
+        )
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+        client = FakeClient(
+            pages=[_relayed_answer_confirmed_page(question_revision=pushed.revision)]
+        )
+        sync_tick(client=client)
+
+        payload = portal_store.render_ledger_payload(SUB)
+        [bucket] = [
+            b for b in payload["qa"] if b["question_revision"] == pushed.revision
+        ]
+        assert len(bucket["answers"]) == 1
+        assert bucket["answers"][0]["relayed"] is True
+        assert len(bucket["confirmations"]) == 1
+
+    def test_a_second_tick_does_not_re_ledger_the_same_confirmation(self) -> None:
+        entry = _relayed_answer_entry(question_revision=1)
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+        client = FakeClient(pages=[_relayed_answer_confirmed_page(question_revision=1)])
+        first = sync_tick(client=client)
+        second = sync_tick(client=FakeClient())
+
+        assert first.relayed_answer_confirmations_consumed == 1
+        assert second.relayed_answer_confirmations_consumed == 0
+        confirmations = [
+            e for e in portal_store.ledger_for_submission(SUB)
+            if e.kind == portal_store.LEDGER_KIND_ANSWER_CONFIRMED
+        ]
+        assert len(confirmations) == 1
+
+    def test_a_correction_lands_as_a_normal_answer_alongside_the_relayed_one(
+        self,
+    ) -> None:
+        """The other half of #2987's acceptance bar: a CORRECTION needs no
+        new consumer — it is an ordinary `question.answered` event, handled
+        by the pre-existing #2749 consumer, and both rows stay visible."""
+        pushed = _push_and_apply_question()
+        entry = _relayed_answer_entry(
+            question_revision=pushed.revision, text="Relayed: yes."
+        )
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+        client = FakeClient(
+            pages=[
+                _question_answered_page(
+                    revision=pushed.revision, answer="Actually, no.",
+                    answered_by="the client", event_id="e2",
+                )
+            ]
+        )
+
+        result = sync_tick(client=client)
+
+        assert result.questions_consumed == 1
+        payload = portal_store.render_ledger_payload(SUB)
+        [bucket] = [
+            b for b in payload["qa"] if b["question_revision"] == pushed.revision
+        ]
+        assert [a["text"] for a in bucket["answers"]] == [
+            "Relayed: yes.", "Actually, no.",
+        ]
+        assert [a["relayed"] for a in bucket["answers"]] == [True, False]
+
+    def test_a_ledger_write_failure_freezes_the_watermark_for_retry(
+        self, monkeypatch
+    ) -> None:
+        entry = _relayed_answer_entry(question_revision=1)
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+
+        real_append = portal_store.append_ledger_entry
+
+        def _boom(submission_id, kind, **kw):
+            if kind == portal_store.LEDGER_KIND_ANSWER_CONFIRMED:
+                raise RuntimeError("database is locked")
+            return real_append(submission_id, kind, **kw)
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", _boom)
+
+        client = FakeClient(pages=[_relayed_answer_confirmed_page(question_revision=1)])
+        result = sync_tick(client=client)
+
+        assert result.relayed_answer_confirmations_consumed == 0
+        assert any("database is locked" in e for e in result.errors)
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", real_append)
+        retry = sync_tick(client=FakeClient())
+        assert retry.relayed_answer_confirmations_consumed == 1
+        assert portal_store.unhandled_events() == []
+
+    def test_a_large_non_actionable_backlog_does_not_starve_a_later_confirmation(
+        self,
+    ) -> None:
+        entry = _relayed_answer_entry(question_revision=1)
+        enqueue_relayed_answer(SUB, entry, config=_ungated())
+        noise = [
+            {"id": f"noise-{i}", "submission_id": SUB, "type": "created"} for i in range(150)
+        ]
+        portal_store.record_events(noise)
+        confirm_event = _relayed_answer_confirmed_page(question_revision=1)["events"][0]
+        portal_store.record_events([confirm_event])
+
+        consumed = 0
+        for _ in range(5):
+            consumed, _errors = portal_sync._consume_relayed_answer_confirmations(
+                None, limit=50, pages=1
+            )
+            if consumed:
+                break
+
+        assert consumed == 1
+
+
+class TestAnswerQuestionPushesOutbound:
+    """#2987 acceptance criterion #1: `coord portal answer` (#2986) enqueues
+    the relayed answer outbound, draft-gated, going through
+    `portal_store.answer_question` exactly as `coord portal answer` and the
+    dashboard/daemon seams all do — not `enqueue_relayed_answer` directly."""
+
+    def test_answering_a_pushed_question_enqueues_a_relayed_answer_row(self) -> None:
+        row = _push_and_apply_question()
+
+        portal_store.answer_question(SUB, "Yes, offline-first.", source="phone", actor="jane")
+
+        relayed_rows = [
+            r for r in portal_store.outbox_for_submission(SUB)
+            if r.kind == portal_sync.KIND_RELAYED_ANSWER
+        ]
+        assert len(relayed_rows) == 1
+        assert relayed_rows[0].fields["relayed_answer"]["question_revision"] == (
+            row.revision
+        )
+        assert relayed_rows[0].fields["relayed_answer"]["text"] == "Yes, offline-first."
+        # Gated by default (no config passed here — the ungating fixture
+        # only relaxes design_round/question, matching production's real
+        # default policy for relayed_answer): a human must approve it.
+        assert relayed_rows[0].state == portal_store.STATE_DRAFT
+
+    def test_a_failure_to_enqueue_never_breaks_the_ledger_write(self, monkeypatch) -> None:
+        """#2179's failure posture, at the OUTBOUND-enqueue layer: even if
+        queuing to the portal blows up, the answer stays recorded locally
+        and `answer_question` does not raise."""
+        _push_and_apply_question()
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(portal_sync, "enqueue_relayed_answer", _boom)
+
+        entry = portal_store.answer_question(SUB, "Yes.", actor="jane")
+
+        assert entry.text == "Yes."
+        assert entry.payload == {"relayed": True, "source": "verbal"}
+        assert [
+            e for e in portal_store.ledger_for_submission(SUB)
+            if e.kind == portal_store.LEDGER_KIND_QUESTION_ANSWERED
+        ] == [entry]
+        assert [
+            r for r in portal_store.outbox_for_submission(SUB)
+            if r.kind == portal_sync.KIND_RELAYED_ANSWER
+        ] == []
