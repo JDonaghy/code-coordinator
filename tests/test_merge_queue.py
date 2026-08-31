@@ -1008,6 +1008,12 @@ class TestProcessRealGithubOpsChokepoint:
     This exercises the actual #1196 chokepoint end to end: both hole 1 (a
     "work" assignment whose issue_number IS the epic) and hole 2 (the PR
     body's own `Closes #<epic>` keyword) in one pass.
+
+    The `fake_gh` stubs below take `**_kwargs` (#2988): `_gh` now carries a
+    `caller=` attribution tag that every `github_ops` call site passes, and a
+    positional-only stub would raise TypeError instead of answering. These
+    tests assert on which `gh` subcommand ran, never on `_gh`'s keywords, so
+    absorbing them is the intended shape — not a loosened assertion.
     """
 
     def test_type_work_direct_on_epic_with_open_child_stays_open(
@@ -1020,7 +1026,7 @@ class TestProcessRealGithubOpsChokepoint:
             "labels": [], "body": "## Sub-issues\n- [ ] #1039\n- [x] #1040\n",
         })
 
-        def fake_gh(*args: str) -> str:
+        def fake_gh(*args: str, **_kwargs: object) -> str:
             if args[:2] == ("pr", "list"):
                 return "[]"
             if args[:2] == ("pr", "create"):
@@ -1085,7 +1091,7 @@ class TestProcessRealGithubOpsChokepoint:
         })
         calls: list[tuple[str, ...]] = []
 
-        def fake_gh(*args: str) -> str:
+        def fake_gh(*args: str, **_kwargs: object) -> str:
             calls.append(args)
             if args[:2] == ("pr", "list"):
                 return "[]"
@@ -1139,7 +1145,7 @@ class TestProcessRealGithubOpsChokepoint:
             "labels": [], "body": "",
         })
 
-        def fake_gh(*args: str) -> str:
+        def fake_gh(*args: str, **_kwargs: object) -> str:
             if args[:2] == ("pr", "list"):
                 return "[]"
             if args[:2] == ("pr", "create"):
