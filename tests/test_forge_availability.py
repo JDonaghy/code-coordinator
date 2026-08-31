@@ -11,7 +11,12 @@ Scope per the issue's acceptance bar:
   contiguous unavailable stretch, and refusal counts by reason correctly
   over a seeded set of observations, identically whether those observations
   arrived as raw per-row writes or as rolled-up aggregates;
-- the retention sweep bounds growth without deleting recent data.
+- the retention sweep bounds growth without deleting recent data;
+- #2988: every `gh_call` row carries a normalised subcommand `shape` and a
+  non-empty `caller` tag (never the pre-#2988 `argv0`-only key), the
+  `ok`-aggregate buckets on `(caller, shape)`, and templated shapes actually
+  collapse volume (851 distinct branch refs -> ONE shape key) -- see
+  TestGhCallShape / TestCallerAttribution below.
 """
 
 from __future__ import annotations
@@ -29,9 +34,11 @@ from coord.forge_availability import (
     RETENTION_DAYS,
     _OkAggregate,
     _flush_all_ok_aggregates,
+    _infer_caller_tag,
     _maybe_prune,
     availability_report,
     format_report_lines,
+    gh_call_shape,
     record_ci_check_fetch,
     record_gh_call,
     record_merge_gate_refusal,
@@ -72,7 +79,8 @@ class TestRecordGhCall:
         assert details["outcome"] == "ok"
         assert details["count"] == 1
         assert details["duration_s_total"] == pytest.approx(0.42)
-        assert details["argv0"] == "pr"
+        assert details["shape"] == "pr view {n}"
+        assert details["caller"] == "tests.test_forge_availability"
 
     def test_records_unreachable_outcome(self, coord_db) -> None:
         record_gh_call(("pr", "view"), outcome="unreachable", duration_s=30.0,
@@ -158,13 +166,33 @@ class TestOkRollup:
         assert other_details["count"] == 1
         assert other_details["conclusions"] == {"success": 1}
 
-    def test_different_argv0_get_separate_aggregates(self, coord_db) -> None:
+    def test_different_shapes_get_separate_aggregates(self, coord_db) -> None:
         record_gh_call(("pr",), outcome="ok", duration_s=0.1)
         record_gh_call(("issue",), outcome="ok", duration_s=0.1)
         _flush_all_ok_aggregates()
 
         rows = _details(coord_db, event_type="gh_call")
-        assert {r["argv0"] for r in rows} == {"pr", "issue"}
+        assert {r["shape"] for r in rows} == {"pr", "issue"}
+        assert all(r["count"] == 1 for r in rows)
+
+    def test_different_callers_of_the_same_shape_get_separate_aggregates(
+        self, coord_db
+    ) -> None:
+        """#2988: the bucket key is `(caller, shape)`, not `shape` alone --
+        two different code paths hitting the exact same endpoint class must
+        not be folded into one aggregate, or the whole point of this issue
+        (attributing volume to a caller) is lost."""
+        record_gh_call(("pr", "view", "1"), outcome="ok", duration_s=0.1,
+                        caller="coord.reconcile")
+        record_gh_call(("pr", "view", "2"), outcome="ok", duration_s=0.1,
+                        caller="coord.drive")
+        _flush_all_ok_aggregates()
+
+        rows = _details(coord_db, event_type="gh_call")
+        assert {(r["caller"], r["shape"]) for r in rows} == {
+            ("coord.reconcile", "pr view {n}"),
+            ("coord.drive", "pr view {n}"),
+        }
         assert all(r["count"] == 1 for r in rows)
 
     def test_bucket_roll_flushes_the_old_bucket_and_starts_a_new_one(
@@ -237,6 +265,121 @@ class TestOkRollup:
 
         assert _rows(coord_db) == []
         assert fa._ok_aggregates == {}
+
+
+class TestGhCallShape:
+    """#2988: `gh_call_shape` -- `argv[0]` plus a normalised `argv[1]`/
+    `argv[2]` identifying the endpoint CLASS, with volatile parts (branch
+    names, issue/PR numbers, owner/repo pairs) templated out so they
+    aggregate instead of minting a fresh key per call."""
+
+    def test_851_distinct_branch_refs_collapse_to_one_shape(self) -> None:
+        """The issue's own acceptance bar, verbatim: 851 distinct branch
+        refs must collapse to ONE shape key, not 851."""
+        shapes = {
+            gh_call_shape(("api", f"repos/acme/api/git/refs/heads/issue-{i}-x"))
+            for i in range(851)
+        }
+        assert shapes == {"api repos/{owner}/{repo}/git/refs/heads/{branch}"}
+
+    def test_repo_path_templates_owner_and_repo(self) -> None:
+        assert (
+            gh_call_shape(("api", "repos/acme/api/issues/123"))
+            == "api repos/{owner}/{repo}/issues/{issue}"
+        )
+        assert (
+            gh_call_shape(("api", "repos/other-org/other-repo/issues/999"))
+            == "api repos/{owner}/{repo}/issues/{issue}"
+        )
+
+    def test_positional_pr_number_is_templated(self) -> None:
+        assert gh_call_shape(("pr", "view", "123", "--repo", "acme/api")) == "pr view {n}"
+        assert gh_call_shape(("pr", "view", "456", "--repo", "acme/api")) == "pr view {n}"
+
+    def test_subcommand_words_are_not_templated(self) -> None:
+        assert gh_call_shape(("issue", "list", "--repo", "acme/api")) == "issue list"
+        assert gh_call_shape(("pr", "diff")) == "pr diff"
+
+    def test_query_string_is_stripped(self) -> None:
+        assert (
+            gh_call_shape(("api", "repos/acme/api/pulls/7/commits?per_page=100"))
+            == "api repos/{owner}/{repo}/pulls/{pr}/commits"
+        )
+
+    def test_flag_values_never_enter_the_shape(self) -> None:
+        """A flag's VALUE (a repo slug, a JSON field list, a PR body) must
+        never leak into the shape -- only the bare positional words before
+        the first flag do. This is also the #2988 "no URL/token/path"
+        guarantee: nothing past the first `-`-prefixed token is ever
+        inspected."""
+        shape = gh_call_shape((
+            "issue", "edit", "42", "--repo", "acme/api",
+            "--body", "see https://example.com/secret-token-abc123",
+        ))
+        assert "example.com" not in shape
+        assert "secret-token" not in shape
+        assert shape == "issue edit {n}"
+
+    def test_empty_argv(self) -> None:
+        assert gh_call_shape(()) == "(no args)"
+
+    def test_graphql_query_body_is_not_in_the_shape(self) -> None:
+        """`-f query=...` bodies can carry issue numbers / repo names in
+        free text -- must never enter the shape (privacy + aggregation)."""
+        shape = gh_call_shape((
+            "api", "graphql", "-f", "query={ repository(owner: \"acme\") { id } }",
+        ))
+        assert shape == "api graphql"
+
+
+class TestCallerAttribution:
+    """#2988: every `record_gh_call` row carries a non-empty `caller` tag --
+    an explicit one when given, else a module-name fallback -- so no row can
+    ever record the pre-#2988 empty/absent attribution."""
+
+    def test_explicit_caller_is_recorded_verbatim(self, coord_db) -> None:
+        record_gh_call(
+            ("pr", "view", "1"), outcome="unreachable", duration_s=1.0,
+            caller="reconcile:false_merge_audit",
+        )
+        details = _details(coord_db, event_type="gh_call")
+        assert details[0]["caller"] == "reconcile:false_merge_audit"
+
+    def test_missing_caller_falls_back_to_a_non_empty_module_name(self, coord_db) -> None:
+        """No call site -- tagged or not -- can ever record an empty
+        `caller`. A call site that doesn't pass one gets the calling
+        module's dotted name instead (module docstring: 'documented default
+        that names the module')."""
+        record_gh_call(("pr", "view"), outcome="unreachable", duration_s=1.0)
+        details = _details(coord_db, event_type="gh_call")
+        assert details[0]["caller"]
+        assert details[0]["caller"] == "tests.test_forge_availability"
+
+    def test_infer_caller_tag_never_returns_empty(self) -> None:
+        assert _infer_caller_tag()
+
+    def test_group_by_caller_answers_who_made_the_most_calls(self, coord_db) -> None:
+        """The issue's own acceptance query, run for real against a seeded
+        DB: `SELECT caller_tag, SUM(count) ... GROUP BY 1` (expressed here
+        as `json_extract` over `details_json`, since `caller`/`count` live
+        inside the JSON blob, same as every other audit_log detail)."""
+        record_gh_call(("pr", "view", "1"), outcome="ok", duration_s=0.1,
+                        caller="coord.reconcile")
+        record_gh_call(("pr", "view", "2"), outcome="ok", duration_s=0.1,
+                        caller="coord.reconcile")
+        record_gh_call(("issue", "list"), outcome="ok", duration_s=0.1,
+                        caller="coord.drive")
+        _flush_all_ok_aggregates()
+
+        rows = coord_db.execute(
+            "SELECT json_extract(details_json, '$.caller') AS caller_tag, "
+            "       SUM(json_extract(details_json, '$.count')) AS total "
+            "FROM audit_log WHERE category=? AND event_type=? "
+            "GROUP BY caller_tag ORDER BY total DESC",
+            (CATEGORY, EVENT_GH_CALL),
+        ).fetchall()
+        totals = {r["caller_tag"]: r["total"] for r in rows}
+        assert totals == {"coord.reconcile": 2, "coord.drive": 1}
 
 
 class TestRecordCiCheckFetch:
@@ -469,7 +612,7 @@ class TestRetentionSweep:
 
         rows = _rows(coord_db)
         assert len(rows) == 1
-        assert json.loads(rows[0]["details_json"])["argv0"] == "new"
+        assert json.loads(rows[0]["details_json"])["shape"] == "new"
 
     def test_prune_never_touches_other_categories(self, coord_db) -> None:
         from coord.audit import record_audit

@@ -591,7 +591,7 @@ class TestIssueCloseCli:
         # refusal clearly" acceptance bar, exercised through the real
         # github_ops.close_issue guard (only the `gh` subprocess boundary
         # is mocked), not a stand-in exception.
-        def fake_gh(*args: str) -> str:
+        def fake_gh(*args: str, **_kwargs) -> str:
             if args[:2] == ("issue", "view"):
                 return (
                     '{"number": 1041, "body": "## Sub-issues\\n- [ ] #1039\\n", '

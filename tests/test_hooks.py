@@ -182,7 +182,7 @@ class TestRunHooks:
                        issue_title="Epic", status="done", assignment_id="w1"),
         ])
 
-        def fake_gh(*args: str) -> str:
+        def fake_gh(*args: str, **_kwargs) -> str:
             if args[:2] == ("issue", "view"):
                 return (
                     '{"number": 1041, "body": "## Sub-issues\\n- [ ] #1039\\n'

@@ -519,7 +519,7 @@ def _fake_gh_dispatch(issue_body_json: str, graphql: str | Exception):
     body, ``api graphql`` returns (or raises) the live-state batch lookup —
     the two `_gh` calls `get_open_children` now makes per invocation (#1354)."""
 
-    def _fake(*args: str) -> str:
+    def _fake(*args: str, **_kwargs) -> str:
         if args[:2] == ("issue", "view"):
             return issue_body_json
         if args[:2] == ("api", "graphql"):
@@ -893,7 +893,7 @@ class TestChangeIssueLabelsAutoCreate:
         """
         edit_calls = {"n": 0}
 
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             calls.append(args)
             if args[0] == "issue" and args[1] == "view":
                 return _CURRENT_LABELS_JSON
@@ -952,7 +952,7 @@ class TestChangeIssueLabelsAutoCreate:
             "GraphQL: Could not resolve to a Label with the name 'phantom'."
         )
 
-        def _always_fail(*args: str) -> str:
+        def _always_fail(*args: str, **_kwargs) -> str:
             if args[0] == "issue" and args[1] == "view":
                 return _CURRENT_LABELS_JSON
             if args[0] == "issue" and args[1] == "edit":
@@ -972,7 +972,7 @@ class TestChangeIssueLabelsAutoCreate:
         )
         create_called = {"v": False}
 
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             if args[0] == "issue" and args[1] == "view":
                 return _CURRENT_LABELS_JSON
             if args[0] == "label" and args[1] == "create":
@@ -1000,7 +1000,7 @@ class TestChangeIssueLabelsAutoCreate:
         network_error = "gh issue edit 7 --repo acme/api failed: connection refused"
         edit_calls = {"n": 0}
 
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             if args[0] == "issue" and args[1] == "view":
                 return _CURRENT_LABELS_JSON
             if args[0] == "label" and args[1] == "create":
@@ -1029,7 +1029,7 @@ class TestChangeIssueLabelsAutoCreate:
         )
         create_called = {"v": False}
 
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             if args[0] == "issue" and args[1] == "view":
                 return json.dumps({"labels": [{"name": "existing"}]})
             if args[0] == "label" and args[1] == "create":
@@ -1070,7 +1070,8 @@ class TestGetIssueComments:
             comments = github_ops.get_issue_comments("acme/api", 42)
         assert comments == [{"body": "hi", "url": "u"}]
         mock_gh.assert_called_once_with(
-            "issue", "view", "42", "--repo", "acme/api", "--json", "comments"
+            "issue", "view", "42", "--repo", "acme/api", "--json", "comments",
+            caller="github_ops.get_issue_comments",
         )
 
     def test_returns_empty_list_when_no_comments_key(self) -> None:
@@ -1124,7 +1125,7 @@ class TestPostIssueCommentCaptureAtWrite:
         """close_issue posts its --comment through post_issue_comment, so
         the capture hook fires for it without any separate instrumentation."""
 
-        def _dispatch(*args: str) -> str:
+        def _dispatch(*args: str, **_kwargs) -> str:
             if args[0] == "issue" and args[1] == "comment":
                 return "https://github.com/acme/api/issues/42#issuecomment-99"
             return ""
@@ -1651,7 +1652,9 @@ class TestGetBranchSha:
             return_value=json.dumps({"commit": {"sha": "abc123"}}),
         ) as gh_mock:
             github_ops.get_branch_sha("acme/api", "main")
-        gh_mock.assert_called_once_with("api", "-i", "repos/acme/api/branches/main")
+        gh_mock.assert_called_once_with(
+            "api", "-i", "repos/acme/api/branches/main", caller="github_ops.get_branch_sha",
+        )
 
     def test_success_tolerates_a_bare_gh_stub_with_no_include_headers(self) -> None:
         """A test double (or an old `gh`) that just hands back plain JSON
@@ -1733,7 +1736,10 @@ class TestGetDefaultBranchHead:
         ) as gh_mock:
             sha = github_ops.get_default_branch_head("acme/api", "main")
         assert sha == "abc123"
-        gh_mock.assert_called_once_with("api", "-i", "repos/acme/api/branches/main")
+        gh_mock.assert_called_once_with(
+            "api", "-i", "repos/acme/api/branches/main",
+            caller="github_ops.get_default_branch_head",
+        )
 
     def test_strips_include_headers_before_parsing_json(self) -> None:
         raw = (
@@ -2285,7 +2291,8 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
-        assert details[-1]["argv0"] == "issue"
+        assert details[-1]["shape"] == "issue close {n}"
+        assert details[-1]["caller"] == "github_ops.close_issue"
 
     def test_close_issue_already_closed_still_records_and_does_not_raise(
         self, coord_db,
@@ -2332,7 +2339,8 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
-        assert details[-1]["argv0"] == "issue"
+        assert details[-1]["shape"] == "issue edit {n}"
+        assert details[-1]["caller"] == "github_ops.edit_issue"
 
     def test_edit_issue_failure_records_app_error_and_raises(self, coord_db) -> None:
         with patch(
@@ -2351,7 +2359,8 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
-        assert details[-1]["argv0"] == "run"
+        assert details[-1]["shape"] == "run rerun {n}"
+        assert details[-1]["caller"] == "github_ops.rerun_workflow_run"
 
     def test_rerun_workflow_run_gh_missing_records_unreachable(self, coord_db) -> None:
         with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
@@ -2366,7 +2375,8 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         _flush_all_ok_aggregates()  # #2654: "ok" observations buffer until flushed
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "ok"
-        assert details[-1]["argv0"] == "run"
+        assert details[-1]["shape"] == "run rerun {n}"
+        assert details[-1]["caller"] == "github_ops.rerun_workflow_run_failed"
 
     def test_rerun_workflow_run_failed_nonzero_exit_records_app_error(
         self, coord_db,

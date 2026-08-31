@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime
 from typing import Any, NamedTuple
@@ -448,8 +449,49 @@ def _parse_gh_include(raw: str) -> tuple[GhResponseMeta, str]:
     return GhResponseMeta(status, request_id, retry_after), body
 
 
-def _gh(*args: str, force_through_backoff: bool = False) -> str:
+def _resolve_caller(explicit: str) -> str:
+    """#2988: the caller tag threaded into :func:`coord.forge_availability.
+    record_gh_call`, so GitHub call volume is attributable to a code path
+    instead of just an endpoint class (``argv[0]``).
+
+    An *explicit* tag always wins -- that's the ~85 call sites in this
+    module that name themselves (``caller="github_ops.get_issue"``, etc.):
+    a hand-picked tag survives refactors, is greppable, and costs nothing at
+    runtime, which a stack walk on every single ``gh`` call would not.
+
+    When a call site hasn't been given one (``explicit == ""`` — every
+    caller *outside* this module that still calls :func:`_gh`/
+    :func:`_gh_json`/:func:`_gh_input_json` directly, e.g. ``coord.claim``,
+    ``coord.smoke``, ``coord.refine_chat``), this falls back to the
+    immediate calling module's dotted name via a stack walk. Coarser than a
+    hand-picked tag (can't distinguish two call sites in the same module),
+    but every row still carries a real, non-empty, greppable value instead
+    of the pre-#2988 argv[0]-only key -- that's the acceptance bar, not
+    maximal precision. ``sys._getframe(2)``: frame 0 is this function,
+    frame 1 is the ``_gh``/``_gh_json``/``_gh_input_json`` call that invoked
+    it, frame 2 is whoever called *that* -- correct for all three funnels
+    because each resolves its own ``caller`` in its own body, before doing
+    any further calling (see e.g. ``_gh_json`` resolving before it calls
+    ``_gh``, so ``_gh``'s own resolution is always a no-op in that path).
+    """
+    if explicit:
+        return explicit
+    try:
+        frame = sys._getframe(2)
+        name = frame.f_globals.get("__name__", "")
+        return name or "unknown"
+    except Exception:  # noqa: BLE001 -- best-effort; never break a gh call over this
+        return "unknown"
+
+
+def _gh(*args: str, caller: str = "", force_through_backoff: bool = False) -> str:
     """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
+
+    *caller* (#2988): a short tag identifying the code path making this
+    call (e.g. ``"github_ops.get_issue"``), threaded straight into
+    :func:`coord.forge_availability.record_gh_call` so GitHub call volume is
+    attributable. Resolved via :func:`_resolve_caller` when not given
+    explicitly -- see that function's docstring.
 
     #1483: this is the single seam every ``_gh``-backed helper in this module
     funnels through, so it is also the single place that must absorb the
@@ -491,6 +533,7 @@ def _gh(*args: str, force_through_backoff: bool = False) -> str:
     protect (this flag is not theirs to set); it only stops a rare,
     low-frequency caller from being permanently outbid by them.
     """
+    caller = _resolve_caller(caller)
     backoff_sleep_s, active_backoff = github_throttle.consult()
     if active_backoff is not None:
         remaining = active_backoff.until - time.time()
@@ -499,7 +542,7 @@ def _gh(*args: str, force_through_backoff: bool = False) -> str:
             # request to a limiter that only recovers when the rate drops.
             # This is not a fresh observation, so it is not re-recorded.
             record_gh_call(
-                args, outcome="transient", duration_s=0.0,
+                args, outcome="transient", duration_s=0.0, caller=caller,
                 detail=(
                     f"skipped: coordinated backoff active ({active_backoff.reason}, "
                     f"{remaining:.0f}s remaining)"
@@ -531,15 +574,15 @@ def _gh(*args: str, force_through_backoff: bool = False) -> str:
         )
     except FileNotFoundError as exc:
         record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
-                        detail="gh not found")
+                        detail="gh not found", caller=caller)
         raise GhError(f"gh {' '.join(args)} failed: gh not found: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
-                        detail="timed out")
+                        detail="timed out", caller=caller)
         raise GhError(f"gh {' '.join(args)} failed: timed out: {exc}") from exc
     except OSError as exc:
         record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
-                        detail=str(exc))
+                        detail=str(exc), caller=caller)
         raise GhError(f"gh {' '.join(args)} failed: {exc}") from exc
     duration = time.monotonic() - _t0
     if result.returncode != 0:
@@ -547,7 +590,8 @@ def _gh(*args: str, force_through_backoff: bool = False) -> str:
         # #1896: distinguish a transient forge/auth/network failure (an
         # availability signal) from an ordinary application-level error like
         # "label not found" (not one) — see `_classify_gh_exit`.
-        record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration, detail=stderr)
+        record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration,
+                        detail=stderr, caller=caller)
         is_rate_limit, is_secondary = _classify_rate_limit(stderr)
         if is_rate_limit:
             if not is_secondary:
@@ -581,7 +625,7 @@ def _gh(*args: str, force_through_backoff: bool = False) -> str:
                 secondary=is_secondary,
             )
         raise RuntimeError(f"gh {' '.join(args)} failed: {stderr}")
-    record_gh_call(args, outcome="ok", duration_s=duration)
+    record_gh_call(args, outcome="ok", duration_s=duration, caller=caller)
     return result.stdout.strip()
 
 
@@ -614,7 +658,9 @@ def _json_loads_or(raw: str | None, default: Any = None) -> Any:
         return default
 
 
-def _gh_json(*args: str, default: Any = None, force_through_backoff: bool = False) -> Any:
+def _gh_json(
+    *args: str, default: Any = None, caller: str = "", force_through_backoff: bool = False,
+) -> Any:
     """Run ``gh`` with *args* and JSON-decode its stdout, failing open.
 
     Composes :func:`_gh` (still raises on a non-zero ``gh`` exit / missing
@@ -622,19 +668,30 @@ def _gh_json(*args: str, default: Any = None, force_through_backoff: bool = Fals
     empty/malformed stdout from an otherwise-successful invocation). See
     :func:`_json_loads_or` for why this exists.
 
+    *caller* (#2988): resolved via :func:`_resolve_caller` — same as
+    :func:`_gh` — *before* calling :func:`_gh`, so the module name inferred
+    (when no explicit tag was given) names whoever called ``_gh_json``, not
+    ``_gh_json`` itself. Always passed to :func:`_gh` explicitly from here on
+    (never omitted), unlike *force_through_backoff* below — seeing this
+    module's own ~85 call sites hand-tag themselves already changed most
+    ``_gh_json``-mocking tests' expected call args regardless, so there was
+    no longer a "keep every OTHER call site's exact signature" case to
+    preserve for this parameter the way there was pre-#2988.
+
     *force_through_backoff* passes straight through to :func:`_gh` — see its
     docstring (#2858). Deliberately omitted from the call entirely (rather
-    than forwarded as an explicit ``False``) when unset: a bare ``_gh(*args)``
-    keeps every OTHER ``_gh_json``-based call site's exact pre-#2858 call
-    signature, which matters because several tests mock ``_gh`` directly and
-    assert on its exact call args — forwarding an always-present keyword
-    would have changed every one of those, not just the callers that
-    actually use this.
+    than forwarded as an explicit ``False``) when unset: a bare
+    ``_gh(*args, caller=caller)`` keeps every OTHER ``_gh_json``-based call
+    site's call args free of a stray ``force_through_backoff=False``, which
+    matters because several tests mock ``_gh`` directly and assert on its
+    exact call args — forwarding an always-present keyword would have
+    changed every one of those, not just the callers that actually use this.
     """
+    caller = _resolve_caller(caller)
     if force_through_backoff:
-        raw = _gh(*args, force_through_backoff=True)
+        raw = _gh(*args, caller=caller, force_through_backoff=True)
     else:
-        raw = _gh(*args)
+        raw = _gh(*args, caller=caller)
     return _json_loads_or(raw, default)
 
 
@@ -653,8 +710,7 @@ def get_open_issues(repo: str, *, force_through_backoff: bool = False) -> list[d
         "--json", "number,title,labels,milestone,body,assignees",
         "--limit", "500",
         default=[],
-        force_through_backoff=force_through_backoff,
-    )
+        force_through_backoff=force_through_backoff, caller="github_ops.get_open_issues")
 
 
 def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
@@ -672,8 +728,7 @@ def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
         "issue", "list", "--repo", repo, "--state", "closed", "--label", label,
         "--json", "number,title,labels,milestone,body,assignees",
         "--limit", "500",
-        default=[],
-    )
+        default=[], caller="github_ops.get_closed_epics")
 
 
 def get_issue(repo: str, issue_number: int) -> dict:
@@ -692,8 +747,7 @@ def get_issue(repo: str, issue_number: int) -> dict:
     return _gh_json(
         "issue", "view", str(issue_number), "--repo", repo,
         "--json", "number,title,body,state,milestone,labels",
-        default={},
-    )
+        default={}, caller="github_ops.get_issue")
 
 
 # ── Sub-issues (#1195) ───────────────────────────────────────────────────────
@@ -717,7 +771,8 @@ def get_sub_issues(repo: str, issue_number: int) -> list[dict]:
     the API's normal response, not a 404/410 — see #1195's filing notes).
     Each item is a full issue object; callers only need ``number``/``state``.
     """
-    return _gh_json("api", f"repos/{repo}/issues/{issue_number}/sub_issues", default=[])
+    return _gh_json("api", f"repos/{repo}/issues/{issue_number}/sub_issues", default=[],
+        caller="github_ops.get_sub_issues")
 
 
 def get_issue_parent(repo: str, issue_number: int) -> dict | None:
@@ -728,7 +783,8 @@ def get_issue_parent(repo: str, issue_number: int) -> dict | None:
     needed). ``None`` covers both "field absent" and the documented
     ``parent: null`` shape.
     """
-    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".parent")
+    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".parent",
+        caller="github_ops.get_issue_parent")
     stripped = raw.strip()
     if not stripped or stripped == "null":
         return None
@@ -738,7 +794,8 @@ def get_issue_parent(repo: str, issue_number: int) -> dict | None:
 def _resolve_issue_id(repo: str, issue_number: int) -> int:
     """Issue `number` -> internal database `id` (#1195's write-path gotcha:
     the sub-issues POST/DELETE endpoints want the latter, not the former)."""
-    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".id")
+    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".id",
+        caller="github_ops._resolve_issue_id")
     return int(raw.strip())
 
 
@@ -751,8 +808,7 @@ def add_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
     _gh(
         "api", f"repos/{repo}/issues/{parent_number}/sub_issues",
         "-X", "POST",
-        "-F", f"sub_issue_id={child_id}",
-    )
+        "-F", f"sub_issue_id={child_id}", caller="github_ops.add_sub_issue")
 
 
 def remove_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
@@ -763,8 +819,7 @@ def remove_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
     _gh(
         "api", f"repos/{repo}/issues/{parent_number}/sub_issue",
         "-X", "DELETE",
-        "-F", f"sub_issue_id={child_id}",
-    )
+        "-F", f"sub_issue_id={child_id}", caller="github_ops.remove_sub_issue")
 
 
 def edit_issue(
@@ -802,17 +857,18 @@ def edit_issue(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.edit_issue")
         raise
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr, caller="github_ops.edit_issue")
         raise RuntimeError(
             f"gh issue edit #{issue_number} failed: {stderr}"
         )
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration, caller="github_ops.edit_issue")
 
 
 def create_milestone(
@@ -837,7 +893,7 @@ def create_milestone(
         args += ["-f", f"description={description}"]
     if due_on is not None:
         args += ["-f", f"due_on={due_on}"]
-    return _json_loads_or(_gh(*args), default={})
+    return _json_loads_or(_gh(*args, caller="github_ops.create_milestone"), default={})
 
 
 def edit_milestone(
@@ -861,7 +917,7 @@ def edit_milestone(
         args += ["-f", f"description={description}"]
     if due_on is not None:
         args += ["-f", f"due_on={due_on}"]
-    return _json_loads_or(_gh(*args), default={})
+    return _json_loads_or(_gh(*args, caller="github_ops.edit_milestone"), default={})
 
 
 class IssueHasOpenChildrenError(RuntimeError):
@@ -910,7 +966,8 @@ def get_issues_live_state(repo: str, numbers: list[int]) -> dict[int, str]:
         f"}} }}"
     )
     try:
-        data = _gh_json("api", "graphql", "-f", f"query={query}", default={})
+        data = _gh_json("api", "graphql", "-f", f"query={query}", default={},
+            caller="github_ops.get_issues_live_state")
     except RuntimeError:
         return {}
     data_field = data.get("data") if isinstance(data, dict) else None
@@ -1068,19 +1125,21 @@ def close_issue(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.close_issue")
         raise
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr, caller="github_ops.close_issue")
         if "already closed" not in stderr.lower():
             raise RuntimeError(
                 f"gh issue close #{issue_number} failed: {stderr}"
             )
     else:
-        record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+        record_gh_call(tuple(args), outcome="ok", duration_s=duration,
+                        caller="github_ops.close_issue")
 
 
 def reopen_issue(
@@ -1111,19 +1170,21 @@ def reopen_issue(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.reopen_issue")
         raise
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr, caller="github_ops.reopen_issue")
         if "already open" not in stderr.lower():
             raise RuntimeError(
                 f"gh issue reopen #{issue_number} failed: {stderr}"
             )
     else:
-        record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+        record_gh_call(tuple(args), outcome="ok", duration_s=duration,
+                        caller="github_ops.reopen_issue")
 
 
 def check_pr_mergeable(repo: str, number: int) -> bool | None:
@@ -1146,8 +1207,7 @@ def check_pr_mergeable(repo: str, number: int) -> bool | None:
     try:
         value = _gh_json(
             "pr", "view", str(number), "--repo", repo, "--json", "mergeable",
-            default={},
-        ).get("mergeable")
+            default={}, caller="github_ops.check_pr_mergeable").get("mergeable")
     except Exception:  # noqa: BLE001 — fail-safe: unknown mergeability blocks nothing
         return None
     if value == "MERGEABLE":
@@ -1183,7 +1243,8 @@ def branch_has_merge_commit(repo: str, number: int) -> bool | None:
     inconclusive read).
     """
     try:
-        raw = _gh("api", f"repos/{repo}/pulls/{number}/commits?per_page=100")
+        raw = _gh("api", f"repos/{repo}/pulls/{number}/commits?per_page=100",
+            caller="github_ops.branch_has_merge_commit")
         commits = json.loads(raw)
     except Exception:  # noqa: BLE001 — fail-safe: unknown parents blocks nothing
         return None
@@ -1199,12 +1260,13 @@ def get_pr_body(repo: str, number: int) -> str:
     """Return PR *number*'s current body text (empty string if unset)."""
     return _gh_json(
         "pr", "view", str(number), "--repo", repo, "--json", "body", default={},
-    ).get("body") or ""
+            caller="github_ops.get_pr_body").get("body") or ""
 
 
 def edit_pr_body(repo: str, number: int, body: str) -> None:
     """Overwrite PR *number*'s body text via ``gh pr edit --body``."""
-    _gh("pr", "edit", str(number), "--repo", repo, "--body", body)
+    _gh("pr", "edit", str(number), "--repo", repo, "--body", body,
+        caller="github_ops.edit_pr_body")
 
 
 def get_pr_commit_messages(repo: str, number: int) -> list[str]:
@@ -1221,7 +1283,8 @@ def get_pr_commit_messages(repo: str, number: int) -> list[str]:
     fail-open posture as :func:`get_pr_body`.
     """
     try:
-        raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "commits")
+        raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "commits",
+            caller="github_ops.get_pr_commit_messages")
     except RuntimeError:
         return []
     data = _json_loads_or(raw, default={})
@@ -1286,8 +1349,7 @@ def pr_is_merged(repo: str, branch: str) -> bool:
         raw = _gh(
             "pr", "list", "--repo", repo, "--head", branch,
             "--state", "all", "--json", "number,state,mergedAt,headRefOid",
-            "--limit", "10",
-        )
+            "--limit", "10", caller="github_ops.pr_is_merged")
     except RuntimeError:
         return False
     prs = _json_loads_or(raw, default=[])
@@ -1403,7 +1465,8 @@ def parse_comment_id(url: str) -> int | None:
 def _current_gh_login() -> str | None:
     if "login" not in _login_cache:
         try:
-            _login_cache["login"] = _gh("api", "user", "--jq", ".login") or None
+            _login_cache["login"] = _gh("api", "user", "--jq", ".login",
+                caller="github_ops._current_gh_login") or None
         except Exception:  # noqa: BLE001 — best-effort; capture still proceeds without it
             _login_cache["login"] = None
     return _login_cache["login"]
@@ -1420,12 +1483,12 @@ def get_issue_comments(repo: str, issue_number: int) -> list[dict]:
     """
     return _gh_json(
         "issue", "view", str(issue_number), "--repo", repo, "--json", "comments",
-        default={},
-    ).get("comments", [])
+        default={}, caller="github_ops.get_issue_comments").get("comments", [])
 
 
 def post_issue_comment(repo: str, issue_number: int, body: str):
-    url = _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+    url = _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body,
+        caller="github_ops.post_issue_comment")
     _capture_comment_write(repo, issue_number, body, url)
 
 
@@ -1464,7 +1527,7 @@ def add_issue_labels(repo: str, issue_number: int, labels: list[str]) -> None:
     args = ["issue", "edit", str(issue_number), "--repo", repo]
     for lbl in labels:
         args.extend(["--add-label", lbl])
-    _gh(*args)
+    _gh(*args, caller="github_ops.add_issue_labels")
 
 
 def create_label(
@@ -1493,7 +1556,7 @@ def create_label(
         args.extend(["--description", description])
     if force:
         args.append("--force")
-    _gh(*args)
+    _gh(*args, caller="github_ops.create_label")
 
 
 def remove_issue_label(repo: str, issue_number: int, label: str) -> None:
@@ -1502,7 +1565,8 @@ def remove_issue_label(repo: str, issue_number: int, label: str) -> None:
     Idempotent — ``gh`` silently no-ops if the label is not present.
     Raises RuntimeError on ``gh`` failure.
     """
-    _gh("issue", "edit", str(issue_number), "--repo", repo, "--remove-label", label)
+    _gh("issue", "edit", str(issue_number), "--repo", repo, "--remove-label", label,
+        caller="github_ops.remove_issue_label")
 
 
 def change_issue_labels(
@@ -1526,8 +1590,7 @@ def change_issue_labels(
     """
     view_data = _gh_json(
         "issue", "view", str(issue_number), "--repo", repo, "--json", "labels",
-        default={},
-    )
+        default={}, caller="github_ops.change_issue_labels")
     current: set[str] = {
         lbl.get("name", "")
         for lbl in view_data.get("labels", [])
@@ -1544,7 +1607,7 @@ def change_issue_labels(
         for lbl in sorted(to_remove):
             args.extend(["--remove-label", lbl])
         try:
-            _gh(*args)
+            _gh(*args, caller="github_ops.change_issue_labels")
         except RuntimeError as exc:
             if to_add and _is_label_not_found(exc):
                 # A label in ``to_add`` doesn't exist in the repo yet.
@@ -1557,11 +1620,12 @@ def change_issue_labels(
                 # handled gracefully.
                 for lbl in sorted(to_add):
                     try:
-                        _gh("label", "create", lbl, "--repo", repo)
+                        _gh("label", "create", lbl, "--repo", repo,
+                            caller="github_ops.change_issue_labels")
                     except RuntimeError:
                         pass  # idempotent: label may already exist
                 try:
-                    _gh(*args)
+                    _gh(*args, caller="github_ops.change_issue_labels")
                 except RuntimeError as retry_exc:
                     if _is_label_not_found(retry_exc):
                         raise GhNotFound(str(retry_exc)) from retry_exc
@@ -1629,7 +1693,8 @@ def get_repo_file_with_sha(repo: str, path: str, branch: str = "develop") -> tup
     docstring). :func:`get_repo_file` is now a thin wrapper over this.
     """
     import base64
-    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}",
+        caller="github_ops.get_repo_file_with_sha")
     data = _json_loads_or(raw, default=None)
     # #1353: an empty/malformed-but-exit-0 response used to bare-json.loads()
     # into an unattributable JSONDecodeError (or, post-decode, a KeyError on
@@ -1673,8 +1738,7 @@ def update_repo_file(
         "-f", f"message={message}",
         "-f", f"content={base64.b64encode(content.encode()).decode()}",
         "-f", f"branch={branch}",
-        "-f", f"sha={sha}",
-    )
+        "-f", f"sha={sha}", caller="github_ops.update_repo_file")
     data = _json_loads_or(raw, default={})
     return ((data or {}).get("commit") or {}).get("sha", "")
 
@@ -1688,7 +1752,8 @@ def list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
     ``_gh``) when *path* doesn't exist — callers that want a soft "not
     found" should catch that, mirroring ``_default_gate_a_file_exists``.
     """
-    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}",
+        caller="github_ops.list_repo_dir")
     data = _json_loads_or(raw, default=None)
     if not isinstance(data, list):
         return []
@@ -1703,7 +1768,8 @@ def list_repo_subdirs(repo: str, path: str, branch: str = "develop") -> list[str
     (no local checkout) when hunting for the ``ms-NN`` manifest that maps a
     given issue — see ``coord.acceptance.find_ms_manifest_for_issue_via_api``.
     """
-    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}",
+        caller="github_ops.list_repo_subdirs")
     data = _json_loads_or(raw, default=None)
     if not isinstance(data, list):
         return []
@@ -1712,7 +1778,7 @@ def list_repo_subdirs(repo: str, path: str, branch: str = "develop") -> list[str
 
 def check_branch_exists(repo: str, branch: str) -> bool:
     try:
-        _gh("api", f"repos/{repo}/branches/{branch}")
+        _gh("api", f"repos/{repo}/branches/{branch}", caller="github_ops.check_branch_exists")
         return True
     except RuntimeError:
         return False
@@ -1730,7 +1796,8 @@ def get_repo_default_branch(repo: str) -> str:
     guessing ``"main"`` — a caller that cannot tell "the default is main" from
     "I could not ask" must not treat the second as the first.
     """
-    data = _gh_json("api", f"repos/{repo}", default=None)
+    data = _gh_json("api", f"repos/{repo}", default=None,
+        caller="github_ops.get_repo_default_branch")
     if not isinstance(data, dict) or not data.get("default_branch"):
         raise RuntimeError(f"gh api repos/{repo}: no default_branch in response")
     return str(data["default_branch"])
@@ -1745,8 +1812,8 @@ def list_repo_labels(repo: str) -> list[str]:
     yet". Raises on read failure — see :func:`get_repo_default_branch`.
     """
     data = _gh_json(
-        "api", "--paginate", "--slurp", f"repos/{repo}/labels", default=None
-    )
+        "api", "--paginate", "--slurp", f"repos/{repo}/labels", default=None,
+            caller="github_ops.list_repo_labels")
     # `--paginate --slurp` yields a list of per-page arrays; a single
     # unpaginated read yields a flat array. Accept both rather than depending
     # on how many labels the repo happens to have.
@@ -1773,7 +1840,8 @@ def list_repo_workflows(repo: str) -> list[dict]:
     :func:`get_repo_workflow_count`: "no workflows" and "couldn't check" have
     opposite consequences for the merge gate.
     """
-    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None)
+    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None,
+        caller="github_ops.list_repo_workflows")
     if not isinstance(data, dict) or not isinstance(data.get("workflows"), list):
         raise RuntimeError(
             f"gh api repos/{repo}/actions/workflows: malformed response"
@@ -1791,7 +1859,8 @@ def repo_file_exists(repo: str, path: str, branch: str) -> bool:
     auth error as a missing ``CLAUDE.md``.
     """
     try:
-        _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+        _gh("api", f"repos/{repo}/contents/{path}?ref={branch}",
+            caller="github_ops.repo_file_exists")
         return True
     except RuntimeError as exc:
         msg = str(exc).lower()
@@ -1812,8 +1881,7 @@ def list_remote_branch_names(repo: str) -> set[str]:
         raw = _gh(
             "api", "--paginate",
             f"repos/{repo}/git/refs/heads",
-            "--jq", ".[].ref",
-        )
+            "--jq", ".[].ref", caller="github_ops.list_remote_branch_names")
     except RuntimeError:
         return set()
     prefix = "refs/heads/"
@@ -1837,7 +1905,8 @@ def branch_exists_on_remote(repo: str, branch: str) -> bool:
     routing a follow-on assignment to a machine that can't fetch the branch.
     """
     try:
-        _gh("api", f"repos/{repo}/git/refs/heads/{branch}")
+        _gh("api", f"repos/{repo}/git/refs/heads/{branch}",
+            caller="github_ops.branch_exists_on_remote")
         return True
     except RuntimeError as exc:
         err = str(exc).lower()
@@ -1853,7 +1922,8 @@ def branch_exists_on_remote(repo: str, branch: str) -> bool:
 def delete_remote_branch(repo: str, branch: str) -> bool:
     """Delete a remote branch. Returns True on success, False on failure."""
     try:
-        _gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}")
+        _gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}",
+            caller="github_ops.delete_remote_branch")
         return True
     except RuntimeError:
         return False
@@ -1871,8 +1941,7 @@ def create_remote_branch(repo: str, branch: str, sha: str) -> bool:
         _gh(
             "api", "-X", "POST", f"repos/{repo}/git/refs",
             "-f", f"ref=refs/heads/{branch}",
-            "-f", f"sha={sha}",
-        )
+            "-f", f"sha={sha}", caller="github_ops.create_remote_branch")
         return True
     except RuntimeError:
         return False
@@ -1908,7 +1977,7 @@ def repo_exists(repo: str) -> bool:
     surfacing the real (auth/network) problem immediately.
     """
     try:
-        _gh("api", f"repos/{repo}")
+        _gh("api", f"repos/{repo}", caller="github_ops.repo_exists")
         return True
     except RuntimeError as exc:
         msg = str(exc).lower()
@@ -1953,8 +2022,8 @@ def create_repo(
     args = ["repo", "create", repo, "--private" if private else "--public", "--add-readme"]
     if description:
         args += ["--description", description]
-    _gh(*args)
-    data = _gh_json("api", f"repos/{repo}", default=None)
+    _gh(*args, caller="github_ops.create_repo")
+    data = _gh_json("api", f"repos/{repo}", default=None, caller="github_ops.create_repo")
     if not isinstance(data, dict) or not data.get("default_branch"):
         raise RuntimeError(f"repos/{repo}: created but could not read it back")
     return {
@@ -1965,14 +2034,16 @@ def create_repo(
     }
 
 
-def _gh_input_json(*args: str, body: str) -> Any:
+def _gh_input_json(*args: str, body: str, caller: str = "") -> Any:
     """Like :func:`_gh_json` but pipes *body* via stdin (``gh api --input -``)
     for endpoints whose payload — a nested tree/commit object, here — can't be
     expressed with :func:`_gh`'s flat ``-f key=value`` args. Records the same
     #1896 forge-availability observation as :func:`_gh`, for the same reason
     :func:`edit_issue`/:func:`close_issue` do their own stdin plumbing instead
-    of routing through it.
+    of routing through it -- including the #2988 caller tag, resolved the same
+    way :func:`_gh` resolves its own (see :func:`_resolve_caller`).
     """
+    caller = _resolve_caller(caller)
     full_args = [*args, "--input", "-"]
     _t0 = time.monotonic()
     try:
@@ -1981,15 +2052,15 @@ def _gh_input_json(*args: str, body: str) -> Any:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(full_args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc), caller=caller)
         raise GhError(f"gh {' '.join(full_args)} failed: {exc}") from exc
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(full_args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr, caller=caller)
         raise RuntimeError(f"gh {' '.join(full_args)} failed: {stderr}")
-    record_gh_call(tuple(full_args), outcome="ok", duration_s=duration)
+    record_gh_call(tuple(full_args), outcome="ok", duration_s=duration, caller=caller)
     return _json_loads_or(result.stdout, default={})
 
 
@@ -2018,11 +2089,13 @@ def create_commit_with_files(
     but never a *corrupt* one: nothing is written to *branch* until the final
     ref update, which is the one step that can't partially apply.
     """
-    ref = _gh_json("api", f"repos/{repo}/git/refs/heads/{branch}", default={})
+    ref = _gh_json("api", f"repos/{repo}/git/refs/heads/{branch}", default={},
+        caller="github_ops.create_commit_with_files")
     parent_sha = ((ref or {}).get("object") or {}).get("sha")
     if not parent_sha:
         raise RuntimeError(f"repos/{repo}: could not resolve branch {branch!r} head")
-    parent_commit = _gh_json("api", f"repos/{repo}/git/commits/{parent_sha}", default={})
+    parent_commit = _gh_json("api", f"repos/{repo}/git/commits/{parent_sha}", default={},
+        caller="github_ops.create_commit_with_files")
     base_tree = (parent_commit or {}).get("tree", {}).get("sha")
     if not base_tree:
         raise RuntimeError(f"repos/{repo}: could not resolve base tree for {parent_sha}")
@@ -2033,8 +2106,7 @@ def create_commit_with_files(
             "api", f"repos/{repo}/git/blobs",
             "-f", f"content={base64.b64encode(content.encode()).decode()}",
             "-f", "encoding=base64",
-            default={},
-        )
+            default={}, caller="github_ops.create_commit_with_files")
         blob_sha = (blob or {}).get("sha")
         if not blob_sha:
             raise RuntimeError(f"repos/{repo}: blob create failed for {path!r}")
@@ -2048,6 +2120,7 @@ def create_commit_with_files(
     new_tree = _gh_input_json(
         "api", f"repos/{repo}/git/trees",
         body=json.dumps({"base_tree": base_tree, "tree": tree_entries}),
+        caller="github_ops.create_commit_with_files",
     )
     tree_sha = (new_tree or {}).get("sha")
     if not tree_sha:
@@ -2056,6 +2129,7 @@ def create_commit_with_files(
     new_commit = _gh_input_json(
         "api", f"repos/{repo}/git/commits",
         body=json.dumps({"message": message, "tree": tree_sha, "parents": [parent_sha]}),
+        caller="github_ops.create_commit_with_files",
     )
     commit_sha = (new_commit or {}).get("sha")
     if not commit_sha:
@@ -2063,8 +2137,7 @@ def create_commit_with_files(
 
     _gh(
         "api", "-X", "PATCH", f"repos/{repo}/git/refs/heads/{branch}",
-        "-f", f"sha={commit_sha}",
-    )
+        "-f", f"sha={commit_sha}", caller="github_ops.create_commit_with_files")
     return commit_sha
 
 
@@ -2074,7 +2147,8 @@ def get_default_branch_head(repo: str, branch: str) -> str:
     # `X-GitHub-Request-Id` headers into `_gh`'s `GhRateLimitError` — see
     # `_parse_gh_include`. Harmless on success: `_parse_gh_include` below
     # strips the header block back off before this parses the JSON body.
-    raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}")
+    raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}",
+        caller="github_ops.get_default_branch_head")
     _meta, body = _parse_gh_include(raw)
     data = _json_loads_or(body, default=None)
     # #1353: every caller of this already catches RuntimeError to mean "HEAD
@@ -2121,7 +2195,8 @@ def get_branch_sha(repo: str, branch: str, *, raise_on_transient: bool = False) 
     try:
         # #2809: `-i` recovers the real HTTP headers (Retry-After,
         # X-GitHub-Request-Id) on a 403 — see `get_default_branch_head`.
-        raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}")
+        raw = _gh("api", "-i", f"repos/{repo}/branches/{branch}",
+            caller="github_ops.get_branch_sha")
         _meta, body = _parse_gh_include(raw)
         data = _json_loads_or(body, default={})
         return data["commit"]["sha"]
@@ -2163,7 +2238,8 @@ def get_branch_commit_timestamp(repo: str, branch: str) -> float | None:
     base never moved".
     """
     try:
-        raw = _gh("api", f"repos/{repo}/branches/{branch}")
+        raw = _gh("api", f"repos/{repo}/branches/{branch}",
+            caller="github_ops.get_branch_commit_timestamp")
         data = _json_loads_or(raw, default={})
         date = data["commit"]["commit"]["committer"]["date"]
         return datetime.fromisoformat(str(date).replace("Z", "+00:00")).timestamp()
@@ -2180,8 +2256,7 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
         "--head", branch,
         "--json", "number,title,url,headRefName,baseRefName,additions,deletions,mergeable",
         "--limit", "1",
-        default=[],
-    )
+        default=[], caller="github_ops.find_pr_for_branch")
     return items[0] if items else None
 
 
@@ -2197,7 +2272,8 @@ def get_pr_state_for_branch(repo: str, branch: str) -> str | None:
     MERGED PR whose branch may since have been deleted from the remote.
     """
     try:
-        state = _gh("pr", "view", branch, "--repo", repo, "--json", "state", "-q", ".state")
+        state = _gh("pr", "view", branch, "--repo", repo, "--json", "state", "-q", ".state",
+            caller="github_ops.get_pr_state_for_branch")
     except RuntimeError:
         return None
     return state or None
@@ -2214,8 +2290,7 @@ def get_pr_head_ref(repo: str, number: int) -> str | None:
     try:
         head_ref = _gh(
             "pr", "view", str(number), "--repo", repo,
-            "--json", "headRefName", "--jq", ".headRefName",
-        )
+            "--json", "headRefName", "--jq", ".headRefName", caller="github_ops.get_pr_head_ref")
     except RuntimeError:
         return None
     return head_ref or None
@@ -2317,7 +2392,8 @@ def get_repo_workflow_count(repo: str) -> int:
     treat the latter as the former; see #1525 for the identical reasoning
     applied to check-run reads themselves.
     """
-    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None)
+    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None,
+        caller="github_ops.get_repo_workflow_count")
     if not isinstance(data, dict) or not isinstance(data.get("total_count"), int):
         raise RuntimeError(
             f"gh api repos/{repo}/actions/workflows: malformed response"
@@ -2344,7 +2420,8 @@ def get_required_status_check_contexts(repo: str) -> list[str] | None:
     non-empty ``required_status_checks.contexts`` list narrows the gate.
     """
     try:
-        repo_data = _gh_json("api", f"repos/{repo}", default=None)
+        repo_data = _gh_json("api", f"repos/{repo}", default=None,
+            caller="github_ops.get_required_status_check_contexts")
         if not isinstance(repo_data, dict):
             return None
         default_branch = repo_data.get("default_branch")
@@ -2352,8 +2429,7 @@ def get_required_status_check_contexts(repo: str) -> list[str] | None:
             return None
         protection = _gh_json(
             "api", f"repos/{repo}/branches/{default_branch}/protection",
-            default=None,
-        )
+            default=None, caller="github_ops.get_required_status_check_contexts")
     except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError):
         return None
     if not isinstance(protection, dict):
@@ -2426,7 +2502,8 @@ def get_run_jobs(repo: str, run_id: str) -> list[dict]:
     (:mod:`coord.ci_store`'s false-negative bias) must catch and treat a
     raised error the same as "no job data" — never as evidence either way.
     """
-    data = _gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", default=None)
+    data = _gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", default=None,
+        caller="github_ops.get_run_jobs")
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
         raise RuntimeError(
             f"gh api repos/{repo}/actions/runs/{run_id}/jobs: malformed response"
@@ -2458,15 +2535,18 @@ def rerun_workflow_run(repo: str, run_id: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.rerun_workflow_run")
         return False
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr,
+                        caller="github_ops.rerun_workflow_run")
         return False
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
+                    caller="github_ops.rerun_workflow_run")
     return True
 
 
@@ -2499,15 +2579,18 @@ def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc))
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.rerun_workflow_run_failed")
         return False
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr)
+                        duration_s=duration, detail=stderr,
+                        caller="github_ops.rerun_workflow_run_failed")
         return False
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
+                    caller="github_ops.rerun_workflow_run_failed")
     return True
 
 
@@ -2677,7 +2760,8 @@ def pr_diff(repo_github: str, pr_number: int, *, max_chars: int | None = 60000) 
     so the caller falls back to the in-briefing three-dot diff instructions.
     """
     try:
-        diff = _gh("pr", "diff", str(pr_number), "--repo", repo_github)
+        diff = _gh("pr", "diff", str(pr_number), "--repo", repo_github,
+            caller="github_ops.pr_diff")
     except RuntimeError:
         return None
     if max_chars is None:
@@ -2734,8 +2818,7 @@ def get_compare_diff(repo: str, base: str, head: str) -> str | None:
     try:
         return _gh(
             "api", f"repos/{repo}/compare/{base}...{head}",
-            "-H", "Accept: application/vnd.github.v3.diff",
-        )
+            "-H", "Accept: application/vnd.github.v3.diff", caller="github_ops.get_compare_diff")
     except RuntimeError:
         return None
 
@@ -2763,8 +2846,7 @@ def get_compare_files(repo: str, base: str, head: str) -> list[str] | None:
     try:
         raw = _gh(
             "api", f"repos/{repo}/compare/{base}...{head}",
-            "--jq", ".files[].filename",
-        )
+            "--jq", ".files[].filename", caller="github_ops.get_compare_files")
     except RuntimeError:
         return None
     return [line for line in (ln.strip() for ln in raw.splitlines()) if line]
@@ -2810,13 +2892,15 @@ def _head_branch_confirmed_deleted(repo: str, base: str, branch: str) -> bool:
     False so the caller keeps its existing fail-closed ``None``.
     """
     try:
-        _gh("api", f"repos/{repo}/git/refs/heads/{branch}")
+        _gh("api", f"repos/{repo}/git/refs/heads/{branch}",
+            caller="github_ops._head_branch_confirmed_deleted")
         return False  # head resolves fine; compare failed for some other reason
     except RuntimeError as exc:
         if not _gh_ref_confirmed_missing(exc):
             return False  # inconclusive — do not guess
     try:
-        _gh("api", f"repos/{repo}/git/refs/heads/{base}")
+        _gh("api", f"repos/{repo}/git/refs/heads/{base}",
+            caller="github_ops._head_branch_confirmed_deleted")
     except RuntimeError:
         return False  # base itself unconfirmable — don't trust the read
     return True  # head confirmed gone, base confirmed present
@@ -2853,7 +2937,8 @@ def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
     if branch == base:
         return 0
     try:
-        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}")
+        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}",
+            caller="github_ops.branch_commits_ahead")
         cmp = json.loads(raw)
     except Exception:  # noqa: BLE001 — unknown, not zero
         if _head_branch_confirmed_deleted(repo, base, branch):
@@ -2935,8 +3020,7 @@ def create_pr(
     url = _gh(
         "pr", "create", "--repo", repo,
         "--base", base, "--head", head,
-        "--title", title, "--body", body,
-    )
+        "--title", title, "--body", body, caller="github_ops.create_pr")
     # gh pr create returns the URL on the last line of stdout.
     pr_url = url.strip().splitlines()[-1] if url.strip() else ""
     number = int(pr_url.rsplit("/", 1)[-1]) if pr_url else 0
@@ -2948,8 +3032,7 @@ def get_pr_size(repo: str, number: int) -> int:
     try:
         raw = _gh(
             "pr", "view", str(number), "--repo", repo,
-            "--json", "additions,deletions",
-        )
+            "--json", "additions,deletions", caller="github_ops.get_pr_size")
     except RuntimeError:
         return 0
     data = _json_loads_or(raw, default={})
@@ -2968,7 +3051,8 @@ def get_branch_diff_size(repo: str, base: str, branch: str) -> int:
     ordering used at merge time (#776 size unification).
     """
     try:
-        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}")
+        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}",
+            caller="github_ops.get_branch_diff_size")
         data = json.loads(raw)
         return sum(
             int(f.get("additions", 0)) + int(f.get("deletions", 0))
@@ -2995,7 +3079,8 @@ def merge_pr(
     flag = {"rebase": "--rebase", "squash": "--squash", "merge": "--merge"}.get(method, "--rebase")
     delete_flag = f"--delete-branch={'true' if delete_branch else 'false'}"
     try:
-        out = _gh("pr", "merge", str(number), "--repo", repo, flag, delete_flag)
+        out = _gh("pr", "merge", str(number), "--repo", repo, flag, delete_flag,
+            caller="github_ops.merge_pr")
     except RuntimeError as e:
         return False, str(e)
     return True, out
@@ -3005,15 +3090,13 @@ def list_open_prs(repo: str) -> list[dict]:
     return _gh_json(
         "pr", "list", "--repo", repo, "--state", "open",
         "--json", "number,title,headRefName",
-        default=[],
-    )
+        default=[], caller="github_ops.list_open_prs")
 
 
 def get_recent_develop_commits(repo: str, count: int = 10) -> list[dict]:
     commits = _gh_json(
         "api", f"repos/{repo}/commits?sha=develop&per_page={count}",
-        default=[],
-    )
+        default=[], caller="github_ops.get_recent_develop_commits")
     return [
         {"sha": c["sha"][:7], "message": c["commit"]["message"].split("\n")[0]}
         for c in commits
@@ -3033,7 +3116,7 @@ def create_issue(
             args.extend(["--label", label])
     if milestone:
         args.extend(["--milestone", milestone])
-    raw = _gh(*args)
+    raw = _gh(*args, caller="github_ops.create_issue")
     url = raw.strip()
     number = int(url.rstrip("/").rsplit("/", 1)[-1])
     return {"number": number, "url": url}
@@ -3043,8 +3126,7 @@ def update_issue_body(repo: str, issue_number: int, body: str) -> None:
     _gh(
         "api", "-X", "PATCH",
         f"repos/{repo}/issues/{issue_number}",
-        "-f", f"body={body}",
-    )
+        "-f", f"body={body}", caller="github_ops.update_issue_body")
 
 
 def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
@@ -3058,8 +3140,7 @@ def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
     raw = _gh(
         "api", "--paginate",
         f"repos/{repo}/milestones?state={state}",
-        "--jq", ".[] | {number: .number, title: .title}",
-    )
+        "--jq", ".[] | {number: .number, title: .title}", caller="github_ops.get_repo_milestones")
     # --jq emits one JSON object per line when applied to an array.  #1353:
     # a single malformed line used to bare-json.loads() into an unattributable
     # crash that discarded every other (well-formed) milestone line too — skip
@@ -3083,7 +3164,8 @@ def get_milestone(repo: str, milestone_number: int) -> dict:
     Raises RuntimeError (propagated from ``_gh``) when the milestone does not
     exist.
     """
-    return _gh_json("api", f"repos/{repo}/milestones/{milestone_number}", default={})
+    return _gh_json("api", f"repos/{repo}/milestones/{milestone_number}", default={},
+        caller="github_ops.get_milestone")
 
 
 def search_issues(
@@ -3116,7 +3198,7 @@ def search_issues(
         args.extend(["--milestone", milestone])
     if label:
         args.extend(["--label", label])
-    return _gh_json(*args, default=[])
+    return _gh_json(*args, default=[], caller="github_ops.search_issues")
 
 
 def get_milestone_issues(
@@ -3136,8 +3218,7 @@ def get_milestone_issues(
         "issue", "list", "--repo", repo, "--milestone", milestone_title,
         "--state", state, "--json", "number,title,state,labels",
         "--limit", "200",
-        default=[],
-    )
+        default=[], caller="github_ops.get_milestone_issues")
 
 
 def assign_issue_milestone(
@@ -3152,8 +3233,7 @@ def assign_issue_milestone(
     _gh(
         "api", "-X", "PATCH",
         f"repos/{repo}/issues/{issue_number}",
-        "-F", f"milestone={milestone_number}",
-    )
+        "-F", f"milestone={milestone_number}", caller="github_ops.assign_issue_milestone")
 
 
 def unassign_issue_milestone(repo: str, issue_number: int) -> None:
@@ -3169,8 +3249,7 @@ def unassign_issue_milestone(repo: str, issue_number: int) -> None:
     _gh(
         "api", "-X", "PATCH",
         f"repos/{repo}/issues/{issue_number}",
-        "-F", "milestone=null",
-    )
+        "-F", "milestone=null", caller="github_ops.unassign_issue_milestone")
 
 
 def close_pr(repo: str, number: int, *, comment: str | None = None) -> None:
@@ -3182,7 +3261,7 @@ def close_pr(repo: str, number: int, *, comment: str | None = None) -> None:
     """
     if comment:
         post_issue_comment(repo, number, comment)
-    _gh("pr", "close", str(number), "--repo", repo)
+    _gh("pr", "close", str(number), "--repo", repo, caller="github_ops.close_pr")
 
 
 def branch_is_fully_merged(
@@ -3203,7 +3282,8 @@ def branch_is_fully_merged(
     if not branch or not default_branch or branch == default_branch:
         return False
     try:
-        raw = _gh("api", f"repos/{repo}/compare/{default_branch}...{branch}")
+        raw = _gh("api", f"repos/{repo}/compare/{default_branch}...{branch}",
+            caller="github_ops.branch_is_fully_merged")
         cmp = json.loads(raw)
         return isinstance(cmp, dict) and cmp.get("ahead_by") == 0
     except Exception:  # noqa: BLE001 — fail-safe: keep the PR open on any error
@@ -3222,4 +3302,5 @@ def post_pr_review(repo: str, number: int, verdict: str, body: str) -> None:
         flag = "--request-changes"
     else:
         raise ValueError(f"Invalid review verdict: {verdict!r} (must be 'approve' or 'request-changes')")
-    _gh("pr", "review", str(number), "--repo", repo, flag, "--body", body)
+    _gh("pr", "review", str(number), "--repo", repo, flag, "--body", body,
+        caller="github_ops.post_pr_review")

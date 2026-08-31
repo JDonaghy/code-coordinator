@@ -1217,7 +1217,7 @@ def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
     from coord import github_ops
 
     big = "x" * 10_000
-    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    monkeypatch.setattr(github_ops, "_gh", lambda *args, **kwargs: big)
     out = github_ops.pr_diff("acme/api", 42, max_chars=100)
     assert out is not None
     assert out.startswith("x" * 100)
@@ -1233,7 +1233,7 @@ def test_pr_diff_max_chars_none_returns_full_diff(monkeypatch) -> None:
     from coord import github_ops
 
     big = "x" * 100_000
-    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    monkeypatch.setattr(github_ops, "_gh", lambda *args, **kwargs: big)
     out = github_ops.pr_diff("acme/api", 42, max_chars=None)
     assert out == big
 
@@ -1245,7 +1245,7 @@ def test_truncate_diff_text_matches_pr_diff_truncation(monkeypatch) -> None:
     from coord import github_ops
 
     big = "x" * 10_000
-    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    monkeypatch.setattr(github_ops, "_gh", lambda *args, **kwargs: big)
     via_pr_diff = github_ops.pr_diff("acme/api", 42, max_chars=100)
     via_helper = github_ops.truncate_diff_text(big, max_chars=100)
     assert via_pr_diff == via_helper
@@ -1333,7 +1333,7 @@ def test_pr_diff_returns_none_on_gh_error(monkeypatch) -> None:
     """#612: pr_diff is best-effort — a gh failure yields None, not a raise."""
     from coord import github_ops
 
-    def _boom(*args):
+    def _boom(*args, **kwargs):
         raise RuntimeError("gh exploded")
 
     monkeypatch.setattr(github_ops, "_gh", _boom)

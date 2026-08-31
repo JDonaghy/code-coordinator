@@ -226,7 +226,7 @@ class TestGitHubParentageWrites:
         store = GitHubParentage()
         calls: list[tuple] = []
 
-        def fake_gh(*args):
+        def fake_gh(*args, **_kwargs):
             calls.append(args)
             if "--jq" in args:
                 return "4856912446"
@@ -247,7 +247,7 @@ class TestGitHubParentageWrites:
         store = GitHubParentage()
         calls: list[tuple] = []
 
-        def fake_gh(*args):
+        def fake_gh(*args, **_kwargs):
             calls.append(args)
             if "--jq" in args:
                 return "4856912446"
