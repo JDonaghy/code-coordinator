@@ -612,6 +612,7 @@ def _run_decompose_chat_interactive(
     )
     from coord.decomposition_chat import (  # noqa: PLC0415
         build_decomposition_chat_briefing,
+        describe_unapproved_submission,
         fetch_running_context,
         render_running_context_section,
         repo_topology_context,
@@ -633,8 +634,7 @@ def _run_decompose_chat_interactive(
     submission = resolve_approved_submission(cfg, submission_id)
     if submission is None:
         click.secho(
-            f"error: submission {submission_id!r} is not a currently-approved "
-            "portal submission — nothing to decompose",
+            f"error: {describe_unapproved_submission(cfg, submission_id)}",
             fg="red",
         )
         raise SystemExit(1)
@@ -1343,10 +1343,47 @@ def portal_enqueue_status(submission_id: str, status: str) -> None:
     Unlike `push`, this allocates the revision for you and refuses a status
     that would summon the customer to an empty screen — `awaiting-signoff`
     with no design round queued, `needs-input` with no question (#835).
+
+    **#2996: warns, never refuses, before a `_PULLED_STATUSES` push that
+    would silently withdraw SUBMISSION_ID from decomposition.**
+    `coord.approved_work.approved_submissions` (the "Approved work items"
+    panel's data source) drops any submission whose `last_status` moves to
+    `planned` / `in-progress` / `quality-check` / `shipped` — those four
+    values are only ever supposed to mean "already pulled into a linked
+    milestone/issue and dispatch has begun". Pushing one of them here on a
+    submission with no `coord portal link` on file does that removal anyway,
+    with nothing to say so — the observed failure mode (#2996's own filing)
+    was a status pushed purely to update the customer-facing wording, which
+    happened to also empty the queue and only surfaced later as an unrelated
+    "not a currently-approved portal submission" error. This command still
+    sends the push regardless — there are legitimate reasons to set any of
+    these by hand (a correction, a re-sync, an out-of-band delivery) — it
+    only makes the consequence visible first.
     """
     _refuse_if_thin_client("enqueue-status")
 
+    from coord.approved_work import is_pulled_status  # noqa: PLC0415
     from coord.portal_sync import PortalSyncError, enqueue_status  # noqa: PLC0415
+
+    if is_pulled_status(status):
+        from coord import portal_store  # noqa: PLC0415
+
+        if portal_store.get_link_by_submission(submission_id) is None:
+            click.secho(
+                f"warning: {submission_id} has no linked milestone/issue on "
+                "file (no `coord portal link` recorded) and no decomposition "
+                f"on record — pushing status={status!r} will still be sent, "
+                "but coord treats that status as \"already pulled into "
+                f"decomposition and delivery\": {submission_id} will vanish "
+                "from the TUI's Approved work items panel, and `coord portal "
+                "decompose-chat` will refuse it as no longer approved. If "
+                "the work has not actually been decomposed yet and you just "
+                "want an honest \"we know what's next\" status for the "
+                f"customer, use `coord portal enqueue-status {submission_id} "
+                "in-design` instead — it stays on the queue and announces "
+                "nobody.",
+                fg="yellow",
+            )
 
     try:
         row = enqueue_status(submission_id, status)
