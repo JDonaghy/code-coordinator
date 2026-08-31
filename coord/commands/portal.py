@@ -723,7 +723,7 @@ def _run_decompose_chat_interactive(
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec as _AssignmentSpecDc,
         DECOMPOSITION_CHAT_ATTENDED_ADDENDUM,
-        DECOMPOSITION_CHAT_DENY_COMMANDS,
+        DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS,
         DECOMPOSITION_CHAT_SYSTEM_PROMPT,
         build_deny_prompt,
     )
@@ -854,13 +854,21 @@ def _run_decompose_chat_interactive(
     # This session, by contrast, has a human in the pane: the addendum makes
     # its first turn confirm-then-write (#2742's absorbed half, which #2750
     # only ever wired into mode SELECTION, never into the posture itself).
+    #
+    # #2998: the deny list here is the ATTENDED one — identical to the
+    # headless DECOMPOSITION_CHAT_DENY_COMMANDS except it does not blanket-
+    # forbid `coord portal decision confirm`, because DECOMPOSITION_CHAT_
+    # ATTENDED_ADDENDUM spells out the (narrow, operator-instruction-gated)
+    # condition under which this session may run it. The headless path above
+    # keeps using the unmodified list, so a headless session still cannot
+    # confirm, self-confirm, or be talked into confirming.
     argv = provider.build_command(
         spec,
         resolved_model=resolved_model,
         system_prompt=(
             DECOMPOSITION_CHAT_SYSTEM_PROMPT
             + DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
-            + build_deny_prompt(DECOMPOSITION_CHAT_DENY_COMMANDS)
+            + build_deny_prompt(DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS)
         ),
         allowed_tools="Read,Bash",
     )

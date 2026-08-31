@@ -10,6 +10,7 @@ import pytest
 from coord import decomposition_chat
 from coord.agent import (
     AssignmentSpec,
+    DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS,
     DECOMPOSITION_CHAT_DENY_COMMANDS,
     DECOMPOSITION_CHAT_SYSTEM_PROMPT,
     WRITE_CAPABLE_SPEC_TYPES,
@@ -1106,6 +1107,116 @@ def test_system_prompt_requires_recording_house_stack_alternative():
 
 def test_deny_list_blocks_self_confirming_a_proposal():
     assert "Bash(coord portal decision confirm *)" in DECOMPOSITION_CHAT_DENY_COMMANDS
+
+
+# ── #2998: attended sessions may confirm on explicit operator instruction ──
+
+
+def test_attended_deny_list_omits_only_decision_confirm():
+    """The attended deny list is the headless one minus exactly one entry —
+    `coord portal decision confirm`. Every genuinely dangerous entry (raw
+    `gh` mutations, `git push`/`commit`, destructive git, `coord approve`/
+    `merge`/`assign`) must stay denied in both postures."""
+    assert (
+        "Bash(coord portal decision confirm *)"
+        not in DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS
+    )
+    removed = set(DECOMPOSITION_CHAT_DENY_COMMANDS) - set(
+        DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS
+    )
+    assert removed == {"Bash(coord portal decision confirm *)"}
+    # Nothing was added that wasn't already on the headless list.
+    assert set(DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS) <= set(
+        DECOMPOSITION_CHAT_DENY_COMMANDS
+    )
+
+
+def test_headless_deny_list_is_untouched_by_the_attended_carve_out():
+    """Acceptance bar: "the headless posture is unchanged" — the constant the
+    headless dispatch path actually uses still hard-denies confirm."""
+    assert "Bash(coord portal decision confirm *)" in DECOMPOSITION_CHAT_DENY_COMMANDS
+
+
+def test_attended_addendum_permits_confirm_on_explicit_operator_instruction():
+    from coord.agent import DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+
+    assert "#2998" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    assert "coord portal decision confirm" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    # Requires an explicit, present-turn instruction — never inferred assent.
+    assert "EXPLICIT, PRESENT-TURN instruction" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    assert "own initiative" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    # Attribution: a ledger note recorded BEFORE the confirm runs.
+    assert "coord portal note" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    assert "Operator instructed" in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM
+    confirm_section = DECOMPOSITION_CHAT_ATTENDED_ADDENDUM.split(
+        "Confirming a decision on the operator's instruction"
+    )[1]
+    assert confirm_section.index("coord portal note") < confirm_section.index(
+        "coord portal decision confirm <submission_id> <seq>"
+    )
+    # The dangerous entries are called out as staying forbidden regardless.
+    assert "coord approve" in confirm_section
+    assert "coord merge" in confirm_section
+    assert "git push" in confirm_section
+
+
+def test_cli_interactive_dry_run_permits_confirm_but_keeps_dangerous_entries_denied():
+    """The system prompt `_run_decompose_chat_interactive` actually builds
+    must not list `coord portal decision confirm` under FORBIDDEN COMMANDS
+    (the addendum, not a blanket deny, governs it) while every dangerous
+    entry stays listed."""
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    runner = CliRunner()
+    local = _machine("here", ["api"])
+    cfg = Config(repos=[_repo("api")], machines=[local])
+    with patch("coord.commands.portal._load_config", return_value=cfg), patch(
+        "coord.decomposition_chat.resolve_approved_submission", return_value=SUBMISSION
+    ), patch("coord.test_orchestrator.local_machine", return_value=local), patch(
+        "coord.board_service.resolve", return_value=None
+    ), patch("coord.state.record_dispatched_assignment"), patch(
+        "coord.interactive.launch_human_attended_interactive"
+    ):
+        result = runner.invoke(
+            portal_group,
+            ["decompose-chat", "sub_2f6a1c", "--interactive", "--discuss", "--dry-run"],
+        )
+    assert result.exit_code == 0, result.output
+    forbidden_section = result.output.split("FORBIDDEN")[-1]
+    assert "coord portal decision confirm" not in forbidden_section
+    assert "coord approve" in forbidden_section
+    assert "coord merge" in forbidden_section
+    assert "git push" in forbidden_section
+    assert "rm -rf" in forbidden_section
+    # ...but the addendum's own gated carve-out is present elsewhere in the
+    # prompt, spelling out how confirm may be used.
+    assert "#2998" in result.output
+    assert "coord portal note" in result.output
+
+
+def test_default_worker_command_decomposition_chat_still_forbids_confirm():
+    """Headless-unchanged regression guard: the actual argv the headless
+    dispatch path builds still lists `coord portal decision confirm` under
+    FORBIDDEN COMMANDS, with no operator-instruction carve-out text at all
+    (that text lives only in DECOMPOSITION_CHAT_ATTENDED_ADDENDUM, which the
+    headless path never appends — see
+    test_headless_decomposition_chat_prompt_has_no_attended_posture)."""
+    spec = AssignmentSpec(
+        repo_name="r",
+        repo_path="/tmp/r",
+        issue_number=0,
+        issue_title="decomposition: sub_2f6a1c",
+        briefing="b",
+        type="decomposition-chat",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    system_prompt = argv[idx + 1]
+    forbidden_section = system_prompt.split("FORBIDDEN")[-1]
+    assert "coord portal decision confirm" in forbidden_section
+    assert "#2998" not in system_prompt
 
 
 # ── #2750 (IL-4): `coord portal decompose-chat` CLI — --discuss/--interactive ──

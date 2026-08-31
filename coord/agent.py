@@ -4282,7 +4282,41 @@ exists. Any time the operator gives you a substantive fact about the \
 client, the users, or the scope, say back what you would record and ask \
 whether to record it. Keep the wording theirs, not your paraphrase — the \
 ledger is verbatim by design, and the narrative (which is regenerable) is \
-where summarizing belongs.\
+where summarizing belongs.
+
+**Confirming a decision on the operator's instruction (#2998).** The base \
+prompt above says never to run `coord portal decision confirm` — that rule \
+was written for a session with nobody to ask. You have someone to ask: the \
+operator sitting at this terminal, who is exactly who that command is \
+reserved for. What never changes, headless or attended, is that YOU may \
+never confirm your own proposal on your own initiative — inferring consent, \
+or treating agreement about something else as consent to confirm, is \
+exactly the self-approval the base rule exists to prevent.
+
+But when the operator gives you an EXPLICIT, PRESENT-TURN instruction to \
+confirm a specific decision ("confirm decision 8", "yes, confirm that"), you \
+MAY act on it, in this order:
+
+1. Quote the operator's instruction back, verbatim, so the transcript makes \
+unambiguous that this was ordered, not inferred.
+2. Record the attribution on the ledger BEFORE confirming, so a later \
+session (or a human reading the ledger) can see this was operator-\
+instructed rather than session-initiated:
+
+    coord portal note <submission_id> "Operator instructed: confirm decision #<seq> (\"<their exact words>\")"
+
+3. Only then run:
+
+    coord portal decision confirm <submission_id> <seq>
+
+Do not collapse this into one step, and do not run it on a vague or implied \
+go-ahead — if you are not sure which decision the operator means, ask for \
+the seq before running anything. This carve-out covers `decision confirm` \
+ONLY. Every other entry on the deny list stays forbidden in this session \
+exactly as it is headlessly (raw `gh` mutations, `git push`, `git commit`, \
+destructive git, `coord approve`, `coord merge`, `coord assign`) — an \
+operator being present changes who may authorize a RESERVED command, it \
+does not change whether a DANGEROUS one is safe.\
 """
 
 # Deny list applied to decomposition-chat workers (#2533; extended #2750
@@ -4296,6 +4330,13 @@ where summarizing belongs.\
 # confirm` (the OPERATOR's move, never this session's own — #2750's "Propose"
 # terminal move must not self-confirm), while every write path this session
 # actually needs is allowed by omission.
+#
+# This is the HEADLESS list — used verbatim by `default_worker_command`'s
+# `spec.type == "decomposition-chat"` branch below, where the session
+# genuinely has nobody to ask, so `decision confirm` stays hard-denied. The
+# `--interactive` posture has an operator in the room; see
+# DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS below (#2998) for its own,
+# narrower carve-out of exactly this one entry.
 DECOMPOSITION_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(gh issue edit *)",
     "Bash(gh issue create *)",
@@ -4322,6 +4363,23 @@ DECOMPOSITION_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(coord merge *)",
     "Bash(coord assign *)",
     "Bash(coord portal decision confirm *)",
+]
+
+# #2998: the ATTENDED counterpart to the list above — every entry the same
+# EXCEPT `coord portal decision confirm`. An attended session has an
+# operator sitting at the terminal, and `decision confirm` is RESERVED for
+# the operator (not DANGEROUS the way `git push`/`coord merge`/destructive
+# git are) — the question in that posture is who authorised it, not whether
+# it's safe. DECOMPOSITION_CHAT_ATTENDED_ADDENDUM spells out the condition
+# under which the session may actually run it (an explicit, present-turn
+# operator instruction, quoted back and attributed on the ledger via `coord
+# portal note` before confirming) — this list only stops blanket-denying it
+# so that addendum isn't fighting a FORBIDDEN COMMANDS entry telling the
+# session the opposite. Every genuinely dangerous entry stays denied,
+# unchanged, in both postures.
+DECOMPOSITION_CHAT_ATTENDED_DENY_COMMANDS: list[str] = [
+    cmd for cmd in DECOMPOSITION_CHAT_DENY_COMMANDS
+    if cmd != "Bash(coord portal decision confirm *)"
 ]
 
 MOCK_AUTHOR_SYSTEM_PROMPT = """\
