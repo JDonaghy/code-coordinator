@@ -598,6 +598,21 @@ def test_end_to_end_a_really_ambient_sensitive_test_reddens_the_arm(
     (r / "tests" / "test_ok.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
+    # An ini file so the fixture repo anchors its OWN pytest rootdir. This is the
+    # only test in this file that runs a real pytest inside `tmp_path`, and
+    # without an anchor that nested run infers its rootdir by walking UP out of
+    # `tmp_path` — so any stray `pyproject.toml`/`conftest.py` left in `$TMPDIR`
+    # by some unrelated process becomes an ancestor config of the fixture repo.
+    # On a machine carrying a stray `/tmp/conftest.py` copied from THIS repo,
+    # the nested run imported it and died with
+    # `INTERNALERROR ModuleNotFoundError: No module named 'tests.backends'`
+    # before collecting a single fixture test — a red Test gate with no relation
+    # to the branch under test. rootdir also fixes confcutdir, so anchoring here
+    # cuts ancestor conftest collection off at the fixture repo, exactly as the
+    # scrubbed `$HOME` below cuts off ambient fleet state. Committed in the BASE
+    # commit on purpose: the runner is diff-scoped, and this must not show up as
+    # a changed file.
+    (r / "pytest.ini").write_text("[pytest]\ntestpaths = tests\n", encoding="utf-8")
     shutil.copy2(HARNESS, r / HARNESS_REL)
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "initial")
