@@ -429,6 +429,79 @@ def close() -> None:
 
 _T = TypeVar("_T")
 
+
+# ── Recovering a connection after a swallowed driver error (#2983) ──────────
+
+
+def _board_connection_if_open() -> Any | None:
+    """This process's already-open board connection, or ``None`` (#2983).
+
+    Deliberately NOT :func:`get_connection`: this is called from inside a
+    driver-error handler, where *opening* a connection that wasn't open
+    before would be a surprising side effect (and, on the SQLite path,
+    would create the database file). It only ever hands back a connection
+    something else already opened — the ``override_connection()``/SQLite
+    singleton, else THIS thread's Postgres connection, mirroring
+    :func:`get_connection`'s own precedence order.
+    """
+    if _conn is not None:
+        return _conn
+    return getattr(_pg_thread_local, "conn", None)
+
+
+def rollback_after_driver_error(conn: Any | None, exc: BaseException) -> None:
+    """Clear the aborted transaction *exc* left behind on *conn*, so a
+    handler that swallowed *exc* and keeps using the same connection still
+    has a usable one (#2983).
+
+    **The rule this implements.** After catching a driver error through the
+    dialect seam (``except sql.driver_error(conn):`` /
+    ``except sql.driver_errors():``), a handler that intends to CONTINUE on
+    the same connection must roll back first. A handler that re-raises need
+    not. Postgres aborts the *whole* transaction on any failed statement,
+    so without this every statement issued afterwards on that connection —
+    for the rest of the process, since ``coord.db``'s connection is a
+    process-/thread-lived singleton — raises
+    ``psycopg.errors.InFailedSqlTransaction``. That is what made the whole
+    #2597/#2689/#2784 degrade-gracefully layer inert or actively harmful on
+    the second backend: guards written to *prevent* a crash caused one.
+    SQLite has no such concept — a failed statement there leaves the
+    connection perfectly usable — which is exactly why every one of these
+    21 handler sites read as correct for years.
+
+    **Gated on the exception, not on the connection's dialect.** *exc* is a
+    Postgres driver error iff it carries a SQLSTATE (``psycopg3``'s
+    ``.sqlstate``, ``psycopg2``'s ``.pgcode`` — the same pair
+    :func:`is_lock_contention_error` dispatches on, for the same #2719
+    reason: no config flag, no driver import). Keying off that rather than
+    ``sql.detect_dialect(conn)`` makes "SQLite behaviour is byte-identical
+    to before #2983" true *by construction* rather than by argument: a
+    ``sqlite3.Error`` has no SQLSTATE, so this returns without touching the
+    connection and no SQLite caller can lose uncommitted work it expected
+    to survive into the next statement (``retry_on_locked``'s multi-
+    statement writers being the case where that would actually be
+    observable). #2982's sibling fix in ``_migrate_add_columns`` predates
+    this helper and rolls back unconditionally; it is correct there (the
+    only uncommitted statement at that point is the one that just failed)
+    and is deliberately left as-is.
+
+    A ``None`` *conn* is a no-op — see :func:`_board_connection_if_open`,
+    which may legitimately have nothing to hand over. A failure of the
+    rollback itself is suppressed: this runs inside an ``except`` block
+    whose original exception is the interesting one, and masking it with a
+    secondary error from the recovery attempt would be strictly worse than
+    leaving the connection unrecovered.
+    """
+    if conn is None:
+        return
+    if getattr(exc, "sqlstate", None) is None and getattr(exc, "pgcode", None) is None:
+        return  # not a Postgres driver error — nothing was aborted
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001 — never mask the caught driver error
+        pass
+
+
 # #2538: a handful of consecutive short retries — long enough to ride out a
 # concurrent writer (the daemon's own passive tick, another `coord merge`/
 # `coord notify` invocation) that only holds the DB for a moment, short
@@ -517,6 +590,7 @@ def is_lock_contention_error(exc: BaseException) -> bool:
 def retry_on_locked(
     write: Callable[[], _T],
     *,
+    conn: Any | None = None,
     attempts: int = _LOCK_RETRY_ATTEMPTS,
     base_delay: float = _LOCK_RETRY_BASE_DELAY_S,
 ) -> _T:
@@ -547,12 +621,58 @@ def retry_on_locked(
     ``coord.state._record_dispatched_assignment_local``, whose caller —
     ``coord.auto_loop._dispatch_fix`` — treats it as a declined dispatch
     rather than letting it crash the whole run).
+
+    Transaction recovery, and whether "retry" means anything on Postgres
+    (#2983)
+    ------------------------------------------------------------------
+    SQLite's ``SQLITE_BUSY`` retry model is "the statement never ran; the
+    lock is held elsewhere; the transaction is untouched" — so re-running
+    *write* verbatim is exactly the right move, and has been since #2538.
+    Postgres's three contention SQLSTATEs
+    (:data:`_POSTGRES_LOCK_CONTENTION_SQLSTATES`) are contention-shaped in
+    the same way, but they ALSO abort the whole transaction. That makes the
+    retry loop *worse than useless* on Postgres without recovery: attempt 2
+    onwards raises ``InFailedSqlTransaction`` instead of re-attempting the
+    write, ``is_lock_contention_error`` reads False for it, and the loop
+    bails out on attempt 2 re-raising the wrong error — the #2597/#2689
+    retry budget silently reduced to a single attempt.
+
+    So the answer to "does SQLite's retry model have a Postgres analogue at
+    all, or should the retry just be a no-op there?" is: it has one, and it
+    is the standard Postgres idiom — **roll back, then re-run the whole
+    transaction.** Every *write* callable in this tree is already a
+    self-contained transaction (its own statements followed by its own
+    ``conn.commit()``), which is precisely what makes re-running it after a
+    rollback correct rather than a partial replay. Hence
+    :func:`rollback_after_driver_error` before both the retry and the final
+    re-raise: after the re-raise the connection must still be usable too,
+    because ~13 of this tree's callers catch that exception and *swallow*
+    it (a cache mirror whose upstream GitHub write already landed must not
+    turn into a 503), then keep using the same singleton connection.
+    Recovering here rather than in each of those handlers is what keeps the
+    guarantee in one place: **when this function returns OR raises, it has
+    not left an aborted transaction behind.**
+
+    *conn* is the connection *write* writes through, needed only for that
+    rollback. It defaults to :func:`_board_connection_if_open` because
+    every call site in this tree writes through ``get_connection()``
+    (``coord.state``, ``coord.merge_queue``, ``coord.audit``,
+    ``coord.commands.merge``), so the default is correct for all of them
+    and none had to be churned; pass it explicitly if you ever write
+    through a different connection. Rolling back an innocent already-
+    committed connection would be a no-op anyway — every writer here
+    commits immediately — and the rollback is skipped entirely unless the
+    caught exception carries a Postgres SQLSTATE, so the SQLite path is
+    byte-identical to before #2983.
     """
     delay = base_delay
     for attempt in range(1, attempts + 1):
         try:
             return write()
         except sql.driver_errors() as exc:
+            rollback_after_driver_error(
+                conn if conn is not None else _board_connection_if_open(), exc
+            )
             if not is_lock_contention_error(exc) or attempt >= attempts:
                 raise
             time.sleep(delay)
@@ -613,10 +733,21 @@ def _read_schema_version(conn: sqlite3.Connection) -> int:
     the current ``_DB_SCHEMA_VERSION`` and skips the write path entirely —
     until the next bump (#2675: that skip is exactly what silently dropped
     two `_migrate_add_columns` entries when they landed without one).
+
+    #2983: the "table doesn't exist yet" swallow below needs its own
+    rollback — #2982's fix is one layer downstream and does not cover this.
+    On a fresh Postgres database this is the FIRST statement `_open_postgres`
+    -> `_migrate_if_needed` runs, it errors (`UndefinedTable`), and that
+    aborts the transaction; the caller then continues on the same connection
+    straight into `_fix_schema_version_table`'s `CREATE TABLE IF NOT
+    EXISTS`, which raises `InFailedSqlTransaction`. So on Postgres the
+    brand-new-database path — the one case this guard exists for — could
+    never get past its own first statement.
     """
     try:
         row = sql.execute(conn, "SELECT MAX(version) FROM schema_version").fetchone()
-    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        rollback_after_driver_error(conn, exc)  # #2983: caller keeps using `conn`
         return 0  # table doesn't exist yet
     if row is None or row[0] is None:
         return 0

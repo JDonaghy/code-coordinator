@@ -21,6 +21,12 @@ from coord import db as db_mod
 from coord import sql
 from coord.dao import CoordStore, SqliteStore
 from coord.db import _ensure_schema
+from tests import backends
+from tests.test_db import (
+    AbortOnErrorConn,
+    abort_simulating_connection,
+    schema_migrated_sqlite_connection,
+)
 
 
 @pytest.fixture
@@ -262,3 +268,79 @@ class TestConnectDialectRouting:
         store = SqliteStore(read_db)
         with pytest.raises(db_mod.ProductionDatabaseGuardError):
             store._connect()
+
+
+# ── #2983: a swallowed driver error must not poison the read connection ─────
+#
+# `_audit_recent_count` is documented as failing "open to 0 so a
+# missing/pre-migration table never 503s the board".  On Postgres a failed
+# statement aborts the whole transaction, so before #2983 the swallow took
+# out every *sibling* read sharing that `with closing(self._connect())`
+# block -- `escalations` and `drive_queue` are evaluated after it in
+# `board_projection`'s dict literal -- producing precisely the 503 the guard
+# exists to prevent.
+
+
+class TestAuditRecentCountRollsBackOnDriverError:
+    """Drives the regression with the shared abort-simulating stub, so it is
+    meaningful on a SQLite-only dev machine with no Postgres server."""
+
+    def _store_with_missing_audit_log(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[SqliteStore, AbortOnErrorConn]:
+        conn = abort_simulating_connection(
+            monkeypatch, schema_migrated_sqlite_connection(drop=("audit_log",))
+        )
+        monkeypatch.setattr(SqliteStore, "_connect", lambda self: conn)
+        return SqliteStore(Path("unused-the-connection-is-injected.db")), conn
+
+    def test_returns_zero_and_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store, conn = self._store_with_missing_audit_log(monkeypatch)
+
+        assert store._audit_recent_count(conn) == 0
+        assert conn.rollbacks == 1
+        # The "further operation on the same connection" acceptance
+        # criterion -- pre-fix this raises "current transaction is aborted".
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_board_projection_still_serves_the_reads_after_the_swallow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The user-visible shape: a missing `audit_log` must degrade to
+        `audit_recent_count: 0`, not 503 the whole board.  `escalations` and
+        `drive_queue` are read *after* `_audit_recent_count` in
+        `board_projection`'s dict literal, so they are what actually broke."""
+        store, conn = self._store_with_missing_audit_log(monkeypatch)
+
+        payload = store.board_projection()
+
+        assert payload["audit_recent_count"] == 0
+        assert payload["escalations"] == []
+        assert payload["drive_queue"] == []
+        assert payload["assignments"] == []
+
+
+class TestAuditRecentCountRollsBackOnRealPostgres:
+    """The same regression against an actual Postgres server, when one is
+    reachable -- `psycopg.errors.UndefinedTable` followed by
+    `InFailedSqlTransaction`, the real shapes the stub above simulates."""
+
+    def test_sibling_reads_survive_a_missing_audit_log(self) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            _ensure_schema(session.conn)
+            sql.execute(session.conn, "DROP TABLE audit_log")
+            session.conn.commit()
+            store = SqliteStore(Path("unused-the-connection-is-injected.db"))
+
+            assert store._audit_recent_count(session.conn) == 0
+            # Pre-fix: psycopg.errors.InFailedSqlTransaction.
+            assert sql.execute(session.conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+        finally:
+            session.close()

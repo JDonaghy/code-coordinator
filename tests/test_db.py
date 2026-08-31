@@ -2269,59 +2269,175 @@ class TestMigrateAddColumnsVersionGuard:
 # the very same `_ensure_schema()` call that is running the loop.
 
 
-class _AbortOnErrorCursor:
+# #2983 generalized this stub so the other 20 swallowed-driver-error sites
+# (coord/state.py, coord/dao.py, coord/merge_queue.py) can drive the same
+# defect shape without each test file growing its own copy -- see
+# `PostgresStyleDriverError` below for the one behavioural change: the
+# simulated errors now carry a SQLSTATE, because that (not the connection's
+# dialect) is what `db.rollback_after_driver_error` keys off.
+
+# SQLSTATEs the stub hands out.  Real codes, so a reader can look them up.
+SQLSTATE_UNDEFINED_TABLE = "42P01"
+SQLSTATE_IN_FAILED_SQL_TRANSACTION = "25P02"
+SQLSTATE_SERIALIZATION_FAILURE = "40001"  # one of db._POSTGRES_LOCK_CONTENTION_SQLSTATES
+
+
+class PostgresStyleDriverError(sqlite3.Error):
+    """A driver error that is Postgres-shaped in the one way #2983 cares
+    about -- it carries a SQLSTATE -- while still being an instance of
+    ``sqlite3.Error``, so ``sql.driver_errors()`` / ``sql.driver_error(conn)``
+    catch it against a SQLite connection exactly as psycopg's would against
+    a real one.
+
+    Deliberately NOT a ``sqlite3.OperationalError`` subclass:
+    ``db.is_lock_contention_error`` checks ``isinstance(exc,
+    sqlite3.OperationalError)`` *first* and, for that branch, only looks at
+    the message text.  Subclassing the base ``sqlite3.Error`` instead sends
+    it down the same ``.sqlstate``/``.pgcode`` branch a real psycopg error
+    takes, which is what makes ``SQLSTATE_SERIALIZATION_FAILURE`` read as
+    genuine lock contention here without any message-text games.
+    """
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class AbortOnErrorCursor:
     """Delegates to a real sqlite3 cursor, except it flags its parent
     connection as aborted the moment a statement raises -- see
-    ``_AbortOnErrorConn`` below."""
+    ``AbortOnErrorConn`` below."""
 
-    def __init__(self, real_cursor: Any, parent: "_AbortOnErrorConn") -> None:
+    def __init__(self, real_cursor: Any, parent: "AbortOnErrorConn") -> None:
         self._real = real_cursor
         self._parent = parent
 
-    def execute(self, *args: Any, **kwargs: Any) -> "_AbortOnErrorCursor":
-        if self._parent._aborted:
-            raise sqlite3.OperationalError("current transaction is aborted")
+    def execute(self, *args: Any, **kwargs: Any) -> "AbortOnErrorCursor":
+        if self._parent.aborted:
+            raise PostgresStyleDriverError(
+                "current transaction is aborted, commands ignored until end of "
+                "transaction block",
+                SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+            )
         try:
             self._real.execute(*args, **kwargs)
-        except sqlite3.OperationalError:
-            self._parent._aborted = True
-            raise
+        except sqlite3.Error as exc:
+            self._parent.aborted = True
+            raise PostgresStyleDriverError(str(exc), self._parent.sqlstate) from exc
         return self
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)
 
 
-class _AbortOnErrorConn:
+class AbortOnErrorConn:
     """Wraps a real, already-schema'd sqlite3 connection and reproduces
     Postgres's abort-the-whole-transaction-on-error behaviour on top of it:
     once a statement raises, every later statement -- including
     ``commit()`` -- raises the same error until ``rollback()`` clears it.
 
-    This is what lets the #2982 regression be driven -- and go red on the
-    pre-fix code -- on a SQLite-only dev machine with no Postgres server:
+    This is what lets the #2982/#2983 regressions be driven -- and go red on
+    the pre-fix code -- on a SQLite-only dev machine with no Postgres server:
     nothing here talks to a real Postgres, but the observable shape (a
     swallowed error leaves the connection unusable until rolled back) is
     the same defect.
+
+    ``rollbacks`` counts recovery attempts so a test can assert the *absence*
+    of a rollback too -- which is how "SQLite behaviour is byte-identical"
+    gets a real assertion rather than a promise.
     """
 
-    def __init__(self, real: sqlite3.Connection) -> None:
+    def __init__(
+        self, real: sqlite3.Connection, *, sqlstate: str = SQLSTATE_UNDEFINED_TABLE
+    ) -> None:
         self._real = real
-        self._aborted = False
+        self.aborted = False
+        self.sqlstate = sqlstate
+        self.rollbacks = 0
 
-    def cursor(self) -> _AbortOnErrorCursor:
-        if self._aborted:
-            raise sqlite3.OperationalError("current transaction is aborted")
-        return _AbortOnErrorCursor(self._real.cursor(), self)
+    def cursor(self) -> AbortOnErrorCursor:
+        if self.aborted:
+            raise PostgresStyleDriverError(
+                "current transaction is aborted", SQLSTATE_IN_FAILED_SQL_TRANSACTION
+            )
+        return AbortOnErrorCursor(self._real.cursor(), self)
 
     def commit(self) -> None:
-        if self._aborted:
-            raise sqlite3.OperationalError("current transaction is aborted")
+        if self.aborted:
+            raise PostgresStyleDriverError(
+                "current transaction is aborted", SQLSTATE_IN_FAILED_SQL_TRANSACTION
+            )
         self._real.commit()
 
     def rollback(self) -> None:
-        self._aborted = False
+        self.rollbacks += 1
+        self.aborted = False
         self._real.rollback()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def pin_sqlite_dialect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``sql.detect_dialect`` keys off ``type(conn).__module__``, which
+    :class:`AbortOnErrorConn` fails (it isn't a ``sqlite3.Connection``
+    subclass) -- pin it to ``"sqlite"`` so ``sql.execute``/
+    ``sql.executescript``'s ``translate()`` and ``cursor()`` calls behave
+    exactly as they would against the real connection underneath, and so
+    ``sql.driver_error(conn)`` still resolves to ``sqlite3.Error``.
+
+    Note this pin does NOT weaken what the #2983 tests prove:
+    ``db.rollback_after_driver_error`` dispatches on the *exception's*
+    SQLSTATE, never on the connection's dialect, precisely so that the
+    SQLite path stays byte-identical by construction.
+    """
+    monkeypatch.setattr(sql, "detect_dialect", lambda conn: sql.DIALECT_SQLITE)
+
+
+def schema_migrated_sqlite_connection(*, drop: tuple[str, ...] = ()) -> sqlite3.Connection:
+    """A real, schema-migrated in-memory SQLite connection for
+    :class:`AbortOnErrorConn` to wrap, with *drop* tables removed again.
+
+    The **only** ``sqlite3.connect`` site the #2982/#2983 abort simulations
+    use, deliberately: ``tests/test_sqlite_connect_ratchet.py`` pins a
+    per-file count, and routing all four test files (``test_db``,
+    ``test_dao``, ``test_state``, ``test_merge_queue``) through this one
+    factory means the sweep adds no new site to any of them.
+
+    The connection underneath has to be a genuine sqlite3 one — the stub
+    raises/catches ``sqlite3.Error`` and :func:`pin_sqlite_dialect` pins
+    ``sql.detect_dialect``, so ``translate()``/``cursor()`` behave exactly as
+    they do against the real driver.  ``coord_db`` is out (it is already
+    installed as ``override_connection``, and under
+    ``COORD_TEST_BACKEND=postgres`` it is a psycopg connection that already
+    aborts for real, which is the behaviour being *simulated* here) and
+    ``scratch_database()`` is out for the same backend-following reason.
+
+    *drop* exists because the sites #2983 fixes swallow a **missing table**
+    error, and the table in question is either created by
+    ``coord.housekeeping`` rather than ``_ensure_schema`` (``assignments_
+    archive``, ``merge_queue_archive`` — nothing to drop, absent already) or
+    is in the schema and has to be taken back out (``audit_log``,
+    ``schema_version``).
+    """
+    real = sqlite3.connect(":memory:")
+    real.row_factory = sqlite3.Row
+    db_mod._ensure_schema(real)
+    for table in drop:
+        sql.execute(real, f"DROP TABLE IF EXISTS {table}")  # noqa: S608 -- test-local literal
+    real.commit()
+    return real
+
+
+def abort_simulating_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    real: sqlite3.Connection,
+    *,
+    sqlstate: str = SQLSTATE_UNDEFINED_TABLE,
+) -> AbortOnErrorConn:
+    """The two lines every #2983 regression test needs, in one call."""
+    pin_sqlite_dialect(monkeypatch)
+    return AbortOnErrorConn(real, sqlstate=sqlstate)
 
 
 class TestMigrateAddColumnsRollsBackOnDriverError:
@@ -2331,17 +2447,10 @@ class TestMigrateAddColumnsRollsBackOnDriverError:
 
     def _wrapped_conn_with_columns_already_present(
         self, monkeypatch: pytest.MonkeyPatch
-    ) -> _AbortOnErrorConn:
-        real = sqlite3.connect(":memory:")
-        real.row_factory = sqlite3.Row
-        db_mod._ensure_schema(real)  # every _MIGRATE_ADD_COLUMNS column now exists
-        # `sql.detect_dialect` keys off `type(conn).__module__`, which the
-        # stub fails (it isn't a sqlite3.Connection subclass) -- pin it to
-        # "sqlite" so `sql.execute`/`sql.executescript`'s translate() and
-        # cursor() calls behave exactly as they would against the real
-        # connection underneath.
-        monkeypatch.setattr(sql, "detect_dialect", lambda conn: sql.DIALECT_SQLITE)
-        return _AbortOnErrorConn(real)
+    ) -> AbortOnErrorConn:
+        # every _MIGRATE_ADD_COLUMNS column now exists, so every ALTER is a dup
+        real = schema_migrated_sqlite_connection()
+        return abort_simulating_connection(monkeypatch, real)
 
     def test_ensure_schema_completes_when_a_duplicate_alter_aborts_the_tx(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2400,6 +2509,267 @@ class TestMigrateAddColumnsRollsBackOnRealPostgres:
             ).fetchall()
             assert len(rows) == 1
             assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+        finally:
+            session.close()
+
+
+# ── #2983: the other 20 swallowed-driver-error sites ────────────────────────
+#
+# #2982 fixed one instance of "catch a driver error through the dialect seam,
+# then keep using the same connection".  This sweeps the rest.  The shared
+# rule lives in `db.rollback_after_driver_error`; these tests pin (a) that
+# helper's contract, (b) `retry_on_locked`'s "never leaves an aborted
+# transaction behind" guarantee, which is what makes the ~13 handlers whose
+# `try` body is just a `retry_on_locked(...)` call safe without their own
+# rollback, and (c) `_read_schema_version`, which #2982's fix does NOT cover.
+
+
+class _RollbackRecorder:
+    """Minimal connection stand-in: records rollbacks, nothing else."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.rollbacks = 0
+        self._fail = fail
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        if self._fail:
+            raise sqlite3.OperationalError("rollback itself failed")
+
+    def close(self) -> None:
+        """Only so a test may install this as ``db._conn`` and still survive
+        the ``coord_db`` fixture's ``db.close()`` teardown."""
+
+
+class TestRollbackAfterDriverError:
+    """The #2983 rule, unit-tested: roll back iff the caught exception is a
+    Postgres driver error (it carries a SQLSTATE)."""
+
+    def test_rolls_back_for_a_psycopg3_style_sqlstate(self) -> None:
+        conn = _RollbackRecorder()
+
+        db_mod.rollback_after_driver_error(
+            conn, PostgresStyleDriverError("no such table", SQLSTATE_UNDEFINED_TABLE)
+        )
+
+        assert conn.rollbacks == 1
+
+    def test_rolls_back_for_a_psycopg2_style_pgcode(self) -> None:
+        """psycopg2 spells the same field ``.pgcode`` — both must work, same
+        as ``is_lock_contention_error`` already accepts either."""
+        conn = _RollbackRecorder()
+        exc = sqlite3.OperationalError("relation does not exist")
+        exc.pgcode = SQLSTATE_UNDEFINED_TABLE  # type: ignore[attr-defined]
+
+        db_mod.rollback_after_driver_error(conn, exc)
+
+        assert conn.rollbacks == 1
+
+    def test_plain_sqlite_error_is_left_completely_alone(self) -> None:
+        """The "SQLite behaviour is byte-identical" criterion, as an
+        assertion rather than a promise: a real ``sqlite3`` error carries no
+        SQLSTATE, so no SQLite caller can lose uncommitted work it expected
+        to survive into the retry/next statement."""
+        conn = _RollbackRecorder()
+
+        db_mod.rollback_after_driver_error(
+            conn, sqlite3.OperationalError("database is locked")
+        )
+
+        assert conn.rollbacks == 0
+
+    def test_none_connection_is_a_no_op(self) -> None:
+        db_mod.rollback_after_driver_error(
+            None, PostgresStyleDriverError("boom", SQLSTATE_UNDEFINED_TABLE)
+        )  # must not raise
+
+    def test_a_failing_rollback_never_masks_the_caught_error(self) -> None:
+        """This runs inside an ``except`` block; a secondary error from the
+        recovery attempt replacing the original driver error would be
+        strictly worse than leaving the connection unrecovered."""
+        conn = _RollbackRecorder(fail=True)
+
+        db_mod.rollback_after_driver_error(
+            conn, PostgresStyleDriverError("boom", SQLSTATE_UNDEFINED_TABLE)
+        )
+
+        assert conn.rollbacks == 1
+
+
+class TestBoardConnectionIfOpen:
+    """`retry_on_locked`'s default connection resolution — it must never
+    *open* one from inside an error handler."""
+
+    def test_returns_the_installed_override(self, coord_db) -> None:
+        assert db_mod._board_connection_if_open() is coord_db
+
+    def test_returns_none_when_nothing_is_open(self, monkeypatch) -> None:
+        monkeypatch.setattr(db_mod, "_conn", None)
+        monkeypatch.setattr(db_mod, "_pg_thread_local", threading.local())
+
+        assert db_mod._board_connection_if_open() is None
+
+
+class TestRetryOnLockedRecoversAbortedTransaction:
+    """The highest-value site in #2983: on Postgres the first contention
+    failure aborts the transaction, so without a rollback attempt 2 onwards
+    raises ``InFailedSqlTransaction`` (which is not lock contention), the
+    loop bails out immediately, and the whole #2597/#2689 retry budget is
+    silently one attempt."""
+
+    def test_the_retry_budget_still_works_after_a_postgres_style_abort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(db_mod.time, "sleep", lambda _s: None)
+        conn = abort_simulating_connection(
+            monkeypatch,
+            schema_migrated_sqlite_connection(),
+            sqlstate=SQLSTATE_SERIALIZATION_FAILURE,
+        )
+        attempts: list[int] = []
+
+        def _write() -> str:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                # A genuinely failing statement — this is what aborts the tx.
+                sql.execute(conn, "SELECT 1 FROM no_such_table")
+            sql.execute(conn, "SELECT 1")
+            conn.commit()
+            return "written"
+
+        # Pre-fix this raises on attempt 2: the aborted-transaction error is
+        # not lock contention, so `retry_on_locked` re-raises it instead of
+        # retrying, and reports the wrong error to boot.
+        assert db_mod.retry_on_locked(_write, conn=conn) == "written"
+        assert len(attempts) == 3
+        assert conn.rollbacks == 2  # one per swallowed collision
+
+    def test_connection_is_usable_after_the_budget_is_exhausted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The acceptance criterion for this site: drive the error path, then
+        perform a further operation on the same connection.  ~13 callers
+        catch this raise and *swallow* it (a cache mirror whose GitHub write
+        already landed must not 503), then keep using the same singleton."""
+        monkeypatch.setattr(db_mod.time, "sleep", lambda _s: None)
+        conn = abort_simulating_connection(
+            monkeypatch,
+            schema_migrated_sqlite_connection(),
+            sqlstate=SQLSTATE_SERIALIZATION_FAILURE,
+        )
+
+        with pytest.raises(sqlite3.Error):
+            db_mod.retry_on_locked(
+                lambda: sql.execute(conn, "SELECT 1 FROM no_such_table"), conn=conn
+            )
+
+        # Pre-fix: raises "current transaction is aborted".
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_sqlite_contention_path_is_byte_identical(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real SQLite ``database is locked`` error carries no SQLSTATE, so
+        the retry loop behaves exactly as it did before #2983 — no rollback,
+        so a multi-statement writer's uncommitted work still survives into
+        the retry."""
+        monkeypatch.setattr(db_mod.time, "sleep", lambda _s: None)
+        conn = _RollbackRecorder()
+        calls: list[int] = []
+
+        def _write() -> str:
+            calls.append(1)
+            if len(calls) < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return "written"
+
+        assert db_mod.retry_on_locked(_write, conn=conn) == "written"
+        assert conn.rollbacks == 0
+
+    def test_defaults_to_the_open_board_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No call site in coord/ passes ``conn=`` — they all write through
+        ``get_connection()``, so the default has to find it, which is what
+        keeps ``coord/audit.py``, ``coord/auto_loop.py`` and
+        ``coord/commands/merge.py`` fixed without being touched."""
+        monkeypatch.setattr(db_mod.time, "sleep", lambda _s: None)
+        conn = _RollbackRecorder()
+        monkeypatch.setattr(db_mod, "_conn", conn)
+
+        with pytest.raises(PostgresStyleDriverError):
+            db_mod.retry_on_locked(
+                lambda: (_ for _ in ()).throw(
+                    PostgresStyleDriverError("aborted", SQLSTATE_UNDEFINED_TABLE)
+                )
+            )
+
+        assert conn.rollbacks == 1
+
+
+class TestReadSchemaVersionRollsBackOnDriverError:
+    """`_read_schema_version`'s "table doesn't exist yet" swallow is on the
+    same first-open path #2982 fixed, but one layer earlier, and #2982's fix
+    does not reach it: on a fresh Postgres database this is the FIRST
+    statement `_migrate_if_needed` runs, its `UndefinedTable` aborts the
+    transaction, and the caller then continues on the same connection
+    straight into `_fix_schema_version_table`'s `CREATE TABLE IF NOT
+    EXISTS`."""
+
+    def test_returns_zero_and_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = abort_simulating_connection(
+            monkeypatch, schema_migrated_sqlite_connection(drop=("schema_version",))
+        )
+
+        assert db_mod._read_schema_version(conn) == 0
+
+        # Pre-fix: raises "current transaction is aborted".
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_migrate_if_needed_completes_over_the_swallowed_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole first-open path, end to end — the caller really does
+        keep using the connection, so this is the shape that broke."""
+        conn = abort_simulating_connection(
+            monkeypatch, schema_migrated_sqlite_connection(drop=("schema_version",))
+        )
+
+        db_mod._migrate_if_needed(
+            conn, is_production=False, target_desc="a #2983 scratch database"
+        )
+
+        rows = sql.execute(conn, "SELECT version FROM schema_version").fetchall()
+        assert [r["version"] for r in rows] == [db_mod._DB_SCHEMA_VERSION]
+
+
+class TestReadSchemaVersionRollsBackOnRealPostgres:
+    """The same regression against an actual Postgres server, when one is
+    reachable — `psycopg.errors.UndefinedTable` then
+    `InFailedSqlTransaction`, the real shapes the stub above simulates."""
+
+    def test_migrate_if_needed_completes_on_a_fresh_postgres_schema(self) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            # A brand-new private schema: `schema_version` genuinely does not
+            # exist, so `_read_schema_version`'s SELECT really does raise
+            # UndefinedTable and really does abort the transaction.
+            db_mod._migrate_if_needed(
+                session.conn,
+                is_production=False,
+                target_desc="a #2983 scratch Postgres schema",
+            )
+
+            rows = sql.execute(
+                session.conn, "SELECT version FROM schema_version"
+            ).fetchall()
+            assert [r["version"] for r in rows] == [db_mod._DB_SCHEMA_VERSION]
         finally:
             session.close()
 

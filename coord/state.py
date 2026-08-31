@@ -46,7 +46,12 @@ from coord.board_service import route_assignment_patch as _route_assignment_patc
 from coord.board_service import route_issue_comment as _route_issue_comment
 from coord.board_service import route_issue_patch as _route_issue_patch
 from coord.board_service import route_write as _route_write
-from coord.db import get_connection, is_lock_contention_error, retry_on_locked
+from coord.db import (
+    get_connection,
+    is_lock_contention_error,
+    retry_on_locked,
+    rollback_after_driver_error,
+)
 from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
@@ -3137,6 +3142,13 @@ def _update_assignment_tokens_local(
         # and now also covers a lock that outlasts the retry budget.
         retry_on_locked(_write)
     except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+        # #2983 audit: safe to swallow without a rollback here, unlike the
+        # sibling handlers below — `retry_on_locked` guarantees it has not
+        # left an aborted transaction behind when it returns OR raises (see
+        # its "Transaction recovery" docstring section), so every handler
+        # whose `try` body is a `retry_on_locked(...)` call inherits the fix
+        # for free. Adding a second rollback here would be redundant, not
+        # safer.
         pass
 
 
@@ -3184,9 +3196,17 @@ def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -
             (stop_reason, assignment_id),
         )
         conn.commit()
-    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         # Column may not exist yet (pre-migration DB or test fixtures).
-        pass
+        #
+        # #2983: `conn` is the process-/thread-lived `get_connection()`
+        # singleton, so on Postgres swallowing this without a rollback
+        # leaves the transaction aborted for every LATER caller of
+        # `get_connection()` in this process, not just for the rest of this
+        # function. Nothing uncommitted is lost: the only statement in the
+        # transaction is the UPDATE that just failed (the `commit()` above
+        # is the last thing in the block).
+        rollback_after_driver_error(conn, exc)
 
 
 def mark_assignment_interactive(assignment_id: str) -> None:
@@ -3221,9 +3241,12 @@ def _mark_assignment_interactive_local(assignment_id: str) -> None:
             (assignment_id,),
         )
         conn.commit()
-    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         # Column may not exist on a pre-migration DB.
-        pass
+        # #2983: same shared-singleton reasoning as
+        # `_update_assignment_stop_reason_local` above — swallow, but leave
+        # the connection usable for the next `get_connection()` caller.
+        rollback_after_driver_error(conn, exc)
 
 
 def set_test_plan(
@@ -3392,8 +3415,14 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
             (reason[:512], now, assignment_id),  # cap at 512 chars — one-liner
         )
         conn.commit()
-    except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
         # Column may not exist on a pre-migration DB — best-effort.
+        # #2983: the `return` ends this function but NOT the connection's
+        # life — it is the shared `get_connection()` singleton, so an
+        # un-rolled-back abort here would take out every later statement in
+        # the process on Postgres (including this same daemon request's
+        # audit write below).
+        rollback_after_driver_error(conn, exc)
         return
     # #1036 fix review finding 2: no matching row (bad/stale assignment_id)
     # means the UPDATE above touched nothing — don't audit a transition that
@@ -5982,7 +6011,15 @@ def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
                 f"SELECT DISTINCT issue_number FROM {table} WHERE repo_name = ?",  # noqa: S608
                 (repo_name,),
             ).fetchall()
-        except sql.driver_errors():  # #2784: was sqlite3.OperationalError only
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            # #2983: `continue` goes straight back round the loop on the SAME
+            # connection, so on Postgres a missing `assignments_archive` (the
+            # exact case named below) aborted the transaction and the NEXT
+            # iteration — plus everything else this process later ran through
+            # `get_connection()` — raised InFailedSqlTransaction uncaught.
+            # Read-only loop, so the rollback can only discard the SELECT
+            # that just failed.
+            rollback_after_driver_error(conn, exc)
             continue  # assignments_archive may not exist yet (housekeeping never ran)
         numbers.update(r[0] for r in rows if r[0] is not None)
     return numbers

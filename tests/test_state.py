@@ -9,6 +9,9 @@ import warnings
 
 import pytest
 
+from coord import db as db_mod
+from coord import sql
+from coord import state
 from coord.models import Proposal
 from coord.state import (
     save_proposals,
@@ -18,6 +21,12 @@ from coord.state import (
     record_test_verdict,
     record_uat_verdict,
     update_assignment_claude_session_id,
+)
+from tests import backends
+from tests.test_db import (
+    AbortOnErrorConn,
+    abort_simulating_connection,
+    schema_migrated_sqlite_connection,
 )
 
 
@@ -3658,3 +3667,137 @@ class TestUpsertSeamReplacesNotDuplicates:
         ).fetchall()
         assert len(rows) == 1
         assert [link["submission_id"] for link in list_portal_links()] == ["s2"]
+
+
+# ── #2983: swallowed driver errors must leave the connection usable ─────────
+#
+# `coord.db.get_connection()` is a process-/thread-lived singleton, so these
+# handlers do not just "swallow and carry on" for the rest of their own
+# function -- on Postgres an un-rolled-back abort takes out every LATER
+# statement in the process too, including ones in completely unrelated
+# request handlers.
+
+
+def _abort_conn_with_assignment_rows(
+    monkeypatch: pytest.MonkeyPatch, *, drop: tuple[str, ...] = ()
+) -> AbortOnErrorConn:
+    """The `get_connection()` singleton, replaced by an abort-simulating stub
+    over a real schema-migrated SQLite connection with one assignment row.
+
+    `monkeypatch.setattr` rather than `db_mod.override_connection` so the
+    autouse `coord_db` fixture's own connection is restored before its
+    teardown runs.
+    """
+    real = schema_migrated_sqlite_connection(drop=drop)
+    if "assignments" not in drop:
+        sql.execute(
+            real,
+            "INSERT INTO assignments (assignment_id, repo_name, issue_number, "
+            "issue_title, machine_name, status) VALUES (?, ?, ?, ?, ?, ?)",
+            ("a-1", "demo", 42, "Demo issue", "laptop", "running"),
+        )
+        real.commit()
+    conn = abort_simulating_connection(monkeypatch, real)
+    monkeypatch.setattr(db_mod, "_conn", conn)
+    return conn
+
+
+class TestListIssueNumbersWithAssignmentsRollsBack:
+    """`_list_issue_numbers_with_assignments_local` loops over
+    ``("assignments", "assignments_archive")`` and `continue`s past a missing
+    table **on the same connection**.  `assignments_archive` is created by
+    `coord.housekeeping`, not `_ensure_schema`, so "it doesn't exist yet" is
+    the ordinary case the comment names -- and on Postgres it aborted the
+    transaction for everything that came afterwards."""
+
+    def test_returns_live_issue_numbers_and_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = _abort_conn_with_assignment_rows(monkeypatch)
+
+        assert state._list_issue_numbers_with_assignments_local("demo") == {42}
+        assert conn.rollbacks == 1  # the archive miss, recovered
+
+        # The acceptance criterion: a further operation on the same
+        # connection.  Pre-fix this raises "current transaction is aborted"
+        # -- and it is the *shared singleton*, so every later caller in the
+        # process saw it, not just this one.
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_a_later_state_read_on_the_same_singleton_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The blast radius, spelled out: the very next `coord.state` call
+        through `get_connection()` must not inherit the aborted transaction."""
+        _abort_conn_with_assignment_rows(monkeypatch)
+
+        state._list_issue_numbers_with_assignments_local("demo")
+
+        assert state._list_issue_numbers_with_assignments_local("demo") == {42}
+
+
+class TestBestEffortColumnSwallowsRollBack:
+    """The three `update_assignment_*`-family handlers that swallow a
+    "column may not exist on a pre-migration DB" error with a bare `pass` /
+    `return` and no rollback."""
+
+    def test_update_stop_reason_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = _abort_conn_with_assignment_rows(monkeypatch, drop=("assignments",))
+
+        state._update_assignment_stop_reason_local("a-1", "max_turns")
+
+        assert conn.rollbacks == 1
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_mark_interactive_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = _abort_conn_with_assignment_rows(monkeypatch, drop=("assignments",))
+
+        state._mark_assignment_interactive_local("a-1")
+
+        assert conn.rollbacks == 1
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+    def test_set_failure_reason_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = _abort_conn_with_assignment_rows(monkeypatch, drop=("assignments",))
+
+        state._set_assignment_failure_reason_local("a-1", "agent unreachable")
+
+        assert conn.rollbacks == 1
+        assert sql.execute(conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+
+
+class TestListIssueNumbersWithAssignmentsOnRealPostgres:
+    """The same regression against an actual Postgres server, when one is
+    reachable -- `psycopg.errors.UndefinedTable` then
+    `InFailedSqlTransaction`, the real shapes the stub above simulates."""
+
+    def test_missing_archive_table_does_not_poison_the_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            db_mod._ensure_schema(session.conn)
+            sql.execute(
+                session.conn,
+                "INSERT INTO assignments (assignment_id, repo_name, issue_number, "
+                "issue_title, machine_name, status) VALUES (?, ?, ?, ?, ?, ?)",
+                ("a-1", "demo", 42, "Demo issue", "laptop", "running"),
+            )
+            session.conn.commit()
+            monkeypatch.setattr(db_mod, "_conn", session.conn)
+
+            assert state._list_issue_numbers_with_assignments_local("demo") == {42}
+            assert sql.execute(session.conn, "SELECT 1 AS ok").fetchone()["ok"] == 1
+        finally:
+            monkeypatch.undo()
+            session.close()
