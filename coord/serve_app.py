@@ -1048,7 +1048,12 @@ def _sync_issues_tick(config: Config) -> int:
     dormant, and dormant repos are only swept once per
     ``coord.repo_dormancy.DORMANT_SWEEP_FLOOR_S`` rather than every tick.
     Queuing work for a dormant repo un-skips it on the very next tick (the
-    check is live against board + drive-queue state, never cached).
+    check is live against board + drive-queue state, never cached). This
+    adds a ``build_board()`` call to this tick that wasn't here before —
+    a local SQLite read, not a network call; every other slow-cadence tick
+    in this module (``_reconcile_merges_tick`` included, run moments earlier
+    in the same ``_tick_loop`` pass) already pays it once per tick, so this
+    is not new cost territory.
     """
     import logging  # noqa: PLC0415
 
@@ -1065,10 +1070,12 @@ def _sync_issues_tick(config: Config) -> int:
     total = 0
     skipped_dormant = 0
     for repo in config.repos:
-        if repo_dormancy.should_skip_sweep(repo.name, board):
+        if repo_dormancy.should_skip_sweep(
+            repo.name, board, repo_dormancy.KIND_ISSUES
+        ):
             skipped_dormant += 1
             continue
-        repo_dormancy.record_swept(repo.name)
+        repo_dormancy.record_swept(repo.name, repo_dormancy.KIND_ISSUES)
         starved = issues_sync_status.is_starved(repo.name)
         issues_sync_status.record_attempt(repo.name)
         try:

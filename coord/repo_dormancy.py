@@ -23,8 +23,19 @@ filed by someone who isn't coord) is still noticed eventually even though
 nothing coord-side would otherwise prompt a look. Same best-effort,
 JSON-backed, never-raises shape as the sibling starvation-floor tracker
 :mod:`coord.issues_sync_status` established for exactly this kind of
-bookkeeping — one file, one dict of ``{repo_name: last_swept_at}``, no new
-persistence layer.
+bookkeeping — one file, one dict, no new persistence layer.
+
+**Two independent sweep kinds, two independent floors (#2994 review).**
+``_sync_issues_tick`` (issues-sync, ``gh issue list``) and
+``close_stale_prs`` (stale-PR sweep, ``gh pr list``) both call this module
+for the *same repo* in the same daemon tick, one right after the other
+(``_tick_loop``). They are unrelated ``gh`` calls that happen to run
+back-to-back — if they shared one ``{repo_name: last_swept_at}`` clock,
+whichever tick ran first would refresh it before the second ever saw a
+stale-enough value, permanently starving the loser. So every entry point
+takes a mandatory ``kind`` (a short tag like ``"issues"`` or ``"prs"``) and
+the on-disk state is keyed by ``f"{repo_name}:{kind}"`` — same file, two
+disjoint sets of keys, each consumer only ever reads/writes its own.
 
 Both consumers follow the same two-call contract:
 
@@ -60,6 +71,13 @@ _STATE_FILENAME = "repo_dormancy_status.json"
 # calls on most ticks, short enough that "eventually" reads as "within the
 # hour" to an operator rather than "whenever someone notices."
 DORMANT_SWEEP_FLOOR_S = 3600.0
+
+# Sweep-kind tags (#2994 review): each gets its own floor timer, keyed by
+# f"{repo_name}:{kind}" on disk, so the issues-sync tick and the stale-PR
+# sweep never clobber each other's clock even when they run back-to-back
+# for the same repo in the same tick (`_tick_loop`).
+KIND_ISSUES = "issues"
+KIND_PRS = "prs"
 
 
 def _state_path() -> Path:
@@ -113,8 +131,17 @@ def _write_all(data: dict[str, float]) -> None:
         _log.debug("repo_dormancy: write failed: %s", exc)
 
 
-def record_swept(repo_name: str, *, now: float | None = None) -> None:
-    """Best-effort: stamp *repo_name* as having had a real sweep just now.
+def _key(repo_name: str, kind: str) -> str:
+    return f"{repo_name}:{kind}"
+
+
+def record_swept(repo_name: str, kind: str, *, now: float | None = None) -> None:
+    """Best-effort: stamp *repo_name*'s *kind* sweep as having run just now.
+
+    *kind* is a short tag identifying which independent sweep this is (e.g.
+    ``"issues"`` for the issues-sync tick, ``"prs"`` for the stale-PR sweep)
+    — each gets its own floor timer, keyed by ``f"{repo_name}:{kind}"``, so
+    the two sweeps never clobber each other's clock.
 
     Called right after a tick decides NOT to skip a repo — regardless of
     whether the sweep itself goes on to succeed or fail — so the floor timer
@@ -122,12 +149,12 @@ def record_swept(repo_name: str, *, now: float | None = None) -> None:
     """
     now = now if now is not None else time.time()
     data = _read_all()
-    data[repo_name] = now
+    data[_key(repo_name, kind)] = now
     _write_all(data)
 
 
-def _last_swept_at(repo_name: str) -> float | None:
-    return _read_all().get(repo_name)
+def _last_swept_at(repo_name: str, kind: str) -> float | None:
+    return _read_all().get(_key(repo_name, kind))
 
 
 def repo_has_activity(repo_name: str, board: Board) -> bool:
@@ -166,9 +193,14 @@ def repo_has_activity(repo_name: str, board: Board) -> bool:
 
 
 def should_skip_sweep(
-    repo_name: str, board: Board, *, now: float | None = None
+    repo_name: str, board: Board, kind: str, *, now: float | None = None
 ) -> bool:
-    """True when this tick should skip *repo_name*'s GitHub sweep.
+    """True when this tick should skip *repo_name*'s *kind* GitHub sweep.
+
+    *kind* must match the tag the corresponding :func:`record_swept` call
+    uses (``"issues"`` vs. ``"prs"``) — the two sweeps are independent
+    ``gh`` call types with independent floors; see the module docstring for
+    why they must not share one clock.
 
     Only ever True for a repo with zero activity (see
     :func:`repo_has_activity`) that was also swept for real inside
@@ -178,7 +210,7 @@ def should_skip_sweep(
     """
     if repo_has_activity(repo_name, board):
         return False
-    last = _last_swept_at(repo_name)
+    last = _last_swept_at(repo_name, kind)
     if last is None:
         return False
     now = now if now is not None else time.time()
