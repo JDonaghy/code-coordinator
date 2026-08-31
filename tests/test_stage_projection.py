@@ -397,6 +397,36 @@ def test_compute_issue_projection_includes_acceptance_box():
     assert out["acceptance_progress"] == {"passed": 5, "total": 5}
 
 
+def test_compute_issue_projection_stage_counts_has_same_keys_as_stages():
+    """Review fix (#3013): `stage_counts` must carry every key `stages`
+    does — including `acceptance`, which is added to `stages`
+    unconditionally outside `names`/`default_gates` and was previously
+    dropped from `stage_counts` entirely, contradicting the `/board` schema
+    description ('Same key set as `stages`') and risking a `KeyError` for
+    any client indexing `stage_counts` by every key in `stages`."""
+    a = [_work(status="done", acceptance_state="passed", acceptance_total=5, acceptance_passed=5)]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert set(out["stage_counts"]) == set(out["stages"])
+    assert out["stage_counts"]["acceptance"] == 1
+
+
+def test_compute_issue_projection_stage_counts_acceptance_counts_verdict_legs():
+    """Each `type="work"` row carrying a recorded `acceptance_state` is a
+    separate acceptance-verdict leg — mirrors the `test`/`merge` special
+    cases: no dedicated assignment type exists to count directly."""
+    a = [
+        _work(assignment_id="w1", status="done", acceptance_state="failed", dispatched_at=1.0),
+        _work(assignment_id="w2", status="done", acceptance_state="passed", dispatched_at=2.0),
+        _work(assignment_id="w3", status="done", dispatched_at=3.0),  # no verdict yet
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["acceptance"] == 2
+
+
 # ── compute_issue_projection: stage_counts (#3013) ──────────────────────────
 
 
@@ -984,6 +1014,92 @@ def test_compute_board_stage_projection_stage_counts_attributes_slice_legs_to_ch
     assert by_issue[164]["stage_counts"]["review"] == 5
     # The epic's own count must not also carry the slice's legs — they
     # belong on exactly one entry, not both.
+    assert by_issue[160]["stage_counts"]["work"] == 0
+    assert by_issue[160]["stage_counts"]["review"] == 0
+
+
+def test_compute_board_stage_projection_phantom_slice_stages_match_stage_counts():
+    """Review fix (#3013 blocking finding): a slice/child issue whose ONLY
+    board rows are booked to the tracking issue — and which is NOT itself in
+    the `issues` table yet (unlike the sibling test above, where both #160
+    and #164 are already synced) — must not render a self-contradictory
+    board row: every stage PENDING/SKIPPED right next to a `stage_counts`
+    proving 4 work legs and 5 review legs ran. `stages` now falls back to
+    the same effective-keyed rows `stage_counts` uses whenever an issue has
+    zero rows keyed to its own raw `issue_number` (nothing separately
+    tracked for #1652's false-green concern to clobber)."""
+    issues = [
+        {"repo_name": "api", "number": 160, "title": "epic", "state": "open"},
+        # #164 deliberately absent — the phantom case: it only appears via
+        # the effective-key union below.
+    ]
+    assignments = [
+        _work(
+            assignment_id="ta1", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=1.0,
+        ),
+        _work(
+            assignment_id="ta2", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=2.0,
+        ),
+        _work(
+            assignment_id="ta3", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=3.0,
+        ),
+        _work(
+            assignment_id="ta4", issue_number=160, type="test-author",
+            status="done", for_issue_number=164, dispatched_at=4.0,
+        ),
+        _review(
+            assignment_id="r1", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=5.0,
+        ),
+        _review(
+            assignment_id="r2", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=6.0,
+        ),
+        _review(
+            assignment_id="r3", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=7.0,
+        ),
+        _review(
+            assignment_id="r4", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=8.0,
+        ),
+        _review(
+            assignment_id="r5", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="approve", dispatched_at=9.0,
+        ),
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "merge"],
+    )
+    by_issue = {e["issue_number"]: e for e in out}
+    slice_entry = by_issue[164]
+
+    # The counts are unaffected by this fix — same as the synced-sibling case.
+    assert slice_entry["stage_counts"]["work"] == 4
+    assert slice_entry["stage_counts"]["review"] == 5
+
+    # The core fix: `stages` must no longer be a blanket PENDING default —
+    # it reflects the SAME rows the counts are drawn from.
+    assert slice_entry["stages"]["work"] == sp.DONE
+    assert slice_entry["stages"]["review"] == sp.DONE
+    assert slice_entry["has_approved_review"] is True
+    # No merge signal exists for a phantom entry (no merge-queue row keys to
+    # it) — PENDING here is honest (matches stage_counts["merge"] == 0), not
+    # a fabricated green.
+    assert slice_entry["stages"]["merge"] == sp.PENDING
+    assert slice_entry["stage_counts"]["merge"] == 0
+
+    # Genuinely unknown, not fabricated from the tracking issue's own title.
+    assert slice_entry["issue_title"] == ""
+
+    # The epic's own entry is completely unaffected (it has real raw-keyed
+    # rows, so the phantom fallback never applies to it).
     assert by_issue[160]["stage_counts"]["work"] == 0
     assert by_issue[160]["stage_counts"]["review"] == 0
 

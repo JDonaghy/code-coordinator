@@ -2568,7 +2568,14 @@ def _board_response_schema(components: dict) -> dict:
                                 "legs at that stage (e.g. a stage re-dispatched 4 "
                                 "times reads 4, not 1) — lets a client render "
                                 "'Work (2)' / 'Review (5)' and suppress the suffix "
-                                "at 1. Same key set as `stages`."
+                                "at 1. Same key set as `stages` (including "
+                                "`acceptance`). Caveat: `merge` uses a different "
+                                "convention from every other key — it counts "
+                                "conflict-fix RETRIES (0 for a clean single merge, "
+                                "not 1 for 'one attempt happened'), so a uniform "
+                                "'suppress at <= 1' rule will also suppress a "
+                                "single conflict-fix retry, which is usually the "
+                                "most useful count to surface."
                             ),
                             "additionalProperties": {"type": "integer"},
                         },
