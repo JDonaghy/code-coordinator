@@ -2015,6 +2015,197 @@ def test_daemon_portal_answer_endpoint(tmp_path) -> None:
     assert stored.text == "Yes, offline-first."
 
 
+def test_daemon_portal_link_by_submission_endpoint(tmp_path) -> None:
+    """#2995: GET `/portal-link-by-submission` — the reverse-lookup twin of
+    `/portal-link` (test_daemon_portal_link_endpoints above), keyed on
+    submission_id instead of (repo_name, milestone/issue). Backs
+    `coord.portal_store.get_link_by_submission` on a thin client — the read
+    `coord portal enqueue-status`'s #2996 "no link on file" warning needs
+    once enqueue-status itself started routing through the daemon."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db, state
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-link-by-submission.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    state.save_portal_link(
+        {
+            "repo_name": "api",
+            "milestone_number": 3,
+            "issue_number": None,
+            "submission_id": "sub_abc123",
+            "linked_at": 0.0,
+            "actor": "tester",
+            "schema": 1,
+        }
+    )
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        found = cli.get(
+            "/portal-link-by-submission", params={"submission_id": "sub_abc123"}
+        )
+        missing = cli.get(
+            "/portal-link-by-submission", params={"submission_id": "sub_nope"}
+        )
+        no_param = cli.get("/portal-link-by-submission")
+
+    assert found.status_code == 200
+    assert found.json()["link"]["submission_id"] == "sub_abc123"
+    assert missing.json() == {"link": None}
+    assert no_param.status_code == 400
+
+
+def test_daemon_portal_enqueue_status_endpoint(tmp_path) -> None:
+    """#2995: POST `/portal-enqueue-status` — `coord portal enqueue-status`
+    executed on the daemon, mirroring `test_daemon_portal_decision_endpoint`
+    above. The claim check itself lives client-side
+    (`coord.commands.portal._refuse_unless_claiming_machine`) — this
+    endpoint only asserts the write it performs once a request arrives."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import outbox_for_submission
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-enqueue-status.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_submission_id = cli.post(
+            "/portal-enqueue-status", json={"status": "in-design"}
+        )
+        missing_status = cli.post(
+            "/portal-enqueue-status", json={"submission_id": "sub_1"}
+        )
+        unknown_status = cli.post(
+            "/portal-enqueue-status",
+            json={"submission_id": "sub_1", "status": "on-fire"},
+        )
+        # `quality-check` announces a `preview` — refused with nothing queued.
+        no_preview = cli.post(
+            "/portal-enqueue-status",
+            json={"submission_id": "sub_1", "status": "quality-check"},
+        )
+        ok = cli.post(
+            "/portal-enqueue-status",
+            json={"submission_id": "sub_1", "status": "in-design"},
+        )
+
+    assert missing_submission_id.status_code == 400
+    assert missing_status.status_code == 400
+    assert unknown_status.status_code == 400
+    assert "not in the pinned portal status vocabulary" in unknown_status.json()["error"]
+    assert no_preview.status_code == 400
+    assert ok.status_code == 200
+    row = ok.json()["row"]
+    assert row["submission_id"] == "sub_1"
+    assert row["kind"] == "status"
+    assert row["fields_json"] == '{"status": "in-design"}'
+
+    [stored] = outbox_for_submission("sub_1")
+    assert stored.kind == "status"
+    assert stored.fields == {"status": "in-design"}
+
+
+def test_daemon_portal_enqueue_question_endpoint_applies_both_rows_atomically(
+    tmp_path,
+) -> None:
+    """#2995: POST `/portal-enqueue-question` — `coord portal
+    enqueue-question` executed on the daemon. The design note this issue's
+    acceptance bar calls out: the question row and its `needs-input`
+    announcement (#2901) must both land from this ONE request, so a thin
+    client can never observe (or a crash never leave behind) a question
+    with no status row behind it."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import outbox_for_submission
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-enqueue-question.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_submission_id = cli.post(
+            "/portal-enqueue-question", json={"question": "Offline-first?"}
+        )
+        empty_question = cli.post(
+            "/portal-enqueue-question",
+            json={"submission_id": "sub_1", "question": "   "},
+        )
+        ok = cli.post(
+            "/portal-enqueue-question",
+            json={"submission_id": "sub_1", "question": "Offline-first?"},
+        )
+
+    assert missing_submission_id.status_code == 400
+    assert empty_question.status_code == 400
+    assert ok.status_code == 200
+    body = ok.json()
+    question_row = body["question_row"]
+    status_row = body["status_row"]
+    assert question_row["kind"] == "question"
+    assert question_row["fields_json"] == '{"question": "Offline-first?"}'
+    assert status_row["kind"] == "status"
+    assert status_row["fields_json"] == '{"status": "needs-input"}'
+    # seq N (question) immediately followed by N+1 (its own announcement) —
+    # both applied in this one request, never observably apart.
+    assert status_row["seq"] == question_row["seq"] + 1
+
+    stored = outbox_for_submission("sub_1")
+    assert [r.kind for r in stored] == ["question", "status"]
+
+
 # ── #2990: dashboard reads gating a browser client's relayed answer ────────
 
 

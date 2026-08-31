@@ -4178,9 +4178,10 @@ never this session's own.
 - Do NOT run `git push`, `git commit`, or any command that writes to a repo \
 checkout — this session files issues and queues work, it does not touch code.
 - If an `enqueue-question`/`enqueue-status`/`decision` command refuses with \
-a thin-client error (this machine isn't the daemon host and isn't routed \
-yet — #2751), say so explicitly to the operator rather than silently \
-dropping the Ask/Propose; do not retry it as some other command.
+a thin-client error (this machine does not claim every repo the submission \
+maps to — #2995/#2751; it should not happen, since you were only dispatched \
+here because it does), say so explicitly to the operator rather than \
+silently dropping the Ask/Propose; do not retry it as some other command.
 - Keep the operator informed: summarize your plan before writing anything, \
 and report back what you asked/proposed/filed/queued/linked (and any gap) \
 when done.\

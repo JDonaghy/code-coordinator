@@ -835,6 +835,36 @@ def fetch_portal_link(
     return link if isinstance(link, dict) else None
 
 
+def fetch_portal_link_by_submission(
+    svc: ServiceConfig, submission_id: str, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict | None:
+    """GET the portal link for *submission_id* by reverse lookup (#2995) —
+    the submission-keyed counterpart to :func:`fetch_portal_link`'s
+    ``(repo_name, milestone_number/issue_number)``-keyed one.
+
+    Backs :func:`coord.portal_store.get_link_by_submission` on a thin
+    client — needed once ``coord portal enqueue-status``'s #2996 "no link on
+    file" warning became reachable from one. Fail-soft to ``None`` on any
+    transport/HTTP/decode error, same reasoning as :func:`fetch_portal_link`:
+    a daemon hiccup degrades to the same "not linked" a genuinely unlinked
+    submission would show, rather than a traceback, for a read that only
+    ever gates a warning.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/portal-link-by-submission",
+            params={"submission_id": submission_id},
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    link = data.get("link") if isinstance(data, dict) else None
+    return link if isinstance(link, dict) else None
+
+
 def fetch_portal_ledger(
     svc: ServiceConfig, submission_id: str, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> dict:
