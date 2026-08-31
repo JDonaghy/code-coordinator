@@ -1921,6 +1921,32 @@ def ledger_for_submission(submission_id: str) -> list[LedgerEntry]:
     return [_ledger_from_row(r) for r in rows]
 
 
+def ledger_entry_wire(entry: LedgerEntry) -> dict[str, Any]:
+    """The wire shape for a :class:`LedgerEntry` — shared by every JSON
+    surface that hands one back: the daemon's ``/portal-note`` and
+    ``/portal-answer`` responses, and (#2990) the dashboard's own
+    ``/api/portal/answer`` and the ``relayed_answers`` list in
+    :func:`_answer_preflight_local`'s payload. One shared function so a
+    payload built on the daemon and rehydrated by a thin client round-trips
+    through exactly one shape rather than three near-verbatim copies.
+    ``payload_json`` is a JSON *string* on purpose (mirrors the raw DB
+    column), matching what :func:`_ledger_from_row`-style consumers parse
+    back on the other end.
+    """
+    return {
+        "id": entry.id,
+        "submission_id": entry.submission_id,
+        "seq": entry.seq,
+        "kind": entry.kind,
+        "question_revision": entry.question_revision,
+        "text": entry.text,
+        "actor": entry.actor,
+        "source_event_id": entry.source_event_id,
+        "payload_json": json.dumps(entry.payload, sort_keys=True),
+        "recorded_at": entry.recorded_at,
+    }
+
+
 def operator_notes_for_submission(submission_id: str) -> list[LedgerEntry]:
     """*submission_id*'s operator notes (#2867), oldest first — the ledger
     rows a human typed, filtered out of :func:`ledger_for_submission`'s full
@@ -2184,6 +2210,119 @@ def answer_question(
         config=config,
         now=now,
     )
+
+
+# ── #2990: dashboard reads gating a browser client's relayed answer ────────
+#
+# `coord/dashboard/server.py`'s `/api/portal/needs-input` and
+# `/api/portal/answer` need three of this module's local reads
+# (`list_submissions`, `ledger_for_submission`,
+# `_current_open_question_revision`) to decide what to show and whether to
+# accept a write. Same #2751 reasoning as `answer_question` right above:
+# `coord web` is explicitly supported running off the daemon host (see
+# `_read_board`/`_write_board`/`_drive_queue_write` in that same file, which
+# already resolve `board_service` before touching board/drive-queue state),
+# where a direct local read would silently see this process's own
+# empty/stale local DB instead of the daemon's. These two pairs bundle "the
+# reads a caller needs" into one call each and make the routing decision
+# HERE — the same seam `_route_answer`/`_route_note` already use for the
+# write — so the dashboard (or any other caller) never re-derives it, and
+# reaches into no leading-underscore helper of this module directly.
+
+
+def _needs_input_submissions_local() -> list[dict[str, Any]]:
+    """Local read: submissions in ``needs-input`` with a still-open pushed
+    question, each as ``{"submission_id", "question_revision", "question"}``.
+
+    Runs on the daemon host — either directly, or on behalf of a thin
+    client via ``GET /portal-needs-input`` (:mod:`coord.serve_app`). See
+    :func:`needs_input_submissions` for the routed entry point callers
+    should actually use.
+
+    A ``needs-input`` submission whose question has since been answered out
+    of band (the #2986 fold nudge is best-effort, so this can lag by a
+    beat) has no current open question and is left out rather than shown
+    with a stale/empty one.
+    """
+    submissions: list[dict[str, Any]] = []
+    for sub in list_submissions():
+        if sub.last_status != "needs-input":
+            continue
+        revision = _current_open_question_revision(sub.submission_id)
+        if revision is None:
+            continue
+        question_text = sub.open_question
+        for entry in ledger_for_submission(sub.submission_id):
+            if (
+                entry.kind == LEDGER_KIND_QUESTION_PUSHED
+                and entry.question_revision == revision
+            ):
+                question_text = entry.text
+        submissions.append({
+            "submission_id": sub.submission_id,
+            "question_revision": revision,
+            "question": question_text,
+        })
+    return submissions
+
+
+def needs_input_submissions() -> list[dict[str, Any]]:
+    """Submissions currently awaiting a relayed answer (#2990) — routed to
+    the daemon's ``GET /portal-needs-input`` when ``board_service`` is
+    configured, else read from the local DB directly (this process IS the
+    daemon host).
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    if svc is not None:
+        from coord.client import fetch_portal_needs_input  # noqa: PLC0415
+
+        return fetch_portal_needs_input(svc)
+    return _needs_input_submissions_local()
+
+
+def _answer_preflight_local(submission_id: str) -> dict[str, Any] | None:
+    """Local read: everything a caller needs to gate a relayed-answer write
+    before calling :func:`answer_question` — ``None`` for an unknown
+    *submission_id* (the caller's 404), else ``{"current_open_revision",
+    "relayed_answers"}`` where ``current_open_revision`` is
+    :func:`_current_open_question_revision`'s result and
+    ``relayed_answers`` is every previously-recorded relayed answer
+    (:func:`ledger_entry_wire`-shaped, for idempotency matching against a
+    retried write).
+
+    Bundled into one call, rather than three separate reads, so it can be
+    routed to the daemon in a single round trip exactly the way the write
+    itself already is — see :func:`answer_preflight`.
+    """
+    if get_submission(submission_id) is None:
+        return None
+    relayed_answers = [
+        ledger_entry_wire(entry)
+        for entry in ledger_for_submission(submission_id)
+        if entry.kind == LEDGER_KIND_QUESTION_ANSWERED
+        and bool(entry.payload.get("relayed"))
+    ]
+    return {
+        "current_open_revision": _current_open_question_revision(submission_id),
+        "relayed_answers": relayed_answers,
+    }
+
+
+def answer_preflight(submission_id: str) -> dict[str, Any] | None:
+    """Routed equivalent of :func:`_answer_preflight_local` (#2990) — the
+    daemon's ``GET /portal-answer-preflight`` when ``board_service`` is
+    configured, else the local DB directly.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    if svc is not None:
+        from coord.client import fetch_portal_answer_preflight  # noqa: PLC0415
+
+        return fetch_portal_answer_preflight(svc, submission_id)
+    return _answer_preflight_local(submission_id)
 
 
 # ── layer 2: decisions (agent-authored, operator-confirmed) ─────────────────

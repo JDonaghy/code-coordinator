@@ -291,3 +291,211 @@ class TestPortalAnswerAPI:
         )
 
         assert r.status_code == 400
+
+
+class TestPortalThinClientRouting:
+    """#2990 review fix round: on a thin-client dashboard host
+    (``board_service`` configured — a ``coord web`` process running
+    anywhere other than the daemon host, which the architecture explicitly
+    supports), both endpoints must route through the daemon instead of
+    reading/writing this process's own local ``coord.db`` directly. Before
+    this fix, ``api_portal_needs_input``/``api_portal_answer`` called
+    ``portal_store.list_submissions()``/``get_submission()``/
+    ``ledger_for_submission()``/``_current_open_question_revision()``
+    unconditionally — silently wrong off the daemon host per
+    ``coord/portal_store.py``'s own module docstring. This is the scenario
+    the review flagged as completely untested: every other test in this
+    file builds a ``Config`` with no ``board_service`` set and reads/writes
+    the same local ``rw_db``.
+    """
+
+    def test_needs_input_routes_to_the_daemon_instead_of_the_local_db(
+        self, rw_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+
+        # Sits in THIS (thin client's) own local DB — must NOT show up in
+        # the response, proving the handler isn't reading it.
+        _set_needs_input("local_only_sub")
+        _push_question("local_only_sub", "Local question?")
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def fake_get(url, **kw):
+            assert url == "http://daemon:7435/portal-needs-input"
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return {
+                        "submissions": [
+                            {
+                                "submission_id": "remote_sub",
+                                "question_revision": 3,
+                                "question": "Remote question?",
+                            }
+                        ]
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/portal/needs-input")
+
+        assert r.status_code == 200
+        assert r.json() == {
+            "submissions": [
+                {
+                    "submission_id": "remote_sub",
+                    "question_revision": 3,
+                    "question": "Remote question?",
+                }
+            ]
+        }
+
+    def test_answer_routes_preflight_checks_and_the_write_to_the_daemon(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """The 404/409/idempotency gating and the actual write must all
+        agree with the DAEMON's data, not this thin client's empty local
+        DB — `remote_sub` exists only on the (mocked) daemon side."""
+        import coord.client as cc
+        from coord import portal_store
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def fake_get(url, **kw):
+            assert url == "http://daemon:7435/portal-answer-preflight"
+            assert kw["params"] == {"submission_id": "remote_sub"}
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return {
+                        "preflight": {
+                            "current_open_revision": 5,
+                            "relayed_answers": [],
+                        }
+                    }
+
+            return _Resp()
+
+        posted = []
+
+        def fake_post(url, *, json=None, **kw):
+            posted.append((url, json))
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return {
+                        "entry": {
+                            "id": 1,
+                            "submission_id": "remote_sub",
+                            "seq": 1,
+                            "kind": "question_answered",
+                            "question_revision": 5,
+                            "text": "Yes, offline-first.",
+                            "actor": "operator:jane",
+                            "source_event_id": None,
+                            "payload_json": (
+                                '{"relayed": true, "source": "phone"}'
+                            ),
+                            "recorded_at": 100.0,
+                        }
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+        monkeypatch.setattr(cc.httpx, "post", fake_post)
+
+        client = _client()
+        r = client.post(
+            "/api/portal/answer",
+            json={
+                "submission_id": "remote_sub",
+                "text": "Yes, offline-first.",
+                "source": "phone",
+                "revision": 5,
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        entry = r.json()["entry"]
+        assert entry["submission_id"] == "remote_sub"
+        assert entry["question_revision"] == 5
+        assert posted == [
+            (
+                "http://daemon:7435/portal-answer",
+                {
+                    "submission_id": "remote_sub",
+                    "text": "Yes, offline-first.",
+                    "source": "phone",
+                    "revision": 5,
+                    "actor": "",
+                },
+            )
+        ]
+        # Nothing was written to this (thin client's) own local DB — the
+        # submission doesn't even exist there.
+        assert portal_store.get_submission("remote_sub") is None
+        assert portal_store.ledger_for_submission("remote_sub") == []
+
+    def test_answer_404s_on_a_submission_the_daemon_does_not_know_either(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """A submission that happens to exist in THIS thin client's own
+        local DB must not paper over a daemon-side 404 — the daemon's
+        answer is authoritative, never the local one."""
+        import coord.client as cc
+
+        # Exists locally, but the (mocked) daemon has never heard of it.
+        _set_needs_input("local_sub")
+        _push_question("local_sub", "Local question?")
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def fake_get(url, **kw):
+            class _Resp:
+                status_code = 404
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.post(
+            "/api/portal/answer",
+            json={
+                "submission_id": "local_sub",
+                "text": "Yes.",
+                "source": "verbal",
+                "revision": 1,
+            },
+        )
+
+        assert r.status_code == 404

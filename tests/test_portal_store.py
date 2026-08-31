@@ -2008,3 +2008,243 @@ def test_daemon_portal_answer_endpoint(tmp_path) -> None:
         e for e in ledger_for_submission("sub_1") if e.kind == "question_answered"
     ]
     assert stored.text == "Yes, offline-first."
+
+
+# ── #2990: dashboard reads gating a browser client's relayed answer ────────
+
+
+def test_daemon_portal_needs_input_endpoint(tmp_path) -> None:
+    """#2990: GET `/portal-needs-input` — the daemon seam backing the
+    dashboard's `GET /api/portal/needs-input` off the daemon host, mirroring
+    `test_daemon_portal_ledger_endpoint` above."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import enqueue, mark_applied
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-needs-input.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    status_row = enqueue("sub_1", "status", {"status": "needs-input"})
+    mark_applied(status_row)
+    question_row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+    mark_applied(question_row)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        r = cli.get("/portal-needs-input")
+
+    assert r.status_code == 200
+    assert r.json() == {
+        "submissions": [
+            {
+                "submission_id": "sub_1",
+                "question_revision": question_row.revision,
+                "question": "Offline-first?",
+            }
+        ]
+    }
+
+
+def test_daemon_portal_answer_preflight_endpoint(tmp_path) -> None:
+    """#2990: GET `/portal-answer-preflight` — the daemon seam backing the
+    dashboard's `POST /api/portal/answer` gating checks off the daemon
+    host."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.portal_store import answer_question, enqueue, mark_applied
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-portal-answer-preflight.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    row = enqueue("sub_1", "question", {"question": "Offline-first?"})
+    mark_applied(row)
+
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing_param = cli.get("/portal-answer-preflight")
+        unknown = cli.get(
+            "/portal-answer-preflight", params={"submission_id": "sub_nope"}
+        )
+        before_answer = cli.get(
+            "/portal-answer-preflight", params={"submission_id": "sub_1"}
+        )
+
+    assert missing_param.status_code == 400
+    assert unknown.status_code == 404
+    assert before_answer.status_code == 200
+    preflight = before_answer.json()["preflight"]
+    assert preflight["current_open_revision"] == row.revision
+    assert preflight["relayed_answers"] == []
+
+    answer_question("sub_1", "Yes, offline-first.", source="phone", actor="jane")
+
+    with TestClient(app) as cli:
+        after_answer = cli.get(
+            "/portal-answer-preflight", params={"submission_id": "sub_1"}
+        )
+
+    assert after_answer.status_code == 200
+    preflight = after_answer.json()["preflight"]
+    # The question is now answered, so there is no open question left.
+    assert preflight["current_open_revision"] is None
+    [relayed] = preflight["relayed_answers"]
+    assert relayed["question_revision"] == row.revision
+    assert relayed["text"] == "Yes, offline-first."
+    assert relayed["payload_json"] == '{"relayed": true, "source": "phone"}'
+
+
+class TestNeedsInputAndAnswerPreflightRouteToTheDaemon:
+    """#2990 fix round: `needs_input_submissions()` and `answer_preflight()`
+    must resolve `board_service` and route to the daemon exactly like
+    `answer_question`'s own `_route_answer` already does for the write —
+    mirroring `TestOperatorNotes.test_append_routes_to_the_daemon_when_
+    board_service_is_set` above. Before this fix, both read straight off the
+    local DB unconditionally, which is silently wrong on a thin client
+    (`coord/portal_store.py`'s own module docstring)."""
+
+    def test_needs_input_submissions_routes_to_the_daemon_when_board_service_is_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+        from coord.portal_store import needs_input_submissions
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append((url, kw))
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "submissions": [
+                            {
+                                "submission_id": "sub_1",
+                                "question_revision": 1,
+                                "question": "Offline-first?",
+                            }
+                        ]
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = needs_input_submissions()
+
+        assert len(calls) == 1
+        assert calls[0][0] == "http://daemon:7435/portal-needs-input"
+        assert result == [
+            {
+                "submission_id": "sub_1",
+                "question_revision": 1,
+                "question": "Offline-first?",
+            }
+        ]
+
+    def test_answer_preflight_routes_to_the_daemon_when_board_service_is_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+        from coord.portal_store import answer_preflight, ledger_for_submission
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append((url, kw))
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "preflight": {
+                            "current_open_revision": 2,
+                            "relayed_answers": [],
+                        }
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = answer_preflight("sub_1")
+
+        assert len(calls) == 1
+        assert calls[0][0] == "http://daemon:7435/portal-answer-preflight"
+        assert calls[0][1]["params"] == {"submission_id": "sub_1"}
+        assert result == {"current_open_revision": 2, "relayed_answers": []}
+        # ...and nothing was read off this (thin client's) own local DB —
+        # there is no local submission at all, so a local read would have
+        # raised or returned None instead of the daemon's answer.
+        assert ledger_for_submission("sub_1") == []
+
+    def test_answer_preflight_returns_none_for_daemon_404(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
+        from coord.portal_store import answer_preflight
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def fake_get(url, **kw):
+            class _Resp:
+                status_code = 404
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        assert answer_preflight("sub_nope") is None

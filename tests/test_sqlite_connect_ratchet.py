@@ -218,7 +218,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "HTTP write path.",
     ),
     "test_portal_store.py": Classification(
-        5, (BUCKET_C,),
+        7, (BUCKET_C,),
         "The portal daemon-endpoint pattern, once per endpoint under test: a "
         "file board.db opened with check_same_thread=False (TestClient runs "
         "the handler on a worker thread the autouse connection cannot serve) "
@@ -237,7 +237,13 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "daemon, so the test has to prove the question_answered entry the "
         "handler thread wrote is readable back through the SqliteStore the "
         "app opened by path. Same two halves as its neighbours, same reason "
-        "scratch_database() does not fit.",
+        "scratch_database() does not fit. "
+        "+1 for #2990's test_daemon_portal_needs_input_endpoint, the GET "
+        "`/portal-needs-input` seam backing the dashboard's thin-client read. "
+        "+1 for #2990's test_daemon_portal_answer_preflight_endpoint, the GET "
+        "`/portal-answer-preflight` seam backing the dashboard's thin-client "
+        "gating checks — both the same daemon-endpoint shape as their "
+        "neighbours above.",
     ),
     "test_milestone_gate.py": Classification(
         3, (BUCKET_C,),

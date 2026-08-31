@@ -872,6 +872,68 @@ def fetch_portal_ledger(
     return resp.json()["payload"]
 
 
+def fetch_portal_needs_input(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> list[dict]:
+    """GET ``/portal-needs-input`` from the daemon *svc* points at — the
+    list :func:`coord.portal_store.needs_input_submissions` builds locally,
+    routed through the daemon for a thin client (#2990).
+
+    Backs the dashboard's ``GET /api/portal/needs-input`` when
+    ``coord web`` is running off the daemon host: `coord/portal_store.py`'s
+    own module docstring is explicit that its tables are only correct on
+    the daemon host, so a thin client's local read would silently answer
+    "nothing pending" instead — the exact 2026-08-16 incident
+    `coord/commands/portal.py` cites for the CLI's own thin-client guard.
+
+    Deliberately does **not** fail-soft to ``[]`` on a transport/HTTP
+    error, same reasoning as :func:`fetch_portal_ledger`: an empty list on
+    a daemon hiccup is indistinguishable from "genuinely nothing pending",
+    which is actively misleading rather than merely unavailable. Raises
+    ``httpx.HTTPError`` on a transport/HTTP failure and ``KeyError``/
+    ``ValueError`` on a malformed body; callers let the failure surface.
+    """
+    resp = httpx.get(
+        f"{svc.url}/portal-needs-input",
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["submissions"]
+
+
+def fetch_portal_answer_preflight(
+    svc: ServiceConfig, submission_id: str, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict | None:
+    """GET ``/portal-answer-preflight`` from the daemon *svc* points at —
+    the gating reads :func:`coord.portal_store._answer_preflight_local`
+    builds locally (current open question revision + previously-recorded
+    relayed answers), routed through the daemon for a thin client (#2990).
+
+    Backs the dashboard's ``POST /api/portal/answer`` existence/idempotency/
+    stale-revision checks off the daemon host, same reasoning as
+    :func:`fetch_portal_needs_input` right above.
+
+    Returns ``None`` for an unknown *submission_id* (the daemon's 404) —
+    the caller's own signal to answer with a 404, mirroring
+    :func:`coord.portal_store._answer_preflight_local`'s local contract.
+    Any other HTTP error raises, same as :func:`fetch_portal_ledger`: a
+    stale-revision or idempotency check evaluated against a silently
+    substituted "empty" result would be actively misleading, not merely
+    unavailable.
+    """
+    resp = httpx.get(
+        f"{svc.url}/portal-answer-preflight",
+        params={"submission_id": submission_id},
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()["preflight"]
+
+
 def fetch_milestone_gate(
     svc: ServiceConfig,
     repo_name: str,
