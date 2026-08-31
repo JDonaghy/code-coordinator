@@ -116,7 +116,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
 
     # ── A: legitimately SQLite-specific ───────────────────────────────────
     "test_db.py": Classification(
-        38, (BUCKET_A,),
+        39, (BUCKET_A,),
         "The canonical bucket-A file: it tests coord/db.py's SQLite "
         "connection machinery itself — pre-migration CREATE TABLEs read back "
         "with PRAGMA table_info, busy_timeout contention across two "
@@ -136,7 +136,24 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "back a connection on the active backend — under "
         "COORD_TEST_BACKEND=postgres that is the very thing this test proves "
         "is bypassed. A bare sqlite3 sentinel, matching the neighbouring "
-        "TestOverrideConnection cases, is the point.",
+        "TestOverrideConnection cases, is the point. "
+        "+1 for #2982's TestMigrateAddColumnsRollsBackOnDriverError::"
+        "_wrapped_conn_with_columns_already_present: it schemas a real "
+        "sqlite3 connection and then wraps it in a stub that reproduces "
+        "Postgres's abort-the-whole-transaction-on-error semantics on top, "
+        "so _migrate_add_columns' missing conn.rollback() can be driven red "
+        "on a machine with no Postgres server. The connection underneath has "
+        "to be a genuine sqlite3 one: the stub raises and catches "
+        "sqlite3.OperationalError and pins sql.detect_dialect to "
+        "DIALECT_SQLITE so translate()/cursor() behave as they do against "
+        "the real driver. coord_db is out (it is already installed as the "
+        "override, and under COORD_TEST_BACKEND=postgres it is a psycopg "
+        "connection that already aborts for real, which is the behaviour "
+        "being *simulated* here), and scratch_database() is out for the same "
+        "backend-following reason. Same subject as the rest of this file — "
+        "coord/db.py's migration machinery — so it files A alongside it. The "
+        "sibling TestMigrateAddColumnsRollsBackOnRealPostgres class adds no "
+        "site: it goes through tests.backends.open_named_session().",
     ),
     "test_sql_dialect.py": Classification(
         7, (BUCKET_A,),
