@@ -2547,7 +2547,8 @@ def _board_response_schema(components: dict) -> dict:
                     "#550: server-computed per-issue stage/gate badges "
                     "(work/review/smoke/test/merge status, has_approved_review) — "
                     "generalizes the #776/#778 pattern so coord-tui's "
-                    "pipeline.rs stops re-deriving this from raw rows"
+                    "pipeline.rs stops re-deriving this from raw rows. #3013 adds "
+                    "a per-stage leg count (`stage_counts`) alongside the status."
                 ),
                 "items": {
                     "type": "object",
@@ -2560,6 +2561,17 @@ def _board_response_schema(components: dict) -> dict:
                             "description": "stage name -> pending|active|done|failed|stale|skipped",
                             "additionalProperties": {"type": "string"},
                         },
+                        "stage_counts": {
+                            "type": "object",
+                            "description": (
+                                "#3013: stage name -> count of separate dispatched "
+                                "legs at that stage (e.g. a stage re-dispatched 4 "
+                                "times reads 4, not 1) — lets a client render "
+                                "'Work (2)' / 'Review (5)' and suppress the suffix "
+                                "at 1. Same key set as `stages`."
+                            ),
+                            "additionalProperties": {"type": "integer"},
+                        },
                         "has_approved_review": {"type": "boolean"},
                         "uat_preview_url": {
                             "type": ["string", "null"],
@@ -2571,7 +2583,13 @@ def _board_response_schema(components: dict) -> dict:
                             ),
                         },
                     },
-                    "required": ["repo_name", "issue_number", "stages", "has_approved_review"],
+                    "required": [
+                        "repo_name",
+                        "issue_number",
+                        "stages",
+                        "stage_counts",
+                        "has_approved_review",
+                    ],
                 },
             },
             "plan_roster": {

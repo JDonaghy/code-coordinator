@@ -397,6 +397,86 @@ def test_compute_issue_projection_includes_acceptance_box():
     assert out["acceptance_progress"] == {"passed": 5, "total": 5}
 
 
+# ── compute_issue_projection: stage_counts (#3013) ──────────────────────────
+
+
+def test_compute_issue_projection_stage_counts_counts_separate_legs():
+    """A stage re-dispatched N times must report N in stage_counts, not
+    fold into the single status string the way `stages` does."""
+    a = [
+        _work(assignment_id="w1", status="failed", dispatched_at=1.0),
+        _work(assignment_id="w2", status="failed", dispatched_at=2.0),
+        _work(assignment_id="w3", status="done", test_state="passed", dispatched_at=3.0),
+        _review(
+            assignment_id="r1", review_of_assignment_id="w3",
+            review_verdict="request-changes", dispatched_at=4.0,
+        ),
+        _review(
+            assignment_id="r2", review_of_assignment_id="w3",
+            review_verdict="approve", dispatched_at=5.0,
+        ),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["work"] == 3
+    assert out["stage_counts"]["review"] == 2
+
+
+def test_compute_issue_projection_stage_counts_single_leg_is_one():
+    a = [_work(assignment_id="w1", status="done", dispatched_at=1.0)]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["work"] == 1
+    assert out["stage_counts"]["review"] == 0
+
+
+def test_compute_issue_projection_stage_counts_test_counts_smoke_legs():
+    """The Test stage has no `type="test"` assignment — its dispatched
+    worker is `type="smoke"` (coord.smoke) — so the count must key off
+    that, not a literal type match."""
+    a = [
+        _work(assignment_id="w1", status="done", dispatched_at=1.0),
+        _work(assignment_id="s1", type="smoke", status="done", test_state="failed", dispatched_at=2.0),
+        _work(assignment_id="s2", type="smoke", status="done", test_state="passed", dispatched_at=3.0),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["test"] == 2
+
+
+def test_compute_issue_projection_stage_counts_merge_counts_conflict_fix_legs():
+    """Repeated landing attempts show up as `type="conflict-fix"` legs
+    (#241) — there is no `type="merge"` assignment to count directly."""
+    a = [
+        _work(assignment_id="w1", status="done", dispatched_at=1.0),
+        _work(assignment_id="cf1", type="conflict-fix", status="done", dispatched_at=2.0),
+        _work(assignment_id="cf2", type="conflict-fix", status="failed", dispatched_at=3.0),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["merge"] == 2
+
+
+def test_compute_issue_projection_stage_counts_work_includes_test_author_legs():
+    """#3013's coord-portal#164 example: an oracle-loop acceptance slice's
+    repeated `test-author` legs must count as Work legs — a strict
+    `type == "work"` match would never see them."""
+    a = [
+        _work(assignment_id="ta1", type="test-author", status="failed", dispatched_at=1.0),
+        _work(assignment_id="ta2", type="test-author", status="failed", dispatched_at=2.0),
+        _work(assignment_id="ta3", type="test-author", status="failed", dispatched_at=3.0),
+        _work(assignment_id="ta4", type="test-author", status="done", dispatched_at=4.0),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["work"] == 4
+
+
 # ── issue_has_any_approved_review ───────────────────────────────────────────
 
 
@@ -839,3 +919,91 @@ def test_merged_test_author_entry_does_not_green_child_with_own_unmerged_work():
     )
     by_issue = {e["issue_number"]: e for e in out}
     assert by_issue[1122]["stages"]["merge"] == sp.PENDING
+
+
+# ── compute_board_stage_projection: stage_counts epic/slice keying (#3013) ──
+
+
+def test_compute_board_stage_projection_stage_counts_attributes_slice_legs_to_child():
+    """#3013's coord-portal#164 example: an oracle-loop acceptance slice's
+    test-author/review legs are booked (`issue_number`) to the milestone's
+    tracking issue but FOR the child (`for_issue_number`) — `coord gates
+    coord-portal 164` resolves them the same way. stage_counts must land on
+    the CHILD's own projection entry, not the epic's — and must not
+    double-count the same legs on both."""
+    issues = [
+        {"repo_name": "api", "number": 160, "title": "epic", "state": "open"},
+        {"repo_name": "api", "number": 164, "title": "slice", "state": "open"},
+    ]
+    assignments = [
+        _work(
+            assignment_id="ta1", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=1.0,
+        ),
+        _work(
+            assignment_id="ta2", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=2.0,
+        ),
+        _work(
+            assignment_id="ta3", issue_number=160, type="test-author",
+            status="failed", for_issue_number=164, dispatched_at=3.0,
+        ),
+        _work(
+            assignment_id="ta4", issue_number=160, type="test-author",
+            status="done", for_issue_number=164, dispatched_at=4.0,
+        ),
+        _review(
+            assignment_id="r1", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=5.0,
+        ),
+        _review(
+            assignment_id="r2", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=6.0,
+        ),
+        _review(
+            assignment_id="r3", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=7.0,
+        ),
+        _review(
+            assignment_id="r4", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="request-changes", dispatched_at=8.0,
+        ),
+        _review(
+            assignment_id="r5", issue_number=160, review_of_assignment_id="ta4",
+            for_issue_number=164, review_verdict="approve", dispatched_at=9.0,
+        ),
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "merge"],
+    )
+    by_issue = {e["issue_number"]: e for e in out}
+    assert by_issue[164]["stage_counts"]["work"] == 4
+    assert by_issue[164]["stage_counts"]["review"] == 5
+    # The epic's own count must not also carry the slice's legs — they
+    # belong on exactly one entry, not both.
+    assert by_issue[160]["stage_counts"]["work"] == 0
+    assert by_issue[160]["stage_counts"]["review"] == 0
+
+
+def test_compute_board_stage_projection_stage_counts_ordinary_issue_uses_own_key():
+    """An ordinary (non-oracle-loop) issue has no `for_issue_number` — its
+    stage_counts must come from its own rows, unaffected by the #3013
+    effective-key indirection added for the slice case above."""
+    issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
+    assignments = [
+        _work(assignment_id="w1", status="failed", dispatched_at=1.0),
+        _work(assignment_id="w2", status="done", dispatched_at=2.0),
+        _review(assignment_id="r1", review_of_assignment_id="w2", review_verdict="approve", dispatched_at=3.0),
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "merge"],
+    )
+    entry = out[0]
+    assert entry["stage_counts"]["work"] == 2
+    assert entry["stage_counts"]["review"] == 1
