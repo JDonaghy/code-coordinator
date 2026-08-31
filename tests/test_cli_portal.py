@@ -1592,6 +1592,102 @@ def test_enqueue_question_routes_through_the_daemon_atomically_on_a_claiming_thi
     assert calls[0][1] == {"submission_id": "sub_1", "question": "which blue?"}
 
 
+def test_enqueue_status_shows_a_clean_error_when_the_daemon_rejects_the_write(
+    thin_client, monkeypatch
+):
+    """#2995 fix-round: the daemon answers a routed rejection (e.g. an
+    announcing status with nothing queued — the exact `PortalSyncError` case
+    a daemon-host caller sees) with a 400, which `client.post_record` raises
+    as `httpx.HTTPStatusError`, not `PortalSyncError`. Before this fix the
+    CLI's `except PortalSyncError` let it through as a raw traceback; a
+    claiming thin client must see the same clean red message + exit 1 a
+    daemon-host caller gets for the identical mistake."""
+    import httpx
+
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["coord"]},
+    )
+
+    class _Machine:
+        name = "elitebook"
+
+        def can_work_on(self, repo_name):
+            return repo_name == "coord"
+
+    monkeypatch.setattr("coord.test_orchestrator.local_machine", lambda cfg: _Machine())
+
+    # Go through the real `client.post_record` (rather than faking it
+    # outright) so `_reraise_with_detail` (#2907) actually runs and folds
+    # the daemon's `{"error": ...}` body into the exception's message,
+    # exactly like the real daemon response this fix has to survive.
+    def _fake_httpx_post(url, *, json, headers, timeout):
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            400,
+            json={
+                "error": "bad portal-enqueue-status: refusing to queue "
+                "status 'needs-input' for sub_1: it emails the customer "
+                "about a question and none has been queued",
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(cc.httpx, "post", _fake_httpx_post)
+
+    result = run("portal", "enqueue-status", "sub_1", "needs-input")
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "refusing to queue status" in result.output
+
+
+def test_enqueue_question_shows_a_clean_error_when_the_daemon_rejects_the_write(
+    thin_client, monkeypatch
+):
+    """Same fix, `enqueue-question` half — see the matching `enqueue-status`
+    test right above for the full rationale."""
+    import httpx
+
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["coord"]},
+    )
+
+    class _Machine:
+        name = "elitebook"
+
+        def can_work_on(self, repo_name):
+            return repo_name == "coord"
+
+    monkeypatch.setattr("coord.test_orchestrator.local_machine", lambda cfg: _Machine())
+
+    # See the matching `enqueue-status` test above: go through the real
+    # `client.post_record` so `_reraise_with_detail` (#2907) folds the
+    # daemon's error body into the raised exception's message.
+    def _fake_httpx_post(url, *, json, headers, timeout):
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            400,
+            json={"error": "bad portal-enqueue-question: sub_1 is not approved"},
+            request=request,
+        )
+
+    monkeypatch.setattr(cc.httpx, "post", _fake_httpx_post)
+
+    result = run("portal", "enqueue-question", "sub_1", "which blue?")
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "is not approved" in result.output
+
+
 def test_status_heartbeat_and_push_do_not_call_the_thin_client_guard(thin_client):
     """status/heartbeat/push never touch the local DB, so they must not be
     gated by the #2336 guard — only sync/outbox/events/enqueue-*/requeue call

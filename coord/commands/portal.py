@@ -159,6 +159,30 @@ def _refuse_if_thin_client(cmd_name: str) -> None:
     )
 
 
+def _missing_claimed_repos(machine, repos: list[str]) -> list[str]:
+    """Repos in REPOS that MACHINE does not claim — the "does this machine
+    claim every repo this submission maps to" predicate, in exactly one
+    place (#2995 review, #2085/#2096 "one question, one answer").
+
+    ``machine is None`` (this box isn't a configured machine in
+    ``coordinator.yml`` at all) counts every repo as unclaimed — an
+    unconfigured machine claims nothing. Shared by
+    :func:`_refuse_unless_claiming_machine` (above) and
+    ``_run_decompose_chat_interactive`` (further down this module): both
+    ask this exact question before letting a thin/local client touch a
+    submission's mapped repo(s), and before this helper existed they asked
+    it with two independently-written comprehensions that happened to agree
+    only because they were written together in the same commit — nothing
+    kept them in sync if either changed later. Callers keep their own
+    branching for the ``machine is None`` case where they want a distinct
+    message/exit path (``_run_decompose_chat_interactive`` does); this only
+    answers "which repos are missing," never how to report it.
+    """
+    if machine is None:
+        return list(repos)
+    return [r for r in repos if not machine.can_work_on(r)]
+
+
 def _refuse_unless_claiming_machine(cfg, submission_id: str, cmd_name: str) -> None:
     """Refuse *cmd_name* on a thin client that does not claim every repo
     SUBMISSION_ID maps to (#2995). A no-op on the daemon host itself.
@@ -210,7 +234,7 @@ def _refuse_unless_claiming_machine(cfg, submission_id: str, cmd_name: str) -> N
         )
     repos: list[str] = submission.get("repos") or []
     machine = local_machine(cfg)
-    missing = [r for r in repos if machine is None or not machine.can_work_on(r)]
+    missing = _missing_claimed_repos(machine, repos)
     if not repos or missing:
         reason = (
             f"submission {submission_id!r} has no mapped repo (portal."
@@ -750,7 +774,7 @@ def _run_decompose_chat_interactive(
             err=True,
         )
         raise SystemExit(2)
-    missing = [r for r in repos if not machine.can_work_on(r)]
+    missing = _missing_claimed_repos(machine, repos)
     if missing:
         click.echo(
             f"error: --interactive is local-only for now (Track B / #486 is "
@@ -1479,9 +1503,19 @@ def portal_enqueue_status(config_path, submission_id: str, status: str) -> None:
                 fg="yellow",
             )
 
+    import httpx  # noqa: PLC0415
+
     try:
         row = enqueue_status(submission_id, status, config=cfg)
-    except PortalSyncError as exc:
+    except (PortalSyncError, httpx.HTTPStatusError) as exc:
+        # #2995 fix-round: routed through the daemon (see
+        # `_refuse_unless_claiming_machine` above), a rejection comes back
+        # as `httpx.HTTPStatusError` (`board_service.route_write` →
+        # `client.post_record`), not `PortalSyncError` — the daemon-host
+        # path's identical rejection (e.g. an announcing status with
+        # nothing queued) never reaches `post_record` at all. Without this,
+        # a thin-client caller saw a raw traceback where a daemon-host
+        # caller got this same clean red message.
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
     _echo_enqueued(row, f"status={status}")
@@ -1562,9 +1596,14 @@ def portal_enqueue_question(config_path, submission_id: str, question: str) -> N
 
     from coord.portal_sync import PortalSyncError, enqueue_question  # noqa: PLC0415
 
+    import httpx  # noqa: PLC0415
+
     try:
         question_row, status_row = enqueue_question(submission_id, question, config=cfg)
-    except PortalSyncError as exc:
+    except (PortalSyncError, httpx.HTTPStatusError) as exc:
+        # #2995 fix-round: see the matching comment in `portal_enqueue_status`
+        # above — a routed rejection surfaces as `httpx.HTTPStatusError`, not
+        # `PortalSyncError`.
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
     _echo_enqueued(question_row, "question")
