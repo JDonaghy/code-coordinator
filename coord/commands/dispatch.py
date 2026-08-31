@@ -1172,6 +1172,28 @@ def assign(
     # Fetch the issue title from GitHub
     try:
         issue_data = github_ops.get_issue(repo_cfg.github, issue)
+    except github_ops.GhRateLimitError as e:
+        if e.from_cache:
+            # #2977: `_gh`'s pre-call guard refused this WITHOUT ever making
+            # a network call — a shared rate-limit backoff
+            # (`coord.github_throttle`) was already known active. That is
+            # categorically different from a real failure: nothing about
+            # this dispatch attempt was wrong, and the exact moment it would
+            # succeed is already known. Exit `EX_TEMPFAIL` (not the generic
+            # `1` below) and embed that moment in the message itself — see
+            # `github_ops.format_throttle_skip_reason` — so
+            # `coord/drive_queue.py`'s tick can park this launch without
+            # spending one of its two attempts, instead of treating a
+            # skipped call as indistinguishable from a genuine dispatch
+            # failure (the `coord-portal#161` incident this closes).
+            click.echo(
+                f"error: could not fetch issue #{issue}: "
+                f"{github_ops.format_throttle_skip_reason(e)}",
+                err=True,
+            )
+            sys.exit(github_ops.EX_TEMPFAIL)
+        click.echo(f"error: could not fetch issue #{issue}: {e}", err=True)
+        sys.exit(1)
     except RuntimeError as e:
         click.echo(f"error: could not fetch issue #{issue}: {e}", err=True)
         sys.exit(1)

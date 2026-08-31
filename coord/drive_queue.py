@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
+from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
     PLAN_READY,
@@ -2301,12 +2302,20 @@ class UnreachableWait:
     evidence a genuine transient wouldn't have, and `last_reason` is
     whatever the last sweep to touch this row recorded — useful context,
     never re-interpreted here.
+
+    `dependents` (#2978) is the count of OTHER queue entries whose `after=`
+    names this one — computed against the full entry set the caller passed
+    to :func:`detect_unreachable_waits`, not just the flagged subset, so it
+    is accurate even though those dependents themselves never appear in the
+    result (see the predicate's own docstring for why). `0` for an entry
+    nothing is chained behind.
     """
 
     key: str
     state: str
     deferrals: int
     last_reason: str
+    dependents: int = 0
 
 
 def detect_unreachable_waits(
@@ -2316,35 +2325,73 @@ def detect_unreachable_waits(
 ) -> list[UnreachableWait]:
     """Entries sitting in the #2944 guaranteed-false wait.
 
-    ``state in (blocked, parked) AND attempts == 0 AND deferrals >
-    min_deferrals`` — see the module comment above this function for why
-    that combination can never resolve itself. Pure and cheap (a predicate
-    over already-loaded rows, no clock, no I/O), so the same function backs
-    both `coord drive-queue status`'s `alert:` line
-    (`coord.commands.drive_queue._queue_alert`) and the `coord doctor` WARN
-    (`coord.health.checks.wedged_drive_queue`) — one definition of "wedged",
-    not two that could drift apart.
+    Two independent shapes, either of which qualifies a `blocked`/`parked`
+    entry — both provably have no branch/PR/merge-queue row for any sweep to
+    ever form an opinion about, which is the actual invariant this predicate
+    is checking, not "attempts == 0" as a proxy for it (#2978 found the proxy
+    wrong for the second shape):
 
-    An entry with ``attempts > 0`` is excluded unconditionally, however long
-    it has sat: it WAS dispatched at least once, so it has (or had) a real
-    branch/PR/merge-queue row for a sweep to have a genuine opinion about —
-    that is a legitimate wait, not an unreachable one.
+    * ``attempts == 0`` and ``deferrals > min_deferrals`` — never dispatched
+      at all. The original #2944 shape.
+    * ``attempts > 0``, ``state == blocked``, and the entry's own
+      `last_reason` carries #2273's "no assignment was ever created for this
+      run" marker (:func:`_is_dispatch_failure_reason`) — every dispatch
+      attempt died before `coord assign` produced a board-visible row, and
+      the entry has now exhausted its retry budget (the only way to reach
+      `blocked` with that reason: see `_reconcile_running`'s `exhausted`
+      branch). Exhaustion is its own grace period — there is no next attempt
+      left to wait out — so `min_deferrals` is not applied here.
+
+    A `blocked`/`parked` entry whose `last_reason` is instead one of
+    `_resolve_prereqs`'s unsatisfiable-`after=` verdict shapes
+    (:func:`_is_unsatisfiable_prereq_reason`) is excluded UNCONDITIONALLY,
+    regardless of attempts/deferrals — #2978: that shape is
+    :func:`_reconcile_blocked_after`'s to resolve (#2362, widened #2756),
+    not an operator's, and flagging it here directly contradicts that
+    function's own documented behaviour. This is what keeps a chain's
+    dependents (each blocked with "pre-req X is queued but blocked — it will
+    never satisfy") out of the result entirely, leaving only the root that
+    actually needs a human.
+
+    Pure and cheap (a predicate over already-loaded rows, no clock, no I/O),
+    so the same function backs both `coord drive-queue status`'s `alert:`
+    line (`coord.commands.drive_queue._queue_alert`) and the `coord doctor`
+    WARN (`coord.health.checks.wedged_drive_queue`) — one definition of
+    "wedged", not two that could drift apart.
     """
-    return [
-        UnreachableWait(
-            key=e.key, state=e.state, deferrals=e.deferrals, last_reason=e.last_reason
+    entries = list(entries)
+    dependents_of: dict[str, int] = {}
+    for e in entries:
+        for dep in e.after:
+            dependents_of[dep] = dependents_of.get(dep, 0) + 1
+
+    waits: list[UnreachableWait] = []
+    for e in entries:
+        if e.state not in (STATE_BLOCKED, STATE_PARKED):
+            continue
+        if _is_unsatisfiable_prereq_reason(e.last_reason):
+            continue
+        if e.attempts == 0:
+            if e.deferrals <= min_deferrals:
+                continue
+        elif not (e.state == STATE_BLOCKED and _is_dispatch_failure_reason(e.last_reason)):
+            continue
+        waits.append(
+            UnreachableWait(
+                key=e.key,
+                state=e.state,
+                deferrals=e.deferrals,
+                last_reason=e.last_reason,
+                dependents=dependents_of.get(e.key, 0),
+            )
         )
-        for e in entries
-        if e.state in (STATE_BLOCKED, STATE_PARKED)
-        and e.attempts == 0
-        and e.deferrals > min_deferrals
-    ]
+    return waits
 
 
 def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     """The queue-level record #2944's predicate raises, in :func:`_hold_alert`'s
-    shape — a message naming the entry (or entries), the deferral count that
-    is the evidence, and the ONE remedy that actually clears it.
+    shape — a message naming the entry (or entries), the evidence that
+    qualified it, and the ONE remedy that actually clears it.
 
     ``add`` alone does not clear ``blocked`` (the queue list already
     documents this as a footgun elsewhere) — only ``remove`` then ``add``
@@ -2356,29 +2403,52 @@ def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     ``gate_readings``/``details`` lines are printed) so the remedy is visible
     wherever this alert's ``reason`` is, not just to a caller that also reads
     the structured field.
+
+    #2978: each name also carries its `dependents` count when non-zero — the
+    entries chained behind a flagged root never appear in `waits` (see
+    `detect_unreachable_waits`), so without this an operator has no way to
+    know a fix to the one row named here will also resolve N others they
+    never see mentioned. Explicitly says those dependents need no remedy of
+    their own, since #2944's original wording ("for each entry named above")
+    read, on a real incident, as an instruction to `remove`+`add` entries
+    that were never named — but easy to mis-generalize to "the dependents
+    too" by an operator who does not already know #2756 self-heals them.
     """
-    names = ", ".join(
-        f"{w.key} ({w.state}, {w.deferrals} deferrals)" for w in waits[:5]
-    )
+    def _name(w: UnreachableWait) -> str:
+        base = f"{w.key} ({w.state}, {w.deferrals} deferrals)"
+        if w.dependents:
+            plural = "ies" if w.dependents != 1 else "y"
+            base += (
+                f" — {w.dependents} dependent entr{plural} chained behind it "
+                "will self-heal automatically once this clears (#2756), no "
+                "remedy needed on them"
+            )
+        return base
+
+    names = ", ".join(_name(w) for w in waits[:5])
     more = ", ..." if len(waits) > 5 else ""
     plural = len(waits) != 1
     return QueueAlert(
         reason=(
             f"{len(waits)} queue entr{'ies' if plural else 'y'} stuck in a "
-            "guaranteed-false wait — never dispatched (attempts=0) yet "
-            f"blocked/parked past {UNREACHABLE_WAIT_MIN_DEFERRALS} deferrals; "
+            "guaranteed-false wait — blocked/parked with no branch/PR/"
+            "merge-queue row any sweep could ever act on (never dispatched, "
+            "or every dispatch attempt died before creating an assignment); "
             f"no sweep can ever clear this on its own: {names}{more}. Fix: "
             "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> for each entry named above."
+            "coord drive-queue add <repo> <issue> for each ROOT entry named "
+            "above — never on a dependent chained behind one."
         ),
         details=tuple(
             f"{w.key}: {w.state}, {w.deferrals} deferrals, "
-            f"last_reason={w.last_reason!r}"
+            f"dependents={w.dependents}, last_reason={w.last_reason!r}"
             for w in waits
         ),
         command=(
             "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> — for each entry named above"
+            "coord drive-queue add <repo> <issue> — for each ROOT entry "
+            "named above; any dependents chained behind it self-heal on "
+            "their own (#2756)"
         ),
     )
 
@@ -3409,6 +3479,42 @@ def _reconcile_running(
             "then `coord drive-queue remove`+`add` (or just relaunch "
             "`coord drive`) — it now detects the retarget and dispatches "
             "fresh work automatically (#2871)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
+    # #2977: `coord assign` exited because `_gh`'s pre-call guard found a
+    # shared GitHub rate-limit backoff already active and skipped the call
+    # entirely (`GhRateLimitError(from_cache=True)`) — no `gh` call was ever
+    # attempted for this launch. That is neither a permanent refusal (the
+    # `is_policy_refusal_reason`/`is_gate_a_refusal_reason` shapes above —
+    # nothing about the ISSUE was rejected) nor a genuine dispatch failure
+    # (the generic `_dispatch_produced_nothing` note below, which would
+    # spend an attempt): it is a fleet-wide, known-duration condition this
+    # entry had nothing to do with. Parks WITHOUT spending an attempt
+    # (`Reconcile.updates` carries no `attempts` key, same as every other
+    # park above) — the wall-clock `until=` timestamp
+    # `github_ops.format_throttle_skip_reason` embedded in `own_reason` is
+    # what lets `plan_tick`'s parked-entry sweep resume it the moment the
+    # backoff clears, with no live re-check and no operator action, unlike
+    # the gate_a/policy parks just above which need one.
+    if own_reason and is_throttle_skip_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt; the queue "
+            "resumes it automatically once the backoff clears, no operator "
+            "needed (#2977)"
         )
         return (
             Reconcile(
@@ -5007,6 +5113,59 @@ def plan_tick(
         # bounce this check exists to prevent. Stays parked until a human
         # clears it (`coord drive-queue remove`, same as `blocked`).
         if is_policy_refusal_reason(entry.last_reason):
+            continue
+        # #2977: a throttle-skip park (`github_ops.is_throttle_skip_reason`)
+        # carries its OWN known wall-clock expiry (`until=<epoch>`, embedded
+        # by `github_ops.format_throttle_skip_reason` at park time) — unlike
+        # the CI-park default below, which needs a live re-check because it
+        # has no way to know in advance when checks will report, this park
+        # can resume on a plain clock comparison, no I/O at all. `now is
+        # None` (a pure-logic caller with no clock) degrades to "never
+        # resume this tick", same posture #1794's grace window uses for the
+        # same input. An unparseable `until` (should not happen for text
+        # this module itself wrote) or a wait that has run well past
+        # `PARK_STALE_SECONDS` — far longer than any real backoff
+        # (`coord.github_throttle.MAX_BACKOFF_S` is 900s) — resumes anyway
+        # rather than parking indefinitely on a reading nothing can refresh,
+        # the same finite-wait guarantee #2158 already gives the CI park.
+        if is_throttle_skip_reason(entry.last_reason):
+            if now is None:
+                continue
+            until = parse_throttle_skip_until(entry.last_reason)
+            age = now - entry.reason_at if entry.reason_at is not None else None
+            cleared = until is not None and now >= until
+            stale = until is None or (age is not None and age > PARK_STALE_SECONDS)
+            if not cleared and not stale:
+                continue
+            reason = (
+                (
+                    f"the GitHub rate-limit backoff that parked {entry.key} "
+                    "has cleared — resuming without spending an attempt "
+                    "(#2977)"
+                )
+                if cleared
+                else (
+                    f"{entry.last_reason} — this throttle-skip park has run "
+                    f"{PARK_STALE_SECONDS / 60:.0f}m+ with no refreshable "
+                    "expiry left to trust — resuming rather than parking "
+                    "indefinitely (#2977)"
+                )
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "resumed",
+                    reason,
+                    occupies=False,
+                    updates={
+                        "state": STATE_WAITING,
+                        "attempts": 0,
+                        "last_reason": reason,
+                    },
+                )
+            )
+            states[entry.key] = STATE_WAITING
+            effective_attempts[entry.key] = 0
             continue
         if park_expired is not None:
             # Deliberately does NOT claim CI has reported — nothing here knows
