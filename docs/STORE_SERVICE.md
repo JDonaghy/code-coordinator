@@ -1,7 +1,8 @@
 # Store Service — a stable API contract over a pluggable backend
 
 **Milestone:** `Store Service` (#60) · **Tracking epic:** #1949 · **Status:** Phases A and C
-complete; B and D open · *last reconciled against the tree 2026-08-28*
+complete; B and D each down to their last issue · *last reconciled against the tree
+2026-08-31*
 
 > **Where this doc and #1949 disagree, #1949 wins.** The epic is rescoped more often than
 > this narrative is; it also carries the machine-readable `## Work order`, and
@@ -9,9 +10,17 @@ complete; B and D open · *last reconciled against the tree 2026-08-28*
 > what is blocked.
 
 **Phase A** (#1849, #1939, #1941, #1942) and **Phase C** (#1948, via slices #2719–#2768 plus
-#2782/#2784) are closed. The open frontier is **Phase B** (#1944 → #1945 → #1946 → #1947)
-and **Phase D** (#827 → #2884/#2886 → #828/#2885 → #829), which are independent of each
-other: Phase B reshapes the wire, Phase D swaps the engine.
+#2782/#2784) are closed. Since 2026-08-28 the whole of Phase D's confidence apparatus and its
+migration tool have landed too — #827, #2884, #2886, #828 and #2885 are all closed, as are
+Phase B's #1944, #1945 and #1946.
+
+**Two issues remain in the milestone**: **#1947** (retire the RPC surface on telemetry
+evidence) and **#829** (the Postgres cutover). They are independent of each other: Phase B
+reshapes the wire, Phase D swaps the engine.
+
+**But #829's own acceptance bar is not close.** The Postgres CI lane #2886 built has never
+once been green — see Phase D below. That is the live constraint on this milestone, and it is
+tracked outside it, in #2982 and #2983.
 
 This is the plan of record for turning `coord serve` into what it is already trying to
 be: **one storage service with a contract that does not change when the storage engine
@@ -145,9 +154,9 @@ upgraded" is how the 405 trap happens.
 | phase | issues | what | status |
 |---|---|---|---|
 | **A — Contract** | #1849, #1942, #1939, #1941 | Declare DTOs; sever the wire from the DDL; gate the clients; build the store contract suite | ✅ **closed** |
-| **B — REST** | #1943 → #1944 → #1945 → #1946 → #1947 | Negotiate; add resource routes; measure; migrate per client; retire on evidence | #1943 closed; **#1944–#1947 open** |
+| **B — REST** | #1943 → #1944 → #1945 → #1946 → #1947 | Negotiate; add resource routes; measure; migrate per client; retire on evidence | #1943–#1946 closed; **#1947 open** |
 | **C — Dialect seam** | #1948 (slices #2719–#2768, #2782, #2784) | Translate the SQL — paramstyle, upserts, DDL, driver exceptions — **not** a `CoordStore` write interface | ✅ **closed** |
-| **D — Second backend** | #827 → #2884/#2886 → #828/#2885 → #829 | Postgres proves the seam is real, and the instruments prove the proof | **open, unblocked** |
+| **D — Second backend** | #827 → #2884/#2886 → #828/#2885 → #829 | Postgres proves the seam is real, and the instruments prove the proof | #827, #2884, #2886, #828, #2885 closed; **#829 open and blocked in practice** |
 
 ### Phase A — Contract
 
@@ -173,9 +182,12 @@ four field-setters. Mechanical, wide, and low-risk *if* sequenced as expand/migr
 Order matters: negotiation first, then routes, then telemetry, then per-client migration,
 then retirement. Telemetry before migration, so retirement has evidence rather than hope.
 
-**#1943 (negotiation) is closed** — `X-Coord-Schema`, absent meaning today's shape, is the
-mechanism every remaining slice depends on. #1944–#1947 are open and are **independent of
-Phase D**: nothing in the REST reshaping blocks or is blocked by the backend swap.
+**#1943–#1946 are closed.** `X-Coord-Schema` (absent meaning today's shape) is the mechanism
+every slice depends on; the resource routes exist alongside the RPC surface, deprecation
+telemetry is recording, and the Python CLI is migrated (client 1 of 4). **#1947 — retirement
+— is the only one left**, and by design it does not start until the telemetry shows zero calls
+from any client version over a defined window. It is **independent of Phase D**: nothing in
+the REST reshaping blocks or is blocked by the backend swap.
 
 ### Phase C — Dialect seam
 
@@ -208,10 +220,10 @@ are Python's `time.strftime`, not SQL's.
 
 ### Phase D — Second backend
 
-**Open and unblocked.** Its value is as **proof**: a second backend is the only way to know
-the seam is real rather than nominal. Postgres is the chosen prover; **SQLite remains
-supported**, which is also what makes the cutover's rollback a config flip rather than a
-restore.
+**Its code has landed; its proof has not.** Its value is as **proof**: a second backend
+is the only way to know the seam is real rather than nominal. Postgres is the chosen
+prover; **SQLite remains supported**, which is also what makes the cutover's rollback a
+config flip rather than a restore.
 
 After Phase C, the port itself is small. There are exactly **two** connection factories in
 the tree — `coord/db.py:109` and `coord/dao.py:294` — and both already delegate everything
@@ -220,24 +232,52 @@ things a connection swap does not cover: `DB_PATH` is a module-level `Path` and 
 deployment has a DSN, and `db.py` hands out a singleton with `check_same_thread=False`,
 which is a SQLite affordance that psycopg3 does not share.
 
-**The confidence apparatus is the other half, and it was unfiled until 2026-08-28.** The code
-is portable; the evidence machinery is not. #828 and #829's acceptance criteria — *"high
-confidence the import is safe, or else revert"*, *"full suite green on Postgres"* — are
-claims only tests can make, and three things stood in the way:
+**The confidence apparatus is the other half, and it was unfiled until 2026-08-28.** It was
+then built in two days — all three issues below are closed, as is #828's migration tool
+(`coord migrate-to-postgres`, `coord/store_migrate.py`). The code is portable and the
+machinery exists. What it *reports* is the problem: see "the lane is red" below.
 
-- **#2884** — the suite cannot be pointed at a second backend. The autouse `coord_db`
+- **#2884 (closed)** — the suite cannot be pointed at a second backend. The autouse `coord_db`
   fixture (`tests/conftest.py:797`) is a single chokepoint covering all 393 test files,
   which makes this much cheaper than the raw `sqlite3.connect` count suggests; 38 files
   open their own connections and need triage. **On the critical path — build it before
   #828.** A migration tool with no way to verify its output is a tool you have to trust.
-- **#2885** — the write path has no parity oracle. #1942's contract suite is scoped to
+- **#2885 (closed)** — the write path has no parity oracle. #1942's contract suite is scoped to
   reads and reaches 12 of the 313 SQL sites. The 37 `INSERT OR REPLACE` rewrites recorded a
   judgement per site, not a test.
-- **#2886** — `coord/sql.py`'s Postgres branches have never executed. `psycopg` is not a
-  declared dependency, no CI workflow mentions Postgres, and the Postgres-aware tests use
-  mock connections.
+- **#2886 (closed)** — `coord/sql.py`'s Postgres branches have never executed. `psycopg` is
+  not a declared dependency, no CI workflow mentions Postgres, and the Postgres-aware tests
+  use mock connections.
 
-Order: **#827 → #2884 / #2886 → #828 / #2885 → #829.**
+Order: **#827 → #2884 / #2886 → #828 / #2885 → #829.** Everything before #829 has landed.
+
+#### The lane is red — this is what actually gates #829
+
+`coord/sql.py`'s Postgres branches now execute in CI against a real Postgres 16 service
+(#2886, a separate `postgres` job in `.github/workflows/test.yml`). **It has never been
+green.** On `main` at `a706a8d9` (run `33342821643`):
+
+```
+12 skipped, 13884 errors in 2414.26s (0:40:14)      <- 13,896 collected, 0 passed
+```
+
+A 100% error rate, from the first test, invisible because the job carries
+`continue-on-error: true`.
+
+The cause is a single missing line, not a deep portability problem.
+`coord/db.py`'s `_migrate_add_columns` swallows the driver error from a duplicate
+`ALTER TABLE ... ADD COLUMN` without calling `conn.rollback()`. On SQLite that is harmless; on
+Postgres the first swallowed error aborts the transaction, so every statement after it — the
+remaining 73 ALTERs and `_set_schema_version`'s `DELETE FROM schema_version` — fails with
+`InFailedSqlTransaction`. Since `_ensure_schema()` is what the autouse `coord_db` fixture
+calls, the fixture dies before any test body runs.
+
+Tracked in **#2982** (the rollback + a regression test; reports the residual failure list
+rather than fixing it) and **#2983** (the other 20 `except sql.driver_errors():` handlers that
+continue on the same connection — `coord/` has 21 such sites and exactly one `conn.rollback()`
+tree-wide). Until #2982 lands, #829's *"full test suite green with the Postgres backend
+selected"* stands at zero, and #2885's write-parity oracle — built precisely to make this
+cutover safe — is itself among the errors.
 
 A whole-day outage is an acceptable cost for this cutover, which is what keeps #828 a
 one-shot importer: no dual-write, no online migration, no cutover choreography.
@@ -261,9 +301,12 @@ job than that warning anticipated — translation rather than relocation, which 
 decomposed into ten mechanical slices instead of a semantic refactor of `state.py`.
 
 It does not claim Phase D is finished when the code compiles against psycopg. **A seam is
-nominal until something has run on both sides of it**, and as of 2026-08-28 nothing in this
-repo has ever connected to a Postgres server. That is what #2884/#2885/#2886 exist to change,
-and why they are sequenced *before* the migration tool rather than after it.
+nominal until something has run on both sides of it.** As of 2026-08-31 this repo *does* now
+connect to a real Postgres server in CI — #2884/#2885/#2886 delivered that, and sequencing
+them before the migration tool was right. But connecting is not passing: the lane is at a 100%
+error rate (see Phase D), so the seam is still nominal in the only sense that matters. The
+apparatus was worth building precisely because it is what turned "we believe the seam is real"
+into a measurable, currently-failing number.
 
 ---
 
@@ -275,8 +318,12 @@ and why they are sequenced *before* the migration tool rather than after it.
 - **#1948** — the dialect seam, and the adjudication in §2 (closed; slices #2719–#2768)
 - **#2708** — corrects `dao.py`'s "DB-API 2.0 abstracts the dialect" claim (closed)
 - **#2768 / #2784** — the ratchet that keeps the seam closed (closed)
-- **#827 / #828 / #829** — connection factory + config seam → migration tool → cutover
-- **#2884 / #2885 / #2886** — test-harness portability, write-path parity oracle, psycopg + Postgres CI
+- **#827 / #828** — connection factory + config seam; `coord migrate-to-postgres` (both closed)
+- **#829** — the cutover (open; gated in practice on the red Postgres lane)
+- **#2884 / #2885 / #2886** — test-harness portability, write-path parity oracle,
+  psycopg + Postgres CI (all closed)
+- **#2982 / #2983** — the missing `conn.rollback()` that keeps the Postgres lane at 0 passes,
+  and the tree-wide sweep for the same defect
 - **#1825** — state durability & the relocatable daemon
 - **#282** — multi-user / team mode, the eventual consumer of a real store seam
 - **#750 / #748 / #757** — codegen, golden fixture, OpenAPI spec (the assets §3 lists)
