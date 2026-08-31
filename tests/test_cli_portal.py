@@ -414,6 +414,38 @@ def test_decompose_chat_reports_a_dispatch_failure_cleanly(config_path):
     assert "no single machine claims every repo" in result.output
 
 
+def test_decompose_chat_names_the_pulled_status_that_disqualified_it(config_path):
+    """#2996: the generic "is not a currently-approved portal submission"
+    error named neither the cause nor the status that caused it. When the
+    real cause is a `_PULLED_STATUSES` push on a submission with an
+    `approved` sign-off — e.g. an operator's own `enqueue-status planned`
+    pushed before the submission was actually decomposed — the failure now
+    names that status and the `in-design` recovery, with no mock standing in
+    for `dispatch_decomposition_chat` this time."""
+    from coord import portal_store
+
+    portal_store.record_events(
+        [{"id": "e1", "submission_id": "sub_2f6a1c", "type": "signoff.approved"}],
+        now=1.0,
+    )
+    row = portal_store.enqueue("sub_2f6a1c", "status", {"status": "planned"}, now=2.0)
+    portal_store.mark_applied(row, now=2.0)
+
+    result = run("portal", "decompose-chat", "--config", config_path, "sub_2f6a1c")
+    assert result.exit_code != 0
+    assert "'planned'" in result.output
+    assert "in-design" in result.output
+
+
+def test_decompose_chat_generic_message_when_never_approved_at_all(config_path):
+    """No disqualifying status to name here — the submission simply has no
+    approved sign-off on record, so the generic message stays generic."""
+    result = run("portal", "decompose-chat", "--config", config_path, "sub_never_seen")
+    assert result.exit_code != 0
+    assert "is not a currently-approved portal submission" in result.output
+    assert "last_status" not in result.output
+
+
 # ── #2743: --wait blocks and prints the closing summary ────────────────────
 #
 # A CLI-dispatched decomposition-chat is issue_number=0 — no GitHub thread to
@@ -711,6 +743,57 @@ def test_enqueue_preview_rejects_an_empty_url():
     result = run("portal", "enqueue-preview", "sub_1", "")
     assert result.exit_code != 0
     assert "non-empty" in result.output
+
+
+# ── #2996: `enqueue-status` warns before a `_PULLED_STATUSES` push that ────
+# would silently withdraw a submission from decomposition, on a submission
+# with no linked milestone/issue and (so, by construction here) no
+# decomposition on record. It must never refuse — only warn.
+
+
+@pytest.mark.parametrize("status", ["planned", "in-progress", "shipped"])
+def test_enqueue_status_warns_before_withdrawing_an_unlinked_submission(status):
+    result = run("portal", "enqueue-status", "sub_1", status)
+    assert result.exit_code == 0, result.output
+    assert "warning" in result.output.lower()
+    # Names the consequence in operator terms, not just the constant's name.
+    assert "Approved work items" in result.output
+    assert "decompose-chat" in result.output
+    # Names the alternative for the "not started yet" case.
+    assert "in-design" in result.output
+    # And the push still went through.
+    assert "queued:" in result.output
+
+
+def test_enqueue_status_does_not_warn_for_a_non_pulled_status():
+    result = run("portal", "enqueue-status", "sub_1", "in-design")
+    assert result.exit_code == 0, result.output
+    assert "warning" not in result.output.lower()
+
+
+def test_enqueue_status_does_not_warn_once_a_link_is_on_file(config_path):
+    """A linked submission has actually been pulled into decomposition — the
+    #2996 warning exists for the case where it has NOT, so it must not fire
+    once `coord portal link` is on record."""
+    from coord import portal_store
+
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=1, submission_id="sub_linked", actor="tester"
+    )
+    result = run("portal", "enqueue-status", "sub_linked", "planned")
+    assert result.exit_code == 0, result.output
+    assert "warning" not in result.output.lower()
+
+
+def test_enqueue_status_still_warns_even_when_the_push_itself_is_refused():
+    """The warning is about the *consequence of applying* the status, which
+    is independent of the #835 ordering guard's own separate refusal
+    (`quality-check` with no preview queued yet) — both fire together
+    rather than the ordering guard's exit code swallowing the warning."""
+    result = run("portal", "enqueue-status", "sub_1", "quality-check")
+    assert result.exit_code != 0
+    assert "warning" in result.output.lower()
+    assert "preview" in result.output
 
 
 def test_outbox_is_empty_by_default():

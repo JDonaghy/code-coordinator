@@ -256,6 +256,47 @@ def approved_submission_ids() -> set[str]:
     return {sid for sid, verdict in _fold_signoff_verdicts().items() if verdict == "approved"}
 
 
+def is_pulled_status(status: str) -> bool:
+    """Whether *status* is one of :data:`_PULLED_STATUSES` — the public,
+    non-underscore way for another module (:mod:`coord.commands.portal`,
+    #2996) to ask "would pushing this status withdraw a submission from
+    :func:`approved_submissions`?" without reaching into this module's
+    private constant.
+    """
+    return status in _PULLED_STATUSES
+
+
+def disqualifying_status(submission_id: str) -> str | None:
+    """The ``last_status`` responsible for *submission_id* being missing
+    from :func:`approved_submissions` despite an ``approved`` sign-off
+    verdict on file — or ``None`` when that is not why it is missing (never
+    approved, no record at all, or genuinely not pulled) (#2996).
+
+    Reads local :mod:`coord.portal_store` directly, same as
+    :func:`approved_submissions` itself — so, like that function, this is
+    only meaningful when called on the daemon host (the caller is
+    responsible for that; see :func:`coord.commands.portal.
+    _refuse_if_thin_client` and :func:`coord.decomposition_chat.
+    resolve_approved_submission`'s own thin-client routing).
+
+    Exists so a "why isn't this on the queue" failure message
+    (:func:`coord.decomposition_chat.resolve_approved_submission`'s callers)
+    can name the actual cause — a status an operator pushed by hand, most
+    often via ``coord portal enqueue-status`` — instead of the generic
+    "is not a currently-approved portal submission", which names neither.
+    """
+    from coord import portal_store  # noqa: PLC0415 — avoid import cycle
+
+    record = portal_store.get_submission(submission_id)
+    if record is None:
+        return None
+    if record.submission_id not in approved_submission_ids():
+        return None
+    if record.last_status in _PULLED_STATUSES:
+        return record.last_status
+    return None
+
+
 def approved_submissions(config: "Config") -> list[dict[str, Any]]:
     """The ``/board`` ``approved_submissions`` payload, **oldest first**.
 

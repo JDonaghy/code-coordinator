@@ -546,6 +546,50 @@ def resolve_approved_submission(config: "Config", submission_id: str) -> dict[st
     )
 
 
+def describe_unapproved_submission(config: "Config", submission_id: str) -> str:
+    """Human-readable reason :func:`resolve_approved_submission` returned
+    ``None`` for *submission_id* (#2996).
+
+    Names the disqualifying ``last_status`` when that is actually why — most
+    often an operator's own ``coord portal enqueue-status`` push to a
+    :data:`coord.approved_work._PULLED_STATUSES` value on a submission that
+    had not, in fact, been decomposed yet — instead of the generic "is not a
+    currently-approved portal submission", which names neither the cause nor
+    the status that caused it (the whole complaint in #2996's issue body).
+
+    Best-effort: the disqualifying-status lookup
+    (:func:`coord.approved_work.disqualifying_status`) needs to read the
+    daemon's own local :mod:`coord.portal_store` directly, so it is skipped
+    (falling back to the plain generic message) when this machine is a thin
+    client — the same constraint :func:`resolve_approved_submission` itself
+    already works around by routing through the daemon's ``/board`` instead
+    of reading the wrong box's empty tables.
+    """
+    base = f"submission {submission_id!r} is not a currently-approved portal submission"
+
+    from coord import board_service  # noqa: PLC0415
+
+    reason: str | None = None
+    if board_service.resolve() is None:
+        from coord.approved_work import disqualifying_status  # noqa: PLC0415
+
+        reason = disqualifying_status(submission_id)
+
+    if reason:
+        return (
+            f"{base} — its last_status is {reason!r}, which coord already treats "
+            "as pulled into decomposition/delivery (coord.approved_work."
+            "_PULLED_STATUSES), so it no longer shows up in the TUI's Approved "
+            "work items panel and this command refuses it. If it was pushed to "
+            f"that status before decomposition actually happened, `coord portal "
+            f"enqueue-status {submission_id} in-design` puts it back on the "
+            "queue without re-mailing the customer. Nothing to decompose."
+        )
+    return (
+        f"{base} (coord.approved_work.approved_submissions) — nothing to decompose"
+    )
+
+
 def dispatch_decomposition_chat(
     submission_id: str,
     config: "Config",
@@ -576,10 +620,7 @@ def dispatch_decomposition_chat(
     """
     submission = resolve_approved_submission(config, submission_id)
     if submission is None:
-        raise RuntimeError(
-            f"submission {submission_id!r} is not a currently-approved portal "
-            "submission (coord.approved_work.approved_submissions) — nothing to decompose"
-        )
+        raise RuntimeError(describe_unapproved_submission(config, submission_id))
 
     repos: list[str] = submission.get("repos") or []
     if not repos:
