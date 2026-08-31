@@ -1892,7 +1892,9 @@ def list_remote_branch_names(repo: str) -> set[str]:
     }
 
 
-def branch_exists_on_remote(repo: str, branch: str) -> bool:
+def branch_exists_on_remote(
+    repo: str, branch: str, *, cache: dict | None = None
+) -> bool:
     """Return True if `branch` currently exists on `repo` (owner/name) at GitHub.
 
     Uses a targeted ``gh api`` call rather than listing all branches.  Fails
@@ -1903,7 +1905,27 @@ def branch_exists_on_remote(repo: str, branch: str) -> bool:
 
     Called by ``dispatch_review`` and ``_dispatch_fix`` (#586) to avoid
     routing a follow-on assignment to a machine that can't fetch the branch.
+
+    *cache* (#2989) is an optional caller-owned ``dict`` used to memoise the
+    lookup for the duration of ONE sweep, mirroring
+    :func:`work_is_terminal`'s ``cache=``.  A single ``reconcile_board_merges``
+    pass measured 1,304 ref lookups for only 851 distinct refs (1.53x
+    redundancy) because sibling assignment rows — a work row and its
+    conflict-fix, or a re-dispatch — legitimately share one branch.  The
+    cache is deliberately **per-pass and caller-scoped**, never module-level:
+    branch existence is exactly the kind of fact that must be re-read on the
+    next pass.
     """
+    key = (repo, branch)
+    if cache is not None and key in cache:
+        return cache[key]
+    result = _branch_exists_on_remote_uncached(repo, branch)
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def _branch_exists_on_remote_uncached(repo: str, branch: str) -> bool:
     try:
         _gh("api", f"repos/{repo}/git/refs/heads/{branch}",
             caller="github_ops.branch_exists_on_remote")
