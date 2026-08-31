@@ -541,6 +541,66 @@ def test_tui_update_force_overwrites_dev_build(stub_server, tmp_path: Path) -> N
     assert out == f"coord-tui {version}"
 
 
+def test_tui_update_v0_1_0_release_is_not_misclassified_as_dev_build(
+    stub_server, tmp_path: Path
+) -> None:
+    """#2984 regression, pinned at the CLI level.
+
+    `DEV_BUILD_SENTINEL_VERSION` is `"0.1.0"` -- and that is ALSO coord-tui's
+    real first release tag, because `release-tui.yml` stamps the tag straight
+    over `Cargo.toml`'s committed placeholder, and the one tag that
+    reproduces the placeholder exactly is the one every new release channel
+    starts on. A host that already carries a CI-built v0.1.0 binary must be
+    able to run `coord tui update` again, with no `--force`, and have that
+    recognised as "already current" -- not refused as if it were a dev
+    build someone is iterating on.
+    """
+    from coord.tui_release import DEV_BUILD_SENTINEL_VERSION
+
+    version = DEV_BUILD_SENTINEL_VERSION
+    assert version == "0.1.0"  # fixture assumption: this IS the colliding tag
+    dest = _installed(tmp_path, version)
+
+    server = stub_server
+    lpath, lpayload = _latest_route(version)
+    server.routes[lpath] = ("json", lpayload)
+    # No asset/download routes registered: reaching the download would 404,
+    # proving the "already current" short-circuit is what actually fired.
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "tui", "update",
+            "--repo", REPO,
+            "--api-base", _api_base(server),
+            "--dest", str(dest),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to do" in result.output
+    assert "refusing to overwrite" not in result.output
+    # Untouched -- the same bytes that were already there, not re-downloaded.
+    assert dest.read_bytes() == _fake_binary(version)
+
+
+def test_is_dev_build_does_not_misclassify_the_v0_1_0_collision(tmp_path: Path) -> None:
+    """#2984 regression, at the `tui_release.is_dev_build` unit level -- no
+    CLI or network involved. A sentinel-versioned binary whose
+    `target_version` (the release a run resolved as "the one to install") is
+    that very same value must not be reported as a dev build; that's exactly
+    the v0.1.0 collision. Omitting `target_version` keeps the old,
+    collision-prone, version-only check, asserted here as a control so this
+    test would fail loudly if that fallback ever silently changed too."""
+    from coord.tui_release import DEV_BUILD_SENTINEL_VERSION, is_dev_build
+
+    binary = _installed(tmp_path, DEV_BUILD_SENTINEL_VERSION)
+
+    assert is_dev_build(binary) is True
+    assert is_dev_build(binary, target_version=DEV_BUILD_SENTINEL_VERSION) is False
+    assert is_dev_build(binary, target_version="0.9.9") is True
+
+
 # ── version-skew notice (`coord tui status`, and bare `coord tui`) ─────────
 #
 # #2898's acceptance criterion: `coord tui status` compares against coord-tui's
