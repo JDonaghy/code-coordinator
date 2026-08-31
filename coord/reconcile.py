@@ -2821,6 +2821,15 @@ def close_stale_prs(
     to evaluate; with *board* left ``None`` this is a no-op regardless of
     *skip_dormant_repos* (no activity signal to check against, so never
     skip).
+
+    Note: the floor is recorded as soon as a repo is deemed due, before
+    ``list_open_prs`` is even attempted, and it stays recorded if that call
+    then raises (deliberate — see ``coord.repo_dormancy.record_swept``'s
+    docstring: it tracks "a real gh call was spent", not "and it worked").
+    One operator-facing consequence: a repo that is persistently failing
+    (renamed, deleted, secondary-rate-limited) goes quiet for up to
+    ``DORMANT_SWEEP_FLOOR_S`` between retries rather than being retried
+    sooner, same as a genuinely idle repo would be.
     """
     from coord import github_ops  # noqa: PLC0415
 
@@ -2834,10 +2843,12 @@ def close_stale_prs(
         if skip_dormant_repos and board is not None:
             from coord import repo_dormancy  # noqa: PLC0415
 
-            if repo_dormancy.should_skip_sweep(repo_cfg.name, board):
+            if repo_dormancy.should_skip_sweep(
+                repo_cfg.name, board, repo_dormancy.KIND_PRS
+            ):
                 dormant_skipped += 1
                 continue
-            repo_dormancy.record_swept(repo_cfg.name)
+            repo_dormancy.record_swept(repo_cfg.name, repo_dormancy.KIND_PRS)
 
         try:
             open_prs = github_ops.list_open_prs(repo_cfg.github)

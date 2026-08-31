@@ -941,7 +941,7 @@ def test_close_stale_prs_skips_dormant_repo_when_opted_in(
     # 'idle' already had a baseline sweep, well inside the floor -- only a
     # repo that has been swept before is even eligible to be skipped (see
     # test_never_swept_repo_is_not_skipped in test_repo_dormancy.py).
-    repo_dormancy.record_swept("idle", now=time.time())
+    repo_dormancy.record_swept("idle", repo_dormancy.KIND_PRS, now=time.time())
 
     board = Board(
         active=[],
@@ -992,7 +992,9 @@ def test_close_stale_prs_dormant_repo_swept_again_past_the_floor(
     )
 
     now = time.time()
-    repo_dormancy.record_swept("api", now=now - repo_dormancy.DORMANT_SWEEP_FLOOR_S - 1.0)
+    repo_dormancy.record_swept(
+        "api", repo_dormancy.KIND_PRS, now=now - repo_dormancy.DORMANT_SWEEP_FLOOR_S - 1.0
+    )
 
     board = Board(active=[], completed=[])  # no activity -- 'api' is idle
 
@@ -1022,8 +1024,8 @@ def test_reconcile_board_merges_wakes_dormant_repo_when_work_is_queued(
     # ('never swept' always sweeps -- see test_never_swept_repo_is_not_skipped
     # in test_repo_dormancy.py). 'api' has real activity below so it's never
     # skipped regardless; 'idle' was just swept -- well inside the floor.
-    repo_dormancy.record_swept("api", now=now)
-    repo_dormancy.record_swept("idle", now=now)
+    repo_dormancy.record_swept("api", repo_dormancy.KIND_PRS, now=now)
+    repo_dormancy.record_swept("idle", repo_dormancy.KIND_PRS, now=now)
 
     api_assignment = _done_work(assignment_id="w-api", status="running")
     api_assignment.repo_name = "api"

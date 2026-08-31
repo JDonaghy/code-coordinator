@@ -5494,7 +5494,7 @@ def test_sync_issues_tick_skips_dormant_repo(
     # a baseline sweep so the floor actually applies (a repo that has never
     # been swept is always due -- see
     # coord.repo_dormancy.should_skip_sweep / test_repo_dormancy.py).
-    repo_dormancy.record_swept("shared", now=time.time())
+    repo_dormancy.record_swept("shared", repo_dormancy.KIND_ISSUES, now=time.time())
 
     calls: list[str] = []
     monkeypatch.setattr(
@@ -5524,8 +5524,8 @@ def test_sync_issues_tick_wakes_dormant_repo_when_work_is_queued(
     rw_db.commit()
 
     now = time.time()
-    repo_dormancy.record_swept("api", now=now)
-    repo_dormancy.record_swept("shared", now=now)
+    repo_dormancy.record_swept("api", repo_dormancy.KIND_ISSUES, now=now)
+    repo_dormancy.record_swept("shared", repo_dormancy.KIND_ISSUES, now=now)
 
     calls: list[str] = []
     monkeypatch.setattr(
@@ -5553,6 +5553,62 @@ def test_sync_issues_tick_wakes_dormant_repo_when_work_is_queued(
     _sync_issues_tick(cfg)
 
     assert calls == ["acme/shared"]
+
+
+def test_reconcile_and_issues_ticks_back_to_back_do_not_starve_issues_sync(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2994 review (blocking regression guard): drives
+    ``_reconcile_merges_tick`` immediately followed by ``_sync_issues_tick``
+    for the same fully-dormant repos, exactly the order and proximity
+    ``_tick_loop`` uses them in. Before the fix both ticks shared one
+    ``{repo_name: last_swept_at}`` clock, so the PR sweep (which always runs
+    first) stamped it and the issues sweep, moments later in the same pass,
+    saw a just-refreshed timestamp and skipped -- permanently, since it
+    never got a first real sweep to see stale. The two sweep kinds must use
+    independent floors so this can't happen."""
+    from coord import github_ops
+    from coord.config import load as load_config
+    from coord.serve_app import _reconcile_merges_tick, _sync_issues_tick
+
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
+
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.commit()
+    # No assignments seeded at all -- both 'api' and 'shared' are fully
+    # dormant (no open assignment, no drive-queue entry, no open PR).
+
+    pr_calls: list[str] = []
+    issue_calls: list[str] = []
+    monkeypatch.setattr(
+        github_ops, "list_open_prs", lambda repo: pr_calls.append(repo) or []
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "get_open_issues",
+        lambda repo, **kwargs: issue_calls.append(repo) or [],
+    )
+    # Sweeps (a)/(b) inside reconcile_board_merges only touch board rows,
+    # and the board is empty here, but stub them anyway so this test can't
+    # ever shell out to a real `gh`/`git`.
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda *a: False)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda *a: False)
+
+    cfg = load_config(valid_config_path)
+
+    # Same order + proximity as the real _tick_loop: reconcile-merges tick
+    # (stale-PR sweep) immediately followed by the issues-sync tick.
+    _reconcile_merges_tick(cfg)
+    _sync_issues_tick(cfg)
+
+    # Both repos had never been swept before -- both sweep kinds are due on
+    # their own first look, independent of what the other kind just did.
+    assert sorted(pr_calls) == ["acme/api", "acme/shared"]
+    assert sorted(issue_calls) == ["acme/api", "acme/shared"]
 
 
 # ── #1220: _clean_worktrees_tick — fleet-wide orphaned-worktree sweep ────────
