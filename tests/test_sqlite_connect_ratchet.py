@@ -395,6 +395,20 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "whose handlers execute on a worker thread that the autouse fixture's "
         "thread-bound connection cannot be used from.",
     ),
+    "test_dashboard_api.py": Classification(
+        1, (BUCKET_C,),
+        "#2990's dashboard exposure of `coord portal answer` "
+        "(GET /api/portal/needs-input + POST /api/portal/answer), driven "
+        "through the real app under TestClient — so it needs the identical "
+        "rw_db fixture as test_dashboard.py directly above, which its own "
+        "docstring cites by name: the handlers run on a TestClient worker "
+        "thread that the autouse coord_db connection is thread-bound away "
+        "from, and the test's whole point is that a portal_ledger row written "
+        "under the handler thread reads back on the override connection. "
+        "scratch_database() does not fit for the usual reason — the file "
+        "connection has to be opened with check_same_thread=False, which it "
+        "does not do.",
+    ),
     "test_cli_issue_reopen.py": Classification(
         1, (BUCKET_C,),
         "_make_file_db seeds a real board file for the SqliteStore-backed "
