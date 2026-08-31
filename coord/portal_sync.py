@@ -576,9 +576,14 @@ def _enqueue_status_local(
     """The actual write :func:`enqueue_status` performs — local to whichever
     process runs it. See that function's own docstring for the routing
     contract; this is also what backs `_enqueue_question_local`'s own
-    `needs-input` row and every daemon-tick-loop caller
-    (`sync_submission_statuses`, `enqueue_relayed_answer`), none of which
-    need routing since they only ever run on the daemon itself.
+    `needs-input` row directly. `sync_submission_statuses` and
+    `enqueue_relayed_answer` do **not** call this directly — they call the
+    public, routing-aware `enqueue_status()` like any other caller. That
+    routing is a no-op for them in practice (the daemon process itself has
+    no `board_service` configured, so `_route_enqueue_status` always returns
+    `None` there and every call falls through to this same local write) but
+    it means this function does not, by itself, "back" those two callers —
+    `enqueue_status()` does.
     """
     if status not in SUBMISSION_STATUSES:
         raise PortalSyncError(
