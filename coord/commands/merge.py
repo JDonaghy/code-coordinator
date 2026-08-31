@@ -583,6 +583,15 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     called in because a worker genuinely tried and failed, or because the
     failure is provably not this branch's, never because two correct
     declines were miscounted as two failed attempts.
+
+    Before trusting ``dispatch_was_noop`` at all, first checks ``coord.
+    ci_fix._has_active_fix`` — the SHA comparison alone cannot distinguish
+    "the fix worker finished and declined to push" from "the fix worker is
+    still running and just hasn't pushed yet" (a dispatched leg stays
+    PENDING for its whole lifetime, so the very next tick after dispatch
+    would otherwise read as a noop). While a fix is still active, the entry
+    is left untouched — no refund, no streak bump, no new dispatch — for
+    the next tick to re-check.
     """
     ci_events = [ev for ev in events if ev.kind == "checks_failed"]
     if not ci_events or dry_run:
@@ -592,6 +601,7 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     from coord.ci_fix import (  # noqa: PLC0415
         MAX_CI_FIX_DISPATCHES,
         MAX_CI_FIX_NOOP_STREAK,
+        _has_active_fix,
         dispatch_ci_fix,
         dispatch_was_noop,
         refund_noop_ci_fix,
@@ -605,6 +615,25 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     dispatched_any = False
     for ev in ci_events:
         entry = ev.entry
+        # #3011 follow-up: `dispatch_was_noop` only compares the SHA
+        # snapshotted at dispatch time against the current branch head — it
+        # cannot tell "the fix worker finished and declined to push" apart
+        # from "the fix worker is still running and just hasn't pushed yet".
+        # A dispatched leg stays PENDING for its whole lifetime (`process()`
+        # never mutates entry.state for this path), so on the very next tick
+        # after dispatch the SHA still matches and `dispatch_was_noop` would
+        # read `True` for a leg that hasn't even had a chance to push.
+        # `_has_active_fix` is the same in-flight guard `dispatch_ci_fix`
+        # itself checks before dispatching — treat "still running" as "still
+        # pending" here too: skip the noop/refund accounting entirely and
+        # leave the entry untouched for the next tick, exactly like the
+        # generic "already in flight" decline below.
+        if _has_active_fix(fix_board, entry):
+            click.echo(
+                f"  {entry.repo_name} #{entry.issue_number}: "
+                "ci-fix already in flight — will re-check next run"
+            )
+            continue
         if dispatch_was_noop(entry):
             refund_noop_ci_fix(entry)
             dispatched_any = True
