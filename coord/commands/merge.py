@@ -569,13 +569,33 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     is never reprocessed by a later ``process()`` call (it only acts on
     ``PENDING`` entries) so whichever caller sees the event first must also
     be the one to act on it.
+
+    #3011: before dispatching again, checks whether the entry's LAST ci-fix
+    leg was a no-op — the branch HEAD is unchanged from
+    ``entry.ci_fix_head_sha``, the snapshot ``dispatch_ci_fix`` took when it
+    dispatched that leg. A no-op means a fresh worker looked at this
+    failure and pushed no commit — evidence the failure isn't attributable
+    to this branch, not evidence a fix attempt failed — so it is refunded
+    (``coord.ci_fix.refund_noop_ci_fix``) rather than counted toward
+    ``MAX_CI_FIX_DISPATCHES``. Consecutive no-ops are bounded separately by
+    ``MAX_CI_FIX_NOOP_STREAK``, escalating to ``HUMAN_REQUIRED`` with a
+    distinct reason once THAT cap is hit — the goal being that a human is
+    called in because a worker genuinely tried and failed, or because the
+    failure is provably not this branch's, never because two correct
+    declines were miscounted as two failed attempts.
     """
     ci_events = [ev for ev in events if ev.kind == "checks_failed"]
     if not ci_events or dry_run:
         return
 
     from coord.audit import record_audit  # noqa: PLC0415
-    from coord.ci_fix import MAX_CI_FIX_DISPATCHES, dispatch_ci_fix  # noqa: PLC0415
+    from coord.ci_fix import (  # noqa: PLC0415
+        MAX_CI_FIX_DISPATCHES,
+        MAX_CI_FIX_NOOP_STREAK,
+        dispatch_ci_fix,
+        dispatch_was_noop,
+        refund_noop_ci_fix,
+    )
     from coord.merge_queue import HUMAN_REQUIRED  # noqa: PLC0415
     from coord.state import load_board, save_board  # noqa: PLC0415
 
@@ -585,6 +605,64 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     dispatched_any = False
     for ev in ci_events:
         entry = ev.entry
+        if dispatch_was_noop(entry):
+            refund_noop_ci_fix(entry)
+            dispatched_any = True
+            if entry.ci_fix_noop_streak >= MAX_CI_FIX_NOOP_STREAK:
+                entry.state = HUMAN_REQUIRED
+                click.echo(
+                    f"  {entry.repo_name} #{entry.issue_number}: "
+                    f"{entry.ci_fix_noop_streak} consecutive ci-fix workers "
+                    "pushed no commit — not attributable to this branch, "
+                    "manual resolution required"
+                )
+                record_audit(
+                    tier="operational",
+                    category="merge",
+                    event_type="ci_fix_not_attributable",
+                    actor="daemon",
+                    summary=(
+                        f"ci-fix not attributable to branch: "
+                        f"{entry.repo_name}#{entry.issue_number} — "
+                        f"{entry.ci_fix_noop_streak} consecutive fix "
+                        "workers pushed no commit; manual resolution "
+                        "required"
+                    ),
+                    repo=entry.repo_name,
+                    issue=entry.issue_number,
+                    assignment_id=entry.assignment_id,
+                    details={
+                        "reason": "ci_fix_noop_streak",
+                        "ci_fix_noop_streak": entry.ci_fix_noop_streak,
+                        "error": entry.error,
+                    },
+                )
+            else:
+                click.echo(
+                    f"  {entry.repo_name} #{entry.issue_number}: "
+                    "ci-fix leg pushed no commit — refunding attempt "
+                    f"({entry.ci_fix_dispatches}/{MAX_CI_FIX_DISPATCHES} "
+                    "real attempts spent), will retry next run"
+                )
+                record_audit(
+                    tier="operational",
+                    category="merge",
+                    event_type="ci_fix_noop_refunded",
+                    actor="daemon",
+                    summary=(
+                        f"ci-fix leg was a no-op (branch head unchanged): "
+                        f"{entry.repo_name}#{entry.issue_number} — attempt "
+                        "refunded, not counted toward the retry cap"
+                    ),
+                    repo=entry.repo_name,
+                    issue=entry.issue_number,
+                    assignment_id=entry.assignment_id,
+                    details={
+                        "ci_fix_dispatches": entry.ci_fix_dispatches,
+                        "ci_fix_noop_streak": entry.ci_fix_noop_streak,
+                    },
+                )
+            continue
         fix = dispatch_ci_fix(entry, fix_board, config, checks_summary=ev.message)
         if fix is not None:
             click.echo(

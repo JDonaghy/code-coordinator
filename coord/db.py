@@ -594,7 +594,10 @@ def retry_on_locked(
 #
 # #2987: bumped 6 -> 7 for the two `portal_sync_state.relayed_answer_
 # watermark_*` columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 7
+#
+# #3011: bumped 7 -> 8 for the two `merge_queue.ci_fix_head_sha`/
+# `ci_fix_noop_streak` columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 8
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -797,7 +800,9 @@ _SCHEMA_SQL = """
             ci_flaky_reruns INTEGER NOT NULL DEFAULT 0,
             ci_flaky_pending TEXT NOT NULL DEFAULT '',
             ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0,
-            ci_fix_dispatches INTEGER NOT NULL DEFAULT 0
+            ci_fix_dispatches INTEGER NOT NULL DEFAULT 0,
+            ci_fix_head_sha TEXT NOT NULL DEFAULT '',
+            ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -1719,6 +1724,23 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # predating this migration, same as the column's own default for a
     # freshly-enqueued entry.
     "ALTER TABLE merge_queue ADD COLUMN ci_fix_dispatches INTEGER NOT NULL DEFAULT 0",
+    # #3011: durable snapshot of `QueuedMerge.branch_head_sha` taken at the
+    # moment `coord.ci_fix.dispatch_ci_fix` last dispatched a fix worker —
+    # unlike `branch_head_sha` itself (recomputed from GitHub every tick,
+    # never persisted), this survives to the NEXT tick so
+    # `coord.ci_fix.dispatch_was_noop` can tell whether that leg actually
+    # moved the branch. '' for every row predating this migration and for
+    # an entry with no ci-fix dispatch currently unaccounted-for.
+    "ALTER TABLE merge_queue ADD COLUMN ci_fix_head_sha TEXT NOT NULL DEFAULT ''",
+    # #3011: count of CONSECUTIVE ci-fix legs that completed with the branch
+    # HEAD unchanged (a worker correctly declined and pushed no commit) —
+    # kept separate from `ci_fix_dispatches` so a no-op leg can be refunded
+    # (doesn't count toward `MAX_CI_FIX_DISPATCHES`) while still bounding
+    # how many times that can happen before escalating to HUMAN_REQUIRED
+    # with a distinct "not attributable to this branch" reason — see
+    # `coord.ci_fix.MAX_CI_FIX_NOOP_STREAK`. 0 for every row predating this
+    # migration and for an entry that has never had a no-op ci-fix leg.
+    "ALTER TABLE merge_queue ADD COLUMN ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0",
     # #2509 review fix: the verdict consumer's own read position into
     # `portal_events` — see the CREATE TABLE comment above for why it
     # cannot reuse the shared `handled_at` column. NULL (read as

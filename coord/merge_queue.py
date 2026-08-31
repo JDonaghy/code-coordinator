@@ -3354,6 +3354,34 @@ class QueuedMerge:
     # stopped the loop; resetting it on an unrelated green tick would just
     # reopen a budget a still-broken PR could re-exhaust forever.
     ci_fix_dispatches: int = 0
+    # #3011: `branch_head_sha` (see the field above) captured at the moment
+    # `coord.ci_fix.dispatch_ci_fix` last dispatched a fix worker for this
+    # entry's confirmed-failure streak. Durable — unlike `branch_head_sha`
+    # itself, which is transient/recomputed every tick — so a later tick
+    # can compare "what was the branch at when we dispatched" against "what
+    # is the branch NOW" and tell a genuine attempt apart from a worker
+    # that pushed no commit. '' means no ci-fix dispatch is currently
+    # unaccounted-for: either none has ever been dispatched for this
+    # streak, or the last one was already resolved (a real attempt spent,
+    # or a no-op refunded — see `coord.ci_fix.dispatch_was_noop`/
+    # `refund_noop_ci_fix`). 0/'' for every row predating this column.
+    ci_fix_head_sha: str = ""
+    # #3011: count of CONSECUTIVE ci-fix legs that completed with the
+    # branch HEAD unchanged from `ci_fix_head_sha` — i.e. a fresh worker
+    # looked at this confirmed failure and correctly concluded it wasn't
+    # theirs to fix, pushing no commit. Kept separate from
+    # `ci_fix_dispatches`: a no-op leg is refunded there (does NOT count
+    # toward `coord.ci_fix.MAX_CI_FIX_DISPATCHES`) precisely so two correct
+    # declines don't masquerade as two failed genuine attempts. This
+    # counter is what actually bounds the no-op case — capped at
+    # `coord.ci_fix.MAX_CI_FIX_NOOP_STREAK`, at which point
+    # `coord.commands.merge._dispatch_ci_fixes` escalates to
+    # `HUMAN_REQUIRED` with a "not attributable to this branch" reason
+    # instead of the generic retry-cap one. Reset to 0 the moment a
+    # dispatch's OWN outcome shows the branch actually moved (a real
+    # attempt, not a no-op) — see `dispatch_ci_fix`. 0 for every row
+    # predating this column.
+    ci_fix_noop_streak: int = 0
 
 
 class GhOps(Protocol):
@@ -3712,6 +3740,10 @@ def load_queue() -> list[QueuedMerge]:
             # decodes to 0 — no CI-fix dispatches spent yet, same as a fresh
             # entry.
             ci_fix_dispatches=row["ci_fix_dispatches"] or 0,
+            # #3011: same NULL-to-''/0 decoding as the columns above, for
+            # rows predating these migrations.
+            ci_fix_head_sha=row["ci_fix_head_sha"] or "",
+            ci_fix_noop_streak=row["ci_fix_noop_streak"] or 0,
         )
         for row in rows
     ]
@@ -3733,8 +3765,9 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         pr_number, pr_url, size, last_attempt, error, enqueued_at,
                         assignment_type, required_gates, ci_infra_reruns,
                         ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
-                        ci_unreadable_reruns, ci_fix_dispatches
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ci_unreadable_reruns, ci_fix_dispatches,
+                        ci_fix_head_sha, ci_fix_noop_streak
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         item.assignment_id, item.repo_name, item.repo_github,
                         item.branch, item.target_branch, item.issue_number,
@@ -3744,6 +3777,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         item.ci_infra_reruns, item.ci_stale_reruns,
                         item.ci_flaky_reruns, item.ci_flaky_pending,
                         item.ci_unreadable_reruns, item.ci_fix_dispatches,
+                        item.ci_fix_head_sha, item.ci_fix_noop_streak,
                     ),
                 )
 
