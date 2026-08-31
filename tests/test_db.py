@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,6 +21,7 @@ from coord.db import (
     is_lock_contention_error,
     retry_on_locked,
 )
+from tests import backends
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -2252,6 +2254,154 @@ class TestMigrateAddColumnsVersionGuard:
             "migration shipped without one) and update the pinned tuple "
             "above to match, in the same commit."
         )
+
+
+# ── _migrate_add_columns rolls back on a Postgres-style tx abort (#2982) ───
+#
+# Root cause: every entry in `_MIGRATE_ADD_COLUMNS` duplicates a column
+# `_SCHEMA_SQL` already creates, so on a freshly-created schema the very
+# first ALTER in the loop errors. SQLite tolerates a failed statement without
+# touching the transaction, so the old `except sql.driver_errors(): pass`
+# was invisible there -- but Postgres aborts the *whole* transaction on any
+# error, so without a `conn.rollback()` every statement after the first
+# swallowed error fails with `psycopg.errors.InFailedSqlTransaction`,
+# including `_set_schema_version`'s own `DELETE FROM schema_version` inside
+# the very same `_ensure_schema()` call that is running the loop.
+
+
+class _AbortOnErrorCursor:
+    """Delegates to a real sqlite3 cursor, except it flags its parent
+    connection as aborted the moment a statement raises -- see
+    ``_AbortOnErrorConn`` below."""
+
+    def __init__(self, real_cursor: Any, parent: "_AbortOnErrorConn") -> None:
+        self._real = real_cursor
+        self._parent = parent
+
+    def execute(self, *args: Any, **kwargs: Any) -> "_AbortOnErrorCursor":
+        if self._parent._aborted:
+            raise sqlite3.OperationalError("current transaction is aborted")
+        try:
+            self._real.execute(*args, **kwargs)
+        except sqlite3.OperationalError:
+            self._parent._aborted = True
+            raise
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+class _AbortOnErrorConn:
+    """Wraps a real, already-schema'd sqlite3 connection and reproduces
+    Postgres's abort-the-whole-transaction-on-error behaviour on top of it:
+    once a statement raises, every later statement -- including
+    ``commit()`` -- raises the same error until ``rollback()`` clears it.
+
+    This is what lets the #2982 regression be driven -- and go red on the
+    pre-fix code -- on a SQLite-only dev machine with no Postgres server:
+    nothing here talks to a real Postgres, but the observable shape (a
+    swallowed error leaves the connection unusable until rolled back) is
+    the same defect.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+        self._aborted = False
+
+    def cursor(self) -> _AbortOnErrorCursor:
+        if self._aborted:
+            raise sqlite3.OperationalError("current transaction is aborted")
+        return _AbortOnErrorCursor(self._real.cursor(), self)
+
+    def commit(self) -> None:
+        if self._aborted:
+            raise sqlite3.OperationalError("current transaction is aborted")
+        self._real.commit()
+
+    def rollback(self) -> None:
+        self._aborted = False
+        self._real.rollback()
+
+
+class TestMigrateAddColumnsRollsBackOnDriverError:
+    """Drives the #2982 regression with the abort-simulating stub above --
+    meaningful without a Postgres server, per the issue's acceptance
+    criterion."""
+
+    def _wrapped_conn_with_columns_already_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> _AbortOnErrorConn:
+        real = sqlite3.connect(":memory:")
+        real.row_factory = sqlite3.Row
+        db_mod._ensure_schema(real)  # every _MIGRATE_ADD_COLUMNS column now exists
+        # `sql.detect_dialect` keys off `type(conn).__module__`, which the
+        # stub fails (it isn't a sqlite3.Connection subclass) -- pin it to
+        # "sqlite" so `sql.execute`/`sql.executescript`'s translate() and
+        # cursor() calls behave exactly as they would against the real
+        # connection underneath.
+        monkeypatch.setattr(sql, "detect_dialect", lambda conn: sql.DIALECT_SQLITE)
+        return _AbortOnErrorConn(real)
+
+    def test_ensure_schema_completes_when_a_duplicate_alter_aborts_the_tx(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The acceptance criterion, verbatim: `_ensure_schema()` runs to
+        completion, and `schema_version` ends up holding
+        `_DB_SCHEMA_VERSION`, on a connection where a duplicate ALTER
+        errors. Pre-fix, this raises `OperationalError("current
+        transaction is aborted")` out of `_set_schema_version`'s `DELETE
+        FROM schema_version` -- the exact failure the issue reports,
+        reproduced without touching a real Postgres."""
+        conn = self._wrapped_conn_with_columns_already_present(monkeypatch)
+
+        db_mod._ensure_schema(conn)  # every ALTER this pass is a duplicate
+
+        rows = sql.execute(conn, "SELECT version FROM schema_version").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+
+    def test_migrate_add_columns_leaves_the_connection_usable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Narrower unit check directly on `_migrate_add_columns`: every one
+        of the 74 duplicate ALTERs must be individually recovered, not just
+        "the suite happens to still work by the end" -- a plain `commit()`
+        right after must not raise."""
+        conn = self._wrapped_conn_with_columns_already_present(monkeypatch)
+
+        db_mod._migrate_add_columns(conn)
+
+        conn.commit()  # raises "current transaction is aborted" pre-fix
+
+
+class TestMigrateAddColumnsRollsBackOnRealPostgres:
+    """The same #2982 regression against an actual Postgres server, when one
+    is reachable -- the stub-based class above proves the fix is logically
+    correct; this proves it against the real driver-error shape
+    (`psycopg.errors.InFailedSqlTransaction`) the issue was filed against.
+    Skips outright on a machine with no Postgres server, matching the
+    #2885 write-parity harness's own skip pattern."""
+
+    def test_ensure_schema_completes_on_postgres_with_columns_already_present(
+        self,
+    ) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            db_mod._ensure_schema(session.conn)  # first pass: fresh schema
+            db_mod._ensure_schema(session.conn)  # second pass: every ALTER duplicates
+
+            rows = sql.execute(
+                session.conn, "SELECT version FROM schema_version"
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["version"] == db_mod._DB_SCHEMA_VERSION
+        finally:
+            session.close()
 
 
 # ── #2752: non-release builds must not stamp the production DB's schema ─────

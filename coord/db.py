@@ -1775,13 +1775,27 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
     error raised for a duplicate column (SQLite's ``OperationalError``;
     Postgres's equivalent under ``sql.driver_errors()``, #2784) is silently
     swallowed.
+
+    #2982: Postgres aborts the whole transaction on a failed statement, so
+    without a ``conn.rollback()`` here the *first* duplicate ALTER (every
+    entry in ``_MIGRATE_ADD_COLUMNS`` is one, against a freshly-created
+    schema) leaves the connection unusable -- every statement after it,
+    including the remaining ALTERs and ``_set_schema_version``'s own
+    ``DELETE FROM schema_version``, fails with
+    ``psycopg.errors.InFailedSqlTransaction``. SQLite has no such concept
+    (a failed statement there doesn't touch the transaction), so the
+    rollback is a no-op on that backend -- and by this point in
+    ``_ensure_schema`` there is nothing uncommitted to lose on either
+    backend: the schema script already committed, and each successful ALTER
+    in this loop commits immediately, so a rollback can only ever discard
+    the one statement that just failed.
     """
     for ddl in _MIGRATE_ADD_COLUMNS:
         try:
             sql.execute(conn, ddl)
             conn.commit()
         except sql.driver_errors():
-            pass  # Column already exists
+            conn.rollback()  # Column already exists; Postgres needs the tx cleared
 
 
 # ── JSON migration ─────────────────────────────────────────────────────────────
