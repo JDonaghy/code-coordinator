@@ -3534,6 +3534,54 @@ def _fetch_live_ci_gate(
     return overrides, reasons
 
 
+def _index_merge_queue_by_key(rows: list, board: Any) -> dict[str, Any]:
+    """``{entry_key: row}`` for every *rows* (``coord.merge_queue.QueuedMerge``),
+    plus a SECOND key for each row's #1553 *effective* issue when it differs
+    from the row's own ``issue_number`` (#3012).
+
+    ``QueuedMerge.issue_number`` is always the assignment's BOOKED-TO issue —
+    ``merge_queue.enqueue``/``refresh_entry_assignment`` set it straight from
+    ``assignment.issue_number`` — which for an oracle-loop acceptance slice is
+    the milestone's tracking/epic issue, never the slice's own issue. A
+    drive-queue entry for the slice is keyed on the SLICE issue (`entry_key`
+    over the queue row's own `.issue`, `coord/drive_queue.py`), so looking the
+    merge row up by that key alone always misses it — reported as "no
+    merge-queue row for this entry" (unreadable, "retry might help") even
+    though the row exists, is perfectly readable, and may sit in a terminal
+    state like `human_required` that no retry will ever change
+    (coord-portal#164, 2026-08-31).
+
+    Mirrors ``coord.gates.build_gate_report``'s own resolution (``a.issue_
+    number == issue_number or effective_issue_number(a) == issue_number``) by
+    cross-referencing each row's ``assignment_id`` against the board to find
+    its ``for_issue_number``. Best-effort: a board that can't be walked (a
+    bare stub in a unit test, or an ``assignment_id`` with no matching board
+    row) just skips the second key — the row stays reachable by its own
+    ``issue_number``, exactly as before this fix.
+    """
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
+    assignments_by_id: dict[str, Any] = {}
+    try:
+        assignments_by_id = {
+            a.assignment_id: a
+            for a in (list(board.active) + list(board.completed))
+            if getattr(a, "assignment_id", None)
+        }
+    except Exception:  # noqa: BLE001 — best-effort enrichment only, see docstring
+        assignments_by_id = {}
+
+    indexed: dict[str, Any] = {}
+    for q in rows:
+        indexed.setdefault(entry_key(q.repo_name, q.issue_number), q)
+        a = assignments_by_id.get(getattr(q, "assignment_id", None))
+        if a is not None:
+            effective = effective_issue_number(a)
+            if effective and effective != q.issue_number:
+                indexed.setdefault(entry_key(q.repo_name, effective), q)
+    return indexed
+
+
 def _fetch_live_blocked_gate(
     entries: list, config_path: Path | None
 ) -> tuple[dict[str, bool], dict[str, str]]:
@@ -3643,9 +3691,7 @@ def _fetch_live_blocked_gate(
         ci_store = build_ci_store(
             cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
         )
-        queue_by_key = {
-            entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
-        }
+        queue_by_key = _index_merge_queue_by_key(_mq.load_queue(), board)
     except Exception as exc:  # noqa: BLE001 — see the fail-soft note above
         log.warning(
             "blocked-gate sweep (#2806): could not build board/config/queue "
@@ -3663,9 +3709,7 @@ def _fetch_live_blocked_gate(
     if any(queue_by_key.get(e.key) is None for e in targets):
         try:
             _mq.enqueue_approved_work(cfg, board)
-            queue_by_key = {
-                entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
-            }
+            queue_by_key = _index_merge_queue_by_key(_mq.load_queue(), board)
         except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
             log.warning(
                 "blocked-gate sweep (#2806): enqueue_approved_work self-heal "
