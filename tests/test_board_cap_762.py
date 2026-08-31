@@ -20,6 +20,33 @@ RECENT = NOW - 2 * 86400      # 2 days ago  → inside the 14d board window
 OLD = NOW - 40 * 86400        # 40 days ago → outside both windows
 
 
+@pytest.fixture(autouse=True)
+def _isolated_confirm_worktrees_dir(monkeypatch, tmp_path):
+    """#2974: ``housekeeping.sweep()`` now also calls
+    ``coord.confirm_test.sweep_stale_confirm_worktrees`` on every invocation
+    (even ``dry_run=False`` calls made directly, as most tests below do), and
+    that helper resolves its sweep root from the real, lazily-resolved
+    ``coord.state.COORD_DIR`` (``~/.coord`` on POSIX absent a ``$COORD_DIR``
+    override).  Before this fixture, every test in this file that calls the
+    real (non-dry-run) ``housekeeping.sweep()`` — or drives it through the
+    real ``/housekeeping`` endpoint — would ``shutil.rmtree`` anything under
+    the OPERATOR's real ``~/.coord/confirm-worktrees/`` older than
+    ``coord.confirm_test.STALE_WORKTREE_MAX_AGE_HOURS`` as an untracked side
+    effect of running `pytest`.  Pin ``coord.state.COORD_DIR`` to a private
+    ``tmp_path`` for every test in this module — mirrors
+    ``tests/test_confirm_test.py``'s own ``isolated_coord_dir`` fixture,
+    which the real ``sweep_stale_confirm_worktrees`` call site already
+    trusts (it re-imports ``coord.state.COORD_DIR`` fresh on every call, so
+    a plain ``monkeypatch.setattr`` here is picked up with no further
+    wiring). A file-local autouse fixture (rather than a global one in
+    ``tests/conftest.py``) is deliberate: ``tests/test_platform_paths.py``
+    has real tests that assert ``coord.state.COORD_DIR`` reflects the
+    *actual* default resolution with nothing overriding it, which a global
+    override would break.
+    """
+    monkeypatch.setattr("coord.state.COORD_DIR", tmp_path / "coord-state")
+
+
 def _ins_assignment(
     conn: sqlite3.Connection,
     aid: str,

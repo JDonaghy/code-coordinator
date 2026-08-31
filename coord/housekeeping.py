@@ -33,6 +33,14 @@ declog. ``coord.merge_queue.merged_issue_keys()`` unions the live table with
 the archive so the "already merged, don't re-enqueue" dedup in
 ``enqueue_approved_work``/``staging_items`` keeps working after a row ages
 out.
+
+#2974: this is also the one existing low-cadence, filesystem-safe hook the
+daemon already calls on a timer (and that ``coord housekeeping`` calls on
+demand) — so it is where :func:`coord.confirm_test.sweep_stale_confirm_worktrees`
+is wired in too, reclaiming ``~/.coord/confirm-worktrees/`` entries that
+outlived ``confirm_branch``'s own per-run cleanup. That is disk hygiene, not
+DB archiving, but reusing this sweep's cadence beats inventing a second timer
+for a second maintenance job.
 """
 
 from __future__ import annotations
@@ -140,12 +148,13 @@ def _move_rows(
 
 def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     """Archive stale terminal assignments + their notifications + merged
-    merge_queue entries.
+    merge_queue entries, and reclaim leaked confirm-worktree directories.
 
     Returns ``{"archived_assignments": N, "archived_notifications": M,
-    "archived_merge_queue": K, "dry_run": bool, "retention_days": D}``.
-    ``archived_*`` are the counts that were (or, for ``dry_run``, would be)
-    moved.  A no-op returns zeros.
+    "archived_merge_queue": K, "removed_confirm_worktrees": W, "dry_run": bool,
+    "retention_days": D}``. ``archived_*``/``removed_confirm_worktrees`` are
+    the counts that were (or, for ``dry_run``, would be) moved/deleted.  A
+    no-op returns zeros.
 
     Conservative by construction: nothing active, recent (within the archive
     window), queued-for-merge, latest-of-an-open-issue, or review-linked to any
@@ -153,17 +162,29 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     are in the terminal ``MERGED`` state (#1107 Part 3) — non-terminal /
     conflicted entries are left for ``prune_stale_queue_entries`` or manual
     ``coord merge --drop``.
+
+    #2974: ``removed_confirm_worktrees`` is independent of the DB-archiving
+    ``cutoff``/``retention_days`` above (it has its own, much shorter,
+    :data:`coord.confirm_test.STALE_WORKTREE_MAX_AGE_HOURS` window) and runs
+    even when DB archiving itself is disabled (``COORD_ARCHIVE_RETENTION_DAYS``
+    ``<= 0``) — a disk leak on the daemon host is not something an operator
+    who merely turned off DB archiving meant to also keep.
     """
+    from coord.confirm_test import sweep_stale_confirm_worktrees  # noqa: PLC0415
+
+    swept_worktrees = sweep_stale_confirm_worktrees(dry_run=dry_run, now=now)
+
     cutoff = _archive_cutoff(now)
     result = {
         "archived_assignments": 0,
         "archived_notifications": 0,
         "archived_merge_queue": 0,
+        "removed_confirm_worktrees": len(swept_worktrees["removed"]),
         "dry_run": dry_run,
         "retention_days": _archive_retention_days(),
     }
     if cutoff is None:
-        return result  # archiving disabled
+        return result  # DB archiving disabled; the worktree sweep above still ran
 
     conn = get_connection()
     index = [
