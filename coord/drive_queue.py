@@ -94,6 +94,7 @@ from coord.gate_a import is_gate_a_refusal_reason
 from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
+    CI_STALE_PREFIX,
     PLAN_READY,
     ci_rollup_all_clear,
     is_ci_flaky_reason,
@@ -2744,6 +2745,74 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
     if "smoke_required —" in lowered or "review_required —" in lowered:
         return True
     return "merge_status=" in lowered
+
+
+def merge_plan_inspect_command(repo: str) -> str:
+    """The read-only ``coord merge --plan`` fallback (#3016) — safe to
+    propose whenever no specific, blind-runnable remedy is known, because it
+    never mutates anything. Used both as :func:`merge_gate_remedy_command`'s
+    own fallback and directly by callers escalating a #2806 ``gate_unreadable``
+    outcome, whose reason text already says "the next tick re-probes" — the
+    destructive `remove && add` requeue would directly contradict that.
+    """
+    return f"coord merge --plan --repo {repo}"
+
+
+def merge_gate_remedy_command(reason: str | None, repo: str, issue: int) -> str:
+    """The gate-specific one-line fix for a `_is_merge_gate_block_reason`
+    block (#3016) — never the blanket ``drive-queue remove && add`` requeue
+    a synthetic escalation writer would otherwise reach for by default.
+
+    A requeue is not merely useless for a merge-gate block, it is actively
+    destructive: it discards a completed Work/Test/Review cycle to re-run it
+    from scratch, when the real fix is a single, targeted merge-lane command
+    — exactly the misdirection `_is_merge_gate_block_reason`'s own docstring
+    already names two live escalations (claude-coordinator#2405, coord-web#2)
+    as having produced, and #2424 only fixed on the prose (``reason``) side,
+    leaving this — the field a one-click "Run proposed fix" menu actually
+    executes — untouched.
+
+    Only the CI-stale / stale-but-passed-smoke shape has a remedy that is
+    both KNOWN and SAFE to run blind: ``coord merge --revalidate --only
+    <repo>#<issue>``, the exact command :func:`coord.merge_queue.
+    ci_stale_reason`'s own prose already tells the operator to run (matched
+    textually here — via :data:`coord.merge_queue.CI_STALE_PREFIX` and
+    :func:`is_stale_smoke_reason` — rather than re-derived, so the two can
+    never diverge on what "CI stale" means).
+
+    Every other shape this matches — red CI (``checks failed``), a
+    review/smoke gate divergence (``review_required —``/``smoke_required
+    —``), an opaque terminal ``merge_status=`` — has no single command that
+    is always both correct and safe to run without a human first reading
+    the actual gate state (fixing a named CI check, recovering or re-running
+    a review, deciding a UAT verdict). Guessing wrong there is worse than
+    not guessing: the menu this feeds runs the command on one click. So
+    every one of those falls back to the read-only inspect command instead
+    — see #3016's design note ("a wrong 'Recommended' is worse than no
+    recommendation").
+
+    Callers are expected to gate on :func:`_is_merge_gate_block_reason`
+    first; called on a reason that ISN'T a merge-gate block at all, this
+    still returns the safe inspect fallback rather than raising — there is
+    no reason this text-matching helper needs to enforce that precondition
+    itself when a wrong answer here is never destructive.
+    """
+    if reason and (
+        CI_STALE_PREFIX.lower() in reason.lower() or is_stale_smoke_reason(reason)
+    ):
+        return f"coord merge --revalidate --only {entry_key(repo, issue)}"
+    return merge_plan_inspect_command(repo)
+
+
+def is_merge_gate_block_reason(reason: str | None) -> bool:
+    """Public alias for :func:`_is_merge_gate_block_reason` (#3016).
+
+    Same convention as ``is_empty_branch_death_reason``/
+    ``is_unsatisfiable_prereq_reason``: the classifier is shared with the
+    synthetic escalation writers in ``coord.commands.drive_queue``, so it
+    gets a non-underscored name rather than a second copy of the text match.
+    """
+    return _is_merge_gate_block_reason(reason)
 
 
 def _is_empty_branch_death_reason(reason: str | None) -> bool:

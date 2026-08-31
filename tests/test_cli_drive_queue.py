@@ -1987,6 +1987,78 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+def test_exhausted_ci_stale_escalation_proposes_revalidate_not_a_requeue(
+    cli, seed, launches, coord_db, config_file
+):
+    """#3016 regression fixture — the exact claude-coordinator#2983 shape
+    (2026-08-31), rendered end-to-end through the real `coord drive-queue
+    tick` -> escalation write -> `coord escalate list` path: a merge-gate
+    death whose OWN reason already names `coord merge --revalidate` as the
+    fix must not have the escalation's `proposed_command` — the ONE field a
+    one-click "Run proposed fix" menu actually runs — propose the blanket
+    `drive-queue remove && add` requeue instead. #2424 already fixed the
+    parallel misdirection in the `reason` prose; this pins the field that
+    executes.
+    """
+    from coord.audit import record_audit
+
+    seed(issues={2983: "open"})
+    cli("add", REPO, "2983")
+    cli("tick")
+
+    def _own_reason(n: int) -> str:
+        return (
+            f"drive exited for {REPO}#2983 (exit_code=1): merge attempted "
+            f"3 times without landing.\n"
+            "   Last board state: status='PENDING' reason='CI stale: checks "
+            "predate the current base (...); auto-rerun budget exhausted "
+            "(2/2) — re-run CI (`coord merge --revalidate`) before merging'"
+            f" (attempt {n})"
+        )
+
+    launched_at = queued(2983)["launched_at"]
+    _backdate(2983, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=_own_reason(1), repo=REPO, issue=2983,
+        ts=launched_at + 5,
+    )
+    cli("tick")
+
+    _backdate_reason(coord_db, 2983, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    relaunch = cli("tick")
+    assert relaunch.exit_code == 0, relaunch.output
+    assert queued(2983)["state"] == "running"
+
+    launched_at = queued(2983)["launched_at"]
+    _backdate(2983, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=_own_reason(2), repo=REPO, issue=2983,
+        ts=launched_at + 5,
+    )
+    second_retry = cli("tick")
+    assert second_retry.exit_code == 0, second_retry.output
+
+    entry = queued(2983)
+    assert entry["state"] == "blocked"
+
+    listing = CliRunner().invoke(
+        main, ["escalate", "list", "--config", str(config_file)]
+    )
+    assert listing.exit_code == 0, listing.output
+    assert f"{REPO} #2983" in listing.output
+    assert "coord merge --revalidate" in listing.output
+    assert f"--only {REPO}#2983" in listing.output
+    assert "drive-queue remove" not in listing.output
+    assert "drive-queue add" not in listing.output
+
+    escalation = state._get_drive_escalation_local(REPO, 2983)
+    assert escalation is not None
+    proposed = escalation["proposed_command"]
+    assert proposed == f"coord merge --revalidate --only {REPO}#2983"
+
+
 def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
     cli, seed, launches,
 ):

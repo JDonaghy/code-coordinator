@@ -46,6 +46,9 @@ from coord.drive_queue import (
     entry_key,
     find_cycle,
     is_empty_branch_death_reason,
+    is_merge_gate_block_reason,
+    merge_gate_remedy_command,
+    merge_plan_inspect_command,
     parse_after_spec,
     parse_key,
     plan_tick,
@@ -5468,3 +5471,82 @@ def test_detect_unreachable_waits_reproduces_the_ms5_incident_shape():
         assert dep.key not in alert.reason
     assert "8 dependent entries" in alert.reason
     assert "self-heal" in alert.reason
+
+
+# ── #3016: the escalation-time remedy for a merge-gate block must be the ──
+# gate-specific fix, never the blanket `drive-queue remove && add` requeue —
+# a requeue discards a completed Work/Test/Review cycle instead of fixing
+# the one gate actually stuck. `merge_gate_remedy_command` is the mapping;
+# `is_merge_gate_block_reason` (already exercised elsewhere via #2424) is
+# what a caller gates on before reaching for it.
+
+
+def test_merge_gate_remedy_command_is_the_2983_regression_fixture():
+    """The exact claude-coordinator#2983 shape (2026-08-31): a `merge
+    attempted N times without landing` death whose OWN reason already names
+    `coord merge --revalidate` as the fix must map to a scoped revalidate
+    command, never a requeue."""
+    reason = (
+        "drive exited (exit_code=1): merge attempted 3 times without "
+        "landing.\n   Last board state: status='PENDING' reason='CI stale: "
+        "checks predate the current base (...); auto-rerun budget exhausted "
+        "(2/2) — re-run CI (`coord merge --revalidate`) before merging'"
+    )
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 2983)
+    assert command == f"coord merge --revalidate --only {REPO}#2983"
+    assert "drive-queue remove" not in command
+    assert "drive-queue add" not in command
+
+
+def test_merge_gate_remedy_command_handles_a_stale_smoke_verdict():
+    """The #1479 staleness race — `is_stale_smoke_reason` matches even
+    without the `CI stale:` prefix at all — same remedy, same reasoning."""
+    reason = "smoke test verdict is stale: recorded against base abc123, base is now def456"
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 1650)
+    assert command == f"coord merge --revalidate --only {REPO}#1650"
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_red_ci():
+    """`checks failed` (red CI) has no safe one-line auto-fix — the correct
+    remedy is "fix the named check", which is not a command this can hand
+    an operator to run blind. Falls back to the read-only inspect command
+    rather than a requeue or a guess."""
+    reason = "checks failed: build (exit 1)"
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 1650)
+    assert command == merge_plan_inspect_command(REPO)
+    assert "revalidate" not in command
+    assert "drive-queue remove" not in command
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_review_required():
+    reason = (
+        "review_required — coord merge's own gate reports 'review missing', "
+        "but this driver's OWN view already shows review_verdict='approved'"
+    )
+    assert is_merge_gate_block_reason(reason) is True
+    assert merge_gate_remedy_command(reason, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_smoke_required():
+    reason = "smoke_required — coord merge's own gate reports 'no verdict'"
+    assert is_merge_gate_block_reason(reason) is True
+    assert merge_gate_remedy_command(reason, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_opaque_merge_status():
+    reason = "merge_status=NEEDS_ATTENTION — no number of retries changes this"
+    assert is_merge_gate_block_reason(reason) is True
+    assert merge_gate_remedy_command(reason, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+def test_merge_gate_remedy_command_is_the_safe_inspect_fallback_for_none_and_non_block_reasons():
+    """Never raises — called on a reason that isn't a merge-gate block at
+    all (or is missing entirely), it still returns the safe, read-only
+    fallback rather than asserting a precondition on its caller."""
+    assert merge_gate_remedy_command(None, REPO, 1650) == merge_plan_inspect_command(REPO)
+    ordinary = "no candidate machine available for claude-coordinator#1650"
+    assert is_merge_gate_block_reason(ordinary) is False
+    assert merge_gate_remedy_command(ordinary, REPO, 1650) == merge_plan_inspect_command(REPO)
