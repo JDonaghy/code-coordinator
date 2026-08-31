@@ -2108,3 +2108,23 @@ def test_rows_for_unmapped_repos_do_not_consume_the_recency_cap(
     reconcile_board_merges(board, config, dry_run=True)
 
     assert len(calls["branch_exists"]) == 3
+
+
+def test_throttled_dry_run_does_not_consume_the_real_runs_turn(
+    monkeypatch, config
+) -> None:
+    """A throttled `--dry-run` must not stamp the hourly clock — otherwise a
+    read-only preview would silently suppress the next real sweep."""
+    import coord.reconcile as rec
+
+    board = Board(completed=_merged_rows(2))
+    calls = _patch_false_merge_probes(monkeypatch, ahead=None)
+    monkeypatch.setattr(rec.time, "time", lambda: 2_000_000.0)
+
+    reconcile_board_merges(
+        board, config, dry_run=True, throttle_false_merge_audit=True
+    )
+    calls["branch_exists"].clear()
+    reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+
+    assert len(calls["branch_exists"]) == 2

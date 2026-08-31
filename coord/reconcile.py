@@ -3560,7 +3560,12 @@ def reconcile_board_merges(
                     :_FALSE_MERGE_AUDIT_MAX_ROWS
                 ]
 
-    if _run_false_merge_audit and throttle_false_merge_audit and not _false_merge_targeted:
+    if (
+        _run_false_merge_audit
+        and throttle_false_merge_audit
+        and not _false_merge_targeted
+        and not dry_run  # a dry-run must not consume the real run's turn
+    ):
         # Stamp even when there was nothing to do — the point of the stamp is
         # "this sweep had its turn this hour", not "this sweep found work".
         state.set_false_merge_audit_last_run(time.time())
