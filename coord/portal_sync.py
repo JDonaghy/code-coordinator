@@ -458,6 +458,52 @@ def enqueue_preview(
     )
 
 
+def _route_enqueue_question(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST *payload* to the daemon's ``/portal-enqueue-question`` seam, or
+    ``None`` if this process IS the daemon host (#2995) — the enqueue-
+    question twin of :func:`coord.portal_store._route_decision`.
+
+    ``coord portal decompose-chat --interactive`` is dispatched to any
+    machine that claims a submission's mapped repo(s) (#2750), not just the
+    daemon host, and the Ask move — the one thin-client gap #2751/#2867/
+    #2986 left open — needs `enqueue-question` from exactly that machine.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    return board_service.route_write(svc, "/portal-enqueue-question", payload)
+
+
+def _enqueue_question_local(
+    submission_id: str,
+    question: str,
+    *,
+    config: Any = None,
+    now: float | None = None,
+) -> tuple[portal_store.OutboxRow, portal_store.OutboxRow]:
+    """The actual two-row write :func:`enqueue_question` performs — local to
+    whichever process runs it (the daemon itself, or this same process when
+    it IS the daemon host). Never call this directly for a routed write: the
+    #2995 atomicity guarantee (both rows applied in one request, so a thin
+    client can never observe the question without its announcement) depends
+    on it running inside `post_portal_enqueue_question`'s single request,
+    not as two separate calls from a thin client.
+    """
+    if not question or not question.strip():
+        raise PortalSyncError("question must be non-empty")
+    question_row = portal_store.enqueue(
+        submission_id,
+        KIND_QUESTION,
+        {"question": question},
+        state=initial_outbox_state(KIND_QUESTION, config=config),
+        now=now,
+    )
+    status_row = _enqueue_status_local(
+        submission_id, "needs-input", config=config, now=now
+    )
+    return question_row, status_row
+
+
 def enqueue_question(
     submission_id: str,
     question: str,
@@ -485,22 +531,41 @@ def enqueue_question(
     second question is plausibly real news, so re-announcing is intended,
     not churn to suppress.
 
+    Routed to the daemon's ``/portal-enqueue-question`` seam when
+    ``board_service`` is configured (#2995), else applied locally — see
+    :func:`_route_enqueue_question`. Routed as ONE request carrying both
+    rows: the alternative (this function separately routing the question
+    row, then separately routing the `enqueue_status` call below) would let
+    a thin client observe — or a crash leave behind — a question with no
+    status row behind it, exactly the #2901 mute-question failure this
+    function exists to prevent. `_enqueue_question_local` is what actually
+    runs on whichever side ends up doing the write.
+
     Returns ``(question_row, status_row)`` in that seq order.
     """
-    if not question or not question.strip():
-        raise PortalSyncError("question must be non-empty")
-    question_row = portal_store.enqueue(
-        submission_id,
-        KIND_QUESTION,
-        {"question": question},
-        state=initial_outbox_state(KIND_QUESTION, config=config),
-        now=now,
+    routed = _route_enqueue_question(
+        {"submission_id": submission_id, "question": question}
     )
-    status_row = enqueue_status(submission_id, "needs-input", config=config, now=now)
-    return question_row, status_row
+    if routed is not None:
+        return (
+            portal_store._outbox_from_row(routed["question_row"]),
+            portal_store._outbox_from_row(routed["status_row"]),
+        )
+    return _enqueue_question_local(submission_id, question, config=config, now=now)
 
 
-def enqueue_status(
+def _route_enqueue_status(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST *payload* to the daemon's ``/portal-enqueue-status`` seam, or
+    ``None`` if this process IS the daemon host (#2995) — same shape and
+    same reason as :func:`_route_enqueue_question` right above.
+    """
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    return board_service.route_write(svc, "/portal-enqueue-status", payload)
+
+
+def _enqueue_status_local(
     submission_id: str,
     status: str,
     *,
@@ -508,21 +573,12 @@ def enqueue_status(
     now: float | None = None,
     requires_kind: str | None = None,
 ) -> portal_store.OutboxRow:
-    """Queue an up-mapped customer status for *submission_id*.
-
-    Refuses, **at enqueue time**, an announcing status with nothing queued to
-    announce (see :data:`ANNOUNCING_STATUSES`). The drain enforces the same
-    rule again against *confirmed* state, so this early check is not the
-    safety property — it is the difference between a caller learning it has
-    the order wrong immediately, and a row sitting held in the queue while
-    someone wonders why the customer was never told.
-
-    *requires_kind*, when given, overrides :data:`ANNOUNCING_STATUSES`'s
-    default for *status* — needed because more than one kind can share the
-    same announcing status (#2987: `needs-input` announces either a
-    `question` or a relayed `answer`, and only the caller enqueueing THIS
-    row knows which). ``None`` (the default) keeps the existing
-    one-status-one-kind lookup every other caller relies on.
+    """The actual write :func:`enqueue_status` performs — local to whichever
+    process runs it. See that function's own docstring for the routing
+    contract; this is also what backs `_enqueue_question_local`'s own
+    `needs-input` row and every daemon-tick-loop caller
+    (`sync_submission_statuses`, `enqueue_relayed_answer`), none of which
+    need routing since they only ever run on the daemon itself.
     """
     if status not in SUBMISSION_STATUSES:
         raise PortalSyncError(
@@ -553,6 +609,51 @@ def enqueue_status(
         requires_kind=requires_kind,
         state=initial_outbox_state(KIND_STATUS, config=config),
         now=now,
+    )
+
+
+def enqueue_status(
+    submission_id: str,
+    status: str,
+    *,
+    config: Any = None,
+    now: float | None = None,
+    requires_kind: str | None = None,
+) -> portal_store.OutboxRow:
+    """Queue an up-mapped customer status for *submission_id*.
+
+    Refuses, **at enqueue time**, an announcing status with nothing queued to
+    announce (see :data:`ANNOUNCING_STATUSES`). The drain enforces the same
+    rule again against *confirmed* state, so this early check is not the
+    safety property — it is the difference between a caller learning it has
+    the order wrong immediately, and a row sitting held in the queue while
+    someone wonders why the customer was never told.
+
+    *requires_kind*, when given, overrides :data:`ANNOUNCING_STATUSES`'s
+    default for *status* — needed because more than one kind can share the
+    same announcing status (#2987: `needs-input` announces either a
+    `question` or a relayed `answer`, and only the caller enqueueing THIS
+    row knows which). ``None`` (the default) keeps the existing
+    one-status-one-kind lookup every other caller relies on.
+
+    Routed to the daemon's ``/portal-enqueue-status`` seam when
+    ``board_service`` is configured (#2995), else applied locally by
+    :func:`_enqueue_status_local` — the ``enqueue-status`` half of the same
+    gap :func:`enqueue_question` closes: an attended `decompose-chat
+    --interactive` session's Ask-shaped exit needs this from any machine
+    that claims the submission's repo(s), not just the daemon host.
+    """
+    routed = _route_enqueue_status(
+        {
+            "submission_id": submission_id,
+            "status": status,
+            "requires_kind": requires_kind,
+        }
+    )
+    if routed is not None:
+        return portal_store._outbox_from_row(routed["row"])
+    return _enqueue_status_local(
+        submission_id, status, config=config, now=now, requires_kind=requires_kind
     )
 
 

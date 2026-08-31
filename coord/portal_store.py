@@ -1749,6 +1749,13 @@ def list_milestone_links() -> list[PortalLink]:
     return [link for link in links if link is not None]
 
 
+def _get_link_by_submission_local(submission_id: str) -> PortalLink | None:
+    for link in list_milestone_links():
+        if link.submission_id == submission_id:
+            return link
+    return None
+
+
 def get_link_by_submission(submission_id: str) -> PortalLink | None:
     """Reverse lookup: the link for a portal ``submission_id``, if any —
     whether it is scoped to a milestone or (#2665) a single issue.
@@ -1761,11 +1768,29 @@ def get_link_by_submission(submission_id: str) -> PortalLink | None:
     against. Links are few enough (one per submission a customer has ever
     been sent to) that a linear scan of :func:`list_milestone_links` is
     simply the read path — no new index, no new table.
+
+    Every caller until #2995 ran exclusively on the daemon (the tick loop's
+    own consumers, plus ``/portal-answer``'s status fold), so this read
+    stayed local-only. ``coord portal enqueue-status``'s #2996 "no link on
+    file" warning changed that: it is the one CLI-reachable call site, and
+    once ``enqueue-status`` itself started routing through the daemon on a
+    thin client (#2995), a local-only read here would silently check that
+    machine's own empty ``~/.coord/coord.db`` and warn every time, whether or
+    not a link actually exists. Routed through the daemon's
+    ``GET /portal-link-by-submission`` when ``board_service`` is configured,
+    same as :func:`get_portal_link`; fails soft to ``None`` on a routing
+    hiccup for the same reason that function does — "couldn't ask"
+    collapsing to "not linked" is the safe default for a warning-only read.
     """
-    for link in list_milestone_links():
-        if link.submission_id == submission_id:
-            return link
-    return None
+    from coord import board_service  # noqa: PLC0415
+
+    svc = board_service.resolve()
+    if svc is not None:
+        from coord.client import fetch_portal_link_by_submission  # noqa: PLC0415
+
+        raw = fetch_portal_link_by_submission(svc, submission_id)
+        return PortalLink.from_dict(raw) if raw is not None else None
+    return _get_link_by_submission_local(submission_id)
 
 
 # ── the running-context ledger (#2749, IL-3, epic #2746) ────────────────────

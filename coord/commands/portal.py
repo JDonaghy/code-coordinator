@@ -64,6 +64,23 @@ exactly like an inbound ``question.answered`` event does, flags it relayed
 so it never reads as the client's own words, and folds the submission off
 ``needs-input``. Same daemon-routed shape (``POST /portal-note`` /
 ``POST /portal-answer``) and the same reason.
+
+**``enqueue-question`` and ``enqueue-status`` are the last two, and the odd
+ones out (#2995).** Every exception above routes unconditionally — any
+machine in the fleet may be where the operator is typing. These two widen
+the routed set instead of dropping the guard: ``coord portal decompose-chat
+--interactive`` is dispatched only to a machine that claims the
+submission's mapped repo(s) (#2750), and the Ask move — the one exit that
+session could not take from a thin client, the gap this issue closes — is
+exactly what these two commands queue. So they route through the daemon
+(``POST /portal-enqueue-question`` / ``POST /portal-enqueue-status``) only
+when :func:`_refuse_unless_claiming_machine` confirms the calling machine
+claims every mapped repo; a non-claiming thin client still refuses, same as
+every command at the top of this file. ``enqueue-question`` queues two rows
+(the question and its ``needs-input`` announcement, #2901) — the daemon
+applies both in the ONE request, so a partial application can never leave a
+question with no status row behind it (the mute-question failure #2901
+exists to prevent).
 """
 
 from __future__ import annotations
@@ -98,10 +115,11 @@ def _actor() -> str:
 def _refuse_if_thin_client(cmd_name: str) -> None:
     """Refuse *cmd_name* when this machine isn't the daemon host (#2336).
 
-    ``sync``/``outbox``/``events``/``enqueue-*``/``requeue`` read and write
-    the daemon's own ``~/.coord/coord.db`` directly — there is no daemon
-    proxy for portal state yet (unlike ``coord status``/``coord log``/etc,
-    which already route through ``board_service`` when it's configured; see
+    ``sync``/``outbox``/``events``/``enqueue-design-round``/
+    ``enqueue-preview``/``requeue`` read and write the daemon's own
+    ``~/.coord/coord.db`` directly — there is no daemon proxy for portal
+    state yet (unlike ``coord status``/``coord log``/etc, which already
+    route through ``board_service`` when it's configured; see
     ``coord/client.py``'s module docstring for the bootstrap contract). Run
     on a machine that has ``board_service`` set in ``~/.coord/client.toml``
     (a thin client, by definition — every other machine in the fleet that
@@ -110,6 +128,10 @@ def _refuse_if_thin_client(cmd_name: str) -> None:
     (2026-08-16 incident: a customer ``signoff.approved`` event sat
     unnoticed on the daemon host for over an hour because every portal
     command run from a thin client reported nothing pending).
+
+    ``enqueue-question``/``enqueue-status`` used to be in that list too —
+    see :func:`_refuse_unless_claiming_machine` below (#2995) for why they
+    no longer call this at all.
 
     Mirrors the guard already used for the same reason in
     ``coord.commands.drive_queue``'s ``diagnose`` command (#615/#906), which
@@ -135,6 +157,77 @@ def _refuse_if_thin_client(cmd_name: str) -> None:
         "a thin client). Run it over `ssh` on the daemon host instead. "
         "See coord/skills/portal-followup/SKILL.md."
     )
+
+
+def _refuse_unless_claiming_machine(cfg, submission_id: str, cmd_name: str) -> None:
+    """Refuse *cmd_name* on a thin client that does not claim every repo
+    SUBMISSION_ID maps to (#2995). A no-op on the daemon host itself.
+
+    ``enqueue-question``/``enqueue-status`` are the Ask move's exit — the
+    one thing `coord portal decompose-chat --interactive` could not do from
+    a thin client that claims the submission's repo(s), even though that
+    session is explicitly allowed to run there (#2750). Unlike ``note``/
+    ``decision``/``link``/``answer`` (#2751/#2867/#2986), which route
+    unconditionally — any machine in the fleet may be where the operator is
+    typing — this widens the refused set rather than dropping it: a
+    ``type="decomposition-chat"`` session is never dispatched to a machine
+    that doesn't claim the submission's repo(s) in the first place
+    (:func:`coord.decomposition_chat.pick_decomposition_chat_machine`), so a
+    caller invoking these commands directly from one that *doesn't* claim
+    them is either a mistake or a machine that has no business writing
+    against this submission's outbox — that machine still refuses, exactly
+    like every other state-touching command in this file.
+
+    Repos are resolved the same thin-client-safe way
+    ``_run_decompose_chat_interactive`` already does before ever launching a
+    session (see that function, further down in this module), and for the
+    identical reason:
+    :func:`coord.decomposition_chat.resolve_approved_submission`, itself
+    routed through the daemon's ``GET /board``. A submission that isn't
+    currently a recorded ``approved`` sign-off — the only shape that
+    projection carries — cannot be claim-checked from here at all, and this
+    refuses rather than guess at a repo list it cannot verify.
+    """
+    from coord.board_service import resolve  # noqa: PLC0415
+
+    svc = resolve()
+    if svc is None:
+        return
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    from coord.decomposition_chat import resolve_approved_submission  # noqa: PLC0415
+    from coord.test_orchestrator import local_machine  # noqa: PLC0415
+
+    host = urlparse(svc.url).hostname or svc.url
+    submission = resolve_approved_submission(cfg, submission_id)
+    if submission is None:
+        raise click.ClickException(
+            f"coord portal {cmd_name} refuses: submission {submission_id!r} is "
+            "not a currently-approved portal submission, so its mapped "
+            "repo(s) cannot be resolved from this thin client to verify a "
+            "claim. Run it over `ssh` on the daemon host "
+            f"({host}) instead. See coord/skills/portal-followup/SKILL.md."
+        )
+    repos: list[str] = submission.get("repos") or []
+    machine = local_machine(cfg)
+    missing = [r for r in repos if machine is None or not machine.can_work_on(r)]
+    if not repos or missing:
+        reason = (
+            f"submission {submission_id!r} has no mapped repo (portal."
+            "project_repos in coordinator.yml)"
+            if not repos
+            else (
+                f"this machine ({machine.name if machine is not None else 'unconfigured'}) "
+                f"does not claim repo(s) {', '.join(missing)} that submission "
+                f"{submission_id!r} maps to ({', '.join(repos)})"
+            )
+        )
+        raise click.ClickException(
+            f"coord portal {cmd_name} refuses: {reason}. Run it over `ssh` on "
+            f"the daemon host ({host}) instead, or from a machine that claims "
+            "every repo the submission maps to. See "
+            "coord/skills/portal-followup/SKILL.md."
+        )
 
 
 @click.group("portal")
@@ -439,11 +532,11 @@ def portal_link(
         "headless dispatch. Local-only for now (Track B / #486 is remote): "
         "refuses when this machine does not claim every repo SUBMISSION_ID "
         "maps to. On a thin client (this machine has `board_service` "
-        "configured), `coord portal decision`/`ledger`/`link` route through "
-        "the daemon (#2751) but `enqueue-question`/`enqueue-status` do not "
-        "yet — an Ask-shaped iteration will refuse loudly mid-conversation "
-        "on those; ssh to the daemon host instead for that case. Mutually "
-        "exclusive with --wait/--machine/--timeout/--interval."
+        "configured), `coord portal decision`/`ledger`/`link`/`note`/"
+        "`answer` and (#2995) `enqueue-question`/`enqueue-status` — "
+        "including the Ask move — all route through the daemon, so every "
+        "exit an iteration can take works from here. Mutually exclusive "
+        "with --wait/--machine/--timeout/--interval."
     ),
 )
 @click.option(
@@ -669,19 +762,12 @@ def _run_decompose_chat_interactive(
         )
         raise SystemExit(2)
 
-    from coord import board_service as _board_service  # noqa: PLC0415
-
-    if _board_service.resolve() is not None:
-        click.secho(
-            "note: this machine is a thin client — `coord portal decision`/"
-            "`ledger`/`link`/`note` route through the daemon (#2751/#2867), "
-            "but `coord "
-            "portal enqueue-question`/`enqueue-status` (the Ask move) do "
-            "not yet and will refuse loudly if this iteration needs them. "
-            "ssh to the daemon host for that case (#2750's own stated "
-            "limit).",
-            fg="yellow",
-        )
+    # #2995: no thin-client caveat left to print here — `decision`/`ledger`/
+    # `link`/`note`/`answer` (#2751/#2867/#2986) and now `enqueue-question`/
+    # `enqueue-status` (the Ask move's exit) all route through the daemon
+    # from exactly this machine, which the claim check above just verified
+    # claims every repo SUBMISSION_ID maps to. A prior revision warned here
+    # that the Ask move would "refuse loudly" — no longer true.
 
     topology_context = repo_topology_context(cfg, repos)
     discuss_mode, discuss_reason = select_discuss_mode(cfg, submission, discuss_override=discuss)
@@ -1335,9 +1421,10 @@ def _echo_enqueued(row: "OutboxRow", label: str) -> None:
 
 
 @portal_group.command("enqueue-status")
+@_CONFIG_OPTION
 @click.argument("submission_id")
 @click.argument("status", type=click.Choice(SUBMISSION_STATUSES))
-def portal_enqueue_status(submission_id: str, status: str) -> None:
+def portal_enqueue_status(config_path, submission_id: str, status: str) -> None:
     """Queue an up-mapped status for SUBMISSION_ID (sent on the next sync).
 
     Unlike `push`, this allocates the revision for you and refuses a status
@@ -1359,8 +1446,15 @@ def portal_enqueue_status(submission_id: str, status: str) -> None:
     sends the push regardless — there are legitimate reasons to set any of
     these by hand (a correction, a re-sync, an out-of-band delivery) — it
     only makes the consequence visible first.
+
+    **#2995: routes through the daemon on a thin client that claims
+    SUBMISSION_ID's mapped repo(s)**, instead of refusing outright like
+    every other state-touching ``enqueue-*`` command — see
+    :func:`_refuse_unless_claiming_machine`. This is the ``enqueue-status``
+    half of the Ask move's exit; ``enqueue-question`` below is the other.
     """
-    _refuse_if_thin_client("enqueue-status")
+    cfg = _load_config(config_path)
+    _refuse_unless_claiming_machine(cfg, submission_id, "enqueue-status")
 
     from coord.approved_work import is_pulled_status  # noqa: PLC0415
     from coord.portal_sync import PortalSyncError, enqueue_status  # noqa: PLC0415
@@ -1386,7 +1480,7 @@ def portal_enqueue_status(submission_id: str, status: str) -> None:
             )
 
     try:
-        row = enqueue_status(submission_id, status)
+        row = enqueue_status(submission_id, status, config=cfg)
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc
@@ -1444,22 +1538,32 @@ def portal_enqueue_preview(submission_id: str, preview_url: str) -> None:
 
 
 @portal_group.command("enqueue-question")
+@_CONFIG_OPTION
 @click.argument("submission_id")
 @click.argument("question")
-def portal_enqueue_question(submission_id: str, question: str) -> None:
+def portal_enqueue_question(config_path, submission_id: str, question: str) -> None:
     """Queue an open question for SUBMISSION_ID (sent on the next sync).
 
     Also queues the `needs-input` status that announces it (#2901) — a
     question with no status row behind it sends no email, so this command
     always queues both rows in one call rather than leaving the second one
-    to a caller who might forget it.
+    to a caller who might forget it. When routed through the daemon (see
+    below), both rows are applied in that one request, so a crash or a
+    dropped response can never leave the question queued without its
+    announcement.
+
+    **#2995: routes through the daemon on a thin client that claims
+    SUBMISSION_ID's mapped repo(s)**, instead of refusing outright — see
+    :func:`_refuse_unless_claiming_machine`. This is the Ask move's other
+    half; ``enqueue-status`` above is the one a plain status push uses.
     """
-    _refuse_if_thin_client("enqueue-question")
+    cfg = _load_config(config_path)
+    _refuse_unless_claiming_machine(cfg, submission_id, "enqueue-question")
 
     from coord.portal_sync import PortalSyncError, enqueue_question  # noqa: PLC0415
 
     try:
-        question_row, status_row = enqueue_question(submission_id, question)
+        question_row, status_row = enqueue_question(submission_id, question, config=cfg)
     except PortalSyncError as exc:
         click.secho(str(exc), fg="red")
         raise SystemExit(1) from exc

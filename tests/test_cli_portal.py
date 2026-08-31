@@ -1355,10 +1355,8 @@ def thin_client(monkeypatch):
         ("portal", "sync"),
         ("portal", "outbox"),
         ("portal", "events"),
-        ("portal", "enqueue-status", "sub_1", "shipped"),
         ("portal", "enqueue-design-round", "sub_1", "{}"),
         ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
-        ("portal", "enqueue-question", "sub_1", "why?"),
         ("portal", "requeue", "sub_1", "1"),
         ("portal", "remirror"),
         ("portal", "remirror", "sub_1"),
@@ -1371,6 +1369,227 @@ def test_state_touching_commands_refuse_on_a_thin_client(thin_client, args):
     assert result.exit_code != 0
     assert "must run on the daemon host" in result.output
     assert "dellserver" in result.output
+
+
+# ── #2995: `enqueue-question`/`enqueue-status` — the Ask move's exit ───────
+#
+# Unlike every command in the parametrized test above, these two no longer
+# call `_refuse_if_thin_client` at all — they route through the daemon on a
+# thin client that claims SUBMISSION_ID's mapped repo(s)
+# (`_refuse_unless_claiming_machine`), and only refuse outright when that
+# machine does NOT claim them (still exercised below — this widens the
+# routed set, it does not remove the guard).
+
+
+def test_enqueue_status_refuses_on_a_non_claiming_thin_client(thin_client, monkeypatch):
+    import coord.commands.portal as portal_mod
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["web"]},
+    )
+    monkeypatch.setattr("coord.test_orchestrator.local_machine", lambda cfg: None)
+
+    result = run("portal", "enqueue-status", "sub_1", "in-design")
+    assert result.exit_code != 0
+    assert "does not claim" in result.output or "unconfigured" in result.output
+    assert "dellserver" in result.output
+
+
+def test_enqueue_status_refuses_when_submission_not_approved_on_a_thin_client(
+    thin_client, monkeypatch
+):
+    import coord.commands.portal as portal_mod
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: None,
+    )
+
+    result = run("portal", "enqueue-status", "sub_1", "in-design")
+    assert result.exit_code != 0
+    assert "not a currently-approved" in result.output
+
+
+def test_enqueue_status_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    """`enqueue-status` must never call `_refuse_if_thin_client` — only the
+    narrower `_refuse_unless_claiming_machine` (#2995)."""
+    import coord.commands.portal as portal_mod
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: None,
+    )
+    try:
+        result = run("portal", "enqueue-status", "sub_1", "in-design")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0  # refused for an unrelated reason (not approved)
+    assert calls == []
+
+
+def test_enqueue_status_routes_through_the_daemon_on_a_claiming_thin_client(
+    thin_client, monkeypatch
+):
+    """End-to-end: a claiming thin client's `enqueue-status` reaches
+    `/portal-enqueue-status` instead of writing a local (wrong, empty) DB —
+    the same shape as `test_decision_propose_routes_through_the_daemon_on_a_
+    thin_client` above."""
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["coord"]},
+    )
+
+    class _Machine:
+        name = "elitebook"
+
+        def can_work_on(self, repo_name):
+            return repo_name == "coord"
+
+    monkeypatch.setattr(
+        "coord.test_orchestrator.local_machine", lambda cfg: _Machine()
+    )
+
+    calls = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        calls.append((path, payload))
+        return {
+            "row": {
+                "id": 1, "submission_id": payload["submission_id"], "seq": 1,
+                "revision": 1, "kind": "status",
+                "fields_json": f'{{"status": "{payload["status"]}"}}',
+                "announces": "", "requires_kind": "", "state": "pending",
+                "reason": "", "attempts": 0, "enqueued_at": 100.0, "sent_at": None,
+            }
+        }
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    result = run("portal", "enqueue-status", "sub_1", "in-design")
+    assert result.exit_code == 0, result.output
+    assert "status=in-design" in result.output
+    assert len(calls) == 1
+    assert calls[0][0] == "/portal-enqueue-status"
+    assert calls[0][1]["submission_id"] == "sub_1"
+    assert calls[0][1]["status"] == "in-design"
+
+
+def test_enqueue_question_refuses_on_a_non_claiming_thin_client(thin_client, monkeypatch):
+    import coord.commands.portal as portal_mod
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["web"]},
+    )
+    monkeypatch.setattr("coord.test_orchestrator.local_machine", lambda cfg: None)
+
+    result = run("portal", "enqueue-question", "sub_1", "why?")
+    assert result.exit_code != 0
+    assert "does not claim" in result.output or "unconfigured" in result.output
+    assert "dellserver" in result.output
+
+
+def test_enqueue_question_does_not_call_the_thin_client_guard(thin_client, monkeypatch):
+    import coord.commands.portal as portal_mod
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: None,
+    )
+    try:
+        result = run("portal", "enqueue-question", "sub_1", "why?")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0  # refused for an unrelated reason (not approved)
+    assert calls == []
+
+
+def test_enqueue_question_routes_through_the_daemon_atomically_on_a_claiming_thin_client(
+    thin_client, monkeypatch
+):
+    """End-to-end: a claiming thin client's `enqueue-question` reaches
+    `/portal-enqueue-question` exactly ONCE — the #2995 design-note
+    requirement that the question row and its `needs-input` announcement
+    (#2901) are applied atomically across the seam, not as two separate
+    routed calls a crash (or a thin client) could observe apart."""
+    import coord.commands.portal as portal_mod
+    from coord import client as cc
+
+    monkeypatch.setattr(portal_mod, "_load_config", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "coord.decomposition_chat.resolve_approved_submission",
+        lambda cfg, sid: {"submission_id": sid, "repos": ["coord"]},
+    )
+
+    class _Machine:
+        name = "elitebook"
+
+        def can_work_on(self, repo_name):
+            return repo_name == "coord"
+
+    monkeypatch.setattr(
+        "coord.test_orchestrator.local_machine", lambda cfg: _Machine()
+    )
+
+    calls = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        calls.append((path, payload))
+        assert path == "/portal-enqueue-question"
+        return {
+            "question_row": {
+                "id": 1, "submission_id": payload["submission_id"], "seq": 1,
+                "revision": 1, "kind": "question",
+                "fields_json": f'{{"question": "{payload["question"]}"}}',
+                "announces": "", "requires_kind": "", "state": "draft",
+                "reason": "", "attempts": 0, "enqueued_at": 100.0, "sent_at": None,
+            },
+            "status_row": {
+                "id": 2, "submission_id": payload["submission_id"], "seq": 2,
+                "revision": 2, "kind": "status",
+                "fields_json": '{"status": "needs-input"}',
+                "announces": "needs-input", "requires_kind": "question",
+                "state": "pending", "reason": "", "attempts": 0,
+                "enqueued_at": 100.0, "sent_at": None,
+            },
+        }
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    result = run("portal", "enqueue-question", "sub_1", "which blue?")
+    assert result.exit_code == 0, result.output
+    assert "question" in result.output
+    assert "status=needs-input" in result.output
+    # Exactly ONE request carried both rows — never two separate round trips.
+    assert len(calls) == 1
+    assert calls[0][0] == "/portal-enqueue-question"
+    assert calls[0][1] == {"submission_id": "sub_1", "question": "which blue?"}
 
 
 def test_status_heartbeat_and_push_do_not_call_the_thin_client_guard(thin_client):

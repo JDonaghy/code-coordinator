@@ -3340,6 +3340,26 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/portal-link-by-submission": {
+            "get": {
+                "summary": (
+                    "#2995: reverse lookup (submission_id -> link) — backs "
+                    "coord.portal_store.get_link_by_submission on a thin "
+                    "client, the read `coord portal enqueue-status`'s #2996 "
+                    "\"no link on file\" warning needs."
+                ),
+                "parameters": [
+                    {
+                        "name": "submission_id", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK — {'link': <serialized PortalLink> | None}"},
+                    "400": {"description": "Missing submission_id"},
+                },
+            },
+        },
         "/portal-decision": {
             "post": {
                 "summary": (
@@ -3463,6 +3483,84 @@ def openapi_spec() -> dict:
                             "unknown submission, or no open question on file"
                         )
                     },
+                },
+            },
+        },
+        "/portal-enqueue-status": {
+            "post": {
+                "summary": (
+                    "#2995: queue an up-mapped customer status, executed "
+                    "HERE on the daemon, same reason /portal-decision is — "
+                    "`coord portal enqueue-status`. The claim check (does "
+                    "this machine's caller claim the submission's mapped "
+                    "repo(s)) runs client-side before this request is sent, "
+                    "not here."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "submission_id": {"type": "string"},
+                                    "status": {"type": "string"},
+                                    "requires_kind": {
+                                        "type": "string",
+                                        "description": (
+                                            "Overrides ANNOUNCING_STATUSES' "
+                                            "default announced-kind for "
+                                            "`status` (#2987)."
+                                        ),
+                                    },
+                                },
+                                "required": ["submission_id", "status"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK — {'row': <serialized OutboxRow>}"},
+                    "400": {
+                        "description": (
+                            "Missing submission_id/status, unknown status, or "
+                            "an announcing status with nothing queued to announce"
+                        )
+                    },
+                },
+            },
+        },
+        "/portal-enqueue-question": {
+            "post": {
+                "summary": (
+                    "#2995: queue an open question for the customer, plus "
+                    "its `needs-input` announcement, applied atomically in "
+                    "ONE request — `coord portal enqueue-question`. Same "
+                    "client-side claim check as /portal-enqueue-status."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "submission_id": {"type": "string"},
+                                    "question": {"type": "string"},
+                                },
+                                "required": ["submission_id", "question"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — {'question_row': <serialized OutboxRow>, "
+                            "'status_row': <serialized OutboxRow>}"
+                        )
+                    },
+                    "400": {"description": "Missing submission_id, or empty question"},
                 },
             },
         },
@@ -6387,6 +6485,32 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"link": record})
 
+    async def get_portal_link_by_submission(request: Request) -> Response:
+        # #2995: reverse lookup (submission_id -> link), keyed the other way
+        # from get_portal_link above. Backs coord.portal_store.
+        # get_link_by_submission on a thin client — the one CLI-reachable
+        # caller is coord portal enqueue-status's #2996 "no link on file"
+        # warning, which used to read this local-only (safe only because
+        # enqueue-status itself refused outright on a thin client); now that
+        # enqueue-status routes through the daemon (see post_portal_enqueue_
+        # status below), this read needs the same seam so the warning isn't
+        # always wrong on a thin client.
+        from coord import portal_store  # noqa: PLC0415
+
+        submission_id = request.query_params.get("submission_id")
+        if not submission_id:
+            return JSONResponse(
+                {"error": "submission_id is required"}, status_code=400
+            )
+        try:
+            link = portal_store._get_link_by_submission_local(submission_id)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-link-by-submission read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"link": link.to_dict() if link is not None else None})
+
     async def post_portal_link(request: Request) -> Response:
         # #2751: upsert a milestone's/issue's portal submission_id link on
         # the shared DB for a thin client's `coord portal link`. Mirrors
@@ -6609,6 +6733,133 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     "payload_json": _json.dumps(entry.payload, sort_keys=True),
                     "recorded_at": entry.recorded_at,
                 }
+            }
+        )
+
+    def _outbox_row_wire(row: Any) -> dict[str, Any]:
+        """A ``coord.portal_store.OutboxRow`` as the wire dict
+        ``coord.portal_store._outbox_from_row`` reconstructs from — same
+        shape it parses off a real DB row (``fields_json`` is the JSON
+        *string*, not the parsed dict), so the client-side
+        ``coord.portal_sync.enqueue_question``/``enqueue_status`` can hand a
+        routed response straight to that one existing reconstructor. Shared
+        by ``post_portal_enqueue_status`` and ``post_portal_enqueue_
+        question`` below, the latter of which returns two of these.
+        """
+        import json as _json  # noqa: PLC0415
+
+        return {
+            "id": row.id,
+            "submission_id": row.submission_id,
+            "seq": row.seq,
+            "revision": row.revision,
+            "kind": row.kind,
+            "fields_json": _json.dumps(row.fields, sort_keys=True),
+            "announces": row.announces,
+            "requires_kind": row.requires_kind,
+            "state": row.state,
+            "reason": row.reason,
+            "attempts": row.attempts,
+            "enqueued_at": row.enqueued_at,
+            "sent_at": row.sent_at,
+        }
+
+    async def post_portal_enqueue_status(request: Request) -> Response:
+        # #2995: `coord portal enqueue-status` executed HERE on the daemon,
+        # same shape and same rationale as `/portal-decision`/`/portal-note`
+        # above — the Ask move's status half needs to land from whatever
+        # machine claims the submission's repo(s) (verified client-side
+        # *before* this request is ever sent — see coord.commands.portal.
+        # _refuse_unless_claiming_machine — since this endpoint, unlike
+        # /portal-decision/-note/-answer, has no way to check that itself),
+        # not just the daemon host. Uses THIS process's own `config` (the
+        # closure variable `build_app` sets up and `_refresh_config` keeps
+        # current) for the #2903 draft-gate policy read, same reason
+        # `/portal-answer` does — never anything a caller could hand over
+        # the wire.
+        from coord import portal_sync  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        submission_id = body.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return JSONResponse(
+                {"error": "portal-enqueue-status needs a 'submission_id'"},
+                status_code=400,
+            )
+        status = body.get("status")
+        if not isinstance(status, str) or not status:
+            return JSONResponse(
+                {"error": "portal-enqueue-status needs a 'status'"}, status_code=400
+            )
+        requires_kind = body.get("requires_kind")
+        if requires_kind is not None and not isinstance(requires_kind, str):
+            return JSONResponse(
+                {"error": "portal-enqueue-status 'requires_kind' must be a string"},
+                status_code=400,
+            )
+        try:
+            row = portal_sync._enqueue_status_local(
+                submission_id, status, config=config, requires_kind=requires_kind
+            )
+        except portal_sync.PortalSyncError as e:
+            return JSONResponse(
+                {"error": f"bad portal-enqueue-status: {e}"}, status_code=400
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-enqueue-status write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"row": _outbox_row_wire(row)})
+
+    async def post_portal_enqueue_question(request: Request) -> Response:
+        # #2995: `coord portal enqueue-question` executed HERE on the
+        # daemon, same rationale as `post_portal_enqueue_status` right
+        # above. The two rows this allocates (the question, then its
+        # `needs-input` announcement — #2901: a question with no status row
+        # behind it sends no email) are applied in ONE local call
+        # (`portal_sync._enqueue_question_local`), inside this single
+        # request, so a thin client can never observe the question queued
+        # without its announcement — the atomicity the issue's design note
+        # requires. A caller-side retry after a dropped response re-sends
+        # both, same replay contract as every other outbox row (see
+        # `coord.portal_sync`'s module docstring, "Idempotency and replay").
+        from coord import portal_sync  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        submission_id = body.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return JSONResponse(
+                {"error": "portal-enqueue-question needs a 'submission_id'"},
+                status_code=400,
+            )
+        question = body.get("question")
+        if not isinstance(question, str) or not question:
+            return JSONResponse(
+                {"error": "portal-enqueue-question needs a 'question'"},
+                status_code=400,
+            )
+        try:
+            question_row, status_row = portal_sync._enqueue_question_local(
+                submission_id, question, config=config
+            )
+        except portal_sync.PortalSyncError as e:
+            return JSONResponse(
+                {"error": f"bad portal-enqueue-question: {e}"}, status_code=400
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-enqueue-question write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "question_row": _outbox_row_wire(question_row),
+                "status_row": _outbox_row_wire(status_row),
             }
         )
 
@@ -9992,9 +10243,20 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
         Route("/portal-link", get_portal_link, methods=["GET"]),
         Route("/portal-link", post_portal_link, methods=["POST"]),
+        Route(
+            "/portal-link-by-submission",
+            get_portal_link_by_submission,
+            methods=["GET"],
+        ),
         Route("/portal-decision", post_portal_decision, methods=["POST"]),
         Route("/portal-note", post_portal_note, methods=["POST"]),
         Route("/portal-answer", post_portal_answer, methods=["POST"]),
+        Route(
+            "/portal-enqueue-status", post_portal_enqueue_status, methods=["POST"]
+        ),
+        Route(
+            "/portal-enqueue-question", post_portal_enqueue_question, methods=["POST"]
+        ),
         Route("/portal-ledger", get_portal_ledger, methods=["GET"]),
         Route("/portal-needs-input", get_portal_needs_input, methods=["GET"]),
         Route(
