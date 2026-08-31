@@ -3309,6 +3309,73 @@ def test_fetch_live_blocked_gate_unreadable_causes_all_log_at_warning(
     assert all(rec.levelname == "WARNING" for rec in sweep_records), caplog.text
 
 
+# ── #3012: an acceptance-slice's merge row is keyed to the EPIC, not the ────
+# slice — the blocked-gate sweep must resolve it via `for_issue_number`
+#
+# coord-portal#164, 2026-08-31: the merge_queue row for an oracle-loop
+# acceptance slice is keyed on `issue_number` = the milestone/epic issue
+# (`merge_queue.enqueue`/`refresh_entry_assignment` set it straight from
+# `assignment.issue_number`), never the slice's own issue. The drive-queue
+# entry for the slice is keyed on the SLICE issue, so `queue_by_key.get(e.key)`
+# always missed it — reported "no merge-queue row for this entry" (reads as
+# "retry might help") even though the row existed and was sitting in a
+# genuinely terminal state (`human_required`) that no retry could ever clear.
+# `coord gates` already resolves this via `effective_issue_number` (the
+# `for_issue_number` on the underlying assignment); the sweep must too.
+
+
+def test_fetch_live_blocked_gate_finds_an_acceptance_slices_row_keyed_to_the_epic(
+    monkeypatch, coord_db,
+):
+    """A merge-queue row booked to the epic (#160) but FOR the slice (#164,
+    via the assignment's `for_issue_number`) must be found when probing the
+    slice's own blocked drive-queue entry — not reported unreadable."""
+    import types
+
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_blocked_gate
+    from coord.drive_queue import STATE_BLOCKED, QueueEntry, entry_key
+
+    entry = QueueEntry(
+        repo=REPO, issue=164, position=1, state=STATE_BLOCKED,
+        last_reason="drive session died without landing the work, launched "
+        "90s ago (attempt 2/2) — giving up",
+    )
+
+    # The merge-queue row: booked to the epic (#160), same as coord-portal#164
+    # actually recorded it.
+    row = types.SimpleNamespace(
+        repo_name=REPO, issue_number=160, pr_number=42, assignment_id="a3ab4b929",
+    )
+    # The board assignment behind that row: booked to #160, but FOR #164.
+    slice_assignment = types.SimpleNamespace(
+        assignment_id="a3ab4b929", issue_number=160, for_issue_number=164,
+    )
+    fake_board = types.SimpleNamespace(active=[], completed=[slice_assignment])
+
+    def fake_entry_gate_status(q, board, cfg, ci_store, gh_ops):
+        assert q is row  # the epic-keyed row, resolved via for_issue_number
+        return mq.PLAN_BLOCKED, "checks failed: e2e smoke (playwright) (failure)"
+
+    monkeypatch.setattr(mq, "load_queue", lambda: [row])
+    monkeypatch.setattr(mq, "entry_gate_status", fake_entry_gate_status)
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: fake_board)
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, unreadable = _fetch_live_blocked_gate([entry], None)
+
+    # Found and read — NOT "could not be read". The gate is confirmed still
+    # shut (still blocked), which is the true, reportable state.
+    assert unreadable == {}
+    assert overrides == {entry_key(REPO, 164): True}
+
+
 # ── tick: the cross-host guard (#1870) ───────────────────────────────────────
 #
 # 2026-08-06: a drive launched by hand on `elitebook` was 47 minutes into a
