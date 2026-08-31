@@ -409,6 +409,174 @@ def pick_decomposition_chat_machine(cfg: "Config", repos: list[str]) -> "Machine
     return None
 
 
+# ── #2997: HOUSE STACK — the fleet's existing stack, not just this
+# submission's mapped repo(s). See the module briefing (SUB-1EA1D3, the
+# grocery-list submission) for why this section exists: a MODE: DISCUSS
+# iteration proposed Vite+React+Supabase for a greenfield repo without ever
+# weighing Cloudflare — the stack every other repo in this org already runs
+# and pays for — because nothing in the briefing carried it. This section is
+# CONTEXT, not a mandate (the design sketch's own framing): a session may
+# still propose something else, but the system prompt (coord/agent.py) is
+# what requires it to then record the house alternative as a
+# considered-and-rejected decision rather than staying silent about it.
+
+#: Root-level marker file -> the stack signal its mere presence implies.
+#: Deliberately mechanical and small, same posture as `_SEEDED_ROOT_FILES`
+#: above: cheap to check, cheap to extend, wrong at worst by omission (a
+#: repo using something unlisted here just contributes nothing) never by a
+#: false positive.
+_ROOT_STACK_MARKERS: dict[str, str] = {
+    "wrangler.toml": "Cloudflare Workers/Pages (wrangler.toml)",
+    "Cargo.toml": "Rust (Cargo.toml)",
+    "package.json": "Node/TypeScript (package.json)",
+    "pyproject.toml": "Python (pyproject.toml)",
+}
+
+#: Same idea, scoped to `.github/workflows/` — a deploy LANE is a workflow
+#: file, not a root marker.
+_WORKFLOW_STACK_MARKERS: dict[str, str] = {
+    "deploy-cloudflare.yml": "Cloudflare Pages deploy (.github/workflows/deploy-cloudflare.yml)",
+}
+
+#: `wrangler.toml` binding keys -> the managed Cloudflare service they name
+#: (Cloudflare's own `wrangler.toml` schema) — read only when the file is
+#: actually present, so this never guesses at a service that isn't wired up.
+_WRANGLER_BINDING_MARKERS: dict[str, str] = {
+    "d1_databases": "Cloudflare D1 (bound in wrangler.toml)",
+    "r2_buckets": "Cloudflare R2 (bound in wrangler.toml)",
+    "kv_namespaces": "Cloudflare KV (bound in wrangler.toml)",
+}
+
+#: Keywords worth a mention when they show up in a repo's own `CLAUDE.md` —
+#: the design sketch's "cheapest read from each repo's own CLAUDE.md" half,
+#: for a lane that leaves no marker file at all (e.g. Cloudflare Access,
+#: which is edge config, never a repo artifact — coord-portal's own
+#: `docs/CUSTOMER_PORTAL.md` names it in prose, not in a file this module
+#: could otherwise detect). Casefolded substring match: a false positive
+#: here only adds one extra weighed line, never a wrong guess about what
+#: exists, since the word is genuinely present in the repo's own docs.
+_CLAUDE_MD_KEYWORD_MARKERS: dict[str, str] = {
+    "cloudflare access": "Cloudflare Access (mentioned in CLAUDE.md)",
+    "cloudflare pages": "Cloudflare Pages (mentioned in CLAUDE.md)",
+    "cloudflare d1": "Cloudflare D1 (mentioned in CLAUDE.md)",
+    "cloudflare r2": "Cloudflare R2 (mentioned in CLAUDE.md)",
+}
+
+
+def _repo_stack_signals(repo_github: str, branch: str) -> list[str]:
+    """Mechanical, best-effort stack signals for *repo_github* on *branch* —
+    root-level marker files, known deploy-workflow files under
+    `.github/workflows/`, and (when `wrangler.toml` is present) the managed
+    Cloudflare services it binds.
+
+    **Degrades gracefully** (#2997 acceptance criterion): any lookup
+    failure, or a repo with nothing recognisable, returns `[]` rather than a
+    guess — this feeds an informational briefing section, not a gate, so
+    silence is always the safe failure mode.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        root_files, root_dirs = _dir_entries(repo_github, "", branch)
+    except RuntimeError:
+        return []
+
+    signals = [label for marker, label in _ROOT_STACK_MARKERS.items() if marker in root_files]
+
+    if "wrangler.toml" in root_files:
+        try:
+            wrangler_text = github_ops.get_repo_file(repo_github, "wrangler.toml", branch)
+        except RuntimeError:
+            wrangler_text = ""
+        signals += [
+            label for key, label in _WRANGLER_BINDING_MARKERS.items() if key in wrangler_text
+        ]
+
+    if "CLAUDE.md" in root_files:
+        try:
+            claude_md_text = github_ops.get_repo_file(repo_github, "CLAUDE.md", branch).casefold()
+        except RuntimeError:
+            claude_md_text = ""
+        signals += [
+            label for key, label in _CLAUDE_MD_KEYWORD_MARKERS.items() if key in claude_md_text
+        ]
+
+    if ".github" in root_dirs:
+        try:
+            _, gh_dirs = _dir_entries(repo_github, ".github", branch)
+        except RuntimeError:
+            gh_dirs = []
+        if "workflows" in gh_dirs:
+            try:
+                wf_files, _ = _dir_entries(repo_github, ".github/workflows", branch)
+            except RuntimeError:
+                wf_files = []
+            signals += [
+                label for marker, label in _WORKFLOW_STACK_MARKERS.items() if marker in wf_files
+            ]
+
+    return signals
+
+
+def house_stack_context(cfg: "Config", exclude_repos: list[str] | None = None) -> str:
+    """Render the HOUSE STACK briefing section: what the *rest* of the
+    fleet's repos already run and deploy on, derived mechanically from each
+    registered repo's tracked files rather than hand-maintained (the design
+    sketch's own preference — a hand-maintained approved-stack list rots and
+    suppresses the reasoning the decision archive exists to capture).
+
+    *exclude_repos* is normally the submission's own mapped repo(s) — the
+    one(s) actually being decomposed, which say nothing about "the REST of
+    the fleet" even when they aren't greenfield.
+
+    A repo that contributes no recognisable signal (no CLAUDE.md, no known
+    marker file, no known workflow file) is omitted from the per-repo list
+    entirely — #2997's "degrades gracefully" criterion: nothing beats a
+    wrong guess. When *no* repo in the fleet contributes anything, the whole
+    section reads as empty rather than asserting a managed-services list or
+    a host-coupled gate that nothing here actually evidences.
+    """
+    exclude = set(exclude_repos or [])
+    per_repo: list[str] = []
+    saw_cloudflare = False
+    for repo_cfg in cfg.repos:
+        if repo_cfg.name in exclude:
+            continue
+        branch = repo_cfg.default_branch or "main"
+        signals = _repo_stack_signals(repo_cfg.github, branch)
+        if not signals:
+            continue
+        per_repo.append(f"- {repo_cfg.name} ({repo_cfg.github}): {'; '.join(signals)}")
+        if any("Cloudflare" in s for s in signals):
+            saw_cloudflare = True
+
+    if not per_repo:
+        return (
+            "HOUSE STACK (fleet-wide, #2997): no recognisable stack/deploy signal on any "
+            "other registered repo — nothing to weigh here."
+        )
+
+    lines = [
+        "HOUSE STACK (fleet-wide, not just this submission's mapped repo(s) — #2997):",
+        *per_repo,
+        "",
+        "This is CONTEXT, not a mandate: propose something else if it genuinely fits "
+        "better, but if you do, record the house-stack alternative as a "
+        "considered-and-rejected decision with a reason (`coord portal decision propose` "
+        "then `coord portal decision reject ... \"<why the house stack loses>\"`) instead "
+        "of leaving it unweighed.",
+    ]
+    if saw_cloudflare:
+        lines.append("")
+        lines.append(
+            "Gate that assumes a host: `coord portal enqueue-preview` reads a Cloudflare "
+            "Pages PREVIEW deployment URL created per-PR by `cloudflare/pages-action` "
+            "(docs/CUSTOMER_PORTAL.md) — choosing a different host means the #2359 "
+            "customer preview-approval gate does not apply without new coord work."
+        )
+    return "\n".join(lines)
+
+
 def repo_topology_context(cfg: "Config", repos: list[str]) -> str:
     """One paragraph of `coordinator.yml` topology per mapped repo — the
     "coordinator.yml topology context ... the same way docs/CUSTOMER_PORTAL.md's
@@ -442,6 +610,7 @@ def build_decomposition_chat_briefing(
     discuss: bool,
     discuss_reason: str,
     running_context_section: str = "",
+    house_stack_context_section: str = "",
 ) -> str:
     """Compose the seed briefing the worker sees as its first user message.
 
@@ -454,6 +623,15 @@ def build_decomposition_chat_briefing(
     pane already shows the operator (ms-67 contract §4b: "nothing hidden
     between 'looks right in the panel' and 'is what the session got'"),
     plus everything #2749's ledger has accumulated across prior iterations.
+
+    **#2997:** also carries a HOUSE STACK section (*house_stack_context_section*,
+    normally :func:`house_stack_context`'s output) — the fleet's existing
+    stack and infrastructure conventions, which used to be entirely absent
+    from this briefing. That gap is what let a MODE: DISCUSS iteration on a
+    greenfield repo propose a brand-new vendor (Supabase) without ever
+    weighing the Cloudflare stack the rest of this org already runs and
+    pays for (SUB-1EA1D3, this issue's own measured regression case). Empty
+    by default so every existing caller/test keeps working unchanged.
     """
     submission_id = submission.get("submission_id", "")
     repos = submission.get("repos") or []
@@ -483,6 +661,11 @@ def build_decomposition_chat_briefing(
     parts.append("")
     parts.append("COORDINATOR.YML TOPOLOGY CONTEXT:")
     parts.append(topology_context)
+    parts.append("")
+    parts.append(
+        house_stack_context_section.strip()
+        or "HOUSE STACK (fleet-wide, #2997): (not computed for this briefing)"
+    )
     parts.append("")
     parts.append(
         running_context_section.strip()
@@ -677,6 +860,7 @@ def dispatch_decomposition_chat(
         machine = picked
 
     topology_context = repo_topology_context(config, repos)
+    house_stack = house_stack_context(config, exclude_repos=repos)
     discuss_mode, discuss_reason = select_discuss_mode(
         config, submission, discuss_override=discuss
     )
@@ -687,6 +871,7 @@ def dispatch_decomposition_chat(
         discuss=discuss_mode,
         discuss_reason=discuss_reason,
         running_context_section=running_context,
+        house_stack_context_section=house_stack,
     )
 
     resolved_model = config.models.default
