@@ -1613,10 +1613,27 @@ def _patch_false_merge_probes(
     """
     from coord import github_ops
 
-    monkeypatch.setattr(
-        github_ops, "branch_exists_on_remote", lambda repo, branch: branch_exists
-    )
-    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: pr_merged)
+    # #2989: the sweep now passes a per-pass `cache=` dict (dedup), so the
+    # stub must accept it. Calls are recorded so a test can assert the dedup
+    # actually happened.
+    calls: dict[str, list] = {"branch_exists": [], "pr_is_merged": []}
+
+    def _fake_branch_exists(repo, branch, *, cache=None):
+        key = (repo, branch)
+        if cache is not None and key in cache:
+            return cache[key]
+        calls["branch_exists"].append(key)
+        result = branch_exists
+        if cache is not None:
+            cache[key] = result
+        return result
+
+    def _fake_pr_is_merged(repo, branch):
+        calls["pr_is_merged"].append((repo, branch))
+        return pr_merged
+
+    monkeypatch.setattr(github_ops, "branch_exists_on_remote", _fake_branch_exists)
+    monkeypatch.setattr(github_ops, "pr_is_merged", _fake_pr_is_merged)
     monkeypatch.setattr(
         github_ops,
         "branch_commits_ahead",
@@ -1638,6 +1655,7 @@ def _patch_false_merge_probes(
         return content
 
     monkeypatch.setattr(github_ops, "get_repo_file", _fake_get_repo_file)
+    return calls
 
 
 def test_falsely_merged_row_with_differing_content_is_flagged(
@@ -1779,3 +1797,314 @@ def test_falsely_merged_sweep_respects_repo_and_issue_filters(
 
     assert any("ta-1" in s and "POSSIBLY LOST" in s for s in actions)
     assert not any("ta-2" in s for s in actions)
+
+
+# ── #2989: bounding sweep (h)'s candidate set ───────────────────────────────
+#
+# Before this, the sweep selected EVERY `status='merged'` work-like row in
+# the board — 1,302 rows on the drive host, proportional to project history,
+# +1 per merge, never shrinking — and re-probed all of them against GitHub
+# on the daemon's 30s tick. Measured: 1,304 of one pass's 1,346 `gh`
+# invocations (97%). These tests pin the three mechanisms that bound it
+# (terminal marker, recency cap, per-pass ref dedup) plus the cadence gate,
+# and — critically — that NONE of them changed what the sweep concludes.
+
+
+def _merged_rows(n: int, *, start: int = 1000) -> list[Assignment]:
+    """*n* distinct merged work rows, one branch each, newest-issue last."""
+    return [
+        _merged_row(
+            assignment_id=f"hist-{i}",
+            issue_number=start + i,
+            branch=f"issue-{start + i}-old-work",
+            row_type="work",
+        )
+        for i in range(n)
+    ]
+
+
+def test_false_merge_candidate_set_does_not_scale_with_project_history(
+    monkeypatch, config
+) -> None:
+    """THE headline acceptance bar: doubling merged history must not double
+    the sweep's probe count. Every row here is a genuine flag (branch exists,
+    no merged PR, ahead, content differs) so nothing is filtered out by the
+    clean-marker — only the recency cap can bound this."""
+    from coord.reconcile import _FALSE_MERGE_AUDIT_MAX_ROWS
+
+    def _probe_count(n: int) -> int:
+        board = Board(completed=_merged_rows(n))
+        calls = _patch_false_merge_probes(
+            monkeypatch,
+            ahead=1,
+            changed_files=["x.py"],
+            file_contents={"x.py": ("new", "old")},
+        )
+        reconcile_board_merges(board, config, dry_run=True)
+        return len(calls["branch_exists"])
+
+    small = _probe_count(_FALSE_MERGE_AUDIT_MAX_ROWS * 2)
+    large = _probe_count(_FALSE_MERGE_AUDIT_MAX_ROWS * 8)
+
+    assert small == _FALSE_MERGE_AUDIT_MAX_ROWS
+    # 4x the history, same cost — the whole point.
+    assert large == small
+
+
+def test_clean_audit_row_is_not_reprobed_on_the_next_pass(
+    monkeypatch, config
+) -> None:
+    """A row confirmed correctly-merged is confirmed forever. The terminal
+    marker makes the candidate set proportional to *unaudited* merges."""
+    board = Board(completed=_merged_rows(5))
+    # branch deleted from origin == the dominant benign case: merged + cleaned up.
+    calls = _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    first = reconcile_board_merges(board, config)
+    assert len(calls["branch_exists"]) == 5
+    assert not any("POSSIBLY LOST" in s for s in first)
+
+    calls["branch_exists"].clear()
+    second = reconcile_board_merges(board, config)
+
+    assert calls["branch_exists"] == []  # zero re-probes
+    assert not any("POSSIBLY LOST" in s for s in second)
+
+
+def test_clean_marker_records_every_terminal_verdict_shape(
+    monkeypatch, config
+) -> None:
+    """All four "clean" exits are permanent and must all mark: branch gone,
+    merged PR at the tip, 0 commits ahead, content byte-identical on base."""
+    from coord import state
+
+    shapes = [
+        dict(branch_exists=False),
+        dict(pr_merged=True),
+        dict(ahead=0),
+        dict(
+            ahead=1,
+            changed_files=["c.md"],
+            file_contents={"c.md": ("same", "same")},
+        ),
+    ]
+    for i, kwargs in enumerate(shapes):
+        row = _merged_row(assignment_id=f"shape-{i}", issue_number=2000 + i)
+        _patch_false_merge_probes(monkeypatch, **kwargs)
+        reconcile_board_merges(Board(completed=[row]), config)
+
+    clean = state.load_false_merge_audit_clean()
+    assert {f"shape-{i}" for i in range(len(shapes))} <= clean
+
+
+def test_fail_open_verdicts_are_never_marked_clean(monkeypatch, config) -> None:
+    """`branch_commits_ahead` failing open to None (a `gh` error) is NOT
+    evidence the row is fine — it must be re-probed next pass, or a transient
+    GitHub blip would permanently retire a row from the audit."""
+    from coord import state
+
+    row = _merged_row(assignment_id="flaky-1")
+    calls = _patch_false_merge_probes(monkeypatch, ahead=None)
+
+    reconcile_board_merges(Board(completed=[row]), config)
+
+    assert "flaky-1" not in state.load_false_merge_audit_clean()
+
+    calls["branch_exists"].clear()
+    reconcile_board_merges(Board(completed=[row]), config)
+    assert calls["branch_exists"] != []  # re-probed
+
+
+def test_flagged_row_is_never_marked_clean_and_reflags(monkeypatch, config) -> None:
+    """A POSSIBLY LOST row must keep surfacing until an operator acts on it —
+    marking it clean would hide the very thing the sweep exists to find."""
+    from coord import state
+
+    row = _merged_row(assignment_id="lost-1")
+    board = Board(completed=[row])
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["x.py"],
+        file_contents={"x.py": ("new", "old")},
+    )
+
+    first = reconcile_board_merges(board, config)
+    assert any("POSSIBLY LOST" in s and "lost-1" in s for s in first)
+    assert "lost-1" not in state.load_false_merge_audit_clean()
+
+    second = reconcile_board_merges(board, config)
+    assert any("POSSIBLY LOST" in s and "lost-1" in s for s in second)
+
+
+def test_genuine_false_merge_still_detected_among_clean_history(
+    monkeypatch, config
+) -> None:
+    """Regression bar: bounding must not change what the sweep CONCLUDES.
+    One genuinely-lost row buried in otherwise-clean history is still found."""
+    lost = _merged_row(assignment_id="lost-1", issue_number=42, branch="issue-42-work")
+    board = Board(completed=[*_merged_rows(10), lost])
+
+    from coord import github_ops
+
+    _patch_false_merge_probes(
+        monkeypatch,
+        ahead=1,
+        changed_files=["x.py"],
+        file_contents={"x.py": ("new", "old")},
+    )
+    # Only `issue-42-work` is still ahead of base; the history rows were
+    # merged and cleaned up normally.
+    monkeypatch.setattr(
+        github_ops,
+        "branch_exists_on_remote",
+        lambda repo, branch, *, cache=None: branch == "issue-42-work",
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert any("POSSIBLY LOST" in s and "lost-1" in s for s in actions)
+    assert lost.status == "merged"  # still detection-only
+
+
+def test_branch_ref_lookups_are_deduped_within_one_pass(monkeypatch, config) -> None:
+    """K rows sharing ONE branch make ONE ref lookup, not K. Measured on the
+    live board: 1,304 lookups for 851 distinct refs (~453 wasted calls)."""
+    rows = [
+        _merged_row(
+            assignment_id=f"sib-{i}",
+            issue_number=77,
+            branch="issue-77-shared",
+            row_type="work",
+        )
+        for i in range(8)
+    ]
+    board = Board(completed=rows)
+    calls = _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    reconcile_board_merges(board, config, dry_run=True)
+
+    assert calls["branch_exists"] == [("acme/api", "issue-77-shared")]
+
+
+def test_branch_exists_on_remote_cache_is_caller_scoped(monkeypatch) -> None:
+    """The `cache=` seam itself: memoised within one dict, and a FRESH dict
+    re-reads (branch existence must never be cached across passes)."""
+    seen: list[str] = []
+
+    def _fake_gh(*args, **kwargs):
+        seen.append(args[-1])
+        return ""
+
+    monkeypatch.setattr(github_ops, "_gh", _fake_gh)
+
+    cache: dict = {}
+    assert github_ops.branch_exists_on_remote("acme/api", "b", cache=cache) is True
+    assert github_ops.branch_exists_on_remote("acme/api", "b", cache=cache) is True
+    assert len(seen) == 1
+    # different branch, same cache -> its own lookup
+    github_ops.branch_exists_on_remote("acme/api", "other", cache=cache)
+    assert len(seen) == 2
+    # fresh per-pass cache -> re-read
+    github_ops.branch_exists_on_remote("acme/api", "b", cache={})
+    assert len(seen) == 3
+    # no cache at all -> unchanged legacy behaviour
+    github_ops.branch_exists_on_remote("acme/api", "b")
+    assert len(seen) == 4
+
+
+def test_dry_run_does_not_persist_the_clean_marker(monkeypatch, config) -> None:
+    """`--dry-run` must not change what the next real pass does."""
+    from coord import state
+
+    board = Board(completed=[_merged_row(assignment_id="dr-1")])
+    _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    reconcile_board_merges(board, config, dry_run=True)
+
+    assert "dr-1" not in state.load_false_merge_audit_clean()
+
+
+def test_targeted_issue_audit_bypasses_the_clean_marker(monkeypatch, config) -> None:
+    """An operator who asks for `--issue N` gets a real re-probe, even for a
+    row previously retired as clean — otherwise the marker would make a
+    suspected row permanently un-recheckable by hand."""
+    row = _merged_row(assignment_id="ta-1", issue_number=16)
+    board = Board(completed=[row])
+    calls = _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    reconcile_board_merges(board, config)
+    assert len(calls["branch_exists"]) == 1
+
+    calls["branch_exists"].clear()
+    reconcile_board_merges(board, config, issue=16)
+
+    assert len(calls["branch_exists"]) == 1
+
+
+def test_throttled_audit_runs_at_most_hourly(monkeypatch, config) -> None:
+    """The daemon's 30s tick opts into throttling: sweep (h) detects a rare,
+    non-urgent condition, so it gets one turn an hour instead of 120."""
+    import coord.reconcile as rec
+
+    board = Board(completed=_merged_rows(3))
+    calls = _patch_false_merge_probes(monkeypatch, ahead=None)  # never marked clean
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(rec.time, "time", lambda: now[0])
+
+    reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+    assert len(calls["branch_exists"]) == 3
+
+    calls["branch_exists"].clear()
+    now[0] += 30.0  # the very next daemon tick
+    reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+    assert calls["branch_exists"] == []
+
+    now[0] += rec._FALSE_MERGE_AUDIT_MIN_INTERVAL_SECONDS + 1
+    reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+    assert len(calls["branch_exists"]) == 3
+
+
+def test_unthrottled_manual_run_always_sweeps(monkeypatch, config) -> None:
+    """A manual `coord reconcile-merges` is deliberately NOT throttled — the
+    operator asked, and the before/after measurement in #2989 has to be
+    deterministic."""
+    board = Board(completed=_merged_rows(3))
+    calls = _patch_false_merge_probes(monkeypatch, ahead=None)
+
+    reconcile_board_merges(board, config, throttle_false_merge_audit=True)
+    calls["branch_exists"].clear()
+    reconcile_board_merges(board, config)  # default: no throttle
+
+    assert len(calls["branch_exists"]) == 3
+
+
+def test_rows_for_unmapped_repos_do_not_consume_the_recency_cap(
+    monkeypatch, config
+) -> None:
+    """An orphaned row (repo since dropped from coordinator.yml) is
+    unprobeable, so it must be filtered BEFORE the cap — otherwise a pile of
+    them starves the rows the sweep can actually audit."""
+    from coord.reconcile import _FALSE_MERGE_AUDIT_MAX_ROWS
+
+    orphans = [
+        Assignment(
+            machine_name="laptop",
+            repo_name="gone",
+            issue_number=3000 + i,
+            issue_title="t",
+            status="merged",
+            assignment_id=f"orphan-{i}",
+            branch=f"issue-{3000 + i}-x",
+            type="work",
+        )
+        for i in range(_FALSE_MERGE_AUDIT_MAX_ROWS * 2)
+    ]
+    real = _merged_rows(3)
+    board = Board(completed=orphans + real)
+    calls = _patch_false_merge_probes(monkeypatch, branch_exists=False)
+
+    reconcile_board_merges(board, config, dry_run=True)
+
+    assert len(calls["branch_exists"]) == 3

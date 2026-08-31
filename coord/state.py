@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import time
 import warnings
+from collections.abc import Iterable
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4361,6 +4362,140 @@ def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
             ("milestone_gates", json.dumps(remaining)),
             conflict_columns=["key"],
         )
+
+
+# ── #2989: the false-merge audit's terminal marker ──────────────────────────
+#
+# Sweep (h) of :func:`coord.reconcile.reconcile_board_merges` re-derives
+# "did this branch really land" for `status='merged'` rows.  Its candidate
+# set was proportional to PROJECT HISTORY (1,302 rows on the drive host,
+# growing by one per merge, never shrinking) and it re-probed every one of
+# them against GitHub on the daemon's 30s tick — 97% of a reconcile pass's
+# `gh` calls, and the generator behind the fleet-wide secondary rate
+# limiting #2809/#2858/#2934/#2977 all treated symptomatically.
+#
+# A row whose audit came back CLEAN is clean forever: the branch was
+# deleted after a real merge, or a merged PR sits at its exact tip, or its
+# commits are already an ancestor of base, or its changed files are
+# byte-identical on base.  None of those can un-happen for a row that is
+# already terminal.  Recording the verdict makes the candidate set
+# proportional to *unaudited* merges — bounded by recent throughput — which
+# is the same discipline `coord.gate_snapshot`'s refresh already states
+# ("merged history is never refreshed").
+#
+# Stored as a JSON list of assignment_ids under one board_meta key, in the
+# same seam as `milestone_drains`/`milestone_gates` above.  Local-DB only:
+# the only callers are the daemon's own reconcile tick and a `coord
+# reconcile-merges` CLI run, both of which execute against the canonical DB
+# (a thin client's `coord reconcile-merges` reroutes to the daemon before
+# reaching this code).  Fail-open at both ends — a read or write problem
+# degrades to "re-probe next pass", never to a wrong verdict.
+
+_FALSE_MERGE_AUDIT_CLEAN_KEY = "false_merge_audit_clean"
+
+# Cap on the persisted clean-verdict list.  It is append-only and bounded
+# only by total merge history, so trim it the way a ring buffer would: the
+# most recently confirmed rows are the ones a repeat pass would otherwise
+# re-probe first.  Dropping the tail is safe — a forgotten row just gets
+# re-audited once and re-marked.
+_FALSE_MERGE_AUDIT_CLEAN_MAX = 5000
+
+
+def load_false_merge_audit_clean() -> set[str]:
+    """Return assignment_ids whose false-merge audit already came back clean.
+
+    Fails open to an empty set on any read problem — the caller then simply
+    re-probes, which is correct-but-slower, never wrong.
+    """
+    try:
+        conn = get_connection()
+        row = sql.execute(
+            conn,
+            "SELECT value FROM board_meta WHERE key = ?",
+            (_FALSE_MERGE_AUDIT_CLEAN_KEY,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — advisory cache, never load-bearing
+        return set()
+    if row is None:
+        return set()
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(x) for x in data if isinstance(x, (str, int))}
+
+
+def mark_false_merge_audit_clean(assignment_ids: Iterable[str]) -> None:
+    """Record *assignment_ids* as permanently audited-clean (idempotent).
+
+    Never raises — this is an optimisation marker, and a board that cannot
+    persist it must still reconcile correctly (just without the speedup).
+    """
+    new = {str(a) for a in assignment_ids if a}
+    if not new:
+        return
+    try:
+        conn = get_connection()
+        with conn:
+            existing = load_false_merge_audit_clean()
+            merged = existing | new
+            if merged == existing:
+                return
+            # Keep insertion order stable-ish (old first, newly-confirmed
+            # last) so the trim below drops the oldest confirmations.
+            ordered = [a for a in existing if a in merged]
+            ordered += [a for a in new if a not in existing]
+            if len(ordered) > _FALSE_MERGE_AUDIT_CLEAN_MAX:
+                ordered = ordered[-_FALSE_MERGE_AUDIT_CLEAN_MAX:]
+            sql.upsert(
+                conn,
+                "board_meta",
+                ["key", "value"],
+                (_FALSE_MERGE_AUDIT_CLEAN_KEY, json.dumps(ordered)),
+                conflict_columns=["key"],
+            )
+    except Exception:  # noqa: BLE001 — advisory cache, never load-bearing
+        return
+
+
+_FALSE_MERGE_AUDIT_LAST_RUN_KEY = "false_merge_audit_last_run"
+
+
+def get_false_merge_audit_last_run() -> float:
+    """Epoch seconds of the last throttled false-merge audit, 0.0 if never."""
+    try:
+        conn = get_connection()
+        row = sql.execute(
+            conn,
+            "SELECT value FROM board_meta WHERE key = ?",
+            (_FALSE_MERGE_AUDIT_LAST_RUN_KEY,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if row is None:
+        return 0.0
+    try:
+        return float(row["value"])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_false_merge_audit_last_run(when: float) -> None:
+    """Stamp the last throttled false-merge audit run. Never raises."""
+    try:
+        conn = get_connection()
+        with conn:
+            sql.upsert(
+                conn,
+                "board_meta",
+                ["key", "value"],
+                (_FALSE_MERGE_AUDIT_LAST_RUN_KEY, repr(float(when))),
+                conflict_columns=["key"],
+            )
+    except Exception:  # noqa: BLE001
+        return
 
 
 # ── #1630: fleet-health aggregation ─────────────────────────────────────────

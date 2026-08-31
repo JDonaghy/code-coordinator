@@ -31,6 +31,23 @@ if TYPE_CHECKING:
 # and treating a huge, all-matching-so-far diff as inconclusive (fail open).
 _FALSE_MERGE_AUDIT_MAX_FILES = 20
 
+# #2989: bounds the OUTER candidate set of that same sweep — the loop #2639
+# left unbounded. Without it the set is proportional to project history
+# (1,302 rows on the drive host, +1 per merge, never shrinking), re-probed
+# every 30s. This is a per-pass ceiling applied newest-first as a backstop
+# behind the persistent terminal marker (`state.mark_false_merge_audit_
+# clean`); the older tail drains over subsequent passes as newer rows are
+# confirmed and drop out permanently. Not applied to a targeted
+# `--issue N` audit.
+_FALSE_MERGE_AUDIT_MAX_ROWS = 50
+
+# #2989: how often the sweep may run when the caller opts into throttling
+# (the daemon's reconcile tick does; a manual `coord reconcile-merges` does
+# not). It detects a rare, non-urgent condition — a merged-marked row whose
+# branch still differs from base — which is an hourly sweep, not a
+# twice-a-minute one.
+_FALSE_MERGE_AUDIT_MIN_INTERVAL_SECONDS = 3600.0
+
 
 def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
     try:
@@ -2908,6 +2925,7 @@ def reconcile_board_merges(
     repo: str | None = None,
     issue: int | None = None,
     dry_run: bool = False,
+    throttle_false_merge_audit: bool = False,
 ) -> list[str]:
     """Reconcile done work assignments against git/GitHub reality.
 
@@ -2970,7 +2988,14 @@ def reconcile_board_merges(
     catching a historical false ``status='merged'`` flip that predates this
     fix (or any future bug shaped like it) rather than leaving it invisible
     to every other diagnostic forever. See its own inline comment for the
-    full methodology and false-positive guards.)
+    full methodology and false-positive guards.
+
+    #2989 bounds sweep (h)'s candidate set — it used to select every
+    ``merged`` work-like row in project history and re-probe all of them on
+    the daemon's 30s tick (97% of a pass's ``gh`` calls). Set
+    *throttle_false_merge_audit* to run that sweep at most hourly; the
+    daemon tick does, a manual ``coord reconcile-merges`` deliberately does
+    not. See the inline block above ``_false_merge_candidates``.)
     """
     from coord import github_ops, state  # noqa: PLC0415
 
@@ -3456,28 +3481,116 @@ def reconcile_board_merges(
     # this is a FLAG for a human to check, exactly like the manual sweep this
     # automates, not a verdict. Fail-open at every layer: any fetch failure
     # skips that row/file rather than either flagging or clearing it.
-    _false_merge_candidates = [
-        a
-        for a in board.active + board.completed
-        if a.status == "merged"
-        and a.branch
-        and (a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a))
-        and (repo is None or a.repo_name == repo)
-        and (issue is None or a.issue_number == issue)
-    ]
+    #
+    # BOUNDING (#2989) — three mechanisms, applied in this order.  Before
+    # them this sweep selected EVERY `merged` work-like row in the board:
+    # 1,302 rows on the drive host, proportional to project history rather
+    # than to work in flight, re-probed on the daemon's 30s tick.  Measured,
+    # that was 1,304 of one pass's 1,346 `gh` invocations (97%), and the
+    # generator behind the fleet-wide secondary rate limiting #2809/#2858/
+    # #2934/#2977 all treated symptomatically.  (#2639 had already capped
+    # the inner per-file loop — the wrong loop; the outer candidate set was
+    # left unbounded.)
+    #
+    #   (1) CADENCE.  This detects a rare, non-urgent condition — a
+    #       merged-marked row whose branch still differs from base, which is
+    #       recovered by a human days later regardless.  Twice a minute is
+    #       absurd for that.  The daemon tick passes
+    #       `throttle_false_merge_audit=True` and the sweep then runs at most
+    #       once an hour (~120x fewer passes on its own).  A manual `coord
+    #       reconcile-merges` / `coord diagnose` never throttles: an operator
+    #       who asked for a sweep gets one, deterministically.
+    #   (2) TERMINAL MARKER.  A clean verdict is clean forever (branch
+    #       deleted, merged PR at the tip, already an ancestor of base, or
+    #       content byte-identical on base — none of those un-happen for a
+    #       terminal row).  Persisting it (`state.mark_false_merge_audit_
+    #       clean`) drops the row from the candidate list permanently, which
+    #       makes the set proportional to *unaudited* merges — bounded by
+    #       recent throughput, not project age.  This is the real fix, and
+    #       the same discipline `coord.gate_snapshot`'s refresh already
+    #       states ("merged history is never refreshed").
+    #   (3) RECENCY CAP.  A backstop for the first pass after this ships (and
+    #       for any board whose marker was lost): audit at most
+    #       `_FALSE_MERGE_AUDIT_MAX_ROWS` rows per pass, newest first.  A
+    #       false merge that has gone unnoticed for two months is not being
+    #       caught by a 30-second sweep anyway; the older tail is simply
+    #       drained over the following passes as newer rows get marked.
+    #
+    # An explicit `--issue N` bypasses (2) and (3) entirely: a targeted
+    # re-audit must always re-probe, so a previously-cleared row stays
+    # re-checkable by hand.  Nothing here changes what the sweep CONCLUDES,
+    # only how many probes it takes to conclude it.
+    _false_merge_targeted = issue is not None
+    _run_false_merge_audit = True
+    if throttle_false_merge_audit and not _false_merge_targeted:
+        _last_run = state.get_false_merge_audit_last_run()
+        if (time.time() - _last_run) < _FALSE_MERGE_AUDIT_MIN_INTERVAL_SECONDS:
+            _run_false_merge_audit = False
+
+    _false_merge_candidates: list[Assignment] = []
+    if _run_false_merge_audit:
+        _false_merge_candidates = [
+            a
+            for a in board.active + board.completed
+            if a.status == "merged"
+            and a.branch
+            and (a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a))
+            and (repo is None or a.repo_name == repo)
+            and (issue is None or a.issue_number == issue)
+            # #2989: a row whose repo has no GitHub mapping is unprobeable —
+            # drop it HERE rather than after the recency cap, so a pile of
+            # orphaned rows (a repo since removed from coordinator.yml) can't
+            # eat the cap's slots and starve the rows we can actually audit.
+            and getattr(config.repo(a.repo_name), "github", None)
+        ]
+        if not _false_merge_targeted:
+            _already_clean = state.load_false_merge_audit_clean()
+            if _already_clean:
+                _false_merge_candidates = [
+                    a
+                    for a in _false_merge_candidates
+                    if a.assignment_id not in _already_clean
+                ]
+            if len(_false_merge_candidates) > _FALSE_MERGE_AUDIT_MAX_ROWS:
+                _false_merge_candidates.sort(
+                    key=lambda a: (a.finished_at or a.dispatched_at or 0.0),
+                    reverse=True,
+                )
+                _false_merge_candidates = _false_merge_candidates[
+                    :_FALSE_MERGE_AUDIT_MAX_ROWS
+                ]
+
+    if _run_false_merge_audit and throttle_false_merge_audit and not _false_merge_targeted:
+        # Stamp even when there was nothing to do — the point of the stamp is
+        # "this sweep had its turn this hour", not "this sweep found work".
+        state.set_false_merge_audit_last_run(time.time())
+
     if _false_merge_candidates:
         from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
 
         _false_merge_milestone_cache: dict = {}
+        # #2989 mechanism (3'): one ref lookup per DISTINCT (repo, branch)
+        # per pass, not one per row.  Sibling rows legitimately share a
+        # branch (a work row and its conflict-fix, a re-dispatch), which
+        # measured 1.53x redundancy — ~453 wasted calls in a single pass.
+        _false_merge_branch_cache: dict = {}
+        _false_merge_confirmed_clean: list[str] = []
         for a in _false_merge_candidates:
             repo_cfg = config.repo(a.repo_name)
             if repo_cfg is None or not repo_cfg.github:
                 continue
             try:
-                if not github_ops.branch_exists_on_remote(repo_cfg.github, a.branch):
-                    continue  # branch gone — presumed genuinely merged + cleaned up
+                if not github_ops.branch_exists_on_remote(
+                    repo_cfg.github, a.branch, cache=_false_merge_branch_cache
+                ):
+                    # branch gone — presumed genuinely merged + cleaned up,
+                    # and permanently so (#2989).
+                    _false_merge_confirmed_clean.append(a.assignment_id)
+                    continue
                 if github_ops.pr_is_merged(repo_cfg.github, a.branch):
-                    continue  # correctly tracked: a merged PR sits at this exact tip
+                    # correctly tracked: a merged PR sits at this exact tip
+                    _false_merge_confirmed_clean.append(a.assignment_id)
+                    continue
                 base_branch = resolve_base_branch_for_issue_number(
                     repo_cfg,
                     repo_cfg.github,
@@ -3487,13 +3600,20 @@ def reconcile_board_merges(
                 ahead = github_ops.branch_commits_ahead(
                     repo_cfg.github, base_branch, a.branch
                 )
-                if not ahead:  # None (fail-open) or 0 (already an ancestor)
+                if ahead is None:
+                    # fail-open: the probe itself failed, so this row is NOT
+                    # confirmed clean — re-probe it next pass (#2989).
+                    continue
+                if ahead == 0:
+                    # already an ancestor of base: its content landed, and
+                    # that is permanent (#2989).
+                    _false_merge_confirmed_clean.append(a.assignment_id)
                     continue
                 changed_files = github_ops.get_compare_files(
                     repo_cfg.github, base_branch, a.branch
                 )
                 if not changed_files:
-                    continue  # can't confirm anything — fail open
+                    continue  # can't confirm anything — fail open, re-probe
                 content_differs = False
                 differing_path = None
                 for _path in changed_files[:_FALSE_MERGE_AUDIT_MAX_FILES]:
@@ -3514,7 +3634,10 @@ def reconcile_board_merges(
                         differing_path = _path
                         break
                 if not content_differs:
-                    continue  # verbatim on base already — rebase/squash, not lost
+                    # verbatim on base already — rebase/squash, not lost, and
+                    # a terminal row's content cannot un-land (#2989).
+                    _false_merge_confirmed_clean.append(a.assignment_id)
+                    continue
                 actions.append(
                     f"POSSIBLY LOST (#2639): {a.assignment_id} "
                     f"({a.repo_name} #{a.issue_number}, branch={a.branch}) is "
@@ -3534,5 +3657,11 @@ def reconcile_board_merges(
                     f"skip false-merge audit for {a.assignment_id} "
                     f"({a.repo_name} #{a.issue_number}): {exc}"
                 )
+
+        # #2989: persist the terminal marker once, at the end of the sweep —
+        # one board_meta write per pass, not one per row.  Never on a
+        # dry-run: `--dry-run` must not change what the next real pass does.
+        if _false_merge_confirmed_clean and not dry_run:
+            state.mark_false_merge_audit_clean(_false_merge_confirmed_clean)
 
     return actions

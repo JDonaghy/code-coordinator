@@ -986,7 +986,12 @@ def _reconcile_merges_tick(config: Config) -> list[str]:
     from coord.state import build_board, save_board  # noqa: PLC0415
 
     board = build_board()
-    actions = reconcile_board_merges(board, config)
+    # #2989: the daemon is the ONLY caller that opts into throttling the
+    # false-merge audit (sweep h). It ran on this same 30s tick against a
+    # candidate set proportional to project history — 97% of a reconcile
+    # pass's `gh` calls, and the demand behind the fleet-wide secondary rate
+    # limiting. A manual `coord reconcile-merges` still sweeps every time.
+    actions = reconcile_board_merges(board, config, throttle_false_merge_audit=True)
     save_board(board)
     if actions:
         # #1038: one coarse operational row per tick that did something —
