@@ -218,7 +218,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "HTTP write path.",
     ),
     "test_portal_store.py": Classification(
-        7, (BUCKET_C,),
+        10, (BUCKET_C,),
         "The portal daemon-endpoint pattern, once per endpoint under test: a "
         "file board.db opened with check_same_thread=False (TestClient runs "
         "the handler on a worker thread the autouse connection cannot serve) "
@@ -243,7 +243,19 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "+1 for #2990's test_daemon_portal_answer_preflight_endpoint, the GET "
         "`/portal-answer-preflight` seam backing the dashboard's thin-client "
         "gating checks — both the same daemon-endpoint shape as their "
-        "neighbours above.",
+        "neighbours above. "
+        "+3 for #2995's Ask-exit seams, which finish routing the portal "
+        "write path through the daemon: GET `/portal-link-by-submission` "
+        "(the reverse lookup enqueue-status's #2996 'no link on file' warning "
+        "needs once enqueue-status itself is remote), POST "
+        "`/portal-enqueue-status`, and POST `/portal-enqueue-question` — the "
+        "last of which proves the question row and its `needs-input` "
+        "announcement land from one request rather than observably apart. All "
+        "three are verbatim copies of the endpoint shape above them, for the "
+        "same two reasons: TestClient runs the handler on a worker thread the "
+        "autouse connection cannot serve (hence check_same_thread=False), and "
+        "the same file has to be handed to SqliteStore *by path* for the read "
+        "side, which scratch_database() cannot yield.",
     ),
     "test_milestone_gate.py": Classification(
         3, (BUCKET_C,),
