@@ -1318,3 +1318,64 @@ def test_cli_interactive_dry_run_ships_the_attended_wait_posture():
     # ...and the operator-note offer, so the operator need not know the
     # command exists.
     assert "coord portal note" in result.output
+
+
+def test_cli_interactive_computes_and_writes_house_stack_section(tmp_path, monkeypatch):
+    """#2997 fix round: `_run_decompose_chat_interactive` is the documented
+    `--interactive` counterpart to the headless `dispatch_decomposition_chat`
+    (see `test_dispatch_forwards_house_stack_context_into_the_briefing`
+    above) and must compute the same HOUSE STACK section rather than
+    silently falling back to `build_decomposition_chat_briefing`'s own
+    "(not computed for this briefing)" placeholder. Regression case for the
+    review finding on this issue: an attended intake session for a
+    greenfield repo must still see the fleet's Cloudflare stack.
+    """
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from click.testing import CliRunner
+
+    from coord.commands.portal import portal_group
+
+    local = _machine("here", ["api"])
+    cfg = Config(repos=[_repo("api"), _repo("coord-portal")], machines=[local])
+
+    def _list_dir(repo, path, branch):
+        if path == "" and repo == "acme/coord-portal":
+            return ["wrangler.toml"]
+        return []
+
+    monkeypatch.setattr("coord.github_ops.list_repo_dir", _list_dir)
+    monkeypatch.setattr("coord.github_ops.list_repo_subdirs", lambda repo, path, branch: [])
+    monkeypatch.setattr("coord.github_ops.get_repo_file", lambda repo, path, branch: "")
+
+    runner = CliRunner()
+    with patch("coord.commands.portal._load_config", return_value=cfg), patch(
+        "coord.decomposition_chat.resolve_approved_submission", return_value=SUBMISSION
+    ), patch("coord.test_orchestrator.local_machine", return_value=local), patch(
+        "coord.board_service.resolve", return_value=None
+    ), patch(
+        "coord.state.record_dispatched_assignment"
+    ), patch(
+        "coord.interactive.launch_human_attended_interactive"
+    ):
+        result = runner.invoke(
+            portal_group,
+            ["decompose-chat", "sub_2f6a1c", "--interactive", "--discuss", "--dry-run"],
+        )
+    assert result.exit_code == 0, result.output
+
+    brief_path = _Path(_tempfile.gettempdir()) / "coord-intake-sub_2f6a1c.md"
+    briefing_on_disk = brief_path.read_text(encoding="utf-8")
+    assert "HOUSE STACK" in briefing_on_disk
+    assert "coord-portal" in briefing_on_disk
+    assert "Cloudflare" in briefing_on_disk
+    # The submission's own mapped repo ("api") must not appear in the
+    # HOUSE STACK per-repo list — only as MAPPED REPO(S)/topology, same as
+    # the headless dispatcher's own guarantee.
+    house_stack_section = briefing_on_disk.split("HOUSE STACK", 1)[1].split(
+        "RUNNING CONTEXT", 1
+    )[0]
+    assert "- api (" not in house_stack_section
+    # ...and the seed prompt pointer now names it too.
+    assert "house stack" in result.output.lower() or "house stack" in briefing_on_disk.lower()

@@ -486,7 +486,12 @@ def _repo_stack_signals(repo_github: str, branch: str) -> list[str]:
     if "wrangler.toml" in root_files:
         try:
             wrangler_text = github_ops.get_repo_file(repo_github, "wrangler.toml", branch)
-        except RuntimeError:
+        except (RuntimeError, ValueError):
+            # ValueError also catches `binascii.Error` (a ValueError subclass)
+            # from `get_repo_file_with_sha`'s `base64.b64decode` on a
+            # malformed Contents-API response — this feeds an informational
+            # section, not a gate, so any lookup failure degrades to "no
+            # signal" rather than blowing up the briefing build.
             wrangler_text = ""
         signals += [
             label for key, label in _WRANGLER_BINDING_MARKERS.items() if key in wrangler_text
@@ -495,7 +500,7 @@ def _repo_stack_signals(repo_github: str, branch: str) -> list[str]:
     if "CLAUDE.md" in root_files:
         try:
             claude_md_text = github_ops.get_repo_file(repo_github, "CLAUDE.md", branch).casefold()
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             claude_md_text = ""
         signals += [
             label for key, label in _CLAUDE_MD_KEYWORD_MARKERS.items() if key in claude_md_text

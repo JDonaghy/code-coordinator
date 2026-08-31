@@ -731,6 +731,7 @@ def _run_decompose_chat_interactive(
         build_decomposition_chat_briefing,
         describe_unapproved_submission,
         fetch_running_context,
+        house_stack_context,
         render_running_context_section,
         repo_topology_context,
         resolve_approved_submission,
@@ -794,6 +795,7 @@ def _run_decompose_chat_interactive(
     # that the Ask move would "refuse loudly" — no longer true.
 
     topology_context = repo_topology_context(cfg, repos)
+    house_stack = house_stack_context(cfg, exclude_repos=repos)
     discuss_mode, discuss_reason = select_discuss_mode(cfg, submission, discuss_override=discuss)
     running_context = render_running_context_section(fetch_running_context(submission_id))
     briefing = build_decomposition_chat_briefing(
@@ -802,6 +804,7 @@ def _run_decompose_chat_interactive(
         discuss=discuss_mode,
         discuss_reason=discuss_reason,
         running_context_section=running_context,
+        house_stack_context_section=house_stack,
     )
 
     repo_path = str(_Path(machine.repo_path(repos[0]) or str(_Path.cwd())).expanduser())
@@ -819,9 +822,9 @@ def _run_decompose_chat_interactive(
     seed_prompt = (
         f"Intake session for portal submission {submission_id} "
         f"(MODE: {mode_word} — {discuss_reason}): read the full context at "
-        f"{brief_path} (submission fields, repo topology, and the running-"
-        "context ledger so far) and let's work through it. This is an "
-        "ATTENDED session: state your read and your PROPOSED exit, then stop "
+        f"{brief_path} (submission fields, repo topology, the house stack, "
+        "and the running-context ledger so far) and let's work through it. "
+        "This is an ATTENDED session: state your read and your PROPOSED exit, then stop "
         "and wait for me — write nothing until I answer (#2867)."
     )
 
