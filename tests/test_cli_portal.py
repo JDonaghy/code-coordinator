@@ -439,11 +439,17 @@ def test_decompose_chat_names_the_pulled_status_that_disqualified_it(config_path
 
 def test_decompose_chat_generic_message_when_never_approved_at_all(config_path):
     """No disqualifying status to name here — the submission simply has no
-    approved sign-off on record, so the generic message stays generic."""
+    approved sign-off on record, so the generic message stays generic.
+
+    Matches the enrichment clause's own wording rather than the bare token
+    "last_status" for the same reason as `WITHDRAWAL_WARNING` below: click
+    `Result.output` interleaves stderr, so a loose token can be satisfied by
+    unrelated CLI chatter that only appears in some environments.
+    """
     result = run("portal", "decompose-chat", "--config", config_path, "sub_never_seen")
     assert result.exit_code != 0
     assert "is not a currently-approved portal submission" in result.output
-    assert "last_status" not in result.output
+    assert "its last_status is" not in result.output
 
 
 # ── #2743: --wait blocks and prints the closing summary ────────────────────
@@ -750,12 +756,31 @@ def test_enqueue_preview_rejects_an_empty_url():
 # with no linked milestone/issue and (so, by construction here) no
 # decomposition on record. It must never refuse — only warn.
 
+#: The #2996 warning's own distinctive opening clause.
+#:
+#: Assertions below match on THIS rather than on the bare token "warning",
+#: because under click >= 8.2 ``Result.output`` is no longer a proxy for
+#: stdout — it is an interleaved stdout+stderr stream (see
+#: ``click.testing.Result.output``). A bare ``"warning" not in
+#: result.output.lower()`` therefore also asserts the absence of every
+#: *unrelated* advisory the CLI may write to stderr in some other
+#: environment: ``coord/cli.py``'s "warning: coord CLI is running from a
+#: non-editable install …" banner, ``coord/commands/portal.py``'s "warning:
+#: backstop failed to record intake-session exit", a best-effort store
+#: failure line, and so on. None of those are under test here, and none of
+#: them fire on a developer box while several can fire on a CI runner — so
+#: the loose form is green locally and red in CI for no product reason.
+#: Matching the specific clause keeps the assertion about the behaviour the
+#: test names.
+WITHDRAWAL_WARNING = "has no linked milestone/issue on file"
+
 
 @pytest.mark.parametrize("status", ["planned", "in-progress", "shipped"])
 def test_enqueue_status_warns_before_withdrawing_an_unlinked_submission(status):
     result = run("portal", "enqueue-status", "sub_1", status)
     assert result.exit_code == 0, result.output
-    assert "warning" in result.output.lower()
+    assert WITHDRAWAL_WARNING in result.output
+    assert "warning:" in result.output
     # Names the consequence in operator terms, not just the constant's name.
     assert "Approved work items" in result.output
     assert "decompose-chat" in result.output
@@ -768,7 +793,7 @@ def test_enqueue_status_warns_before_withdrawing_an_unlinked_submission(status):
 def test_enqueue_status_does_not_warn_for_a_non_pulled_status():
     result = run("portal", "enqueue-status", "sub_1", "in-design")
     assert result.exit_code == 0, result.output
-    assert "warning" not in result.output.lower()
+    assert WITHDRAWAL_WARNING not in result.output
 
 
 def test_enqueue_status_does_not_warn_once_a_link_is_on_file(config_path):
@@ -782,7 +807,7 @@ def test_enqueue_status_does_not_warn_once_a_link_is_on_file(config_path):
     )
     result = run("portal", "enqueue-status", "sub_linked", "planned")
     assert result.exit_code == 0, result.output
-    assert "warning" not in result.output.lower()
+    assert WITHDRAWAL_WARNING not in result.output
 
 
 def test_enqueue_status_still_warns_even_when_the_push_itself_is_refused():
@@ -792,7 +817,7 @@ def test_enqueue_status_still_warns_even_when_the_push_itself_is_refused():
     rather than the ordering guard's exit code swallowing the warning."""
     result = run("portal", "enqueue-status", "sub_1", "quality-check")
     assert result.exit_code != 0
-    assert "warning" in result.output.lower()
+    assert WITHDRAWAL_WARNING in result.output
     assert "preview" in result.output
 
 

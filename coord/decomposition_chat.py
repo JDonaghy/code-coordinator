@@ -38,6 +38,7 @@ posture every other dispatcher in this file already uses.
 from __future__ import annotations
 
 import datetime
+import logging
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coord.config import Config
     from coord.models import Machine
+
+_log = logging.getLogger(__name__)
 
 #: Sentinel `issue_title` this module writes onto the dispatched assignment
 #: — mirrors `dispatch_new_issue_chat`'s own `"(new issue draft)"` sentinel
@@ -564,16 +567,37 @@ def describe_unapproved_submission(config: "Config", submission_id: str) -> str:
     client — the same constraint :func:`resolve_approved_submission` itself
     already works around by routing through the daemon's ``/board`` instead
     of reading the wrong box's empty tables.
+
+    **This function must never raise.** It exists only to phrase a failure
+    its callers have already decided on — ``dispatch_decomposition_chat``
+    raises ``RuntimeError(describe_unapproved_submission(...))`` and
+    ``_run_decompose_chat_interactive`` prints it — so an exception escaping
+    the *enrichment* lookup would replace a clear, actionable error with a
+    traceback about a completely different subsystem. The store read is
+    therefore best-effort: any failure (an unreadable/locked portal store, a
+    schema older than :func:`coord.approved_work.disqualifying_status`
+    expects, a thin client that slipped past the ``board_service`` check)
+    degrades to the plain generic message, which is exactly the pre-#2996
+    behaviour and still correct — just less specific.
     """
     base = f"submission {submission_id!r} is not a currently-approved portal submission"
 
-    from coord import board_service  # noqa: PLC0415
-
     reason: str | None = None
-    if board_service.resolve() is None:
-        from coord.approved_work import disqualifying_status  # noqa: PLC0415
+    try:
+        from coord import board_service  # noqa: PLC0415
 
-        reason = disqualifying_status(submission_id)
+        if board_service.resolve() is None:
+            from coord.approved_work import disqualifying_status  # noqa: PLC0415
+
+            reason = disqualifying_status(submission_id)
+    except Exception:  # noqa: BLE001 — best-effort enrichment, never break the message
+        _log.debug(
+            "describe_unapproved_submission: disqualifying-status lookup failed "
+            "for %s; falling back to the generic message",
+            submission_id,
+            exc_info=True,
+        )
+        reason = None
 
     if reason:
         return (
