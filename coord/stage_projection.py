@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from coord.models import CLOSES_ISSUE_TYPES
+from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, effective_issue_number
 
 # ── Stage-status vocabulary — mirrors tui/src/app/pipeline.rs::StageStatus ──
 PENDING = "pending"
@@ -170,6 +170,52 @@ def assignments_for_stage(
         elif t == stage:
             out.append(a)
     return out
+
+
+def _leg_count_for_stage(
+    assignments_for_issue: list,
+    stage: str,
+    *,
+    require_plan: bool,
+) -> int:
+    """How many separate dispatched attempts ("legs") this issue has had at
+    *stage* (#3013) — "attempts a human would recognise as separate", not a
+    raw row count. Each retry/redispatch is already its own board row (a
+    retry dispatches a fresh assignment id rather than mutating the failed
+    one, see ``coord.reconcile._reassign``), so counting rows already gives
+    the right number for stages backed by their own dedicated assignment
+    ``type`` — this only needs to special-case the stages that aren't:
+
+    * ``"work"`` is widened from a literal ``type == "work"`` (plus the
+      existing plan-fold) to the full :data:`WORK_LIKE_TYPES` — an
+      oracle-loop acceptance slice's repeated ``test-author``/``mock-author``
+      legs (#3013's coord-portal#164 example: 4 ``test-author`` legs, 5
+      ``review`` legs on one branch) are exactly the kind of repetition this
+      field exists to surface, and a strict ``type == "work"`` match would
+      never see them.
+    * ``"test"`` has no ``type="test"`` assignment — the Test-stage's
+      dispatched worker is ``type="smoke"`` (``coord.smoke``).
+    * ``"merge"`` has no ``type="merge"`` assignment either — repeated
+      landing attempts show up as ``type="conflict-fix"`` legs (#241).
+
+    Every other stage (``"plan"``, ``"review"``, ``"uat"``, ...) already has
+    a 1:1 assignment ``type``, so :func:`assignments_for_stage` alone gives
+    the right count.
+    """
+    if stage == "work":
+        matching = assignments_for_stage(assignments_for_issue, "work", require_plan=require_plan)
+        seen = {id(a) for a in matching}
+        extra = [
+            a
+            for a in assignments_for_issue
+            if id(a) not in seen and (a.type or "work") in WORK_LIKE_TYPES
+        ]
+        return len(matching) + len(extra)
+    if stage == "test":
+        return sum(1 for a in assignments_for_issue if (a.type or "work") == "smoke")
+    if stage == "merge":
+        return sum(1 for a in assignments_for_issue if (a.type or "work") == "conflict-fix")
+    return len(assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan))
 
 
 def upstream_max_dispatched_at(
@@ -698,6 +744,7 @@ def compute_issue_projection(
     ci_store: Any | None = None,
     uat_enabled: bool = False,
     uat_preview_url: str | None = None,
+    stage_count_assignments: list | None = None,
 ) -> dict[str, Any]:
     """Compute the full per-issue stage badge dict.
 
@@ -717,6 +764,15 @@ def compute_issue_projection(
     carried through unconditionally so a caller can show it next to the
     badge instead of sending the operator to ``coord merge``'s refusal
     message to find it (#2951 item 3).
+
+    ``stage_count_assignments`` (#3013) is the assignment list
+    :func:`_leg_count_for_stage` scans to fill ``stage_counts`` — a client
+    can then render ``Work (2)`` / ``Review (5)`` next to the status badge
+    and suppress the suffix at 1. Defaults to *assignments_for_issue* (the
+    same list ``stages`` uses) when omitted, which is correct for an
+    ordinary issue; :func:`compute_board_stage_projection` passes a
+    separately-keyed list for the #1553 oracle-loop epic/slice case — see
+    that function's docstring.
     """
     names = issue_stage_names(assignments_for_issue, default_gates, uat_enabled=uat_enabled)
     stages: dict[str, str] = {}
@@ -741,8 +797,19 @@ def compute_issue_projection(
     # excluded from the per-issue stage-strip ordering that `default_gates`
     # drives, since it only applies to oracle-loop milestones.
     stages["acceptance"] = acceptance_stage_status_for(assignments_for_issue)
+
+    count_source = (
+        assignments_for_issue if stage_count_assignments is None else stage_count_assignments
+    )
+    stage_counts: dict[str, int] = {
+        name: _leg_count_for_stage(count_source, name, require_plan=require_plan) for name in names
+    }
+    stage_counts.setdefault(
+        "merge", _leg_count_for_stage(count_source, "merge", require_plan=require_plan)
+    )
     return {
         "stages": stages,
+        "stage_counts": stage_counts,
         "acceptance_progress": acceptance_progress_for(assignments_for_issue),
         "uat_preview_url": uat_preview_url if uat_enabled else None,
         "has_approved_review": issue_has_any_approved_review(
@@ -779,6 +846,22 @@ def compute_board_stage_projection(
     ``None`` (the default — e.g. a caller with no config loaded) means no
     repo is treated as opted in, matching :func:`pipeline_stage_names`'s own
     fail-toward-hidden default.
+
+    ``stage_counts`` (#3013) is deliberately built from a SECOND index keyed
+    by ``coord.models.effective_issue_number`` rather than the raw
+    ``assignments_by_key`` below: an oracle-loop acceptance slice's
+    ``test-author``/``mock-author``/``review`` legs are booked
+    (``issue_number``) to the milestone's *tracking* issue, with the child
+    they're actually FOR named in ``for_issue_number`` (see
+    ``coord gates <repo> <slice>``, which resolves the same way). Reusing
+    ``assignments_by_key`` for the count would leave a slice's own
+    ``stage_counts`` reading 0 forever — the same keying trap noted in the
+    #3013 issue's "drive-queue sweep bug" reference. This does NOT touch
+    ``stages`` itself: that stays keyed on the raw ``issue_number`` on
+    purpose (#1652 — re-attributing status by ``for_issue_number`` moved a
+    false "merged" green from the epic onto the child; a leg *count* carries
+    no such false-green risk, so the two fields are allowed to disagree on
+    which issue owns which rows).
     """
     is_closed_by_key: dict[tuple[str, int], bool] = {
         (i["repo_name"], i["number"]): str(i.get("state", "")).lower() == "closed"
@@ -793,6 +876,17 @@ def compute_board_stage_projection(
         if not a.repo_name or a.issue_number is None:
             continue
         assignments_by_key.setdefault((a.repo_name, a.issue_number), []).append(a)
+
+    # #3013: effective-issue-keyed index — see docstring above. Used only to
+    # fill `stage_counts`, never `stages`.
+    assignments_by_effective_key: dict[tuple[str, int], list] = {}
+    for a in assignments:
+        if not a.repo_name:
+            continue
+        eff = effective_issue_number(a)
+        if not eff:
+            continue
+        assignments_by_effective_key.setdefault((a.repo_name, eff), []).append(a)
 
     merge_by_key: dict[tuple[str, int], Any] = {}
     for m in merge_queue_items:
@@ -815,7 +909,11 @@ def compute_board_stage_projection(
         # `load_queue()`/`board_projection()` both order by `id` ascending.
         merge_by_key.setdefault(key, m)
 
-    keys = set(is_closed_by_key) | set(assignments_by_key)
+    # #3013: also union in the effective-key index so an acceptance slice
+    # whose only board rows are booked to the tracking issue (nothing keyed
+    # to the slice's own issue_number, e.g. never separately synced) still
+    # gets a projection row for stage_counts to land in.
+    keys = set(is_closed_by_key) | set(assignments_by_key) | set(assignments_by_effective_key)
 
     uat_enabled_by_repo: dict[str, bool] = {}
 
@@ -840,6 +938,7 @@ def compute_board_stage_projection(
                 if uat_enabled
                 else None
             ),
+            stage_count_assignments=assignments_by_effective_key.get(key, []),
         )
         entry["repo_name"] = repo_name
         entry["issue_number"] = issue_number
