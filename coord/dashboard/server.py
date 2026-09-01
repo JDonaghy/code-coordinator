@@ -631,6 +631,29 @@ def openapi_spec() -> dict:
                 "responses": {"200": {"description": "OK"}},
             }
         },
+        "/api/machines/health": {
+            "get": {
+                "summary": (
+                    "Fleet-wide health snapshot (#3024): per-machine severity/"
+                    "stale/checked_at/results plus fleet-scope checks, verbatim "
+                    "off coord.health.fleet_snapshot.FleetHealthSnapshot"
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK -- {schema, refreshed_at, machine_health: [...], "
+                            "fleet_checks: [...], truncated}, unchanged"
+                        ),
+                    },
+                    "503": {
+                        "description": (
+                            "The daemon is unreachable -- an explicit "
+                            "{error, reachable: false} body, never a stale-looking 200"
+                        ),
+                    },
+                },
+            }
+        },
         "/api/machines/metrics": {
             "get": {
                 "summary": (
@@ -1239,6 +1262,72 @@ def build_app(
         rows = machine_health_rows(machine_names, raw, now=time.time())
         return board, {row["machine"]: row for row in rows}
 
+    _EMPTY_FLEET_HEALTH_BLOCK = {
+        "schema": 1,
+        "refreshed_at": None,
+        "machine_health": [],
+        "fleet_checks": [],
+        "truncated": False,
+    }
+
+    def _read_fleet_health() -> dict:
+        """The full ``FleetHealthSnapshot``-shaped block backing ``GET
+        /api/machines/health`` (#3024).
+
+        Deliberately a SEPARATE read from ``_read_board_and_machine_health()``
+        rather than folding this into it: that helper's ``health_by_name``
+        already carries every field this returns per machine (``severity``,
+        ``stale``, ``checked_at``, ``results``) — see
+        ``coord.health.fleet_snapshot.machine_health_rows`` — but ``GET
+        /api/machines`` deliberately narrows to the small reachability
+        subset the fleet panel renders on every poll, the same way ``GET
+        /api/machines/metrics`` was split out from ``GET /api/machines``
+        (#3021/#3022) instead of inflating it: the per-check ``results``
+        arrays (headroom strings, values, detail) are exactly the
+        bytes-heavy, low-poll-frequency payload that split precedent argues
+        for keeping out of the panel's steady-state response.
+
+        Returns the block **verbatim** — never re-derives, re-ranks, or
+        collapses a severity here. Per #1630/#3023's honesty contract,
+        ``_effective_severity`` (upstream, in ``coord.health.fleet_snapshot``)
+        has already made the one call that matters: ``unknown``, never a
+        carried-forward ``ok``, whenever the daemon can't currently vouch for
+        a machine, while still keeping that machine's last-known
+        ``results``/``checked_at`` so a renderer can distinguish "OK" from
+        "last measured OK, a while ago".
+
+        Thin client (``board_service`` configured): the daemon's own
+        ``fleet_health`` sibling key off ``GET /board`` —
+        ``FleetHealthSnapshot.to_dict()`` (``schema``/``refreshed_at``/
+        ``machine_health``/``fleet_checks``/``truncated``) — forwarded
+        unexamined. Raises on an unreachable daemon; callers degrade
+        explicitly (mirrors ``api_machine_metrics``, #3022).
+
+        Co-located (no ``board_service``): ``fleet_checks`` is always ``[]``
+        here — those probes (board latency, phantom-running rows, deploy-lane
+        skew, …) only exist inside a live ``coord serve`` process's in-memory
+        ``FleetHealthRefresher``; a separate dashboard process has no way to
+        reach into that process's memory, same restriction
+        ``coord.health.aggregate.local_fleet_health_block`` documents for
+        ``coord status``. Per-machine severities still come from the same
+        row-assembly the thin-client path rides (``machine_health_rows``), so
+        the two modes can't drift on that half.
+        """
+        from coord import board_service  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            return payload.get("fleet_health") or dict(_EMPTY_FLEET_HEALTH_BLOCK)
+
+        from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
+
+        machine_names = [m.name for m in config.machines]
+        block = local_fleet_health_block(machine_names)
+        return {**_EMPTY_FLEET_HEALTH_BLOCK, **block}
+
     def _active_assignments_by_machine(board) -> dict[str, list[dict]]:  # noqa: ANN001
         """Group *board*'s RUNNING active assignments by machine (#3023).
 
@@ -1543,6 +1632,66 @@ def build_app(
                 machine_data["assignments"] = {"active": active}
             result.append(machine_data)
         return JSONResponse(result)
+
+    async def api_machines_health(request: Request) -> JSONResponse:
+        """GET /api/machines/health — the fleet-wide health snapshot (#3024).
+
+        The richest per-machine data the coordinator has, already computed
+        and already refreshed by the daemon's health-poll tick
+        (``coord.health.fleet_snapshot.FleetHealthRefresher``, #1630) and
+        already served on the board daemon's own ``/board`` for coord-tui —
+        this is what makes it reachable from ``coord web`` too, which
+        previously had no view of it at all.
+
+        Kept as its own endpoint rather than folded into ``GET
+        /api/machines``: see ``_read_fleet_health()``'s docstring for why —
+        in short, the same split ``GET /api/machines/metrics`` already made
+        from ``GET /api/machines`` (#3021/#3022), because the per-check
+        ``results`` this carries (headroom strings, values, detail, one row
+        per check per machine) are meaningfully heavier than the small
+        reachability summary the fleet panel polls on every tick.
+
+        Body shape mirrors ``/board``'s own ``fleet_health`` key exactly
+        (``coord.health.fleet_snapshot.FleetHealthSnapshot.to_dict()``):
+        ``{schema, refreshed_at, machine_health: [...], fleet_checks: [...],
+        truncated}``. Every ``machine_health`` row carries ``severity``,
+        ``stale``, ``checked_at`` and ``results`` verbatim from
+        ``_effective_severity``/``machine_health_rows`` — never re-derived,
+        re-ranked, or collapsed at this layer (#1630's honesty contract: a
+        stale/offline/never-polled machine reads ``unknown``, never a
+        carried-forward ``ok``, while its last-known ``results``/
+        ``checked_at`` are retained so a renderer can still tell "OK" apart
+        from "last measured OK, a while ago").
+
+        Degrades honestly on an unreachable daemon (thin-client mode only —
+        same failure mode ``api_machine_metrics`` already guards against,
+        #3022): an explicit ``{error, reachable: false}`` 503, never a 200
+        with an empty/last-known block a renderer could mistake for "fleet
+        quiet, all healthy".
+
+        Fixture mode has no live health poll to simulate, so it serves
+        whatever ``fleet_health`` block (if any) was captured alongside the
+        seeded ``/board`` payload — the same "golden /board capture drops in
+        unchanged" posture ``FixtureServer.board()`` and friends already
+        have — falling back to the same all-empty shape a fresh install with
+        no health data yet would report, rather than fabricating severities.
+        """
+        if _fixture is not None:
+            block = _fixture.board_payload.get("fleet_health")
+            return JSONResponse(block if block else dict(_EMPTY_FLEET_HEALTH_BLOCK))
+
+        try:
+            block = _read_fleet_health()
+        except Exception as e:  # noqa: BLE001 — network failure/timeout/daemon 5xx: all "unreachable"
+            return JSONResponse(
+                {
+                    "error": "fleet health daemon unreachable",
+                    "detail": str(e),
+                    "reachable": False,
+                },
+                status_code=503,
+            )
+        return JSONResponse(block)
 
     def _machine_metrics_daemon_target():  # -> coord.client.ServiceConfig
         """Where ``GET /api/machines/metrics`` actually reaches for data (#3022).
@@ -3107,6 +3256,7 @@ def build_app(
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
         Route("/api/machines", api_machines, methods=["GET"]),
+        Route("/api/machines/health", api_machines_health, methods=["GET"]),
         Route("/api/machines/metrics", api_machine_metrics, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
