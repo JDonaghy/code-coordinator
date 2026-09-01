@@ -68,8 +68,12 @@ def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("coord.dashboard.server.write_board", _boom)
     monkeypatch.setattr("coord.dashboard.server.load_proposals", _boom)
     monkeypatch.setattr("coord.dashboard.server.list_drive_queue", _boom)
-    monkeypatch.setattr("coord.dashboard.server.check_all", _boom)
-    monkeypatch.setattr("coord.dashboard.server.fetch_status", _boom)
+    # #3023: GET /api/machines no longer fans out to the fleet at all (live
+    # mode now reads the daemon's already-refreshed health snapshot instead
+    # of probing `check_all`/`fetch_status`) — these two boundaries assert
+    # fixture mode never falls through to THAT read path either.
+    monkeypatch.setattr("coord.state.load_machine_health", _boom)
+    monkeypatch.setattr("coord.client.fetch_board_payload", _boom)
     monkeypatch.setattr("coord.merge_queue.load_queue", _boom)
     monkeypatch.setattr("coord.state.load_assignment_review_findings", _boom)
     monkeypatch.setattr("coord.github_ops._gh", _boom)

@@ -51,7 +51,6 @@ from coord.drive_queue import (
     summarize_drive_queue,
 )
 from coord.models import Assignment
-from coord.network import check_all, fetch_status
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 from coord.pipeline import PipelineView
 from coord.state import list_drive_queue, load_proposals
@@ -1142,6 +1141,71 @@ def build_app(
             return
         write_board(board)
 
+    def _read_machine_health() -> dict[str, dict]:
+        """Every configured machine's latest daemon-tick-refreshed health
+        row, keyed by machine name (#3023).
+
+        Backs ``GET /api/machines``. Same daemon-vs-local resolution as
+        ``_read_board()`` above, applied to the fleet-health block instead
+        of the board: a thin client (``board_service`` configured) reads
+        the SAME already-published ``/board`` response's
+        ``fleet_health.machine_health`` sibling key — the tick-refreshed
+        output of ``coord.health.fleet_snapshot.FleetHealthRefresher``
+        (#1630) a live board poll already carries — never a fresh
+        per-request probe of the fleet. A dashboard co-located with the
+        daemon (no ``board_service``) reads that exact same tick's result
+        straight out of the shared local DB via
+        ``coord.state.load_machine_health`` + the same
+        ``_machine_health_rows`` helper ``FleetHealthRefresher.refresh()``
+        itself calls right after persisting — so the two modes can't drift.
+
+        A machine absent from the returned dict was never polled (fresh
+        install, or nothing has ticked the health refresher yet) — callers
+        must treat that the same as an ``unknown`` state, never as healthy
+        (#1485's failure mode).
+        """
+        from coord import board_service  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            rows = (payload.get("fleet_health") or {}).get("machine_health") or []
+            return {row["machine"]: row for row in rows}
+
+        from coord.health.fleet_snapshot import _machine_health_rows  # noqa: PLC0415
+        from coord.state import load_machine_health  # noqa: PLC0415
+
+        raw = load_machine_health()
+        machine_names = [m.name for m in config.machines]
+        rows = _machine_health_rows(machine_names, raw, now=time.time())
+        return {row["machine"]: row for row in rows}
+
+    def _active_assignments_by_machine(board) -> dict[str, list[dict]]:  # noqa: ANN001
+        """Group *board*'s active assignments by machine (#3023).
+
+        Backs the legacy dashboard's per-machine "busy" card
+        (``coord/dashboard/index.html``'s ``loadMachines()``), which used
+        to come from a live per-agent ``GET /status`` probe. The board
+        already carries the same fact — which issue a machine is currently
+        running — from the normal board read path, so grouping it here
+        costs zero extra I/O beyond the ``_read_board()`` call every
+        request already needs elsewhere.
+        """
+        out: dict[str, list[dict]] = {}
+        for a in board.active:
+            out.setdefault(a.machine_name, []).append({
+                "assignment_id": a.assignment_id,
+                "status": a.status,
+                "spec": {
+                    "issue_number": a.issue_number,
+                    "issue_title": a.issue_title,
+                    "repo_name": a.repo_name,
+                },
+            })
+        return out
+
     def _read_drive_queue() -> list[dict]:
         """Every drive-queue row — seeded fixture or the daemon/local DB (#2428).
 
@@ -1350,27 +1414,46 @@ def build_app(
         })
 
     async def api_machines(request: Request) -> JSONResponse:
+        """GET /api/machines — the fleet panel, from daemon-refreshed state (#3023).
+
+        Used to do a synchronous fan-out probe on every request: ``GET
+        /health`` against every configured machine, then ``GET /status``
+        against every one that answered — seconds of worst-case latency,
+        multiplied by every connected client polling this panel live. Now
+        serves the SAME state the board daemon's tick loop already
+        refreshes on its own cadence (``_read_machine_health()``) plus the
+        board this dashboard reads for every other panel anyway
+        (``_active_assignments_by_machine()``) — zero per-request network
+        fan-out to the fleet, whether this dashboard is co-located with the
+        daemon or a thin client of it.
+        """
         if _fixture is not None:
             # Seeded reachability — never probe the fleet in fixture mode.
             return JSONResponse(_fixture.machines())
-        statuses = check_all(config.machines, timeout=3.0)
+        health_by_name = _read_machine_health()
+        assignments_by_machine = _active_assignments_by_machine(_read_board())
         result = []
-        for s in statuses:
+        for m in config.machines:
+            row = health_by_name.get(m.name) or {}
             machine_data = {
-                "name": s.machine.name,
-                "host": s.machine.host,
-                "repos": s.machine.repos,
-                "state": s.state,
-                "reason": s.reason,
-                "latency_ms": s.latency_ms,
+                "name": m.name,
+                "host": m.host,
+                "repos": m.repos,
+                "state": row.get("state", "unknown"),
+                "reason": row.get("reason", ""),
+                "latency_ms": row.get("latency_ms"),
+                # #3023: agent's own running version — compared against
+                # this coordinator's local version by consumers (coord-tui's
+                # `machine_detail_list` shows it red on a mismatch) — and
+                # total on-disk size of this agent's git worktrees. Both
+                # ride the same tick-refreshed health blob as everything
+                # else here; see `coord.health.fleet_snapshot.refresh`.
+                "agent_version": row.get("agent_runtime_version"),
+                "worktree_bytes": row.get("worktree_bytes"),
             }
-            if s.is_online:
-                status_result = fetch_status(s.machine, timeout=3.0)
-                if status_result.ok:
-                    machine_data["assignments"] = status_result.data
-                else:
-                    machine_data["assignments"] = None
-                    machine_data["status_error"] = status_result.error
+            active = assignments_by_machine.get(m.name)
+            if active:
+                machine_data["assignments"] = {"active": active}
             result.append(machine_data)
         return JSONResponse(result)
 
