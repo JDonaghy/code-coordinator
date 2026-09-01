@@ -3161,6 +3161,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         log_path=entry.get("log_path"),
     )
     assignment_type = record.get("type", "work")
+    if transition.issue_number == 0:
+        # #3039: issue_number=0 is the established "no GitHub issue" sentinel
+        # (see coord/milestone_chat.py:524, coord/refine_chat.py:439,
+        # coord/new_issue_chat.py) — a board-level chat (decomposition-chat
+        # against a portal submission, a brand-new milestone/issue draft,
+        # board-level refinement) has no real issue to comment on, and the
+        # TUI routes these rows to a Board Chat tab rather than an issue
+        # thread. `gh issue comment 0` always fails (GraphQL "Could not
+        # resolve to an issue or pull request with the number of 0"), so
+        # posting must be skipped entirely rather than retried — record the
+        # notification locally only, same as the milestone-chat/refinement
+        # no-post branch below (which happens to also apply here, but not
+        # every type=="refinement" row is issue_number==0, so this check
+        # must stand on its own rather than folding into that allowlist).
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+        return
     if transition.event == EVENT_COMPLETION and assignment_type in (
         "refinement",
         "milestone-chat",
