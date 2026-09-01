@@ -3175,10 +3175,29 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # no-post branch below (which happens to also apply here, but not
         # every type=="refinement" row is issue_number==0, so this check
         # must stand on its own rather than folding into that allowlist).
+        #
+        # Non-blocking #3039 follow-up: thread the same failure-reason/
+        # exit-code pair every other EVENT_FAILURE branch in this function
+        # carries (see the identical `or` chain a few branches down) so an
+        # EVENT_FAILURE sentinel row doesn't land as `status='failed'` with
+        # both columns null — `mark_notified` only applies them on an
+        # EVENT_FAILURE-flavoured write, so passing them unconditionally is
+        # a no-op for every other event.
+        _failure_reason = (
+            entry.get("usage_limit_reason")
+            or entry.get("api_error_reason")
+            or entry.get("push_failure_reason")
+            or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
+            or entry.get("runtime_ceiling_reason")
+            or entry.get("host_sleep_reason")
+        )
         mark_notified(
             transition.assignment_id,
             transition.event,
             branch=entry.get("branch"),
+            failure_reason=_failure_reason,
+            exit_code=transition.exit_code,
         )
         return
     if transition.event == EVENT_COMPLETION and assignment_type in (

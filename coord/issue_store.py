@@ -344,7 +344,25 @@ def _post_github_comment(
     Returns ``(ok, error)``.  We never raise — the local DB write is the
     authoritative state record; a comment post failure is surfaced to
     the caller as diagnostics but must not undo the state transition.
+
+    #3039: ``issue_number == 0`` is the established "no GitHub issue"
+    sentinel (``assignments.issue_number`` is ``NOT NULL``, so 0 is how
+    "no issue" is spelled — see ``coord.notify.post_transition``'s
+    identical guard, ``coord/milestone_chat.py:524``,
+    ``coord/refine_chat.py:439``). A board-level chat row (decomposition-
+    chat against a portal submission, a brand-new milestone/issue draft,
+    board-level refinement) has no real issue to comment on, and
+    ``gh issue comment 0`` always fails (GraphQL "Could not resolve to an
+    issue or pull request with the number of 0"). Every caller of this
+    function — ``_post_done_path``/``_post_advisory_path``/
+    ``_post_failure_path`` plus the audit/result paths — funnels through
+    here, so guarding it once here (rather than at each call site) is
+    the shared fix: skip the doomed API call and report "not posted, no
+    error" so callers still record the notification locally without
+    filing a nonsensical error string.
     """
+    if issue_number == 0:
+        return False, None
     try:
         github_ops.post_issue_comment(repo_github, issue_number, body)
         return True, None

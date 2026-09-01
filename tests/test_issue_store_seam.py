@@ -502,6 +502,110 @@ class TestPostCompletion:
         assert row["status"] == "done"
 
 
+class TestNoIssueSentinelSkipsGithubPost:
+    """#3039: `issue_number == 0` is the established "no GitHub issue"
+    sentinel (`assignments.issue_number` is NOT NULL, so 0 is how "no issue"
+    is spelled — see coord.notify.post_transition's identical guard,
+    coord/milestone_chat.py:524, coord/refine_chat.py:439). A terminal
+    decomposition-chat assignment (dispatched against a portal submission,
+    not a GitHub issue) routes through `post_completion` → one of
+    `_post_done_path`/`_post_advisory_path`/`_post_failure_path` → the
+    shared `_post_github_comment` sink. Before this fix, that sink called
+    `github_ops.post_issue_comment` unconditionally, so `finalize_interactive_
+    exit`'s hardcoded `issue_number=0` exit backstop (coord/commands/
+    portal.py's `_run_decompose_chat_interactive`) fired the doomed
+    `gh issue comment 0` GraphQL call every time. The guard now lives in
+    `_post_github_comment` itself so all three terminal paths share it."""
+
+    def test_done_path_skips_post_and_reports_not_posted(self) -> None:
+        _seed_running_assignment(
+            "aid-sentinel-done", issue_number=0, assignment_type="decomposition-chat",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-sentinel-done",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=0,
+                    exit_code=0,
+                    commits_ahead=3,
+                    branch="decomposition-chat",
+                )
+            )
+        post.assert_not_called()
+        assert outcome.status == "done"
+        assert outcome.posted is False
+        assert outcome.error is None
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-sentinel-done",),
+        ).fetchone()
+        assert row["status"] == "done"
+
+    def test_advisory_path_skips_post_and_reports_not_posted(self) -> None:
+        _seed_running_assignment(
+            "aid-sentinel-adv", issue_number=0, assignment_type="decomposition-chat",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-sentinel-adv",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=0,
+                    exit_code=0,
+                    commits_ahead=0,
+                )
+            )
+        post.assert_not_called()
+        assert outcome.status == "advisory"
+        assert outcome.posted is False
+        assert outcome.error is None
+
+    def test_failed_path_skips_post_and_reports_not_posted(self) -> None:
+        _seed_running_assignment(
+            "aid-sentinel-fail", issue_number=0, assignment_type="decomposition-chat",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-sentinel-fail",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=0,
+                    exit_code=1,
+                    commits_ahead=0,
+                )
+            )
+        post.assert_not_called()
+        assert outcome.status == "failed"
+        assert outcome.posted is False
+        assert outcome.error is None
+
+    def test_real_issue_number_still_posts(self) -> None:
+        """Guard rail: the new `issue_number == 0` check must not swallow
+        legitimate real-issue posts."""
+        _seed_running_assignment("aid-sentinel-real", issue_number=7)
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-sentinel-real",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=1,
+                )
+            )
+        post.assert_called_once()
+        assert outcome.posted is True
+
+
 # ── post_result (coord report-result sink) ─────────────────────────────────
 
 

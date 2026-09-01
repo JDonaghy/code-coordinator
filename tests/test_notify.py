@@ -1886,7 +1886,7 @@ class TestNoIssueSentinelNotifySuppression:
 
         mock_post_completion.assert_not_called()
         mock_mark_notified.assert_called_once_with(
-            "dc-1", EVENT_COMPLETION, branch=None
+            "dc-1", EVENT_COMPLETION, branch=None, failure_reason=None, exit_code=0,
         )
 
     def test_decomposition_chat_failure_skips_post_failure(self) -> None:
@@ -1921,7 +1921,124 @@ class TestNoIssueSentinelNotifySuppression:
 
         mock_post_failure.assert_not_called()
         mock_mark_notified.assert_called_once_with(
-            "dc-2", EVENT_FAILURE, branch=None
+            "dc-2", EVENT_FAILURE, branch=None, failure_reason=None, exit_code=1,
+        )
+
+    def test_decomposition_chat_failure_threads_failure_reason(self) -> None:
+        """Non-blocking #3039 follow-up: the sentinel branch must thread
+        `failure_reason`/`exit_code` through to `mark_notified` exactly like
+        every other EVENT_FAILURE branch in `post_transition` — otherwise a
+        `status='failed'` sentinel row is left with both columns null even
+        though the worker's own diagnostic (e.g. a usage-limit kill) was
+        available on `entry`."""
+        from coord.notify import post_transition, Transition, EVENT_FAILURE
+
+        transition = Transition(
+            assignment_id="dc-3",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_FAILURE,
+            exit_code=1,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+            "usage_limit_reason": "usage limit — resets 3pm",
+        }
+        with (
+            patch("coord.notify.post_failure") as mock_post_failure,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_failure.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-3",
+            EVENT_FAILURE,
+            branch=None,
+            failure_reason="usage limit — resets 3pm",
+            exit_code=1,
+        )
+
+    def test_decomposition_chat_advisory_skips_post_advisory(self) -> None:
+        """The sentinel guard fires unconditionally on `issue_number == 0`,
+        before the event if/elif chain — cover EVENT_ADVISORY too, not just
+        EVENT_COMPLETION/EVENT_FAILURE, so the guard's own "regardless of
+        event" comment is verified rather than inferred."""
+        from coord.notify import post_transition, Transition, EVENT_ADVISORY
+
+        transition = Transition(
+            assignment_id="dc-4",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_ADVISORY,
+            exit_code=0,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_advisory") as mock_post_advisory,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_advisory.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-4", EVENT_ADVISORY, branch=None, failure_reason=None, exit_code=0,
+        )
+
+    def test_decomposition_chat_refused_policy_skips_post_refused_policy(
+        self,
+    ) -> None:
+        """Same guard, EVENT_REFUSED_POLICY leg."""
+        from coord.notify import post_transition, Transition, EVENT_REFUSED_POLICY
+
+        transition = Transition(
+            assignment_id="dc-5",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_REFUSED_POLICY,
+            exit_code=0,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_refused_policy") as mock_post_refused_policy,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_refused_policy.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-5", EVENT_REFUSED_POLICY, branch=None, failure_reason=None, exit_code=0,
         )
 
 
