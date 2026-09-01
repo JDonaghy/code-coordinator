@@ -372,6 +372,21 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "reached, so a throwaway :memory: handle is the cheapest correct "
         "stand-in.",
     ),
+    "test_serve_app.py": Classification(
+        1, (BUCKET_C,),
+        "#3021's GET /machines/metrics route tests: the `file_db` fixture "
+        "writes a schema'd board into a real file under tmp_path because "
+        "build_app() is handed `SqliteStore(file_db)`, and SqliteStore opens "
+        "the database *by path* with its own mode=ro connection — it can "
+        "never see the autouse coord_db fixture's `:memory:` database. Only "
+        "one site, and no rw_db twin, because this route is pure read path: "
+        "the metrics themselves come from an injected "
+        "MachineMetricsSampler's in-process ring buffer "
+        "(build_app(machine_metrics_sampler=...)), not from the board, so "
+        "nothing is ever written through the TestClient worker thread. "
+        "scratch_database() does not fit for the usual reason — it yields a "
+        "connection, and SqliteStore needs the path.",
+    ),
     "test_serve_app_board_trim.py": Classification(
         1, (BUCKET_C,),
         "_seed_big_board writes an oversized board into a real file so the "
