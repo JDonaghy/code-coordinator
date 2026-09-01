@@ -53,6 +53,7 @@ defect, with no network and no live agents.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -141,6 +142,18 @@ class GithubFacts:
     workflow_error: str | None = None
     claude_md_present: bool | None = None
     claude_md_error: str | None = None
+    # #3037: is `graphify-out/` guarded against an accidental `git add -A`?
+    # Two independent, both-correct shapes exist across the fleet (see
+    # `evaluate_contents`) — each probed and reported separately so the
+    # evaluator can accept EITHER without either probe's failure hiding the
+    # other's answer.
+    graphify_out_gitignore_present: bool | None = None
+    graphify_out_gitignore_error: str | None = None
+    # None when the root `.gitignore` itself could not be determined either
+    # way (see `root_gitignore_error`) — distinct from a proven "no
+    # graphify-out/ line in it".
+    root_gitignore_has_graphify_out: bool | None = None
+    root_gitignore_error: str | None = None
 
 
 @dataclass
@@ -347,6 +360,32 @@ def workflow_triggers_on_pull_request(content: str) -> bool:
     return False
 
 
+# #3037: matches a root `.gitignore` line that ignores `graphify-out/` —
+# `graphify-out`, `graphify-out/`, a root-anchored `/graphify-out/`, or a
+# trailing `*`/`**` glob, all of which git treats as "ignore the directory".
+# Deliberately narrow (no partial/substring match) so a line like
+# `not-graphify-out/` or a comment mentioning the directory can't false-
+# positive as a guard.
+_GRAPHIFY_OUT_LINE_RE = re.compile(r"^/?graphify-out/?(\*\*?)?$")
+
+
+def root_gitignore_ignores_graphify_out(content: str) -> bool:
+    """True when *content* (a root ``.gitignore``) has a line that ignores
+    ``graphify-out/`` — the second of the two guard shapes live across the
+    fleet (space-invaders, grocery-list), sibling to the self-ignoring
+    ``graphify-out/.gitignore`` shape every other repo uses. Comments and
+    blank lines are skipped; matching is line-exact, not substring, so a
+    line merely mentioning the directory in a comment doesn't count.
+    """
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _GRAPHIFY_OUT_LINE_RE.match(line):
+            return True
+    return False
+
+
 def gather_github_facts(
     slug: str | None,
     *,
@@ -412,6 +451,33 @@ def gather_github_facts(
         facts.claude_md_present = ops.repo_file_exists(slug, "CLAUDE.md", branch)
     except Exception as exc:  # noqa: BLE001
         facts.claude_md_error = str(exc)
+
+    # #3037: probed independently from the root-.gitignore check below, so
+    # one probe's failure never hides the other's answer — `evaluate_contents`
+    # accepts either guard, and needs both votes to say so honestly.
+    try:
+        facts.graphify_out_gitignore_present = ops.repo_file_exists(
+            slug, "graphify-out/.gitignore", branch,
+        )
+    except Exception as exc:  # noqa: BLE001
+        facts.graphify_out_gitignore_error = str(exc)
+
+    try:
+        root_gitignore = ops.get_repo_file(slug, ".gitignore", branch)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "404" in msg:
+            # No root .gitignore at all — a real, provable "no" for this
+            # guard shape, not an unanswerable probe.
+            facts.root_gitignore_has_graphify_out = False
+        else:
+            facts.root_gitignore_error = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        facts.root_gitignore_error = str(exc)
+    else:
+        facts.root_gitignore_has_graphify_out = root_gitignore_ignores_graphify_out(
+            root_gitignore,
+        )
 
     return facts
 
@@ -1132,7 +1198,68 @@ def evaluate_contents(facts: RepoFacts) -> list[Finding]:
             ),
         ))
 
+    out.extend(_evaluate_graphify_out_guard(facts))
+
     return out
+
+
+# #3037: `graphify-out/` guard against an accidental `git add -A`. Two
+# shapes are both correct across the fleet (see `root_gitignore_ignores_
+# graphify_out`'s docstring) — a self-ignoring `graphify-out/.gitignore`
+# (what `coord repo create` now seeds) or a `graphify-out/` line in the root
+# `.gitignore` (space-invaders, grocery-list). Either one alone is enough;
+# only "neither" is reported, and only when BOTH probes actually answered —
+# one probe erroring must never masquerade as the other's "no".
+def _evaluate_graphify_out_guard(facts: RepoFacts) -> list[Finding]:
+    gh = facts.gh
+    if gh.graphify_out_gitignore_present or gh.root_gitignore_has_graphify_out:
+        guard = (
+            "graphify-out/.gitignore" if gh.graphify_out_gitignore_present
+            else "a `graphify-out/` line in the root .gitignore"
+        )
+        return [Finding(
+            layer="contents", check="contents.graphify_out_guarded", severity=OK,
+            summary=f"graphify-out/ is guarded ({guard})",
+        )]
+
+    errors = [e for e in (gh.graphify_out_gitignore_error, gh.root_gitignore_error) if e]
+    if errors:
+        return [Finding(
+            layer="contents", check="contents.graphify_out_guard_unknown",
+            severity=UNKNOWN,
+            summary=(
+                "could not check whether graphify-out/ is guarded — "
+                + "; ".join(errors)
+            ),
+        )]
+
+    if (
+        gh.graphify_out_gitignore_present is False
+        and gh.root_gitignore_has_graphify_out is False
+    ):
+        return [Finding(
+            layer="contents", check="contents.graphify_out_unguarded", severity=WARN,
+            summary=(
+                "graphify-out/ has neither guard — no graphify-out/.gitignore "
+                "and no `graphify-out/` line in the root .gitignore. The "
+                "seeded post-checkout hook's own comment treats a guard as a "
+                "given; without one, a worker's `git add -A` on a linked "
+                "worktree commits the multi-MB rebuilt graph, or worse, "
+                "machine-local absolute-path symlinks (grocery-list#3)"
+            ),
+            fix=(
+                "add graphify-out/.gitignore (the `*` / `!.gitignore` block "
+                "coord repo create now seeds — see coord/commands/repo.py's "
+                "_GRAPHIFY_OUT_GITIGNORE) via a PR — not automatic, "
+                "`coord repo doctor --fix` only repairs graphify's "
+                "machine-local half"
+            ),
+        )]
+
+    # Neither probe errored, but also neither returned a proven False for
+    # BOTH — e.g. gathering wasn't wired up for this call path. Stay silent
+    # rather than guess; this mirrors claude_md's UNKNOWN-vs-silent split.
+    return []
 
 
 def evaluate_oracle(facts: RepoFacts) -> list[Finding]:

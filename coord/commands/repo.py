@@ -297,6 +297,30 @@ fi
 gfy_chain post-merge "$@"
 """
 
+# #3037: the seeded `post-checkout` hook above documents, as a design
+# invariant, that `graphify-out/.gitignore` exists and is tracked ("only
+# graphify-out/.gitignore is tracked ... `git worktree add` materialises
+# graphify-out/ with only the tracked .gitignore checked out"). But until
+# this constant, `_seed_files` never actually wrote that file — a repo
+# created by `coord repo create` shipped a hook whose contract was false
+# from the first commit. The self-ignoring `*` / `!.gitignore` form is
+# seeded (not a root-.gitignore line) because it travels with the directory
+# and reaches every clone, including ones that never see the root file
+# rewritten. See `coord.repo_onboard` for the doctor-side check, which
+# accepts this form OR a root `.gitignore` entry — both are correct, and are
+# the two shapes live across the fleet.
+_GRAPHIFY_OUT_GITIGNORE = """\
+# graphify-out/ is a regenerable, machine-local cache rebuilt by the
+# post-commit / post-checkout git hooks — we do NOT commit it:
+#   - every machine rebuilds locally (one-time `/graphify` seed, then free
+#     AST refresh on each commit), so sharing the built copy is redundant
+#   - graph.json is multi-MB and rewritten every commit -> history bloat and
+#     guaranteed merge conflicts across parallel worker branches
+# Only this .gitignore is tracked, so the rule reaches every clone.
+*
+!.gitignore
+"""
+
 # `--template`/per-stack default for the seeded CI workflow (#2747's
 # proposal point 2). `generic` is the default and the only one guaranteed to
 # report a GREEN check on a repo with no application code yet — `python`/
@@ -420,9 +444,12 @@ TODO: language version, formatter/linter, commit message style.
 def _seed_files(name: str, ci_template: str) -> list[tuple[str, str, bool]]:
     """The ``(path, content, executable)`` triples :func:`coord.github_ops.
     create_commit_with_files` seeds into a freshly created repo (#2747):
-    ``CLAUDE.md``, a CI workflow that triggers on ``pull_request``, and the
-    ``.githooks/`` port. The three ``.githooks/*`` shims are executable —
-    everything else is a plain file.
+    ``CLAUDE.md``, a CI workflow that triggers on ``pull_request``, the
+    ``.githooks/`` port, and ``graphify-out/.gitignore`` (#3037 — the seeded
+    ``post-checkout`` hook depends on that file existing and tracked; without
+    it the hook's own documented invariant is false from the first commit).
+    The three ``.githooks/*`` shims are executable — everything else is a
+    plain file.
     """
     return [
         ("CLAUDE.md", _render_claude_md_skeleton(name), False),
@@ -431,6 +458,7 @@ def _seed_files(name: str, ci_template: str) -> list[tuple[str, str, bool]]:
         (".githooks/post-checkout", _GITHOOKS_POST_CHECKOUT, True),
         (".githooks/post-commit", _GITHOOKS_POST_COMMIT, True),
         (".githooks/post-merge", _GITHOOKS_POST_MERGE, True),
+        ("graphify-out/.gitignore", _GRAPHIFY_OUT_GITIGNORE, False),
     ]
 
 
@@ -783,9 +811,10 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
             "— the worker WORKTREE BASE"
         )
         click.echo(
-            "  · CLAUDE.md, a `pull_request`-triggered CI workflow, and the "
-            "`.githooks/` port in the repo itself — `coord repo create` seeds "
-            "these; `coord repo add` cannot, since the repo already existed"
+            "  · CLAUDE.md, a `pull_request`-triggered CI workflow, the "
+            "`.githooks/` port, and graphify-out/.gitignore in the repo "
+            "itself — `coord repo create` seeds these; `coord repo add` "
+            "cannot, since the repo already existed"
         )
         click.echo(
             "  · `test_command`/`ci_command`, `smoke_tests.capability_rules`, "
@@ -1846,18 +1875,22 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
 
     click.echo(
         "seeding CLAUDE.md, .github/workflows/ci.yml "
-        f"(--template {ci_template}), and .githooks/..."
+        f"(--template {ci_template}), .githooks/, and graphify-out/.gitignore..."
     )
     files = _seed_files(name, ci_template)
     try:
         github_ops.create_commit_with_files(
             github_slug, default_branch, files,
-            message="coord repo create: seed CLAUDE.md, CI workflow, .githooks (#2747)",
+            message=(
+                "coord repo create: seed CLAUDE.md, CI workflow, .githooks, "
+                "graphify-out/.gitignore (#2747, #3037)"
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(
             f"{github_slug} was created but seeding failed: {exc}. The repo "
-            "now EXISTS on GitHub but has no CLAUDE.md/CI/.githooks yet — fix "
+            "now EXISTS on GitHub but has no CLAUDE.md/CI/.githooks/"
+            "graphify-out/.gitignore yet — fix "
             "the underlying problem (likely `gh` auth/rate-limit), then "
             "either seed it by hand or re-run `coord repo create` with the "
             "same --github: none of the seed files exist there yet, so a "
@@ -1941,7 +1974,8 @@ def _print_create_residue(
     click.echo("")
     click.echo(
         "NOT DONE — 4 things still need a human (down from `repo add`'s 8 — "
-        "CLAUDE.md, the CI workflow, and .githooks/ are already seeded):"
+        "CLAUDE.md, the CI workflow, .githooks/, and graphify-out/.gitignore "
+        "are already seeded):"
     )
     tracked = default_settings_dir() / TRACKED_CONFIG_REL
     if target == tracked:

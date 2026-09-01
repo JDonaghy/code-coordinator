@@ -146,6 +146,7 @@ class TestRepoCreateCommand:
             ".githooks/post-checkout",
             ".githooks/post-commit",
             ".githooks/post-merge",
+            "graphify-out/.gitignore",
         }
         # The hook shims must be executable — a git hook that isn't simply
         # never runs — everything else must not be.
@@ -156,6 +157,17 @@ class TestRepoCreateCommand:
         assert executable[".githooks/_lib.sh"] is False
         assert executable["CLAUDE.md"] is False
         assert executable[".github/workflows/ci.yml"] is False
+        assert executable["graphify-out/.gitignore"] is False
+
+        # #3037: the seeded `graphify-out/.gitignore` must actually guard the
+        # directory (the self-ignoring `*` / `!.gitignore` form) — a repo
+        # created by `coord repo create` is born with the seeded
+        # post-checkout hook's own documented invariant made true.
+        gitignore_content = dict(
+            (p, c) for p, c, _e in seed["files"]
+        )["graphify-out/.gitignore"]
+        assert "*" in gitignore_content.splitlines()
+        assert "!.gitignore" in gitignore_content.splitlines()
 
         # The default `generic` CI template actually triggers on pull_request
         # — the whole point, since `expects_checks()` blocks every merge
