@@ -621,12 +621,39 @@ class TestMachinesAPI:
 
         assert "assignments" not in r.json()[0]
 
+    def test_non_running_assignment_excluded_from_busy_card(self) -> None:
+        """``_active_assignments_by_machine`` must filter to ``status ==
+        "running"`` exactly like ``Board.idle_machines()`` and
+        ``Board.active_files_by_repo()`` do — an unfiltered read of
+        ``board.active`` would be a second, independent answer to "is this
+        machine busy" that could diverge from those two (#2096 "one
+        question, one answer")."""
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=99, issue_title="Not actually running",
+                assignment_id="pending1", status="pending",
+            ),
+        ])
+        client = _client()
+        with (
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/machines")
+
+        assert "assignments" not in r.json()[0]
+
     def test_thin_client_reads_the_daemons_published_fleet_health_block(
         self, monkeypatch
     ) -> None:
         """``board_service`` configured -> the raw ``/board`` payload's
         ``fleet_health.machine_health`` sibling key, not a local DB read and
-        not a fresh probe of the fleet."""
+        not a fresh probe of the fleet.
+
+        Also asserts the payload is fetched exactly ONCE (#3023 review): the
+        health rows and the board's active assignments both come from the
+        same ``/board`` response, not two independent daemon round trips."""
         import coord.client as cc
 
         monkeypatch.setattr(
@@ -662,7 +689,11 @@ class TestMachinesAPI:
             },
         }
 
+        calls = []
+
         def fake_get(url, **kw):
+            calls.append(url)
+
             class _Resp:
                 status_code = 200
 
@@ -680,6 +711,10 @@ class TestMachinesAPI:
             client = _client()
             r = client.get("/api/machines")
 
+        assert len(calls) == 1, (
+            f"expected exactly one /board round trip, got {len(calls)}: {calls}"
+        )
+
         assert r.status_code == 200
         mock_check_all.assert_not_called()
         data = r.json()
@@ -693,6 +728,13 @@ class TestMachinesAPI:
         and ``m.assignments.active[0].spec.{issue_number,issue_title}`` —
         every key it dereferences must still be present in the served
         shape.
+
+        Also asserts the (documented, #3023 review) DROPPED half of the old
+        shape: ``a.progress`` (the live per-worker ``STATUS:``/``STUCK:``
+        log tail) is gone from BOTH sides — the server no longer serves it,
+        and ``index.html`` no longer dereferences it — so this isn't a
+        silent, undiscovered loss the way the reviewer flagged the first
+        version of this PR for.
         """
         board = Board(active=[
             Assignment(
@@ -707,6 +749,10 @@ class TestMachinesAPI:
         assert "loadMachines" in index_html
         assert "m.assignments.active" in index_html
         assert "m.repos" in index_html
+        # Dead branches removed, not just left dangling — a comment
+        # referencing `a.progress` for context is fine, a live
+        # `a.progress.updates`/`a.progress.stuck` dereference is not.
+        assert "a.progress." not in index_html
 
         with (
             patch(
@@ -722,3 +768,4 @@ class TestMachinesAPI:
             assert key in m
         assert m["assignments"]["active"][0]["spec"]["issue_number"] == 7
         assert m["assignments"]["active"][0]["spec"]["issue_title"] == "Add logging"
+        assert "progress" not in m["assignments"]["active"][0]

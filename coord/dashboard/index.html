@@ -521,12 +521,12 @@ async function loadMachines() {
       const a = m.assignments.active[0];
       const spec = a.spec || {};
       detail = `<div class="meta">${badge('busy', 'busy')} #${spec.issue_number}: ${E(spec.issue_title || '')}</div>`;
-      if (a.progress && a.progress.updates && a.progress.updates.length) {
-        detail += `<div class="meta">latest: ${E(a.progress.updates[a.progress.updates.length-1])}</div>`;
-      }
-      if (a.progress && a.progress.stuck) {
-        detail += `<div class="meta" style="color:#da3633">STUCK: ${E(a.progress.stuck)}</div>`;
-      }
+      // #3023: GET /api/machines no longer carries `a.progress` (live
+      // STATUS:/STUCK: tail of the owning machine's own log file) — that
+      // data only ever existed via a fresh per-agent probe, and serving it
+      // here would reintroduce the exact per-request fleet fan-out this
+      // endpoint was reworked to remove. Use `coord status` / `coord log
+      // <id> -f` for live per-worker progress instead.
     }
     return `
       <div class="card">
