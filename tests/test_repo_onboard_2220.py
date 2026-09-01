@@ -466,6 +466,121 @@ class TestContentsLayer:
         assert facts.smoke_command == "make test"
         assert "newrepo" in (facts.smoke_command_source or "")
 
+    # ── #3037: graphify-out/ guard ───────────────────────────────────────────
+
+    def test_neither_guard_present_warns(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="make test",
+            machines=[_healthy_machine()],
+            gh=ro.GithubFacts(
+                slug="acme/r",
+                graphify_out_gitignore_present=False,
+                root_gitignore_has_graphify_out=False,
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "contents.graphify_out_unguarded" in _checks(report)
+        # WARN, not CRIT — an unguarded repo works fine until someone runs
+        # `git add -A`, so it must not hard-gate doctor's exit code.
+        assert report.ok
+        f = next(f for f in report.findings if f.check == "contents.graphify_out_unguarded")
+        assert f.severity == ro.WARN
+
+    def test_self_ignoring_gitignore_guards(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="make test",
+            gh=ro.GithubFacts(
+                slug="acme/r",
+                graphify_out_gitignore_present=True,
+                root_gitignore_has_graphify_out=False,
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "contents.graphify_out_guarded" in _checks(report)
+        assert "contents.graphify_out_unguarded" not in _checks(report)
+
+    def test_root_gitignore_form_guards_no_false_positive(self):
+        """space-invaders and grocery-list guard graphify-out/ via a line in
+        the ROOT .gitignore, not a graphify-out/.gitignore of their own. A
+        naive "is graphify-out/.gitignore tracked?" probe reported both as
+        unguarded on the first pass of the fleet audit that found #3037 —
+        this is the regression test for that false positive.
+        """
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="make test",
+            gh=ro.GithubFacts(
+                slug="acme/r",
+                graphify_out_gitignore_present=False,
+                root_gitignore_has_graphify_out=True,
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "contents.graphify_out_guarded" in _checks(report)
+        assert "contents.graphify_out_unguarded" not in _checks(report)
+
+    def test_guard_probe_error_is_unknown_not_warn(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="make test",
+            machines=[_healthy_machine()],
+            gh=ro.GithubFacts(
+                slug="acme/r",
+                graphify_out_gitignore_error="rate limited",
+                root_gitignore_has_graphify_out=False,
+            ),
+        )
+        report = ro.evaluate(facts)
+        assert "contents.graphify_out_guard_unknown" in _checks(report)
+        assert "contents.graphify_out_unguarded" not in _checks(report)
+        assert report.ok  # UNKNOWN must never gate
+
+    def test_unguarded_fix_is_informational_not_automatic(self):
+        """`--fix`'s contract is idempotent, machine-local graph repair only
+        (coord/commands/repo.py's `_run_graph_fix` calls `/graph-fix` and the
+        local clone fixer — nothing content-layer). The finding's `fix` text
+        must say so rather than implying `--fix` will handle it.
+        """
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="make test",
+            gh=ro.GithubFacts(
+                slug="acme/r",
+                graphify_out_gitignore_present=False,
+                root_gitignore_has_graphify_out=False,
+            ),
+        )
+        report = ro.evaluate(facts)
+        f = next(f for f in report.findings if f.check == "contents.graphify_out_unguarded")
+        assert "not automatic" in (f.fix or "")
+        assert "--fix" in (f.fix or "")
+
+
+class TestGraphifyOutGitignoreLineMatcher:
+    """Pure unit tests for `root_gitignore_ignores_graphify_out` — the parser
+    behind the root-.gitignore guard shape."""
+
+    @pytest.mark.parametrize("line", [
+        "graphify-out/",
+        "graphify-out",
+        "/graphify-out/",
+        "/graphify-out",
+        "graphify-out/*",
+        "graphify-out/**",
+    ])
+    def test_recognized_forms(self, line):
+        content = f"node_modules/\n{line}\n*.pyc\n"
+        assert ro.root_gitignore_ignores_graphify_out(content)
+
+    def test_comment_mentioning_it_does_not_count(self):
+        content = "# ignore graphify-out/ contents\n*.pyc\n"
+        assert not ro.root_gitignore_ignores_graphify_out(content)
+
+    def test_unrelated_gitignore_does_not_count(self):
+        content = "node_modules/\n*.pyc\ndist/\n"
+        assert not ro.root_gitignore_ignores_graphify_out(content)
+
+    def test_partial_name_does_not_false_positive(self):
+        content = "not-graphify-out/\n"
+        assert not ro.root_gitignore_ignores_graphify_out(content)
+
 
 class TestGraphLayer:
     def test_absent_local_clone_is_a_skip_not_a_pass(self):
