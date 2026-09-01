@@ -771,6 +771,199 @@ class TestMachinesAPI:
         assert "progress" not in m["assignments"]["active"][0]
 
 
+class TestMachinesHealthAPI:
+    """#3024: GET /api/machines/health -- the fleet-wide `FleetHealthSnapshot`
+    (severity/stale/headroom detail per machine, plus fleet-scope checks)
+    that `GET /api/machines` deliberately keeps out of its own response.
+    """
+
+    def _health_row(self, *, received_at=None, results=None, **overrides) -> dict:
+        now = time.time()
+        row = {
+            "state": "online",
+            "reason": "",
+            "latency_ms": 7.5,
+            "received_at": now if received_at is None else received_at,
+            "health": {
+                "schema": 1,
+                "checked_at": now,
+                "severity": "ok",
+                "results": results if results is not None else [
+                    {"check_id": "disk", "severity": "ok", "headroom": "42% free"},
+                ],
+                "worktree_bytes": 4096,
+                "agent_runtime_version": "0.42.0",
+            },
+        }
+        row.update(overrides)
+        return row
+
+    def test_local_mode_passes_severity_and_results_through_verbatim(self) -> None:
+        """No `board_service` configured -> the same local-DB reassembly
+        `coord status` uses (`coord.health.aggregate.local_fleet_health_block`),
+        with every per-check field (`severity`, `results`/`headroom`) intact
+        -- never re-derived or collapsed at this layer."""
+        client = _client()
+        with patch(
+            "coord.state.load_machine_health",
+            return_value={"laptop": self._health_row()},
+        ):
+            r = client.get("/api/machines/health")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["fleet_checks"] == []
+        rows = {row["machine"]: row for row in data["machine_health"]}
+        laptop = rows["laptop"]
+        assert laptop["severity"] == "ok"
+        assert laptop["stale"] is False
+        assert laptop["results"] == [
+            {"check_id": "disk", "severity": "ok", "headroom": "42% free"},
+        ]
+
+    def test_stale_machine_reads_unknown_but_retains_last_known_results(
+        self,
+    ) -> None:
+        """#1630's honesty contract: a machine whose last poll is older than
+        `STALE_AFTER_SECONDS` must report `severity="unknown"` and
+        `stale=True` -- NEVER a carried-forward `ok` -- while its last-known
+        `results`/`checked_at` are still served, so a renderer can tell
+        "OK" apart from "last measured OK, a while ago"."""
+        from coord.health.fleet_snapshot import STALE_AFTER_SECONDS
+
+        long_ago = time.time() - STALE_AFTER_SECONDS - 100
+        stale_results = [
+            {"check_id": "disk", "severity": "ok", "headroom": "42% free"},
+        ]
+        client = _client()
+        with patch(
+            "coord.state.load_machine_health",
+            return_value={
+                "laptop": self._health_row(
+                    received_at=long_ago, results=stale_results
+                ),
+            },
+        ):
+            r = client.get("/api/machines/health")
+
+        assert r.status_code == 200
+        laptop = {row["machine"]: row for row in r.json()["machine_health"]}["laptop"]
+        assert laptop["severity"] == "unknown"
+        assert laptop["stale"] is True
+        # Last-known detail is retained, not dropped just because the
+        # severity above it was downgraded for staleness.
+        assert laptop["results"] == stale_results
+
+    def test_never_polled_machine_reads_unknown_not_absent(self) -> None:
+        client = _client()
+        with patch("coord.state.load_machine_health", return_value={}):
+            r = client.get("/api/machines/health")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["machine_health"]) == 1
+        assert data["machine_health"][0]["machine"] == "laptop"
+        assert data["machine_health"][0]["severity"] == "unknown"
+
+    def test_thin_client_forwards_the_daemons_fleet_health_block_verbatim(
+        self, monkeypatch
+    ) -> None:
+        """`board_service` configured -> the daemon's own `GET /board`
+        `fleet_health` key, forwarded unexamined -- including `fleet_checks`,
+        which the local-mode path can never populate (#3024)."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        now = time.time()
+        fleet_health = {
+            "schema": 1,
+            "refreshed_at": now,
+            "truncated": False,
+            "machine_health": [
+                {
+                    "machine": "laptop",
+                    "state": "online",
+                    "reason": "",
+                    "latency_ms": 3.2,
+                    "received_at": now,
+                    "stale": False,
+                    "severity": "warn",
+                    "checked_at": now,
+                    "results": [
+                        {"check_id": "disk", "severity": "warn", "headroom": "8% free"},
+                    ],
+                    "worktree_bytes": 999,
+                    "agent_runtime_version": "1.0.0",
+                },
+            ],
+            "fleet_checks": [
+                {"check_id": "fleet_board_latency", "severity": "ok"},
+            ],
+        }
+        payload = {
+            "assignments": [], "plans": {}, "round_number": 0,
+            "fleet_health": fleet_health,
+        }
+
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append(url)
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return payload
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/machines/health")
+
+        assert len(calls) == 1
+        assert r.status_code == 200
+        assert r.json() == fleet_health
+
+    def test_unreachable_daemon_degrades_to_an_explicit_error(
+        self, monkeypatch
+    ) -> None:
+        """A daemon that can't be reached must come back as an explicit
+        error -- NEVER a 200 with a stale/empty block a renderer could
+        mistake for "fleet quiet, all healthy" (mirrors #3022's
+        `/api/machines/metrics` degradation)."""
+        import httpx
+
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def raising_get(url, **kw):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(cc.httpx, "get", raising_get)
+
+        client = _client()
+        r = client.get("/api/machines/health")
+
+        assert r.status_code == 503
+        body = r.json()
+        assert body["reachable"] is False
+        assert "error" in body
+
+
 class TestMachineMetricsAPI:
     """``GET /api/machines/metrics`` — the dashboard's proxy of #3021's daemon
     endpoint (#3022). ``coord web``'s own origin is what the browser (and
