@@ -1141,25 +1141,31 @@ def build_app(
             return
         write_board(board)
 
-    def _read_machine_health() -> dict[str, dict]:
-        """Every configured machine's latest daemon-tick-refreshed health
-        row, keyed by machine name (#3023).
+    def _read_board_and_machine_health() -> tuple:  # -> tuple[Board, dict[str, dict]]
+        """The board plus every configured machine's latest daemon-tick-
+        refreshed health row, keyed by machine name (#3023).
 
-        Backs ``GET /api/machines``. Same daemon-vs-local resolution as
-        ``_read_board()`` above, applied to the fleet-health block instead
-        of the board: a thin client (``board_service`` configured) reads
-        the SAME already-published ``/board`` response's
+        Backs ``GET /api/machines``. Fetches both in ONE daemon round trip
+        when this dashboard is a thin client (``board_service`` configured)
+        instead of two independent ``GET /board`` calls — the review found
+        that ``_read_machine_health()`` fetching its own payload and then
+        ``_active_assignments_by_machine(_read_board())`` fetching a SECOND
+        one doubled this endpoint's daemon I/O per client poll, which is
+        exactly the per-request amplification #3023 exists to eliminate
+        (just at a smaller scale than the fan-out it replaced). A thin
+        client reads the daemon-published payload's
         ``fleet_health.machine_health`` sibling key — the tick-refreshed
         output of ``coord.health.fleet_snapshot.FleetHealthRefresher``
-        (#1630) a live board poll already carries — never a fresh
-        per-request probe of the fleet. A dashboard co-located with the
-        daemon (no ``board_service``) reads that exact same tick's result
-        straight out of the shared local DB via
-        ``coord.state.load_machine_health`` + the same
-        ``_machine_health_rows`` helper ``FleetHealthRefresher.refresh()``
-        itself calls right after persisting — so the two modes can't drift.
+        (#1630) a board poll already carries — never a fresh per-request
+        probe of the fleet. A dashboard co-located with the daemon (no
+        ``board_service``) has no network cost to share in the first place:
+        it reads the board from the local DB and the health rows straight
+        out of the same local DB via ``coord.state.load_machine_health`` +
+        ``coord.health.fleet_snapshot.machine_health_rows`` (the public
+        wrapper ``FleetHealthRefresher.refresh()`` itself calls right after
+        persisting) — so the two modes can't drift.
 
-        A machine absent from the returned dict was never polled (fresh
+        A machine absent from the health dict was never polled (fresh
         install, or nothing has ticked the health refresher yet) — callers
         must treat that the same as an ``unknown`` state, never as healthy
         (#1485's failure mode).
@@ -1168,33 +1174,50 @@ def build_app(
 
         svc = board_service.resolve()
         if svc is not None:
-            from coord.client import fetch_board_payload  # noqa: PLC0415
+            from coord.client import board_from_payload, fetch_board_payload  # noqa: PLC0415
 
             payload = fetch_board_payload(svc)
+            board = board_from_payload(payload)
             rows = (payload.get("fleet_health") or {}).get("machine_health") or []
-            return {row["machine"]: row for row in rows}
+            return board, {row["machine"]: row for row in rows}
 
-        from coord.health.fleet_snapshot import _machine_health_rows  # noqa: PLC0415
+        from coord.health.fleet_snapshot import machine_health_rows  # noqa: PLC0415
         from coord.state import load_machine_health  # noqa: PLC0415
 
+        board = _read_board()
         raw = load_machine_health()
         machine_names = [m.name for m in config.machines]
-        rows = _machine_health_rows(machine_names, raw, now=time.time())
-        return {row["machine"]: row for row in rows}
+        rows = machine_health_rows(machine_names, raw, now=time.time())
+        return board, {row["machine"]: row for row in rows}
 
     def _active_assignments_by_machine(board) -> dict[str, list[dict]]:  # noqa: ANN001
-        """Group *board*'s active assignments by machine (#3023).
+        """Group *board*'s RUNNING active assignments by machine (#3023).
 
         Backs the legacy dashboard's per-machine "busy" card
         (``coord/dashboard/index.html``'s ``loadMachines()``), which used
         to come from a live per-agent ``GET /status`` probe. The board
         already carries the same fact — which issue a machine is currently
         running — from the normal board read path, so grouping it here
-        costs zero extra I/O beyond the ``_read_board()`` call every
-        request already needs elsewhere.
+        costs no extra daemon I/O beyond what ``_read_board_and_machine_health()``
+        already fetches.
+
+        Filters to ``status == "running"`` exactly like
+        ``Board.idle_machines()`` and ``Board.active_files_by_repo()`` in
+        ``coord/models.py`` do before treating an active-list entry as real,
+        in-progress work — an unfiltered read of ``board.active`` would be a
+        second, independent answer to "is this machine busy" that could
+        diverge from those two (epic #2096 "one question, one answer").
+        Every ``board.active.append()`` call site happens to set
+        ``status="running"`` at append time today, and reconcile removes
+        non-running entries the same tick it retags them, so this filter is
+        currently a no-op in practice — which is exactly why the existing
+        code defends against it twice already rather than trusting that
+        invariant to hold forever.
         """
         out: dict[str, list[dict]] = {}
         for a in board.active:
+            if a.status != "running":
+                continue
             out.setdefault(a.machine_name, []).append({
                 "assignment_id": a.assignment_id,
                 "status": a.status,
@@ -1421,17 +1444,32 @@ def build_app(
         against every one that answered — seconds of worst-case latency,
         multiplied by every connected client polling this panel live. Now
         serves the SAME state the board daemon's tick loop already
-        refreshes on its own cadence (``_read_machine_health()``) plus the
-        board this dashboard reads for every other panel anyway
-        (``_active_assignments_by_machine()``) — zero per-request network
+        refreshes on its own cadence, plus the board this dashboard reads
+        for every other panel anyway, both from ONE combined read
+        (``_read_board_and_machine_health()``) — zero per-request network
         fan-out to the fleet, whether this dashboard is co-located with the
         daemon or a thin client of it.
+
+        Design decision (#3023 review): each active assignment's ``spec``
+        (issue/repo) is included, but the live ``STATUS:``/``STUCK:``
+        per-worker progress tail (``a.progress.updates`` / ``a.progress.stuck``
+        in the pre-#3023 shape) is NOT. That data only ever existed as a
+        fresh tail-read of the OWNING machine's own log file — see
+        ``AgentServer.progress()``/``list_assignments()`` in ``coord/agent.py``
+        ("only this machine can see its own log file — the coordinator
+        cannot stat a remote path") — so serving it here would mean putting
+        the exact per-request fan-out probe this endpoint exists to remove
+        right back in, just hidden one level down. ``coord/dashboard/index.html``
+        no longer reads those two keys; live per-worker progress is still
+        available via ``coord status`` / ``coord log <id> -f``, which DO pay
+        for a targeted probe of the one machine in question rather than
+        every machine on every dashboard poll.
         """
         if _fixture is not None:
             # Seeded reachability — never probe the fleet in fixture mode.
             return JSONResponse(_fixture.machines())
-        health_by_name = _read_machine_health()
-        assignments_by_machine = _active_assignments_by_machine(_read_board())
+        board, health_by_name = _read_board_and_machine_health()
+        assignments_by_machine = _active_assignments_by_machine(board)
         result = []
         for m in config.machines:
             row = health_by_name.get(m.name) or {}

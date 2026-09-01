@@ -209,6 +209,19 @@ def _effective_severity(entry: dict, *, now: float) -> tuple[str, bool]:
     return (severity or "unknown"), stale
 
 
+def machine_health_rows(machine_names: list[str], raw: dict, *, now: float) -> list[dict]:
+    """Public wrapper around :func:`_machine_health_rows` (#3023).
+
+    ``coord.dashboard.server`` reads this from outside the module (the
+    local-mode half of ``GET /api/machines``, mirroring the thin-client half
+    that reads the daemon-published ``fleet_health.machine_health`` block
+    ``FleetHealthRefresher.refresh()`` builds from this same function) —
+    exposed as a real entry point instead of reaching across the module
+    boundary for the underscore-prefixed helper below.
+    """
+    return _machine_health_rows(machine_names, raw, now=now)
+
+
 def _machine_health_rows(machine_names: list[str], raw: dict, *, now: float) -> list[dict]:
     rows: list[dict] = []
     for name in machine_names:
