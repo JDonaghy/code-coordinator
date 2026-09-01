@@ -125,23 +125,30 @@ class TestBoardAPI:
 
 
 class TestMachinesAPI:
-    @patch("coord.dashboard.server.fetch_status")
-    @patch("coord.dashboard.server.check_all")
-    def test_returns_machine_list(
-        self, mock_check: MagicMock, mock_fetch: MagicMock,
-    ) -> None:
-        mock_status = MagicMock()
-        mock_status.machine = Machine(name="laptop", host="laptop.tailnet", repos=["api"])
-        mock_status.state = "online"
-        mock_status.reason = ""
-        mock_status.latency_ms = 5.0
-        mock_status.is_online = True
-        mock_check.return_value = [mock_status]
-        from coord.network import StatusResult
-        mock_fetch.return_value = StatusResult(data={"active": [], "completed": []})
+    """#3023: served from the daemon's already-refreshed health snapshot,
+    never a per-request fan-out probe of the fleet — see
+    ``tests/test_dashboard_api.py::TestMachinesAPI`` for the fuller
+    shape/no-probe/legacy-consumer coverage this issue asks for. This class
+    keeps the smoke-level "does the route wire up" check colocated with the
+    rest of this file's board/sessions API tests.
+    """
 
+    def test_returns_machine_list(self) -> None:
+        health = {
+            "laptop": {
+                "state": "online",
+                "reason": "",
+                "latency_ms": 5.0,
+                "received_at": time.time(),
+                "health": {"schema": 1, "checked_at": time.time(), "results": []},
+            },
+        }
         client = _client()
-        r = client.get("/api/machines")
+        with (
+            patch("coord.state.load_machine_health", return_value=health),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/machines")
         assert r.status_code == 200
         data = r.json()
         assert len(data) == 1

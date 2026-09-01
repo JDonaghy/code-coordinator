@@ -10,14 +10,16 @@ worker thread, which the autouse ``coord_db`` in-memory connection
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from starlette.testclient import TestClient
 
 from coord.config import Config
 from coord.dashboard.server import build_app
-from coord.models import Machine, Repo
+from coord.models import Assignment, Board, Machine, Repo
 
 
 @pytest.fixture(autouse=True)
@@ -499,3 +501,224 @@ class TestPortalThinClientRouting:
         )
 
         assert r.status_code == 404
+
+
+class TestMachinesAPI:
+    """#3023: GET /api/machines serves the daemon's already-refreshed
+    machine state — never a synchronous per-request fan-out probe of the
+    fleet (the old shape: ``check_all`` against every machine's
+    ``/health``, then ``fetch_status`` against every one that answered).
+    """
+
+    def _health_row(self, **overrides) -> dict:
+        now = time.time()
+        row = {
+            "state": "online",
+            "reason": "",
+            "latency_ms": 7.5,
+            "received_at": now,
+            "health": {
+                "schema": 1,
+                "checked_at": now,
+                "results": [],
+                "worktree_bytes": 4096,
+                "agent_runtime_version": "0.42.0",
+            },
+        }
+        row.update(overrides)
+        return row
+
+    def test_served_shape_carries_daemon_refreshed_fields(self) -> None:
+        """reachability, state/reason, latency, agent version, worktree
+        bytes — all sourced from the tick-refreshed health snapshot, not a
+        live probe of the agent."""
+        client = _client()
+        with (
+            patch(
+                "coord.state.load_machine_health",
+                return_value={"laptop": self._health_row()},
+            ),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        m = data[0]
+        assert m["name"] == "laptop"
+        assert m["host"] == "laptop.tailnet"
+        assert m["repos"] == ["api"]
+        assert m["state"] == "online"
+        assert m["reason"] == ""
+        assert m["latency_ms"] == 7.5
+        assert m["agent_version"] == "0.42.0"
+        assert m["worktree_bytes"] == 4096
+
+    def test_never_polled_machine_reads_unknown_not_absent(self) -> None:
+        client = _client()
+        with (
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data[0]["state"] == "unknown"
+
+    def test_performs_no_per_request_fleet_probe(self) -> None:
+        """The whole point of #3023: assert on the ABSENCE of the fan-out
+        probe call, not on wall-clock timing (a slow mock could satisfy a
+        timing assertion while still being the wrong architecture).
+        """
+        client = _client()
+        with (
+            patch("coord.network.check_all") as mock_check_all,
+            patch("coord.network.check_machine") as mock_check_machine,
+            patch("coord.network.fetch_status") as mock_fetch_status,
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        mock_check_all.assert_not_called()
+        mock_check_machine.assert_not_called()
+        mock_fetch_status.assert_not_called()
+
+    def test_busy_machine_carries_its_active_assignment_from_the_board(self) -> None:
+        """The legacy dashboard's per-machine 'busy' card used to come from
+        a live per-agent GET /status probe; it now comes from the same
+        board this dashboard already reads for every other panel."""
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="Fix auth",
+                assignment_id="abc123", status="running",
+            ),
+        ])
+        client = _client()
+        with (
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        active = r.json()[0]["assignments"]["active"]
+        assert len(active) == 1
+        assert active[0]["spec"]["issue_number"] == 42
+        assert active[0]["spec"]["issue_title"] == "Fix auth"
+
+    def test_idle_machine_carries_no_assignments_key(self) -> None:
+        client = _client()
+        with (
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/machines")
+
+        assert "assignments" not in r.json()[0]
+
+    def test_thin_client_reads_the_daemons_published_fleet_health_block(
+        self, monkeypatch
+    ) -> None:
+        """``board_service`` configured -> the raw ``/board`` payload's
+        ``fleet_health.machine_health`` sibling key, not a local DB read and
+        not a fresh probe of the fleet."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        now = time.time()
+        payload = {
+            "assignments": [],
+            "plans": {},
+            "round_number": 0,
+            "fleet_health": {
+                "schema": 1,
+                "refreshed_at": now,
+                "truncated": False,
+                "machine_health": [
+                    {
+                        "machine": "laptop",
+                        "state": "online",
+                        "reason": "",
+                        "latency_ms": 3.2,
+                        "received_at": now,
+                        "stale": False,
+                        "severity": "ok",
+                        "checked_at": now,
+                        "results": [],
+                        "worktree_bytes": 999,
+                        "agent_runtime_version": "1.0.0",
+                    },
+                ],
+                "fleet_checks": [],
+            },
+        }
+
+        def fake_get(url, **kw):
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return payload
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        with patch("coord.network.check_all") as mock_check_all:
+            client = _client()
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        mock_check_all.assert_not_called()
+        data = r.json()
+        assert data[0]["worktree_bytes"] == 999
+        assert data[0]["agent_version"] == "1.0.0"
+
+    def test_legacy_dashboard_still_consumes_the_response(self) -> None:
+        """Compatibility check (this issue's explicit ask):
+        ``coord/dashboard/index.html``'s ``loadMachines()`` reads
+        ``m.state``, ``m.latency_ms``, ``m.name``, ``m.host``, ``m.repos``,
+        and ``m.assignments.active[0].spec.{issue_number,issue_title}`` —
+        every key it dereferences must still be present in the served
+        shape.
+        """
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=7, issue_title="Add logging",
+                assignment_id="def456", status="running",
+            ),
+        ])
+        client = _client()
+
+        index_html = client.get("/").text
+        assert "loadMachines" in index_html
+        assert "m.assignments.active" in index_html
+        assert "m.repos" in index_html
+
+        with (
+            patch(
+                "coord.state.load_machine_health",
+                return_value={"laptop": self._health_row()},
+            ),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/machines")
+
+        m = r.json()[0]
+        for key in ("name", "host", "repos", "state", "latency_ms"):
+            assert key in m
+        assert m["assignments"]["active"][0]["spec"]["issue_number"] == 7
+        assert m["assignments"]["active"][0]["spec"]["issue_title"] == "Add logging"

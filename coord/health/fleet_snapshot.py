@@ -234,6 +234,11 @@ def _machine_health_rows(machine_names: list[str], raw: dict, *, now: float) -> 
                 "severity": severity,
                 "checked_at": checks.get("checked_at"),
                 "results": checks.get("results", []),
+                # #3023: sibling facts `refresh()` stashes on the same
+                # persisted `health` blob — see its docstring comment for
+                # why they live here instead of inside `results`.
+                "worktree_bytes": checks.get("worktree_bytes"),
+                "agent_runtime_version": checks.get("agent_runtime_version"),
             }
         )
     return rows
@@ -310,6 +315,36 @@ class FleetHealthRefresher:
             health_block = (
                 status.health.get("health") if status.health else None
             ) or last_known_health
+            # #3023: the coord-web Machines panel (GET /api/machines) needs
+            # two more whole-payload facts that live OUTSIDE the H-1
+            # check-registry block above — the agent's own running
+            # `version` (compared against the coordinator's local version to
+            # flag skew) and `worktree_bytes` (total on-disk size of this
+            # agent's git worktrees). Both are real facts about the agent
+            # PROCESS, not a health check result, so they ride as sibling
+            # keys on the same persisted `health` blob rather than a schema
+            # change — advisory only, same as everything else in this
+            # module (see the module docstring). Freshly measured whenever
+            # this poll actually reached the agent; carried forward from the
+            # last successful poll otherwise, same "last-known, not
+            # blanked" posture as the H-1 `results` above, so a machine
+            # that's merely offline for one tick doesn't flash to "no data"
+            # in the panel. Named `agent_runtime_version` (not
+            # `agent_version`) to avoid colliding with the unrelated
+            # `agent_version` H-1 *check* already inside `results`, which
+            # measures installed-vs-latest-on-PyPI skew, not this.
+            if status.health is not None:
+                worktree_bytes = status.health.get("worktree_bytes")
+                agent_runtime_version = status.health.get("version")
+            else:
+                worktree_bytes = (last_known_health or {}).get("worktree_bytes")
+                agent_runtime_version = (last_known_health or {}).get("agent_runtime_version")
+            if health_block is not None:
+                health_block = {
+                    **health_block,
+                    "worktree_bytes": worktree_bytes,
+                    "agent_runtime_version": agent_runtime_version,
+                }
             state.save_machine_health(
                 machine.name,
                 state=status.state,
