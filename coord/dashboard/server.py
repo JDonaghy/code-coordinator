@@ -631,6 +631,55 @@ def openapi_spec() -> dict:
                 "responses": {"200": {"description": "OK"}},
             }
         },
+        "/api/machines/metrics": {
+            "get": {
+                "summary": (
+                    "Proxy of the daemon's GET /machines/metrics (#3021) -- per-machine "
+                    "CPU/mem sample series for the Machines panel (#3022)"
+                ),
+                "parameters": [
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": (
+                            "Epoch number, ISO-8601 timestamp, or duration (e.g. '6h') -- "
+                            "forwarded to the daemon unexamined; see "
+                            "coord.machine_metrics.resolve_since."
+                        ),
+                    },
+                    {
+                        "name": "resolution",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer"},
+                        "description": "Max points per machine after server-side downsampling.",
+                    },
+                    {
+                        "name": "machine",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Restrict to one machine's series.",
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK -- daemon's versioned metrics payload, verbatim",
+                    },
+                    "400": {
+                        "description": "The daemon rejected since/resolution as malformed",
+                    },
+                    "503": {
+                        "description": (
+                            "The daemon is unreachable -- an explicit "
+                            "{error, reachable: false} body, never an empty series"
+                        ),
+                    },
+                },
+            }
+        },
         "/api/proposals": {
             "get": {
                 "summary": "Pending brain proposals awaiting approve/reject",
@@ -1493,6 +1542,103 @@ def build_app(
             if active:
                 machine_data["assignments"] = {"active": active}
             result.append(machine_data)
+        return JSONResponse(result)
+
+    def _machine_metrics_daemon_target():  # -> coord.client.ServiceConfig
+        """Where ``GET /api/machines/metrics`` actually reaches for data (#3022).
+
+        Resolves daemon-vs-local exactly like ``_read_board()``/
+        ``_read_drive_queue()``: ``board_service.resolve()`` first, so a
+        thin-client dashboard reaches the fleet's real daemon over Tailscale.
+
+        Unlike the board or the drive queue, though, there is no on-disk
+        local fallback here. The metrics ring buffer
+        (``coord.machine_metrics.MachineMetricsSampler``, #3020) lives ONLY
+        in the ``coord serve`` process's memory, by design (see that
+        module's "No persistence" note) — the identical "introspection of a
+        running interpreter" situation
+        ``coord.release_verify._default_board_fetch`` already solved for
+        reading the daemon's own version off the daemon host. So "local"
+        here still costs one HTTP hop, just a loopback one to THIS host's
+        own daemon (``127.0.0.1:SERVE_PORT``, same
+        ``resolve_serve_token()`` bearer-token convention) rather than a
+        Tailscale round trip to a configured ``board_service`` URL — never
+        a recursive call back into this same dashboard process.
+        """
+        from coord import board_service  # noqa: PLC0415
+        from coord.client import ServiceConfig  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            return svc
+        from coord.serve_app import SERVE_PORT, resolve_serve_token  # noqa: PLC0415
+
+        return ServiceConfig(
+            url=f"http://127.0.0.1:{SERVE_PORT}", token=resolve_serve_token()
+        )
+
+    async def api_machine_metrics(request: Request) -> JSONResponse:
+        """GET /api/machines/metrics — proxy the daemon's GET /machines/metrics
+        (#3021) so the Machines panel's own origin (``coord web``, port 7434)
+        can chart it without the browser needing to reach the daemon's
+        separate port 7435 directly (#3022).
+
+        Forwards ``since``/``resolution``/``machine`` straight through,
+        unexamined — the daemon
+        (``coord.machine_metrics.resolve_since``/``build_metrics_response``)
+        already owns their validation vocabulary and this handler must not
+        duplicate or drift from it. See ``_machine_metrics_daemon_target()``
+        for how daemon-vs-local is resolved.
+
+        Fixture mode has no live sampler to simulate at all, so it always
+        reports the same explicit-unreachable shape a real unreachable
+        daemon would (below) rather than pretending to have live data —
+        mirrors ``api_machines``' "never probe the fleet in fixture mode",
+        just with nothing to seed instead of a canned reachable answer.
+
+        Degrades honestly (#3022): a daemon that is unreachable (down,
+        network partition, wrong token) comes back as an explicit
+        ``{"error": ..., "reachable": false}`` body with a 503 — never a 200
+        with an empty/short series a renderer could mistake for "fleet
+        quiet, all healthy". That is the same failure mode
+        ``coord.machine_metrics`` already guards against for a single
+        unresponsive agent (its ``status="unknown"`` samples), just
+        extended here to "the whole daemon didn't answer". A 400 the daemon
+        itself raised for a malformed ``since``/``resolution`` is forwarded
+        as a 400, not folded into the unreachable state — that's the
+        caller's bad input, not a daemon health problem.
+        """
+        if _fixture is not None:
+            return JSONResponse(
+                {
+                    "error": "machine metrics have no fixture source",
+                    "reachable": False,
+                },
+                status_code=503,
+            )
+
+        from coord.client import fetch_machine_metrics  # noqa: PLC0415
+
+        svc = _machine_metrics_daemon_target()
+        qp = request.query_params
+        params = {
+            "since": qp.get("since"),
+            "resolution": qp.get("resolution"),
+            "machine": qp.get("machine"),
+        }
+        try:
+            result = fetch_machine_metrics(svc, params)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001 — network failure/timeout/daemon 5xx: all "unreachable"
+            return JSONResponse(
+                {
+                    "error": "machine metrics daemon unreachable",
+                    "detail": str(e),
+                    "reachable": False,
+                },
+                status_code=503,
+            )
         return JSONResponse(result)
 
     async def api_sessions(request: Request) -> JSONResponse:
@@ -2961,6 +3107,7 @@ def build_app(
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
         Route("/api/machines", api_machines, methods=["GET"]),
+        Route("/api/machines/metrics", api_machine_metrics, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/drive-queue", api_drive_queue, methods=["GET"]),

@@ -1085,3 +1085,39 @@ def fetch_report(
         raise ValueError(detail or f"report request rejected ({resp.status_code})")
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_machine_metrics(
+    svc: ServiceConfig,
+    params: dict[str, Any] | None = None,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """GET /machines/metrics from the daemon (#3021's read endpoint).
+
+    *params* (``since``/``resolution``/``machine``) forward straight through —
+    :func:`coord.machine_metrics.resolve_since`/``build_metrics_response`` on the daemon side
+    already own their validation vocabulary; this function does no interpretation of its own.
+
+    Mirrors :func:`fetch_report`'s error posture: a 400 (malformed ``since``/``resolution``) is
+    a caller error, surfaced as :class:`ValueError` with the daemon's own message rather than a
+    generic HTTP status. Everything else (network failure, timeout, 5xx) is left to raise
+    ``httpx.HTTPError`` — the dashboard's ``GET /api/machines/metrics`` handler (#3022) turns
+    that into an explicit "metrics unreachable" response rather than an empty-but-200 series.
+    """
+    resp = httpx.get(
+        f"{svc.url}/machines/metrics",
+        params={k: v for k, v in (params or {}).items() if v not in (None, "")},
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    if resp.status_code == 400:
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("error") or ""
+        except Exception:  # noqa: BLE001 — non-JSON error body; fall through
+            detail = resp.text.strip()
+        raise ValueError(detail or f"machine metrics request rejected ({resp.status_code})")
+    resp.raise_for_status()
+    return resp.json()

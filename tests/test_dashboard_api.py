@@ -769,3 +769,192 @@ class TestMachinesAPI:
         assert m["assignments"]["active"][0]["spec"]["issue_number"] == 7
         assert m["assignments"]["active"][0]["spec"]["issue_title"] == "Add logging"
         assert "progress" not in m["assignments"]["active"][0]
+
+
+class TestMachineMetricsAPI:
+    """``GET /api/machines/metrics`` — the dashboard's proxy of #3021's daemon
+    endpoint (#3022). ``coord web``'s own origin is what the browser (and
+    the phone webapp's Machines panel) actually talks to; this handler
+    resolves where the REAL data lives and forwards there.
+
+    The autouse fixture in ``tests/conftest.py`` (``COORD_SERVICE_URL``/
+    ``COORD_TOKEN`` deleted, ``CLIENT_TOML`` pointed at a nonexistent path)
+    means ``coord.client.resolve_board_service()`` returns ``None`` by
+    default in every test here unless a test monkeypatches it itself — i.e.
+    the *daemon-local* (loopback) branch is what an unmodified test hits.
+    """
+
+    _PAYLOAD = {
+        "schema": 1,
+        "generated_at": 1234.5,
+        "since": None,
+        "resolution": None,
+        "machines": {"laptop": [{"timestamp": 1234.5, "cpu_percent": 12.0}]},
+    }
+
+    @staticmethod
+    def _fake_get(payload, calls, *, status_code=200):
+        def fake_get(url, **kw):
+            calls.append((url, kw.get("params"), kw.get("headers")))
+
+            class _Resp:
+                def __init__(self):
+                    self.status_code = status_code
+
+                def raise_for_status(self):
+                    if self.status_code >= 400:
+                        import httpx
+
+                        raise httpx.HTTPStatusError(
+                            "boom", request=None, response=self
+                        )
+
+                def json(self):
+                    return payload
+
+            return _Resp()
+
+        return fake_get
+
+    def test_daemon_remote_resolution_proxies_to_the_configured_board_service(
+        self, monkeypatch
+    ) -> None:
+        """``board_service`` configured (thin-client dashboard) -> the request
+        goes to THAT daemon's URL over Tailscale, not a local loopback."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        calls = []
+        monkeypatch.setattr(cc.httpx, "get", self._fake_get(self._PAYLOAD, calls))
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 200
+        assert r.json() == self._PAYLOAD
+        assert len(calls) == 1
+        url, params, _headers = calls[0]
+        assert url == "http://daemon:7435/machines/metrics"
+
+    def test_daemon_local_resolution_hits_the_loopback_daemon_not_itself(
+        self, monkeypatch
+    ) -> None:
+        """No ``board_service`` configured (dashboard co-located with the
+        daemon host) -> a loopback call to the daemon's OWN port
+        (``coord.serve_app.SERVE_PORT``, #3020/#3021's home), carrying its
+        bearer-token convention -- never a recursive call back into this
+        same dashboard process's own port."""
+        import coord.client as cc
+        from coord.serve_app import SERVE_PORT
+
+        monkeypatch.setattr(
+            "coord.serve_app.resolve_serve_token", lambda *a, **k: "secret-tok"
+        )
+        calls = []
+        monkeypatch.setattr(cc.httpx, "get", self._fake_get(self._PAYLOAD, calls))
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 200
+        assert r.json() == self._PAYLOAD
+        assert len(calls) == 1
+        url, params, headers = calls[0]
+        assert url == f"http://127.0.0.1:{SERVE_PORT}/machines/metrics"
+        assert headers["Authorization"] == "Bearer secret-tok"
+
+    def test_since_resolution_machine_query_params_are_forwarded_verbatim(
+        self, monkeypatch
+    ) -> None:
+        import coord.client as cc
+
+        calls = []
+        monkeypatch.setattr(cc.httpx, "get", self._fake_get(self._PAYLOAD, calls))
+
+        client = _client()
+        r = client.get(
+            "/api/machines/metrics",
+            params={"since": "6h", "resolution": "50", "machine": "laptop"},
+        )
+
+        assert r.status_code == 200
+        assert len(calls) == 1
+        _url, params, _headers = calls[0]
+        assert params == {"since": "6h", "resolution": "50", "machine": "laptop"}
+
+    def test_unreachable_daemon_degrades_to_an_explicit_error_not_an_empty_series(
+        self, monkeypatch
+    ) -> None:
+        """A daemon that can't be reached must come back as an explicit
+        error the UI can render as "no data" -- NEVER a 200 with an empty
+        (or missing) ``machines`` series, which would read as "fleet quiet,
+        all healthy" rather than "we don't know"."""
+        import httpx
+
+        import coord.client as cc
+
+        def raising_get(url, **kw):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(cc.httpx, "get", raising_get)
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 503
+        body = r.json()
+        assert body["reachable"] is False
+        assert "error" in body
+        assert "machines" not in body
+
+    def test_daemon_5xx_also_degrades_rather_than_forwarding_a_500(
+        self, monkeypatch
+    ) -> None:
+        import coord.client as cc
+
+        calls = []
+        monkeypatch.setattr(
+            cc.httpx, "get", self._fake_get({}, calls, status_code=500)
+        )
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 503
+        assert r.json()["reachable"] is False
+
+    def test_daemon_400_is_forwarded_as_a_caller_error_not_folded_into_unreachable(
+        self, monkeypatch
+    ) -> None:
+        """A malformed ``since``/``resolution`` is the CALLER's bad input --
+        the daemon said so via a 400 -- and must stay a 400, distinct from
+        "the daemon didn't answer" (503)."""
+        import coord.client as cc
+
+        calls = []
+        monkeypatch.setattr(
+            cc.httpx,
+            "get",
+            self._fake_get({"error": "bad since='not-a-time'"}, calls, status_code=400),
+        )
+
+        client = _client()
+        r = client.get("/api/machines/metrics", params={"since": "not-a-time"})
+
+        assert r.status_code == 400
+        assert "reachable" not in r.json()
+
+    def test_fixture_mode_reports_unreachable_rather_than_faking_a_series(self) -> None:
+        """``coord web --fixture`` has no live sampler to simulate -- it must
+        say so honestly rather than returning a canned "healthy" series."""
+        from coord.dashboard.fixture import FixtureServer
+
+        client = TestClient(build_app(_config(), fixture=FixtureServer()))
+
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 503
+        assert r.json()["reachable"] is False
