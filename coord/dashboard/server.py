@@ -703,6 +703,16 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/api/machines/stats": {
+            "get": {
+                "summary": (
+                    "Per-machine work stats derived from the board (#3025): "
+                    "active vs configured concurrency, completed/failed counts "
+                    "over the retention window, and recent (last 20) job history"
+                ),
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
         "/api/proposals": {
             "get": {
                 "summary": "Pending brain proposals awaiting approve/reject",
@@ -1788,6 +1798,98 @@ def build_app(
                 },
                 status_code=503,
             )
+        return JSONResponse(result)
+
+    async def api_machines_stats(request: Request) -> JSONResponse:
+        """GET /api/machines/stats — per-machine work stats derived purely
+        from the board (#3025): active workers vs configured concurrency,
+        completed/failed counts over the retention window, and recent job
+        history. No new probe, no agent contact — every number here is
+        already sitting in the board this dashboard reads for every other
+        panel; this endpoint just aggregates it per machine.
+
+        Kept as its own endpoint rather than folded into ``GET /api/machines``
+        for the same reason ``/api/machines/health`` and ``/api/machines/metrics``
+        were split out (#3021/#3022/#3024): ``GET /api/machines`` is the
+        small, steady-state shape the fleet panel polls constantly, and a
+        per-machine job-history list (up to 20 rows each) is exactly the
+        heavier, lower-poll-frequency payload that precedent argues for
+        keeping out of it.
+
+        Capacity: ``active`` counts ``board.active`` entries with
+        ``status == "running"`` for the machine — the same filter
+        ``_active_assignments_by_machine``/``Board.idle_machines`` use, so
+        this can't produce a second, diverging answer to "is this machine
+        busy" (#2096). ``max`` is the effective concurrency ceiling
+        (``coord.reconcile._machine_capacity``: the machine's own
+        ``max_workers`` override, falling back to the fleet-wide
+        ``concurrency.max_workers``) — the exact same helper the dispatcher
+        itself uses to decide whether a machine has headroom, so this can't
+        drift from what actually gates dispatch either.
+
+        Counts + job history are both sourced from ``board.completed`` —
+        every non-active (``done``/``failed``/``cancelled``/``advisory``/
+        ``refused_policy``) assignment currently on the board. That list is
+        already retention-windowed upstream (``coord.dao._board_retention_cutoff``
+        / ``compute_board_keep_ids``, identical in thin-client and co-located
+        mode), so this handler applies no additional cutoff of its own — a
+        machine with nothing in the window (fresh install, or everything
+        aged out) reads zero counts and an empty history, never an error.
+        ``completed``/``failed`` count only ``status == "done"``/``"failed"``
+        respectively; ``cancelled``/``advisory``/``refused_policy`` rows still
+        appear in ``job_history`` but are not bucketed into either count —
+        they are neither a clean success nor a failure (#448/#2234's "advisory
+        is a third state" distinction).
+
+        ``job_history`` is capped at the most recent 20 per machine (mirrors
+        coord-tui's ``machine_detail_list``), newest first by ``finished_at``
+        (falling back to ``dispatched_at`` for a row that somehow has no
+        ``finished_at``).
+        """
+        from coord.reconcile import _machine_capacity  # noqa: PLC0415
+
+        board = _read_board()
+        active_by_machine: dict[str, int] = {}
+        for a in board.active:
+            if a.status == "running":
+                active_by_machine[a.machine_name] = active_by_machine.get(a.machine_name, 0) + 1
+
+        completed_by_machine: dict[str, list] = {}
+        for a in board.completed:
+            completed_by_machine.setdefault(a.machine_name, []).append(a)
+
+        def _sort_key(a):  # noqa: ANN001, ANN202
+            return a.finished_at if a.finished_at is not None else (a.dispatched_at or 0.0)
+
+        result = []
+        for m in config.machines:
+            rows = sorted(
+                completed_by_machine.get(m.name, []), key=_sort_key, reverse=True
+            )
+            result.append({
+                "name": m.name,
+                "capacity": {
+                    "active": active_by_machine.get(m.name, 0),
+                    "max": _machine_capacity(m, config),
+                },
+                "counts": {
+                    "completed": sum(1 for a in rows if a.status == "done"),
+                    "failed": sum(1 for a in rows if a.status == "failed"),
+                },
+                "job_history": [
+                    {
+                        "assignment_id": a.assignment_id,
+                        "repo_name": a.repo_name,
+                        "issue_number": a.issue_number,
+                        "issue_title": a.issue_title,
+                        "type": a.type,
+                        "status": a.status,
+                        "dispatched_at": a.dispatched_at,
+                        "finished_at": a.finished_at,
+                    }
+                    for a in rows[:20]
+                ],
+            })
         return JSONResponse(result)
 
     async def api_sessions(request: Request) -> JSONResponse:
@@ -3258,6 +3360,7 @@ def build_app(
         Route("/api/machines", api_machines, methods=["GET"]),
         Route("/api/machines/health", api_machines_health, methods=["GET"]),
         Route("/api/machines/metrics", api_machine_metrics, methods=["GET"]),
+        Route("/api/machines/stats", api_machines_stats, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/drive-queue", api_drive_queue, methods=["GET"]),
