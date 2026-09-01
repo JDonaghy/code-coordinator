@@ -5340,6 +5340,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
     _fleet_health_refresher = FleetHealthRefresher()
 
+    # #3020: same shape again — polling every agent's own /metrics is real
+    # per-machine I/O, so it runs on the tick loop's cadence
+    # (`_machine_metrics_loop` below), never inline off a request handler.
+    # Series live only in this sampler's bounded in-memory ring buffers; no
+    # read endpoint exists yet (that's #A2) and nothing here touches /board.
+    from coord.machine_metrics import MachineMetricsSampler  # noqa: PLC0415
+
+    _machine_metrics_sampler = MachineMetricsSampler()
+
     # Short-TTL cache for the computed /board projection so burst polls from the
     # TUI don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
@@ -9452,6 +9461,26 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("fleet-health refresh failed", exc_info=True)
 
+        # #3020: CPU/mem sampler for the coord-web Machines panel — default
+        # 15s (env COORD_METRICS_POLL_INTERVAL; 0 disables). Own loop, not a
+        # `_tick_loop` step, for the identical reason as `_health_refresh_loop`
+        # just above: it fans out one HTTP GET per agent and must never be
+        # held up behind, or hold up, the reconcile/enqueue/drain steps.
+        try:
+            metrics_poll_interval = float(
+                os.environ.get("COORD_METRICS_POLL_INTERVAL", "15")
+            )
+        except ValueError:
+            metrics_poll_interval = 15.0
+
+        async def _machine_metrics_loop() -> None:
+            while True:
+                await asyncio.sleep(metrics_poll_interval)
+                try:
+                    await run_in_threadpool(_machine_metrics_sampler.refresh, config)
+                except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                    log.warning("machine-metrics refresh failed", exc_info=True)
+
         # #2570: the #2536 phantom-row auto-heal, run a SECOND time from
         # inside this long-lived process rather than relying solely on
         # `coord-notify.timer`'s oneshot `~/.coord-venv/bin/coord notify`
@@ -10218,12 +10247,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 else None,
                 "auto-revalidate",
             )
+            machine_metrics_task = _watch(
+                asyncio.create_task(_machine_metrics_loop())
+                if interval > 0 and metrics_poll_interval > 0
+                else None,
+                "machine-metrics",
+            )
             try:
                 yield
             finally:
                 for t in (
                     task, gate_task, health_task, phantom_heal_task,
-                    auto_revalidate_task,
+                    auto_revalidate_task, machine_metrics_task,
                 ):
                     if t is not None:
                         t.cancel()
