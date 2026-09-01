@@ -1842,6 +1842,89 @@ class TestMilestoneChatNotifySuppression:
         )
 
 
+class TestNoIssueSentinelNotifySuppression:
+    """#3039: issue_number=0 is the established "no GitHub issue" sentinel
+    (coord/milestone_chat.py, coord/refine_chat.py, coord/new_issue_chat.py)
+    for board-level chats — decomposition-chat against a portal submission,
+    a brand-new milestone/issue draft, board-level refinement. Posting a
+    completion/failure/advisory comment against "issue 0" always fails
+    (`gh issue comment 0` → GraphQL "Could not resolve to an issue or pull
+    request with the number of 0"), and — because the old code called the
+    raising `github_ops.post_issue_comment` wrapper *before* `mark_notified`
+    — the row was never marked notified, so the same doomed post retried on
+    every subsequent drain. The drain must skip the GitHub post entirely for
+    issue_number==0 and record the notification locally, regardless of
+    assignment type."""
+
+    def test_decomposition_chat_completion_skips_post_completion(self) -> None:
+        from coord.notify import post_transition, Transition, EVENT_COMPLETION
+
+        transition = Transition(
+            assignment_id="dc-1",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_completion") as mock_post_completion,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_completion.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-1", EVENT_COMPLETION, branch=None
+        )
+
+    def test_decomposition_chat_failure_skips_post_failure(self) -> None:
+        """Same sentinel guard on the failure leg — the #3039 journal showed
+        both `done` and `failed` terminal rows with issue_number=0."""
+        from coord.notify import post_transition, Transition, EVENT_FAILURE
+
+        transition = Transition(
+            assignment_id="dc-2",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_FAILURE,
+            exit_code=1,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_failure") as mock_post_failure,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_failure.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-2", EVENT_FAILURE, branch=None
+        )
+
+
 # ── #1021: headless smoke exit code → parent work row Test verdict ────────────
 
 
