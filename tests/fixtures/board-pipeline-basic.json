@@ -7,7 +7,19 @@
     "Every timestamp is a fixed epoch offset from `now` — nothing here reads",
     "the wall clock, so two runs produce byte-identical /api/pipeline output.",
     "The `events` script below does NOT auto-play: subscribe to /events first,",
-    "then POST /api/fixture/events/replay. Schema: coord/dashboard/fixture.py."
+    "then POST /api/fixture/events/replay. Schema: coord/dashboard/fixture.py.",
+    "",
+    "#3026 — board.fleet_health seeds GET /api/machines/health with five rows",
+    "spanning all four severities plus a stale row: precision=ok,",
+    "dellserver=unknown (offline, matches its `machines` reachability entry",
+    "below), gpu-box=warn, build-runner=crit, spare-mini=ok-but-stale (last",
+    "measured OK a long time ago — the 'OK' vs 'last measured OK, a while",
+    "ago' distinction #1630 exists for). Top-level `machine_metrics` seeds",
+    "GET /api/machines/metrics: precision's series has a gap (no sample",
+    "between now-90 and now-30 — e.g. a daemon restart, since the ring buffer",
+    "is memory-only) and one 'unknown' sample sandwiched between real",
+    "readings; dellserver's series is unknown end-to-end, matching its",
+    "offline reachability entry."
   ],
   "now": 1750000000.0,
 
@@ -181,7 +193,144 @@
       {"assignment_id": "rev-done"},
       {"assignment_id": "rev-merge-queued"},
       {"assignment_id": "rev-review-approved"}
-    ]
+    ],
+    "fleet_health": {
+      "schema": 1,
+      "refreshed_at": 1749999950.0,
+      "fleet_checks": [],
+      "truncated": false,
+      "machine_health": [
+        {
+          "machine": "precision",
+          "state": "online",
+          "reason": "",
+          "latency_ms": 12,
+          "received_at": 1749999950.0,
+          "stale": false,
+          "severity": "ok",
+          "checked_at": 1749999950.0,
+          "results": [
+            {
+              "key": "disk:/",
+              "check_id": "disk",
+              "scope": "machine",
+              "subject": "/",
+              "title": "disk",
+              "label": "disk /",
+              "severity": "ok",
+              "headroom": "42% used (120G free)",
+              "threshold": "warn at 80%, crit at 93%",
+              "detail": "",
+              "trend": null,
+              "values": {"used_pct": 42.0},
+              "error": null
+            }
+          ],
+          "worktree_bytes": 1048576,
+          "agent_runtime_version": "2026.9.1"
+        },
+        {
+          "machine": "dellserver",
+          "state": "offline",
+          "reason": "connection refused",
+          "latency_ms": null,
+          "received_at": null,
+          "stale": false,
+          "severity": "unknown",
+          "checked_at": null,
+          "results": [],
+          "worktree_bytes": null,
+          "agent_runtime_version": null
+        },
+        {
+          "machine": "gpu-box",
+          "state": "online",
+          "reason": "",
+          "latency_ms": 40,
+          "received_at": 1749999900.0,
+          "stale": false,
+          "severity": "warn",
+          "checked_at": 1749999900.0,
+          "results": [
+            {
+              "key": "disk:/",
+              "check_id": "disk",
+              "scope": "machine",
+              "subject": "/",
+              "title": "disk",
+              "label": "disk /",
+              "severity": "warn",
+              "headroom": "84% used (16G free)",
+              "threshold": "warn at 80%, crit at 93%",
+              "detail": "",
+              "trend": null,
+              "values": {"used_pct": 84.0},
+              "error": null
+            }
+          ],
+          "worktree_bytes": 2097152,
+          "agent_runtime_version": "2026.9.1"
+        },
+        {
+          "machine": "build-runner",
+          "state": "online",
+          "reason": "",
+          "latency_ms": 55,
+          "received_at": 1749999800.0,
+          "stale": false,
+          "severity": "crit",
+          "checked_at": 1749999800.0,
+          "results": [
+            {
+              "key": "disk:/",
+              "check_id": "disk",
+              "scope": "machine",
+              "subject": "/",
+              "title": "disk",
+              "label": "disk /",
+              "severity": "crit",
+              "headroom": "96% used (2G free)",
+              "threshold": "warn at 80%, crit at 93%",
+              "detail": "",
+              "trend": null,
+              "values": {"used_pct": 96.0},
+              "error": null
+            }
+          ],
+          "worktree_bytes": 3145728,
+          "agent_runtime_version": "2026.8.30"
+        },
+        {
+          "machine": "spare-mini",
+          "state": "online",
+          "reason": "",
+          "latency_ms": 20,
+          "received_at": 1749996400.0,
+          "stale": true,
+          "severity": "ok",
+          "checked_at": 1749996400.0,
+          "results": [
+            {
+              "key": "disk:/",
+              "check_id": "disk",
+              "scope": "machine",
+              "subject": "/",
+              "title": "disk",
+              "label": "disk /",
+              "severity": "ok",
+              "headroom": "30% used (200G free)",
+              "threshold": "warn at 80%, crit at 93%",
+              "detail": "",
+              "trend": null,
+              "values": {"used_pct": 30.0},
+              "error": null
+            }
+          ],
+          "worktree_bytes": 524288,
+          "agent_runtime_version": "2026.8.15"
+        }
+      ]
+    }
   },
 
   "merge_queue": [
@@ -305,6 +454,22 @@
       "latency_ms": null
     }
   ],
+
+  "machine_metrics": {
+    "precision": [
+      {"timestamp": 1749999880.0, "status": "ok", "cpu_percent": 12.5, "mem_percent": 40.0, "mem_used_mb": 6400.0, "mem_total_mb": 16000.0, "reason": ""},
+      {"timestamp": 1749999895.0, "status": "ok", "cpu_percent": 15.0, "mem_percent": 41.0, "mem_used_mb": 6560.0, "mem_total_mb": 16000.0, "reason": ""},
+      {"timestamp": 1749999910.0, "status": "unknown", "cpu_percent": null, "mem_percent": null, "mem_used_mb": null, "mem_total_mb": null, "reason": "agent unreachable (timeout)"},
+      {"timestamp": 1749999970.0, "status": "ok", "cpu_percent": 20.0, "mem_percent": 45.0, "mem_used_mb": 7200.0, "mem_total_mb": 16000.0, "reason": ""},
+      {"timestamp": 1749999985.0, "status": "ok", "cpu_percent": 18.0, "mem_percent": 44.0, "mem_used_mb": 7040.0, "mem_total_mb": 16000.0, "reason": ""},
+      {"timestamp": 1750000000.0, "status": "ok", "cpu_percent": 22.0, "mem_percent": 46.0, "mem_used_mb": 7360.0, "mem_total_mb": 16000.0, "reason": ""}
+    ],
+    "dellserver": [
+      {"timestamp": 1749999880.0, "status": "unknown", "cpu_percent": null, "mem_percent": null, "mem_used_mb": null, "mem_total_mb": null, "reason": "connection refused"},
+      {"timestamp": 1749999940.0, "status": "unknown", "cpu_percent": null, "mem_percent": null, "mem_used_mb": null, "mem_total_mb": null, "reason": "connection refused"},
+      {"timestamp": 1750000000.0, "status": "unknown", "cpu_percent": null, "mem_percent": null, "mem_used_mb": null, "mem_total_mb": null, "reason": "connection refused"}
+    ]
+  },
 
   "sessions": [
     {

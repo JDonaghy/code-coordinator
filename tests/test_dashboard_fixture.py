@@ -77,6 +77,12 @@ def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("coord.merge_queue.load_queue", _boom)
     monkeypatch.setattr("coord.state.load_assignment_review_findings", _boom)
     monkeypatch.setattr("coord.github_ops._gh", _boom)
+    # #3026: GET /api/machines/health and GET /api/machines/metrics must serve
+    # the seeded fleet_health block / metrics series in fixture mode, never
+    # the live daemon-proxy (`fetch_machine_metrics`) or co-located
+    # (`local_fleet_health_block`) read paths those endpoints use live.
+    monkeypatch.setattr("coord.client.fetch_machine_metrics", _boom)
+    monkeypatch.setattr("coord.health.aggregate.local_fleet_health_block", _boom)
 
 
 def _config() -> Config:
@@ -307,6 +313,121 @@ class TestSeededReads:
         assert running["needs_attention_reason"] == "wall_clock"
         assert running["needs_attention_detail"] == (
             "Running 60m, past the 45m threshold for type='work'."
+        )
+
+
+class TestMachinesPanelFixtures:
+    """Machines-panel seeding for coord-web's Machines panel milestone (#3026).
+
+    ``GET /api/machines`` and ``GET /api/sessions`` were already covered by
+    ``TestSeededReads.test_machines_and_sessions_never_probe_the_fleet`` —
+    this class covers the three endpoints #3020-#3025 added on top: metrics,
+    health, and per-machine work stats. Every one of these must serve seeded
+    data and never reach the fleet, mirroring the rest of this module.
+    """
+
+    def test_machine_metrics_serves_the_seeded_series(self) -> None:
+        """#3021/#3022's response shape, sourced from the fixture (#3026)."""
+        r = _client().get("/api/machines/metrics")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["schema"] == 1
+        assert body["generated_at"] == 1750000000.0
+        assert set(body["machines"]) == {"precision", "dellserver"}
+        precision = body["machines"]["precision"]
+        assert [s["status"] for s in precision] == [
+            "ok", "ok", "unknown", "ok", "ok", "ok",
+        ]
+        # The deliberate gap: no sample between the unknown one at -90s and
+        # the next real reading at -30s (a 60s hole a renderer must draw as
+        # a break, not interpolate across).
+        assert precision[2]["timestamp"] == 1749999910.0
+        assert precision[3]["timestamp"] == 1749999970.0
+        assert precision[3]["timestamp"] - precision[2]["timestamp"] == 60.0
+        # dellserver is unknown end-to-end, matching its offline `machines` row.
+        dellserver = body["machines"]["dellserver"]
+        assert dellserver and all(s["status"] == "unknown" for s in dellserver)
+
+    def test_machine_metrics_narrows_to_one_machine(self) -> None:
+        body = _client().get("/api/machines/metrics", params={"machine": "precision"}).json()
+        assert set(body["machines"]) == {"precision"}
+
+    def test_machine_metrics_since_and_resolution_use_the_real_pipeline(self) -> None:
+        """``since``/``resolution`` run through the real filter/downsample code
+        (``coord.machine_metrics``), not a fixture-only reimplementation."""
+        client = _client()
+        since_body = client.get(
+            "/api/machines/metrics", params={"since": "45s"}
+        ).json()
+        # now=1750000000.0, so since=now-45s=1749999955.0 keeps only the
+        # last two precision samples (-30s and -15s... actually 0s/-15s/-30s
+        # are >= 1749999955? recompute: samples at -30s/-15s/0s are all >=).
+        assert [s["timestamp"] for s in since_body["machines"]["precision"]] == [
+            1749999970.0, 1749999985.0, 1750000000.0,
+        ]
+        resolution_body = client.get(
+            "/api/machines/metrics", params={"resolution": 3}
+        ).json()
+        assert len(resolution_body["machines"]["precision"]) == 3
+        assert len(resolution_body["machines"]["dellserver"]) <= 3
+
+    def test_machine_metrics_bad_resolution_is_a_400(self) -> None:
+        r = _client().get("/api/machines/metrics", params={"resolution": "0"})
+        assert r.status_code == 400
+        assert "resolution" in r.json()["error"]
+
+    def test_machine_metrics_bad_since_is_a_400(self) -> None:
+        r = _client().get("/api/machines/metrics", params={"since": "not-a-time"})
+        assert r.status_code == 400
+
+    def test_machine_metrics_absent_from_fixture_is_an_empty_series(self) -> None:
+        """No ``machine_metrics`` key at all -- every machine reads ``[]``,
+        never an error (mirrors the live sampler's "never polled" case)."""
+        fx = parse_fixture({"board": {"assignments": []}})
+        body = _client(fx).get("/api/machines/metrics").json()
+        assert body["machines"] == {}
+
+    def test_machine_health_spans_all_four_severities_plus_a_stale_row(self) -> None:
+        r = _client().get("/api/machines/health")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["schema"] == 1
+        by_machine = {row["machine"]: row for row in body["machine_health"]}
+        assert by_machine["precision"]["severity"] == "ok"
+        assert by_machine["dellserver"]["severity"] == "unknown"
+        assert by_machine["gpu-box"]["severity"] == "warn"
+        assert by_machine["build-runner"]["severity"] == "crit"
+        # #1630's honesty contract: `stale` and `severity` are independent —
+        # spare-mini's last-known reading was OK, but it is stale, so a
+        # renderer must be able to tell "OK" apart from "OK a while ago".
+        assert by_machine["spare-mini"]["severity"] == "ok"
+        assert by_machine["spare-mini"]["stale"] is True
+        assert all(
+            row["stale"] is False
+            for name, row in by_machine.items()
+            if name != "spare-mini"
+        )
+
+    def test_machine_health_absent_from_fixture_is_the_empty_block(self) -> None:
+        fx = parse_fixture({"board": {"assignments": []}})
+        body = _client(fx).get("/api/machines/health").json()
+        assert body["machine_health"] == []
+        assert body["schema"] == 1
+
+    def test_machine_stats_are_derived_from_the_seeded_board(self) -> None:
+        """#3025's endpoint needs no dedicated fixture key -- it reads the
+        seeded board + the ``Config`` the app was built with, same as live."""
+        r = _client().get("/api/machines/stats")
+        assert r.status_code == 200
+        by_name = {row["name"]: row for row in r.json()}
+        assert set(by_name) == {"precision", "dellserver"}
+        # precision has one running assignment (work-running) seeded above.
+        assert by_name["precision"]["capacity"]["active"] == 1
+        assert by_name["precision"]["counts"]["completed"] >= 1
+        assert by_name["dellserver"]["counts"]["failed"] == 1
+        assert any(
+            j["assignment_id"] == "work-failed"
+            for j in by_name["dellserver"]["job_history"]
         )
 
 

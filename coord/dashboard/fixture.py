@@ -29,11 +29,19 @@ Fixture schema (every key optional except ``board``)::
         "round_number": 7,
         "assignments": [ {...assignment row...} ],
         "plans": {},                # assignment_id -> plan object
-        "notifications": []         # [{"assignment_id": ...}]
+        "notifications": [],        # [{"assignment_id": ...}]
+        "fleet_health": {           # GET /api/machines/health's block, verbatim (#3026)
+          "schema": 1, "refreshed_at": 1750000000.0,
+          "machine_health": [ {...coord.health.fleet_snapshot row shape...} ],
+          "fleet_checks": [], "truncated": false
+        }
       },
       "merge_queue":     [ {...coord.merge_queue.QueuedMerge fields...} ],
       "proposals":       [ {...coord.models.Proposal fields...} ],
       "machines":        [ {...GET /api/machines entry...} ],
+      "machine_metrics": {         # GET /api/machines/metrics source series (#3026)
+        "precision": [ {...coord.machine_metrics.MetricsSample.to_dict()...} ]
+      },
       "sessions":        [ {...GET /api/sessions entry...} ],
       "drive_queue":     [ {...coord.state._decode_drive_queue_row shape...} ],
       "report_catalogue": {"reports": [ {...coord.reports.ReportDef.to_dict()...} ]},
@@ -55,7 +63,17 @@ client is subscribed (a late subscriber can still catch up via
 ``board`` may also be spelled at the top level (``assignments`` /
 ``round_number`` as siblings of ``merge_queue``), which is exactly what
 ``scripts/gen_board_fixture.py`` emits — so a golden ``/board`` capture drops
-in unchanged.
+in unchanged. ``fleet_health`` rides along as a sibling of ``assignments`` in
+either spelling, for the identical reason: it is already a sibling key on the
+real daemon's ``/board`` payload (``FleetHealthSnapshot.to_dict()``), so a
+golden capture carries it for free.
+
+``GET /api/machines/stats`` (#3026) needs no dedicated fixture key at all —
+it is derived purely from ``board`` (completed/active assignments) and
+``config.machines`` (for the concurrency ceiling), exactly like the live
+handler, so seeding a realistic spread of completed/failed/running
+assignments per machine in ``board.assignments`` is all a fixture needs to
+exercise it.
 """
 
 from __future__ import annotations
@@ -157,6 +175,9 @@ class FixtureServer:
     merge_queue_raw: list = field(default_factory=list)
     proposals_raw: list = field(default_factory=list)
     machines_raw: list = field(default_factory=list)
+    #: #3026: seeded `GET /api/machines/metrics` source series, keyed by
+    #: machine name — see `machine_metrics_series()`.
+    machine_metrics_raw: dict = field(default_factory=dict)
     sessions_raw: list = field(default_factory=list)
     drive_queue_raw: list = field(default_factory=list)
     #: #2492 RPT-1: `GET /api/report`'s catalogue. `None` (the default) falls
@@ -201,6 +222,20 @@ class FixtureServer:
 
     def machines(self) -> list[dict]:
         return copy.deepcopy(self.machines_raw)
+
+    def machine_metrics_series(self) -> dict[str, list[dict]]:
+        """Seeded per-machine metrics ring-buffer contents (#3026).
+
+        Same shape ``coord.machine_metrics.MachineMetricsSampler.all_series()``
+        returns live — machine name to an oldest-first list of
+        ``MetricsSample``-shaped dicts — so ``api_machine_metrics`` can run
+        it through the real ``resolve_since``/``build_metrics_response``
+        pipeline unchanged (no parallel fake filtering/downsampling path);
+        only the series *source* differs from the live daemon-proxy path.
+        A machine absent here comes back ``[]``, same as the live sampler's
+        "never polled yet" case.
+        """
+        return copy.deepcopy(self.machine_metrics_raw)
 
     def sessions(self) -> list[dict]:
         return copy.deepcopy(self.sessions_raw)
@@ -387,6 +422,17 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
         "plans": _as_dict(board_raw.get("plans"), "board.plans"),
         "notifications": _as_list(board_raw.get("notifications"), "board.notifications"),
     }
+    # #3026: `fleet_health` rides along as a sibling of `assignments` on the
+    # real daemon's `/board` payload (`FleetHealthSnapshot.to_dict()`) — carry
+    # it through verbatim so `api_machines_health`'s fixture branch (which
+    # reads `board_payload.get("fleet_health")`) has something to serve.
+    # Absent entirely (the common case for a fixture that doesn't care about
+    # machine health) leaves the key out, matching `_EMPTY_FLEET_HEALTH_BLOCK`
+    # already being the handler's own fallback.
+    if board_raw.get("fleet_health") is not None:
+        board_payload["fleet_health"] = _as_dict(
+            board_raw.get("fleet_health"), "board.fleet_health"
+        )
 
     now = raw.get("now")
     if now is not None:
@@ -418,11 +464,20 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
             "fixture 'report_results' values must be mappings (ReportResult wire shape)"
         )
 
+    machine_metrics_raw = _as_dict(raw.get("machine_metrics"), "machine_metrics")
+    for name, series in machine_metrics_raw.items():
+        if not isinstance(series, list):
+            raise FixtureError(
+                f"fixture 'machine_metrics[{name!r}]' must be a list, "
+                f"got {type(series).__name__}"
+            )
+
     server = FixtureServer(
         board_payload=board_payload,
         merge_queue_raw=_as_list(raw.get("merge_queue"), "merge_queue"),
         proposals_raw=_as_list(raw.get("proposals"), "proposals"),
         machines_raw=_as_list(raw.get("machines"), "machines"),
+        machine_metrics_raw=machine_metrics_raw,
         sessions_raw=_as_list(raw.get("sessions"), "sessions"),
         drive_queue_raw=_as_list(raw.get("drive_queue"), "drive_queue"),
         report_catalogue_raw=report_catalogue_raw,
