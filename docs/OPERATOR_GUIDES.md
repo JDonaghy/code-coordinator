@@ -31,6 +31,11 @@ in `docs/`.*
   per-PR preview / `uat` gate / visual-baseline pattern that fixes it, and the manual runbook
   to use until the gate exists.
 - [`ORACLE_LOOP.md`](ORACLE_LOOP.md) — sealed acceptance suites, Gate-A contracts, the test-author agent.
+- [`DATA_STORE_SELECTION.md`](DATA_STORE_SELECTION.md) — choosing between D1, Supabase
+  and managed Postgres for a new app. **A reasoning guide, not an approved-vendor list** —
+  `house_stack_context()` already derives what the fleet runs mechanically (#2997), and a
+  hand-maintained blessed-stack list would rot and suppress the reasoning. Holds the
+  Hyperdrive fact that stops D1 being a one-way door.
 - [`PHONE_WEBAPP.md`](PHONE_WEBAPP.md) — Phone Control Center v1 runbook and the `/api/pipeline` surface.
 - [`GRAPHIFY_SETUP.md`](GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
 - [`EPHEMERAL_WORKERS.md`](EPHEMERAL_WORKERS.md) — on-demand Azure worker VMs per epic. **The tailnet ACL is the security boundary** — `agent_app.py` has no authentication.
