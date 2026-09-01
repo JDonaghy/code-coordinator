@@ -807,7 +807,7 @@ class TestMachinesStatsAPI:
 
     def test_machine_at_its_concurrency_ceiling(self) -> None:
         """capacity.active reflects only RUNNING assignments (mirrors
-        `_active_assignments_by_machine`/`Board.idle_machines`), and
+        `coord.reconcile._running_by_machine`/`Board.idle_machines`), and
         capacity.max honours a per-machine `max_workers` override over the
         fleet-wide default (`coord.reconcile._machine_capacity`)."""
         machines = [
@@ -880,6 +880,40 @@ class TestMachinesStatsAPI:
         other = by_name["other"]
         assert other["counts"] == {"completed": 1, "failed": 0}
         assert [j["assignment_id"] for j in other["job_history"]] == ["other_done"]
+
+    def test_merged_status_counts_as_completed(self) -> None:
+        """`coord.state.mark_assignment_merged` flips a done work assignment
+        to `status="merged"` once GitHub confirms the merge -- that is the
+        normal steady state for a successfully completed assignment, not a
+        distinct outcome, so it must bucket into `counts.completed` the same
+        way `coord.scorecard` treats it as the success signal (not silently
+        fall into neither bucket like advisory/cancelled/refused_policy)."""
+        now = time.time()
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=30, issue_title="Merge-confirmed",
+                assignment_id="merged1", status="merged",
+                dispatched_at=now - 100, finished_at=now - 90,
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=31, issue_title="Still just done",
+                assignment_id="done1", status="done",
+                dispatched_at=now - 50, finished_at=now - 40,
+            ),
+        ])
+        machines = [Machine(name="laptop", host="laptop.tailnet", repos=["api"])]
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        m = r.json()[0]
+        assert m["counts"] == {"completed": 2, "failed": 0}
+        assert {j["assignment_id"] for j in m["job_history"]} == {"merged1", "done1"}
+        # job_history preserves the raw status, unlike the collapsed count.
+        history_by_id = {j["assignment_id"]: j for j in m["job_history"]}
+        assert history_by_id["merged1"]["status"] == "merged"
 
     def test_advisory_and_cancelled_appear_in_history_but_not_in_counts(self) -> None:
         """#448/#2234: advisory/cancelled/refused_policy are neither a clean
