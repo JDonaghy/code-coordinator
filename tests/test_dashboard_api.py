@@ -771,6 +771,169 @@ class TestMachinesAPI:
         assert "progress" not in m["assignments"]["active"][0]
 
 
+class TestMachinesStatsAPI:
+    """#3025: GET /api/machines/stats -- per-machine work stats derived
+    purely from the board (no new probe, no agent contact): active workers
+    vs configured concurrency, completed/failed counts, and recent job
+    history.
+    """
+
+    def _config(self, machines: list[Machine]) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=machines,
+        )
+
+    def _client(self, machines: list[Machine]) -> TestClient:
+        return TestClient(build_app(self._config(machines)))
+
+    def test_machine_with_zero_jobs_reads_empty_stats(self) -> None:
+        """A machine with nothing on the board at all -- fresh install, or
+        everything aged out of the retention window -- reads zero counts
+        and an empty history, never an error."""
+        machines = [Machine(name="idle", host="idle.tailnet", repos=["api"])]
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/machines/stats")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        m = data[0]
+        assert m["name"] == "idle"
+        assert m["capacity"] == {"active": 0, "max": 2}  # default concurrency.max_workers
+        assert m["counts"] == {"completed": 0, "failed": 0}
+        assert m["job_history"] == []
+
+    def test_machine_at_its_concurrency_ceiling(self) -> None:
+        """capacity.active reflects only RUNNING assignments (mirrors
+        `_active_assignments_by_machine`/`Board.idle_machines`), and
+        capacity.max honours a per-machine `max_workers` override over the
+        fleet-wide default (`coord.reconcile._machine_capacity`)."""
+        machines = [
+            Machine(name="laptop", host="laptop.tailnet", repos=["api"], max_workers=1),
+        ]
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=1, issue_title="At capacity",
+                assignment_id="running1", status="running",
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=2, issue_title="Not yet dispatched",
+                assignment_id="pending1", status="pending",
+            ),
+        ])
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        m = r.json()[0]
+        assert m["capacity"] == {"active": 1, "max": 1}
+
+    def test_completed_and_failed_counts_and_job_history_shape(self) -> None:
+        now = time.time()
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=10, issue_title="Older done",
+                assignment_id="done_old", status="done",
+                dispatched_at=now - 200, finished_at=now - 100,
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=11, issue_title="Newer failure",
+                assignment_id="fail_new", status="failed",
+                dispatched_at=now - 50, finished_at=now - 10,
+            ),
+            Assignment(
+                machine_name="other", repo_name="api",
+                issue_number=12, issue_title="Different machine",
+                assignment_id="other_done", status="done",
+                dispatched_at=now - 30, finished_at=now - 20,
+            ),
+        ])
+        machines = [
+            Machine(name="laptop", host="laptop.tailnet", repos=["api"]),
+            Machine(name="other", host="other.tailnet", repos=["api"]),
+        ]
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        by_name = {m["name"]: m for m in r.json()}
+        laptop = by_name["laptop"]
+        assert laptop["counts"] == {"completed": 1, "failed": 1}
+        # Newest (by finished_at) first.
+        assert [j["assignment_id"] for j in laptop["job_history"]] == [
+            "fail_new", "done_old",
+        ]
+        entry = laptop["job_history"][0]
+        assert entry["issue_number"] == 11
+        assert entry["issue_title"] == "Newer failure"
+        assert entry["status"] == "failed"
+        assert entry["repo_name"] == "api"
+        assert entry["dispatched_at"] == now - 50
+        assert entry["finished_at"] == now - 10
+
+        other = by_name["other"]
+        assert other["counts"] == {"completed": 1, "failed": 0}
+        assert [j["assignment_id"] for j in other["job_history"]] == ["other_done"]
+
+    def test_advisory_and_cancelled_appear_in_history_but_not_in_counts(self) -> None:
+        """#448/#2234: advisory/cancelled/refused_policy are neither a clean
+        success nor a failure -- they still show up in job_history (it is a
+        raw recent-activity feed) but must not inflate either count."""
+        now = time.time()
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=20, issue_title="Zero-commit clean exit",
+                assignment_id="adv1", status="advisory",
+                dispatched_at=now - 10, finished_at=now - 5,
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=21, issue_title="Cancelled mid-run",
+                assignment_id="cancel1", status="cancelled",
+                dispatched_at=now - 20, finished_at=now - 15,
+            ),
+        ])
+        machines = [Machine(name="laptop", host="laptop.tailnet", repos=["api"])]
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        m = r.json()[0]
+        assert m["counts"] == {"completed": 0, "failed": 0}
+        assert {j["assignment_id"] for j in m["job_history"]} == {"adv1", "cancel1"}
+
+    def test_job_history_capped_at_most_recent_20(self) -> None:
+        now = time.time()
+        completed = [
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=i, issue_title=f"Job {i}",
+                assignment_id=f"job{i}", status="done",
+                dispatched_at=now - (100 - i), finished_at=now - (100 - i),
+            )
+            for i in range(25)
+        ]
+        board = Board(completed=completed)
+        machines = [Machine(name="laptop", host="laptop.tailnet", repos=["api"])]
+        client = self._client(machines)
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        m = r.json()[0]
+        assert len(m["job_history"]) == 20
+        # Newest finished_at first: job24 finished most recently.
+        assert m["job_history"][0]["assignment_id"] == "job24"
+        assert m["job_history"][-1]["assignment_id"] == "job5"
+        assert m["counts"]["completed"] == 25  # counts are NOT capped like history
+
+
 class TestMachinesHealthAPI:
     """#3024: GET /api/machines/health -- the fleet-wide `FleetHealthSnapshot`
     (severity/stale/headroom detail per machine, plus fleet-scope checks)
