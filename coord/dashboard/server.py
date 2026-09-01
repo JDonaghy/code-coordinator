@@ -1749,11 +1749,14 @@ def build_app(
         duplicate or drift from it. See ``_machine_metrics_daemon_target()``
         for how daemon-vs-local is resolved.
 
-        Fixture mode has no live sampler to simulate at all, so it always
-        reports the same explicit-unreachable shape a real unreachable
-        daemon would (below) rather than pretending to have live data —
-        mirrors ``api_machines``' "never probe the fleet in fixture mode",
-        just with nothing to seed instead of a canned reachable answer.
+        Fixture mode (#3026) has no live sampler to simulate, so it runs the
+        seeded per-machine series (``FixtureServer.machine_metrics_series()``)
+        through the exact same ``resolve_since``/``build_metrics_response``
+        pipeline the daemon's own ``GET /machines/metrics`` handler
+        (``coord.serve_app.get_machine_metrics``) uses — only the series
+        *source* differs, so ``since``/``resolution``/``machine`` and a bad
+        value's 400 all behave identically to live mode. Never probes the
+        fleet, mirroring ``api_machines``' fixture branch.
 
         Degrades honestly (#3022): a daemon that is unreachable (down,
         network partition, wrong token) comes back as an explicit
@@ -1768,13 +1771,33 @@ def build_app(
         caller's bad input, not a daemon health problem.
         """
         if _fixture is not None:
-            return JSONResponse(
-                {
-                    "error": "machine metrics have no fixture source",
-                    "reachable": False,
-                },
-                status_code=503,
+            from coord.machine_metrics import (  # noqa: PLC0415
+                build_metrics_response,
+                resolve_since,
             )
+
+            qp = request.query_params
+            resolution_raw = qp.get("resolution")
+            try:
+                resolution = int(resolution_raw) if resolution_raw else None
+                if resolution is not None and resolution <= 0:
+                    raise ValueError("resolution must be a positive integer")
+            except ValueError as e:
+                return JSONResponse(
+                    {"error": f"bad resolution={resolution_raw!r}: {e}"}, status_code=400
+                )
+            try:
+                since = resolve_since(qp.get("since"), now=_fixture.now)
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+            result = build_metrics_response(
+                _fixture.machine_metrics_series(),
+                machine=qp.get("machine") or None,
+                since=since,
+                resolution=resolution,
+                now=_fixture.now,
+            )
+            return JSONResponse(result)
 
         from coord.client import fetch_machine_metrics  # noqa: PLC0415
 
@@ -1852,6 +1875,13 @@ def build_app(
         coord-tui's ``machine_detail_list``), newest first by ``finished_at``
         (falling back to ``dispatched_at`` for a row that somehow has no
         ``finished_at``).
+
+        Fixture mode (#3026) needs no dedicated branch here at all: ``_read_board()``
+        already returns the seeded board and ``config`` is already the fixture's
+        own ``config`` block (or the caller-supplied fallback) — this handler
+        reads both exactly like live mode, so a fixture with a realistic spread
+        of completed/failed/running assignments per machine exercises it for
+        free.
         """
         from coord.reconcile import _machine_capacity, _running_by_machine  # noqa: PLC0415
 

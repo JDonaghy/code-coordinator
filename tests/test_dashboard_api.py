@@ -1337,14 +1337,38 @@ class TestMachineMetricsAPI:
         assert r.status_code == 400
         assert "reachable" not in r.json()
 
-    def test_fixture_mode_reports_unreachable_rather_than_faking_a_series(self) -> None:
-        """``coord web --fixture`` has no live sampler to simulate -- it must
-        say so honestly rather than returning a canned "healthy" series."""
+    def test_fixture_mode_serves_the_seeded_series_never_the_live_daemon(
+        self, monkeypatch
+    ) -> None:
+        """``coord web --fixture`` (#3026) never proxies to a live daemon --
+        it runs the fixture's own seeded series through the same
+        ``resolve_since``/``build_metrics_response`` pipeline instead.
+        An unseeded fixture (no ``machine_metrics`` key) reads back as an
+        empty ``machines`` dict -- the same "nothing sampled yet" shape the
+        live sampler reports for a machine it has never polled -- rather
+        than a canned unreachable error (that was the pre-#3026 placeholder,
+        superseded now that the fixture has a real seeding path)."""
+        import coord.client as cc
         from coord.dashboard.fixture import FixtureServer
+
+        def _boom(*a, **k):
+            raise AssertionError("fixture mode reached a live daemon")
+
+        monkeypatch.setattr(cc, "fetch_machine_metrics", _boom)
 
         client = TestClient(build_app(_config(), fixture=FixtureServer()))
 
         r = client.get("/api/machines/metrics")
 
-        assert r.status_code == 503
-        assert r.json()["reachable"] is False
+        assert r.status_code == 200
+        assert r.json()["machines"] == {}
+
+        seeded = FixtureServer(machine_metrics_raw={"laptop": [
+            {"timestamp": 1234.5, "status": "ok", "cpu_percent": 12.0,
+             "mem_percent": 30.0, "mem_used_mb": 100.0, "mem_total_mb": 400.0,
+             "reason": ""},
+        ]})
+        client = TestClient(build_app(_config(), fixture=seeded))
+        r = client.get("/api/machines/metrics")
+        assert r.status_code == 200
+        assert r.json()["machines"] == {"laptop": seeded.machine_metrics_raw["laptop"]}
