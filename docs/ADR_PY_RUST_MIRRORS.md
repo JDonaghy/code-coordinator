@@ -97,6 +97,7 @@ they drift, the symbol names do not — grep the symbol if the line has moved.
 | `coord/commands/terminal.py:5` | `src/app/terminal.rs` | The embedded-terminal session contract. |
 | `coord/commands/_common.py:308` | `src/app/pipeline.rs` | Which acceptance subcommand the TUI's Pipeline dispatch fires. |
 | `coord/health/checks/deploy_lane_facts.py:115` | `src/app/data.rs` | Not a logic mirror: the *structural marker path* `resolve_coord_tui_checkout` uses to recognise a coord-tui checkout, and the pre-#2899 spelling it must NOT match. Listed because it is a hard-coded coord-tui path and would break on a layout change there. |
+| `coord/machine_metrics.py:9` | `src/app/data.rs::spawn_machine_metrics` | The per-agent `GET :7433/metrics` polling contract (`coord.agent_app.metrics`: a `psutil` cpu/mem snapshot, `503` when psutil is absent). Two *independent* samplers now read that one endpoint — coord-tui's in-process `VecDeque`, live only while its panel is open, and the daemon-side ring buffer added by #3020. Not a logic mirror and not a divergence risk in itself: both sides consume the same wire, which is the endpoint's own contract, not a re-derived rule. Listed because it is a hard-coded reference to a coord-tui source symbol, and because a future change to the `/metrics` payload has to be made aware of *both* readers. |
 
 ## Consequences
 
