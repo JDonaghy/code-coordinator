@@ -1817,10 +1817,11 @@ def build_app(
         keeping out of it.
 
         Capacity: ``active`` counts ``board.active`` entries with
-        ``status == "running"`` for the machine — the same filter
-        ``_active_assignments_by_machine``/``Board.idle_machines`` use, so
-        this can't produce a second, diverging answer to "is this machine
-        busy" (#2096). ``max`` is the effective concurrency ceiling
+        ``status == "running"`` for the machine — sourced from
+        ``coord.reconcile._running_by_machine``, the same helper
+        ``_reassign``/``describe_no_candidate_machines`` use, so this can't
+        produce a second, diverging answer to "is this machine busy" (#2096
+        / #1417). ``max`` is the effective concurrency ceiling
         (``coord.reconcile._machine_capacity``: the machine's own
         ``max_workers`` override, falling back to the fleet-wide
         ``concurrency.max_workers``) — the exact same helper the dispatcher
@@ -1828,31 +1829,36 @@ def build_app(
         drift from what actually gates dispatch either.
 
         Counts + job history are both sourced from ``board.completed`` —
-        every non-active (``done``/``failed``/``cancelled``/``advisory``/
-        ``refused_policy``) assignment currently on the board. That list is
-        already retention-windowed upstream (``coord.dao._board_retention_cutoff``
-        / ``compute_board_keep_ids``, identical in thin-client and co-located
-        mode), so this handler applies no additional cutoff of its own — a
-        machine with nothing in the window (fresh install, or everything
-        aged out) reads zero counts and an empty history, never an error.
-        ``completed``/``failed`` count only ``status == "done"``/``"failed"``
-        respectively; ``cancelled``/``advisory``/``refused_policy`` rows still
-        appear in ``job_history`` but are not bucketed into either count —
-        they are neither a clean success nor a failure (#448/#2234's "advisory
-        is a third state" distinction).
+        every non-active (``done``/``merged``/``failed``/``cancelled``/
+        ``advisory``/``refused_policy``) assignment currently on the board.
+        That list is already retention-windowed upstream
+        (``coord.dao._board_retention_cutoff`` / ``compute_board_keep_ids``,
+        identical in thin-client and co-located mode), so this handler
+        applies no additional cutoff of its own — a machine with nothing in
+        the window (fresh install, or everything aged out) reads zero counts
+        and an empty history, never an error. ``completed`` counts
+        ``status == "done"`` **and** ``status == "merged"`` together —
+        ``coord.state.mark_assignment_merged`` flips a done work assignment
+        to ``status="merged"`` once GitHub confirms the merge, so ``merged``
+        is the normal steady state for a successfully completed assignment,
+        not a distinct outcome (mirrors ``coord.scorecard``'s
+        ``status == "merged"`` success check). ``failed`` counts
+        ``status == "failed"``; ``cancelled``/``advisory``/``refused_policy``
+        rows still appear in ``job_history`` but are not bucketed into
+        either count — they are neither a clean success nor a failure
+        (#448/#2234's "advisory is a third state" distinction).
 
         ``job_history`` is capped at the most recent 20 per machine (mirrors
         coord-tui's ``machine_detail_list``), newest first by ``finished_at``
         (falling back to ``dispatched_at`` for a row that somehow has no
         ``finished_at``).
         """
-        from coord.reconcile import _machine_capacity  # noqa: PLC0415
+        from coord.reconcile import _machine_capacity, _running_by_machine  # noqa: PLC0415
 
         board = _read_board()
-        active_by_machine: dict[str, int] = {}
-        for a in board.active:
-            if a.status == "running":
-                active_by_machine[a.machine_name] = active_by_machine.get(a.machine_name, 0) + 1
+        active_by_machine: dict[str, int] = {
+            name: len(rows) for name, rows in _running_by_machine(board).items()
+        }
 
         completed_by_machine: dict[str, list] = {}
         for a in board.completed:
@@ -1873,7 +1879,7 @@ def build_app(
                     "max": _machine_capacity(m, config),
                 },
                 "counts": {
-                    "completed": sum(1 for a in rows if a.status == "done"),
+                    "completed": sum(1 for a in rows if a.status in ("done", "merged")),
                     "failed": sum(1 for a in rows if a.status == "failed"),
                 },
                 "job_history": [
