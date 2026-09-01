@@ -18,8 +18,9 @@ import pytest
 from starlette.testclient import TestClient
 
 from coord.config import Config
-from coord.dashboard.server import build_app
+from coord.dashboard.server import build_app, openapi_spec
 from coord.models import Assignment, Board, Machine, Repo
+from coord.openapi import validate_json_schema
 
 
 @pytest.fixture(autouse=True)
@@ -1372,3 +1373,239 @@ class TestMachineMetricsAPI:
         r = client.get("/api/machines/metrics")
         assert r.status_code == 200
         assert r.json()["machines"] == {"laptop": seeded.machine_metrics_raw["laptop"]}
+
+
+class TestMachinesEndpointsMatchOpenApiSpec:
+    """#3027: every ``/api/machines*`` endpoint (#3021-#3026) must now carry a
+    real response schema in ``openapi_spec()``, not the bare ``{"200":
+    {"description": "OK"}}`` stub ``/api/machines`` had carried until now.
+
+    Mirrors ``tests/test_openapi.py``'s
+    ``test_serve_openapi_board_schema_validates_golden_fixture`` pattern:
+    exercise the REAL (non-fixture) handler with a richly populated payload
+    -- assignments, multi-severity health results, metric samples, job
+    history -- so every optional/nullable field the schema declares is
+    actually hit at least once, then validate the served JSON against the
+    schema the SAME ``openapi_spec()`` this repo's codegen reads declares
+    for that path. A schema that silently drifted from what the handler
+    actually returns fails right here.
+    """
+
+    def _schema_for(self, spec: dict, path: str, status: str = "200") -> dict:
+        return spec["paths"][path]["get"]["responses"][status]["content"][
+            "application/json"
+        ]["schema"]
+
+    def test_machines_response_matches_its_schema(self) -> None:
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="Fix auth",
+                assignment_id="abc123", status="running",
+            ),
+        ])
+        health = {
+            "laptop": {
+                "state": "online", "reason": "", "latency_ms": 7.5,
+                "received_at": time.time(),
+                "health": {
+                    "schema": 1, "checked_at": time.time(), "severity": "ok",
+                    "results": [], "worktree_bytes": 4096,
+                    "agent_runtime_version": "0.42.0",
+                },
+            },
+        }
+        client = _client()
+        with (
+            patch("coord.state.load_machine_health", return_value=health),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/machines")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+        # A machine with no running work at all (the idle-machine case)
+        # must validate too -- `assignments` absent entirely, not null.
+        with (
+            patch("coord.state.load_machine_health", return_value={}),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r2 = client.get("/api/machines")
+        errors2 = validate_json_schema(r2.json(), schema, spec["components"]["schemas"])
+        assert errors2 == [], errors2
+
+    def test_machines_stats_response_matches_its_schema(self) -> None:
+        now = time.time()
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=10, issue_title="Older done",
+                assignment_id="done_old", status="done",
+                dispatched_at=now - 200, finished_at=now - 100,
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=11, issue_title="Newer failure",
+                assignment_id="fail_new", status="failed",
+                dispatched_at=now - 50, finished_at=now - 10,
+            ),
+        ])
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/machines/stats")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/stats")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_machines_health_response_matches_its_schema(self) -> None:
+        now = time.time()
+        full_result = {
+            "key": "disk", "check_id": "disk", "scope": "machine",
+            "subject": "/home", "title": "disk", "label": "disk /home",
+            "severity": "warn", "headroom": "8% free",
+            "threshold": "crit at 5%", "detail": "", "trend": None,
+            "values": {"free_gb": 12}, "error": None,
+        }
+        health = {
+            "laptop": {
+                "state": "online", "reason": "", "latency_ms": 7.5,
+                "received_at": now,
+                "health": {
+                    "schema": 1, "checked_at": now, "severity": "warn",
+                    "results": [full_result], "worktree_bytes": 4096,
+                    "agent_runtime_version": "0.42.0",
+                },
+            },
+        }
+        client = _client()
+        with patch("coord.state.load_machine_health", return_value=health):
+            r = client.get("/api/machines/health")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/health")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_machines_health_unreachable_error_matches_its_schema(
+        self, monkeypatch
+    ) -> None:
+        import httpx
+
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        monkeypatch.setattr(
+            cc.httpx, "get",
+            lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("refused")),
+        )
+
+        client = _client()
+        r = client.get("/api/machines/health")
+
+        assert r.status_code == 503
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/health", status="503")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_machine_metrics_response_matches_its_schema(self, monkeypatch) -> None:
+        import coord.client as cc
+
+        payload = {
+            "schema": 1, "generated_at": 1234.5, "since": None, "resolution": None,
+            "machines": {
+                "laptop": [
+                    {"timestamp": 1234.5, "status": "ok", "cpu_percent": 12.0,
+                     "mem_percent": 30.0, "mem_used_mb": 100.0,
+                     "mem_total_mb": 400.0, "reason": ""},
+                    {"timestamp": 1249.5, "status": "unknown", "cpu_percent": None,
+                     "mem_percent": None, "mem_used_mb": None,
+                     "mem_total_mb": None, "reason": "psutil not installed"},
+                ],
+            },
+        }
+
+        def fake_get(url, **kw):
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return payload
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/metrics")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_machine_metrics_bad_request_matches_its_schema(self, monkeypatch) -> None:
+        """A malformed since/resolution is the DAEMON's 400, forwarded as-is
+        (see ``test_daemon_400_is_forwarded_as_a_caller_error_not_folded_into_unreachable``
+        above) -- so the daemon call itself has to be mocked to return one."""
+        import coord.client as cc
+
+        def fake_get(url, **kw):
+            class _Resp:
+                status_code = 400
+
+                def raise_for_status(self):
+                    import httpx
+
+                    raise httpx.HTTPStatusError("boom", request=None, response=self)
+
+                def json(self):
+                    return {"error": "bad resolution='0': must be a positive integer"}
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/machines/metrics", params={"resolution": "0"})
+
+        assert r.status_code == 400
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/metrics", status="400")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_machine_metrics_unreachable_error_matches_its_schema(
+        self, monkeypatch
+    ) -> None:
+        import httpx
+
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc.httpx, "get",
+            lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("refused")),
+        )
+
+        client = _client()
+        r = client.get("/api/machines/metrics")
+
+        assert r.status_code == 503
+        spec = openapi_spec()
+        schema = self._schema_for(spec, "/api/machines/metrics", status="503")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors

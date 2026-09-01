@@ -607,6 +607,229 @@ def openapi_spec() -> dict:
         },
         "required": ["submission_id", "question_revision", "question"],
     }
+    # #3027: the four `/api/machines*` endpoints (#3021-#3026) went out
+    # carrying a bare `{"200": {"description": "OK"}}` stub — every other
+    # surface here has a real `content` schema, this milestone's own
+    # deliverable is closing that gap. Hand-built (not `dataclass_schema`),
+    # matching the same "mirror the handler's actual dict field-for-field"
+    # convention `report_result_ref`/`portal_ledger_entry` above already
+    # use, because none of these four responses is a plain
+    # `dataclasses.asdict()` of a single dataclass.
+    components["MachineAssignmentSpec"] = {
+        "type": "object",
+        "properties": {
+            "issue_number": {"type": "integer"},
+            "issue_title": {"type": "string"},
+            "repo_name": {"type": "string"},
+        },
+    }
+    machine_assignment_spec_ref = {"$ref": "#/components/schemas/MachineAssignmentSpec"}
+    components["MachineActiveAssignment"] = {
+        "type": "object",
+        "properties": {
+            "assignment_id": {"type": "string"},
+            "status": {"type": "string"},
+            "spec": machine_assignment_spec_ref,
+        },
+    }
+    machine_active_assignment_ref = {
+        "$ref": "#/components/schemas/MachineActiveAssignment"
+    }
+    components["MachineActiveAssignments"] = {
+        "type": "object",
+        "properties": {
+            "active": {"type": "array", "items": machine_active_assignment_ref}
+        },
+        "required": ["active"],
+    }
+    machine_active_assignments_ref = {
+        "$ref": "#/components/schemas/MachineActiveAssignments"
+    }
+    components["MachineRow"] = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "host": {"type": "string"},
+            "repos": {"type": "array", "items": {"type": "string"}},
+            "state": {"type": "string", "description": "unknown|online|offline|..."},
+            "reason": {"type": "string"},
+            "latency_ms": {"type": "number", "nullable": True},
+            "agent_version": {"type": "string", "nullable": True},
+            "worktree_bytes": {"type": "number", "nullable": True},
+            "assignments": {
+                **machine_active_assignments_ref,
+                "nullable": True,
+                "description": "present only when this machine has running work",
+            },
+        },
+        "required": ["name", "host", "repos", "state", "reason"],
+    }
+    machine_row_ref = {"$ref": "#/components/schemas/MachineRow"}
+    machines_response = {"type": "array", "items": machine_row_ref}
+    # `coord.health.models.CheckResult.to_dict()` verbatim — shared by
+    # `MachineHealthRow.results` and `FleetHealthResponse.fleet_checks`,
+    # since both are that same to_dict() shape (see fleet_snapshot.py's
+    # `_machine_health_rows`/`FleetHealthRefresher.refresh`).
+    components["HealthCheckResult"] = {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+            "check_id": {"type": "string"},
+            "scope": {"type": "string"},
+            "subject": {"type": "string", "nullable": True},
+            "title": {"type": "string"},
+            "label": {"type": "string"},
+            "severity": {"type": "string", "description": "ok|warn|crit|unknown"},
+            "headroom": {"type": "string"},
+            "threshold": {"type": "string"},
+            "detail": {"type": "string"},
+            "trend": {"type": "string", "nullable": True},
+            "values": {"type": "object"},
+            "error": {"type": "string", "nullable": True},
+        },
+        "required": ["key", "check_id", "scope", "title", "label", "severity", "headroom"],
+    }
+    health_check_result_ref = {"$ref": "#/components/schemas/HealthCheckResult"}
+    components["MachineHealthRow"] = {
+        "type": "object",
+        "properties": {
+            "machine": {"type": "string"},
+            "state": {"type": "string"},
+            "reason": {"type": "string"},
+            "latency_ms": {"type": "number", "nullable": True},
+            "received_at": {"type": "number", "nullable": True},
+            "stale": {"type": "boolean"},
+            "severity": {"type": "string", "description": "ok|warn|crit|unknown"},
+            "checked_at": {"type": "number", "nullable": True},
+            "results": {"type": "array", "items": health_check_result_ref},
+            "worktree_bytes": {"type": "number", "nullable": True},
+            "agent_runtime_version": {"type": "string", "nullable": True},
+        },
+        "required": ["machine", "state", "reason", "stale", "severity", "results"],
+    }
+    machine_health_row_ref = {"$ref": "#/components/schemas/MachineHealthRow"}
+    # Mirrors `coord.health.fleet_snapshot.FleetHealthSnapshot.to_dict()`
+    # exactly (`{schema, refreshed_at, machine_health, fleet_checks,
+    # truncated}`) -- the same body `/board`'s own `fleet_health` key
+    # carries, per this endpoint's docstring.
+    components["FleetHealthResponse"] = {
+        "type": "object",
+        "properties": {
+            "schema": {"type": "integer"},
+            "refreshed_at": {"type": "number", "nullable": True},
+            "machine_health": {"type": "array", "items": machine_health_row_ref},
+            "fleet_checks": {"type": "array", "items": health_check_result_ref},
+            "truncated": {"type": "boolean"},
+        },
+        "required": ["schema", "machine_health", "fleet_checks", "truncated"],
+    }
+    fleet_health_response_ref = {"$ref": "#/components/schemas/FleetHealthResponse"}
+    # Shared by `/api/machines/health` and `/api/machines/metrics` (#3024/
+    # #3021/#3022 both degrade an unreachable thin-client daemon the same
+    # way): an explicit `{error, detail, reachable: false}` 503 body, never
+    # a stale-looking 200.
+    components["DaemonUnreachableError"] = {
+        "type": "object",
+        "properties": {
+            "error": {"type": "string"},
+            "detail": {"type": "string"},
+            "reachable": {"type": "boolean"},
+        },
+        "required": ["error", "reachable"],
+    }
+    daemon_unreachable_ref = {"$ref": "#/components/schemas/DaemonUnreachableError"}
+    components["BadRequestError"] = {
+        "type": "object",
+        "properties": {"error": {"type": "string"}},
+        "required": ["error"],
+    }
+    bad_request_ref = {"$ref": "#/components/schemas/BadRequestError"}
+    # `coord.machine_metrics.MetricsSample.to_dict()` verbatim.
+    components["MachineMetricsSample"] = {
+        "type": "object",
+        "properties": {
+            "timestamp": {"type": "number"},
+            "status": {"type": "string", "description": "ok|unknown"},
+            "cpu_percent": {"type": "number", "nullable": True},
+            "mem_percent": {"type": "number", "nullable": True},
+            "mem_used_mb": {"type": "number", "nullable": True},
+            "mem_total_mb": {"type": "number", "nullable": True},
+            "reason": {"type": "string"},
+        },
+        "required": ["timestamp", "status", "reason"],
+    }
+    machine_metrics_sample_ref = {"$ref": "#/components/schemas/MachineMetricsSample"}
+    # `coord.machine_metrics.build_metrics_response()`'s body verbatim.
+    components["MachineMetricsResponse"] = {
+        "type": "object",
+        "properties": {
+            "schema": {"type": "integer"},
+            "generated_at": {"type": "number"},
+            "since": {"type": "number", "nullable": True},
+            "resolution": {"type": "integer", "nullable": True},
+            "machines": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "array",
+                    "items": machine_metrics_sample_ref,
+                },
+                "description": "machine name -> oldest-first sample series",
+            },
+        },
+        "required": ["schema", "generated_at", "machines"],
+    }
+    machine_metrics_response_ref = {"$ref": "#/components/schemas/MachineMetricsResponse"}
+    # `api_machines_stats`'s per-machine dict verbatim (#3025).
+    components["MachineStatsJobHistoryEntry"] = {
+        "type": "object",
+        "properties": {
+            "assignment_id": {"type": "string"},
+            "repo_name": {"type": "string"},
+            "issue_number": {"type": "integer", "nullable": True},
+            "issue_title": {"type": "string", "nullable": True},
+            "type": {"type": "string"},
+            "status": {"type": "string"},
+            "dispatched_at": {"type": "number", "nullable": True},
+            "finished_at": {"type": "number", "nullable": True},
+        },
+        "required": ["assignment_id", "repo_name", "type", "status"],
+    }
+    machine_stats_job_history_entry_ref = {
+        "$ref": "#/components/schemas/MachineStatsJobHistoryEntry"
+    }
+    components["MachineCapacity"] = {
+        "type": "object",
+        "properties": {
+            "active": {"type": "integer"},
+            "max": {"type": "integer"},
+        },
+        "required": ["active", "max"],
+    }
+    machine_capacity_ref = {"$ref": "#/components/schemas/MachineCapacity"}
+    components["MachineJobCounts"] = {
+        "type": "object",
+        "properties": {
+            "completed": {"type": "integer"},
+            "failed": {"type": "integer"},
+        },
+        "required": ["completed", "failed"],
+    }
+    machine_job_counts_ref = {"$ref": "#/components/schemas/MachineJobCounts"}
+    components["MachineStatsRow"] = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "capacity": machine_capacity_ref,
+            "counts": machine_job_counts_ref,
+            "job_history": {
+                "type": "array",
+                "items": machine_stats_job_history_entry_ref,
+            },
+        },
+        "required": ["name", "capacity", "counts", "job_history"],
+    }
+    machine_stats_row_ref = {"$ref": "#/components/schemas/MachineStatsRow"}
+    machines_stats_response = {"type": "array", "items": machine_stats_row_ref}
     paths = {
         "/": {
             "get": {
@@ -628,7 +851,12 @@ def openapi_spec() -> dict:
         "/api/machines": {
             "get": {
                 "summary": "Machine reachability + live agent /status per machine",
-                "responses": {"200": {"description": "OK"}},
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": machines_response}},
+                    }
+                },
             }
         },
         "/api/machines/health": {
@@ -644,12 +872,18 @@ def openapi_spec() -> dict:
                             "OK -- {schema, refreshed_at, machine_health: [...], "
                             "fleet_checks: [...], truncated}, unchanged"
                         ),
+                        "content": {
+                            "application/json": {"schema": fleet_health_response_ref}
+                        },
                     },
                     "503": {
                         "description": (
                             "The daemon is unreachable -- an explicit "
                             "{error, reachable: false} body, never a stale-looking 200"
                         ),
+                        "content": {
+                            "application/json": {"schema": daemon_unreachable_ref}
+                        },
                     },
                 },
             }
@@ -690,15 +924,22 @@ def openapi_spec() -> dict:
                 "responses": {
                     "200": {
                         "description": "OK -- daemon's versioned metrics payload, verbatim",
+                        "content": {
+                            "application/json": {"schema": machine_metrics_response_ref}
+                        },
                     },
                     "400": {
                         "description": "The daemon rejected since/resolution as malformed",
+                        "content": {"application/json": {"schema": bad_request_ref}},
                     },
                     "503": {
                         "description": (
                             "The daemon is unreachable -- an explicit "
                             "{error, reachable: false} body, never an empty series"
                         ),
+                        "content": {
+                            "application/json": {"schema": daemon_unreachable_ref}
+                        },
                     },
                 },
             }
@@ -710,7 +951,14 @@ def openapi_spec() -> dict:
                     "active vs configured concurrency, completed/failed counts "
                     "over the retention window, and recent (last 20) job history"
                 ),
-                "responses": {"200": {"description": "OK"}},
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": machines_stats_response}
+                        },
+                    }
+                },
             }
         },
         "/api/proposals": {
