@@ -4957,6 +4957,91 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/machines/metrics": {
+            "get": {
+                "summary": (
+                    "#3021: server-downsampled cpu/mem history from #3020's "
+                    "bounded per-machine ring buffers (~6h at ~15s cadence). "
+                    "Never ships the raw buffer for the client to thin — pass "
+                    "`resolution` and the server reduces it."
+                ),
+                "parameters": [
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": (
+                            "epoch seconds, ISO-8601, or a duration like '6h' "
+                            "('now minus 6h'). Omitted = the full retained window."
+                        ),
+                    },
+                    {
+                        "name": "resolution",
+                        "in": "query",
+                        "schema": {"type": "integer"},
+                        "description": (
+                            "max points per machine per series in the response, "
+                            "e.g. 100. Downsampling is peak-preserving (keeps the "
+                            "highest cpu/mem reading per bucket, never naive "
+                            "striding). Omitted = full filtered series."
+                        ),
+                    },
+                    {
+                        "name": "machine",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "narrow to a single machine's series",
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "schema": {"type": "integer", "enum": [1]},
+                                        "generated_at": {"type": "number"},
+                                        "since": {"type": ["number", "null"]},
+                                        "resolution": {"type": ["integer", "null"]},
+                                        "machines": {
+                                            "type": "object",
+                                            "description": (
+                                                "machine name -> oldest-first list "
+                                                "of samples; status=unknown carries "
+                                                "no cpu/mem values so a renderer "
+                                                "draws a gap instead of interpolating"
+                                            ),
+                                            "additionalProperties": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "timestamp": {"type": "number"},
+                                                        "status": {
+                                                            "type": "string",
+                                                            "enum": ["ok", "unknown"],
+                                                        },
+                                                        "cpu_percent": {"type": ["number", "null"]},
+                                                        "mem_percent": {"type": ["number", "null"]},
+                                                        "mem_used_mb": {"type": ["number", "null"]},
+                                                        "mem_total_mb": {"type": ["number", "null"]},
+                                                        "reason": {"type": "string"},
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                    "required": ["schema", "generated_at", "machines"],
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Bad `since` or `resolution`"},
+                },
+            }
+        },
         "/report": {
             "get": {
                 "summary": (
@@ -5304,11 +5389,23 @@ def openapi_spec() -> dict:
     )
 
 
-def build_app(store: CoordStore, config: Config, *, token: str | None = None) -> Starlette:
+def build_app(
+    store: CoordStore,
+    config: Config,
+    *,
+    token: str | None = None,
+    machine_metrics_sampler: MachineMetricsSampler | None = None,
+) -> Starlette:
     """Build the read-only control-center Starlette app bound to *store* + *config*.
 
     *token* — when set, every endpoint except ``/healthz`` requires
     ``Authorization: Bearer <token>``.
+
+    *machine_metrics_sampler* — injectable for tests (#3021): a fresh
+    :class:`~coord.machine_metrics.MachineMetricsSampler` is created when
+    omitted, exactly as before. Passing a pre-seeded instance lets a test
+    drive ``GET /machines/metrics`` against known ring-buffer contents
+    without waiting on the tick loop or a live agent poll.
     """
     # #1081: track the backing coordinator.yml's mtime so the handlers below
     # can swap in a freshly-reloaded Config when it changes on disk, instead
@@ -5343,11 +5440,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # #3020: same shape again — polling every agent's own /metrics is real
     # per-machine I/O, so it runs on the tick loop's cadence
     # (`_machine_metrics_loop` below), never inline off a request handler.
-    # Series live only in this sampler's bounded in-memory ring buffers; no
-    # read endpoint exists yet (that's #A2) and nothing here touches /board.
+    # Series live only in this sampler's bounded in-memory ring buffers;
+    # `GET /machines/metrics` (#3021, below) is the read endpoint and does
+    # bare in-memory reads only. Nothing here touches /board.
     from coord.machine_metrics import MachineMetricsSampler  # noqa: PLC0415
 
-    _machine_metrics_sampler = MachineMetricsSampler()
+    _machine_metrics_sampler = machine_metrics_sampler or MachineMetricsSampler()
 
     # Short-TTL cache for the computed /board projection so burst polls from the
     # TUI don't each pay the full board_projection + merge-plan + stage-projection
@@ -8882,6 +8980,39 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse(result.to_dict())
 
+    async def get_machine_metrics(request: Request) -> Response:
+        # #3021: the read side of #3020's sampler. Bare in-memory reads +
+        # pure filtering/downsampling — no I/O, so (unlike /board) this
+        # never needs a threadpool hop and can't be slowed by a hanging
+        # agent (that's `_machine_metrics_loop`'s problem, not this
+        # handler's).
+        from coord.machine_metrics import build_metrics_response, resolve_since  # noqa: PLC0415
+
+        qp = request.query_params
+
+        resolution_raw = qp.get("resolution")
+        try:
+            resolution = int(resolution_raw) if resolution_raw else None
+            if resolution is not None and resolution <= 0:
+                raise ValueError("resolution must be a positive integer")
+        except ValueError as e:
+            return JSONResponse(
+                {"error": f"bad resolution={resolution_raw!r}: {e}"}, status_code=400
+            )
+
+        try:
+            since = resolve_since(qp.get("since"))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        result = build_metrics_response(
+            _machine_metrics_sampler.all_series(),
+            machine=qp.get("machine") or None,
+            since=since,
+            resolution=resolution,
+        )
+        return JSONResponse(result)
+
     async def post_merge(request: Request) -> Response:
         # #584: the merge queue + board live in THIS (canonical) DB, and gh is
         # authenticated here — so a thin client's `coord merge` / TUI 'Go' routes
@@ -10292,6 +10423,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # read-only, both alongside /audit because they read the same data.
         Route("/report", get_report_catalogue, methods=["GET"]),
         Route("/report/{report_id}", get_report, methods=["GET"]),
+        # #3021: read side of #3020's sampler — server-downsampled machine
+        # cpu/mem history for the coord-web Machines panel.
+        Route("/machines/metrics", get_machine_metrics, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),

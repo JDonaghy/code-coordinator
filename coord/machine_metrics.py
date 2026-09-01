@@ -48,10 +48,12 @@ for exactly this reason) are not this module's job.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 
@@ -215,3 +217,174 @@ class MachineMetricsSampler:
         except Exception as exc:  # noqa: BLE001 — one bad machine must never abort the refresh
             log.warning("machine-metrics poll: %s raised %s", machine.name, exc)
             return _unknown(f"poll raised: {exc}")
+
+
+# ── read path: GET /machines/metrics (#3021) ────────────────────────────────
+#
+# Everything below is pure — no I/O, no dependence on the sampler's internal
+# deques beyond the plain ``list[dict]`` returned by ``series()``/
+# ``all_series()``. That keeps it trivially unit-testable and reusable from
+# `coord.serve_app`'s request handler without either side needing to know
+# about the other's internals.
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
+_UNIT_SECONDS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
+
+
+def resolve_since(raw: str | None, *, now: float | None = None) -> float | None:
+    """Resolve a ``?since=`` query value to an absolute epoch timestamp.
+
+    Accepts three forms (mirrors the vocabulary the issue asks for,
+    ``<epoch|duration>``, plus ISO-8601 for parity with ``coord audit``'s
+    ``since``/``until``):
+
+    - ``None`` or ``""`` → ``None``, meaning "no lower bound" (the full
+      retained window — the endpoint's documented default).
+    - A duration like ``"6h"``, ``"90m"``, ``"3d"`` (units: s, m, h, d, w) →
+      ``now - duration``.
+    - An epoch number (``"1699999999"``) or an ISO-8601 timestamp
+      (``"2026-01-01T00:00:00Z"``) → that instant, verbatim.
+
+    Raises :class:`ValueError` on anything else, so the HTTP handler can
+    turn it into a 400 with the bad value quoted back.
+    """
+    if raw is None or raw == "":
+        return None
+    now = now if now is not None else time.time()
+    match = _DURATION_RE.match(raw)
+    if match:
+        return now - float(match.group(1)) * _UNIT_SECONDS[match.group(2).lower()]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError(
+            f"not an epoch number, ISO-8601 timestamp, or duration: {raw!r} "
+            "(duration units: s, m, h, d, w)"
+        ) from exc
+
+
+def _filter_since(samples: list[dict], since: float | None) -> list[dict]:
+    if since is None:
+        return list(samples)
+    return [s for s in samples if s["timestamp"] >= since]
+
+
+def _sample_intensity(sample: dict) -> float:
+    """How "interesting" a sample is for peak-preserving downsampling.
+
+    An ``unknown`` sample never outranks a real one — it always scores
+    below every possible real reading (percentages are 0-100) — so a bucket
+    with even one real sample surfaces that reading rather than the gap.
+    """
+    if sample.get("status") != STATUS_OK:
+        return -1.0
+    cpu = sample.get("cpu_percent") or 0.0
+    mem = sample.get("mem_percent") or 0.0
+    return max(cpu, mem)
+
+
+def _pick_representative(bucket: list[dict]) -> dict:
+    """The single sample that best represents ``bucket``.
+
+    Picks the highest-intensity real sample in the bucket (see
+    :func:`_sample_intensity`) so a brief spike survives downsampling
+    instead of being averaged away or dropped by naive striding. A bucket
+    with no real samples at all — every poll in that span came back
+    ``unknown`` — reports its first ``unknown`` sample, so a renderer still
+    sees the gap rather than the bucket silently vanishing.
+    """
+    best = bucket[0]
+    best_score = _sample_intensity(best)
+    for sample in bucket[1:]:
+        score = _sample_intensity(sample)
+        if score > best_score:
+            best, best_score = sample, score
+    return best
+
+
+def downsample(samples: list[dict], resolution: int) -> list[dict]:
+    """Reduce ``samples`` (oldest-first) to at most ``resolution`` points.
+
+    A 6h window at the default ~15s cadence is ~1440 points per machine; a
+    phone asking for ``resolution=100`` must get **at most** 100 back, and
+    the server must do the reduction — never ship the raw buffer and let
+    the client thin it (the whole point of #3021).
+
+    Buckets ``samples`` into ``resolution`` roughly-equal, chronologically
+    contiguous spans and keeps one representative per bucket (see
+    :func:`_pick_representative`) — naive fixed-stride sampling (every Nth
+    point) would silently skip over a spike that lands on a dropped index;
+    this always surfaces the bucket's peak instead.
+
+    Raises :class:`ValueError` if ``resolution`` is not positive.
+    """
+    if resolution <= 0:
+        raise ValueError("resolution must be positive")
+    n = len(samples)
+    if n <= resolution:
+        return list(samples)
+    out: list[dict] = []
+    for i in range(resolution):
+        lo = (i * n) // resolution
+        hi = ((i + 1) * n) // resolution
+        bucket = samples[lo:hi]
+        if bucket:
+            out.append(_pick_representative(bucket))
+    return out
+
+
+def build_metrics_response(
+    series_by_machine: dict[str, list[dict]],
+    *,
+    machine: str | None = None,
+    since: float | None = None,
+    resolution: int | None = None,
+    now: float | None = None,
+) -> dict:
+    """Assemble the versioned ``GET /machines/metrics`` response body.
+
+    ``series_by_machine`` is exactly :meth:`MachineMetricsSampler.all_series`'s
+    shape (name → oldest-first list of :meth:`MetricsSample.to_dict`), kept
+    as a plain argument rather than the sampler itself so this stays a pure
+    function a test can call with a synthetic dict.
+
+    - ``machine`` narrows to a single machine's series; a name with no
+      buffer yet (never polled, or simply unknown) comes back as ``[]``,
+      same as :meth:`MachineMetricsSampler.series` — never a 404, since "no
+      data yet" and "no such machine" are indistinguishable from here and
+      both mean the same thing to a renderer: nothing to draw.
+    - ``since`` filters to samples at or after that epoch timestamp
+      (:func:`resolve_since` turns the query string into this).
+    - ``resolution`` server-side downsamples each machine's filtered series
+      independently (:func:`downsample`); omitted means the full filtered
+      series.
+
+    ``schema: 1`` — versioned explicitly, matching
+    ``FleetHealthSnapshot.to_dict()``'s posture, so a client can detect a
+    future incompatible reshape rather than guess from field presence.
+    """
+    now = now if now is not None else time.time()
+    selected = (
+        {machine: series_by_machine.get(machine, [])}
+        if machine is not None
+        else series_by_machine
+    )
+
+    machines_out: dict[str, list[dict]] = {}
+    for name, series in selected.items():
+        windowed = _filter_since(series, since)
+        if resolution is not None:
+            windowed = downsample(windowed, resolution)
+        machines_out[name] = windowed
+
+    return {
+        "schema": 1,
+        "generated_at": now,
+        "since": since,
+        "resolution": resolution,
+        "machines": machines_out,
+    }
