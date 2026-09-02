@@ -20,6 +20,7 @@ config.
 from __future__ import annotations
 
 import os
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -581,11 +582,31 @@ def fetch_remote_config(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
     """GET /config, cache it to ``~/.coord/coordinator.remote.yml``, return the path.
 
     The caller feeds the returned path to ``coord.config.load()``.
+
+    Written atomically (tempfile-in-same-dir + ``os.replace``, #3052): a plain
+    truncating write leaves a window where the file is empty or holds a
+    truncated-but-syntactically-valid YAML document, and any ``coord`` command
+    that loads config in that window — there is no locking between thin-client
+    processes — would see a fragment instead of a complete old or new config.
+    ``os.replace`` is atomic on POSIX, so a concurrent reader always sees one
+    whole document or the other, never a partial one.
     """
     resp = httpx.get(f"{svc.url}/config", headers=_headers(svc), timeout=timeout)
     resp.raise_for_status()
     COORD_DIR.mkdir(parents=True, exist_ok=True)
-    REMOTE_CONFIG_CACHE.write_text(resp.text)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".coordinator.remote.", suffix=".tmp", dir=str(COORD_DIR)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(resp.text)
+        os.replace(tmp_name, REMOTE_CONFIG_CACHE)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return REMOTE_CONFIG_CACHE
 
 
