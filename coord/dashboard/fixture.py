@@ -87,7 +87,9 @@ it is derived purely from ``board`` (completed/active assignments) and
 ``config.machines`` (for the concurrency ceiling), exactly like the live
 handler, so seeding a realistic spread of completed/failed/running
 assignments per machine in ``board.assignments`` is all a fixture needs to
-exercise it.
+exercise it. ``GET /api/drive-queue``'s ``leg_counts`` field (#3060) is the
+same story: no dedicated key, derived from ``board.assignments``' ``type``
+field via ``FixtureServer.leg_counts()``.
 """
 
 from __future__ import annotations
@@ -267,6 +269,28 @@ class FixtureServer:
         if repo_name:
             rows = [r for r in rows if r.get("repo_name") == repo_name]
         return rows
+
+    def leg_counts(self) -> dict[str, dict[str, int]]:
+        """All-time per-issue assignment leg counts by type (#3060).
+
+        No dedicated fixture key (rule 1, "no parallel fake read path"):
+        computed off the SAME ``board()`` reconstruction ``/api/board`` uses,
+        via :func:`coord.drive_queue.compute_leg_counts` — the real daemon
+        path sources this from `assignments` + `assignments_archive`, and a
+        fixture has no separate archive concept, so the seeded
+        ``board.assignments`` (``active`` + ``completed`` together) already
+        stands in for "the whole history", exactly as it does for every
+        other board-derived fixture accessor (``GET /api/machines/stats``'s
+        docstring makes the same call).
+        """
+        from coord.drive_queue import compute_leg_counts  # noqa: PLC0415
+
+        board = self.board()
+        rows = (
+            (a.repo_name, a.issue_number, a.type)
+            for a in (*board.active, *board.completed)
+        )
+        return compute_leg_counts(rows)
 
     def report_catalogue(self) -> dict[str, Any]:
         """The seeded ``GET /api/report`` catalogue (#2492 RPT-1).

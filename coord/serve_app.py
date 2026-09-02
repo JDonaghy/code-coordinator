@@ -21,6 +21,9 @@ Endpoints:
 * ``GET /issue/{repo_name}/{number}`` — single-issue detail (full body).
 * ``GET /audit``    — paginated, newest-first read over the append-only
   ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
+* ``GET /leg-counts`` — all-time per-issue assignment leg counts by type,
+  keyed ``"repo#N"`` (#3060); spans ``assignments`` + ``assignments_archive``,
+  not part of ``/board`` or ``/drive-queue``.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
   client needs no local config file.
 * ``POST /result``  — record an interactive-session result (#590); body is a
@@ -4733,6 +4736,17 @@ def openapi_spec() -> dict:
                 },
             },
         },
+        "/leg-counts": {
+            "get": {
+                "summary": (
+                    "#3060: all-time per-issue assignment leg counts by "
+                    "type, keyed \"repo#N\" — spans `assignments` + "
+                    "`assignments_archive`. NOT part of `/board` or "
+                    "`/drive-queue`."
+                ),
+                "responses": {"200": {"description": "OK"}},
+            },
+        },
         "/pause": {
             "get": {
                 "summary": (
@@ -8328,6 +8342,25 @@ def build_app(
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_leg_counts(request: Request) -> Response:  # noqa: ARG001
+        # #3060: all-time per-issue assignment leg counts by type, keyed
+        # "repo#N" — deliberately its OWN endpoint (like /audit), never
+        # folded into /board or /drive-queue: the source is `assignments` +
+        # `assignments_archive`, not the `drive_queue` table those two
+        # already read, and unlike `DriveQueueSummary` this isn't derivable
+        # from a drive-queue row set alone. See `coord.state.leg_counts` for
+        # the retention-window caveat this spans.
+        from coord import state  # noqa: PLC0415
+
+        try:
+            counts = state._leg_counts_local()
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "leg-counts read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(counts)
+
     async def get_pause(request: Request) -> Response:  # noqa: ARG001
         # #1563: the daemon's own view of the paused-machine set. ALWAYS the
         # local-only store (coord.machine_pause.local_paused_set()), never
@@ -10619,6 +10652,7 @@ def build_app(
         Route("/drive-escalations", post_drive_escalations, methods=["POST"]),
         Route("/drive-queue", get_drive_queue, methods=["GET"]),
         Route("/drive-queue", post_drive_queue, methods=["POST"]),
+        Route("/leg-counts", get_leg_counts, methods=["GET"]),
         Route("/pause", get_pause, methods=["GET"]),
         Route("/pause", post_pause, methods=["POST"]),
         Route("/github-backoff", get_github_backoff, methods=["GET"]),

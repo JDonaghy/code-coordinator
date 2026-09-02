@@ -2125,6 +2125,80 @@ class TestListIssueNumbersWithAssignments:
         assert list_issue_numbers_with_assignments("api") == {5, 6}
 
 
+class TestLegCounts:
+    """`coord.state.leg_counts` / `_leg_counts_local` (#3060).
+
+    All-time per-issue assignment leg counts by type, keyed `"repo#N"` — the
+    thing that replaces the misleading `drive_queue.attempts` relaunch
+    counter. Mirrors `TestListIssueNumbersWithAssignments`'s union-across-
+    `assignments`+`assignments_archive` coverage, since `_leg_counts_local`
+    is built the same way for the same reason (#2983's archive trap).
+    """
+
+    @staticmethod
+    def _insert(conn, table, assignment_id, repo, issue, atype):
+        conn.execute(
+            f"INSERT INTO {table} (assignment_id, machine_name, repo_name, "  # noqa: S608
+            "issue_number, issue_title, type) VALUES (?, 'm', ?, ?, 't', ?)",
+            (assignment_id, repo, issue, atype),
+        )
+
+    def test_local_counts_by_type_keyed_repo_hash_issue(self, coord_db) -> None:
+        from coord.state import leg_counts
+
+        self._insert(coord_db, "assignments", "a-1", "api", 7, "work")
+        self._insert(coord_db, "assignments", "a-2", "api", 7, "work")
+        self._insert(coord_db, "assignments", "a-3", "api", 7, "review")
+        self._insert(coord_db, "assignments", "a-4", "other-repo", 9, "smoke")
+        coord_db.commit()
+
+        assert leg_counts() == {
+            "api#7": {"work": 2, "review": 1},
+            "other-repo#9": {"smoke": 1},
+        }
+
+    def test_missing_assignments_archive_table_is_tolerated(self, coord_db) -> None:
+        """assignments_archive doesn't exist until housekeeping runs at least
+        once — must not raise (mirrors the identical rule for
+        `list_issue_numbers_with_assignments`)."""
+        from coord.state import leg_counts
+
+        assert leg_counts() == {}
+
+    def test_spans_both_assignments_and_assignments_archive(self, coord_db) -> None:
+        """#3060's "archive trap": a naive `SELECT ... FROM assignments`
+        alone would undercount once `coord housekeeping` moves a terminal
+        leg into `assignments_archive` — the whole point of this field is
+        that the count does NOT shrink when that happens."""
+        from coord.housekeeping import _ensure_archive_mirror
+        from coord.state import leg_counts
+
+        self._insert(coord_db, "assignments", "a-1", "api", 7, "work")
+        coord_db.commit()
+        _ensure_archive_mirror(coord_db, "assignments", "assignments_archive")
+        coord_db.execute(
+            "INSERT INTO assignments_archive SELECT * FROM assignments WHERE assignment_id='a-1'"
+        )
+        coord_db.execute("DELETE FROM assignments WHERE assignment_id='a-1'")
+        self._insert(coord_db, "assignments", "a-2", "api", 7, "review")
+        coord_db.commit()
+
+        assert leg_counts() == {"api#7": {"work": 1, "review": 1}}
+
+    def test_routes_to_daemon_when_board_service_set(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.state import leg_counts
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "fetch_leg_counts", lambda svc, **kw: {"api#7": {"work": 3}},
+        )
+        assert leg_counts() == {"api#7": {"work": 3}}
+
+
 class TestTestVerdictStalenessAnchor:
     """#1479: `record_test_verdict` best-effort captures test_head_sha /
     test_patch_id / test_base_sha alongside a terminal (passed/skipped)

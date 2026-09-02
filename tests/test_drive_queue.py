@@ -42,6 +42,7 @@ from coord.drive_queue import (
     add_preflight_notice,
     build_board_view,
     detect_unreachable_waits,
+    compute_leg_counts,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -716,6 +717,43 @@ def test_entries_from_rows_types_after_json_in_either_encoding():
     assert typed[0].after == ("b#2",)
     assert typed[1].after == ("a#1",)
     assert typed[2].after == ()
+
+
+# ── compute_leg_counts: per-issue assignment leg counts (#3060) ─────────────
+
+
+def test_compute_leg_counts_groups_by_issue_key_and_type():
+    counts = compute_leg_counts([
+        (REPO, 1, "work"),
+        (REPO, 1, "work"),
+        (REPO, 1, "review"),
+        ("web", 9, "smoke"),
+    ])
+    assert counts == {
+        entry_key(REPO, 1): {"work": 2, "review": 1},
+        entry_key("web", 9): {"smoke": 1},
+    }
+
+
+def test_compute_leg_counts_returns_only_types_actually_present():
+    """No fixed `{work, review, smoke}` shape — a type nobody dispatched
+    never appears, and (the flip side, #3060's acceptance bar) a type this
+    function has never heard of shows up automatically with no code change:
+    the grouping is by whatever string sits in the `type` column."""
+    counts = compute_leg_counts([(REPO, 1, "a-brand-new-assignment-type")])
+    assert counts == {entry_key(REPO, 1): {"a-brand-new-assignment-type": 1}}
+
+
+def test_compute_leg_counts_empty_input_is_empty_map():
+    assert compute_leg_counts([]) == {}
+
+
+def test_compute_leg_counts_treats_falsy_type_as_work():
+    """A row with no `type` (empty string / None, e.g. a hand-built test
+    fixture) counts as `work` — the same default `assignments.type` and
+    `coord.models.Assignment.type` both carry."""
+    counts = compute_leg_counts([(REPO, 1, ""), (REPO, 1, None)])
+    assert counts == {entry_key(REPO, 1): {"work": 2}}
 
 
 # ── plan_tick: the launch decision ───────────────────────────────────────────

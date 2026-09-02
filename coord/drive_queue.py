@@ -949,6 +949,41 @@ def summarize_drive_queue(entries: Sequence[QueueEntry]) -> DriveQueueSummary:
     )
 
 
+# ── per-issue assignment leg counts (#3060) ────────────────────────────────
+#
+# `drive_queue.attempts` is a relaunch counter on the QUEUE ROW: a relaunch
+# resets it while the fix budget it's meant to track keeps burning (#2972),
+# so it is the wrong number for "how much work has actually happened on this
+# issue". This is the right one — a per-`AssignmentType` count of every
+# dispatched leg, all-time, keyed the same way the queue itself keys a row
+# (:func:`entry_key`, ``"repo#N"``) so a client can look a queue entry's
+# counts up directly. Pure aggregation, same posture as
+# :func:`summarize_drive_queue` above: the caller fetches the rows (from
+# `assignments` + `assignments_archive` on the daemon, or from a fixture's
+# seeded board), this just counts them.
+
+
+def compute_leg_counts(
+    rows: Iterable[tuple[str, int, str]],
+) -> dict[str, dict[str, int]]:
+    """Build the ``"repo#N" -> {assignment_type: count}`` map from raw
+    ``(repo_name, issue_number, type)`` triples.
+
+    Returns only the types actually present in *rows* — never a fixed
+    three-column ``{work, review, smoke}`` shape — so a thirteenth
+    ``AssignmentType`` value shows up automatically with no code change here,
+    the same "nothing can silently vanish" posture ``coord/reports.py``'s
+    ``_ordered()`` takes for drive-queue states. The caller decides how many
+    of the returned types to render.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for repo, issue, assignment_type in rows:
+        by_type = counts.setdefault(entry_key(repo, issue), {})
+        t = assignment_type or "work"
+        by_type[t] = by_type.get(t, 0) + 1
+    return counts
+
+
 # ── the board projection ─────────────────────────────────────────────────────
 
 

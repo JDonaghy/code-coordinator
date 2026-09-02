@@ -465,6 +465,7 @@ class TestDriveQueueAPI:
                 "held": 0,
                 "fleet_held": 0,
             },
+            "leg_counts": {},
         }
 
     def test_seeded_db_returns_entries_and_summary(self, rw_db) -> None:
@@ -551,6 +552,92 @@ class TestDriveQueueAPI:
         assert data["summary"]["fleet_held"] == 1
         assert data["summary"]["held"] == 1
         assert data["summary"]["level"] == "held"
+
+    def test_leg_counts_keyed_repo_hash_issue_and_broken_out_by_type(
+        self, rw_db
+    ) -> None:
+        """#3060: `leg_counts` is a THIRD sibling of `entries`/`summary`, not
+        a reshaping of either — sourced from `assignments`, not `drive_queue`."""
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-1', 'm', 'api', 1, 't', 'work')"
+        )
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-2', 'm', 'api', 1, 't', 'review')"
+        )
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-3', 'm', 'web', 9, 't', 'smoke')"
+        )
+        rw_db.commit()
+
+        client = _client()
+        data = client.get("/api/drive-queue").json()
+        assert data["leg_counts"] == {
+            "api#1": {"work": 1, "review": 1},
+            "web#9": {"smoke": 1},
+        }
+
+    def test_leg_counts_is_computed_over_the_full_history_not_the_repo_filter(
+        self, rw_db
+    ) -> None:
+        """Mirrors `test_repo_filter_scopes_entries_but_not_the_summary`:
+        `?repo=` narrows `entries` only — `leg_counts` stays fleet-wide, same
+        posture as `summary`, so a client can still look up a filtered-out
+        repo's own counts by key if it ever needs to."""
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-1', 'm', 'api', 1, 't', 'work')"
+        )
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-2', 'm', 'web', 9, 't', 'smoke')"
+        )
+        rw_db.commit()
+
+        client = _client()
+        filtered = client.get("/api/drive-queue", params={"repo": "api"}).json()
+        unfiltered = client.get("/api/drive-queue").json()
+        assert filtered["leg_counts"] == unfiltered["leg_counts"] == {
+            "api#1": {"work": 1},
+            "web#9": {"smoke": 1},
+        }
+
+    def test_leg_counts_does_not_reset_on_a_drive_queue_relaunch(self, rw_db) -> None:
+        """#2972: `drive_queue.attempts` resets on a relaunch while the fix
+        budget it's meant to track keeps burning — that's the whole reason
+        this field exists. Prove the two diverge: bump `attempts` back down
+        (what a relaunch does to the queue row) and confirm `leg_counts`
+        — sourced from `assignments`, a table a queue relaunch never
+        touches — is unaffected."""
+        from coord.state import _enqueue_drive_queue_local, _update_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 1)
+        _update_drive_queue_entry_local("api", 1, attempts=2)
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-1', 'm', 'api', 1, 't', 'work')"
+        )
+        rw_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type) VALUES ('a-2', 'm', 'api', 1, 't', 'work')"
+        )
+        rw_db.commit()
+
+        client = _client()
+        before = client.get("/api/drive-queue").json()
+        assert before["entries"][0]["attempts"] == 2
+        assert before["leg_counts"]["api#1"] == {"work": 2}
+
+        # Simulate a drive-queue relaunch: attempts resets to 0, the entry's
+        # queue-side history is wiped — but the two dispatched legs already
+        # recorded in `assignments` are untouched.
+        _update_drive_queue_entry_local("api", 1, attempts=0)
+
+        after = client.get("/api/drive-queue").json()
+        assert after["entries"][0]["attempts"] == 0
+        assert after["leg_counts"]["api#1"] == {"work": 2}
 
 
 class TestDriveQueueActionAPI:
