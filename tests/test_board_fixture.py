@@ -101,3 +101,36 @@ def test_board_sample_fixture_parses_as_representative_payload():
     assert payload["merge_queue"]
     assert payload["proposals"]
     assert payload["issues"]
+
+
+def test_board_sample_fixture_carries_every_board_meta_row():
+    """All three seeded `board_meta` rows reach the payload (#3045).
+
+    `round_number` above only proves ONE of them. When the generator moved
+    into the `coord` package it came under the `coord.sql` dialect-seam
+    ratchet (tests/test_sql_dialect.py walks `coord/**`, and knew nothing
+    about `scripts/`), so its three SQLite-only `INSERT OR REPLACE INTO
+    board_meta` statements became `sql.upsert(..., conflict_columns=["key"])`.
+    A wrong conflict key there silently keeps only the last row — which the
+    Rust round-trip would not catch either, because a short `board_meta` map
+    still deserializes fine. This pins all three.
+    """
+    board_meta = json.loads(fixture_json_text())["board_meta"]
+    assert board_meta == {
+        "round_number": "3",
+        "board_initialized": "1",
+        "pipeline_default_gates": '["test", "review", "merge"]',
+    }
+
+
+def test_board_sample_fixture_is_identical_through_the_packaged_module():
+    """`coord.gen_board_fixture` and the `scripts/` shim emit the same bytes.
+
+    #3045 moved the generator into the wheel-shipped `coord` package so
+    coord-tui's freshness gate can run it from a `pip install`; the shim is
+    only a re-export. If these two ever diverge, the gate compares a fixture
+    built by one generator against a checkout built by the other.
+    """
+    from coord.gen_board_fixture import fixture_json_text as packaged
+
+    assert packaged() == fixture_json_text()

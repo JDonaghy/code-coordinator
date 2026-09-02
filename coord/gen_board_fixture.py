@@ -56,6 +56,14 @@ generator" above was aspirational for coord-tui's CI, the same gap
 `scripts/gen_board_fixture.py` still exists, as a thin shim re-exporting
 this module, so existing local invocations and docs that predate the move
 keep working from a checkout of *this* repo.
+
+Because this module is now inside the `coord` package, it is also inside the
+`coord.sql` dialect-seam ratchet's blast radius (#2768/#827/#1948 — enforced
+by `tests/test_sql_dialect.py`, which walks `coord/**` and knows nothing about
+`scripts/`). Every statement below therefore goes through `coord.sql`, and the
+fixture connection is opened by `sql.connect()`, exactly like the rest of the
+package. The seam is a no-op translation for SQLite, so the emitted fixture
+bytes are unchanged by the move.
 """
 
 from __future__ import annotations
@@ -67,6 +75,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from coord import sql
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 
@@ -116,7 +125,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     #    test_plan (JSON object — decoded to a native object on the wire,
     #    NOT an array, per #584) + review_findings (kept as a raw JSON
     #    string on the wire) + cost/token accounting.
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO assignments (assignment_id, machine_name, repo_name, repo_github, "
         "issue_number, issue_title, status, type, branch, model, dispatched_at, "
         "finished_at, exit_code, cost_usd, smoke_tests, review_findings, test_plan, "
@@ -136,7 +146,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     # 2. A running human-attended interactive (Max/Pro) assignment —
     #    is_interactive=1, no cost/token data (the #546 case this fixture
     #    exists to guard).
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO assignments (assignment_id, machine_name, repo_name, repo_github, "
         "issue_number, issue_title, status, type, branch, dispatched_at, is_interactive) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -147,7 +158,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
         ),
     )
     # 3. A review of assignment 1 (pairs via review_of_assignment_id).
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO assignments (assignment_id, machine_name, repo_name, repo_github, "
         "issue_number, issue_title, status, type, review_of_assignment_id, dispatched_at, "
         "finished_at, review_verdict, is_interactive) "
@@ -160,17 +172,20 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     )
 
     # ── machines ─────────────────────────────────────────────────────────
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
         ("precision", "precision.tailnet", '["python", "rust"]', '["claude-coordinator"]'),
     )
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
         ("dellserver", "dellserver.tailnet", '["python", "gtk"]', '["claude-coordinator"]'),
     )
 
     # ── merge_queue ──────────────────────────────────────────────────────
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, branch, "
         "target_branch, issue_number, issue_title, state, pr_number, pr_url, size, "
         "enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -183,7 +198,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     )
 
     # ── proposals ────────────────────────────────────────────────────────
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO proposals (machine_name, repo_name, issue_number, issue_title, "
         "rationale, type) VALUES (?,?,?,?,?,?)",
         (
@@ -193,7 +209,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     )
 
     # ── issues ───────────────────────────────────────────────────────────
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at, "
         "milestone_number, milestone_title) VALUES (?,?,?,?,?,?,?,?,?)",
         (
@@ -215,7 +232,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     # field typed `Vec<String>` without
     # the `after_json` rename silently stays empty — and a field typed
     # `String` fails the whole BoardPayload parse and blanks every panel.
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO drive_queue (repo_name, issue_number, position, machine, "
         "after_json, state, attempts, deferrals, last_reason, session_name, "
         "launched_at, enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -224,7 +242,8 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
             None, None, 1000001200.0,
         ),
     )
-    conn.execute(
+    sql.execute(
+        conn,
         "INSERT INTO drive_queue (repo_name, issue_number, position, machine, "
         "after_json, state, attempts, deferrals, last_reason, session_name, "
         "launched_at, enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -237,12 +256,18 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
     )
 
     # ── board_meta ───────────────────────────────────────────────────────
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '3')")
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-        "('pipeline_default_gates', '[\"test\", \"review\", \"merge\"]')"
-    )
+    # `sql.upsert` rather than the SQLite-only `INSERT OR REPLACE` these three
+    # rows used while this module still lived under `scripts/` — same shape
+    # `coord/db.py` already uses for its own board_meta writes.
+    for key, value in (
+        ("round_number", "3"),
+        ("board_initialized", "1"),
+        ("pipeline_default_gates", '["test", "review", "merge"]'),
+    ):
+        sql.upsert(
+            conn, "board_meta", ["key", "value"], (key, value),
+            conflict_columns=["key"],
+        )
     conn.commit()
 
 
@@ -257,8 +282,8 @@ def build_fixture_payload() -> dict:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "board_fixture.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
+        conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=db_path)
+        sql.apply_row_factory(conn)
         _ensure_schema(conn)
         build_fixture_db(conn)
         conn.close()
