@@ -5042,6 +5042,88 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/machines/stats": {
+            "get": {
+                "summary": (
+                    "#3041: per-machine work stats derived purely from the "
+                    "board -- active vs configured concurrency, completed/"
+                    "failed counts over the retention window, and recent "
+                    "(last 20) job history. Daemon-native counterpart of the "
+                    "dashboard's GET /api/machines/stats (#3025): both call "
+                    "the same coord.machine_stats.build_machine_stats, so "
+                    "they can't drift on the rules the way coord-tui's own "
+                    "prior reimplementation did."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "capacity": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "active": {"type": "integer"},
+                                                    "max": {"type": "integer"},
+                                                },
+                                                "required": ["active", "max"],
+                                            },
+                                            "counts": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "completed": {"type": "integer"},
+                                                    "failed": {"type": "integer"},
+                                                },
+                                                "required": ["completed", "failed"],
+                                            },
+                                            "job_history": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "assignment_id": {"type": "string"},
+                                                        "repo_name": {"type": "string"},
+                                                        "issue_number": {
+                                                            "type": ["integer", "null"]
+                                                        },
+                                                        "issue_title": {
+                                                            "type": ["string", "null"]
+                                                        },
+                                                        "type": {"type": "string"},
+                                                        "status": {"type": "string"},
+                                                        "dispatched_at": {
+                                                            "type": ["number", "null"]
+                                                        },
+                                                        "finished_at": {
+                                                            "type": ["number", "null"]
+                                                        },
+                                                    },
+                                                    "required": [
+                                                        "assignment_id",
+                                                        "repo_name",
+                                                        "type",
+                                                        "status",
+                                                    ],
+                                                },
+                                            },
+                                        },
+                                        "required": [
+                                            "name", "capacity", "counts", "job_history",
+                                        ],
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "503": {"description": "board read failed"},
+                },
+            }
+        },
         "/report": {
             "get": {
                 "summary": (
@@ -9013,6 +9095,35 @@ def build_app(
         )
         return JSONResponse(result)
 
+    async def get_machine_stats(request: Request) -> Response:
+        # #3041: the daemon-native counterpart to the dashboard's
+        # `GET /api/machines/stats` (#3025), so coord-tui (which talks to
+        # THIS daemon on 7435 and has no other reason to depend on `coord
+        # web` running on 7434) can reach the same per-machine work-stats
+        # rules over its own transport instead of coord-tui's
+        # `machine_detail_list()` reimplementing them by hand in Rust — the
+        # exact divergence #3041 exists to close (missing capacity ceiling,
+        # missing completed/failed counts, unsorted job history).
+        #
+        # Thin wrapper: build the board, hand it to the same pure
+        # `coord.machine_stats.build_machine_stats` the dashboard calls, so
+        # the two transports can't drift on the rules again. `build_board()`
+        # does real I/O (sqlite reads) so it's offloaded to a threadpool,
+        # mirroring `get_assignment`/`get_issue` above rather than
+        # `get_machine_metrics`'s bare in-memory read.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord.machine_stats import build_machine_stats  # noqa: PLC0415
+        from coord.state import build_board  # noqa: PLC0415
+
+        try:
+            stats_board = await run_in_threadpool(build_board)
+        except Exception as e:  # noqa: BLE001 — any board-read failure: unreachable, not a 500
+            return JSONResponse(
+                {"error": "board read failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse(build_machine_stats(stats_board, config))
+
     async def post_merge(request: Request) -> Response:
         # #584: the merge queue + board live in THIS (canonical) DB, and gh is
         # authenticated here — so a thin client's `coord merge` / TUI 'Go' routes
@@ -10426,6 +10537,10 @@ def build_app(
         # #3021: read side of #3020's sampler — server-downsampled machine
         # cpu/mem history for the coord-web Machines panel.
         Route("/machines/metrics", get_machine_metrics, methods=["GET"]),
+        # #3041: per-machine work stats (capacity/completed/failed/job
+        # history) — the daemon-native transport for the same rules
+        # `/api/machines/stats` serves over the dashboard.
+        Route("/machines/stats", get_machine_stats, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),

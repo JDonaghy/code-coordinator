@@ -286,3 +286,54 @@ def test_route_unknown_status_preserved_over_http(cli):
     sample = resp.json()["machines"]["server"][0]
     assert sample["status"] == STATUS_UNKNOWN
     assert sample["cpu_percent"] is None
+
+
+# ── GET /machines/stats (#3041) ──────────────────────────────────────────────
+#
+# The rule set itself is covered by tests/test_machine_stats.py's unit tests
+# on the shared `coord.machine_stats.build_machine_stats`; this just proves
+# the daemon route is thin plumbing over it -- builds a board, calls the
+# shared function, returns its JSON -- and degrades cleanly when the board
+# can't be built.
+
+
+def test_machine_stats_route_returns_derived_rows(cli, monkeypatch):
+    from coord.models import Assignment, Board
+
+    board = Board(
+        active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=1, issue_title="Running",
+                assignment_id="running1", status="running",
+            ),
+        ],
+        completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=2, issue_title="Done",
+                assignment_id="done1", status="done",
+                dispatched_at=1.0, finished_at=2.0,
+            ),
+        ],
+    )
+    monkeypatch.setattr("coord.state.build_board", lambda: board)
+
+    resp = cli.get("/machines/stats")
+    assert resp.status_code == 200
+    by_name = {row["name"]: row for row in resp.json()}
+    assert set(by_name) == {"laptop", "server"}
+    assert by_name["laptop"]["capacity"]["active"] == 1
+    assert by_name["laptop"]["counts"] == {"completed": 1, "failed": 0}
+    assert by_name["server"]["counts"] == {"completed": 0, "failed": 0}
+
+
+def test_machine_stats_route_returns_503_on_board_read_failure(cli, monkeypatch):
+    def _boom():
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr("coord.state.build_board", _boom)
+
+    resp = cli.get("/machines/stats")
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "board read failed"
