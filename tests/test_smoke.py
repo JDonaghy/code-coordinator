@@ -13,6 +13,7 @@ from coord.smoke import (
     MUTE_SMOKE_LEG_BUDGET,
     NO_SMOKE_VERDICT_MARKER,
     SMOKE_SYSTEM_PROMPT,
+    SmokeCommand,
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
@@ -20,6 +21,8 @@ from coord.smoke import (
     mute_smoke_legs,
     mute_smoke_tally,
     pick_smoke_machine,
+    resolve_rule_command,
+    resolve_smoke_command,
 )
 
 
@@ -116,6 +119,176 @@ def test_match_rules_no_trailing_slash_matches_files_too() -> None:
     """A rule `src/gtk` (no slash) is the loose form — catches gtk_helpers.c."""
     rules = [SmokeRule(files=["src/gtk"], requires=["gtk"])]
     assert match_rules(["src/gtk_helpers.c"], rules) == ["gtk"]
+
+
+# ── Rule command override (#3056) ───────────────────────────────────────────
+
+
+@pytest.fixture
+def win_repo() -> Repo:
+    return Repo(
+        name="quadraui", github="acme/quadraui", depends_on=[], default_branch="main",
+        test_command="cargo check -p quadraui --features win",
+    )
+
+
+def test_resolve_rule_command_returns_none_when_no_rule_declares_one() -> None:
+    """A rule with no `command` behaves exactly as before #3056 — routing
+    only, no say over which command runs."""
+    rules = [SmokeRule(files=["src/win/"], requires=["windows"])]
+    assert resolve_rule_command(["src/win/gpu.rs"], rules) is None
+
+
+def test_resolve_rule_command_returns_the_matched_rules_command() -> None:
+    rules = [
+        SmokeRule(files=["src/win/"], requires=["windows"], command="cargo xwin test"),
+    ]
+    resolved = resolve_rule_command(["src/win/gpu.rs"], rules)
+    assert resolved is not None
+    assert resolved.command == "cargo xwin test"
+    assert resolved.ci_equivalent is False
+    assert resolved.from_rule is True
+    assert "capability_rules[0]" in resolved.source
+
+
+def test_resolve_rule_command_ignores_a_non_matching_rule() -> None:
+    rules = [
+        SmokeRule(files=["src/gtk/"], requires=["gtk"], command="make gtk-smoke"),
+    ]
+    assert resolve_rule_command(["src/win/gpu.rs"], rules) is None
+
+
+def test_resolve_rule_command_first_declared_match_wins() -> None:
+    """#3056: a diff touching both a gtk/ rule and a win/ rule, each with its
+    own `command`, cannot union the two — the FIRST rule in
+    `capability_rules` declaration order wins, deterministically (not dict
+    ordering)."""
+    rules = [
+        SmokeRule(files=["src/gtk/"], requires=["gtk"], command="make gtk-smoke"),
+        SmokeRule(files=["src/win/"], requires=["windows"], command="cargo xwin test"),
+    ]
+    touched = ["src/win/gpu.rs", "src/gtk/window.c"]
+    resolved = resolve_rule_command(touched, rules)
+    assert resolved is not None
+    assert resolved.command == "make gtk-smoke"
+
+    # Declaration order controls the outcome, not the order files are listed
+    # in the diff or the order rules match within it — swap the declaration
+    # order and the winner swaps too.
+    rules_reordered = [
+        SmokeRule(files=["src/win/"], requires=["windows"], command="cargo xwin test"),
+        SmokeRule(files=["src/gtk/"], requires=["gtk"], command="make gtk-smoke"),
+    ]
+    resolved2 = resolve_rule_command(touched, rules_reordered)
+    assert resolved2 is not None
+    assert resolved2.command == "cargo xwin test"
+
+
+def test_resolve_rule_command_skips_a_matching_rule_with_no_command() -> None:
+    """A matching rule with no `command` is not a candidate — resolution
+    keeps looking rather than stopping on it."""
+    rules = [
+        SmokeRule(files=["src/win/"], requires=["windows"]),
+        SmokeRule(files=["src/win/gpu"], requires=["windows"], command="cargo xwin test"),
+    ]
+    resolved = resolve_rule_command(["src/win/gpu.rs"], rules)
+    assert resolved is not None
+    assert resolved.command == "cargo xwin test"
+
+
+class TestResolveSmokeCommandRulePrecedence:
+    """#3056: a matched rule's `command` must outrank every repo-wide
+    source — that's the entire point of the feature."""
+
+    def test_rule_command_outranks_ci_command(self, win_repo: Repo) -> None:
+        smoke_cfg = SmokeTestsConfig(
+            default_command="make smoke",
+            capability_rules=[
+                SmokeRule(
+                    files=["src/win/"], requires=["windows"],
+                    command="cargo xwin test",
+                ),
+            ],
+        )
+        repo = replace(win_repo, ci_command="cargo test -p quadraui --features win")
+        resolved = resolve_smoke_command(
+            repo, smoke_cfg, touched_files=["src/win/gpu.rs"]
+        )
+        assert resolved.command == "cargo xwin test"
+        assert resolved.from_rule is True
+        assert resolved.ci_equivalent is False
+
+    def test_no_touched_files_falls_back_to_old_precedence(
+        self, win_repo: Repo
+    ) -> None:
+        """Callers with no diff context (fleet-health, onboarding) are
+        unaffected — the #3056 rule step is a no-op without `touched_files`."""
+        smoke_cfg = SmokeTestsConfig(
+            capability_rules=[
+                SmokeRule(
+                    files=["src/win/"], requires=["windows"],
+                    command="cargo xwin test",
+                ),
+            ],
+        )
+        repo = replace(win_repo, ci_command="cargo test -p quadraui --features win")
+        resolved = resolve_smoke_command(repo, smoke_cfg)
+        assert resolved.command == "cargo test -p quadraui --features win"
+        assert resolved.from_rule is False
+
+    def test_non_matching_diff_falls_back_to_ci_command(self, win_repo: Repo) -> None:
+        smoke_cfg = SmokeTestsConfig(
+            capability_rules=[
+                SmokeRule(
+                    files=["src/win/"], requires=["windows"],
+                    command="cargo xwin test",
+                ),
+            ],
+        )
+        repo = replace(win_repo, ci_command="cargo test -p quadraui --features win")
+        resolved = resolve_smoke_command(
+            repo, smoke_cfg, touched_files=["src/gtk/window.c"]
+        )
+        assert resolved.command == "cargo test -p quadraui --features win"
+        assert resolved.from_rule is False
+
+    def test_rule_with_no_command_is_byte_identical_to_pre_3056(
+        self, win_repo: Repo
+    ) -> None:
+        smoke_cfg = SmokeTestsConfig(
+            default_command="make smoke",
+            capability_rules=[SmokeRule(files=["src/win/"], requires=["windows"])],
+        )
+        resolved = resolve_smoke_command(
+            win_repo, smoke_cfg, touched_files=["src/win/gpu.rs"]
+        )
+        assert resolved.command == "make smoke"
+        assert resolved.source == "smoke_tests.default_command"
+        assert resolved.from_rule is False
+
+
+class TestRuleCommandBriefingNote:
+    def test_names_the_rule_as_provenance(self) -> None:
+        resolved = resolve_rule_command(
+            ["src/win/gpu.rs"],
+            [
+                SmokeRule(
+                    files=["src/win/"], requires=["windows"],
+                    command="cargo xwin test",
+                ),
+            ],
+        )
+        assert resolved is not None
+        note = resolved.briefing_note()
+        assert "capability_rules" in note
+        assert "capability_rules[0]" in note
+
+    def test_repo_command_note_is_unaffected_by_from_rule_default(self) -> None:
+        """Back-compat: a plain repo-sourced SmokeCommand (from_rule defaults
+        False) still gets the pre-#3056 briefing text."""
+        note = SmokeCommand("npm test", "repos[portal].test_command", False).briefing_note()
+        assert "NARROWER than CI" in note
+        assert "capability_rules" not in note
 
 
 # ── Machine selection ───────────────────────────────────────────────────────
