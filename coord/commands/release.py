@@ -1031,6 +1031,82 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             click.echo("\n".join(rp.render_record(record)))
         sys.exit(exit_code)
 
+    def _scope_gate(report) -> "rp.GateVerdict":
+        """Score *report* against this run's own attempts, print advisories
+        with their remedy, and stamp both onto *record* (#3048).
+
+        Shared by the post-roll gate (step 5, the only caller before #3048)
+        AND every early deferral above it. #3048: dell64 sat cordoned and
+        idle for a whole roll while `coord release propagate` rolled the
+        other three hosts fine and said nothing about it — because the run
+        that found nothing to attempt (`if not rolls:`) exited via
+        `_finish()` before ever reaching step 5, so the CRIT this same
+        run's own `before` sweep already had in hand (dell64 on 0.5.335,
+        expected 0.5.341) never got scored or printed. It surfaced only
+        because an operator happened to run `coord release verify`
+        separately.
+
+        Calling this wherever `record.lanes` reflects "nothing attempted so
+        far" is always safe: :func:`~coord.release_propagate.
+        attempted_scope` only counts rows this run actually rolled
+        (``ok`` is not ``None`` and not flagged ``unrollable``), so at any
+        point before the roll loop it is empty by construction and every
+        CRIT the report carries scores as advisory — the exact shape the
+        post-roll gate already knew how to report, just reached sooner.
+        """
+        gate = rp.scope_verification(report.to_dict(), lanes=record.lanes)
+        record.verification = report.to_dict()
+        record.gate = gate.to_dict()
+        for finding in gate.advisory:
+            host = finding.get("host")
+            # #2403: elitebook sat on 0.5.146 (expected 0.5.148) for the
+            # length of a cordon's full lifetime with this line as the ONLY
+            # signal an operator got — "fix by hand" with no hand to
+            # follow. When the finding names a host, name the two commands
+            # that actually clear it, so nobody has to derive them from
+            # scratch under time pressure.
+            #
+            # #2963: that fixed remedy is `coord agent update` — which
+            # swaps the venv and nothing else — for EVERY advisory finding,
+            # including ones on the `units` lane (`unit
+            # coord-agent.service`, #1831/#1927). `coord agent update`
+            # never installs a unit file, so printing it for a stale-unit
+            # finding sent an operator to run the one command guaranteed
+            # not to fix it (#2938's `Restart=always` fix shipped in four
+            # releases and reached zero hosts' live systemd). The units
+            # lane's own health check (`coord.health.checks.unit_drift`)
+            # already computed the exact per-host, per-unit remedy into
+            # `detail` — reuse it here instead of fabricating a wrong one.
+            lane = str(finding.get("lane") or "")
+            if rp.verify_lane_kind(lane) == rp.LANE_UNITS:
+                own_detail = str(finding.get("detail") or "").strip()
+                remedy = (
+                    f" — {own_detail}"
+                    if own_detail
+                    else " — run `coord release propagate --lane units` to "
+                    "install it (mask-safe since #2812)"
+                )
+            else:
+                remedy = (
+                    f" — run `coord agent update --machine {host}` then "
+                    f"`coord release cordon --clear {host}`"
+                    if host
+                    else ""
+                )
+            click.echo(
+                f"  ~ advisory [{finding.get('severity')}] {host} "
+                f"{finding.get('lane')}: {finding.get('summary')} "
+                f"— outside propagation's reach, fix by hand{remedy}",
+                err=True,
+            )
+        if gate.unrollable:
+            click.echo(
+                "  ~ lanes with no channel from this host: "
+                + ", ".join(gate.unrollable),
+                err=True,
+            )
+        return gate
+
     # ── 1. what version are we propagating? ──────────────────────────────
     index_url = getattr(getattr(config, "health", None), "pypi_index_url",
                         "https://pypi.org/simple")
@@ -1221,6 +1297,14 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # must be visibly *working*, not visibly failing. #2101: and now it
         # has cordoned whatever is behind on the way past, so the next tick
         # meets a fleet that is actually draining.
+        #
+        # #3048: score `before` — the sweep already paid for above, ahead
+        # of cordoning — before finishing, so a host this run could never
+        # have reached anyway (busy for a reason that will never resolve
+        # on its own) prints its CRIT and remedy NOW rather than staying
+        # invisible until an operator happens to run `coord release
+        # verify` or `coord status` separately.
+        _scope_gate(before)
         _finish(rp.STATUS_DEFERRED, 0)
 
     # #2101: this refusal is checked AFTER the deferral above, deliberately.
@@ -1273,6 +1357,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             min_releases_behind=effective_min_behind, dry_run=dry_run,
             queue_provably_busy=_queue_provably_busy(quiescence, daemon_name),
         )
+        # #3048: this defer holds back EVERY host's lanes this tick, not
+        # just the daemon's — score `before` now so any of them already
+        # outside propagation's reach says so immediately instead of
+        # waiting for a tick that finally reaches step 5.
+        _scope_gate(before)
         _finish(rp.STATUS_DEFERRED, 0)
 
     still_busy = busy_hosts - set(current)
@@ -1316,6 +1405,15 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         _finish(rp.STATUS_DEFERRED if still_busy else rp.STATUS_UP_TO_DATE, 0)
 
     if not rolls:
+        # #3048: dell64 sat cordoned and idle, behind the target, while
+        # this exact branch fired tick after tick — every OTHER behind
+        # host had already rolled and gone `current`, so `rolls` came back
+        # empty and the run finished right here without ever reaching step
+        # 5's gate. Score `before` now, the same sweep already paid for in
+        # step 3 (before cordoning), so a host stuck outside propagation's
+        # reach says so on THIS tick instead of staying silent until an
+        # operator happens to run `coord release verify` by hand.
+        _scope_gate(before)
         _finish(rp.STATUS_DEFERRED if still_busy else rp.STATUS_UP_TO_DATE, 0)
 
     # ── 4. roll, in the planned order ────────────────────────────────────
@@ -1435,59 +1533,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         daemon_host=daemon_facts, daemon_host_name=daemon_label,
         expected=record.target_version,
     )
-    record.verification = after.to_dict()
 
     # #2052: the gate is scoped to the lanes this run attempted and could
     # have moved. The full report above is still journalled verbatim — this
     # narrows what may TRIGGER a rollback, not what gets reported.
-    gate = rp.scope_verification(record.verification, lanes=record.lanes)
-    record.gate = gate.to_dict()
-    for finding in gate.advisory:
-        host = finding.get("host")
-        # #2403: elitebook sat on 0.5.146 (expected 0.5.148) for the length
-        # of a cordon's full lifetime with this line as the ONLY signal an
-        # operator got — "fix by hand" with no hand to follow. When the
-        # finding names a host, name the two commands that actually clear
-        # it, so nobody has to derive them from scratch under time pressure.
-        #
-        # #2963: that fixed remedy is `coord agent update` — which swaps
-        # the venv and nothing else — for EVERY advisory finding, including
-        # ones on the `units` lane (`unit coord-agent.service`, #1831/#1927).
-        # `coord agent update` never installs a unit file, so printing it
-        # for a stale-unit finding sent an operator to run the one command
-        # guaranteed not to fix it (#2938's `Restart=always` fix shipped in
-        # four releases and reached zero hosts' live systemd). The units
-        # lane's own health check (`coord.health.checks.unit_drift`) already
-        # computed the exact per-host, per-unit remedy into `detail` — reuse
-        # it here instead of fabricating a wrong one.
-        lane = str(finding.get("lane") or "")
-        if rp.verify_lane_kind(lane) == rp.LANE_UNITS:
-            own_detail = str(finding.get("detail") or "").strip()
-            remedy = (
-                f" — {own_detail}"
-                if own_detail
-                else " — run `coord release propagate --lane units` to "
-                "install it (mask-safe since #2812)"
-            )
-        else:
-            remedy = (
-                f" — run `coord agent update --machine {host}` then "
-                f"`coord release cordon --clear {host}`"
-                if host
-                else ""
-            )
-        click.echo(
-            f"  ~ advisory [{finding.get('severity')}] {host} "
-            f"{finding.get('lane')}: {finding.get('summary')} "
-            f"— outside propagation's reach, fix by hand{remedy}",
-            err=True,
-        )
-    if gate.unrollable:
-        click.echo(
-            "  ~ lanes with no channel from this host: "
-            + ", ".join(gate.unrollable),
-            err=True,
-        )
+    gate = _scope_gate(after)
 
     if gate.red and rollback_on_red:
         # #1835: "a red post-deploy verification must roll back, not just

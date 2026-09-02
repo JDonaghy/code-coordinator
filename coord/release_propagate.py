@@ -397,6 +397,22 @@ RESTARTED_BY_PYTHON_LANE: frozenset[str] = frozenset(
 #: reachable lane is: blocking exactly when this run attempted that host's
 #: python lane. Shrinking this set is exactly how new coverage is meant to
 #: re-arm the gate (see the module docstring above).
+#:
+#: #3048 checked whether this set was overreaching for a host whose
+#: ``~/.coord-venv``/``coord-agent`` is reachable over the agent API on
+#: 7433 (dell64: cordoned, idle, a plain ``POST /update`` fixed it in
+#: seconds once someone finally issued one). It is not — ``~/.coord-venv``,
+#: ``coord-agent process`` and ``coord-agent spawns`` were never in this
+#: set; they are ``LANE_PYTHON`` via :data:`_VERIFY_LANE_EXACT`, a lane
+#: this module has always known how to roll. dell64's finding was scored
+#: ADVISORY only because THIS run never attempted it (busy, or — #3048's
+#: actual fix — a run that reached ``if not rolls:`` before ever calling
+#: :func:`scope_verification` at all, see ``coord/commands/release.py``'s
+#: ``_scope_gate``), never because ``lane_is_out_of_reach`` misjudged the
+#: lane itself. Grow this set only for a lane with genuinely no remote
+#: install path — the ``tui`` lane's per-host binary is the honest case
+#: (``coord tui update`` has to run ON the host); a reachable venv is not
+#: that case and must not be added here.
 OUT_OF_REACH_LANES: frozenset[str] = frozenset({"~/.coord-cli-venv", "webapp bundle"})
 
 #: ``"~/.coord-venv (precision)"`` — the label `coord release verify` builds
