@@ -31,8 +31,8 @@ import copy
 
 import pytest
 
-import scripts.codegen as codegen
-from scripts.codegen import (
+import coord.codegen as codegen
+from coord.codegen import (
     RUST_OUTPUT_ENV_VAR,
     RUST_OUTPUT_RELPATH,
     RUST_STRUCTS,

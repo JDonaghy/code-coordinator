@@ -12,9 +12,11 @@ closing the hand-mirrored-wire-contract drift class from #750.
 `coord-web` repo. That byte-comparison is therefore no longer performable in
 this checkout: there is no committed TypeScript to compare against. It has
 NOT been dropped, it MOVED: `coord-web`'s CI runs
-`python scripts/codegen.py --check --out src/api/generated.ts` against its own
-copy, using this script from the `code-coordinator[server]` wheel it already
-installs (docs/ADR_COORD_WEB_CI.md, #2006).
+`python -m coord.codegen --check --out src/api/generated.ts` against its own
+copy, using the generator from the `code-coordinator[server]` wheel it
+already installs (docs/ADR_COORD_WEB_CI.md, #2006; the generator moved from
+`scripts/codegen.py` to `coord/codegen.py` in #3045 so that wheel install
+can actually reach it — `scripts/` was never shipped).
 
 What is still provable from here, and what this file now pins, is the
 *producer* half — the half that lives in this repo and is the half that
@@ -55,7 +57,7 @@ def test_generator_emits_a_declaration_for_every_served_schema():
         if f"interface {name} " not in generated and f"interface {name}\n" not in generated
     ]
     assert not missing, (
-        f"scripts/codegen.py emitted no TypeScript interface for {missing} — "
+        f"coord/codegen.py emitted no TypeScript interface for {missing} — "
         "a schema registered in coord/openapi.py is not reaching coord-web's "
         "generated.ts, which is the #750 hand-mirrored-contract drift class"
     )
