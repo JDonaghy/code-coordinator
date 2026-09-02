@@ -1527,6 +1527,52 @@ def test_the_outside_reach_message_names_the_manual_remedy(
     assert "coord release cordon --clear laptop" in result.output
 
 
+def test_a_stuck_busy_host_with_nothing_else_to_roll_still_reports_reach(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#3048: dell64 sat cordoned and idle, behind the target, while this
+    run had nothing else left to attempt — `server` was already on target
+    and `laptop` (the only host still behind) was busy, so `rolls` came
+    back empty and the run used to finish via the `if not rolls:` branch
+    *before* it ever reached the post-roll gate that knows how to print
+    the outside-reach message. The remedy used to surface only if an
+    operator happened to run `coord release verify` separately. It must
+    now print here too, on the very tick that found nothing to roll."""
+    from coord import release_verify as rv
+
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.104"], "server": ["0.4.111"]},
+        daemon="server",
+        findings=[
+            rv.Finding(severity="crit", host="laptop",
+                       lane="~/.coord-venv (laptop)",
+                       summary="on 0.4.104, expected 0.4.111"),
+        ],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not calls  # nothing was attempted this run — `rolls` was empty
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_DEFERRED
+    assert "outside propagation's reach, fix by hand" in result.output
+    assert "coord agent update --machine laptop" in result.output
+    assert "coord release cordon --clear laptop" in result.output
+    assert record["verification"]["severity"] == "crit"
+    assert record["gate"]["advisory"]
+    assert record["gate"]["severity"] == "ok"  # advisory never triggers red
+
+
 def test_a_stale_unit_advisory_names_the_units_remedy_not_agent_update(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
