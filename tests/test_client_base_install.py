@@ -207,7 +207,7 @@ def test_client_commands_run_without_the_server_extra(argv: list[str]) -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("argv", [["serve"], ["web"], ["agent"]])
+@pytest.mark.parametrize("argv", [["serve"], ["web"], ["agent"], ["codegen", "--check"]])
 def test_server_commands_explain_the_missing_extra(argv: list[str]) -> None:
     """No raw ModuleNotFoundError traceback — a one-line, actionable error."""
     script = _BLOCKER_PREAMBLE + (

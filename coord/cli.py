@@ -141,6 +141,7 @@ from coord.commands.drive import (
 )
 from coord.commands.drive_queue import drive_queue_group
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
+from coord.commands.codegen import codegen
 from coord.commands.machine import machine_group
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
@@ -497,6 +498,9 @@ main.add_command(repo_group)
 main.add_command(machine_group)
 main.add_command(migrate_to_postgres)
 main.add_command(tui_group)
+# #3045: reach coord.codegen (formerly scripts/codegen.py, never shipped)
+# without a checkout of this repo.
+main.add_command(codegen)
 
 
 # #1809: without this guard, `python -m coord.cli <args>` just IMPORTS the

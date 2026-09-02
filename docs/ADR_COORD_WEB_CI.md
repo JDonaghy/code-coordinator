@@ -175,8 +175,21 @@ that reaches back into this repo's `tests/acceptance/` tree — both of which
 adds inherits this ADR's install spec unchanged, and `coord_web_ci_pin`
 grades it the same way it grades `e2e`'s.
 
-The `generated.ts` drift gate (`python scripts/codegen.py --check`) is
-likewise deferred, for the same class of reason, as #2258.
+The `generated.ts` drift gate is likewise deferred, for the same class of
+reason, as #2258. #3045 fixed the packaging half of that story: the
+generator now lives at `coord/codegen.py` — a real module of the `coord`
+package — rather than at `scripts/codegen.py`, which `[tool.setuptools.
+packages.find]` never shipped (`include = ["coord*"]`; `scripts/` is not a
+package). Before #3045, "installs `code-coordinator[server]` from PyPI ...
+to get this script" a few paragraphs up was aspirational — a consumer repo's
+CI had no way to actually reach it. The invocation `coord-web`'s CI should
+use, once #2258 stands the job up, is:
+
+    python -m coord.codegen --check --out src/api/generated.ts
+
+(or the equivalent `coord codegen --check --out ...`, once a `coord` binary
+is on the runner's `PATH`) — no checkout of this repo required, just the
+`[server]` extra this ADR already mandates.
 
 ## Rejected alternatives
 
