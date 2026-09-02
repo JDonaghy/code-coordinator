@@ -19,18 +19,15 @@ Layers:
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from starlette.testclient import TestClient
 
 from coord.config import Config
 from coord.config import load as load_config
 from coord.dao import SqliteStore
-from coord.db import _ensure_schema
 from coord.machine_stats import build_machine_stats
 from coord.models import Assignment, Board, Machine, Repo
 
@@ -196,19 +193,8 @@ def test_result_order_follows_config_machines_order() -> None:
 # ── cross-transport parity: dashboard vs daemon ─────────────────────────────
 
 
-@pytest.fixture
-def file_db(tmp_path: Path) -> Path:
-    p = tmp_path / "coord.db"
-    conn = sqlite3.connect(str(p))
-    conn.row_factory = sqlite3.Row
-    _ensure_schema(conn)
-    conn.commit()
-    conn.close()
-    return p
-
-
 def test_daemon_and_dashboard_agree_on_identical_board(
-    valid_config_path: Path, file_db: Path
+    valid_config_path: Path, tmp_path: Path
 ) -> None:
     """The regression guard against #3041's two implementations drifting
     apart again: given the identical board + config, `GET /machines/stats`
@@ -247,8 +233,17 @@ def test_daemon_and_dashboard_agree_on_identical_board(
         dashboard_client = TestClient(build_dashboard_app(config))
         dashboard_resp = dashboard_client.get("/api/machines/stats")
 
+    # `GET /machines/stats` derives everything from `build_board()` (patched
+    # here) and never touches the store, so the daemon app only needs *a*
+    # `SqliteStore` to construct -- `SqliteStore` resolves its backend lazily,
+    # per call. Deliberately NOT seeding a real on-disk schema'd DB the way
+    # `tests/test_serve_rest_routes.py`'s `file_db` fixture does: that would
+    # hardcode a `sqlite3.connect` (#2884's ratchet) for a connection this
+    # route never opens. If the route ever grows a store read, it fails loudly
+    # here rather than passing against a stub.
+    unused_store_path = tmp_path / "unused-by-this-route.db"
     with patch("coord.state.build_board", return_value=board):
-        daemon_client = TestClient(build_daemon_app(SqliteStore(file_db), config))
+        daemon_client = TestClient(build_daemon_app(SqliteStore(unused_store_path), config))
         daemon_resp = daemon_client.get("/machines/stats")
 
     assert dashboard_resp.status_code == 200
