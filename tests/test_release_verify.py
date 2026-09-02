@@ -774,6 +774,90 @@ def test_unit_drift_against_an_unverified_reference_is_reported_not_dropped() ->
     assert report.severity == "unknown"  # annotated, not paged
 
 
+def test_masked_by_policy_unit_drift_renders_no_warn_and_no_remedy() -> None:
+    """#3049: `coord-release-propagate.service` is masked ON PURPOSE (manual
+    release rolls by choice) and carries an entry in
+    `~/.coord/watchdog-suppress.json` — the same sentinel the fleet watchdog
+    already honours. The `unit_drift` WARN this drift always produces (a
+    masked unit's installed copy is a symlink to /dev/null, which always
+    content-diffs) must render here as "masked by policy", not as a WARN
+    carrying the `cp .../restart` remedy that would re-arm the very thing
+    the masking exists to prevent."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result(
+                    "unit_drift",
+                    subject="coord-release-propagate.service",
+                    severity="warn",
+                    headroom=(
+                        "stale — installed 1921.1h ago, 120 line(s) differ "
+                        "from packaged coord 0.5.341"
+                    ),
+                    detail=(
+                        "cp .../coord-release-propagate.service ... && "
+                        "systemctl --user daemon-reload && systemctl --user "
+                        "restart coord-release-propagate"
+                    ),
+                    suppressed=True,
+                    suppress_reason="manual release rolls by choice -- masked, not broken",
+                    suppress_set="2026-08-26",
+                ),
+            )
+        },
+        expected=RELEASED,
+    )
+    finding = next(
+        f for f in report.findings if f.lane == "unit coord-release-propagate.service"
+    )
+    assert finding.severity == "ok"
+    assert "masked by policy" in finding.summary
+    assert "manual release rolls by choice" in finding.summary
+    assert "2026-08-26" in finding.summary
+    assert "cp " not in finding.detail
+    assert "restart" not in finding.summary
+    # A suppressed unit must never be the reason the whole report pages.
+    assert report.severity == "ok"
+
+    rendered = rv.render(report)
+    assert "masked by policy" in rendered
+    assert "cp .../coord-release-propagate.service" not in rendered
+
+
+def test_masked_unit_with_no_sentinel_entry_still_warns_as_before() -> None:
+    """#3049's own acceptance line: "A unit that is masked and has no
+    sentinel entry should keep WARNing exactly as today; the sentinel is the
+    signal, not the masking." — `values["suppressed"]` absent/false must not
+    be treated as coverage."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result(
+                    "unit_drift",
+                    subject="coord-release-propagate.service",
+                    severity="warn",
+                    headroom="stale — installed 1921.1h ago, 120 line(s) differ",
+                    detail="cp deploy/coord-release-propagate.service ... && restart ...",
+                    suppressed=False,
+                    suppress_reason=None,
+                    suppress_set=None,
+                ),
+            )
+        },
+        expected=RELEASED,
+    )
+    finding = next(
+        f for f in report.findings if f.lane == "unit coord-release-propagate.service"
+    )
+    assert finding.severity == "warn"
+    assert "masked by policy" not in finding.summary
+    assert "stale" in finding.summary
+    assert "cp " in finding.detail
+    assert report.severity == "warn"
+
+
 def test_webapp_bundle_staleness_is_folded_in() -> None:
     """Lane 5 of the issue's enumeration — the webapp bundle — rides the same
     report too, on staleness-vs-source terms rather than a version (see

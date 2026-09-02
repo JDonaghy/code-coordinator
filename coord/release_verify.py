@@ -36,6 +36,23 @@ every machine computes its own machine-scope health checks and serves them
 at ``/health``, and the daemon publishes its own process-local facts in
 ``/board``'s ``fleet_health`` block. Nothing here shells out over ssh, so it
 works from a laptop that holds no credentials and no checkout.
+
+**Masked-by-policy is not stale (#3049).** A unit masked on purpose — this
+fleet's ``coord-release-propagate``/``coord-release-window`` lanes, masked
+because release rolls here are manually initiated by choice — reads
+identically to genuine neglect to the ``unit_drift`` machine-scope check: a
+masked unit's installed copy is a symlink to ``/dev/null``, which always
+content-diffs against ``deploy/<name>``. That probe still reports the raw
+WARN (severity is its call, not this module's), but it also checks the same
+intent sentinel the fleet watchdog already honours
+(``~/.coord/watchdog-suppress.json``, #2580) and hands this module the
+verdict. ``findings_for_host`` is the policy-aware layer: a suppressed
+``unit_drift`` WARN renders here as "masked by policy" with the sentinel's
+reason and ``set`` date, never as a WARN carrying a ``cp``/``restart``
+remedy — following that remedy verbatim un-masks the unit and re-arms
+exactly what the masking exists to prevent. A masked unit with no sentinel
+entry keeps WARNing exactly as before; the sentinel is the signal, not the
+masking.
 """
 
 from __future__ import annotations
@@ -388,14 +405,51 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
     # here would restore precisely the false green this fold-in exists to
     # surface. UNKNOWN outranks OK and is outranked by WARN, so it annotates
     # the report without paging.
+    # #3049: a unit masked ON PURPOSE (a fleet that chose manual release
+    # rolls masks the propagate/window lanes deliberately) reads identically
+    # to genuine neglect to `unit_drift` — a masked unit's installed copy is
+    # a symlink to /dev/null, which content-diffs against `deploy/<name>`
+    # exactly like a three-week-stale one would. `unit_drift` still reports
+    # the honest WARN (deciding whether drift is *wanted* is not its job —
+    # see that probe's own #3049 note) but also checks the SAME intent
+    # sentinel the watchdog already honours
+    # (`~/.coord/watchdog-suppress.json`, #2580) and publishes the verdict in
+    # `values["suppressed"]`. THIS layer is the policy-aware one: a
+    # suppressed WARN renders as "masked by policy" — no WARN, and
+    # critically no `cp .../restart` remedy, because following that remedy
+    # verbatim un-masks the unit and re-arms exactly what the masking exists
+    # to prevent. A unit with no sentinel entry (`suppressed` false/absent)
+    # keeps WARNing exactly as before — the sentinel is the signal, not the
+    # masking (#3049's own acceptance line).
     for row in _rows(health, "unit_drift"):
         sev = row.get("severity")
+        lane = f"unit {row.get('subject') or '?'}"
+        values = row.get("values") or {}
+        if sev == "warn" and values.get("suppressed"):
+            reason = values.get("suppress_reason") or "no reason recorded"
+            set_on = values.get("suppress_set")
+            when = f", set {set_on}" if set_on else ""
+            out.append(
+                Finding(
+                    severity="ok",
+                    host=host,
+                    lane=lane,
+                    summary=f"masked by policy: {reason}{when}",
+                    detail=(
+                        "suppressed via ~/.coord/watchdog-suppress.json — the "
+                        "drift is intentional; do NOT run the cp/restart "
+                        "remedy, it re-arms the auto-release this masking "
+                        "exists to prevent (#3049)"
+                    ),
+                )
+            )
+            continue
         if sev in ("crit", "warn", "unknown"):
             out.append(
                 Finding(
                     severity=str(sev),
                     host=host,
-                    lane=f"unit {row.get('subject') or '?'}",
+                    lane=lane,
                     summary=str(row.get("headroom") or "unit drift"),
                     detail=str(row.get("detail") or ""),
                 )

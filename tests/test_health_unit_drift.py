@@ -9,6 +9,7 @@ ahead of the release entry point).
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -175,6 +176,76 @@ def test_stale_unit_is_warn_and_reports_mtime_and_diff(tmp_path) -> None:
     assert r.values["installed_mtime"] == pytest.approx(stale_mtime)
     assert r.values["diff_lines"] >= 1
     assert "cp" in r.detail and "restart" in r.detail
+
+
+def test_stale_unit_with_no_sentinel_entry_is_not_suppressed(tmp_path) -> None:
+    """#3049: absence of a sentinel entry must not read as "suppressed" —
+    the sentinel is the signal, not the masking."""
+    checkout = tmp_path / "src" / "claude-coordinator"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "deploy" / "coord-release-propagate.service").write_text(
+        UNIT_TEXT + "ExtraLineInDeploy=1\n"
+    )
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True)
+    installed = installed_dir / "coord-release-propagate.service"
+    installed.write_text(UNIT_TEXT)
+
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
+    results = ud.probe_unit_drift(ctx)
+    assert len(results) == 1
+    r = results[0]
+    assert r.severity is Severity.WARN
+    assert r.values["suppressed"] is False
+    assert r.values["suppress_reason"] is None
+    assert r.values["suppress_set"] is None
+
+
+def test_stale_unit_covered_by_the_watchdog_suppress_sentinel_is_flagged(tmp_path) -> None:
+    """#3049: a unit masked on purpose — covered by the same
+    ``watchdog-suppress.json`` sentinel the fleet watchdog already honours —
+    still reports the honest WARN (severity is this probe's call, not a
+    policy layer's), but surfaces the sentinel's reason/set date in
+    ``values`` so a policy-aware consumer (`coord release verify`, #3049)
+    can render it as masked-by-policy instead of paging on it.
+    """
+    checkout = tmp_path / "src" / "claude-coordinator"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "deploy" / "coord-release-propagate.service").write_text(
+        UNIT_TEXT + "ExtraLineInDeploy=1\n"
+    )
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True)
+    installed = installed_dir / "coord-release-propagate.service"
+    installed.write_text(UNIT_TEXT)
+
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "watchdog-suppress.json").write_text(
+        json.dumps(
+            {
+                "coord-release-propagate.service": {
+                    "reason": "manual release rolls by choice -- masked, not broken",
+                    "set": "2026-08-26",
+                    "expires": None,
+                }
+            }
+        )
+    )
+
+    ctx = make_ctx(
+        tmp_path,
+        coord_dir=coord_dir,
+        checkouts=(Checkout(name="coordinator", path=checkout),),
+    )
+    results = ud.probe_unit_drift(ctx)
+    assert len(results) == 1
+    r = results[0]
+    # Still the honest WARN — this probe has no policy context of its own.
+    assert r.severity is Severity.WARN
+    assert r.values["suppressed"] is True
+    assert r.values["suppress_reason"] == "manual release rolls by choice -- masked, not broken"
+    assert r.values["suppress_set"] == "2026-08-26"
 
 
 def test_unreadable_installed_unit_is_unknown(tmp_path) -> None:
