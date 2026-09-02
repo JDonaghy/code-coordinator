@@ -33,6 +33,22 @@ on. Two failure modes, one probe:
     verdict — a shadowed release is the split-brain, not a cosmetic
     difference.
 
+#3049 — a masked unit is not a stale one
+-----------------------------------------
+`systemctl --user mask` leaves an installed unit's file symlinked to
+`/dev/null`, which reads back empty and therefore ALWAYS content-diffs
+against `deploy/<name>` — a unit masked on purpose (a fleet that chose
+manual release rolls masks the propagate/window lanes deliberately) reads
+identically to one nobody has looked at in months. This probe still reports
+the honest WARN — deciding whether that drift is *wanted* is policy, and
+this probe has no policy context — but it also checks the same intent
+sentinel the watchdog already honours (`~/.coord/watchdog-suppress.json`,
+#2580) and publishes the verdict in `values["suppressed"]` (plus
+`"suppress_reason"`/`"suppress_set"`) so a policy-aware consumer, notably
+`coord release verify` (:mod:`coord.release_verify`), can render "masked by
+policy" instead of a remedy that would re-arm the very thing the masking
+exists to prevent.
+
 #1927 — where the reference comes from
 --------------------------------------
 The original cut of this check diffed the installed unit against
@@ -87,7 +103,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import check
+from coord.health.registry import check, is_suppressed, load_suppressions
 from coord.health.units import expand, human_hours
 
 _UNIT_GLOBS = ("*.service", "*.timer")
@@ -491,6 +507,19 @@ def probe_unit_drift(ctx: HealthContext) -> list[CheckResult]:
 
     deploy_dir = reference.path
     installed_dir = resolve_systemd_user_dir(ctx)
+    # #3049: a unit deliberately masked on purpose (e.g. the release-roll
+    # lanes on a fleet that chose manual releases) reads identically to a
+    # genuinely-stale one here — masking a unit leaves its installed copy
+    # empty, which diffs against `deploy/` exactly like neglect does. This
+    # probe still reports the honest fact (WARN, "stale", the `cp`/`restart`
+    # remedy) because severity is this probe's call alone and the drift is
+    # real — but it also surfaces whether the SAME sentinel the watchdog
+    # already honours (`~/.coord/watchdog-suppress.json`, #2580) covers this
+    # unit, via `values["suppressed"]`. A downstream consumer that knows the
+    # drift is intentional (`coord release verify`, #3049) can act on that
+    # without this probe silently downgrading a fact it has no policy
+    # context to judge.
+    suppressions = load_suppressions(ctx.coord_dir)
     results: list[CheckResult] = []
     for deploy_path in _unit_files(deploy_dir):
         name = deploy_path.name
@@ -578,6 +607,18 @@ def probe_unit_drift(ctx: HealthContext) -> list[CheckResult]:
             age = ctx.now - installed_mtime
             values["diff_lines"] = changed
             values["first_diff_line"] = first_line
+            # #3049: bare unit name is the key `scripts/fleet_watchdog.py`'s
+            # own checks already suppress under (`suppress_keys=(unit,)` in
+            # `check_disabled_timers`/`check_failed_units`) — an operator who
+            # has already suppressed this unit for the watchdog does not
+            # maintain a second key for this probe. `unit_drift:<name>` is
+            # also accepted for symmetry with `_suppress_keys_for` above.
+            suppressed, entry = is_suppressed(
+                suppressions, (name, f"unit_drift:{name}"), now=ctx.now
+            )
+            values["suppressed"] = suppressed
+            values["suppress_reason"] = (entry or {}).get("reason") if suppressed else None
+            values["suppress_set"] = (entry or {}).get("set") if suppressed else None
             where = f", first differing at line {first_line}" if first_line else ""
             # #1928: a templated reference (coord-agent.service) never gets
             # the bare `cp` remedy below — followed verbatim it installs
