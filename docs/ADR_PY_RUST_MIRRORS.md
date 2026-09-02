@@ -17,9 +17,19 @@ contract are now generated from the served OpenAPI document
 
 | coord-tui file | generator | gate |
 | --- | --- | --- |
-| `src/app/types/generated.rs` | `scripts/codegen.py --rust` (#1941) | `--rust --check` |
-| `src/app/types/generated_requests.rs` | `scripts/codegen.py --rust` (#2900) | `--rust --check` |
-| `tests/fixtures/board_sample.json` | `scripts/gen_board_fixture.py` (#748) | `git diff --exit-code` |
+| `src/app/types/generated.rs` | `coord/codegen.py --rust` (#1941) | `--rust --check` |
+| `src/app/types/generated_requests.rs` | `coord/codegen.py --rust` (#2900) | `--rust --check` |
+| `tests/fixtures/board_sample.json` | `coord/gen_board_fixture.py` (#748) | `git diff --exit-code` |
+
+Both generators used to be `scripts/codegen.py` / `scripts/gen_board_fixture.py`.
+`scripts/` is not in `[tool.setuptools.packages.find]`, so neither shipped in
+the wheel and the cross-repo drift gates above could not actually run from a
+`pip install 'code-coordinator[server]'` — #3045 moved them into the `coord`
+package (`python -m coord.codegen`, `python -m coord.gen_board_fixture`,
+`coord codegen`), leaving thin re-exporting shims at the old `scripts/` paths.
+They are listed in this document because they name coord-tui source files;
+they are **generators, not mirrors** — the drift they would otherwise cause is
+exactly what the gate in this table closes.
 
 That gate runs in coord-tui's `codegen-drift.yml` and is asserted *from this
 repo* by `coord.health.checks.coord_tui_ci_pin`, so the cross-repo contract is
@@ -54,7 +64,7 @@ Specifically:
    The correct response to "the TUI badged a stage differently from `coord
    status`" is to move that derivation onto the wire — have the daemon
    compute it once and ship the answer in the `/board` payload, where
-   `scripts/codegen.py` then guards it like everything else — not to add a
+   `coord/codegen.py` then guards it like everything else — not to add a
    Rust-source-text scraper on the Python side.
 
    That is not hypothetical guidance. `coord/board_bool_guard.py` *was* the
