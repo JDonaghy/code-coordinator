@@ -3672,12 +3672,18 @@ def build_app(
                 Mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
             )
 
-        async def _spa_catch_all(request: Request) -> FileResponse | HTMLResponse:
+        async def _spa_catch_all(
+            request: Request,
+        ) -> FileResponse | HTMLResponse | JSONResponse:
             """Serve exact static files from dist/ or SPA index.html fallback.
 
             Handles three cases:
             - Known static roots (sw.js, manifest.webmanifest, icons/, …)
               → served as the actual file so the browser gets correct MIME types.
+            - Unregistered /api/* paths (#3042)
+              → 404 JSON, so clients can tell "no such endpoint" apart from a
+              real 200. The SPA fallback below is only for client-side router
+              routes and must never swallow API paths.
             - SPA client-side routes (/issues/42, /pipeline, …)
               → serve index.html; the React router takes over.
             """
@@ -3685,6 +3691,8 @@ def build_app(
             candidate = webapp_dist / path
             if candidate.is_file():
                 return FileResponse(str(candidate))
+            if path == "api" or path.startswith("api/"):
+                return JSONResponse({"error": "unknown endpoint"}, status_code=404)
             # SPA fallback — let the React router handle the path.
             return HTMLResponse((webapp_dist / "index.html").read_text())
 
