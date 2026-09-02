@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -863,13 +864,33 @@ def _ensure_roll_pending_marker(
     return True
 
 
+#: #3047 part 2: default ceiling for `--drain`'s resident polling loop before
+#: it gives up and exits non-zero with whichever hosts are still behind. Same
+#: order of magnitude as `release_cordon.DEFAULT_TTL_SECONDS` (an hour) on
+#: purpose — a drain that has not converged in the time its own cordons would
+#: lapse anyway has nothing left protecting it, so there is no point holding
+#: this loop open any longer than that either.
+DEFAULT_DRAIN_DEADLINE_SECONDS = 3600.0
+
+#: How often `--drain` re-evaluates fleet quiescence. #2854's between-legs
+#: gap is "normally seconds long" (`coord/release_propagate.py`'s module
+#: docstring) — a single manual `coord release propagate` call is
+#: overwhelmingly likely to land outside it, which is the whole reason
+#: `--drain` exists. Short enough that a normally-seconds gap is actually
+#: caught inside it; long enough that polling is not pure noise against a
+#: fleet that is still genuinely busy.
+DEFAULT_DRAIN_INTERVAL_SECONDS = 15.0
+
+
 @release_group.command(
     "propagate",
     help=(
         "Roll the released version onto each host at ITS next quiescent "
         "window (#2067 — per host, not fleet-wide), verify it, and roll "
         "back on red (#1835). Safe to run from a timer: a busy host is a "
-        "recorded deferral for that host, not a failure of the run."
+        "recorded deferral for that host, not a failure of the run. "
+        "--drain (#3047) turns this into a resident loop that keeps polling "
+        "for a window itself, instead of leaving that to the operator."
     ),
 )
 @_CONFIG_OPTION
@@ -938,6 +959,23 @@ def _ensure_roll_pending_marker(
                    "if that is unset — any delta at all rolls, today's "
                    "behaviour.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the propagation record as JSON.")
+@click.option("--drain", "drain", is_flag=True,
+              help="#3047: resident mode. Instead of one attempt, keep re-evaluating "
+                   "fleet quiescence on an interval — renewing this run's own cordons "
+                   "every pass, same as a normal attempt already does — until every "
+                   "behind host reaches the target or --deadline passes. Exits the "
+                   "moment the roll is done, unlike `coord-release-propagate.timer`. "
+                   "Cannot be combined with --dry-run: a dry run changes nothing, so "
+                   "draining would never converge.")
+@click.option("--deadline", "deadline_seconds", default=DEFAULT_DRAIN_DEADLINE_SECONDS,
+              type=float, show_default=True,
+              help="#3047: seconds --drain may keep polling before giving up and "
+                   "exiting non-zero with whichever hosts are still behind. Ignored "
+                   "without --drain.")
+@click.option("--drain-interval", "drain_interval_seconds",
+              default=DEFAULT_DRAIN_INTERVAL_SECONDS, type=float, show_default=True,
+              help="#3047: seconds between --drain's re-evaluation attempts. Ignored "
+                   "without --drain.")
 def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions are elsewhere
     config_path: Path,
     target: str | None,
@@ -957,6 +995,9 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     cordon_cooldown: float | None,
     min_behind_override: int | None,
     as_json: bool,
+    drain: bool,
+    deadline_seconds: float,
+    drain_interval_seconds: float,
 ) -> None:
     """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
 
@@ -1003,7 +1044,54 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     ``--cordon-cooldown`` seconds before any may be set again. The counter
     lives in the propagation journal, because the process holding it is
     restarted by the roll it gates.
+
+    #3047: ``--drain`` turns the single attempt this docstring describes into
+    a resident loop (:func:`_run_drain`) that keeps calling this SAME
+    function — one attempt at a time, `deadline_seconds`/`drain_interval_
+    seconds` apart, everything else unchanged — until every host this run
+    would otherwise cordon has rolled, or the deadline passes. It exists
+    because #2854 already stops charging a between-legs row as busy once its
+    gap outlasts a short settle window, but nothing SAMPLES that window while
+    `coord-release-propagate.timer` is masked for a manual roll: one call is
+    overwhelmingly likely to land outside the (normally seconds-long) gap and
+    report ``deferred``, leaving an operator to re-run this command by hand
+    until a poll finally lands inside it.
     """
+    if drain:
+        # #3047: hand off to the resident loop and never reach the rest of
+        # this body directly — `_run_drain` calls right back into THIS
+        # function, one attempt at a time, with `drain=False`. It always
+        # exits (success, deadline, or a hard failure/rollback from one of
+        # its attempts), so nothing after this call ever runs.
+        if dry_run:
+            raise click.UsageError(
+                "--drain cannot be combined with --dry-run: a dry run changes "
+                "nothing on any host, so draining would never converge (#3047)."
+            )
+        _run_drain(
+            deadline_seconds=deadline_seconds,
+            poll_seconds=drain_interval_seconds,
+            config_path=config_path,
+            target=target,
+            daemon_host_override=daemon_host_override,
+            lane_filter=lane_filter,
+            dry_run=dry_run,
+            force=force,
+            do_verify=do_verify,
+            rollback_on_red=rollback_on_red,
+            release_holds=release_holds,
+            timeout=timeout,
+            do_cordon=do_cordon,
+            cordon_after=cordon_after,
+            cordon_ttl=cordon_ttl,
+            drain_deadline=drain_deadline,
+            cordon_max_deferrals=cordon_max_deferrals,
+            cordon_cooldown=cordon_cooldown,
+            min_behind_override=min_behind_override,
+            as_json=as_json,
+        )
+        return  # pragma: no cover — _run_drain always calls sys.exit()
+
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
 
@@ -1029,7 +1117,19 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             click.echo(_json.dumps(record.to_dict(), indent=2, sort_keys=True))
         else:
             click.echo("\n".join(rp.render_record(record)))
-        sys.exit(exit_code)
+        # #3047: equivalent to `sys.exit(exit_code)` for every existing
+        # caller — `SystemExit.code` is identical either way, so a real CLI
+        # invocation or a `CliRunner` both see the exact same exit behaviour
+        # as before. The only change is `.record`: an attribute nothing but
+        # `--drain`'s resident loop (`_run_drain`) ever reads. That loop
+        # calls this whole function again for its next attempt rather than
+        # letting the process actually exit, and needs the finished record
+        # back to know what happened — without it, `_run_drain` would have
+        # no way to tell "rolled, still hosts behind" from "up to date"
+        # except by re-parsing this call's own rendered text.
+        exc = SystemExit(exit_code)
+        exc.record = record
+        raise exc
 
     def _scope_gate(report) -> "rp.GateVerdict":
         """Score *report* against this run's own attempts, print advisories
@@ -1592,6 +1692,153 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         click.echo(f"  {'✓' if ok else '✗'} release deploy gate {key}: {detail}")
 
     _finish(rp.STATUS_VERIFIED, 0)
+
+
+def _sleep(seconds: float) -> None:
+    """`time.sleep`, indirected so `--drain`'s tests never really wait (#3047).
+
+    Matches the module's existing style of monkeypatchable module-level
+    functions (`_fetch_board`, `_post`, `_interactive_session_busy`) rather
+    than reaching for `time.sleep` directly inside `_run_drain`.
+    """
+    import time  # noqa: PLC0415
+
+    time.sleep(max(0.0, seconds))
+
+
+def _drain_remaining_hosts(record: "rp.PropagationRecord") -> set[str]:
+    """Hosts *record* says are still behind the target after one attempt
+    (#3047).
+
+    The union of everything :func:`_apply_cordons` counts as "not yet
+    drained": actively cordoned, spared only because the daemon host itself
+    blocks them from rolling ahead of it (#2176's ``collateral_spared``), or
+    held off only by the #2240 deadlock cooldown (``stuck_in_cooldown``) —
+    minus whatever THIS SAME attempt uncordoned after rolling it.
+
+    That subtraction matters: ``_uncordon_hosts`` mutates the very same
+    ``record.cordons`` dict :func:`_apply_cordons` built earlier in the same
+    attempt, so a host that was cordoned at the start of an attempt and
+    rolled+uncordoned before that attempt finished shows up in BOTH
+    ``cordoned`` (the early plan) and ``uncordoned`` (the late roll) — never
+    only the latter. Reading ``cordoned`` alone would therefore report a host
+    as still outstanding on the very attempt that finished it.
+    """
+    cordons = record.cordons or {}
+    remaining = (
+        set(cordons.get("cordoned") or [])
+        | set(cordons.get("collateral_spared") or [])
+        | set(cordons.get("stuck_in_cooldown") or [])
+    )
+    return remaining - set(cordons.get("uncordoned") or [])
+
+
+def _run_drain(
+    *,
+    deadline_seconds: float,
+    poll_seconds: float,
+    **attempt_kwargs: Any,
+) -> None:
+    """`coord release propagate --drain` (#3047 part 2): keep polling for a
+    quiescent window instead of leaving that to the operator.
+
+    #2854 already stops charging a between-legs row as busy once its gap has
+    outlasted the settle window — that mechanism works unmodified; nothing
+    here duplicates it. The gap this closes is that NOTHING samples it while
+    `coord-release-propagate.timer` is masked for a manual roll: a single
+    `coord release propagate` call is overwhelmingly likely to land outside
+    the (normally seconds-long) window and report `deferred`, leaving an
+    operator re-running the same command by hand until a poll finally lands
+    inside it.
+
+    This is exactly that loop, automated: call ``release_propagate`` itself
+    again — one attempt at a time, *poll_seconds* apart, `drain=False` so it
+    never recurses — renewing this run's own cordons on every pass (each
+    attempt already does that on its own; see :func:`_apply_cordons`), until
+    :func:`_drain_remaining_hosts` reports nothing left behind, *
+    deadline_seconds* elapses, or an attempt comes back with a real failure.
+
+    Never lets a single attempt actually terminate the process: each call is
+    ``release_propagate.callback(...)`` — the plain function Click wraps,
+    invoked directly rather than through Click's own dispatch — with its
+    terminal ``sys.exit`` caught right here. ``_finish`` raises that
+    ``SystemExit`` with the finished record attached (``exc.record``) for
+    exactly this reason: a resident caller needs to know what one attempt
+    did without a second, parallel account of the same run.
+    """
+    import time  # noqa: PLC0415
+
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    start = time.time()
+    attempt = 0
+    last_remaining: set[str] | None = None
+    while True:
+        attempt += 1
+        if attempt > 1 and time.time() - start > deadline_seconds:
+            stragglers = ", ".join(sorted(last_remaining or ())) or "(unknown)"
+            click.echo(
+                f"[drain] deadline of {deadline_seconds:.0f}s reached after "
+                f"{attempt - 1} attempt(s) — still behind: {stragglers}",
+                err=True,
+            )
+            sys.exit(1)
+
+        try:
+            release_propagate.callback(  # type: ignore[misc]
+                drain=False, deadline_seconds=0.0, drain_interval_seconds=0.0,
+                **attempt_kwargs,
+            )
+            record = None
+            exit_code = 0
+        except SystemExit as exc:
+            record = getattr(exc, "record", None)
+            exit_code = exc.code if isinstance(exc.code, int) else 0
+
+        if record is None:
+            # `release_propagate` always reaches `_finish` on every path, so
+            # this should be unreachable — but a caller this loop cannot
+            # interpret must never spin forever on it either.
+            sys.exit(exit_code)
+
+        remaining = _drain_remaining_hosts(record)
+        status = record.status
+        if last_remaining is None:
+            suffix = f" — still behind: {', '.join(sorted(remaining))}" if remaining else ""
+            click.echo(f"[drain] attempt {attempt}: {status}{suffix}")
+        else:
+            for host in sorted(last_remaining - remaining):
+                click.echo(f"[drain] {host}: reached the target")
+            for host in sorted(remaining - last_remaining):
+                click.echo(f"[drain] {host}: now behind (cordoned)")
+            if status != rp.STATUS_DEFERRED or not remaining:
+                click.echo(f"[drain] attempt {attempt}: {status}")
+        last_remaining = remaining
+
+        if status in (rp.STATUS_FAILED, rp.STATUS_ROLLED_BACK):
+            click.echo(
+                f"[drain] stopping — attempt {attempt} came back {status}", err=True
+            )
+            sys.exit(exit_code)
+        if status == rp.STATUS_HOLDING:
+            click.echo("[drain] holding — not enough drift to roll yet (--min-behind)")
+            sys.exit(0)
+        if not remaining:
+            click.echo(f"[drain] every host reached the target after {attempt} attempt(s)")
+            sys.exit(0)
+        if not attempt_kwargs.get("do_cordon") and status != rp.STATUS_DEFERRED:
+            # #3047: without cordoning there is no bookkeeping
+            # (`_drain_remaining_hosts` reads `record.cordons`, which
+            # `_apply_cordons` never populates with `--no-cordon`) to confirm
+            # every host converged. Best this loop can do without it is stop
+            # at the first attempt that managed to roll something, rather
+            # than spin on a signal it structurally cannot read.
+            click.echo(
+                "[drain] --no-cordon: stopping after the first non-deferred attempt "
+                "— no cordon bookkeeping to confirm every host converged"
+            )
+            sys.exit(0)
+        _sleep(poll_seconds)
 
 
 # ── #2101: the cordon loop's I/O half ───────────────────────────────────────
