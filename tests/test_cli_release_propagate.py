@@ -2614,7 +2614,7 @@ def test_drain_gives_up_at_its_deadline_and_reports_stragglers(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
     """The daemon (`server`) is permanently busy, so every attempt defers —
-    exactly the case a timer alone would retry forever. `--deadline 0` means
+    exactly the case a timer alone would retry forever. `--give-up-after 0` means
     the very next poll after the first attempt is already overdue, so this
     must stop after exactly one attempt, exit non-zero, and name the hosts
     still behind rather than hang."""
@@ -2630,7 +2630,7 @@ def test_drain_gives_up_at_its_deadline_and_reports_stragglers(
     result = CliRunner().invoke(
         main,
         ["release", "propagate", "--config", str(valid_config_path),
-         "--target", "0.4.111", "--drain", "--deadline", "0", "--drain-interval", "1"],
+         "--target", "0.4.111", "--drain", "--give-up-after", "0", "--drain-interval", "1"],
     )
     assert result.exit_code == 1, result.output
     assert len(slept) == 1, "must poll once (after attempt 1) before giving up"
@@ -2669,7 +2669,7 @@ def test_drain_rolls_a_host_once_it_frees_up_on_a_later_poll(
     result = CliRunner().invoke(
         main,
         ["release", "propagate", "--config", str(valid_config_path),
-         "--target", "0.4.111", "--drain", "--deadline", "60"],
+         "--target", "0.4.111", "--drain", "--give-up-after", "60"],
     )
     assert result.exit_code == 0, result.output
     assert len(slept) == 1, "must poll exactly once between the two attempts"
@@ -2682,3 +2682,144 @@ def test_drain_rolls_a_host_once_it_frees_up_on_a_later_poll(
     assert any(l["host"] == "laptop" and l["ok"] for l in records[1]["lanes"])
     assert "laptop: reached the target" in result.output
     assert "every host reached the target after 2 attempt(s)" in result.output
+
+
+def test_drain_no_cordon_stops_after_first_non_deferred_attempt(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#3047 review: `--no-cordon --drain` is a distinct, previously-untested
+    code path — and turned out to be genuinely broken. `_drain_remaining_
+    hosts` reads `record.cordons`, which `_apply_cordons` never populates at
+    all with `--no-cordon` (`plan_cordons(enabled=False, ...)` short-circuits
+    before touching any of `cordoned`/`collateral_spared`/`stuck_in_cooldown`/
+    `unknown`), so `remaining` is the empty set on EVERY `--no-cordon`
+    attempt. An earlier version of `_run_drain` checked `not remaining`
+    before the `--no-cordon` branch, so it always won: `laptop` here is still
+    on the OLD version (busy, deferred) after `server` alone rolls, yet the
+    loop reported "every host reached the target after 1 attempt(s)" and
+    exited 0 — a false convergence claim. It must instead take the honest
+    `--no-cordon`-specific exit that says it cannot confirm every host
+    converged."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--no-cordon", "--give-up-after", "60"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not slept, "the honest --no-cordon exit must not poll again"
+    assert "--no-cordon: stopping after the first non-deferred attempt" in result.output
+    assert "every host reached the target" not in result.output, (
+        "laptop never rolled — this must not claim full convergence"
+    )
+    records = _records(state_dir)
+    assert len(records) == 1
+    assert records[0]["status"] == rp.STATUS_VERIFIED
+
+
+def test_drain_no_cordon_keeps_polling_while_fully_deferred(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The other half of the same fix: a fully-deferred `--no-cordon` attempt
+    (nothing rolled at all) must NOT be mistaken for convergence either — it
+    must keep polling until something actually happens or --give-up-after
+    passes, exactly like a cordoned drain does."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"},
+                                  {"machine_name": "server", "issue_number": 10,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--no-cordon",
+         "--give-up-after", "0", "--drain-interval", "1"],
+    )
+    assert result.exit_code == 1, result.output
+    assert len(slept) == 1, "a fully-deferred no-cordon attempt must poll again, not stop"
+    assert "every host reached the target" not in result.output
+    assert "--give-up-after deadline" in result.output
+
+
+# ── #3047 review: `--drain --json` must be one parseable document ────────
+
+
+def test_drain_json_emits_a_single_aggregated_document(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Before this fix, `--drain --json` echoed one full JSON record PER
+    ATTEMPT (`_finish` unconditionally dumps `record.to_dict()` when
+    `--json` is set) interleaved with the loop's own plain-text `[drain]
+    ...` status lines on the SAME stdout — not a single parseable JSON
+    stream for a script reading the output. `--drain --json` must instead
+    produce exactly one JSON document: `_run_drain`'s own aggregated
+    summary."""
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.111"], "server": ["0.4.111"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    # Must parse as exactly one JSON document on STDOUT ALONE — `json.loads`
+    # raises on trailing data, which is exactly what N interleaved documents
+    # (or this attempt's own diagnostic lines) would produce. `result.stdout`
+    # (not the merged `result.output`) is what a script piping this
+    # command's stdout would actually see.
+    payload = json.loads(result.stdout)
+    assert payload["drain_status"] == "converged"
+    assert payload["attempts"] == 1
+    assert payload["remaining"] == []
+    assert payload["last_attempt"]["target_version"] == "0.4.111"
+    assert len(_records(state_dir)) == 1
+
+
+def test_drain_json_across_multiple_attempts_still_emits_one_document(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Same guarantee across more than one poll — the case that actually
+    interleaved multiple JSON documents pre-fix (one per attempt, plus the
+    transition lines between them)."""
+    calls = {"n": 0}
+
+    def _fetch_board():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                {"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                  "status": "RUNNING"}]},
+                None,
+            )
+        return ({"assignments": []}, None)
+
+    monkeypatch.setattr(release_cmd, "_fetch_board", _fetch_board)
+    _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: None)
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--give-up-after", "60", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["drain_status"] == "converged"
+    assert payload["attempts"] == 2
+    assert payload["remaining"] == []
+    assert len(_records(state_dir)) == 2
