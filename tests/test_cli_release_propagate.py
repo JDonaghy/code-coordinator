@@ -2569,3 +2569,116 @@ def test_roll_tui_a_real_failure_still_blocks_after_the_2981_fix(monkeypatch):
     ok, detail = release_cmd._roll_tui(_machine(name="server"), local_name="server")
     assert ok is False
     assert "checksum mismatch" in detail
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #3047 part 2: `--drain` — a resident loop instead of an operator re-running
+# `coord release propagate` by hand until a poll happens to land inside the
+# (normally seconds-long) #2854 between-legs window.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_drain_rejects_dry_run(valid_config_path, state_dir, no_network, monkeypatch):
+    """A dry run changes nothing on any host, so draining it would never
+    converge — refuse the combination up front rather than spin forever."""
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--dry-run"],
+    )
+    assert result.exit_code != 0
+    assert "--dry-run" in result.output
+    assert _records(state_dir) == []
+
+
+def test_drain_converges_in_one_attempt_when_nothing_is_behind(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The fleet is already on the target — `--drain` must recognise that on
+    the very first attempt and exit without ever sleeping/polling again."""
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.111"], "server": ["0.4.111"]})
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not slept, "already up to date — --drain must not poll a second time"
+    assert len(_records(state_dir)) == 1
+    assert "every host reached the target after 1 attempt" in result.output
+
+
+def test_drain_gives_up_at_its_deadline_and_reports_stragglers(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The daemon (`server`) is permanently busy, so every attempt defers —
+    exactly the case a timer alone would retry forever. `--deadline 0` means
+    the very next poll after the first attempt is already overdue, so this
+    must stop after exactly one attempt, exit non-zero, and name the hosts
+    still behind rather than hang."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "server", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--deadline", "0", "--drain-interval", "1"],
+    )
+    assert result.exit_code == 1, result.output
+    assert len(slept) == 1, "must poll once (after attempt 1) before giving up"
+    records = _records(state_dir)
+    assert len(records) == 1
+    assert records[0]["status"] == rp.STATUS_DEFERRED
+    assert "deadline" in result.output
+    assert "laptop" in result.output and "server" in result.output
+
+
+def test_drain_rolls_a_host_once_it_frees_up_on_a_later_poll(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The scenario in #3047's own report: `laptop` is busy on the first
+    poll (so only `server`, the free daemon, rolls) and free by the second
+    (so `laptop` catches up too) — `--drain` must keep going after the first
+    attempt, report the transition, and stop once nothing is left behind."""
+    calls = {"n": 0}
+
+    def _fetch_board():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                {"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                  "status": "RUNNING"}]},
+                None,
+            )
+        return ({"assignments": []}, None)
+
+    monkeypatch.setattr(release_cmd, "_fetch_board", _fetch_board)
+    _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--drain", "--deadline", "60"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(slept) == 1, "must poll exactly once between the two attempts"
+    records = _records(state_dir)
+    assert len(records) == 2
+    assert records[0]["status"] == rp.STATUS_VERIFIED
+    laptop_lane_1 = next(l for l in records[0]["lanes"] if l["host"] == "laptop")
+    assert laptop_lane_1["ok"] is None  # deferred, never attempted
+    assert records[1]["status"] == rp.STATUS_VERIFIED
+    assert any(l["host"] == "laptop" and l["ok"] for l in records[1]["lanes"])
+    assert "laptop: reached the target" in result.output
+    assert "every host reached the target after 2 attempt(s)" in result.output
