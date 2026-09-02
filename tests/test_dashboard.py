@@ -2384,6 +2384,38 @@ class TestSPAServing:
         # The legacy dashboard always contains "coord dashboard" in its markup.
         assert "coord dashboard" in r.text
 
+    def test_unknown_api_path_returns_404_json(self, tmp_path: Path) -> None:
+        """#3042: an unregistered /api/* path must 404 with a JSON body, not
+        the SPA's index.html — otherwise a missing endpoint is
+        indistinguishable from a working one at the HTTP layer."""
+        dist = self._make_dist(tmp_path, "<html><title>coord spa route</title></html>")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/api/this-route-does-not-exist")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+        assert "coord spa route" not in r.text
+
+    def test_unknown_nested_api_path_returns_404_json(self, tmp_path: Path) -> None:
+        """Same guard for a deeper unregistered /api/ path, matching the
+        machines-panel endpoints from #3042 (e.g. /api/machines/x/metrics)."""
+        dist = self._make_dist(tmp_path)
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/api/machines/precision/metrics")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+
+    def test_non_api_unknown_path_still_serves_spa(self, tmp_path: Path) -> None:
+        """The /api/ 404 guard must not regress client-side routing: a
+        non-API unknown path still falls through to index.html."""
+        dist = self._make_dist(tmp_path, "<html><title>coord spa route</title></html>")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/issues/42")
+        assert r.status_code == 200
+        assert "coord spa route" in r.text
+
 
 class TestWebappBundleMissingSignal:
     """#2009: "no bundle" must never be a silent 200.
