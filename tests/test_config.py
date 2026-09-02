@@ -1958,3 +1958,115 @@ def test_full_config_wires_store_block_through(tmp_path: Path) -> None:
 def test_full_config_defaults_store_when_block_absent(valid_config_path: Path) -> None:
     cfg = load(valid_config_path)
     assert cfg.store == StoreConfig()
+
+
+# ── smoke_tests.capability_rules[].command (#3056) ──────────────────────────
+
+
+def _write_smoke_config(tmp_path: Path, capability_rules_yaml: str) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n"
+        "    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n"
+        "    host: dell64.tail\n"
+        "    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  capability_rules:\n" + capability_rules_yaml
+    )
+    return p
+
+
+def test_capability_rule_command_absent_is_none(tmp_path: Path) -> None:
+    """No `command` key: byte-identical to pre-#3056 — the rule only routes."""
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    rule = cfg.smoke_tests.capability_rules[0]
+    assert rule.files == ["src/win/"]
+    assert rule.requires == ["windows"]
+    assert rule.command is None
+
+
+def test_capability_rule_command_round_trips(tmp_path: Path) -> None:
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n"
+            "      requires: [windows]\n"
+            "      command: 'cargo xwin test --target x86_64-pc-windows-msvc'\n",
+        )
+    )
+    rule = cfg.smoke_tests.capability_rules[0]
+    assert rule.command == "cargo xwin test --target x86_64-pc-windows-msvc"
+
+
+def test_capability_rule_command_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\]\.command must be a string",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['src/win/']\n"
+                "      requires: [windows]\n"
+                "      command: 42\n",
+            )
+        )
+
+
+def test_capability_rule_command_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\]\.command must be non-empty",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['src/win/']\n"
+                "      requires: [windows]\n"
+                "      command: ''\n",
+            )
+        )
+
+
+def test_capability_rule_command_rejects_whitespace_only_string(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\]\.command must be non-empty",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['src/win/']\n"
+                "      requires: [windows]\n"
+                "      command: '   '\n",
+            )
+        )
+
+
+def test_capability_rule_command_index_named_for_second_rule(tmp_path: Path) -> None:
+    """Index in the error message matches the rule's position, so a config
+    with several rules points the operator at the right one."""
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[1\]\.command must be a string",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['src/gtk/']\n"
+                "      requires: [gtk]\n"
+                "    - files: ['src/win/']\n"
+                "      requires: [windows]\n"
+                "      command: false\n",
+            )
+        )

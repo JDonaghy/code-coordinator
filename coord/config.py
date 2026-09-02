@@ -272,10 +272,22 @@ class SmokeRule:
     paths match if the touched path starts with the rule path (so `src/gtk`
     catches `src/gtk/foo.c` and `src/gtk_helpers.c`). Use `src/gtk/` to scope
     strictly to the directory.
+
+    `command` (#3056) is an optional override of the Test-stage command for
+    a diff this rule matches — routing to the one machine with a capability
+    is useless if the command that runs there is the same repo-wide command
+    every other machine would run. When set, it OUTRANKS `repos[].ci_command`,
+    `smoke_tests.default_command`, and `repos[].test_command` for a matched
+    diff (see `coord.smoke.resolve_smoke_command`'s precedence). Absent
+    (`None`, the default), a rule behaves exactly as before #3056 — it only
+    contributes to `requires` routing, never to command selection. When more
+    than one matching rule declares a `command`, the first one in
+    `capability_rules` declaration order wins (`coord.smoke.resolve_rule_command`).
     """
 
     files: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
+    command: str | None = None
 
 
 @dataclass
@@ -3017,7 +3029,17 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
             raise ConfigError(
                 f"smoke_tests.capability_rules[{i}].requires must be non-empty"
             )
-        rules.append(SmokeRule(files=files, requires=requires))
+        command = entry.get("command")
+        if command is not None:
+            if not isinstance(command, str):
+                raise ConfigError(
+                    f"smoke_tests.capability_rules[{i}].command must be a string"
+                )
+            if not command.strip():
+                raise ConfigError(
+                    f"smoke_tests.capability_rules[{i}].command must be non-empty"
+                )
+        rules.append(SmokeRule(files=files, requires=requires, command=command))
     cfg.capability_rules = rules
     return cfg
 

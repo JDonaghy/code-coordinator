@@ -17,6 +17,10 @@ Public entry points:
 
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
+- `resolve_smoke_command(repo, smoke_cfg, touched_files=None)` — pure: picks
+  the Test-stage command, provenance included. A matched rule's own
+  `command` (#3056) outranks the repo/fleet-wide sources — see
+  `resolve_rule_command` for the multiple-matching-rules tiebreak.
 - `rank_smoke_machines(required_caps, repo, worker_machine, board, config)` —
   every capability-matched machine, best first (#1672).
 - `pick_smoke_machine(required_caps, worker_machine, board, config)` — picks
@@ -508,14 +512,35 @@ class SmokeCommand:
     can still be a lie if the config drifts from the workflow file; what it
     buys is that the un-declared case stops looking identical to the
     declared one.
+
+    ``from_rule`` (#3056) is True when this command came from a matched
+    ``smoke_tests.capability_rules[].command`` rather than a repo/fleet-wide
+    source. A rule command is never ``ci_equivalent`` — it was hand-written
+    for one path prefix, not declared as "what CI runs" — but it can be
+    *broader* than CI's own leg for that path (e.g. a real device/VM run
+    where CI only compiles) while still being *narrower* than the whole CI
+    workflow. ``briefing_note`` says this explicitly so a transcript reader
+    can tell a rule-command green from a repo-command green.
     """
 
     command: str | None
     source: str
     ci_equivalent: bool
+    from_rule: bool = False
 
     def briefing_note(self) -> str:
         """One line for the smoke agent's briefing naming the command's origin."""
+        if self.from_rule:
+            return (
+                f"- Suite: `{self.source}` — this comes from a matched "
+                "`smoke_tests.capability_rules` entry (#3056), which "
+                "outranks `ci_command`/`default_command`/`test_command` for "
+                "this diff because it was written for exactly these files. "
+                "It is not declared CI-equivalent: it may be BROADER than "
+                "CI's own leg for these files, while still being NARROWER "
+                "than the whole CI workflow. Passing here does not by "
+                "itself prove CI is green."
+            )
         if self.ci_equivalent:
             return (
                 f"- Suite: `{self.source}` — this is the repo's declared "
@@ -529,11 +554,57 @@ class SmokeCommand:
         )
 
 
-def resolve_smoke_command(repo, smoke_cfg: SmokeTestsConfig) -> SmokeCommand:
+def resolve_rule_command(
+    touched_files: list[str], rules: list[SmokeRule]
+) -> SmokeCommand | None:
+    """Return the `SmokeCommand` for the first `capability_rules` entry that
+    matches *touched_files* and declares a `command` (#3056), or `None` if
+    no matching rule declares one.
+
+    **Multiple matching rules.** A diff can touch files matching more than
+    one rule (e.g. a diff touching both a `gtk/` rule and a `win/` rule that
+    each declare a `command`) — two commands cannot union, so this resolves
+    the ambiguity by **first match wins, in `capability_rules` declaration
+    order**. That order is the config author's own explicit list order, not
+    dict/set iteration order, so it is stable across runs and processes.
+    Rules with no `command` are skipped over (they never candidate here) but
+    still participate in `match_rules`' capability routing as before.
+
+    A rule's `SmokeCommand.ci_equivalent` is always False — see
+    `SmokeCommand`'s docstring for why a rule command is neither assumed
+    CI-equivalent nor assumed narrower; it's simply not the same claim.
+    """
+    for i, rule in enumerate(rules):
+        if not rule.command:
+            continue
+        if any(
+            path.startswith(pattern)
+            for path in touched_files
+            for pattern in rule.files
+        ):
+            return SmokeCommand(
+                rule.command,
+                f"smoke_tests.capability_rules[{i}] (files={rule.files!r})",
+                False,
+                from_rule=True,
+            )
+    return None
+
+
+def resolve_smoke_command(
+    repo, smoke_cfg: SmokeTestsConfig, touched_files: list[str] | None = None,
+) -> SmokeCommand:
     """Pick the Test-stage command for *repo*, best (most CI-faithful) first.
 
-    Precedence, deliberately with the per-repo CI declaration on top:
+    Precedence, most-specific first:
 
+    0. A matched `smoke_tests.capability_rules[].command` (#3056) — strictly
+       more specific than any repo/fleet-wide command, since it was written
+       for exactly the files the diff touches. Only consulted when
+       *touched_files* is given (see `resolve_rule_command` for the
+       multiple-matching-rules tiebreak); callers with no diff in hand
+       (fleet config-health checks, repo onboarding) fall straight through
+       to the pre-#3056 precedence below, unchanged.
     1. ``repos[].ci_command`` — what this repo's CI actually runs (#2091).
     2. ``smoke_tests.default_command`` — the fleet-wide fallback.
     3. ``repos[].test_command`` — the local/quick suite.
@@ -541,8 +612,15 @@ def resolve_smoke_command(repo, smoke_cfg: SmokeTestsConfig) -> SmokeCommand:
     ``smoke_tests.default_command`` outranking ``test_command`` is the
     pre-existing #1021 behaviour and is preserved; ``ci_command`` is inserted
     *above* both because a global default cannot possibly be more faithful to
-    one repo's CI than that repo's own declaration.
+    one repo's CI than that repo's own declaration. The #3056 rule command is
+    inserted *above ci_command* because it is strictly narrower still — a
+    rule that names exact files beats a repo-wide declaration every time it
+    matches.
     """
+    if touched_files is not None:
+        rule_command = resolve_rule_command(touched_files, smoke_cfg.capability_rules)
+        if rule_command is not None:
+            return rule_command
     ci_command = (getattr(repo, "ci_command", None) or "").strip() or None
     if ci_command:
         return SmokeCommand(ci_command, f"repos[{repo.name}].ci_command", True)
@@ -1087,8 +1165,10 @@ def dispatch_smoke(
     touched = diff_lookup(repo.github, completed.branch)
     required_caps = match_rules(touched, smoke_cfg.capability_rules)
     # #2091: resolve *with* provenance — the Test verdict this dispatch will
-    # produce is only as meaningful as the suite behind it.
-    resolved = resolve_smoke_command(repo, smoke_cfg)
+    # produce is only as meaningful as the suite behind it. #3056: pass the
+    # touched files so a matching rule's own `command` (routing AND the
+    # command that runs, not just routing) outranks the repo-wide sources.
+    resolved = resolve_smoke_command(repo, smoke_cfg, touched_files=touched)
     smoke_command = resolved.command
 
     if not required_caps:
