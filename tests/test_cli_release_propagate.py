@@ -21,6 +21,7 @@ per-host HTTP calls are all seams.
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -2759,6 +2760,47 @@ def test_drain_no_cordon_keeps_polling_while_fully_deferred(
 # ── #3047 review: `--drain --json` must be one parseable document ────────
 
 
+def _stdout_only_runner() -> CliRunner:
+    """A `CliRunner` whose `result.stdout` really is stdout ALONE.
+
+    Click < 8.2 defaults to `mix_stderr=True`, which aliases `sys.stderr`
+    onto `sys.stdout` for the duration of the invocation — `result.stdout`
+    then holds BOTH streams merged, identically to `result.output`. That
+    silently defeats the very thing the `--drain --json` tests below assert:
+    `_run_drain`'s `[drain] ...` progress lines go to stderr (`_echo` passes
+    `err=json_mode`) and would be spliced in front of the JSON document,
+    making `json.loads` raise before any assertion ran.
+
+    Click >= 8.2 always separates the two streams and REMOVED the parameter,
+    so passing it unconditionally raises `TypeError` there. `pyproject.toml`
+    only requires `click>=8.1`, so both are live installs in practice (the
+    fleet venv has 8.1.6; a fresh `pip install -e '.[dev]'` resolves 8.5.0).
+    Detect the parameter rather than pin a version.
+    """
+    if "mix_stderr" in inspect.signature(CliRunner.__init__).parameters:
+        return CliRunner(mix_stderr=False)  # click < 8.2
+    return CliRunner()  # click >= 8.2 — always separated
+
+
+def test_stdout_only_runner_actually_separates_the_streams():
+    """Guard the guard: if `_stdout_only_runner` ever silently stopped
+    separating the streams (a future click bump renaming the parameter, say),
+    the two `--drain --json` tests below would go green for the wrong reason
+    — stderr would simply be merged in and `json.loads` would... still fail,
+    but a laxer future assertion might not. Pin the property directly."""
+    import click
+
+    @click.command()
+    def _cmd():
+        click.echo("diagnostic line", err=True)
+        click.echo('{"ok": true}')
+
+    result = _stdout_only_runner().invoke(_cmd, [])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"ok": True}
+    assert "diagnostic line" not in result.stdout
+
+
 def test_drain_json_emits_a_single_aggregated_document(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
@@ -2770,7 +2812,7 @@ def test_drain_json_emits_a_single_aggregated_document(
     produce exactly one JSON document: `_run_drain`'s own aggregated
     summary."""
     _stub_verify(monkeypatch, versions={"laptop": ["0.4.111"], "server": ["0.4.111"]})
-    result = CliRunner().invoke(
+    result = _stdout_only_runner().invoke(
         main,
         ["release", "propagate", "--config", str(valid_config_path),
          "--target", "0.4.111", "--drain", "--json"],
@@ -2812,7 +2854,7 @@ def test_drain_json_across_multiple_attempts_still_emits_one_document(
     _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
                  daemon="server")
     monkeypatch.setattr(release_cmd, "_sleep", lambda s: None)
-    result = CliRunner().invoke(
+    result = _stdout_only_runner().invoke(
         main,
         ["release", "propagate", "--config", str(valid_config_path),
          "--target", "0.4.111", "--drain", "--give-up-after", "60", "--json"],
