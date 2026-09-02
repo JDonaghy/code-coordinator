@@ -779,7 +779,8 @@ def openapi_spec() -> dict:
         "required": ["schema", "generated_at", "machines"],
     }
     machine_metrics_response_ref = {"$ref": "#/components/schemas/MachineMetricsResponse"}
-    # `api_machines_stats`'s per-machine dict verbatim (#3025).
+    # `coord.machine_stats.build_machine_stats`'s per-machine dict verbatim
+    # (#3025, extracted to that shared module in #3041).
     components["MachineStatsJobHistoryEntry"] = {
         "type": "object",
         "properties": {
@@ -2087,42 +2088,21 @@ def build_app(
         heavier, lower-poll-frequency payload that precedent argues for
         keeping out of it.
 
-        Capacity: ``active`` counts ``board.active`` entries with
-        ``status == "running"`` for the machine — sourced from
-        ``coord.reconcile._running_by_machine``, the same helper
-        ``_reassign``/``describe_no_candidate_machines`` use, so this can't
-        produce a second, diverging answer to "is this machine busy" (#2096
-        / #1417). ``max`` is the effective concurrency ceiling
-        (``coord.reconcile._machine_capacity``: the machine's own
-        ``max_workers`` override, falling back to the fleet-wide
-        ``concurrency.max_workers``) — the exact same helper the dispatcher
-        itself uses to decide whether a machine has headroom, so this can't
-        drift from what actually gates dispatch either.
+        The actual derivation (capacity ceiling, completed/failed rules, job
+        history sort + cap) lives in :func:`coord.machine_stats.
+        build_machine_stats` — a pure ``(board, config) -> list[dict]``
+        function shared with the board daemon's ``GET /machines/stats``
+        (#3041), so coord-tui can reach the identical rules over its own
+        transport (port 7435) instead of a second, hand-transcribed
+        implementation drifting from this one. See that module's docstring
+        for the full rule table.
 
-        Counts + job history are both sourced from ``board.completed`` —
-        every non-active (``done``/``merged``/``failed``/``cancelled``/
-        ``advisory``/``refused_policy``) assignment currently on the board.
-        That list is already retention-windowed upstream
-        (``coord.dao._board_retention_cutoff`` / ``compute_board_keep_ids``,
-        identical in thin-client and co-located mode), so this handler
-        applies no additional cutoff of its own — a machine with nothing in
-        the window (fresh install, or everything aged out) reads zero counts
-        and an empty history, never an error. ``completed`` counts
-        ``status == "done"`` **and** ``status == "merged"`` together —
-        ``coord.state.mark_assignment_merged`` flips a done work assignment
-        to ``status="merged"`` once GitHub confirms the merge, so ``merged``
-        is the normal steady state for a successfully completed assignment,
-        not a distinct outcome (mirrors ``coord.scorecard``'s
-        ``status == "merged"`` success check). ``failed`` counts
-        ``status == "failed"``; ``cancelled``/``advisory``/``refused_policy``
-        rows still appear in ``job_history`` but are not bucketed into
-        either count — they are neither a clean success nor a failure
-        (#448/#2234's "advisory is a third state" distinction).
-
-        ``job_history`` is capped at the most recent 20 per machine (mirrors
-        coord-tui's ``machine_detail_list``), newest first by ``finished_at``
-        (falling back to ``dispatched_at`` for a row that somehow has no
-        ``finished_at``).
+        Unlike ``/api/machines/metrics`` (which proxies the daemon because
+        the metrics sampler's ring buffer only exists in the ``coord serve``
+        process's memory), this handler computes locally: the derivation is
+        pure board data and ``_read_board()`` below already resolves
+        daemon-vs-local on its own, so adding a network hop here would just
+        be cargo-culting the wrong half of that precedent.
 
         Fixture mode (#3026) needs no dedicated branch here at all: ``_read_board()``
         already returns the seeded board and ``config`` is already the fixture's
@@ -2131,50 +2111,10 @@ def build_app(
         of completed/failed/running assignments per machine exercises it for
         free.
         """
-        from coord.reconcile import _machine_capacity, _running_by_machine  # noqa: PLC0415
+        from coord.machine_stats import build_machine_stats  # noqa: PLC0415
 
         board = _read_board()
-        active_by_machine: dict[str, int] = {
-            name: len(rows) for name, rows in _running_by_machine(board).items()
-        }
-
-        completed_by_machine: dict[str, list] = {}
-        for a in board.completed:
-            completed_by_machine.setdefault(a.machine_name, []).append(a)
-
-        def _sort_key(a):  # noqa: ANN001, ANN202
-            return a.finished_at if a.finished_at is not None else (a.dispatched_at or 0.0)
-
-        result = []
-        for m in config.machines:
-            rows = sorted(
-                completed_by_machine.get(m.name, []), key=_sort_key, reverse=True
-            )
-            result.append({
-                "name": m.name,
-                "capacity": {
-                    "active": active_by_machine.get(m.name, 0),
-                    "max": _machine_capacity(m, config),
-                },
-                "counts": {
-                    "completed": sum(1 for a in rows if a.status in ("done", "merged")),
-                    "failed": sum(1 for a in rows if a.status == "failed"),
-                },
-                "job_history": [
-                    {
-                        "assignment_id": a.assignment_id,
-                        "repo_name": a.repo_name,
-                        "issue_number": a.issue_number,
-                        "issue_title": a.issue_title,
-                        "type": a.type,
-                        "status": a.status,
-                        "dispatched_at": a.dispatched_at,
-                        "finished_at": a.finished_at,
-                    }
-                    for a in rows[:20]
-                ],
-            })
-        return JSONResponse(result)
+        return JSONResponse(build_machine_stats(board, config))
 
     async def api_sessions(request: Request) -> JSONResponse:
         """GET /api/sessions — live coord-* interactive sessions the phone can
