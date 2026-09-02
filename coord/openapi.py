@@ -233,40 +233,105 @@ _JSON_TYPE_CHECK: dict[str, type | tuple[type, ...]] = {
 
 
 def validate_json_schema(
-    instance: Any, schema: dict[str, Any], components: dict[str, Any], *, path: str = "$"
+    instance: Any,
+    schema: dict[str, Any],
+    components: dict[str, Any],
+    *,
+    path: str = "$",
+    check_required: bool = True,
+    check_unknown_properties: bool = True,
 ) -> list[str]:
     """Validate *instance* against a schema produced by this module.
 
     Not a general-purpose JSON Schema validator (no external dependency is
     pulled in for it) — just enough of the dialect this module itself emits
-    (``type``, ``nullable``, ``properties``/``required``, ``items``,
+    (``type`` as a string or a JSON-Schema-style array of strings,
+    ``nullable``, ``properties``/``required``, ``items``,
     ``additionalProperties``, ``$ref``, ``anyOf``) to prove the #757 specs
     actually describe a real payload, e.g. the #748 golden ``/board``
     fixture. Returns a list of human-readable error strings; empty means
     valid.
+
+    Two checks are independently toggleable, both on by default:
+
+    - ``check_required``: a missing declared-required property is an error.
+      A caller validating a deliberately *partial* payload (#3050: a fixture
+      exercising a degraded state legitimately omits fields) passes
+      ``check_required=False`` to validate shape/type without demanding
+      completeness.
+    - ``check_unknown_properties``: a property present on *instance* but
+      absent from the schema's ``properties`` (and not covered by a
+      dict-valued ``additionalProperties``) is an error — this is the #3050
+      check: a payload that *invents* fields the route's schema never
+      declared, e.g. a fixture impersonating a shape it doesn't match. Only
+      applies to schemas that actually declare ``properties`` (a closed
+      shape); a schema with no ``properties`` key at all (a bare ``{"type":
+      "object"}`` used for a genuinely free-form value) stays permissive, as
+      does any schema with ``additionalProperties: true``.
     """
+    # Nullability is checked at THIS level, before resolving `$ref`/`anyOf`:
+    # the codebase's own hand-built schemas spell "nullable $ref" as
+    # `{**some_ref, "nullable": True, ...}` — a sibling key alongside `$ref`
+    # (e.g. `ReportResult.chart`, `MachineRow.assignments`) — which OpenAPI's
+    # own `$ref`-siblings-are-ignored rule would otherwise silently drop,
+    # wrongly rejecting a legitimate `null` for those fields.
+    nullable = bool(schema.get("nullable"))
+    json_type = schema.get("type")
+    # JSON-Schema-dialect nullability: `"type": ["string", "null"]` rather
+    # than this module's own `"type": "string", "nullable": true` — a few
+    # hand-built dashboard schemas (e.g. `session_response`) use this form.
+    if isinstance(json_type, list):
+        nullable = nullable or "null" in json_type
+
+    if instance is None:
+        if nullable or json_type == "null" or not schema:
+            return []
+        return [f"{path}: null but schema is not nullable ({schema.get('type')!r})"]
+
     if "$ref" in schema:
         name = schema["$ref"].rsplit("/", 1)[-1]
         target = components.get(name)
         if target is None:
             return [f"{path}: unresolvable $ref {schema['$ref']!r}"]
-        return validate_json_schema(instance, target, components, path=path)
+        return validate_json_schema(
+            instance,
+            target,
+            components,
+            path=path,
+            check_required=check_required,
+            check_unknown_properties=check_unknown_properties,
+        )
 
     if "anyOf" in schema:
         errors_per_branch = [
-            validate_json_schema(instance, branch, components, path=path)
+            validate_json_schema(
+                instance,
+                branch,
+                components,
+                path=path,
+                check_required=check_required,
+                check_unknown_properties=check_unknown_properties,
+            )
             for branch in schema["anyOf"]
         ]
         if any(not errs for errs in errors_per_branch):
             return []
         return [f"{path}: matched none of {len(schema['anyOf'])} anyOf branches"]
 
-    if instance is None:
-        if schema.get("nullable") or schema.get("type") == "null" or not schema:
-            return []
-        return [f"{path}: null but schema is not nullable ({schema.get('type')!r})"]
+    if isinstance(json_type, list):
+        non_null_types = [t for t in json_type if t != "null"]
+        if len(non_null_types) > 1:
+            branches = [{**schema, "type": t} for t in non_null_types]
+            return validate_json_schema(
+                instance,
+                {"anyOf": branches},
+                components,
+                path=path,
+                check_required=check_required,
+                check_unknown_properties=check_unknown_properties,
+            )
+        json_type = non_null_types[0] if non_null_types else None
 
-    json_type = schema.get("type")
     if json_type is None:
         return []  # untyped ("any") schema — nothing to check
 
@@ -276,28 +341,53 @@ def validate_json_schema(
 
     errors: list[str] = []
     if json_type == "object" and isinstance(instance, dict):
-        properties = schema.get("properties", {})
-        for req in schema.get("required", ()):
-            if req not in instance:
-                errors.append(f"{path}: missing required property {req!r}")
+        properties = schema.get("properties")
+        if check_required:
+            for req in schema.get("required", ()):
+                if req not in instance:
+                    errors.append(f"{path}: missing required property {req!r}")
+        addl = schema.get("additionalProperties")
         for key, value in instance.items():
-            prop_schema = properties.get(key)
+            prop_schema = (properties or {}).get(key)
             if prop_schema is not None:
                 errors.extend(
-                    validate_json_schema(value, prop_schema, components, path=f"{path}.{key}")
-                )
-            else:
-                addl = schema.get("additionalProperties")
-                if isinstance(addl, dict):
-                    errors.extend(
-                        validate_json_schema(value, addl, components, path=f"{path}.{key}")
+                    validate_json_schema(
+                        value,
+                        prop_schema,
+                        components,
+                        path=f"{path}.{key}",
+                        check_required=check_required,
+                        check_unknown_properties=check_unknown_properties,
                     )
+                )
+            elif isinstance(addl, dict):
+                errors.extend(
+                    validate_json_schema(
+                        value,
+                        addl,
+                        components,
+                        path=f"{path}.{key}",
+                        check_required=check_required,
+                        check_unknown_properties=check_unknown_properties,
+                    )
+                )
+            elif addl is True or properties is None:
+                pass  # explicitly open, or a schema with no declared shape at all
+            elif check_unknown_properties:
+                errors.append(f"{path}: unexpected property {key!r} not declared in schema")
     elif json_type == "array" and isinstance(instance, list):
         items_schema = schema.get("items")
         if items_schema:
             for i, item in enumerate(instance):
                 errors.extend(
-                    validate_json_schema(item, items_schema, components, path=f"{path}[{i}]")
+                    validate_json_schema(
+                        item,
+                        items_schema,
+                        components,
+                        path=f"{path}[{i}]",
+                        check_required=check_required,
+                        check_unknown_properties=check_unknown_properties,
+                    )
                 )
     return errors
 

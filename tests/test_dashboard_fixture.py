@@ -202,6 +202,94 @@ class TestFixtureLoader:
         assert fx.config().repos == []
 
 
+class TestSeededPayloadSchemaValidation:
+    """#3050: a fixture that impersonates a schema it doesn't match fails to
+    load, naming the route, the field(s), and (when loaded from a file) the
+    path — rather than silently serving whatever shape it was authored with
+    under a route whose OpenAPI schema says otherwise."""
+
+    def _machines_fixture(self, machine: dict) -> dict:
+        return {"board": {"assignments": []}, "machines": [machine]}
+
+    def test_fields_the_real_handler_never_emits_are_rejected(self) -> None:
+        """The exact #3050 repro: a fixture invents `severity` (a
+        `/api/machines/health` field, never a `/api/machines` one) and
+        other fields `GET /api/machines`'s real handler has never emitted."""
+        with pytest.raises(FixtureError, match=r"does not match the /api/machines schema"):
+            parse_fixture(self._machines_fixture({
+                "name": "m1", "host": "m1.tailnet", "repos": ["api"],
+                "state": "online", "reason": "",
+                "severity": "unknown",
+                "hand_paused": False,
+                "headless_workers": 0,
+                "is_local": True,
+                "quiet_hours_paused": False,
+                "reachable": True,
+                "release_cordoned": False,
+                "active_assignments": [],
+                "concurrency_limit": 2,
+                "agent_version": "1.0",
+                "worktree_bytes": 0,
+            }))
+
+    def test_error_names_the_offending_field_and_the_file(self, tmp_path: Path) -> None:
+        p = tmp_path / "bad-machines.json"
+        p.write_text(json.dumps(self._machines_fixture({
+            "name": "m1", "host": "m1.tailnet", "repos": ["api"],
+            "state": "online", "reason": "",
+            "severity": "unknown",
+        })))
+        with pytest.raises(FixtureError) as exc_info:
+            load_fixture(p)
+        msg = str(exc_info.value)
+        assert "severity" in msg
+        assert str(p) in msg
+        assert "/api/machines" in msg
+
+    def test_type_mismatch_is_rejected(self) -> None:
+        with pytest.raises(FixtureError, match=r"expected number, got str"):
+            parse_fixture(self._machines_fixture({
+                "name": "m1", "host": "m1.tailnet", "repos": ["api"],
+                "state": "online", "reason": "",
+                "latency_ms": "fast",
+            }))
+
+    def test_a_partial_payload_missing_optional_fields_is_not_an_error(self) -> None:
+        """Not a strict required-field match (#3050): a fixture legitimately
+        seeds a degraded/partial state, e.g. a machine with no latency_ms —
+        only extra/undeclared fields and type disagreements are rejected."""
+        fx = parse_fixture(self._machines_fixture({"name": "m1"}))
+        assert fx.machines() == [{"name": "m1"}]
+
+    def test_unvalidated_routes_opts_a_route_out(self) -> None:
+        fx = parse_fixture({
+            **self._machines_fixture({
+                "name": "m1", "host": "m1.tailnet", "repos": ["api"],
+                "state": "online", "reason": "", "severity": "unknown",
+            }),
+            "unvalidated_routes": ["/api/machines"],
+        })
+        assert fx.machines()[0]["severity"] == "unknown"
+
+    def test_drive_queue_extra_field_is_rejected(self) -> None:
+        with pytest.raises(FixtureError, match=r"does not match the /api/drive-queue schema"):
+            parse_fixture({
+                "board": {"assignments": []},
+                "drive_queue": [{
+                    "repo_name": "api", "issue_number": 1,
+                    "made_up_field_the_real_row_never_has": True,
+                }],
+            })
+
+    def test_the_committed_fixtures_pass_validation(self) -> None:
+        """The two fixture files this repo ships load cleanly — proves the
+        check itself isn't so strict it rejects real, well-formed fixtures."""
+        load_fixture(FIXTURE_PATH)
+        load_fixture(
+            Path(__file__).parent / "fixtures" / "board-pipeline-terminal-gates.json"
+        )
+
+
 # ── Reads flow through the real serialization ───────────────────────────────
 
 class TestSeededReads:

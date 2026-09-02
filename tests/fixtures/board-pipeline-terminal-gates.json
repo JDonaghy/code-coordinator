@@ -107,18 +107,16 @@
       "host": "precision.tailnet",
       "repos": ["claude-coordinator"],
       "state": "online",
-      "reason": null,
-      "latency_ms": 12,
-      "assignments": {"active": [], "completed": []}
+      "reason": "",
+      "latency_ms": 12
     },
     {
       "name": "dellserver",
       "host": "dellserver.tailnet",
       "repos": ["claude-coordinator"],
       "state": "online",
-      "reason": null,
-      "latency_ms": 8,
-      "assignments": {"active": [], "completed": []}
+      "reason": "",
+      "latency_ms": 8
     }
   ],
 
