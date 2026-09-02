@@ -5089,18 +5089,22 @@ def openapi_spec() -> dict:
                                                         "assignment_id": {"type": "string"},
                                                         "repo_name": {"type": "string"},
                                                         "issue_number": {
-                                                            "type": ["integer", "null"]
+                                                            "type": "integer",
+                                                            "nullable": True,
                                                         },
                                                         "issue_title": {
-                                                            "type": ["string", "null"]
+                                                            "type": "string",
+                                                            "nullable": True,
                                                         },
                                                         "type": {"type": "string"},
                                                         "status": {"type": "string"},
                                                         "dispatched_at": {
-                                                            "type": ["number", "null"]
+                                                            "type": "number",
+                                                            "nullable": True,
                                                         },
                                                         "finished_at": {
-                                                            "type": ["number", "null"]
+                                                            "type": "number",
+                                                            "nullable": True,
                                                         },
                                                     },
                                                     "required": [
