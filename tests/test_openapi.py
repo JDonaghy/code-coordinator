@@ -266,3 +266,71 @@ def test_validate_json_schema_detects_a_deliberate_mismatch() -> None:
     errors = validate_json_schema({"count": "not an int"}, ref, components)
     assert any("missing required property 'name'" in e for e in errors)
     assert any("expected integer" in e for e in errors)
+
+
+def test_validate_json_schema_detects_an_undeclared_extra_field() -> None:
+    """#3050: a payload that invents a field the schema never declared is
+    rejected — the specific failure mode a fixture impersonating a route's
+    shape produces (e.g. a `/api/machines` fixture claiming `severity`,
+    which only `/api/machines/health` actually emits)."""
+    components = {
+        "Widget": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+        }
+    }
+    ref = {"$ref": "#/components/schemas/Widget"}
+    assert validate_json_schema({"name": "a"}, ref, components) == []
+    errors = validate_json_schema({"name": "a", "severity": "unknown"}, ref, components)
+    assert any("unexpected property 'severity'" in e for e in errors)
+
+
+def test_validate_json_schema_check_unknown_properties_can_be_disabled() -> None:
+    components = {"Widget": {"type": "object", "properties": {"name": {"type": "string"}}}}
+    ref = {"$ref": "#/components/schemas/Widget"}
+    assert validate_json_schema(
+        {"name": "a", "extra": 1}, ref, components, check_unknown_properties=False
+    ) == []
+
+
+def test_validate_json_schema_open_object_schema_stays_permissive() -> None:
+    """A bare `{"type": "object"}` (no `properties`) describes a genuinely
+    free-form value — unknown-property checking must not fire on it."""
+    assert validate_json_schema({"anything": 1, "goes": 2}, {"type": "object"}, {}) == []
+
+
+def test_validate_json_schema_check_required_can_be_disabled() -> None:
+    """#3050: fixture-mode payload validation deliberately does not demand
+    field completeness — a fixture may legitimately seed a partial payload
+    to exercise a degraded state."""
+    components = {
+        "Widget": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+    }
+    ref = {"$ref": "#/components/schemas/Widget"}
+    assert validate_json_schema({}, ref, components) != []
+    assert validate_json_schema({}, ref, components, check_required=False) == []
+
+
+def test_validate_json_schema_nullable_sibling_alongside_ref_is_respected() -> None:
+    """Some hand-built dashboard schemas spell an optional nested object as
+    `{**some_ref, "nullable": True}` — a sibling key alongside `$ref` rather
+    than a `nullable` flag on the target itself. `null` must validate."""
+    components = {"Widget": {"type": "object", "properties": {"name": {"type": "string"}}}}
+    schema = {"$ref": "#/components/schemas/Widget", "nullable": True}
+    assert validate_json_schema(None, schema, components) == []
+    assert validate_json_schema({"name": "a"}, schema, components) == []
+
+
+def test_validate_json_schema_type_array_dialect_is_supported() -> None:
+    """`{"type": ["string", "null"]}` (plain JSON Schema dialect, used by a
+    few hand-built dashboard schemas like `session_response`) is accepted
+    alongside this module's own `nullable: true` convention."""
+    schema = {"type": ["string", "null"]}
+    assert validate_json_schema("x", schema, {}) == []
+    assert validate_json_schema(None, schema, {}) == []
+    errors = validate_json_schema(5, schema, {})
+    assert any("expected string" in e for e in errors)

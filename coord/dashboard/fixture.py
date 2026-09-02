@@ -51,8 +51,22 @@ Fixture schema (every key optional except ``board``)::
       "chat_reply":      "canned /api/chat response text",
       "events": [ {"after": 0.25, "type": "board_updated", "data": {}} ],
       "autoplay_events": false,     # play the script at startup too (default: no)
-      "config":  { ...coordinator.yml mapping... }
+      "config":  { ...coordinator.yml mapping... },
+      "unvalidated_routes": []      # opt out of #3050 schema checks, see below
     }
+
+``machines``/``sessions``/``drive_queue``/``machine_metrics``/
+``report_catalogue``/``report_results`` are served verbatim, so at load time
+(#3050) each entry is checked against the dashboard's own OpenAPI schema for
+the route it backs (``coord.dashboard.server.openapi_spec()`` +
+``coord.openapi.validate_json_schema``) — a field the schema never declared,
+or one whose type disagrees with the schema, fails the load loudly, naming
+the route, the file and the field. Missing fields are **not** an error (a
+fixture legitimately seeds a partial payload to exercise a degraded state —
+e.g. an offline machine with no ``latency_ms``). A fixture that must serve a
+knowingly-nonconforming shape for a given route lists that route's path in
+``unvalidated_routes`` (e.g. ``["/api/machines"]``) to skip the check —
+written down in the fixture, not silently bypassed.
 
 The event script does **not** play on startup by default: a timeline racing the
 client's connect is precisely the nondeterminism this whole mode exists to
@@ -397,6 +411,100 @@ def _parse_events(raw: Any) -> list[ScriptedEvent]:
     return events
 
 
+# ── #3050: seeded payloads validated against the route's real schema ────────
+#
+# `machines`/`sessions`/`drive_queue`/`machine_metrics`/`report_catalogue`/
+# `report_results` are served **verbatim** — no `_filter_kwargs`-style
+# reconstruction through a real dataclass the way `merge_queue`/`proposals`
+# above already get (`FixtureServer.merge_queue`/`.proposals`), so nothing
+# stopped a fixture from inventing fields a route's OpenAPI schema never
+# declared and serving them under that route without complaint — see #3050:
+# a fixture claimed `severity`/`hand_paused`/… on `GET /api/machines`, none
+# of which the real handler has ever emitted, and a test asserting against
+# it read as integration coverage while proving nothing about the real
+# server. Each of these sections is checked here, at load time, against the
+# dashboard's own `openapi_spec()` (the same spec `coord/openapi.py`'s
+# `validate_json_schema` already checks the golden `/board` fixture with —
+# `tests/test_openapi.py::test_serve_openapi_board_schema_validates_golden_fixture`)
+# — `check_required=False` because a fixture legitimately seeds a *partial*
+# payload to exercise a degraded state (e.g. an offline machine with no
+# `latency_ms`); what must not happen is a field the schema doesn't know
+# about, or a field whose type disagrees with what the schema declares.
+def _validate_seeded_payloads(server: FixtureServer, *, unvalidated_routes: set[str]) -> None:
+    """Validate every route-backed raw payload on *server* against the
+    dashboard's real OpenAPI schema for that route.
+
+    Raises :class:`FixtureError` naming the route, the fixture file, and the
+    offending field(s) on the first section that fails — loud and at load
+    time, per #3050's ask, rather than a mystery three layers deep in a
+    client render. A fixture opts a specific route out via the top-level
+    ``unvalidated_routes`` array (e.g. ``["/api/machines"]``) — written down
+    in the fixture file itself, not silently skipped.
+    """
+    from coord.dashboard.server import openapi_spec  # noqa: PLC0415 — avoid a server<->fixture import cycle
+    from coord.openapi import validate_json_schema  # noqa: PLC0415
+
+    spec = openapi_spec()
+    components = spec["components"]["schemas"]
+
+    def response_schema(route: str, method: str = "get") -> dict:
+        return spec["paths"][route][method]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]
+
+    def check(section: str, route: str, items: list, item_schema: dict) -> None:
+        if route in unvalidated_routes or not items:
+            return
+        errors: list[str] = []
+        for i, item in enumerate(items):
+            errors.extend(
+                validate_json_schema(
+                    item,
+                    item_schema,
+                    components,
+                    path=f"{section}[{i}]",
+                    check_required=False,
+                )
+            )
+        if errors:
+            where = f" (fixture: {server.path})" if server.path else ""
+            raise FixtureError(
+                f"fixture '{section}' does not match the {route} schema{where}: "
+                + "; ".join(errors[:8])
+                + (f" (+{len(errors) - 8} more)" if len(errors) > 8 else "")
+                + f" — declare {route!r} in 'unvalidated_routes' if this is "
+                "a deliberately non-conforming fixture"
+            )
+
+    check(
+        "machines", "/api/machines", server.machines_raw,
+        {"$ref": "#/components/schemas/MachineRow"},
+    )
+    check(
+        "sessions", "/api/sessions", server.sessions_raw,
+        response_schema("/api/sessions")["items"],
+    )
+    check(
+        "drive_queue", "/api/drive-queue", server.drive_queue_raw,
+        {"$ref": "#/components/schemas/BoardDriveQueueEntry"},
+    )
+    for machine, series in server.machine_metrics_raw.items():
+        check(
+            f"machine_metrics.{machine}", "/api/machines/metrics", series,
+            {"$ref": "#/components/schemas/MachineMetricsSample"},
+        )
+    if server.report_catalogue_raw is not None:
+        check(
+            "report_catalogue", "/api/report",
+            [server.report_catalogue_raw], response_schema("/api/report"),
+        )
+    for report_id, result in server.report_results_raw.items():
+        check(
+            f"report_results.{report_id}", "/api/report/{report_id}",
+            [result], {"$ref": "#/components/schemas/ReportResult"},
+        )
+
+
 def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
     """Validate a decoded fixture mapping into a :class:`FixtureServer`."""
     if not isinstance(raw, dict):
@@ -472,6 +580,15 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
                 f"got {type(series).__name__}"
             )
 
+    unvalidated_routes_raw = _as_list(raw.get("unvalidated_routes"), "unvalidated_routes")
+    for i, entry in enumerate(unvalidated_routes_raw):
+        if not isinstance(entry, str):
+            raise FixtureError(
+                f"fixture 'unvalidated_routes[{i}]' must be a string route path, "
+                f"got {type(entry).__name__}"
+            )
+    unvalidated_routes = set(unvalidated_routes_raw)
+
     server = FixtureServer(
         board_payload=board_payload,
         merge_queue_raw=_as_list(raw.get("merge_queue"), "merge_queue"),
@@ -498,6 +615,7 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
     # than 500 halfway through an acceptance run.
     server.merge_queue()
     server.proposals()
+    _validate_seeded_payloads(server, unvalidated_routes=unvalidated_routes)
     return server
 
 
