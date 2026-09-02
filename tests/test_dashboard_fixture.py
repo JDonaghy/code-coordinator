@@ -361,6 +361,28 @@ class TestSeededReads:
         assert data["summary"]["level"] == "held"
         assert data["summary"] == _client().get("/api/drive-queue").json()["summary"]
 
+    def test_drive_queue_leg_counts_derived_from_seeded_board_assignments(
+        self,
+    ) -> None:
+        """#3060: `leg_counts` in fixture mode has no dedicated fixture key —
+        it is derived from the SAME seeded ``board.assignments`` every other
+        board-derived accessor reads (rule 1, "no parallel fake read path").
+        The committed fixture's `claude-coordinator#4104` has both a `work`
+        and a `review` leg (`work-review-approved` + `rev-review-approved`),
+        which is what proves this is a real per-type count and not a stub."""
+        data = _client().get("/api/drive-queue").json()
+        leg_counts = data["leg_counts"]
+        assert leg_counts["claude-coordinator#4101"] == {"work": 1}
+        assert leg_counts["claude-coordinator#4104"] == {"work": 1, "review": 1}
+
+    def test_drive_queue_leg_counts_unaffected_by_repo_filter(self) -> None:
+        filtered = _client().get(
+            "/api/drive-queue", params={"repo": "quadraui"}
+        ).json()
+        unfiltered = _client().get("/api/drive-queue").json()
+        assert filtered["leg_counts"] == unfiltered["leg_counts"]
+        assert "claude-coordinator#4104" in filtered["leg_counts"]
+
     def test_diff_is_seeded_not_shelled_out(self) -> None:
         client = _client()
         r = client.get("/api/diff/work-review-approved")

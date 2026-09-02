@@ -6939,6 +6939,57 @@ def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
     return [_decode_drive_queue_row(r) for r in rows]
 
 
+def leg_counts() -> dict[str, dict[str, int]]:
+    """All-time per-issue assignment leg counts by type, keyed ``"repo#N"``
+    (#3060) — backs ``GET /api/drive-queue``'s ``leg_counts`` sibling field.
+
+    Unlike ``drive_queue.attempts`` (a relaunch counter on the queue ROW,
+    reset by a relaunch while the fix budget it's meant to track keeps
+    burning — #2972), this counts every dispatched assignment leg for that
+    issue, ALL TIME, and never resets. Spans both ``assignments`` and
+    ``assignments_archive`` — ``coord housekeeping`` MOVES (never deletes)
+    terminal assignments older than the retention window (default 30 days,
+    ``COORD_ARCHIVE_RETENTION_DAYS``) into the archive table, and a
+    long-lived queue entry would otherwise see its early legs silently
+    disappear from the count as they age past that window.
+
+    Routes to the daemon when ``board_service`` is set, else reads the local
+    DB directly — the counts come from the ``assignments`` table, which only
+    exists wherever the DB actually lives, so (unlike a pure computation
+    such as :func:`coord.drive_queue.summarize_drive_queue`) this cannot be
+    satisfied locally by a thin client the way ``_read_drive_queue()`` reads
+    the drive-queue table.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_leg_counts  # noqa: PLC0415
+
+        return fetch_leg_counts(svc)
+    return _leg_counts_local()
+
+
+def _leg_counts_local() -> dict[str, dict[str, int]]:
+    from coord.drive_queue import compute_leg_counts  # noqa: PLC0415
+
+    conn = get_connection()
+    rows: list[tuple[str, int, str]] = []
+    for table in ("assignments", "assignments_archive"):
+        try:
+            result = sql.execute(conn,
+                f"SELECT repo_name, issue_number, type FROM {table}",  # noqa: S608 — constant
+            ).fetchall()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            # Mirrors `_list_issue_numbers_with_assignments_local`: `continue`
+            # goes straight back round the loop on the SAME connection, so on
+            # Postgres a missing `assignments_archive` (the exact case named
+            # below) would otherwise abort the transaction and poison every
+            # later query on this connection (#2983).
+            rollback_after_driver_error(conn, exc)
+            continue  # assignments_archive may not exist yet (housekeeping never ran)
+        rows.extend((r[0], r[1], r[2]) for r in result)
+    return compute_leg_counts(rows)
+
+
 def list_audit_log(
     *,
     since: float | None = None,

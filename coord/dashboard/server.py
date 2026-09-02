@@ -53,7 +53,7 @@ from coord.drive_queue import (
 from coord.models import Assignment
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 from coord.pipeline import PipelineView
-from coord.state import list_drive_queue, load_proposals
+from coord.state import leg_counts, list_drive_queue, load_proposals
 
 logger = logging.getLogger(__name__)
 
@@ -431,11 +431,32 @@ def openapi_spec() -> dict:
     # place (#2096).
     drive_queue_entry_ref = dataclass_schema(BoardDriveQueueEntry, components)
     drive_queue_summary_ref = dataclass_schema(DriveQueueSummary, components)
+    # #3060: `leg_counts` — a THIRD sibling of `entries`/`summary`, not a new
+    # field on `BoardDriveQueueEntry` (see `api_drive_queue`'s docstring for
+    # why: that DTO also doubles as `/board`'s `drive_queue` projection, and
+    # `project_row` silently drops fields the row doesn't carry). Keyed
+    # `"repo#N"`; the inner map is an open `AssignmentType -> count` — no
+    # fixed `{work, review, smoke}` shape, so a new assignment type shows up
+    # without a schema change here.
+    leg_counts_schema = {
+        "type": "object",
+        "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+            "description": "assignment type -> all-time dispatched-leg count",
+        },
+        "description": (
+            "\"repo#issue\" -> {assignment_type: count}. All-time, spans "
+            "`assignments` + `assignments_archive`, and does not reset on a "
+            "drive-queue relaunch (#2972) — see coord.state.leg_counts()."
+        ),
+    }
     drive_queue_response = {
         "type": "object",
         "properties": {
             "entries": {"type": "array", "items": drive_queue_entry_ref},
             "summary": drive_queue_summary_ref,
+            "leg_counts": leg_counts_schema,
         },
     }
     # #2492 RPT-1: the report engine's wire types. `dataclass_schema` walks
@@ -973,7 +994,8 @@ def openapi_spec() -> dict:
                 "summary": (
                     "The `coord drive` work queue in run order, plus a "
                     "server-computed pending/running/waiting/eligible/"
-                    "blocked/held summary (#2428 DQW-1)"
+                    "blocked/held summary (#2428 DQW-1) and all-time "
+                    "per-issue assignment leg counts by type (#3060)"
                 ),
                 "parameters": [
                     {
@@ -987,7 +1009,10 @@ def openapi_spec() -> dict:
                             "to — `fleet_held`/`level` are fleet-wide facts (a "
                             "fleet-scoped fired deploy gate anywhere stops the "
                             "whole tick), so narrowing the summary to one repo "
-                            "could misreport it as clear."
+                            "could misreport it as clear. `leg_counts` is "
+                            "likewise always computed over the FULL history "
+                            "(#3060) — it is keyed `\"repo#issue\"` so a client "
+                            "can still look up counts for the narrowed `entries`."
                         ),
                     }
                 ],
@@ -1638,6 +1663,18 @@ def build_app(
         if _fixture is not None:
             return _fixture.drive_queue()
         return list_drive_queue()
+
+    def _read_leg_counts() -> dict[str, dict[str, int]]:
+        """All-time per-issue assignment leg counts by type (#3060).
+
+        Same fixture-vs-live indirection as ``_read_drive_queue()`` above.
+        Deliberately ALWAYS the full map, never narrowed to ``?repo=`` —
+        mirrors ``summary``: see ``api_drive_queue``'s docstring for why an
+        aggregate over a filtered subset would be a second, divergent answer.
+        """
+        if _fixture is not None:
+            return _fixture.leg_counts()
+        return leg_counts()
 
     def _drive_queue_write(action: str, **fields) -> dict:
         """POST /drive-queue's ``{action, ...fields}`` shape (#2429 DQW-2).
@@ -2298,6 +2335,23 @@ def build_app(
         Queue panel sidebar's pending/running/waiting/eligible/blocked/held
         counts are always fleet-wide, exactly like the TUI's; only the visible
         row list narrows with ``?repo=``.
+
+        ``leg_counts`` (#3060, :func:`coord.state.leg_counts` /
+        :meth:`coord.dashboard.fixture.FixtureServer.leg_counts`) is a THIRD,
+        independent sibling — not a reshaping of ``entries`` or a derivative
+        of ``summary``. It answers a different question ("how many `work` /
+        `review` / `smoke` / ... legs has this issue had, ever") from a
+        different source (the `assignments` table, not `drive_queue`), keyed
+        ``"repo#N"`` so a client can look a visible entry's counts up by its
+        own key. Like ``summary``, it is computed over the FULL queue/history
+        regardless of ``?repo=`` — see :func:`coord.state.leg_counts` for why
+        (all-time, spans the housekeeping archive, must not reset on a
+        drive-queue relaunch per #2972) — and it is NOT added as a field on
+        ``BoardDriveQueueEntry``/``entries`` rows: that DTO is a hand-maintained
+        mirror of the `drive_queue` DDL that also doubles as `/board`'s
+        `drive_queue` projection, and `project_row` silently drops any field
+        the row doesn't carry, so a computed field placed there would vanish
+        on `/board` for every consumer instead of erroring loudly.
         """
         from dataclasses import asdict
 
@@ -2305,7 +2359,11 @@ def build_app(
         rows = _read_drive_queue()
         summary = summarize_drive_queue(entries_from_rows(rows))
         entries = [r for r in rows if r.get("repo_name") == repo] if repo else rows
-        return JSONResponse({"entries": entries, "summary": asdict(summary)})
+        return JSONResponse({
+            "entries": entries,
+            "summary": asdict(summary),
+            "leg_counts": _read_leg_counts(),
+        })
 
     async def api_drive_queue_action(request: Request) -> JSONResponse:
         """POST /api/drive-queue/action — move/remove/unblock/resume a

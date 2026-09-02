@@ -3534,6 +3534,26 @@ def test_serve_drive_queue_bad_requests_are_400(
         assert "position" in bad.json()["error"]
 
 
+def test_serve_leg_counts(tmp_path: Path, valid_config_path: Path, rw_db):
+    """#3060: `GET /leg-counts` — its OWN endpoint, deliberately not folded
+    into `/board` or `/drive-queue` (the source is `assignments`, not
+    `drive_queue`)."""
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type) VALUES ('a-1', 'm', 'api', 1, 't', 'work')"
+    )
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type) VALUES ('a-2', 'm', 'api', 1, 't', 'review')"
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.get("/leg-counts")
+        assert r.status_code == 200
+        assert r.json() == {"api#1": {"work": 1, "review": 1}}
+
+
 def test_serve_drive_queue_enqueue_at_explicit_position(
     tmp_path: Path, valid_config_path: Path, rw_db
 ):

@@ -723,6 +723,29 @@ def fetch_drive_queue(
     return entries if isinstance(entries, list) else []
 
 
+def fetch_leg_counts(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict[str, dict[str, int]]:
+    """GET the daemon's all-time per-issue assignment leg counts (#3060).
+
+    ``{}`` on ANY failure — including a 404 from a daemon predating this
+    route — fail-soft, mirrors :func:`fetch_drive_queue`: a thin client's
+    ``GET /api/drive-queue`` should still render the queue with no leg
+    counts rather than fail outright because the daemon it's pointed at is
+    older than this feature. See :func:`coord.state.leg_counts` for what the
+    returned ``"repo#N" -> {assignment_type: count}`` map actually spans.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/leg-counts", headers=_headers(svc), timeout=timeout
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def fetch_drive_queue_entry(
     svc: ServiceConfig,
     repo_name: str,
