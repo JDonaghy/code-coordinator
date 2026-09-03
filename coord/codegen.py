@@ -235,6 +235,9 @@ SCHEMA_DISPLAY_ORDER: tuple[str, ...] = (
     "PipelineGate",
     "PipelineView",
     "Assignment",
+    "GateAPacket",
+    "GateAApprovalWire",
+    "GateAMockWire",
 )
 
 # (schema name, field name) -> literal TS type, bypassing the mechanical
@@ -274,6 +277,16 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # against the four literal assignments in coord/pipeline.py and tightened
     # here since a JSON Schema `{"type": "string"}` can't express it either.
     ("PipelineStage", "status"): "'active' | 'completed' | 'skipped' | 'waiting'",
+    # coord/gate_a.py GateADecision.state — the five STATE_* constants
+    # (coord/dashboard/server.py GateAPacket.state mirrors decision.state
+    # verbatim, #3069). A JSON Schema `{"type": "string"}` can't express this
+    # either.
+    ("GateAPacket", "state"): (
+        "'approved' | 'missing' | 'stale' | 'changes' | 'exempt'"
+    ),
+    # coord/gate_a.py GateAApproval.verdict — the two VERDICTS a human can
+    # record (`coord gate-a --approved|--changes`).
+    ("GateAApprovalWire", "verdict"): "'approved' | 'changes'",
 }
 
 # Hand-authored wire-contract enums — see module docstring for why these are

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
+import posixpath
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -93,6 +96,149 @@ WEBAPP_DIST = Path(DEFAULT_WEBAPP_DIST).expanduser()
 #: having to recognise the difference by eye.
 WEBAPP_BUNDLE_HEADER = "X-Coord-Webapp-Bundle"
 WEBAPP_BUNDLE_MISSING = "missing"
+
+
+# ── Gate A packet (#3069) ────────────────────────────────────────────────────
+#
+# ``GET /api/gate-a/{repo}/{tracking_issue}`` — the operator-facing
+# counterpart to PDR-3's customer design round
+# (``coord.mock_author.collect_mock_bundle_files``): same bundle assembler,
+# different audience/auth. See ``api_gate_a`` below for the full assembly.
+
+
+@dataclasses.dataclass(frozen=True)
+class GateAMockWire:
+    """One rendered Gate-A mock, self-contained (#3069).
+
+    ``html`` has already had every relatively-linked stylesheet inlined
+    (:func:`inline_mock_stylesheets`) — a mock this DTO carries renders
+    correctly with zero further fetches, which is the whole point: served
+    as the mock-author committed it, coord-portal ms-4's mocks (this
+    issue's reference fixture) link their stylesheet with a path
+    (``../../../../public/tokens.css``) that only resolves inside a
+    checkout, and render unstyled everywhere else.
+    """
+
+    name: str
+    title: str
+    html: str
+
+
+@dataclasses.dataclass(frozen=True)
+class GateAApprovalWire:
+    """Wire shape of :class:`coord.gate_a.GateAApproval` — the recorded
+    human verdict on a Gate-A contract. Present on :class:`GateAPacket`
+    only when a verdict has actually been recorded."""
+
+    verdict: str
+    contract_sha: str
+    tracking_issue: int | None
+    note: str
+    actor: str
+    recorded_at: float
+
+
+@dataclasses.dataclass(frozen=True)
+class GateAPacket:
+    """Everything a human needs to sign off a milestone's Gate-A contract,
+    assembled with no local checkout assumed (#3069) — the response shape
+    of ``GET /api/gate-a/{repo}/{tracking_issue}``.
+
+    ``state``/``ok``/``stale``/``contract_sha``/``reason``/``approval`` are
+    read straight off :func:`coord.gate_a.evaluate` — the SAME decision
+    ``coord gate-a`` prints — never re-derived, so this endpoint cannot
+    disagree with the CLI. ``stale`` is ``state == coord.gate_a.STATE_STALE``
+    spelled out as a plain bool for a client that doesn't want to import
+    the state enum just to ask one question.
+    """
+
+    repo_name: str
+    milestone_number: int
+    milestone_title: str
+    tracking_issue: int
+    tracking_issue_title: str
+    state: str
+    ok: bool
+    stale: bool
+    contract_sha: str
+    reason: str | None
+    approval: GateAApprovalWire | None
+    contract_markdown: str
+    mocks: list[GateAMockWire]
+    mocks_note: str
+
+
+_MOCK_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
+_REL_STYLESHEET_RE = re.compile(r'rel\s*=\s*["\']stylesheet["\']', re.IGNORECASE)
+_HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def extract_mock_title(mock_html: str, *, fallback: str) -> str:
+    """The mock's own ``<title>`` text, whitespace-collapsed to one line —
+    the same extraction ``scripts/gen_mock_index.py`` uses for its nav
+    labels (not imported from there: that script is not part of the
+    installed package, see ``coord/codegen.py``'s docstring for the same
+    "scripts/ isn't in the wheel" reasoning). Falls back to *fallback*
+    (normally the mock's filename) when there is no ``<title>`` tag.
+    """
+    match = _MOCK_TITLE_RE.search(mock_html)
+    if not match:
+        return fallback
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    return title or fallback
+
+
+def _is_relative_href(href: str) -> bool:
+    return not href.startswith(("http://", "https://", "//", "data:"))
+
+
+def inline_mock_stylesheets(
+    mock_html: str, *, repo_github: str, branch: str, mock_repo_path: str
+) -> str:
+    """Rewrite every relatively-linked ``<link rel="stylesheet">`` in
+    *mock_html* into an inline ``<style>`` block (#3069).
+
+    coord-portal ms-4's mocks link their repo stylesheet relatively, e.g.
+    ``href="../../../../public/tokens.css"`` — a path that resolves inside a
+    checkout and nowhere else. Served as-is, the mock renders unstyled: a
+    working endpoint shipping a broken deliverable. This fetches the
+    referenced stylesheet off the SAME branch via the GitHub Contents API
+    (no local checkout — the same posture
+    :func:`coord.mock_author.collect_mock_bundle_files` already uses) and
+    inlines it, so a mock this has processed renders correctly with no
+    further fetches.
+
+    *mock_repo_path* is the mock's own repo-relative path (e.g.
+    ``tests/acceptance/ms-4/mocks/home.html``) — a relative ``href``
+    resolves against its directory, the same way a browser would resolve
+    it. An absolute (``http(s)://``, ``//``, ``data:``) href, or one that
+    fails to fetch, is left untouched rather than raising — a best-effort
+    inline beats a crashed endpoint, and an absolute href is already
+    fetchable by the client directly.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    mock_dir = posixpath.dirname(mock_repo_path)
+
+    def _replace(match: "re.Match[str]") -> str:
+        tag = match.group(0)
+        if not _REL_STYLESHEET_RE.search(tag):
+            return tag
+        href_match = _HREF_RE.search(tag)
+        if href_match is None:
+            return tag
+        href = href_match.group(1)
+        if not _is_relative_href(href):
+            return tag
+        resolved = posixpath.normpath(posixpath.join(mock_dir, href))
+        try:
+            css = github_ops.get_repo_file(repo_github, resolved, branch)
+        except RuntimeError:
+            return tag
+        return f"<style>\n{css}\n</style>"
+
+    return _LINK_TAG_RE.sub(_replace, mock_html)
 
 
 def webapp_bundle_missing_message(dist_path: Path) -> str:
@@ -628,6 +774,10 @@ def openapi_spec() -> dict:
         },
         "required": ["submission_id", "question_revision", "question"],
     }
+    # #3069: GET /api/gate-a/{repo}/{tracking_issue} — plain `dataclass_schema`
+    # walks (real dataclasses, unlike the hand-built shapes above) since the
+    # handler literally returns `dataclasses.asdict(GateAPacket(...))`.
+    gate_a_packet_ref = dataclass_schema(GateAPacket, components)
     # #3027: the four `/api/machines*` endpoints (#3021-#3026) went out
     # carrying a bare `{"200": {"description": "OK"}}` stub — every other
     # surface here has a real `content` schema, this milestone's own
@@ -1393,6 +1543,46 @@ def openapi_spec() -> dict:
                         "description": (
                             "revision is not the submission's current open "
                             "question"
+                        )
+                    },
+                },
+            }
+        },
+        "/api/gate-a/{repo}/{tracking_issue}": {
+            "get": {
+                "summary": (
+                    "#3069: a milestone's Gate-A packet — live sign-off "
+                    "state, identity, contract.md, and every rendered mock, "
+                    "self-contained"
+                ),
+                "description": (
+                    "Built on the same coord.mock_author."
+                    "collect_mock_bundle_files assembler PDR-3's customer "
+                    "design round uses (#2508), and the same coord.gate_a."
+                    "evaluate() decision `coord gate-a` prints — this "
+                    "endpoint cannot disagree with the CLI. Every mock's "
+                    "relatively-linked stylesheet is inlined at assembly "
+                    "time, so it renders standalone with no further "
+                    "fetches. No local checkout is assumed anywhere in "
+                    "this path."
+                ),
+                "parameters": [
+                    _dashboard_path_param("repo", "repo name (coordinator.yml)"),
+                    _dashboard_path_param(
+                        "tracking_issue", "the milestone's tracking issue number"
+                    ),
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": gate_a_packet_ref}
+                        },
+                    },
+                    "404": {
+                        "description": (
+                            "Unknown repo/issue, or the tracking issue has "
+                            "no milestone"
                         )
                     },
                 },
@@ -3528,6 +3718,171 @@ def build_app(
 
         return JSONResponse({"entry": _serialize_ledger_entry(entry)})
 
+    async def api_gate_a(request: Request) -> JSONResponse:
+        """GET /api/gate-a/{repo}/{tracking_issue} — a milestone's Gate-A
+        packet, assembled with no local checkout assumed (#3069).
+
+        Live gate state is read through :func:`coord.gate_a.evaluate` — the
+        approval fed to it comes off :func:`coord.client.fetch_gate_a_approval`
+        when this dashboard is a thin client (``board_service`` configured),
+        or :func:`coord.state.get_gate_a_approval` directly otherwise — same
+        daemon-vs-local split every other stateful read in this file uses
+        (see e.g. ``_read_drive_queue``). The contract text is fetched the
+        same way ``coord gate-a`` fetches it
+        (:func:`coord.acceptance.gate_a_contract_candidates`, trying each
+        #2896 candidate root in turn), so this endpoint reads the identical
+        bytes the CLI hashes and can never disagree with what it prints.
+
+        Mocks come from :func:`coord.mock_author.collect_mock_bundle_files`
+        — the same assembler PDR-3's customer-facing design round uses
+        (#2508) — gated through :func:`coord.mock_author.
+        resolve_viewable_mock_glob` so a non-browser-viewable driver (e.g.
+        ``tui-tuidriver``'s ``.screen`` fixtures) degrades to an empty
+        ``mocks`` list with ``mocks_note`` explaining why, rather than
+        returning unrenderable content. Every HTML mock is run through
+        :func:`inline_mock_stylesheets` first — see that function's
+        docstring for why a mock is not renderable as committed.
+        """
+        repo_name = request.path_params["repo"]
+        try:
+            tracking_issue = int(request.path_params["tracking_issue"])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "tracking_issue must be an integer"}, status_code=404
+            )
+
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            return JSONResponse(
+                {"error": f"unknown repo {repo_name!r}"}, status_code=404
+            )
+
+        from coord import github_ops  # noqa: PLC0415
+
+        try:
+            issue_data = github_ops.get_issue(repo_cfg.github, tracking_issue)
+        except RuntimeError as e:
+            return JSONResponse(
+                {"error": f"could not fetch {repo_name}#{tracking_issue}: {e}"},
+                status_code=404,
+            )
+        if not issue_data or issue_data.get("number") != tracking_issue:
+            return JSONResponse(
+                {"error": f"unknown issue {repo_name}#{tracking_issue}"},
+                status_code=404,
+            )
+
+        milestone = issue_data.get("milestone") or None
+        if not milestone:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"{repo_name}#{tracking_issue} has no milestone — "
+                        "Gate A is a milestone-level gate, so there is "
+                        "nothing to sign off on"
+                    )
+                },
+                status_code=404,
+            )
+        milestone_number = int(milestone["number"])
+        milestone_title = str(milestone.get("title") or "")
+
+        from coord.acceptance import gate_a_contract_candidates, ms_dirname  # noqa: PLC0415
+
+        contract_text: str | None = None
+        for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
+            try:
+                contract_text = github_ops.get_repo_file(
+                    repo_cfg.github, path, branch=repo_cfg.default_branch
+                )
+                break
+            except RuntimeError:
+                continue
+
+        from coord import board_service  # noqa: PLC0415
+        from coord import gate_a as gate_a_mod  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import fetch_gate_a_approval  # noqa: PLC0415
+
+            approval_raw = fetch_gate_a_approval(svc, repo_cfg.name, milestone_number)
+        else:
+            from coord import state  # noqa: PLC0415
+
+            approval_raw = state.get_gate_a_approval(
+                repo_name=repo_cfg.name, milestone_number=milestone_number
+            )
+
+        decision = gate_a_mod.evaluate(
+            repo_name=repo_cfg.name,
+            milestone_number=milestone_number,
+            contract_text=contract_text,
+            approval=approval_raw,
+        )
+
+        from coord import mock_author  # noqa: PLC0415
+
+        mock_glob, mocks_note = mock_author.resolve_viewable_mock_glob(
+            config.acceptance, repo_cfg.name
+        )
+        mocks: list[GateAMockWire] = []
+        if mock_glob:
+            bundle = mock_author.collect_mock_bundle_files(
+                repo_cfg.github, milestone_number, repo_cfg.default_branch, mock_glob
+            )
+            ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
+            for rel_path in sorted(p for p in bundle if p.startswith("mocks/")):
+                name = rel_path[len("mocks/"):]
+                mock_html = inline_mock_stylesheets(
+                    bundle[rel_path],
+                    repo_github=repo_cfg.github,
+                    branch=repo_cfg.default_branch,
+                    mock_repo_path=f"{ms_dir}/{rel_path}",
+                )
+                mocks.append(
+                    GateAMockWire(
+                        name=name,
+                        title=extract_mock_title(mock_html, fallback=name),
+                        html=mock_html,
+                    )
+                )
+            # collect_mock_bundle_files reads the legacy repo-root
+            # contract.md path only (no #2896 multi-root search) — a
+            # fallback for the rare milestone every candidate above missed
+            # but that path still has.
+            if contract_text is None:
+                contract_text = bundle.get("contract.md")
+
+        approval_wire = None
+        if decision.approval is not None:
+            approval_wire = GateAApprovalWire(
+                verdict=decision.approval.verdict,
+                contract_sha=decision.approval.contract_sha,
+                tracking_issue=decision.approval.tracking_issue,
+                note=decision.approval.note,
+                actor=decision.approval.actor,
+                recorded_at=decision.approval.recorded_at,
+            )
+
+        packet = GateAPacket(
+            repo_name=repo_cfg.name,
+            milestone_number=milestone_number,
+            milestone_title=milestone_title,
+            tracking_issue=tracking_issue,
+            tracking_issue_title=str(issue_data.get("title") or ""),
+            state=decision.state,
+            ok=decision.ok,
+            stale=decision.state == gate_a_mod.STATE_STALE,
+            contract_sha=decision.contract_sha,
+            reason=decision.reason,
+            approval=approval_wire,
+            contract_markdown=contract_text or "",
+            mocks=mocks,
+            mocks_note=mocks_note,
+        )
+        return JSONResponse(dataclasses.asdict(packet))
+
     async def terminal_ws(websocket: WebSocket) -> None:
         """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
 
@@ -3657,6 +4012,7 @@ def build_app(
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         Route("/api/portal/needs-input", api_portal_needs_input, methods=["GET"]),
         Route("/api/portal/answer", api_portal_answer, methods=["POST"]),
+        Route("/api/gate-a/{repo}/{tracking_issue}", api_gate_a, methods=["GET"]),
         build_events_route(event_source),
         WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]
