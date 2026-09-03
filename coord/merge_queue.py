@@ -7634,6 +7634,17 @@ def prune_stale_queue_entries(dry_run: bool = False) -> list["QueuedMerge"]:
     :func:`coord.github_ops.pr_is_merged`, both of which **fail-open**
     (return ``False`` on any ``gh`` error) so a transient GitHub/CLI failure
     never silently prunes a live entry.
+
+    #3063: gated by :func:`coord.models.trust_issue_closed_for` on the
+    entry's own ``assignment_type`` (populated at enqueue time, #1077) —
+    the same carve-out `enqueue_approved_work` already applies on the way
+    in (#2639). A test-author/mock-author entry's `issue_number` is the
+    milestone's *tracking* issue, not this row's own deliverable, so a
+    closed tracking epic is not evidence THIS row's branch landed. Without
+    this gate, this sweep deleted the queue row the instant the epic
+    closed — undoing enqueue's carve-out and feeding an infinite
+    enqueue -> open PR -> close PR (reconcile.close_stale_prs) -> prune
+    loop.
     """
     from coord import github_ops  # noqa: PLC0415
 
@@ -7647,7 +7658,9 @@ def prune_stale_queue_entries(dry_run: bool = False) -> list["QueuedMerge"]:
             continue
 
         is_stale = False
-        if github_ops.issue_is_closed(entry.repo_github, entry.issue_number):
+        if trust_issue_closed_for(entry.assignment_type) and github_ops.issue_is_closed(
+            entry.repo_github, entry.issue_number
+        ):
             is_stale = True
         elif entry.branch and github_ops.pr_is_merged(entry.repo_github, entry.branch):
             is_stale = True

@@ -737,6 +737,54 @@ def test_stale_pr_closed_when_issue_is_closed(monkeypatch, config) -> None:
     assert any("close PR #99" in s and "issue #42 is closed" in s for s in actions)
 
 
+def test_stale_pr_not_closed_for_mock_author_on_closed_tracking_epic(
+    monkeypatch, config,
+) -> None:
+    """#3063 repro: a mock-author row's PR head branch is named after the
+    milestone's *tracking* issue (#122), not its own deliverable — a closed
+    tracking epic must not read as "this PR's work landed" (#2639's
+    carve-out, applied here via the board-derived assignment type). Before
+    this fix, close_stale_prs used a bare `issue_is_closed` with no
+    carve-out, closing this PR every tick even though its own branch never
+    merged — feeding the enqueue -> open -> close -> prune -> re-enqueue
+    loop from the live coord-portal#122 incident."""
+    prs = [{"number": 201, "headRefName": "issue-122-mock"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=False
+    )
+
+    a = _done_work(assignment_id="mock-row", issue_number=122, branch="issue-122-mock")
+    a.type = "mock-author"
+    board = Board(completed=[a])
+
+    actions = close_stale_prs(config, board=board)
+
+    assert closed == []
+    assert not any("close PR" in s for s in actions)
+
+
+def test_stale_pr_closed_for_mock_author_once_its_own_branch_merges(
+    monkeypatch, config,
+) -> None:
+    """Counterpart to the repro above: the carve-out doesn't wedge the PR
+    open forever — once THIS row's own branch is confirmed merged (not just
+    the tracking epic closed), the PR is still closed via the
+    branch_is_fully_merged fallback."""
+    prs = [{"number": 202, "headRefName": "issue-122-mock"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=True
+    )
+
+    a = _done_work(assignment_id="mock-row", issue_number=122, branch="issue-122-mock")
+    a.type = "mock-author"
+    board = Board(completed=[a])
+
+    actions = close_stale_prs(config, board=board)
+
+    assert ("acme/api", 202) in closed
+    assert any("close PR #202" in s and "already on" in s for s in actions)
+
+
 def test_stale_pr_closed_when_branch_fully_merged(monkeypatch, config) -> None:
     """A PR whose branch is fully on the default branch must be closed."""
     prs = [{"number": 77, "headRefName": "issue-10-feature"}]
