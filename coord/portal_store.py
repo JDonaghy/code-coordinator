@@ -776,6 +776,23 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
             payload={"revision": row.revision},
             now=stamp,
         )
+    elif row.kind == "preview":
+        # #3071: `enqueue-preview`'s apply path — the moment a customer can
+        # actually open the preview, which is the one worth putting on the
+        # timeline (a queued-but-unpushed row is not a published preview).
+        # Same "outside the `with conn:` block" reasoning as the question
+        # branch above, and idempotent on this row's own id
+        # (:func:`outbox_source_key`) so a retried apply cannot duplicate it.
+        preview_url = str(row.fields.get("preview_url", ""))
+        append_ledger_entry(
+            row.submission_id,
+            LEDGER_KIND_PREVIEW_PUBLISHED,
+            text=preview_url,
+            actor="coord",
+            source_event_id=outbox_source_key(row.id),
+            payload={"preview_url": preview_url, "revision": row.revision},
+            now=stamp,
+        )
 
 
 def _round_number(fields: dict[str, Any]) -> int:
@@ -1851,10 +1868,49 @@ LEDGER_KIND_OPERATOR_NOTE = "operator_note"
 #: visible, in the order they were recorded.
 LEDGER_KIND_ANSWER_CONFIRMED = "answer_confirmed"
 
+#: #3071: the RUN kinds — the moments a submission's timeline is made of that
+#: the ledger was always meant to carry but nothing ever wrote. Each is
+#: appended at the point the transition already happens (no new tick, no new
+#: polling): ``status_changed`` / ``work_started`` / ``work_shipped`` from
+#: :func:`coord.portal_sync._fold_status_for_link`'s enqueueing arm,
+#: ``design_round_published`` from
+#: :func:`coord.portal_sync.push_design_round_bundle` (the shared tail of
+#: ``coord portal publish-mocks`` and PDR-3's merge hook),
+#: ``preview_published`` from :func:`mark_applied`'s ``preview`` branch, and
+#: ``signoff_recorded`` from :func:`coord.portal_sync._ledger_signoff_events`.
+#: Same append-only contract as every other kind — a correction is a new row.
+LEDGER_KIND_STATUS_CHANGED = "status_changed"
+LEDGER_KIND_DESIGN_ROUND_PUBLISHED = "design_round_published"
+LEDGER_KIND_SIGNOFF_RECORDED = "signoff_recorded"
+LEDGER_KIND_PREVIEW_PUBLISHED = "preview_published"
+LEDGER_KIND_WORK_STARTED = "work_started"
+LEDGER_KIND_WORK_SHIPPED = "work_shipped"
+
 #: Marks a ledger ``actor`` as a human at coord's CLI rather than the portal
 #: wire, so a later session can tell operator-relayed context from something
 #: the client actually wrote. See :func:`operator_actor`.
 OPERATOR_ACTOR_PREFIX = "operator:"
+
+
+def outbox_source_key(row_id: int) -> str:
+    """The synthetic ``source_event_id`` for a ledger row derived from an
+    outbox row rather than a pulled portal event (#3071).
+
+    ``portal_ledger``'s ``UNIQUE(submission_id, kind, source_event_id)``
+    is what makes :func:`append_ledger_entry` idempotent, and it only
+    actually dedupes rows that HAVE a source id (SQL's NULL != NULL — see
+    the ``CREATE TABLE`` comment in :mod:`coord.db`). The #3071 run kinds
+    are derived from an outbox row, which has no ``portal_events.event_id``
+    of its own, so they borrow that constraint with a stable, namespaced key
+    built from the outbox row's primary key: replaying the same transition
+    (a retried push, a re-run backfill, a daemon that crashed between the
+    outbox write and this append) is then a harmless no-op instead of a
+    duplicate timeline entry.
+
+    Namespaced (``outbox:``) so it can never collide with a real portal
+    ``event_id``, which is what the same column holds for a pulled-event row.
+    """
+    return f"outbox:{int(row_id)}"
 
 #: #2986: how an out-of-band answer actually reached the operator —
 #: ``coord portal answer --source``. Recorded in the ledger row's
@@ -2016,6 +2072,31 @@ def ledger_for_submission(submission_id: str) -> list[LedgerEntry]:
         (submission_id,),
     ).fetchall()
     return [_ledger_from_row(r) for r in rows]
+
+
+def ledgered_source_event_ids(kind: str) -> set[tuple[str, str]]:
+    """Every ``(submission_id, source_event_id)`` already ledgered under
+    *kind* (#3071).
+
+    The cheap pre-filter for an idempotent backfill sweep:
+    :func:`append_ledger_entry` is already idempotent per row, but a caller
+    walking N events every tick would pay one SELECT per event to discover
+    that all N are old news. One indexed read answers it for the whole batch
+    instead — see :func:`coord.portal_sync._ledger_signoff_events`, which is
+    the reason this exists.
+
+    Rows with a NULL ``source_event_id`` are excluded: they are the ones the
+    ``UNIQUE(submission_id, kind, source_event_id)`` constraint deliberately
+    does not dedupe (SQL's NULL != NULL — see the ``CREATE TABLE`` comment in
+    :mod:`coord.db`), so reporting them as "already present" would be a lie.
+    """
+    rows = sql.execute(
+        _conn(),
+        "SELECT submission_id, source_event_id FROM portal_ledger "
+        "WHERE kind = ? AND source_event_id IS NOT NULL",
+        (kind,),
+    ).fetchall()
+    return {(r["submission_id"], r["source_event_id"]) for r in rows}
 
 
 def ledger_entry_wire(entry: LedgerEntry) -> dict[str, Any]:
@@ -2910,4 +2991,423 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
             for d in archived_decisions
         ],
         "narrative": narrative.text if narrative else "",
+    }
+
+
+# ── layer 4b: the journal (#3071) ───────────────────────────────────────────
+#
+# `render_ledger_payload` above answers "what does a fresh session need to
+# know" — a briefing, keyed by Q&A pairs and decisions, deliberately unordered
+# in time. This one answers the OTHER question, the one a client asks and a
+# screen-share needs: "what happened to my project, in order." Same tables,
+# different fold: one flat, timestamped, oldest-first list.
+#
+# It joins four sources that until now never met — the four an operator had to
+# assemble by hand:
+#
+#   1. `portal_ledger` — the run kinds this issue started writing, plus the
+#      Q&A history that was already there.
+#   2. `portal_outbox` — applied design_round / preview rows. Present because
+#      the ledger kinds are new: a submission that published its design round
+#      BEFORE this shipped has no `design_round_published` row and never will
+#      (the ledger has no UPDATE path and backfilling one would be a fiction).
+#      Deduped against the ledger on the same `outbox_source_key`, so once the
+#      ledger does carry the moment this source contributes nothing.
+#   3. `portal_events` — sign-off verdicts, same reasoning as (2): every
+#      verdict pulled before `_ledger_signoff_events` existed is only in the
+#      inbox. Deduped on the event's own `event_id`.
+#   4. `audit_log`, `tier="business"` — dispatch and merge. Never mirrored
+#      into the ledger: those are BOARD transitions, not portal-observed
+#      facts, and the ledger's ownership rule (see this module's docstring)
+#      is that it holds what coord observed on the portal seam.
+#
+# Never raises. Every source is read inside its own try/except and a failure
+# becomes a string in `gaps` — a hole in the timeline, never an exception into
+# a caller. That is the same posture the rest of the portal path takes, and it
+# is load-bearing here: this is a read a client is watching over your
+# shoulder, and half a timeline beats a traceback.
+
+#: Categories of `audit_log` row the journal folds in — dispatch and merge,
+#: the two the issue names. Deliberately narrow: the audit trail also carries
+#: test/review/gate rows, which are pipeline noise at the altitude a client
+#: reads this at.
+_JOURNAL_AUDIT_EVENT_TYPES = ("dispatched", "merged")
+
+#: The wire `source` for each half of the join, so a renderer (and #3071's
+#: explicitly-out-of-scope coord-web panel, which must be built against the
+#: SHIPPED shape) can tell a ledgered fact from a derived one.
+JOURNAL_SOURCE_LEDGER = "ledger"
+JOURNAL_SOURCE_OUTBOX = "outbox"
+JOURNAL_SOURCE_EVENT = "portal_event"
+JOURNAL_SOURCE_AUDIT = "audit"
+
+
+def _journal_url(value: Any) -> str | None:
+    """*value* if it is URL-shaped, else ``None``.
+
+    `--json`'s pinned contract is that ``artifact`` is "null or a URL"
+    (#3071), so anything that is not one — most importantly a bare R2 object
+    key like ``bundles/sub-001/r1.tar``, which is what
+    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` returns —
+    must not be smuggled into that field. The raw pointer still travels, in
+    the entry's ``details``; only ``artifact`` is contract-bound.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if "://" not in candidate:
+        return None
+    scheme = candidate.split("://", 1)[0]
+    if not scheme or not scheme[0].isalpha():
+        return None
+    if not all(c.isalnum() or c in "+-." for c in scheme):
+        return None
+    return candidate
+
+
+def _journal_entry(
+    *,
+    ts: float,
+    kind: str,
+    actor: str,
+    text: str,
+    artifact: Any = None,
+    source: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One timeline entry in the pinned `--json` shape.
+
+    Every entry has ``ts``/``kind``/``actor``/``text``/``artifact`` — the five
+    #3071 pins as "stable enough to render against" — plus ``source`` and
+    ``details`` for anything a richer surface wants. Built in one place so the
+    four folds below cannot drift into four near-identical shapes.
+    """
+    try:
+        stamp = float(ts)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    return {
+        "ts": stamp,
+        "kind": str(kind or ""),
+        "actor": str(actor or ""),
+        "text": str(text or ""),
+        "artifact": _journal_url(artifact),
+        "source": source,
+        "details": details or {},
+    }
+
+
+#: How a ledger row's own ``payload`` names the artifact for its kind. Read in
+#: order; the first URL-shaped hit wins.
+_JOURNAL_ARTIFACT_KEYS = ("bundle_url", "preview_url", "url", "pr_url", "bundle_key")
+
+
+def _journal_artifact(payload: Mapping[str, Any]) -> Any:
+    for key in _JOURNAL_ARTIFACT_KEYS:
+        value = payload.get(key)
+        if _journal_url(value) is not None:
+            return value
+    return None
+
+
+def _journal_from_ledger(entries: list[LedgerEntry]) -> list[dict[str, Any]]:
+    return [
+        _journal_entry(
+            ts=entry.recorded_at,
+            kind=entry.kind,
+            actor=entry.actor or "coord",
+            text=entry.text,
+            artifact=_journal_artifact(entry.payload),
+            source=JOURNAL_SOURCE_LEDGER,
+            details={
+                "seq": entry.seq,
+                "question_revision": entry.question_revision,
+                **{k: v for k, v in entry.payload.items() if k != "event"},
+            },
+        )
+        for entry in entries
+    ]
+
+
+def _journal_from_outbox(
+    submission_id: str, ledgered: set[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    """Timeline entries for design rounds and previews the ledger doesn't
+    carry — see this section's comment for why that set is non-empty."""
+    derived: list[dict[str, Any]] = []
+    for row in outbox_for_submission(submission_id):
+        if row.state != STATE_APPLIED:
+            continue
+        key = outbox_source_key(row.id)
+        if row.kind == "design_round":
+            if (LEDGER_KIND_DESIGN_ROUND_PUBLISHED, key) in ledgered:
+                continue
+            design = row.fields.get("design_round")
+            design = design if isinstance(design, dict) else {}
+            bundle_key = design.get("bundle_key") or ""
+            derived.append(
+                _journal_entry(
+                    ts=row.sent_at if row.sent_at is not None else row.enqueued_at,
+                    kind=LEDGER_KIND_DESIGN_ROUND_PUBLISHED,
+                    actor="coord",
+                    text=design_round_text(_round_number(row.fields), bundle_key),
+                    artifact=design.get("bundle_url") or bundle_key,
+                    source=JOURNAL_SOURCE_OUTBOX,
+                    details={
+                        "round": _round_number(row.fields),
+                        "bundle_key": bundle_key,
+                        "seq": row.seq,
+                    },
+                )
+            )
+        elif row.kind == "preview":
+            if (LEDGER_KIND_PREVIEW_PUBLISHED, key) in ledgered:
+                continue
+            preview_url = str(row.fields.get("preview_url", ""))
+            derived.append(
+                _journal_entry(
+                    ts=row.sent_at if row.sent_at is not None else row.enqueued_at,
+                    kind=LEDGER_KIND_PREVIEW_PUBLISHED,
+                    actor="coord",
+                    text=preview_url,
+                    artifact=preview_url,
+                    source=JOURNAL_SOURCE_OUTBOX,
+                    details={"preview_url": preview_url, "seq": row.seq},
+                )
+            )
+    return derived
+
+
+def design_round_text(round_number: int, bundle_key: str) -> str:
+    """The one-line description of a published design round, shared by the
+    ledger writer (:func:`coord.portal_sync.push_design_round_bundle`) and
+    the outbox-derived fallback above so the two read identically."""
+    suffix = f" (bundle {bundle_key})" if bundle_key else ""
+    return f"design round R{round_number} published{suffix}"
+
+
+def _journal_from_signoffs(
+    submission_id: str, ledgered: set[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    """Timeline entries for sign-off verdicts the ledger doesn't carry yet."""
+    from coord.portal_sync import (  # noqa: PLC0415 — avoid an import cycle
+        _normalize_verdict,
+        _signoff_comment,
+        _signoff_verdict,
+    )
+
+    derived: list[dict[str, Any]] = []
+    for event in events_for_submission(submission_id):
+        if (LEDGER_KIND_SIGNOFF_RECORDED, event.event_id) in ledgered:
+            continue
+        verdict = _signoff_verdict(event)
+        if verdict is None:
+            continue
+        derived.append(
+            _journal_entry(
+                ts=event.received_at,
+                kind=LEDGER_KIND_SIGNOFF_RECORDED,
+                actor="customer",
+                text=signoff_text(_normalize_verdict(verdict), _signoff_comment(event)),
+                source=JOURNAL_SOURCE_EVENT,
+                details={
+                    "verdict": _normalize_verdict(verdict),
+                    "event_id": event.event_id,
+                },
+            )
+        )
+    return derived
+
+
+def signoff_text(verdict: str, comment: str) -> str:
+    """The one-line description of a recorded sign-off — shared by
+    :func:`coord.portal_sync._ledger_signoff_events` and the event-derived
+    fallback above so the ledgered and derived forms read identically."""
+    return f"sign-off: {verdict}" + (f" — {comment}" if comment else "")
+
+
+def journal_issue_numbers(submission_id: str, link: "PortalLink | None") -> list[int]:
+    """Which issue numbers count as "this submission's work" (#3071).
+
+    An issue-scoped link (#2665) names exactly one. A milestone-scoped link
+    names none directly — a :class:`PortalLink` carries only the milestone
+    number — and resolving the milestone's members off GitHub is a live API
+    call this read deliberately does not make (it must never raise, and must
+    stay fast enough to run mid-screen-share). So it reads the set coord
+    already told the CUSTOMER about: the ``decomposition`` in every design
+    round pushed for this submission, which
+    :func:`coord.mock_author.build_design_round` builds from the tracking
+    issue's ``## Work order`` block.
+
+    Returns ``[]`` when nothing is resolvable — which the caller renders as a
+    gap ("no audit rows folded"), never as the whole repo's history, because
+    a repo hosting two submissions would otherwise show each client the
+    other's dispatches.
+    """
+    if link is None:
+        return []
+    if link.issue_number is not None:
+        return [link.issue_number]
+    numbers: set[int] = set()
+    for row in outbox_for_submission(submission_id):
+        if row.kind != "design_round":
+            continue
+        design = row.fields.get("design_round")
+        if not isinstance(design, dict):
+            continue
+        for node in design.get("decomposition") or ():
+            if not isinstance(node, Mapping):
+                continue
+            value = node.get("issue_number")
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                numbers.add(value)
+    return sorted(numbers)
+
+
+def _journal_from_audit(
+    link: "PortalLink | None", issue_numbers: list[int]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Dispatch + merge rows from the business tier of the audit trail.
+
+    ``--tier business`` is exactly the right filter and the split exists for
+    this (#3071): the operational tier is daemon-tick housekeeping, which is
+    not what "what is happening with my project" means.
+    """
+    from coord.state import list_audit_log  # noqa: PLC0415 — avoid an import cycle
+
+    if link is None or not issue_numbers:
+        return [], []
+    entries: list[dict[str, Any]] = []
+    gaps: list[str] = []
+    for issue_number in issue_numbers:
+        try:
+            page = list_audit_log(
+                repo=link.repo_name, issue=issue_number, tier="business", limit=200
+            )
+        except Exception as exc:  # noqa: BLE001 — an unreadable audit row is a gap, not a crash
+            gaps.append(
+                f"audit trail unreadable for {link.repo_name}#{issue_number}: {exc}"
+            )
+            continue
+        for row in page.get("entries") or []:
+            if str(row.get("event_type") or "") not in _JOURNAL_AUDIT_EVENT_TYPES:
+                continue
+            details = row.get("details")
+            details = details if isinstance(details, dict) else {}
+            entries.append(
+                _journal_entry(
+                    ts=row.get("ts") or 0.0,
+                    kind=str(row.get("event_type") or ""),
+                    actor=str(row.get("actor") or "coordinator"),
+                    text=str(row.get("summary") or ""),
+                    artifact=details.get("pr_url"),
+                    source=JOURNAL_SOURCE_AUDIT,
+                    details={
+                        "repo": row.get("repo"),
+                        "issue": row.get("issue"),
+                        "machine": row.get("machine"),
+                        "assignment_id": row.get("assignment_id"),
+                    },
+                )
+            )
+    return entries, gaps
+
+
+def render_journal_payload(submission_id: str) -> dict[str, Any]:
+    """One ordered, timestamped narrative of *submission_id*, intake to
+    shipped (#3071) — what ``coord journal`` renders.
+
+    **Never raises.** A missing link, an unreadable audit row, an absent
+    source: each degrades to an entry in ``gaps`` and a hole in the timeline.
+    An unknown or unlinked submission comes back as an empty ``entries`` list
+    and is not an error — a submission coord has simply not done anything
+    with yet has an empty run, which is a true answer.
+
+    The returned shape is the one #3071 pins for renderers (the coord-web
+    panel and the customer-facing view are explicitly follow-ups, and must be
+    built against THIS, not an assumed contract — coord-web has had three
+    incidents of the latter, most recently coord-web#84)::
+
+        {"submission_id", "link", "gaps": [str],
+         "entries": [{"ts", "kind", "actor", "text", "artifact",
+                      "source", "details"}]}
+
+    ``entries`` is oldest-first. ``artifact`` is ``None`` or a URL — never a
+    bare object key (see :func:`_journal_url`).
+    """
+    gaps: list[str] = []
+
+    try:
+        ledger = ledger_for_submission(submission_id)
+    except Exception as exc:  # noqa: BLE001 — a gap in the timeline, never a raise
+        _log.warning("journal: ledger read failed for %s", submission_id, exc_info=True)
+        gaps.append(f"ledger unreadable: {exc}")
+        ledger = []
+
+    ledgered = {
+        (e.kind, e.source_event_id) for e in ledger if e.source_event_id
+    }
+    entries = _journal_from_ledger(ledger)
+
+    for label, fold in (
+        ("outbox", lambda: _journal_from_outbox(submission_id, ledgered)),
+        ("sign-off events", lambda: _journal_from_signoffs(submission_id, ledgered)),
+    ):
+        try:
+            entries.extend(fold())
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "journal: %s read failed for %s", label, submission_id, exc_info=True
+            )
+            gaps.append(f"{label} unreadable: {exc}")
+
+    try:
+        link = get_link_by_submission(submission_id)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("journal: link read failed for %s", submission_id, exc_info=True)
+        gaps.append(f"portal link unreadable: {exc}")
+        link = None
+    if link is None:
+        gaps.append(
+            f"no repo/milestone linked to {submission_id} — dispatch and merge "
+            "events are not in this timeline (`coord portal link`)"
+        )
+        issue_numbers: list[int] = []
+    else:
+        try:
+            issue_numbers = journal_issue_numbers(submission_id, link)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "journal: issue resolution failed for %s", submission_id, exc_info=True
+            )
+            gaps.append(f"linked issues unresolvable: {exc}")
+            issue_numbers = []
+        if not issue_numbers:
+            gaps.append(
+                f"no issue numbers resolvable for {link.repo_name} "
+                f"ms-{link.milestone_number} — dispatch and merge events are not "
+                "in this timeline (a design round with a `## Work order` "
+                "decomposition is what names them)"
+            )
+
+    try:
+        audit_entries, audit_gaps = _journal_from_audit(link, issue_numbers)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("journal: audit read failed for %s", submission_id, exc_info=True)
+        audit_entries, audit_gaps = [], [f"audit trail unreadable: {exc}"]
+    entries.extend(audit_entries)
+    gaps.extend(audit_gaps)
+
+    # Oldest first, with `kind` breaking a tie so a fold that stamps several
+    # rows with the same `now` (the status fold queues `status_changed` and
+    # `work_shipped` on one call) still orders deterministically rather than
+    # shuffling between runs — a renderer diffing two reads must not see churn.
+    entries.sort(key=lambda e: (e["ts"], e["kind"]))
+    return {
+        "submission_id": submission_id,
+        "link": link.to_dict() if link is not None else None,
+        "gaps": gaps,
+        "entries": entries,
     }

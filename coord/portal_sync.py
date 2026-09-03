@@ -418,6 +418,15 @@ def push_design_round_bundle(
 
     Returns ``(bundle_key, row)`` — the R2 object key the portal assigned
     the bundle, and the outbox row now queued for it.
+
+    #3071: also appends the ``design_round_published`` ledger row for this
+    round. Here rather than in either caller precisely because this IS the
+    shared tail — one write covers both the on-demand ``coord portal
+    publish-mocks`` and PDR-3's merge-triggered auto-push, so the timeline
+    cannot show a round published one way but not the other. Ledgering
+    failure is swallowed (logged only): the round has genuinely been uploaded
+    and queued by this point, and losing the timeline entry must not turn a
+    successful publish into a raised error in a merge hook.
     """
     from coord.mock_author import build_design_round  # noqa: PLC0415
 
@@ -430,6 +439,25 @@ def push_design_round_bundle(
         round_number=round_number,
     )
     row = enqueue_design_round(submission_id, design_round, config=config, now=now)
+    try:
+        portal_store.append_ledger_entry(
+            submission_id,
+            portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED,
+            text=portal_store.design_round_text(round_number, bundle_key),
+            actor="coord",
+            source_event_id=portal_store.outbox_source_key(row.id),
+            payload={
+                "round": round_number,
+                "bundle_key": bundle_key,
+                "milestone_title": milestone_title,
+            },
+            now=now,
+        )
+    except Exception:  # noqa: BLE001 — a lost timeline row must not fail a real publish
+        logger.warning(
+            "portal sync: could not ledger design round for %s", submission_id,
+            exc_info=True,
+        )
     return bundle_key, row
 
 
@@ -1068,7 +1096,63 @@ def _fold_status_for_link(
         return StatusFoldResult(
             link.submission_id, status, f"refused: {exc}", failed=True,
         )
+    _ledger_status_change(link.submission_id, status, row, now=now)
     return StatusFoldResult(link.submission_id, status, "queued", row=row)
+
+
+#: #3071: the two folded statuses that are also RUN milestones in their own
+#: right, and the ledger kind each one lands as alongside its `status_changed`
+#: row. `planned` is deliberately absent: "we have written down what we are
+#: going to do" is the absence of a milestone, not one.
+_WORK_LEDGER_KINDS = {
+    STATUS_IN_PROGRESS: portal_store.LEDGER_KIND_WORK_STARTED,
+    STATUS_SHIPPED: portal_store.LEDGER_KIND_WORK_SHIPPED,
+}
+
+
+def _ledger_status_change(
+    submission_id: str,
+    status: str,
+    row: "portal_store.OutboxRow",
+    *,
+    now: float | None = None,
+) -> None:
+    """Ledger one folded status change, plus its run milestone if it has one
+    (#3071).
+
+    Called from :func:`_fold_status_for_link`'s **enqueueing** arm only — the
+    "unchanged since last push" arm above returns before reaching here, which
+    is the whole point: the churn guard exists so an unchanged fold does not
+    re-notify the customer, and a timeline that logged one row per tick
+    saying "still in progress" would be exactly the same failure in a
+    different surface.
+
+    Idempotent on the queued row's own id (:func:`coord.portal_store.
+    outbox_source_key`), so a replay cannot double up. Never raises: a lost
+    timeline row must not make a successfully-queued status look failed —
+    :class:`StatusFoldResult` promises the caller (a merge, a daemon tick)
+    that this whole path never raises.
+    """
+    kinds = [portal_store.LEDGER_KIND_STATUS_CHANGED]
+    work_kind = _WORK_LEDGER_KINDS.get(status)
+    if work_kind is not None:
+        kinds.append(work_kind)
+    for kind in kinds:
+        try:
+            portal_store.append_ledger_entry(
+                submission_id,
+                kind,
+                text=status,
+                actor="coord",
+                source_event_id=portal_store.outbox_source_key(row.id),
+                payload={"status": status, "revision": row.revision},
+                now=now,
+            )
+        except Exception:  # noqa: BLE001 — a lost timeline row is not a failed fold
+            logger.warning(
+                "portal sync: could not ledger %s for %s", kind, submission_id,
+                exc_info=True,
+            )
 
 
 def sync_submission_statuses(
@@ -1221,6 +1305,11 @@ def sync_tick(
     # for a portal-side problem.
     verdicts_consumed = 0
     try:
+        # #3071: put every sign-off on the submission's ledger before acting
+        # on it, so the timeline records what the customer decided whether or
+        # not it was actionable (an `approved` verdict dispatches nothing).
+        # Idempotent and inside the SAME phase — no new tick, no new polling.
+        _ledger_signoff_events(now=now)
         verdicts_consumed, verdict_errors = _consume_verdicts(config, now=now)
         errors.extend(verdict_errors)
     except Exception as exc:  # noqa: BLE001
@@ -1628,6 +1717,62 @@ _VERDICT_SEPARATOR_RE = re.compile(r"[-\s]+")
 
 def _normalize_verdict(verdict: str) -> str:
     return _VERDICT_SEPARATOR_RE.sub("_", verdict.strip().lower()).strip("_")
+
+
+def _ledger_signoff_events(*, now: float | None = None) -> int:
+    """Ledger every sign-off verdict in the inbox that isn't on the ledger
+    yet (#3071); return how many rows were appended.
+
+    Written here, at the one place :func:`coord.portal_store.signoff_events`
+    is consumed on the sync path, rather than inside
+    :func:`_consume_verdicts`' watermark walk. Two reasons, and the second is
+    the load-bearing one:
+
+    * ``_consume_verdicts`` requires a *config* to dispatch against and is a
+      deliberate no-op without one; ledgering an observed fact needs no repo
+      topology at all.
+    * That walk is watermarked. On every existing install the watermark has
+      already moved past the sign-offs that happened before this shipped, so
+      a row hung off it would ledger nothing for exactly the submissions an
+      operator most wants a timeline for. This walks the whole (small — one
+      row per design round a customer has ever ruled on) sign-off set and is
+      idempotent, so history lands on the first tick after upgrade and every
+      tick after that is a single indexed read and no writes.
+
+    Not a new tick and not new polling: it runs inside :func:`sync_tick`'s
+    existing verdict phase, over events an earlier phase already pulled.
+    Never raises — a ledger write failure is logged and the rest of the batch
+    continues, same per-item isolation as every other consumer here.
+    """
+    already = portal_store.ledgered_source_event_ids(
+        portal_store.LEDGER_KIND_SIGNOFF_RECORDED
+    )
+    appended = 0
+    for event in portal_store.signoff_events():
+        if (event.submission_id, event.event_id) in already:
+            continue
+        verdict = _signoff_verdict(event)
+        if verdict is None:
+            continue
+        normalized = _normalize_verdict(verdict)
+        try:
+            portal_store.append_ledger_entry(
+                event.submission_id,
+                portal_store.LEDGER_KIND_SIGNOFF_RECORDED,
+                text=portal_store.signoff_text(normalized, _signoff_comment(event)),
+                actor="customer",
+                source_event_id=event.event_id,
+                payload={"verdict": normalized, "event": event.payload},
+                now=now if now is not None else event.received_at,
+            )
+        except Exception:  # noqa: BLE001 — one bad row must not stop the batch
+            logger.warning(
+                "portal sync: could not ledger sign-off %s", event.event_id,
+                exc_info=True,
+            )
+            continue
+        appended += 1
+    return appended
 
 
 def _consume_verdicts(
