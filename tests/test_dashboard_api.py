@@ -17,7 +17,7 @@ from unittest.mock import patch
 import pytest
 from starlette.testclient import TestClient
 
-from coord.config import Config
+from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
 from coord.dashboard.server import build_app, openapi_spec
 from coord.models import Assignment, Board, Machine, Repo
 from coord.openapi import validate_json_schema
@@ -1607,5 +1607,267 @@ class TestMachinesEndpointsMatchOpenApiSpec:
         assert r.status_code == 503
         spec = openapi_spec()
         schema = self._schema_for(spec, "/api/machines/metrics", status="503")
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+
+# ── GET /api/gate-a/{repo}/{tracking_issue} (#3069) ─────────────────────────
+
+
+def _gate_a_config(driver: AcceptanceDriverConfig | None = None) -> Config:
+    drivers = {"portal": driver} if driver is not None else {}
+    return Config(
+        repos=[Repo(name="portal", github="acme/portal", default_branch="main")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["portal"])],
+        acceptance=AcceptanceConfig(drivers=drivers),
+    )
+
+
+def _gate_a_client(driver: AcceptanceDriverConfig | None = None) -> TestClient:
+    return TestClient(build_app(_gate_a_config(driver)))
+
+
+def _fake_get_repo_file(files: dict[str, str]):
+    def fn(repo, path, branch="develop"):
+        if path in files:
+            return files[path]
+        raise RuntimeError(f"gh: 404 not found: {path}")
+
+    return fn
+
+
+def _fake_list_repo_dir(names_by_path: dict[str, list[str]]):
+    def fn(repo, path, branch):
+        return names_by_path.get(path, [])
+
+    return fn
+
+
+def _fake_repo_file_exists(files: dict[str, str]):
+    def fn(repo, path, branch):
+        return path in files
+
+    return fn
+
+
+def _issue_with_milestone(number: int, milestone_number: int, milestone_title: str):
+    def fn(repo, n):
+        return {
+            "number": n,
+            "title": f"tracking issue {n}",
+            "milestone": {"number": milestone_number, "title": milestone_title},
+        }
+
+    return fn
+
+
+class TestGateAPacketAPI:
+    """#3069: `GET /api/gate-a/{repo}/{tracking_issue}` — the operator-facing
+    Gate-A packet. Every test drives the real ``coord.gate_a.evaluate`` /
+    ``coord.mock_author.collect_mock_bundle_files`` machinery through faked
+    GitHub Contents API reads (``github_ops.get_issue`` /
+    ``get_repo_file`` / ``list_repo_dir`` / ``repo_file_exists``) — never a
+    re-implementation of the gate decision, mirroring how ``coord gate-a``
+    itself reads.
+    """
+
+    def test_unknown_repo_returns_clean_404(self) -> None:
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/nonexistent/1")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_unknown_issue_returns_clean_404(self, monkeypatch) -> None:
+        from coord import github_ops
+
+        def _raise(repo, n):
+            raise RuntimeError("gh: issue not found")
+
+        monkeypatch.setattr(github_ops, "get_issue", _raise)
+
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/portal/999")
+
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_tracking_issue_without_milestone_returns_404(self, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_issue",
+            lambda repo, n: {"number": n, "title": "t", "milestone": None},
+        )
+
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/portal/5")
+
+        assert r.status_code == 404
+
+    def test_signed_off_contract_reports_not_stale_with_recorded_sha(
+        self, rw_db, monkeypatch
+    ) -> None:
+        from coord import gate_a, github_ops, state
+
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "Design round 4")
+        )
+        contract = "# Contract\n\nSome pinned surface text.\n"
+        monkeypatch.setattr(
+            github_ops, "get_repo_file",
+            _fake_get_repo_file({"tests/acceptance/ms-4/contract.md": contract}),
+        )
+        sha = gate_a.contract_digest(contract)
+        record = gate_a.make_record(
+            repo_name="portal", milestone_number=4, verdict=gate_a.VERDICT_APPROVED,
+            contract_sha=sha, tracking_issue=122, actor="jane",
+        )
+        state.save_gate_a_approval(record.to_dict())
+
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/portal/122")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "approved"
+        assert body["ok"] is True
+        assert body["stale"] is False
+        assert body["contract_sha"] == sha
+        assert body["contract_markdown"] == contract
+        assert body["milestone_number"] == 4
+        assert body["milestone_title"] == "Design round 4"
+        assert body["approval"]["actor"] == "jane"
+        assert body["approval"]["verdict"] == "approved"
+
+    def test_amendment_after_signoff_reports_stale(self, rw_db, monkeypatch) -> None:
+        from coord import gate_a, github_ops, state
+
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "Design round 4")
+        )
+        old_contract = "# Contract v1\n"
+        new_contract = "# Contract v2 — amended\n"
+        monkeypatch.setattr(
+            github_ops, "get_repo_file",
+            _fake_get_repo_file({"tests/acceptance/ms-4/contract.md": new_contract}),
+        )
+        old_sha = gate_a.contract_digest(old_contract)
+        record = gate_a.make_record(
+            repo_name="portal", milestone_number=4, verdict=gate_a.VERDICT_APPROVED,
+            contract_sha=old_sha, tracking_issue=122, actor="jane",
+        )
+        state.save_gate_a_approval(record.to_dict())
+
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/portal/122")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "stale"
+        assert body["stale"] is True
+        assert body["contract_sha"] == gate_a.contract_digest(new_contract)
+        # The approval on file is still surfaced — a human can see WHAT was
+        # approved even though it no longer matches the live contract.
+        assert body["approval"]["contract_sha"] == old_sha
+
+    def test_mocks_render_standalone_with_inlined_stylesheet_and_title(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """coord-portal ms-4's mocks link their stylesheet relatively
+        (``../../../../public/tokens.css`` from
+        ``tests/acceptance/ms-4/mocks/<name>.html``, four levels up to the
+        repo root) — a path that only resolves in a checkout. This pins
+        that the endpoint inlines it so the mock is self-contained."""
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "Design round 4")
+        )
+        mock_html = (
+            "<html><head><title>Home — Active</title>"
+            '<link rel="stylesheet" href="../../../../public/tokens.css">'
+            "</head><body>Hi</body></html>"
+        )
+        files = {
+            "tests/acceptance/ms-4/contract.md": "# Contract",
+            "tests/acceptance/ms-4/mocks/home.html": mock_html,
+            "public/tokens.css": "body { color: red; }",
+        }
+        monkeypatch.setattr(github_ops, "get_repo_file", _fake_get_repo_file(files))
+        monkeypatch.setattr(
+            github_ops, "repo_file_exists", _fake_repo_file_exists(files)
+        )
+        monkeypatch.setattr(
+            github_ops, "list_repo_dir",
+            _fake_list_repo_dir({"tests/acceptance/ms-4/mocks": ["home.html"]}),
+        )
+
+        driver = AcceptanceDriverConfig(kind="web-playwright", mock="*.html")
+        client = _gate_a_client(driver)
+        r = client.get("/api/gate-a/portal/122")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["mocks"]) == 1
+        mock = body["mocks"][0]
+        assert mock["name"] == "home.html"
+        assert mock["title"] == "Home — Active"
+        # No further fetch needed to render it: the stylesheet is inlined,
+        # the <link> is gone.
+        assert "<link" not in mock["html"]
+        assert "<style>" in mock["html"]
+        assert "color: red" in mock["html"]
+
+    def test_no_viewable_driver_yields_empty_mocks_with_a_reason(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """A repo with no acceptance driver configured (or a non-browser-
+        viewable one, e.g. tui-tuidriver's `.screen` fixtures) must not
+        crash or guess `*.html` — it degrades to an empty, explained mocks
+        list (#3068's `resolve_viewable_mock_glob`)."""
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "Design round 4")
+        )
+        monkeypatch.setattr(
+            github_ops, "get_repo_file",
+            _fake_get_repo_file({"tests/acceptance/ms-4/contract.md": "# Contract"}),
+        )
+
+        client = _gate_a_client()  # no driver configured
+        r = client.get("/api/gate-a/portal/122")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["mocks"] == []
+        assert body["mocks_note"] != ""
+
+    def test_response_matches_its_openapi_schema(self, rw_db, monkeypatch) -> None:
+        from coord import gate_a, github_ops, state
+
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "Design round 4")
+        )
+        contract = "# Contract\n"
+        monkeypatch.setattr(
+            github_ops, "get_repo_file",
+            _fake_get_repo_file({"tests/acceptance/ms-4/contract.md": contract}),
+        )
+        sha = gate_a.contract_digest(contract)
+        record = gate_a.make_record(
+            repo_name="portal", milestone_number=4, verdict=gate_a.VERDICT_APPROVED,
+            contract_sha=sha, tracking_issue=122, actor="jane",
+        )
+        state.save_gate_a_approval(record.to_dict())
+
+        client = _gate_a_client()
+        r = client.get("/api/gate-a/portal/122")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/gate-a/{repo}/{tracking_issue}"]["get"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"]
         errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
         assert errors == [], errors
