@@ -1098,7 +1098,13 @@ def _mock_bundle_dir(
     return repo_dir
 
 
-def _config_with_repo_path(tmp_path, repo_dir) -> str:
+def _config_with_repo_path(tmp_path, repo_dir, *, driver_mock_glob: str = "*.html") -> str:
+    """#3068: the acceptance driver is part of this fixture now — `publish-mocks`
+    resolves ``acceptance.drivers.<repo>.mock`` to decide which fixtures are
+    "the mocks" and whether they're browser-viewable at all. The default
+    ``*.html`` is the `web-playwright` shape every pre-#3068 test here
+    implicitly assumed; pass ``*.screen`` for a `tui-tuidriver` repo.
+    """
     path = tmp_path / "coordinator.yml"
     path.write_text(textwrap.dedent(f"""
         repos:
@@ -1110,6 +1116,12 @@ def _config_with_repo_path(tmp_path, repo_dir) -> str:
             repos: [coord]
             repo_paths:
               coord: {repo_dir}
+        acceptance:
+          drivers:
+            coord:
+              kind: web-playwright
+              run: npx playwright test
+              mock: "{driver_mock_glob}"
         portal:
           enabled: true
           base_url: https://intake.heurontech.com
@@ -1228,6 +1240,85 @@ def test_publish_mocks_errors_when_bundle_is_empty(tmp_path, monkeypatch):
     result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
     assert result.exit_code != 0
     assert "nothing to publish" in result.output
+
+
+def test_publish_mocks_refuses_a_non_browser_viewable_driver_glob(
+    tmp_path, monkeypatch
+):
+    """#3068: a `tui-tuidriver` repo's mocks are `.screen` text grids — the
+    on-demand CLI must refuse, not publish `contract.md` alone and print a
+    green `published:` line.
+
+    This is the sibling path of the merge-triggered auto-push and used to be
+    the untested half of the bug: `contract.md` on its own is a *truthy*
+    bundle, so the `if not files:` "nothing to publish" guard never fired
+    and the customer got a design round with tens of kilobytes of contract
+    prose and zero viewable screens.
+    """
+    from coord import portal_store
+
+    repo_dir = tmp_path / "repo"
+    bundle_dir = repo_dir / "tests" / "acceptance" / "ms-9"
+    (bundle_dir / "mocks").mkdir(parents=True)
+    (bundle_dir / "contract.md").write_text("# contract\n")
+    (bundle_dir / "mocks" / "tabbar-wide-labels.screen").write_text("┌── tabs ──┐\n")
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir, driver_mock_glob="*.screen")
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    def _explode(*a, **k):  # pragma: no cover — asserts we never get here
+        raise AssertionError("must not upload a bundle with no viewable mock")
+
+    monkeypatch.setattr("httpx.post", _explode)
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "not browser-viewable" in result.output
+    assert "*.screen" in result.output
+    # the green success line, which the pre-fix code printed here
+    assert "published:" not in result.output
+    assert portal_store.outbox_for_submission("sub_1") == []
+
+
+def test_publish_mocks_refuses_when_repo_has_no_acceptance_driver(
+    tmp_path, monkeypatch
+):
+    """#3068: with no `acceptance.drivers.<repo>` on file there is no glob to
+    resolve, so there is no way to know whether what's under `mocks/` is
+    viewable. Guessing `*.html` is exactly what shipped the mock-less design
+    round; refuse loudly and name the config key instead."""
+    from coord import portal_store
+
+    repo_dir = _mock_bundle_dir(tmp_path, milestone_number=9)
+    path = tmp_path / "coordinator.yml"
+    path.write_text(textwrap.dedent(f"""
+        repos:
+          - name: coord
+            github: owner/coord
+        machines:
+          - name: dellserver
+            host: dellserver
+            repos: [coord]
+            repo_paths:
+              coord: {repo_dir}
+        portal:
+          enabled: true
+          base_url: https://intake.heurontech.com
+          bridge_client_id: id-123
+          bridge_client_secret: secret-456
+    """))
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    result = run("portal", "publish-mocks", "--config", str(path), "coord", "3")
+    assert result.exit_code != 0
+    assert "no acceptance driver configured" in result.output
+    assert "acceptance.drivers.coord.mock" in result.output
+    assert portal_store.outbox_for_submission("sub_1") == []
 
 
 def test_publish_mocks_errors_on_non_utf8_mock_file(tmp_path, monkeypatch):

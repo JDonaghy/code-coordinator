@@ -686,6 +686,96 @@ def test_collect_mock_bundle_files_uses_the_repos_own_driver_glob(monkeypatch):
     }
 
 
+# ── resolve_viewable_mock_glob (#3068) ───────────────────────────────────
+
+
+def _acceptance(**drivers):
+    from coord.config import AcceptanceConfig
+
+    return AcceptanceConfig(drivers=drivers)
+
+
+def _driver(**kw):
+    from coord.config import AcceptanceDriverConfig
+
+    return AcceptanceDriverConfig(**kw)
+
+
+def test_resolve_viewable_mock_glob_accepts_a_flat_html_driver():
+    glob, reason = mock_author.resolve_viewable_mock_glob(
+        _acceptance(api=_driver(kind="web-playwright", mock="*.html")), "api"
+    )
+    assert (glob, reason) == ("*.html", "")
+
+
+def test_resolve_viewable_mock_glob_rejects_a_text_grid_driver():
+    """The bug itself: quadraui's `.screen` mocks are not something a
+    customer can open in a browser, so no design round should be built from
+    them at all."""
+    glob, reason = mock_author.resolve_viewable_mock_glob(
+        _acceptance(quadraui=_driver(kind="tui-tuidriver", mock="*.screen")), "quadraui"
+    )
+    assert glob is None
+    assert "not browser-viewable" in reason
+    assert "*.screen" in reason
+
+
+def test_resolve_viewable_mock_glob_rejects_an_unconfigured_repo():
+    glob, reason = mock_author.resolve_viewable_mock_glob(_acceptance(), "api")
+    assert glob is None
+    assert "no acceptance driver configured" in reason
+
+
+def test_resolve_viewable_mock_glob_rejects_a_missing_acceptance_section():
+    """`None` (no `acceptance:` block in coordinator.yml at all) is the same
+    answer as an unknown repo, not an exception."""
+    glob, reason = mock_author.resolve_viewable_mock_glob(None, "api")
+    assert glob is None
+    assert "no acceptance driver configured" in reason
+
+
+def test_resolve_viewable_mock_glob_resolves_agreeing_routes():
+    """#1125 routing: `driver_for` alone returns None without a path, but a
+    milestone has no single path to give. Routes that all declare the same
+    viewable glob answer the question unambiguously."""
+    glob, reason = mock_author.resolve_viewable_mock_glob(
+        _acceptance(
+            api=_driver(
+                routes=[
+                    _driver(match="web/**", kind="web-playwright", mock="*.html"),
+                    _driver(match="admin/**", kind="web-playwright", mock="*.html"),
+                ]
+            )
+        ),
+        "api",
+    )
+    assert (glob, reason) == ("*.html", "")
+
+
+def test_resolve_viewable_mock_glob_refuses_disagreeing_routes():
+    glob, reason = mock_author.resolve_viewable_mock_glob(
+        _acceptance(
+            api=_driver(
+                routes=[
+                    _driver(match="web/**", kind="web-playwright", mock="*.html"),
+                    _driver(match="tui/**", kind="tui-tuidriver", mock="*.screen"),
+                ]
+            )
+        ),
+        "api",
+    )
+    assert glob is None
+    assert "different mock globs" in reason
+
+
+def test_mock_matches_glob_is_case_insensitive():
+    """#2513's `SCREEN.HTML` case-insensitivity survived being generalised
+    from a `.suffix` check to a driver glob."""
+    assert mock_author.mock_matches_glob("SCREEN.HTML", "*.html")
+    assert mock_author.mock_matches_glob("screen.html", "*.HTML")
+    assert not mock_author.mock_matches_glob("notes.txt", "*.html")
+
+
 # ── build_design_round (PDR-3, #2508) ────────────────────────────────────
 
 
