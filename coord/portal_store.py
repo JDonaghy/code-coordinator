@@ -3120,9 +3120,15 @@ def _journal_from_ledger(entries: list[LedgerEntry]) -> list[dict[str, Any]]:
             artifact=_journal_artifact(entry.payload),
             source=JOURNAL_SOURCE_LEDGER,
             details={
+                # `payload` first, typed columns second: a row whose free-form
+                # payload happens to carry its own "seq" must not be able to
+                # shadow the ledger's actual sequence number. `event` (the raw
+                # portal envelope a pulled-event row keeps verbatim) is dropped
+                # — it is the whole original event, not a detail of this
+                # moment, and re-nesting it here would double every payload.
+                **{k: v for k, v in entry.payload.items() if k != "event"},
                 "seq": entry.seq,
                 "question_revision": entry.question_revision,
-                **{k: v for k, v in entry.payload.items() if k != "event"},
             },
         )
         for entry in entries
@@ -3342,7 +3348,7 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
     try:
         ledger = ledger_for_submission(submission_id)
     except Exception as exc:  # noqa: BLE001 — a gap in the timeline, never a raise
-        _log.warning("journal: ledger read failed for %s", submission_id, exc_info=True)
+        _log.debug("journal: ledger read failed for %s", submission_id, exc_info=True)
         gaps.append(f"ledger unreadable: {exc}")
         ledger = []
 
@@ -3358,7 +3364,7 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
         try:
             entries.extend(fold())
         except Exception as exc:  # noqa: BLE001
-            _log.warning(
+            _log.debug(
                 "journal: %s read failed for %s", label, submission_id, exc_info=True
             )
             gaps.append(f"{label} unreadable: {exc}")
@@ -3366,7 +3372,7 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
     try:
         link = get_link_by_submission(submission_id)
     except Exception as exc:  # noqa: BLE001
-        _log.warning("journal: link read failed for %s", submission_id, exc_info=True)
+        _log.debug("journal: link read failed for %s", submission_id, exc_info=True)
         gaps.append(f"portal link unreadable: {exc}")
         link = None
     if link is None:
@@ -3379,7 +3385,7 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
         try:
             issue_numbers = journal_issue_numbers(submission_id, link)
         except Exception as exc:  # noqa: BLE001
-            _log.warning(
+            _log.debug(
                 "journal: issue resolution failed for %s", submission_id, exc_info=True
             )
             gaps.append(f"linked issues unresolvable: {exc}")
@@ -3395,7 +3401,7 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
     try:
         audit_entries, audit_gaps = _journal_from_audit(link, issue_numbers)
     except Exception as exc:  # noqa: BLE001
-        _log.warning("journal: audit read failed for %s", submission_id, exc_info=True)
+        _log.debug("journal: audit read failed for %s", submission_id, exc_info=True)
         audit_entries, audit_gaps = [], [f"audit trail unreadable: {exc}"]
     entries.extend(audit_entries)
     gaps.extend(audit_gaps)
