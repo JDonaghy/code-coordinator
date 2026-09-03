@@ -29,6 +29,7 @@ approving v1 must not silently approve v2.
 from __future__ import annotations
 
 import getpass
+import logging
 import sys
 from pathlib import Path
 
@@ -36,6 +37,8 @@ import click
 
 from coord import gate_a as gate_a_mod
 from coord.commands._common import _CONFIG_OPTION, _load_config
+
+log = logging.getLogger(__name__)
 
 
 def _actor() -> str:
@@ -74,6 +77,11 @@ def _pending_amend_lines(repo_cfg, tracking_issue: int) -> list[str]:
             ),
         )
     except Exception:  # noqa: BLE001 — best-effort enrichment only
+        # #3065 review: silent-but-logged, not silent-and-invisible — a
+        # real bug in this path (vs. a transient no-daemon/no-`gh`
+        # condition) should leave a trace somewhere, even though it must
+        # never fail the read itself.
+        log.debug("pending-amend enrichment failed for #%s", tracking_issue, exc_info=True)
         return []
     return gate_a_mod.summarise_pending_amends(pending)
 
