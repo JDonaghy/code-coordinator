@@ -637,7 +637,7 @@ def test_collect_mock_bundle_files_reads_contract_and_html_mocks(monkeypatch):
 
     monkeypatch.setattr(github_ops, "get_repo_file", _get_repo_file)
 
-    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main")
+    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main", "*.html")
 
     assert files == {
         "contract.md": "content of tests/acceptance/ms-9/contract.md",
@@ -655,9 +655,35 @@ def test_collect_mock_bundle_files_empty_when_nothing_rendered_yet(monkeypatch):
         lambda repo, path, branch: (_ for _ in ()).throw(RuntimeError("404 not found")),
     )
 
-    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main")
+    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main", "*.html")
 
     assert files == {}
+
+
+def test_collect_mock_bundle_files_uses_the_repos_own_driver_glob(monkeypatch):
+    """#3068: a `tui-tuidriver` repo renders `.screen` mocks, not `.html` —
+    the collector must gather THOSE when given that driver's glob, not
+    silently drop them the way the old hardcoded `.html` check did."""
+    monkeypatch.setattr(
+        github_ops, "repo_file_exists",
+        lambda repo, path, branch: path.endswith("contract.md"),
+    )
+    monkeypatch.setattr(
+        github_ops, "list_repo_dir",
+        lambda repo, path, branch: ["tabbar-wide-labels.screen", "notes.txt"],
+    )
+    monkeypatch.setattr(
+        github_ops, "get_repo_file", lambda repo, path, branch: f"content of {path}",
+    )
+
+    files = mock_author.collect_mock_bundle_files("acme/quadraui", 11, "main", "*.screen")
+
+    assert files == {
+        "contract.md": "content of tests/acceptance/ms-11/contract.md",
+        "mocks/tabbar-wide-labels.screen": (
+            "content of tests/acceptance/ms-11/mocks/tabbar-wide-labels.screen"
+        ),
+    }
 
 
 # ── build_design_round (PDR-3, #2508) ────────────────────────────────────

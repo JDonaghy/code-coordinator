@@ -1785,7 +1785,12 @@ class TestDesignRoundPushOnMerge:
         return Board(active=[], completed=list(completed or []))
 
     @staticmethod
-    def _config(*, portal_enabled: bool = True, gate_design_rounds: bool = True):
+    def _config(
+        *,
+        portal_enabled: bool = True,
+        gate_design_rounds: bool = True,
+        driver_mock_glob: str | None = "*.html",
+    ):
         """A minimal config-like object carrying only what
         `_maybe_push_design_round` and the ordinary merge-gate defaults
         read — same "build the smallest _Cfg that satisfies the gate
@@ -1794,9 +1799,16 @@ class TestDesignRoundPushOnMerge:
         *gate_design_rounds* is #2903's draft gate: True (the shipped
         default) holds the auto-pushed round for an operator, False is the
         pre-#2903 straight-to-`pending` behaviour.
+
+        *driver_mock_glob* (#3068) seeds `acceptance.drivers["api"].mock` —
+        the default `"*.html"` mirrors a `web-playwright` repo, the common
+        case every pre-#3068 test here implicitly assumed. `None` omits the
+        driver entirely (an unconfigured-acceptance repo).
         """
         from coord.config import (
             DEFAULT_PORTAL_APPROVAL,
+            AcceptanceConfig,
+            AcceptanceDriverConfig,
             PortalApprovalConfig,
             PortalConfig,
         )
@@ -1804,6 +1816,7 @@ class TestDesignRoundPushOnMerge:
         @dataclass
         class _Cfg:
             portal: PortalConfig = field(default_factory=PortalConfig)
+            acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
 
         cfg = _Cfg()
         cfg.portal = PortalConfig(
@@ -1815,6 +1828,14 @@ class TestDesignRoundPushOnMerge:
                 kinds={**DEFAULT_PORTAL_APPROVAL, "design_round": gate_design_rounds}
             ),
         )
+        if driver_mock_glob is not None:
+            cfg.acceptance = AcceptanceConfig(
+                drivers={
+                    "api": AcceptanceDriverConfig(
+                        kind="web-playwright", run="npx playwright test", mock=driver_mock_glob,
+                    )
+                }
+            )
         return cfg
 
     def _link(self, submission_id: str = "sub_1", milestone_number: int = 9) -> None:
@@ -1878,7 +1899,7 @@ class TestDesignRoundPushOnMerge:
 
         monkeypatch.setattr(
             "coord.mock_author.collect_mock_bundle_files",
-            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+            lambda repo_github, milestone_number, branch, driver_mock_glob: {"contract.md": "# contract"},
         )
         seen_upload = {}
 
@@ -1920,7 +1941,7 @@ class TestDesignRoundPushOnMerge:
 
         monkeypatch.setattr(
             "coord.mock_author.collect_mock_bundle_files",
-            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+            lambda repo_github, milestone_number, branch, driver_mock_glob: {"contract.md": "# contract"},
         )
         monkeypatch.setattr(
             "httpx.post",
@@ -1946,7 +1967,7 @@ class TestDesignRoundPushOnMerge:
         cfg = self._config()
         monkeypatch.setattr(
             "coord.mock_author.collect_mock_bundle_files",
-            lambda repo_github, milestone_number, branch: {},
+            lambda repo_github, milestone_number, branch, driver_mock_glob: {},
         )
 
         events = process(
@@ -1956,6 +1977,44 @@ class TestDesignRoundPushOnMerge:
 
         assert events[-1].kind == "design_round_push_skipped"
 
+    def test_non_html_driver_glob_skips_without_collecting(self, monkeypatch) -> None:
+        """#3068: a `tui-tuidriver` repo (`.screen` mocks) must never push a
+        design round — those mocks aren't browser-viewable — and the skip
+        must fire BEFORE `collect_mock_bundle_files` is even called, since
+        the outcome can't change once the glob is known non-viewable."""
+        self._link()
+        cfg = self._config(driver_mock_glob="*.screen")
+
+        called = []
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda *a, **k: called.append(1) or {"contract.md": "# contract"},
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_push_skipped"
+        assert "not browser-viewable" in events[-1].message
+        assert called == []
+
+    def test_no_acceptance_driver_configured_skips(self, monkeypatch) -> None:
+        """#3068: a `mock-author` entry for a repo with no acceptance driver
+        on file at all (e.g. a hand-dispatched entry) must skip visibly
+        rather than silently guessing `*.html`."""
+        self._link()
+        cfg = self._config(driver_mock_glob=None)
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_push_skipped"
+        assert "no driver configured" in events[-1].message
+
     def test_upload_failure_degrades_to_a_failed_event_not_an_exception(
         self, monkeypatch,
     ) -> None:
@@ -1963,7 +2022,7 @@ class TestDesignRoundPushOnMerge:
         cfg = self._config()
         monkeypatch.setattr(
             "coord.mock_author.collect_mock_bundle_files",
-            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+            lambda repo_github, milestone_number, branch, driver_mock_glob: {"contract.md": "# contract"},
         )
         monkeypatch.setattr(
             "httpx.post", lambda *a, **k: _StubResponse(401, {}, text="unauthorized"),
