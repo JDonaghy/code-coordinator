@@ -2082,6 +2082,18 @@ class HealthConfig:
         default_factory=lambda: list(_DEFAULT_SPAWNED_COORD_UNITS)
     )
 
+    # ── PR churn — a branch whose PRs open and close in a loop (#3064) ─────
+    # The #3063 incident opened and closed 102 PRs for a single branch over
+    # ~10h while every other health signal (disk, unit drift, one transient
+    # stalled-pipeline row) reported clean — every existing check is keyed to
+    # a row *sitting still*, and a self-undoing loop never stalls. A normal
+    # branch gets exactly one PR; a legitimately re-opened/rebased one a
+    # handful at most, so any more than `pr_churn_crit_count` `merge_opened`
+    # audit rows for one (repo, branch) inside a rolling
+    # `pr_churn_window_hours` window is never legitimate.
+    pr_churn_window_hours: float = 24.0
+    pr_churn_crit_count: int = 3
+
 
 @dataclass
 class NotificationsConfig:
@@ -3621,12 +3633,14 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "plan_usage_crit_pct": 0.0,
     "webapp_build_heartbeat_warn_minutes": 0.0,
     "webapp_build_heartbeat_crit_minutes": 0.0,
+    "pr_churn_window_hours": 0.0,
 }
 _HEALTH_INT_FIELDS: tuple[str, ...] = (
     "worktree_warn_count",
     "worktree_crit_count",
     "agent_version_warn_behind",
     "agent_version_crit_behind",
+    "pr_churn_crit_count",
 )
 _HEALTH_STR_LIST_FIELDS: tuple[str, ...] = (
     "disabled_checks",

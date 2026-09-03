@@ -72,6 +72,29 @@ def test_overrides_are_applied(tmp_path) -> None:
     assert health.pypi_index_url == "https://mirror.local/simple"
 
 
+def test_pr_churn_overrides_round_trip(tmp_path) -> None:
+    """#3064: the churn window/threshold must be settable from YAML, same
+    convention as every other single-knob threshold in this block."""
+    cfg = load(
+        _write(
+            tmp_path,
+            """
+            health:
+              pr_churn_window_hours: 6
+              pr_churn_crit_count: 5
+            """,
+        )
+    )
+    assert cfg.health.pr_churn_window_hours == 6.0
+    assert cfg.health.pr_churn_crit_count == 5
+
+
+def test_pr_churn_defaults() -> None:
+    cfg = _parse_health({})
+    assert cfg.pr_churn_window_hours == 24.0
+    assert cfg.pr_churn_crit_count == 3
+
+
 def test_partial_override_keeps_other_defaults(tmp_path) -> None:
     cfg = load(_write(tmp_path, "health:\n  disk_crit_free_pct: 3\n"))
     assert cfg.health.disk_crit_free_pct == 3.0
@@ -173,6 +196,9 @@ def test_unknown_option_is_rejected() -> None:
         ({"deploy_dir": 5}, "string or null"),
         ({"systemd_user_dir": []}, "string or null"),
         ({"deploy_dir": "   "}, "non-empty string or null"),
+        ({"pr_churn_window_hours": -1}, "must be >="),
+        ({"pr_churn_crit_count": -1}, "non-negative integer"),
+        ({"pr_churn_crit_count": 1.5}, "non-negative integer"),
     ],
 )
 def test_invalid_values_are_rejected(block, match) -> None:
