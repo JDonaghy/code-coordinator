@@ -2249,7 +2249,11 @@ def journal(submission_id: str, as_json: bool) -> None:
     timeline and exits 0; an unreadable source becomes a line under "Gaps"
     rather than a traceback. `--json` is the shape a renderer should build
     against — every entry has `ts`, `kind`, `actor`, `text` and an `artifact`
-    that is null or a URL.
+    that is null or a URL. A design round's `artifact` is null against real
+    data (coord only ever learns a bare R2 object key for a bundle, not a
+    fetchable URL — see `coord.portal_store._JOURNAL_ARTIFACT_KEYS`); the key
+    is still visible in that entry's text and `details`. A merge's `artifact`
+    is the real PR URL when one is on file, null otherwise.
 
     Reads the portal tables on THIS machine. On a thin client (one with
     `board_service` set) those are empty by construction — the bridge's state
@@ -2261,7 +2265,7 @@ def journal(submission_id: str, as_json: bool) -> None:
 
     payload = portal_store.render_journal_payload(submission_id)
 
-    if board_service.resolve() is not None:
+    if board_service.is_remote():
         payload = {
             **payload,
             "gaps": [

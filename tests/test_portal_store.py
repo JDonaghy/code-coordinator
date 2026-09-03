@@ -2661,6 +2661,37 @@ class TestRenderJournalPayload:
         assert entry["text"] == "design round R2 published (bundle r2://bundles/4)"
         assert entry["artifact"] == "r2://bundles/4"
 
+    def test_a_realistic_bare_bundle_key_yields_no_artifact_but_is_not_lost(
+        self, coord_db
+    ) -> None:
+        """Review finding on #3071: every seeded ``bundle_key`` elsewhere in
+        this file already looks like a URL (``"r2://bundles/4"``), which only
+        passes :func:`portal_store._journal_url` by accident of spelling —
+        real data never does. :meth:`coord.portal_bridge.PortalBridgeClient.
+        upload_bundle` returns a bare R2 object key, e.g.
+        ``"bundles/sub-001/r2.tar"``, and nothing anywhere writes a
+        ``bundle_url``. Against that realistic shape, ``artifact`` must be
+        ``None`` — never a bare key smuggled past the "null or a URL"
+        contract — while the raw key must still be readable in ``text`` and
+        ``details`` so the operator watching the timeline isn't left with
+        nothing to point at.
+        """
+        from coord import portal_store
+
+        _seed_applied(
+            "design_round",
+            {"design_round": {"round": 2, "bundle_key": "bundles/sub-001/r2.tar"}},
+            now=20.0,
+        )
+
+        [entry] = portal_store.render_journal_payload(JSUB)["entries"]
+        assert entry["kind"] == portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED
+        assert entry["artifact"] is None
+        assert entry["text"] == (
+            "design round R2 published (bundle bundles/sub-001/r2.tar)"
+        )
+        assert entry["details"]["bundle_key"] == "bundles/sub-001/r2.tar"
+
     def test_a_ledgered_design_round_is_not_also_shown_from_the_outbox(
         self, coord_db
     ) -> None:
@@ -2761,6 +2792,89 @@ class TestRenderJournalPayload:
             ("dispatched", "drive"), ("merged", "coordinator"),
         ]
         assert entries[0]["source"] == portal_store.JOURNAL_SOURCE_AUDIT
+
+    def test_a_merged_rows_pr_url_becomes_the_artifact(self, coord_db) -> None:
+        """Review finding on #3071: `mark_assignment_merged` now threads
+        `assignments.pr_url` into `audit_log.details`, so this is the one
+        artifact kind #3071 promises that a real PR merge can actually
+        deliver — proved with a realistic merged row, not one hand-built
+        with the field already present."""
+        from coord import portal_store
+        from coord.audit import record_audit
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: acme#42",
+            repo="acme", issue=42, ts=60.0,
+            details={"pr_url": "https://github.com/acme/api/pull/7"},
+        )
+
+        [entry] = portal_store.render_journal_payload(JSUB)["entries"]
+        assert entry["kind"] == "merged"
+        assert entry["artifact"] == "https://github.com/acme/api/pull/7"
+
+    def test_a_merged_row_with_no_pr_url_on_file_has_no_artifact(
+        self, coord_db
+    ) -> None:
+        """The realistic gap case the review asked for: a merge recorded
+        with no `pr_url` in `details` (a direct out-of-band merge, or one
+        from before #3071 wired the board's PR URL through) must not raise
+        and must not fabricate a URL."""
+        from coord import portal_store
+        from coord.audit import record_audit
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: acme#42",
+            repo="acme", issue=42, ts=60.0,
+        )
+
+        [entry] = portal_store.render_journal_payload(JSUB)["entries"]
+        assert entry["kind"] == "merged"
+        assert entry["artifact"] is None
+
+    def test_a_long_business_tier_history_does_not_drop_the_oldest_row(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Review finding on #3071: `list_audit_log` is newest-first, so a
+        naive single `limit=200` page would silently drop the earliest
+        `dispatched` row once an issue accumulates enough review/test
+        churn — exactly what "intake to shipped" must not lose. Paginate
+        with a tiny page size here so the fold is forced across >1 page."""
+        from coord import portal_store, state
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        monkeypatch.setattr(portal_store, "_JOURNAL_AUDIT_PAGE_SIZE", 2)
+
+        from coord.audit import record_audit
+
+        record_audit(
+            tier="business", category="dispatch", event_type="dispatched",
+            actor="drive", summary="Dispatched work to precision: acme#42",
+            repo="acme", issue=42, ts=10.0,
+        )
+        for i in range(5):
+            record_audit(
+                tier="business", category="review", event_type="review_approved",
+                actor="coordinator", summary=f"noise {i}",
+                repo="acme", issue=42, ts=20.0 + i,
+            )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: acme#42",
+            repo="acme", issue=42, ts=90.0,
+        )
+
+        entries = portal_store.render_journal_payload(JSUB)["entries"]
+        assert [e["kind"] for e in entries] == ["dispatched", "merged"]
 
     def test_another_submissions_issue_never_leaks_into_this_timeline(
         self, coord_db

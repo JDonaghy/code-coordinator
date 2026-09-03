@@ -2856,9 +2856,19 @@ def mark_assignment_merged(assignment_id: str) -> None:
     conn.commit()
     if cur.rowcount > 0:
         row = sql.execute(conn,
-            "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+            "SELECT repo_name, issue_number, machine_name, pr_url FROM assignments "
+            "WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
+        # #3071: `coord journal`'s merge entries have nowhere else to learn a
+        # PR URL from — `audit_log.details` is the only thing that fold reads
+        # — so the board's own `assignments.pr_url` (populated well before
+        # this flip, by whatever set it: a worker's PR, a whole-board upsert
+        # from `merge_queue`) is threaded through here rather than left for
+        # the journal to invent a join. Absent on a row merged out-of-band
+        # with no PR ever recorded on it; that degrades to a null `artifact`,
+        # never a raise.
+        pr_url = row["pr_url"] if row is not None else None
         _record_audit(
             tier="business",
             category="merge",
@@ -2870,6 +2880,7 @@ def mark_assignment_merged(assignment_id: str) -> None:
             issue=row["issue_number"] if row is not None else None,
             assignment_id=assignment_id,
             machine=row["machine_name"] if row is not None else None,
+            details={"pr_url": pr_url} if pr_url else None,
         )
 
 

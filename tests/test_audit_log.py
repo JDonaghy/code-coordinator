@@ -559,6 +559,59 @@ class TestHookedTransitions:
         ]
         assert len(merge_rows_2) == 1
 
+    def test_mark_assignment_merged_carries_the_boards_pr_url_into_details(
+        self, coord_db
+    ) -> None:
+        """#3071 review: `coord journal`'s merge entries read `details.pr_url`
+        off exactly this row — with nowhere else to learn one from, the PR
+        URL the board already has on file (`assignments.pr_url`) must reach
+        `audit_log.details`, not just the human-readable `summary` text."""
+        import json as _json
+
+        from coord.state import mark_assignment_merged
+
+        _dispatch(coord_db, assignment_id="aid-1")
+        coord_db.execute(
+            "UPDATE assignments SET status='done', pr_url=? WHERE assignment_id=?",
+            ("https://github.com/acme/api/pull/7", "aid-1"),
+        )
+        coord_db.commit()
+
+        mark_assignment_merged("aid-1")
+
+        [merge_row] = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["category"] == "merge"
+        ]
+        details = _json.loads(merge_row["details_json"] or "{}")
+        assert details.get("pr_url") == "https://github.com/acme/api/pull/7"
+
+    def test_mark_assignment_merged_with_no_pr_url_on_file_omits_it(
+        self, coord_db
+    ) -> None:
+        """A merge recorded with no PR ever attached to the row (e.g. a
+        direct out-of-band merge) must not raise, and must not fabricate a
+        `pr_url` — the downstream journal fold treats an absent key as a gap
+        in the pointer, never a crash."""
+        import json as _json
+
+        from coord.state import mark_assignment_merged
+
+        _dispatch(coord_db, assignment_id="aid-1")
+        coord_db.execute(
+            "UPDATE assignments SET status='done' WHERE assignment_id=?", ("aid-1",)
+        )
+        coord_db.commit()
+
+        mark_assignment_merged("aid-1")
+
+        [merge_row] = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["category"] == "merge"
+        ]
+        details = _json.loads(merge_row["details_json"] or "{}")
+        assert "pr_url" not in details
+
     def test_update_assignment_branch_writes_one_row_and_is_idempotent(
         self, coord_db
     ) -> None:
