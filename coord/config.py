@@ -1367,9 +1367,9 @@ class PipelineConfig:
         label's gate list like any other gate. Ordered between ``"review"``
         and ``"merge"`` when present. Unlike the other three, its
         *enforcement* additionally requires the specific repo to have
-        ``Repo.uat_preview`` configured (see
-        ``coord.merge_queue.requires_uat``) — so listing ``"uat"`` here is
-        necessary but not sufficient; it is the fleet-wide half of a
+        ``Repo.uat_preview`` or ``Repo.uat_live_preview`` configured (#2948;
+        see ``coord.merge_queue.requires_uat``) — so listing ``"uat"`` here
+        is necessary but not sufficient; it is the fleet-wide half of a
         two-part per-repo opt-in.
         """
         if label and label in self.labels:
@@ -2479,6 +2479,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "artifact_paths",
         "provider",
         "uat_preview",
+        "uat_live_preview",
     }
 )
 
@@ -2609,6 +2610,15 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 "the key entirely to leave the UAT gate off for this repo)"
             )
 
+        # #2948: uat_live_preview — the other half of the UAT gate's per-repo
+        # opt-in, for a repo whose preview host has no templatable URL at all
+        # (the common case — see `Repo.uat_live_preview`'s docstring). Either
+        # this OR `uat_preview` alone is a full opt-in; a repo can also set
+        # both (the `uat_preview` override then wins at evaluation time).
+        uat_live_preview_raw = entry.get("uat_live_preview", False)
+        if not isinstance(uat_live_preview_raw, bool):
+            raise ConfigError(f"repos[{i}].uat_live_preview must be a boolean")
+
         repos.append(
             Repo(
                 name=name,
@@ -2628,6 +2638,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 artifact_paths=artifact_paths,
                 provider=repo_provider,
                 uat_preview=uat_preview,
+                uat_live_preview=uat_live_preview_raw,
             )
         )
     return repos, warnings

@@ -2524,6 +2524,71 @@ class TestGetPrHeadRef:
             assert github_ops.get_pr_head_ref("acme/api", 42) is None
 
 
+class TestGetPrDeploymentUrl:
+    """#2948: the live GitHub-Deployment lookup that replaced the
+    ``{pr_branch_slug}`` Cloudflare-Pages template placeholder — confirmed
+    live to never resolve for a real project (see docs/CUSTOMER_FACING_APPS.md
+    §1 and coord.models.Repo.uat_preview's docstring)."""
+
+    def test_matches_preview_environment_not_recency(self) -> None:
+        # A production deployment (id 2) is newer/first in the list — must
+        # be skipped in favour of the "(Preview)" one, not picked for being
+        # first.
+        deployments = json.dumps([
+            {"id": 2, "environment": "natal-chart (Production)"},
+            {"id": 1, "environment": "natal-chart (Preview)"},
+        ])
+        statuses = json.dumps([
+            {"environment_url": "https://abc123.natal-chart-3ew.pages.dev"},
+        ])
+        with patch(
+            "coord.github_ops._gh", side_effect=[deployments, statuses],
+        ) as mock_gh:
+            url = github_ops.get_pr_deployment_url("acme/natal-chart", "issue-1-x")
+        assert url == "https://abc123.natal-chart-3ew.pages.dev"
+        assert mock_gh.call_count == 2
+        assert mock_gh.call_args_list[0].args[1] == (
+            "repos/acme/natal-chart/deployments?ref=issue-1-x"
+        )
+        assert mock_gh.call_args_list[1].args[1] == (
+            "repos/acme/natal-chart/deployments/1/statuses"
+        )
+
+    def test_skips_non_preview_environment_deployments(self) -> None:
+        deployments = json.dumps([{"id": 5, "environment": "natal-chart (Production)"}])
+        with patch("coord.github_ops._gh", return_value=deployments):
+            assert github_ops.get_pr_deployment_url("acme/natal-chart", "main") is None
+
+    def test_returns_none_when_no_deployments(self) -> None:
+        with patch("coord.github_ops._gh", return_value="[]"):
+            assert github_ops.get_pr_deployment_url("acme/api", "issue-1-x") is None
+
+    def test_returns_none_on_gh_failure(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_pr_deployment_url("acme/api", "issue-1-x") is None
+
+    def test_returns_none_when_matched_deployment_has_no_status_url_yet(self) -> None:
+        deployments = json.dumps([{"id": 1, "environment": "api (Preview)"}])
+        statuses = json.dumps([{"state": "pending"}])  # no environment_url yet
+        with patch("coord.github_ops._gh", side_effect=[deployments, statuses]):
+            assert github_ops.get_pr_deployment_url("acme/api", "issue-1-x") is None
+
+    def test_falls_through_to_next_preview_deployment_on_malformed_statuses(self) -> None:
+        deployments = json.dumps([
+            {"id": 1, "environment": "api (Preview)"},
+            {"id": 2, "environment": "api (Preview)"},
+        ])
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=[
+                deployments, "not json",
+                json.dumps([{"environment_url": "https://ok.example"}]),
+            ],
+        ):
+            url = github_ops.get_pr_deployment_url("acme/api", "issue-1-x")
+        assert url == "https://ok.example"
+
+
 class TestGetRepoWorkflowCount:
     """#1904: backs `GitHubCi.expects_checks` — the signal that tells "no CI
     configured for this repo" apart from "CI exists but never triggered"

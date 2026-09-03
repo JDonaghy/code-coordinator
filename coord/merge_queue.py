@@ -848,11 +848,13 @@ def requires_smoke(entry: "QueuedMerge", config) -> bool:
 #   1. "uat" appears in the entry's effective gate list (required_gates, or
 #      config.pipeline.default_gates) — the fleet-wide half, same mechanism
 #      requires_review/requires_smoke use.
-#   2. The entry's OWN repo has Repo.uat_preview configured — the per-repo
-#      half. This is what keeps "ship the mechanism with the default off
-#      everywhere" true even if an operator adds "uat" to default_gates
-#      (fleet-wide) without meaning to turn it on for every repo: a repo
-#      with no uat_preview never blocks, no matter what default_gates says.
+#   2. The entry's OWN repo has Repo.uat_preview OR Repo.uat_live_preview
+#      configured — the per-repo half (#2948: either one alone is a full
+#      opt-in; a repo needs neither to leave the gate off). This is what
+#      keeps "ship the mechanism with the default off everywhere" true even
+#      if an operator adds "uat" to default_gates (fleet-wide) without
+#      meaning to turn it on for every repo: a repo with neither set never
+#      blocks, no matter what default_gates says.
 #
 # Unlike requires_review/requires_smoke, there is no SHA/patch-id staleness
 # tracking here (see evaluate_uat_verdict's docstring) — a UAT verdict is a
@@ -882,6 +884,11 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
     See the module-comment above this function for the two-part opt-in.
     Duck-typed on ``entry.repo_name``/``entry.required_gates``, matching
     :func:`requires_review`/:func:`requires_smoke`.
+
+    #2948: the per-repo half is now ``uat_preview`` (the override template)
+    OR ``uat_live_preview`` (opt-in to the live GitHub-Deployment lookup) —
+    either one alone is a full opt-in; a repo needs neither to leave the gate
+    off, matching the pre-#2948 behaviour of an unset ``uat_preview``.
     """
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None or config is None:
@@ -890,7 +897,9 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
     if "uat" not in gates:
         return False
     repo = _uat_repo_for(entry, config)
-    return bool(repo is not None and repo.uat_preview)
+    if repo is None:
+        return False
+    return bool(repo.uat_preview) or bool(getattr(repo, "uat_live_preview", False))
 
 
 def _uat_branch_work(entry: "QueuedMerge", board) -> list:
@@ -909,18 +918,65 @@ def _uat_branch_work(entry: "QueuedMerge", board) -> list:
     return branch_work
 
 
+def _resolve_uat_preview_url(
+    entry: "QueuedMerge", config, gh_ops: "GhOps | None"
+) -> str | None:
+    """Resolve the preview URL to surface for *entry* (#2948).
+
+    Resolution order:
+
+    1. ``Repo.uat_preview`` (:meth:`coord.models.Repo.resolve_uat_preview_url`)
+       — an explicit operator override, for a repo whose preview host has a
+       genuinely templatable URL. Always wins when set.
+    2. ``Repo.uat_live_preview`` — the live GitHub-Deployment lookup
+       (:func:`coord.github_ops.get_pr_deployment_url`, via *gh_ops*),
+       matched on environment name rather than recency. Requires both a
+       *gh_ops* and a known branch; returns ``None`` on any read failure
+       rather than raising.
+
+    Returns ``None`` when neither resolves — never a guessed/constructed
+    URL (the #2948 bug: a template placeholder that renders a plausible but
+    dead link).
+    """
+    repo = _uat_repo_for(entry, config)
+    if repo is None:
+        return None
+    if repo.uat_preview:
+        return repo.resolve_uat_preview_url(
+            branch=getattr(entry, "branch", None),
+            issue_number=getattr(entry, "issue_number", None),
+            pr_number=getattr(entry, "pr_number", None),
+        )
+    branch = getattr(entry, "branch", None)
+    if getattr(repo, "uat_live_preview", False) and gh_ops is not None and branch:
+        try:
+            return gh_ops.get_pr_deployment_url(entry.repo_github, branch)
+        except Exception:  # noqa: BLE001 — no URL to report, not a crash
+            return None
+    return None
+
+
 def evaluate_uat_verdict(
-    entry: "QueuedMerge", board, config
+    entry: "QueuedMerge", board, config, gh_ops: "GhOps | None" = None
 ) -> tuple[bool, str]:
     """Return ``(ok, message)`` for *entry*'s UAT-gate state.
 
     ``ok`` is True only when the most recent verdict on the branch's work
     chain is ``"passed"``. ``message`` (populated only when not ``ok``) is
     the whole point of #2687's "surface the URL where the operator already
-    looks": it names the missing/failed verdict, the repo's rendered
-    preview URL (:meth:`coord.models.Repo.resolve_uat_preview_url`), and
-    the exact ``coord uat`` command to clear it — so a caller can print it
-    verbatim instead of sending the operator hunting for the link.
+    looks": it names the missing/failed verdict, the repo's real preview URL
+    (see :func:`_resolve_uat_preview_url` for the #2948 resolution order),
+    and the exact ``coord uat`` command to clear it — so a caller can print
+    it verbatim instead of sending the operator hunting for the link.
+
+    #2948: when *neither* resolution path produces a URL, the message says
+    so explicitly rather than silently omitting the "— preview:" clause (the
+    pre-#2948 behaviour when a template placeholder rendered but pointed
+    nowhere real) — the whole point being that an unresolvable preview must
+    read as unresolved, never as a plausible dead link. *gh_ops* is optional
+    (``None`` by default) so callers that are deliberately I/O-free (e.g.
+    :func:`display_error`'s read-only recompute) can still call this and get
+    the override-template path, just not the live lookup.
 
     Fails CLOSED when no work assignment can be identified for the branch
     (unlike :func:`evaluate_smoke_verdict`, which fails open there) — same
@@ -948,16 +1004,7 @@ def evaluate_uat_verdict(
     if uat_state == "passed":
         return True, ""
 
-    repo = _uat_repo_for(entry, config)
-    preview_url = (
-        repo.resolve_uat_preview_url(
-            branch=getattr(entry, "branch", None),
-            issue_number=getattr(entry, "issue_number", None),
-            pr_number=getattr(entry, "pr_number", None),
-        )
-        if repo is not None
-        else None
-    )
+    preview_url = _resolve_uat_preview_url(entry, config, gh_ops)
     if uat_state == "failed":
         reason_part = f": {uat_reason}" if (uat_reason or "").strip() else ""
         message = f"uat verdict FAILED{reason_part}"
@@ -965,6 +1012,12 @@ def evaluate_uat_verdict(
         message = "uat verdict missing"
     if preview_url:
         message += f" — preview: {preview_url}"
+    else:
+        message += (
+            " — preview URL could not be resolved (no uat_preview override "
+            "configured and no matching GitHub Deployment found for this "
+            "branch)"
+        )
     message += f" — run: coord uat {aid or '<assignment-id>'} --passed|--failed"
     return False, message
 
@@ -989,7 +1042,8 @@ def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     bypass and reporting it would produce a misleading audit row / CLI note
     (#1213 review finding 1). ``"uat"`` (#2687) gets the same treatment,
     mirroring :func:`requires_uat`'s guard instead: reported only when the
-    entry's own repo has ``uat_preview`` configured.
+    entry's own repo has ``uat_preview`` or ``uat_live_preview`` configured
+    (#2948: either is a full per-repo opt-in).
     """
     gates = getattr(entry, "required_gates", None)
     if not gates:
@@ -1005,7 +1059,8 @@ def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     # never has to grow one just because this function now knows about a
     # gate it will filter out on the very next line anyway.
     uat_configured = "uat" in default_gates and "uat" not in gates and bool(
-        (repo := _uat_repo_for(entry, config)) is not None and repo.uat_preview
+        (repo := _uat_repo_for(entry, config)) is not None
+        and (repo.uat_preview or getattr(repo, "uat_live_preview", False))
     )
     candidates = [
         g for g in ("review", "test", "uat") if g in default_gates and g not in gates
@@ -1226,7 +1281,7 @@ def merge_gate_failures(
             if stop_early:
                 return failures
     if requires_uat(a, config):
-        uat_ok, uat_message = evaluate_uat_verdict(a, board, config)
+        uat_ok, uat_message = evaluate_uat_verdict(a, board, config, gh_ops)
         if not uat_ok:
             aid = getattr(a, "assignment_id", None) or "<id>"
             failures.append(MergeGateFailure(
@@ -3209,6 +3264,16 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
         # stale, so a fresh recompute is always the right answer: cleared
         # when a "passed" verdict landed since the stored error was set,
         # otherwise the freshly-worded (still-accurate) message.
+        #
+        # #2948: deliberately called with no `gh_ops` — this function is
+        # I/O-free by contract (see its own docstring above). That means the
+        # live GitHub-Deployment preview lookup never runs here, so a repo
+        # relying solely on `uat_live_preview` shows the "could not be
+        # resolved" wording on this read-only surface even when a live
+        # `coord merge` tick would have found a real URL. Harmless: this
+        # recompute only ever *clears* or re-words an existing block, it
+        # never blocks on its own, and the next live gate evaluation
+        # resolves the URL properly.
         if not requires_uat(entry, config):
             return None
         uat_ok, uat_message = evaluate_uat_verdict(entry, board, config)
@@ -3468,6 +3533,20 @@ class GhOps(Protocol):
         :func:`reconcile_conflict_entries` (#1477) to re-test a parked
         ``CONFLICT`` entry rather than trusting the cached verdict from
         whenever the queue last attempted it.
+        """
+        ...
+
+    def get_pr_deployment_url(self, repo: str, branch: str) -> str | None:
+        """Return the live preview-deployment URL for *branch*'s GitHub
+        Deployment, or ``None`` when one can't be confirmed (#2948).
+
+        Used by :func:`evaluate_uat_verdict` (via ``_resolve_uat_preview_url``)
+        for a repo opted into ``Repo.uat_live_preview`` — the primary UAT-gate
+        preview-URL resolution path, replacing the #2687 ``{pr_branch_slug}``
+        template placeholder that was confirmed live to never resolve for a
+        real Cloudflare Pages project. See
+        :func:`coord.github_ops.get_pr_deployment_url` for the actual ``gh
+        api`` calls and the environment-name matching rule.
         """
         ...
 
@@ -4811,7 +4890,7 @@ def _entry_gate_status(
         # `evaluate_uat_verdict` returns here is already exactly what a
         # live merge attempt would report.
         if requires_uat(entry, config):
-            uat_ok, uat_message = evaluate_uat_verdict(entry, board, config)
+            uat_ok, uat_message = evaluate_uat_verdict(entry, board, config, gh_ops)
             if not uat_ok:
                 return PLAN_BLOCKED, uat_message
     if ci_store is not None and ci_store.is_available and entry.pr_number:
@@ -6517,7 +6596,7 @@ def process(
                     _uat_ok, _uat_message = (
                         (False, "board unavailable to confirm UAT verdict")
                         if board is None
-                        else evaluate_uat_verdict(entry, board, config)
+                        else evaluate_uat_verdict(entry, board, config, gh_ops)
                     )
                     if not _uat_ok:
                         events.append(MergeEvent(
@@ -6933,7 +7012,8 @@ def process(
             # recorded a verdict. Ordered between review/smoke and CI/merge,
             # same skip-not-halt semantics as the gates above. Two-part
             # opt-in (see requires_uat) means this is a no-op for every repo
-            # that hasn't set `uat_preview` — the default posture everywhere.
+            # that hasn't set `uat_preview` or `uat_live_preview` (#2948) —
+            # the default posture everywhere.
             if (
                 not skip_uat
                 and config is not None
@@ -6942,7 +7022,7 @@ def process(
                 uat_ok, uat_msg = (
                     (False, "uat verdict required but board unavailable to confirm")
                     if board is None
-                    else evaluate_uat_verdict(entry, board, config)
+                    else evaluate_uat_verdict(entry, board, config, gh_ops)
                 )
                 if not uat_ok:
                     entry.error = uat_msg

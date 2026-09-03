@@ -20,7 +20,7 @@ def config_file_with_uat(tmp_path: Path) -> Path:
         "repos:\n"
         "  - name: api\n"
         "    github: acme/api\n"
-        "    uat_preview: 'https://{pr_branch_slug}.example.pages.dev/'\n"
+        "    uat_preview: 'https://preview.example/{branch}'\n"
         "machines:\n"
         "  - name: testbox\n    host: testbox.tailnet\n    repos: [api]\n"
     )
@@ -60,9 +60,7 @@ def board_with_done(coord_db) -> Board:
 class TestRepoUatPreviewConfig:
     def test_uat_preview_parsed(self, config_file_with_uat: Path) -> None:
         cfg = load(config_file_with_uat)
-        assert cfg.repo("api").uat_preview == (
-            "https://{pr_branch_slug}.example.pages.dev/"
-        )
+        assert cfg.repo("api").uat_preview == "https://preview.example/{branch}"
 
     def test_uat_preview_optional(self, config_file_without_uat: Path) -> None:
         cfg = load(config_file_without_uat)
@@ -79,7 +77,7 @@ class TestUatVerdict:
         ])
         assert result.exit_code == 0, result.output
         assert "PASSED" in result.output
-        assert "preview: https://issue-42-fix-chart-colors.example.pages.dev/" in result.output
+        assert "preview: https://preview.example/issue-42-fix-chart-colors" in result.output
 
         from coord.state import load_board
         board = load_board()
