@@ -22,7 +22,7 @@ from coord.config import (
     Config,
 )
 from coord.milestone_dispatch import issue_oracle_ready
-from coord.models import Machine, Repo
+from coord.models import Assignment, Machine, Repo
 
 CONTRACT_V1 = "# Contract\n\n- the Save button says `Save`\n"
 CONTRACT_V2 = "# Contract\n\n- the Save button says `Publish`\n"
@@ -232,6 +232,163 @@ class TestSummarise:
         summary = gate_a.summarise(d)
         assert "exempt" in summary
         assert "no user-visible surface" in summary
+
+
+# ── #3065: the pre-merge blind spot ─────────────────────────────────────────
+
+
+def _mock_author(
+    *,
+    branch: str,
+    assignment_id: str = "a1",
+    issue_number: int = 900,
+    repo_name: str = "api",
+) -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title="[gate-a-amend] ms-37 — contract correction",
+        assignment_id=assignment_id,
+        status="done",
+        branch=branch,
+        type="mock-author",
+        dispatched_at=1000.0,
+    )
+
+
+def _review(
+    *,
+    of_assignment_id: str,
+    verdict: str | None,
+    dispatched_at: float = 2000.0,
+) -> Assignment:
+    return Assignment(
+        machine_name="desktop",
+        repo_name="api",
+        issue_number=900,
+        issue_title="review",
+        assignment_id=f"review-of-{of_assignment_id}",
+        status="done",
+        type="review",
+        review_of_assignment_id=of_assignment_id,
+        review_verdict=verdict,
+        dispatched_at=dispatched_at,
+    )
+
+
+class TestFindPendingAmends:
+    """#3065: the incident's own repro — an approved Gate-A `--amend`
+    branch is dispatched, reviewed, even approved, but not yet merged.
+    `evaluate()` only ever compares against the default branch, so this is
+    invisible to it; `find_pending_amends` is the separate read-side check
+    that surfaces it."""
+
+    def test_an_approved_unmerged_branch_is_reported(self) -> None:
+        mock = _mock_author(branch="issue-122-gate-a-amend-1")
+        review = _review(of_assignment_id="a1", verdict="approve")
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[mock, review],
+            is_merged=lambda _b: False,
+        )
+        assert len(pending) == 1
+        assert pending[0].branch == "issue-122-gate-a-amend-1"
+        assert pending[0].review_verdict == "approve"
+
+    def test_a_merged_branch_is_not_reported(self) -> None:
+        """A merged amend is `evaluate()`'s job (STATE_STALE) — this must
+        not also report it, or the operator sees the same fact twice under
+        two different labels."""
+        mock = _mock_author(branch="issue-122-gate-a-amend-1")
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[mock],
+            is_merged=lambda _b: True,
+        )
+        assert pending == []
+
+    def test_no_mock_author_rows_reports_nothing(self) -> None:
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[],
+            is_merged=lambda _b: False,
+        )
+        assert pending == []
+
+    def test_unreviewed_branch_has_no_verdict(self) -> None:
+        mock = _mock_author(branch="issue-122-gate-a-amend-1")
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[mock],
+            is_merged=lambda _b: False,
+        )
+        assert pending[0].review_verdict is None
+
+    def test_only_this_repo_and_tracking_issue_match(self) -> None:
+        other_repo = _mock_author(
+            branch="other-repo-branch", repo_name="web", assignment_id="a2",
+        )
+        other_issue = _mock_author(
+            branch="other-issue-branch", issue_number=901, assignment_id="a3",
+        )
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[other_repo, other_issue],
+            is_merged=lambda _b: False,
+        )
+        assert pending == []
+
+    def test_most_recent_review_verdict_wins(self) -> None:
+        """A re-review (e.g. after a request-changes round) replaces the
+        earlier verdict — the latest one dispatched is what's true now."""
+        mock = _mock_author(branch="issue-122-gate-a-amend-1")
+        first_review = _review(
+            of_assignment_id="a1", verdict="request-changes", dispatched_at=2000.0,
+        )
+        second_review = _review(
+            of_assignment_id="a1", verdict="approve", dispatched_at=3000.0,
+        )
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[mock, second_review, first_review],
+            is_merged=lambda _b: False,
+        )
+        assert pending[0].review_verdict == "approve"
+
+
+class TestSummarisePendingAmends:
+    def test_approved_amend_names_the_branch_and_disclaims_the_approval(
+        self,
+    ) -> None:
+        lines = gate_a.summarise_pending_amends(
+            [gate_a.PendingAmend(branch="issue-122-gate-a-amend-1", assignment_id="a1", review_verdict="approve")]
+        )
+        assert any(
+            "issue-122-gate-a-amend-1" in line and "approve" in line
+            for line in lines
+        )
+        assert any("NOT that branch" in line for line in lines)
+
+    def test_request_changes_and_pending_get_distinct_wording(self) -> None:
+        changes = gate_a.summarise_pending_amends(
+            [gate_a.PendingAmend(branch="b1", assignment_id="a1", review_verdict="request-changes")]
+        )
+        pending = gate_a.summarise_pending_amends(
+            [gate_a.PendingAmend(branch="b2", assignment_id="a2", review_verdict=None)]
+        )
+        assert changes[0] != pending[0]
+        assert "request-changes" in changes[0]
+        assert "pending" in pending[0]
+
+    def test_nothing_pending_yields_no_lines(self) -> None:
+        assert gate_a.summarise_pending_amends([]) == []
 
 
 # ── the park marker ─────────────────────────────────────────────────────────
