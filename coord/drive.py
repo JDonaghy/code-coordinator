@@ -3193,6 +3193,17 @@ _SMOKE_GATE_MARKERS = (
 )
 _REVIEW_GATE_MARKERS = ("review required", "review not approved")
 
+# #2947 (follow-up to #2687): the UAT gate — a human-attended block that only
+# `coord uat <id> --passed` (never a `coord merge` retry) can clear.
+# `evaluate_uat_verdict` (coord.merge_queue) always opens its message with
+# "uat verdict " — "uat verdict missing", "uat verdict FAILED: …", or the
+# board-unavailable stand-in "uat verdict required but board unavailable to
+# confirm" — so that one prefix covers every wording both `process()` (live
+# merge attempt) and `_entry_gate_status` (board/plan render) produce, the
+# same "both callers, one string" guarantee `_SMOKE_GATE_MARKERS`/
+# `_REVIEW_GATE_MARKERS` document above.
+_UAT_GATE_MARKERS = ("uat verdict",)
+
 # #2704: the branch-head-unknown condition
 # (`coord.merge_queue.UNKNOWN_BRANCH_HEAD_REASON`) is its OWN gate kind —
 # neither "smoke" nor "review" — even though `merge_gate_failures` reports it
@@ -3222,6 +3233,12 @@ def _merge_gate_kind(reason: str) -> str | None:
     #2704: checked BEFORE the review marker below — `UNKNOWN_BRANCH_HEAD_
     REASON` names its own condition (`"unknown_head"`), never "review" or
     "smoke", regardless of which gate's refusal carried it.
+
+    #2947: `"uat"` is likewise its own kind, never folded into "review" or
+    "smoke" — it is a human-attended gate with no re-runnable measurement
+    behind it (see `_UAT_GATE_MARKERS`), so callers must route it to a
+    bare wait for a human verdict, never a `coord merge` retry or an
+    automated re-test/re-review escalation.
     """
     r = (reason or "").lower()
     if _UNKNOWN_BRANCH_HEAD_MARKER in r:
@@ -3230,6 +3247,8 @@ def _merge_gate_kind(reason: str) -> str | None:
         return "smoke"
     if any(marker in r for marker in _REVIEW_GATE_MARKERS):
         return "review"
+    if any(marker in r for marker in _UAT_GATE_MARKERS):
+        return "uat"
     return None
 
 
@@ -3263,8 +3282,8 @@ _GATE_WAIVED_MARKER = "waived by this run"
 
 
 def _extract_gate_refusal_reason(diagnostic: str | None) -> str:
-    """The first smoke/review gate refusal named anywhere in a captured
-    `coord merge --only` *diagnostic*, or ``""`` (#2229).
+    """The first smoke/review/uat gate refusal named anywhere in a captured
+    `coord merge --only` *diagnostic*, or ``""`` (#2229; uat added #2947).
 
     Unlike :func:`_extract_gate_block_reason` — which matches only
     `_explain_missing_only_entry`'s "enqueue blocked by <gate>" wording, i.e.
@@ -3365,6 +3384,15 @@ def _merge_gate_divergence(state: IssueState, reason: str | None = None) -> str 
     :func:`_decide_merge` passes :func:`_effective_merge_gate_reason`'s
     result instead so a refusal that exists ONLY in the last captured
     `coord merge --only` diagnostic still classifies.
+
+    #2947: deliberately no `"uat"` arm here. A smoke/review divergence means
+    this driver's OWN cached verdict contradicts what the merge gate found —
+    evidence a re-test/re-review can resolve. A missing/failed UAT verdict is
+    never a contradiction of anything this driver tracks (there is no cached
+    `work_uat_state` this function reads) — it is the gate working exactly as
+    designed, waiting on a human who has not looked yet. `_decide_merge`
+    intercepts `"uat"` before this function is ever consulted, the same way
+    it already does for `"unknown_head"`.
     """
     kind = _merge_gate_kind(state.merge_reason if reason is None else reason)
     if kind == "smoke" and state.work_test_state in ("passed", "skipped"):
@@ -3579,6 +3607,33 @@ def _decide_merge(
                 "MERGE: branch head unknown — GitHub read failed (rate "
                 "limit, auth, or network); waiting, not retrying (#2704): "
                 f"{gate_reason}"
+            )
+        )
+    # #2947 (follow-up to #2687): the UAT gate is a human-attended block — no
+    # `coord merge` retry, re-test, or re-review can clear it, only an
+    # operator recording `coord uat <id> --passed|--failed` after clicking
+    # through the deployed preview. Before this check, `_merge_gate_kind`
+    # returned `None` for every UAT wording (`_UAT_GATE_MARKERS` did not
+    # exist), so this fell through to the same bounded retry every other
+    # retryable status uses — burning the whole `--max-merge-attempts`
+    # budget against a gate that cannot change no matter how many times
+    # `coord merge --only` is retried, then dying with a terminal `blocked`
+    # drive-queue entry nothing re-evaluates (`coord/drive_queue.py`'s
+    # `blocked` state). Checked here, before the divergence classification
+    # (which deliberately has no `"uat"` arm — see
+    # `_merge_gate_divergence`'s docstring) and before the status switch
+    # below, mirrors the #2704 `unknown_head` arm immediately above: wait for
+    # a human to act rather than spend an attempt or escalate. `gate_reason`
+    # already carries `evaluate_uat_verdict`'s full message — the missing/
+    # failed verdict, the resolved preview URL (or why none resolved), and
+    # the exact `coord uat` command — so surfacing it verbatim here is what
+    # gets it into this driver's `STATUS:`/`coord status` output next to the
+    # command that clears it, per #2687's own filing.
+    if _merge_gate_kind(gate_reason) == "uat":
+        return _wait(
+            label=(
+                "MERGE: blocked on UAT — a human must record a verdict; "
+                f"waiting, not retrying (#2947): {gate_reason}"
             )
         )
     divergence = _merge_gate_divergence(state, reason=gate_reason)

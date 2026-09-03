@@ -3895,6 +3895,93 @@ def test_merge_gate_kind_recognises_unknown_branch_head_as_its_own_kind():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2947 (follow-up to #2687): the UAT gate. `coord/merge_queue.py` reports a
+# missing/failed UAT verdict with the same `MergeGateFailure` shape as smoke
+# and review, but before this fix `_merge_gate_kind` had no marker for it —
+# every UAT block fell through the "real, persistent gate, wait cheaply" arm
+# in `_effective_merge_gate_reason`, and the drive spent real `coord merge`
+# attempts against a gate only a human can clear via `coord uat <id>
+# --passed`, hit `max_merge_attempts`, and died with a terminal `blocked`
+# drive-queue entry nothing re-evaluates.
+# ═══════════════════════════════════════════════════════════════════════════
+
+UAT_VERDICT_MISSING = (
+    "uat verdict missing — preview: https://pr-123.natal-chart.pages.dev "
+    "— run: coord uat w1 --passed|--failed"
+)
+UAT_VERDICT_FAILED = (
+    "uat verdict FAILED: layout broke on mobile — preview: "
+    "https://pr-123.natal-chart.pages.dev — run: coord uat w1 --passed|--failed"
+)
+
+
+def test_merge_gate_kind_recognises_uat_as_its_own_kind():
+    from coord.drive import _merge_gate_kind
+
+    assert _merge_gate_kind(UAT_VERDICT_MISSING) == "uat"
+    assert _merge_gate_kind(UAT_VERDICT_FAILED) == "uat"
+    # Regression guard: must never be swallowed into "review"/"smoke" — a UAT
+    # block names neither.
+    assert _merge_gate_kind(UAT_VERDICT_MISSING) not in ("review", "smoke")
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_uat_gate_waits_regardless_of_which_status_the_board_shows(status):
+    action = step(approved_work(merge_status=status, merge_reason=UAT_VERDICT_MISSING))
+    assert action.kind == WAIT
+    assert "UAT" in action.label
+    assert "not retrying" in action.label
+    # #2687: the exact clearing command and the resolved preview URL must
+    # reach this driver's own STATUS:/coord status surface verbatim, not be
+    # summarised away.
+    assert "coord uat w1 --passed|--failed" in action.label
+    assert "https://pr-123.natal-chart.pages.dev" in action.label
+
+
+def test_uat_gate_never_spends_a_merge_attempt():
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="", merge_reason=UAT_VERDICT_MISSING)
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_uat_gate_does_not_escalate_a_fabricated_review_or_smoke_refusal():
+    """The driver's own cached view already shows `review_verdict='approve'`
+    and `work_test_state='passed'` (`approved_work`'s defaults). A UAT block
+    must not be misread as a smoke/review divergence and escalate a
+    re-test/re-review for a gate that was never actually about either —
+    `_merge_gate_divergence` deliberately has no `"uat"` arm, so this only
+    stays true if `_decide_merge` intercepts `"uat"` before that check runs."""
+    action = step(approved_work(merge_status="BLOCKED", merge_reason=UAT_VERDICT_FAILED))
+    assert action.kind == WAIT
+    assert not action.is_exit
+
+
+def test_uat_gate_reached_via_the_diagnostic_fallback_still_waits():
+    """#2229 shape: the board's live reason names no gate (`merge_status=
+    'READY'`, `merge_reason=''`), but this driver's OWN last `coord merge
+    --only` attempt already captured the UAT refusal verbatim. Must still
+    classify and wait, not fall into the bounded retry that burns attempts —
+    mirroring `test_stale_smoke_only_in_the_captured_diagnostic_takes_the_
+    retest_arm`'s shape, but for a gate with no automated retest arm at all."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="READY", merge_reason="")
+    counters.last_merge_diagnostic = (
+        f"  gate uat: {UAT_VERDICT_MISSING} — will block this merge\n"
+    )
+
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert "UAT" in action.label
+    assert counters.merge_attempts == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
 # real about the code, but `coord merge`'s own live attempt has only
 # observed it fail ONCE so far and is already re-running the failed job(s)
