@@ -704,8 +704,9 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
 @click.command(
     help=(
         "Record a pre-merge UAT (User Acceptance Test) verdict (#2687).\n\n"
-        "For repos that opt in via `uat_preview` in coordinator.yml, `coord "
-        "merge` refuses to merge ASSIGNMENT_ID's PR until this records a "
+        "For repos that opt in via `uat_preview` or `uat_live_preview` in "
+        "coordinator.yml, `coord merge` refuses to merge ASSIGNMENT_ID's PR "
+        "until this records a "
         "--passed verdict — the gate exists so a human looks at the PR's "
         "deployed preview (the URL coord.merge_queue.evaluate_uat_verdict "
         "prints alongside the block) before a customer does. Modelled "
@@ -745,18 +746,38 @@ def uat(assignment_id: str, config_path: Path, verdict: str | None, note: str) -
         sys.exit(1)
 
     repo = cfg.repo(assignment.repo_name)
-    if repo is None or not repo.uat_preview:
+    # #2948: "opted in" is uat_preview OR uat_live_preview — same two-part
+    # question coord.merge_queue.requires_uat answers. Checking uat_preview
+    # alone here made this warning lie for a repo that opted in via
+    # uat_live_preview only (the shape this PR's own docs recommend for a
+    # project with no templatable preview host): coord merge DOES enforce
+    # the gate for that repo, so claiming otherwise is the exact silent-
+    # trust-erosion bug #2948 was filed to close, reintroduced on the CLI
+    # surface that records the operator's verdict.
+    uat_opted_in = bool(
+        repo is not None
+        and (repo.uat_preview or getattr(repo, "uat_live_preview", False))
+    )
+    if not uat_opted_in:
         # Not a hard error: an operator may still want a manual verdict on
         # record for a repo that hasn't (yet) opted in — but the merge gate
         # (coord.merge_queue.requires_uat) won't enforce it either way, so
         # say so rather than implying this verdict blocks anything.
         click.echo(
-            f"warning: {assignment.repo_name!r} has no uat_preview configured "
-            "in coordinator.yml — recording the verdict, but coord merge "
-            "will not enforce this gate for this repo.",
+            f"warning: {assignment.repo_name!r} has no uat_preview or "
+            "uat_live_preview configured in coordinator.yml — recording "
+            "the verdict, but coord merge will not enforce this gate for "
+            "this repo.",
             err=True,
         )
-    else:
+    elif repo.uat_preview:
+        # Template-only, best-effort — mirrors coord.stage_projection.
+        # uat_preview_url_for: this command has no gh_ops wired up to run
+        # the live GitHub-Deployment lookup uat_live_preview opts into, so
+        # a uat_live_preview-only repo prints no preview line here rather
+        # than a guessed/dead one (the #2948 bug this PR fixes). The full
+        # live resolution still runs server-side in
+        # coord.merge_queue.evaluate_uat_verdict at merge-gate time.
         pr_number = None
         try:
             from coord import sql  # noqa: PLC0415

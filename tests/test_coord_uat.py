@@ -40,6 +40,23 @@ def config_file_without_uat(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def config_file_with_uat_live_preview(tmp_path: Path) -> Path:
+    """#2948: opted in via `uat_live_preview` ALONE — no `uat_preview`
+    template — the shape recommended for a repo with no templatable
+    preview host (natal-chart's actual situation)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    uat_live_preview: true\n"
+        "machines:\n"
+        "  - name: testbox\n    host: testbox.tailnet\n    repos: [api]\n"
+    )
+    return p
+
+
+@pytest.fixture
 def board_with_done(coord_db) -> Board:
     board = Board(completed=[
         Assignment(
@@ -128,7 +145,28 @@ class TestUatVerdict:
             "--config", str(config_file_without_uat),
         ])
         assert result.exit_code == 0, result.output
-        assert "has no uat_preview configured" in result.output
+        assert "has no uat_preview or uat_live_preview configured" in result.output
+
+        from coord.state import load_board
+        assert load_board().completed[0].uat_state == "passed"
+
+    def test_no_false_warning_when_repo_opted_in_via_uat_live_preview_only(
+        self, config_file_with_uat_live_preview: Path, board_with_done: Board,
+    ) -> None:
+        """#2948: before this fix, the warning checked `repo.uat_preview`
+        alone, so a repo opted in via `uat_live_preview` alone got the "not
+        enforced" warning even though `coord merge` DOES enforce the gate
+        for it — the exact silent-trust-erosion bug #2948 exists to close,
+        reintroduced on this CLI surface. No warning, and no guessed
+        preview line either (this command has no live GitHub-Deployment
+        lookup wired up — that's best-effort, not a regression)."""
+        result = CliRunner().invoke(main, [
+            "uat", "abc123", "--passed",
+            "--config", str(config_file_with_uat_live_preview),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "warning" not in result.output.lower()
+        assert "preview:" not in result.output
 
         from coord.state import load_board
         assert load_board().completed[0].uat_state == "passed"
@@ -155,6 +193,35 @@ class TestUatVerdictMergeGateIntegration:
 
         CliRunner().invoke(main, [
             "uat", "abc123", "--passed", "--config", str(config_file_with_uat),
+        ])
+        board = load_board()
+        assert mq.passes_merge_gates(entry, cfg, board) is True
+
+    def test_uat_live_preview_only_repo_also_enforced_at_merge_gate(
+        self, config_file_with_uat_live_preview: Path, board_with_done: Board,
+    ) -> None:
+        """#2948: `coord.merge_queue.requires_uat` treats `uat_live_preview`
+        as a full opt-in on its own — confirms the CLI's "no false warning"
+        behaviour above isn't accidentally papering over a repo the merge
+        gate doesn't actually enforce."""
+        from coord import merge_queue as mq
+        from coord.config import load as load_cfg
+        from coord.state import load_board
+
+        cfg = load_cfg(config_file_with_uat_live_preview)
+        cfg.pipeline.default_gates = ["uat", "merge"]
+
+        entry = mq.QueuedMerge(
+            assignment_id="abc123", repo_name="api", repo_github="acme/api",
+            branch="issue-42-fix-chart-colors", target_branch="main",
+            issue_number=42, issue_title="t",
+        )
+        board = load_board()
+        assert mq.requires_uat(entry, cfg) is True
+        assert mq.passes_merge_gates(entry, cfg, board) is False
+
+        CliRunner().invoke(main, [
+            "uat", "abc123", "--passed", "--config", str(config_file_with_uat_live_preview),
         ])
         board = load_board()
         assert mq.passes_merge_gates(entry, cfg, board) is True
