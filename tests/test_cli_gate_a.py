@@ -118,6 +118,81 @@ class TestGateACommand:
         assert result.exit_code == 0, result.output
         assert "approved" in result.output
 
+    def test_read_only_invocation_surfaces_an_unmerged_amend_branch(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#3065: the incident this issue reports — an approved contract
+        reads clean while an approved-but-unmerged `--amend` branch sits on
+        the board. The read path must say so, without changing the exit
+        code (this is enrichment, not a new refusal)."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        _run(config_file, ["--approved", "api", "900"], contract=CONTRACT_V1)
+
+        mock_author = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=900,
+            issue_title="[gate-a-amend] ms-37 — contract correction",
+            assignment_id="mock-1",
+            status="done",
+            branch="issue-900-gate-a-amend-1",
+            type="mock-author",
+            dispatched_at=1000.0,
+        )
+        review = Assignment(
+            machine_name="desktop",
+            repo_name="api",
+            issue_number=900,
+            issue_title="review",
+            assignment_id="review-1",
+            status="done",
+            type="review",
+            review_of_assignment_id="mock-1",
+            review_verdict="approve",
+            dispatched_at=2000.0,
+        )
+        save_board(Board(completed=[mock_author, review]))
+
+        with patch("coord.github_ops.pr_is_merged", return_value=False):
+            result = _run(config_file, ["api", "900"], contract=CONTRACT_V1)
+
+        assert result.exit_code == 0, result.output
+        assert "issue-900-gate-a-amend-1" in result.output
+        assert "review: approve" in result.output
+        assert "NOT that branch" in result.output
+
+    def test_read_only_invocation_omits_the_amend_note_once_merged(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Once the branch merges, the contract on main moves and
+        `evaluate()`'s own STATE_STALE takes over — this note must not
+        double-report the same fact."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        _run(config_file, ["--approved", "api", "900"], contract=CONTRACT_V1)
+
+        mock_author = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=900,
+            issue_title="[gate-a-amend] ms-37 — contract correction",
+            assignment_id="mock-1",
+            status="done",
+            branch="issue-900-gate-a-amend-1",
+            type="mock-author",
+            dispatched_at=1000.0,
+        )
+        save_board(Board(completed=[mock_author]))
+
+        with patch("coord.github_ops.pr_is_merged", return_value=True):
+            result = _run(config_file, ["api", "900"], contract=CONTRACT_V1)
+
+        assert result.exit_code == 0, result.output
+        assert "waiting to merge" not in result.output
+
     def test_read_only_invocation_reports_a_stale_approval(
         self, config_file: Path, coord_db
     ) -> None:
