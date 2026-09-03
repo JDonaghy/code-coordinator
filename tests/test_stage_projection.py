@@ -804,6 +804,57 @@ def test_board_projection_resolves_preview_url_for_opted_in_issue():
     assert out[0]["uat_preview_url"] == "https://issue-1-impl.example.dev/"
 
 
+def test_repo_has_uat_preview_true_for_uat_live_preview_only_repo():
+    """#2948: `repo_has_uat_preview` must answer "opted in" the same way
+    `coord.merge_queue.requires_uat` does — `uat_preview` OR
+    `uat_live_preview`, either one alone sufficient. A repo with no
+    templatable preview host (natal-chart's actual situation) opts in via
+    `uat_live_preview` alone; before this fix the badge never lit up for
+    it even though `coord merge` was enforcing the gate."""
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_live_preview=True),
+    ])
+    assert sp.repo_has_uat_preview("api", config) is True
+
+
+def test_repo_has_uat_preview_false_when_neither_set():
+    config = _StubConfig([Repo(name="api", github="acme/api")])
+    assert sp.repo_has_uat_preview("api", config) is False
+
+
+def test_uat_preview_url_for_returns_none_for_uat_live_preview_only_repo():
+    """This module does no I/O (see module docstring), so it can't run the
+    live GitHub-Deployment lookup `uat_live_preview` opts into — it can only
+    render `uat_preview`'s override template. `None` here is the documented
+    best-effort answer, not the #2948 bug (a rendered-but-dead URL)."""
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_live_preview=True),
+    ])
+    assert sp.uat_preview_url_for("api", 1, None, config) is None
+
+
+def test_board_projection_shows_uat_badge_for_uat_live_preview_only_repo():
+    """#2948: the board must surface the "uat" badge (and gate state) for a
+    repo opted in via `uat_live_preview` alone, even though it can't also
+    surface a clickable preview URL here (no I/O in this module) — an
+    operator must see the gate is active, not a clean board that then
+    silently refuses to merge."""
+    config = _StubConfig([
+        Repo(name="api", github="acme/api", uat_live_preview=True),
+    ])
+    issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
+    assignments = [_work(status="done", dispatched_at=1.0, uat_state="passed")]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=[],
+        default_gates=["test", "review", "uat", "merge"],
+        config=config,
+    )
+    assert out[0]["stages"]["uat"] == sp.DONE
+    assert out[0]["uat_preview_url"] is None
+
+
 # ── compute_board_stage_projection ──────────────────────────────────────────
 
 

@@ -715,9 +715,24 @@ def repo_has_uat_preview(repo_name: str, config: Any | None) -> bool:
     """The per-repo half of ``coord.merge_queue.requires_uat``'s two-part
     UAT opt-in (#2687) — the fleet-wide half (``"uat" in default_gates``) is
     threaded separately as ``uat_enabled`` (see :func:`pipeline_stage_names`).
+
+    #2948: mirrors ``requires_uat``'s own per-repo check exactly — ``True``
+    when *either* ``Repo.uat_preview`` (the override template) or
+    ``Repo.uat_live_preview`` (the live GitHub-Deployment lookup) is set.
+    Before this fix the badge only ever lit up for ``uat_preview``, so a
+    repo that opted in via ``uat_live_preview`` alone — the shape this PR's
+    own docs recommend for a project with no templatable preview host —
+    read as "gate off" on the board while ``coord merge`` was actively
+    blocking on it. Answering "has this repo opted in" any other way here
+    than ``requires_uat`` does is exactly the split-brain #2948 exists to
+    close.
     """
     repo = _repo_for(repo_name, config)
-    return bool(repo is not None and getattr(repo, "uat_preview", None))
+    if repo is None:
+        return False
+    return bool(getattr(repo, "uat_preview", None)) or bool(
+        getattr(repo, "uat_live_preview", False)
+    )
 
 
 def uat_preview_url_for(
@@ -730,7 +745,22 @@ def uat_preview_url_for(
     3) — mirrors the preview-resolution half of ``coord.merge_queue.
     evaluate_uat_verdict`` (minus its ``coord uat`` command text, which the
     caller can build itself from the assignment id it already has). Returns
-    ``None`` when the repo isn't configured or hasn't opted in."""
+    ``None`` when the repo isn't configured or hasn't opted in.
+
+    #2948: this module is pure computation (see the module docstring — no
+    I/O), so unlike ``evaluate_uat_verdict`` this can only ever render
+    ``Repo.uat_preview``'s override template — it has no ``gh_ops`` to run
+    the live GitHub-Deployment lookup ``Repo.uat_live_preview`` opts into.
+    For a repo configured with ``uat_live_preview`` alone this therefore
+    returns ``None`` even though :func:`repo_has_uat_preview` now reports
+    the repo as opted in (both intentional — see that function's docstring):
+    the caller (``compute_board_stage_projection``) still surfaces the "uat"
+    badge and gate state from ``uat_enabled``, just without a clickable URL
+    in this code path — a deliberately best-effort, template-only surface,
+    not the #2948 bug class (a plausible but dead link) reappearing. A
+    caller that wants the live URL server-side must call
+    ``coord.merge_queue.evaluate_uat_verdict``/``_resolve_uat_preview_url``
+    (with a real ``gh_ops``) instead."""
     repo = _repo_for(repo_name, config)
     if repo is None:
         return None
