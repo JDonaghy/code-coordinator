@@ -818,7 +818,12 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         )
         click.echo(
             "  · `test_command`/`ci_command`, `smoke_tests.capability_rules`, "
-            "and (if it joins the oracle loop) `acceptance.drivers`"
+            "and (if it joins the oracle loop) `acceptance.drivers` — the "
+            "`coord repo doctor --fix` report above already graded these "
+            "against what this repo is actually enrolled in (#3073): missing "
+            "test_command FAILS, a missing uat_preview/uat_live_preview on a "
+            "portal-linked repo WARNS that `quality-check` is unreachable, "
+            "and tests/acceptance/ already authored with no driver FAILS"
         )
         return
     _print_add_residue(
@@ -1114,7 +1119,14 @@ def _print_add_residue(
     click.echo(
         "  6. set `test_command`/`ci_command`, `smoke_tests.capability_rules` "
         "for this repo's paths, and (if it joins the oracle loop) "
-        "`acceptance.drivers`."
+        "`acceptance.drivers`. `coord repo doctor` now grades each of these "
+        "by what this repo is ACTUALLY enrolled in (#3073), not a fixed "
+        "list: no test_command FAILS (the Test gate silently no-ops "
+        "without it); a portal-linked repo with neither `uat_preview` nor "
+        "`uat_live_preview` WARNS that `quality-check` is unreachable; an "
+        "acceptance `kind` declared ahead of its adapter WARNS (legal) "
+        "rather than failing; a repo with `tests/acceptance/` already "
+        "authored but no driver entry FAILS."
     )
     # #2237: layer 5 used to be one vague line here and nothing else — so
     # every repo onboarded from this command started with no graph, and the
@@ -2012,19 +2024,26 @@ def _print_create_residue(
     )
     if driver_written:
         click.echo(
-            "  Also worth doing by hand, not doctor-checked: set "
-            "`test_command`/`ci_command` and `smoke_tests.capability_rules` "
-            "for this repo's paths. `acceptance.drivers` is already written "
-            "(#2748) — `coord repo doctor` reports its readiness as layer 6."
+            "  Also worth doing by hand: set `test_command`/`ci_command` and "
+            "`smoke_tests.capability_rules` for this repo's paths — a missing "
+            "test_command is a `coord repo doctor` FAIL, not just a chore, "
+            "since the Test gate silently no-ops without it (#3073). "
+            "`acceptance.drivers` is already written (#2748) — `coord repo "
+            "doctor` reports its readiness as layer 6, including a WARN if "
+            "the declared `kind` outruns its adapter."
         )
     else:
         click.echo(
-            "  Also worth doing by hand, not doctor-checked: set "
-            "`test_command`/`ci_command` and `smoke_tests.capability_rules` "
-            "for this repo's paths, and (if it joins the oracle loop) "
+            "  Also worth doing by hand: set `test_command`/`ci_command` and "
+            "`smoke_tests.capability_rules` for this repo's paths — a "
+            "missing test_command is a `coord repo doctor` FAIL, not just a "
+            "chore (#3073) — and (if it joins the oracle loop) "
             "`acceptance.drivers` — `--template python|node` writes one "
             "automatically; `--template generic` leaves it for later since "
-            "the stack isn't decided yet (#2748)."
+            "the stack isn't decided yet (#2748). If this repo is ever "
+            "linked to a portal submission, `coord repo doctor` also WARNs "
+            "when neither `uat_preview` nor `uat_live_preview` is set — "
+            "without one, `quality-check` is unreachable for it."
         )
     click.echo("")
     click.echo(f"Then: coord repo doctor {name}")
