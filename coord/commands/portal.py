@@ -2147,6 +2147,137 @@ def portal_ledger(submission_id: str, as_json: bool) -> None:
     click.echo(_render_ledger_text(payload))
 
 
+# ── #3071: `coord journal` — one submission's run, in order ────────────────
+#
+# Top-level, not under `coord portal`, on purpose: the question it answers
+# ("what is happening with my project") is asked BY a client and answered
+# mid-screen-share, not by an operator already thinking in bridge internals.
+# It is also read-only and never-raises, unlike most of this file.
+
+
+#: Kinds rendered with a friendlier label than their raw wire `kind`. Anything
+#: missing falls through to the wire value, so a kind added later (the schema
+#: comment in `coord.db` is explicit that `kind` stays open-ended) still
+#: renders — unlabelled, never dropped.
+_JOURNAL_KIND_LABELS = {
+    "question_pushed": "asked",
+    "question_answered": "answered",
+    "answer_confirmed": "confirmed",
+    "operator_note": "note",
+    "draft_edited": "draft edited",
+    "draft_approved": "draft approved",
+    "draft_rejected": "draft rejected",
+    "status_changed": "status",
+    "design_round_published": "design round",
+    "signoff_recorded": "sign-off",
+    "preview_published": "preview",
+    "work_started": "work started",
+    "work_shipped": "shipped",
+    "dispatched": "dispatched",
+    "merged": "merged",
+}
+
+
+def _journal_when(ts) -> str:
+    """*ts* as ``YYYY-MM-DD HH:MM UTC``, or ``"?"`` for an unreadable stamp.
+
+    Degrades rather than raising, same as every other read on this path: an
+    entry with a broken timestamp still belongs on the timeline.
+    """
+    try:
+        return datetime.datetime.fromtimestamp(
+            float(ts), tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _render_journal_text(payload: dict) -> str:
+    """The human render of :func:`coord.portal_store.render_journal_payload`.
+
+    Gaps are printed, not hidden: "the audit trail could not be read" is
+    itself part of the answer to "what happened", and a silently short
+    timeline is exactly the failure mode this command exists to end.
+    """
+    lines = [f"# Journal — {payload.get('submission_id', '')}"]
+    link = payload.get("link")
+    if link:
+        scope = (
+            f"ms-{link.get('milestone_number')}"
+            if link.get("milestone_number") is not None
+            else f"issue #{link.get('issue_number')}"
+        )
+        lines.append(f"linked to {link.get('repo_name')} {scope}")
+
+    entries = payload.get("entries") or []
+    lines.append("")
+    if not entries:
+        lines.append("(no recorded activity yet)")
+    for entry in entries:
+        label = _JOURNAL_KIND_LABELS.get(entry.get("kind", ""), entry.get("kind", ""))
+        actor = entry.get("actor") or ""
+        who = f" [{actor}]" if actor else ""
+        lines.append(f"{_journal_when(entry.get('ts')):<20} {label}{who}")
+        text = (entry.get("text") or "").strip()
+        if text:
+            for line in text.splitlines():
+                lines.append(f"    {line}")
+        if entry.get("artifact"):
+            lines.append(f"    → {entry['artifact']}")
+
+    gaps = payload.get("gaps") or []
+    if gaps:
+        lines += ["", "## Gaps"]
+        lines += [f"- {g}" for g in gaps]
+    return "\n".join(lines)
+
+
+@click.command("journal")
+@click.argument("submission_id")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def journal(submission_id: str, as_json: bool) -> None:
+    """Print SUBMISSION_ID's run as one ordered timeline (#3071).
+
+    Intake to shipped, in the order it happened: questions and answers, the
+    design rounds published and what the customer signed off, previews, the
+    status transitions, and the dispatch/merge rows from the business tier of
+    the audit trail. Until now that answer had to be assembled by hand out of
+    `coord audit --tier business`, the outbox, the mirrored `customer_json`
+    and `coord report run usage`, none of which join up.
+
+    **Never fails.** An unlinked or unknown submission prints an empty
+    timeline and exits 0; an unreadable source becomes a line under "Gaps"
+    rather than a traceback. `--json` is the shape a renderer should build
+    against — every entry has `ts`, `kind`, `actor`, `text` and an `artifact`
+    that is null or a URL.
+
+    Reads the portal tables on THIS machine. On a thin client (one with
+    `board_service` set) those are empty by construction — the bridge's state
+    lives on the daemon host — so a note says so rather than letting an empty
+    timeline read as "nothing happened". The audit half routes to the daemon
+    on its own (`coord.state.list_audit_log`) and is correct either way.
+    """
+    from coord import board_service, portal_store  # noqa: PLC0415
+
+    payload = portal_store.render_journal_payload(submission_id)
+
+    if board_service.resolve() is not None:
+        payload = {
+            **payload,
+            "gaps": [
+                *payload.get("gaps", []),
+                "this machine is a thin client — the portal ledger, outbox and "
+                "event inbox live on the daemon host, so run `coord journal` "
+                "there for the portal half of the timeline (#2336)",
+            ],
+        }
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    click.echo(_render_journal_text(payload))
+
+
 @portal_group.command("note")
 @click.argument("submission_id")
 @click.argument("text")

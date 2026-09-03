@@ -2444,3 +2444,501 @@ class TestNeedsInputAndAnswerPreflightRouteToTheDaemon:
         monkeypatch.setattr(cc.httpx, "get", fake_get)
 
         assert answer_preflight("sub_nope") is None
+
+
+# ── #3071: `coord journal` — one submission's run, in order ────────────────
+#
+# The join half of #3071 (the emission half lives in
+# `tests/test_portal_sync.py`): `portal_ledger` + the applied outbox + the
+# sign-off inbox + the business tier of the audit trail, folded into one
+# ordered, timestamped narrative — and the CLI that renders it.
+#
+# The black-box bar (CLAUDE.md, "Testing"): `TestJournalCommand` below drives
+# the real `coord journal` through Click's runner and asserts on rendered
+# stdout, not just on the aggregator's return value.
+
+JSUB = "sub-journal"
+
+
+def _seed_applied(kind: str, fields: dict, *, now: float):
+    """Queue a coord-owned fact and mark it applied, as a successful push
+    does — the state the journal's outbox fold reads."""
+    from coord import portal_store
+
+    row = portal_store.enqueue(JSUB, kind, fields, now=now)
+    portal_store.mark_applied(row, now=now)
+    return row
+
+
+def _seed_signoff(verdict: str = "approved", comments: str = "ship it", *, now: float):
+    from coord import portal_store
+
+    portal_store.record_events(
+        [
+            {
+                "id": f"ev-{verdict}",
+                "submission_id": JSUB,
+                "type": f"signoff.{verdict}",
+                "data": {"verdict": verdict, "comments": comments},
+            }
+        ],
+        now=now,
+    )
+
+
+class TestJournalUrl:
+    """`artifact` is contract-bound to "null or a URL" (#3071's `--json`
+    bullet), so a bare R2 object key must not be smuggled into it."""
+
+    def test_accepts_real_urls(self) -> None:
+        from coord.portal_store import _journal_url
+
+        assert _journal_url("https://pr-7.pages.dev") == "https://pr-7.pages.dev"
+        assert _journal_url("r2://bundles/1") == "r2://bundles/1"
+
+    def test_rejects_a_bare_object_key_and_junk(self) -> None:
+        from coord.portal_store import _journal_url
+
+        assert _journal_url("bundles/sub-001/r1.tar") is None
+        assert _journal_url("") is None
+        assert _journal_url(None) is None
+        assert _journal_url(7) is None
+        assert _journal_url("://nope") is None
+
+
+class TestPreviewPublishedLedgerRow:
+    """#3071: `enqueue-preview`'s APPLY path — the moment the customer can
+    actually open it, not the moment it was queued."""
+
+    def test_applying_a_preview_row_ledgers_it_with_the_url(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = _seed_applied("preview", {"preview_url": "https://pr-7.pages.dev"}, now=10.0)
+
+        [entry] = portal_store.ledger_for_submission(JSUB)
+        assert entry.kind == portal_store.LEDGER_KIND_PREVIEW_PUBLISHED
+        assert entry.text == "https://pr-7.pages.dev"
+        assert entry.source_event_id == portal_store.outbox_source_key(row.id)
+
+    def test_re_applying_the_same_row_does_not_duplicate(self, coord_db) -> None:
+        from coord import portal_store
+
+        row = portal_store.enqueue(
+            JSUB, "preview", {"preview_url": "https://pr-7.pages.dev"}
+        )
+        portal_store.mark_applied(row)
+        portal_store.mark_applied(row)
+
+        assert len(portal_store.ledger_for_submission(JSUB)) == 1
+
+    def test_a_status_row_is_not_mistaken_for_a_preview(self, coord_db) -> None:
+        from coord import portal_store
+
+        _seed_applied("status", {"status": "planned"}, now=10.0)
+        assert portal_store.ledger_for_submission(JSUB) == []
+
+
+class TestJournalIssueNumbers:
+    def test_an_issue_scoped_link_names_exactly_its_own_issue(self, coord_db) -> None:
+        from coord import portal_store
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        link = portal_store.get_link_by_submission(JSUB)
+        assert portal_store.journal_issue_numbers(JSUB, link) == [42]
+
+    def test_a_milestone_link_reads_the_design_round_decomposition(
+        self, coord_db
+    ) -> None:
+        """A `PortalLink` carries only the milestone number, and resolving its
+        members off GitHub is a live call this read must never make. The set
+        coord already told the CUSTOMER about is the right one."""
+        from coord import portal_store
+
+        portal_store.link_milestone(
+            repo_name="acme", milestone_number=4, submission_id=JSUB
+        )
+        _seed_applied(
+            "design_round",
+            {
+                "design_round": {
+                    "round": 1,
+                    "bundle_key": "r2://bundles/4",
+                    "decomposition": [
+                        {"issue_number": 11}, {"issue_number": 9}, {"group": "x"},
+                    ],
+                }
+            },
+            now=10.0,
+        )
+        link = portal_store.get_link_by_submission(JSUB)
+        assert portal_store.journal_issue_numbers(JSUB, link) == [9, 11]
+
+    def test_no_link_and_no_decomposition_resolve_to_nothing(self, coord_db) -> None:
+        from coord import portal_store
+
+        assert portal_store.journal_issue_numbers(JSUB, None) == []
+        portal_store.link_milestone(
+            repo_name="acme", milestone_number=4, submission_id=JSUB
+        )
+        link = portal_store.get_link_by_submission(JSUB)
+        assert portal_store.journal_issue_numbers(JSUB, link) == []
+
+
+class TestRenderJournalPayload:
+    def test_an_unlinked_submission_is_an_empty_timeline_not_an_error(
+        self, coord_db
+    ) -> None:
+        """#3071's second acceptance bullet."""
+        from coord import portal_store
+
+        payload = portal_store.render_journal_payload("sub-never-seen")
+
+        assert payload["entries"] == []
+        assert payload["link"] is None
+        assert any("no repo/milestone linked" in g for g in payload["gaps"])
+
+    def test_every_entry_carries_the_pinned_keys(self, coord_db) -> None:
+        """The `--json` contract a renderer builds against: `ts`, `kind`,
+        `actor`, `text`, and an `artifact` that is null or a URL."""
+        from coord import portal_store
+
+        _seed_applied("preview", {"preview_url": "https://pr-7.pages.dev"}, now=30.0)
+        _seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "r2://bundles/4"}},
+            now=20.0,
+        )
+        _seed_signoff(now=40.0)
+
+        payload = portal_store.render_journal_payload(JSUB)
+
+        assert payload["entries"]
+        for entry in payload["entries"]:
+            assert set(entry) >= {"ts", "kind", "actor", "text", "artifact"}
+            assert isinstance(entry["ts"], float)
+            assert isinstance(entry["kind"], str) and entry["kind"]
+            assert isinstance(entry["actor"], str)
+            assert isinstance(entry["text"], str)
+            assert entry["artifact"] is None or "://" in entry["artifact"]
+
+    def test_entries_are_ordered_oldest_first(self, coord_db) -> None:
+        from coord import portal_store
+
+        _seed_signoff(now=40.0)
+        _seed_applied("preview", {"preview_url": "https://pr-7.pages.dev"}, now=30.0)
+        _seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "r2://bundles/4"}},
+            now=20.0,
+        )
+
+        kinds = [e["kind"] for e in portal_store.render_journal_payload(JSUB)["entries"]]
+        assert kinds == [
+            portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED,
+            portal_store.LEDGER_KIND_PREVIEW_PUBLISHED,
+            portal_store.LEDGER_KIND_SIGNOFF_RECORDED,
+        ]
+
+    def test_a_design_round_published_before_this_shipped_still_renders(
+        self, coord_db
+    ) -> None:
+        """The ledger has no UPDATE path and backfilling one would be a
+        fiction, so a round pushed before #3071 is read off the applied
+        outbox row that IS the durable record of it — bundle key included."""
+        from coord import portal_store
+
+        _seed_applied(
+            "design_round",
+            {"design_round": {"round": 2, "bundle_key": "r2://bundles/4"}},
+            now=20.0,
+        )
+
+        [entry] = portal_store.render_journal_payload(JSUB)["entries"]
+        assert entry["kind"] == portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED
+        assert entry["source"] == portal_store.JOURNAL_SOURCE_OUTBOX
+        assert entry["text"] == "design round R2 published (bundle r2://bundles/4)"
+        assert entry["artifact"] == "r2://bundles/4"
+
+    def test_a_ledgered_design_round_is_not_also_shown_from_the_outbox(
+        self, coord_db
+    ) -> None:
+        from coord import portal_store
+
+        row = _seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "r2://bundles/4"}},
+            now=20.0,
+        )
+        portal_store.append_ledger_entry(
+            JSUB,
+            portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED,
+            text="design round R1 published (bundle r2://bundles/4)",
+            actor="coord",
+            source_event_id=portal_store.outbox_source_key(row.id),
+            payload={"bundle_key": "r2://bundles/4"},
+            now=21.0,
+        )
+
+        entries = portal_store.render_journal_payload(JSUB)["entries"]
+        rounds = [
+            e for e in entries
+            if e["kind"] == portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED
+        ]
+        assert len(rounds) == 1
+        assert rounds[0]["source"] == portal_store.JOURNAL_SOURCE_LEDGER
+
+    def test_a_ledgered_signoff_is_not_also_shown_from_the_inbox(
+        self, coord_db
+    ) -> None:
+        from coord import portal_store
+
+        _seed_signoff(now=40.0)
+        portal_store.append_ledger_entry(
+            JSUB,
+            portal_store.LEDGER_KIND_SIGNOFF_RECORDED,
+            text="sign-off: approved — ship it",
+            actor="customer",
+            source_event_id="ev-approved",
+            payload={"verdict": "approved"},
+            now=41.0,
+        )
+
+        entries = portal_store.render_journal_payload(JSUB)["entries"]
+        signoffs = [
+            e for e in entries
+            if e["kind"] == portal_store.LEDGER_KIND_SIGNOFF_RECORDED
+        ]
+        assert len(signoffs) == 1
+        assert signoffs[0]["source"] == portal_store.JOURNAL_SOURCE_LEDGER
+
+    def test_a_pending_outbox_row_is_not_yet_a_published_artifact(
+        self, coord_db
+    ) -> None:
+        from coord import portal_store
+
+        portal_store.enqueue(
+            JSUB, "preview", {"preview_url": "https://pr-7.pages.dev"}
+        )
+        assert portal_store.render_journal_payload(JSUB)["entries"] == []
+
+    def test_business_tier_dispatch_and_merge_rows_are_folded_in(
+        self, coord_db
+    ) -> None:
+        """`--tier business` is exactly the right filter and the split exists
+        for this: operational-tier housekeeping is not what "what is
+        happening with my project" means."""
+        from coord import portal_store
+        from coord.audit import record_audit
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        record_audit(
+            tier="business", category="dispatch", event_type="dispatched",
+            actor="drive", summary="Dispatched work to precision: acme#42",
+            repo="acme", issue=42, ts=50.0,
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: acme#42",
+            repo="acme", issue=42, ts=60.0,
+        )
+        record_audit(
+            tier="business", category="review", event_type="review_approved",
+            actor="coordinator", summary="Review approved: acme#42",
+            repo="acme", issue=42, ts=55.0,
+        )
+        record_audit(
+            tier="operational", category="tick", event_type="dispatched",
+            actor="daemon", summary="tick housekeeping",
+            repo="acme", issue=42, ts=51.0,
+        )
+
+        entries = portal_store.render_journal_payload(JSUB)["entries"]
+        assert [(e["kind"], e["actor"]) for e in entries] == [
+            ("dispatched", "drive"), ("merged", "coordinator"),
+        ]
+        assert entries[0]["source"] == portal_store.JOURNAL_SOURCE_AUDIT
+
+    def test_another_submissions_issue_never_leaks_into_this_timeline(
+        self, coord_db
+    ) -> None:
+        """Two submissions in one repo is the normal case; showing each
+        client the other's dispatches is not an option."""
+        from coord import portal_store
+        from coord.audit import record_audit
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: acme#99",
+            repo="acme", issue=99, ts=60.0,
+        )
+
+        assert portal_store.render_journal_payload(JSUB)["entries"] == []
+
+    def test_an_unreadable_audit_trail_is_a_gap_not_an_exception(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import portal_store, state
+
+        portal_store.link_issue(
+            repo_name="acme", issue_number=42, submission_id=JSUB
+        )
+
+        def _boom(**_kw):
+            raise RuntimeError("daemon unreachable")
+
+        monkeypatch.setattr(state, "list_audit_log", _boom)
+
+        payload = portal_store.render_journal_payload(JSUB)
+        assert any("daemon unreachable" in g for g in payload["gaps"])
+
+    def test_an_unreadable_ledger_is_a_gap_not_an_exception(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import portal_store
+
+        def _boom(_submission_id):
+            raise RuntimeError("locked database")
+
+        monkeypatch.setattr(portal_store, "ledger_for_submission", _boom)
+
+        payload = portal_store.render_journal_payload(JSUB)
+        assert payload["entries"] == []
+        assert any("ledger unreadable" in g for g in payload["gaps"])
+
+    def test_the_qa_history_already_on_the_ledger_is_part_of_the_timeline(
+        self, coord_db
+    ) -> None:
+        from coord import portal_store
+
+        portal_store.append_ledger_entry(
+            JSUB, portal_store.LEDGER_KIND_QUESTION_PUSHED,
+            question_revision=1, text="Offline-first?", actor="coord", now=5.0,
+        )
+        portal_store.append_ledger_entry(
+            JSUB, portal_store.LEDGER_KIND_QUESTION_ANSWERED,
+            question_revision=1, text="Yes.", actor="jane",
+            source_event_id="ev-answer", now=6.0,
+        )
+
+        entries = portal_store.render_journal_payload(JSUB)["entries"]
+        assert [(e["kind"], e["text"]) for e in entries] == [
+            ("question_pushed", "Offline-first?"),
+            ("question_answered", "Yes."),
+        ]
+
+
+class TestJournalCommand:
+    """Black-box: the real `coord journal`, driven end to end, asserted on
+    its rendered output."""
+
+    def _run(self, *args):
+        from click.testing import CliRunner
+
+        from coord.cli import main
+
+        return CliRunner().invoke(main, ["journal", *args])
+
+    def test_renders_the_run_in_order_with_the_bundle_reference(
+        self, coord_db
+    ) -> None:
+        from coord import portal_store
+
+        portal_store.link_milestone(
+            repo_name="acme", milestone_number=4, submission_id=JSUB
+        )
+        _seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "r2://bundles/4"}},
+            now=1_700_000_000.0,
+        )
+        _seed_signoff(now=1_700_000_100.0)
+
+        result = self._run(JSUB)
+
+        assert result.exit_code == 0, result.output
+        assert f"# Journal — {JSUB}" in result.output
+        assert "linked to acme ms-4" in result.output
+        assert "r2://bundles/4" in result.output
+        design_at = result.output.index("design round")
+        signoff_at = result.output.index("sign-off")
+        assert design_at < signoff_at
+        assert "ship it" in result.output
+
+    def test_an_unlinked_submission_prints_an_empty_timeline_and_exits_zero(
+        self, coord_db
+    ) -> None:
+        result = self._run("sub-never-seen")
+
+        assert result.exit_code == 0, result.output
+        assert "(no recorded activity yet)" in result.output
+        assert "## Gaps" in result.output
+
+    def test_json_is_the_shape_a_renderer_builds_against(self, coord_db) -> None:
+        import json as _json
+
+        from coord import portal_store
+
+        portal_store.link_milestone(
+            repo_name="acme", milestone_number=4, submission_id=JSUB
+        )
+        _seed_applied(
+            "preview", {"preview_url": "https://pr-7.pages.dev"}, now=1_700_000_000.0,
+        )
+
+        result = self._run(JSUB, "--json")
+
+        assert result.exit_code == 0, result.output
+        payload = _json.loads(result.output)
+        assert payload["submission_id"] == JSUB
+        assert payload["link"]["repo_name"] == "acme"
+        assert isinstance(payload["gaps"], list)
+        [entry] = payload["entries"]
+        assert set(entry) >= {"ts", "kind", "actor", "text", "artifact"}
+        assert entry["kind"] == "preview_published"
+        assert entry["artifact"] == "https://pr-7.pages.dev"
+
+    def test_json_stays_valid_when_a_source_is_unreadable(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A gap must never become a traceback on the one command a client is
+        watching over your shoulder."""
+        import json as _json
+
+        from coord import portal_store
+
+        def _boom(_submission_id):
+            raise RuntimeError("locked database")
+
+        monkeypatch.setattr(portal_store, "ledger_for_submission", _boom)
+
+        result = self._run(JSUB, "--json")
+
+        assert result.exit_code == 0, result.output
+        payload = _json.loads(result.output)
+        assert payload["entries"] == []
+        assert any("locked database" in g for g in payload["gaps"])
+
+    def test_a_thin_client_says_so_rather_than_reading_as_nothing_happened(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2336's failure mode, in this surface: the bridge's tables live on
+        the daemon host, so an empty timeline here means "wrong box", not
+        "no activity"."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        result = self._run(JSUB)
+
+        assert result.exit_code == 0, result.output
+        assert "thin client" in result.output

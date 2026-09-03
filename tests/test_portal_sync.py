@@ -2740,3 +2740,219 @@ class TestAnswerQuestionPushesOutbound:
             r for r in portal_store.outbox_for_submission(SUB)
             if r.kind == portal_sync.KIND_RELAYED_ANSWER
         ] == []
+
+
+# ── #3071: the run kinds — emitting a submission's timeline ────────────────
+#
+# `portal_ledger` was built to carry a submission's whole run and only ever
+# got Q&A rows. These tests are the "it now carries the rest" half; the join
+# and `coord journal` itself are covered in `tests/test_portal_store.py`.
+
+
+def _signoff_page(verdict: str = "approved", comments: str = "looks great") -> dict:
+    return {
+        "events": [
+            {
+                "id": "signoff-3071",
+                "submission_id": SUB,
+                "type": f"signoff.{verdict}",
+                "data": {"verdict": verdict, "comments": comments},
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+
+
+class TestLedgerSignoffEvents:
+    """#3071: every sign-off the customer records lands on the ledger —
+    including an `approved` one, which `_consume_verdicts` deliberately
+    dispatches nothing for and would therefore never have recorded."""
+
+    def test_an_approved_signoff_is_ledgered_with_its_comment(self) -> None:
+        client = FakeClient(pages=[_signoff_page()])
+        sync_tick(client=client)
+
+        [entry] = portal_store.ledger_for_submission(SUB)
+        assert entry.kind == portal_store.LEDGER_KIND_SIGNOFF_RECORDED
+        assert entry.text == "sign-off: approved — looks great"
+        assert entry.actor == "customer"
+        assert entry.source_event_id == "signoff-3071"
+        assert entry.payload["verdict"] == "approved"
+
+    def test_replaying_the_same_event_produces_no_duplicate_row(self) -> None:
+        """The acceptance bar's fourth bullet: the existing `INSERT OR
+        IGNORE` / `UNIQUE(submission_id, kind, source_event_id)` behaviour
+        must still hold for the NEW kinds."""
+        page = _signoff_page()
+        sync_tick(client=FakeClient(pages=[page]))
+        sync_tick(client=FakeClient(pages=[dict(page)]))
+
+        signoffs = [
+            e for e in portal_store.ledger_for_submission(SUB)
+            if e.kind == portal_store.LEDGER_KIND_SIGNOFF_RECORDED
+        ]
+        assert len(signoffs) == 1
+
+    def test_a_signoff_pulled_before_this_shipped_is_still_ledgered(self) -> None:
+        """The watermark reason `_ledger_signoff_events` exists: on every
+        existing install the verdict consumer's cursor has already moved past
+        the sign-offs an operator most wants a timeline for. Simulated here
+        by recording the event and advancing that watermark past it, exactly
+        as a pre-#3071 tick would have left things."""
+        event = _signoff_page(verdict="changes_requested", comments="bluer")["events"][0]
+        portal_store.record_events([event])
+        stored = portal_store.events_for_submission(SUB)[0]
+        portal_store.set_verdict_watermark(stored.received_at + 1, "zzz")
+
+        assert portal_sync._ledger_signoff_events() == 1
+        [entry] = portal_store.ledger_for_submission(SUB)
+        assert entry.text == "sign-off: changes_requested — bluer"
+
+    def test_a_non_signoff_event_is_not_ledgered(self) -> None:
+        portal_store.record_events(
+            [{"id": "e-created", "submission_id": SUB, "type": "created"}]
+        )
+        assert portal_sync._ledger_signoff_events() == 0
+        assert portal_store.ledger_for_submission(SUB) == []
+
+    def test_a_ledger_write_failure_does_not_stop_the_batch(self, monkeypatch) -> None:
+        portal_store.record_events(
+            [
+                {"id": "s1", "submission_id": SUB, "type": "signoff.approved"},
+                {"id": "s2", "submission_id": "sub-002", "type": "signoff.approved"},
+            ]
+        )
+        real = portal_store.append_ledger_entry
+
+        def flaky(submission_id, kind, **kw):
+            if submission_id == SUB:
+                raise RuntimeError("locked database")
+            return real(submission_id, kind, **kw)
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", flaky)
+
+        assert portal_sync._ledger_signoff_events() == 1
+        assert portal_store.ledger_for_submission(SUB) == []
+        assert len(portal_store.ledger_for_submission("sub-002")) == 1
+
+
+class TestLedgerDesignRoundPublished:
+    """#3071: written in `push_design_round_bundle` — the SHARED tail of
+    `coord portal publish-mocks` and PDR-3's merge hook — so a round
+    published either way lands on the timeline identically."""
+
+    def test_publishing_a_bundle_ledgers_the_round_and_its_bundle_key(self) -> None:
+        client = _UploadClient(bundle_key="bundles/sub-001/r2.tar")
+
+        _key, row = portal_sync.push_design_round_bundle(
+            client, SUB, {"contract.md": "x"},
+            milestone_title="ms-4", tracking_issue_title="Epic",
+            tracking_issue_body="body", round_number=2, config=_ungated(),
+        )
+
+        [entry] = portal_store.ledger_for_submission(SUB)
+        assert entry.kind == portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED
+        assert entry.text == "design round R2 published (bundle bundles/sub-001/r2.tar)"
+        assert entry.payload["bundle_key"] == "bundles/sub-001/r2.tar"
+        assert entry.source_event_id == portal_store.outbox_source_key(row.id)
+
+    def test_a_ledger_failure_does_not_fail_the_publish(self, monkeypatch) -> None:
+        """The round really has been uploaded and queued by this point; a
+        lost timeline row must not turn that into a raised error inside a
+        merge hook."""
+        def _boom(*_a, **_kw):
+            raise RuntimeError("locked database")
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", _boom)
+
+        key, row = portal_sync.push_design_round_bundle(
+            _UploadClient(), SUB, {"contract.md": "x"},
+            milestone_title="ms-4", tracking_issue_title="Epic",
+            tracking_issue_body="body", config=_ungated(),
+        )
+        assert key == "bundles/sub-001/r1.tar"
+        assert row.kind == portal_sync.KIND_DESIGN_ROUND
+
+
+class TestLedgerStatusChange:
+    """#3071: `status_changed` (plus `work_started`/`work_shipped`) is
+    written on `_fold_status_for_link`'s ENQUEUEING arm only."""
+
+    def _link_and_config(self):
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        return FakeConfig({"acme-portal": FakeRepoCfg()})
+
+    def test_work_starting_ledgers_both_status_changed_and_work_started(
+        self, monkeypatch
+    ):
+        config = self._link_and_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues",
+            lambda *a: [_issue(1, "OPEN"), _issue(2, "CLOSED")],
+        )
+
+        portal_sync.fold_status_for_milestone(
+            config, "acme-portal", 5, board=_board_with_started("acme-portal", {1}),
+        )
+
+        kinds = [e.kind for e in portal_store.ledger_for_submission(SUB)]
+        assert kinds == [
+            portal_store.LEDGER_KIND_STATUS_CHANGED,
+            portal_store.LEDGER_KIND_WORK_STARTED,
+        ]
+
+    def test_everything_closing_ledgers_work_shipped(self, monkeypatch):
+        config = self._link_and_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")],
+        )
+
+        portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        kinds = [e.kind for e in portal_store.ledger_for_submission(SUB)]
+        assert portal_store.LEDGER_KIND_WORK_SHIPPED in kinds
+
+    def test_the_unchanged_arm_writes_nothing(self, monkeypatch):
+        """The churn guard's whole point, restated in this surface: a
+        timeline that logged 'still planned' once per tick is the same
+        failure as re-mailing the customer."""
+        config = self._link_and_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "OPEN")],
+        )
+
+        portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        before = len(portal_store.ledger_for_submission(SUB))
+        for _tick in range(3):
+            portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert len(portal_store.ledger_for_submission(SUB)) == before
+
+    def test_planned_gets_a_status_row_but_no_work_milestone(self, monkeypatch):
+        config = self._link_and_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "OPEN")],
+        )
+
+        portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        kinds = [e.kind for e in portal_store.ledger_for_submission(SUB)]
+        assert kinds == [portal_store.LEDGER_KIND_STATUS_CHANGED]
+
+    def test_a_ledger_failure_still_reports_the_status_as_queued(self, monkeypatch):
+        config = self._link_and_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "OPEN")],
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("locked database")
+
+        monkeypatch.setattr(portal_store, "append_ledger_entry", _boom)
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        assert result.queued is True
+        assert result.failed is False
