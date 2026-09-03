@@ -2836,6 +2836,32 @@ def close_stale_prs(
     actions: list[str] = []
     dormant_skipped = 0
 
+    # #3063: a (repo_name, issue_number) -> work-like `type` lookup, same
+    # shape and same WORK_LIKE_TYPES scope as reconcile_board_merges sweep
+    # (e)'s `work_type_for` below. A test-author/mock-author row's PR head
+    # branch is named `issue-{N}-*` where N is the milestone's *tracking*
+    # issue, not this row's own deliverable (SEALED_PATH_AUTHOR_TYPES,
+    # coord/models.py) — a tracking epic is closed for most of a milestone's
+    # life while slices are still being authored against it, so trusting
+    # `issue_is_closed` below for one of these PRs closes it the instant the
+    # epic closes regardless of whether THIS PR's own branch ever landed.
+    # `merge_queue.enqueue_approved_work` already applies
+    # `trust_issue_closed_for` on the way in (#2639); without this lookup,
+    # this sweep undid that on the way back out — closing the PR the very
+    # next tick, `prune_stale_queue_entries` deleting the queue row, and
+    # auto-drain re-opening a new PR next tick: an infinite open/close loop
+    # (#3063). Built once per call from *board* when given; ``None`` when
+    # *board* is omitted (e.g. a direct/test call) degrades to today's
+    # behaviour (unconditionally trusting `issue_is_closed`) via
+    # `trust_issue_closed_for(None) == True`.
+    assignment_type_by_issue: dict[tuple[str, int], str] = {}
+    if board is not None:
+        for _a in board.active + board.completed:
+            if _a.type in WORK_LIKE_TYPES and _a.issue_number is not None:
+                key = (_a.repo_name, _a.issue_number)
+                if key not in assignment_type_by_issue:
+                    assignment_type_by_issue[key] = _a.type
+
     for repo_cfg in config.repos:
         if repo is not None and repo_cfg.name != repo:
             continue
@@ -2897,7 +2923,12 @@ def close_stale_prs(
                 )
                 pr_base = resolve_base_branch(repo_cfg, milestone_number)
 
-            if github_ops.issue_is_closed(repo_cfg.github, issue_number):
+            trust_issue_closed = trust_issue_closed_for(
+                assignment_type_by_issue.get((repo_cfg.name, issue_number))
+            )
+            if trust_issue_closed and github_ops.issue_is_closed(
+                repo_cfg.github, issue_number
+            ):
                 stale_reason = f"issue #{issue_number} is closed"
             elif github_ops.branch_is_fully_merged(
                 repo_cfg.github, branch, pr_base

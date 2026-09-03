@@ -6408,6 +6408,42 @@ class TestPruneStaleQueueEntries:
         assert pruned == []
         assert len(load_queue()) == 1
 
+    def test_mock_author_survives_closed_tracking_epic(self, coord_db, monkeypatch) -> None:
+        """#3063: a mock-author row's issue_number is the tracking epic, not
+        its own deliverable (#2639) — a closed epic must not prune it. Only
+        `pr_is_merged` (branch-scoped) may retire it.
+        """
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+        monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+
+        save_queue([
+            _q("mock-row", branch="issue-122-mock", assignment_type="mock-author"),
+        ])
+        pruned = mq.prune_stale_queue_entries()
+        assert pruned == []
+        assert [x.assignment_id for x in load_queue()] == ["mock-row"]
+
+    def test_mock_author_pruned_once_its_own_pr_merges(self, coord_db, monkeypatch) -> None:
+        """#3063: the carve-out doesn't wedge a mock-author row forever — once
+        its own branch is confirmed merged, pr_is_merged still prunes it.
+        """
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+        monkeypatch.setattr(
+            github_ops, "pr_is_merged",
+            lambda repo, branch: branch == "issue-122-mock",
+        )
+
+        save_queue([
+            _q("mock-row", branch="issue-122-mock", assignment_type="mock-author"),
+        ])
+        pruned = mq.prune_stale_queue_entries()
+        assert [x.assignment_id for x in pruned] == ["mock-row"]
+        assert load_queue() == []
+
 
 # ── #776: enqueued_at + size-at-enqueue-time ──────────────────────────────────
 
