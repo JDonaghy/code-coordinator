@@ -59,6 +59,78 @@ def _wants_mock_index(driver_mock_glob: str) -> bool:
     return driver_mock_glob.strip().lower().endswith(".html")
 
 
+def mock_matches_glob(name: str, driver_mock_glob: str) -> bool:
+    """Does mock file *name* belong to a bundle collected under
+    *driver_mock_glob*? (#3068)
+
+    The single filename test both bundle collectors use — the GitHub-side
+    :func:`collect_mock_bundle_files` and the local-checkout
+    ``coord.commands.portal._collect_local_mock_bundle_files`` — so an
+    on-demand `coord portal publish-mocks` and the merge-triggered auto-push
+    always publish the SAME set of files for a given repo.
+
+    Case-INSENSITIVE (``SCREEN.HTML`` matches ``*.html``) on every platform,
+    not just the case-folding ones `fnmatch.fnmatch` happens to fold on:
+    that keeps this aligned with the TUI's `gate_a_mocks_dir_exists_for`
+    enablement gate (#2513 review follow-up) — a file that lights the menu
+    item up must be a file the command actually publishes, or the operator
+    gets an enabled button whose dispatch dies with "nothing to publish".
+    """
+    return fnmatch.fnmatch(name.lower(), driver_mock_glob.strip().lower())
+
+
+def resolve_viewable_mock_glob(acceptance_cfg: Any, repo_name: str) -> tuple[str | None, str]:
+    """#3068: the ONE answer to "can this repo's Gate-A mocks be shown to a
+    customer in a browser, and if so which glob collects them?"
+
+    Returns ``(glob, "")`` when *repo_name*'s configured acceptance driver
+    renders browser-viewable mocks, and ``(None, reason)`` otherwise —
+    where *reason* is operator-facing prose naming why nothing should be
+    published. Every caller that puts a mock bundle in front of a paying
+    customer (the merge-triggered auto-push in
+    :func:`coord.merge_queue._maybe_push_design_round`, the on-demand
+    ``coord portal publish-mocks``) resolves through here, so the two paths
+    cannot drift apart the way they did before this issue: pre-#3068 both
+    hardcoded ``*.html``, and a partial fix left one right and one wrong.
+
+    Viewability itself is still :func:`_wants_mock_index`'s call (#2512's
+    "gate on the glob, not the driver name" rule) — this only adds the
+    resolution around it. A repo with no acceptance driver on file yields
+    ``None``: guessing ``*.html`` is what shipped a customer a design round
+    containing engineering prose and no screen.
+
+    Routed repos (#1125, ``acceptance.drivers.<repo>.routes``) have no
+    single driver without a *path*, and this deliberately has none to give —
+    a milestone is not one file. So it resolves across the routes instead:
+    every route agreeing on one viewable glob is an unambiguous answer, not
+    a guess, and is used. Routes that disagree (or any non-viewable route)
+    is genuinely unknowable here and skips with a reason, since publishing
+    the wrong route's mocks is worse than publishing none.
+    """
+    entry = (
+        acceptance_cfg.drivers.get(repo_name) if acceptance_cfg is not None else None
+    )
+    if entry is None:
+        return None, f"repo {repo_name!r} has no acceptance driver configured"
+
+    candidates = entry.routes or [entry]
+    globs = {c.mock.strip() for c in candidates}
+    if len(globs) > 1:
+        return None, (
+            f"repo {repo_name!r}'s acceptance routes declare different mock "
+            f"globs ({', '.join(sorted(repr(g) for g in globs))}) and a "
+            f"milestone-wide bundle can't pick one"
+        )
+
+    glob = globs.pop()
+    if not _wants_mock_index(glob):
+        return None, (
+            f"repo {repo_name!r}'s acceptance driver mock glob is not "
+            f"browser-viewable ({glob!r})"
+        )
+    return glob, ""
+
+
 def _mock_index_instruction(ms_dir: str) -> str:
     """#2512: the instruction text both briefing builders below hand the
     mock-author worker, verbatim — a *provided script* the worker runs as
@@ -422,10 +494,10 @@ def collect_mock_bundle_files(
     ``web-playwright``, ``"*.screen"`` for ``tui-tuidriver``), the same value
     :func:`build_mock_author_briefing` already threads through as
     ``driver_mock_glob``. This function does NOT hardcode ``*.html`` — it
-    collects whatever the repo's own driver actually renders, matched via
-    `fnmatch` against the mock directory's filenames. It also does NOT judge
-    whether that glob is browser-viewable — that is :func:`_wants_mock_index`'s
-    job (#2512), and callers that push the result somewhere that must be
+    collects whatever the repo's own driver actually renders, via the shared
+    :func:`mock_matches_glob`. It also does NOT judge whether that glob is
+    browser-viewable — that is :func:`resolve_viewable_mock_glob`'s job
+    (#2512/#3068), and callers that push the result somewhere that must be
     viewable in a browser (a portal design round) must consult it themselves
     before treating a non-empty return as pushable: a non-``*.html`` glob
     still returns real, non-empty mock content here, just content nobody can
@@ -445,7 +517,7 @@ def collect_mock_bundle_files(
         # explicit catch is only for a `gh` error shaped differently.
         mock_names = []
     for name in mock_names:
-        if fnmatch.fnmatch(name, driver_mock_glob):
+        if mock_matches_glob(name, driver_mock_glob):
             files[f"mocks/{name}"] = github_ops.get_repo_file(
                 repo_github, f"{ms_dir}/mocks/{name}", branch
             )

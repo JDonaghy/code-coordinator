@@ -2013,7 +2013,90 @@ class TestDesignRoundPushOnMerge:
         )
 
         assert events[-1].kind == "design_round_push_skipped"
-        assert "no driver configured" in events[-1].message
+        assert "no acceptance driver configured" in events[-1].message
+
+    def test_routed_repo_with_one_agreed_viewable_glob_still_pushes(
+        self, monkeypatch
+    ) -> None:
+        """#3068 review follow-up: a *routed* repo (#1125) has no flat driver,
+        but if every route declares the same browser-viewable glob the answer
+        is unambiguous — that's a resolution, not a guess, so the design round
+        must still push rather than silently regress to a skip."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        self._link()
+        cfg = self._config()
+        cfg.acceptance = AcceptanceConfig(
+            drivers={
+                "api": AcceptanceDriverConfig(
+                    routes=[
+                        AcceptanceDriverConfig(
+                            match="web/**", kind="web-playwright", mock="*.html",
+                        ),
+                        AcceptanceDriverConfig(
+                            match="api/**", kind="web-playwright", mock="*.html",
+                        ),
+                    ]
+                )
+            }
+        )
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda repo_github, milestone_number, branch, driver_mock_glob: (
+                {"contract.md": "# contract", "mocks/a.html": "<html>"}
+            ),
+        )
+        monkeypatch.setattr(
+            "httpx.post",
+            lambda *a, **k: _StubResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"}),
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_drafted", events[-1].message
+
+    def test_routed_repo_with_disagreeing_globs_skips_with_a_reason(
+        self, monkeypatch
+    ) -> None:
+        """#3068: routes that disagree on the mock glob genuinely can't be
+        resolved milestone-wide (a milestone isn't one file), and publishing
+        the wrong route's mocks to a customer is worse than publishing none —
+        so skip, naming the ambiguity rather than picking one."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        self._link()
+        cfg = self._config()
+        cfg.acceptance = AcceptanceConfig(
+            drivers={
+                "api": AcceptanceDriverConfig(
+                    routes=[
+                        AcceptanceDriverConfig(
+                            match="web/**", kind="web-playwright", mock="*.html",
+                        ),
+                        AcceptanceDriverConfig(
+                            match="tui/**", kind="tui-tuidriver", mock="*.screen",
+                        ),
+                    ]
+                )
+            }
+        )
+        called = []
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda *a, **k: called.append(1) or {},
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_push_skipped"
+        assert "different mock globs" in events[-1].message
+        assert called == []
 
     def test_upload_failure_degrades_to_a_failed_event_not_an_exception(
         self, monkeypatch,
