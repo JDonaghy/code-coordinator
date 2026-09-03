@@ -43,6 +43,67 @@ machines:
       api: ~/src/api
 """
 
+# #3073: a repo with no test_command/ci_command at all — the Test stage
+# cannot resolve a command and the gate silently no-ops without it.
+NO_TEST_COMMAND_CONFIG = """\
+repos:
+  - name: api
+    github: acme/api
+    depends_on: []
+    default_branch: main
+
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: [python]
+    repos: [api]
+    repo_paths:
+      api: ~/src/api
+  - name: dellserver
+    host: dellserver.tailnet
+    capabilities: [python]
+    repos: [api]
+    repo_paths:
+      api: ~/src/api
+"""
+
+# #3073: a `kind` declared ahead of its adapter — legal (SUPPORTED_KINDS is
+# the source of truth on what `run_driver()` will actually execute), so this
+# must WARN, never CRIT.
+UNSUPPORTED_KIND_CONFIG = CONFIG + """\
+acceptance:
+  drivers:
+    api:
+      kind: future-framework
+      run: "run the suite"
+"""
+
+# #3073: uat_preview configured — used to prove presence alone still WARNs
+# (#2948: a configured preview is not the same as a working one).
+UAT_PREVIEW_CONFIG = """\
+repos:
+  - name: api
+    github: acme/api
+    depends_on: []
+    default_branch: main
+    test_command: "make test"
+    uat_preview: "https://example.com/preview/{branch}"
+
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: [python]
+    repos: [api]
+    repo_paths:
+      api: ~/src/api
+  - name: dellserver
+    host: dellserver.tailnet
+    capabilities: [python]
+    repos: [api]
+    repo_paths:
+      api: ~/src/api
+"""
+
 
 @pytest.fixture
 def config_path(tmp_path):
@@ -204,6 +265,233 @@ class TestRepoDoctorCommand:
         )
         assert "machines.servable" in result.output
         assert "github.coord_label_present" in result.output
+
+
+class TestReadinessLayer:
+    """#3073: a repo can clear all five onboarding layers and still not be
+    fit for the pipeline it is actually enrolled in — no test_command, no
+    uat_preview on a portal-linked repo, or a milestone opted into the
+    oracle loop against a driver that was never configured. Severity is
+    driven by enrolment, not a fixed list."""
+
+    def test_no_test_command_fails_and_names_the_repo(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(NO_TEST_COMMAND_CONFIG)
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 1, result.output
+        assert "contents.test_command_unresolved" in result.output
+        assert "api" in result.output
+        assert "Test stage" in result.output
+
+    def test_kind_outside_supported_kinds_warns_not_fails(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(UNSUPPORTED_KIND_CONFIG)
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert "oracle.kind_unsupported" in result.output
+        assert "future-framework" in result.output
+
+    def test_tests_acceptance_authored_with_no_driver_fails(
+        self, config_path, monkeypatch
+    ):
+        """Someone already ran `coord acceptance mock` (tests/acceptance/
+        exists on the default branch) but coordinator.yml never got an
+        `acceptance.drivers` entry — not the legitimate 'hasn't joined yet'
+        WARN, a milestone here can be opted into a driver that doesn't
+        exist."""
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={
+                ".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#",
+                "tests/acceptance": "ms-01/contract.md",
+            },
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 1, result.output
+        assert "oracle.opted_in_no_driver" in result.output
+
+    def test_portal_linked_no_uat_preview_warns_quality_check_unreachable(
+        self, config_path, monkeypatch
+    ):
+        from coord import portal_store
+        from coord.config import load
+
+        portal_store.link_issue(repo_name="api", issue_number=1, submission_id="SUB-1")
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output  # WARN, not a gate
+        assert "contents.uat_preview_missing" in result.output
+        assert "quality-check" in result.output
+        assert "unreachable" in result.output
+
+    def test_unlinked_repo_with_no_uat_preview_is_silent(self, config_path, monkeypatch):
+        """A repo that has never been portal-linked has no timeline to
+        stall — the UAT-readiness check must not fire at all."""
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert "contents.uat_preview_missing" not in result.output
+        assert "contents.uat_preview_unverified" not in result.output
+
+    def test_portal_linked_uat_preview_configured_still_warns_unverified(
+        self, monkeypatch, tmp_path
+    ):
+        """#2948: a CONFIGURED uat_preview is not the same as a WORKING one
+        — presence alone must not read as green."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(UAT_PREVIEW_CONFIG)
+        from coord import portal_store
+        from coord.config import load
+
+        portal_store.link_issue(repo_name="api", issue_number=1, submission_id="SUB-1")
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output  # WARN, not a gate
+        assert "contents.uat_preview_missing" not in result.output
+        assert "contents.uat_preview_unverified" in result.output
+        assert "2948" in result.output
+
+    def test_fully_configured_repo_reports_clean(self, config_path, monkeypatch):
+        """No test_command gap, a supported driver kind, no unauthored
+        oracle evidence, and no portal link at all — the readiness layer
+        must add nothing to a repo that is genuinely fit for its pipeline."""
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        result = CliRunner().invoke(
+            repo_doctor, ["api", "--config", str(config_path)], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert "ok=true" in result.output
+        assert "contents.test_command_unresolved" not in result.output
+        assert "oracle.opted_in_no_driver" not in result.output
+        assert "contents.uat_preview_missing" not in result.output
+        assert "oracle.kind_unsupported" not in result.output
+
+    def test_fix_does_not_invent_test_command_or_preview_url(
+        self, monkeypatch, tmp_path
+    ):
+        """``--fix`` only repairs graphify's machine-local half — it must
+        never write a `test_command`/`uat_preview` into coordinator.yml on
+        the strength of a CRIT/WARN this layer reports (#3073)."""
+        import coord.commands.repo as repo_cmd
+
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(NO_TEST_COMMAND_CONFIG)
+        from coord.config import load
+
+        cfg = load(config_path)
+        monkeypatch.setattr(
+            network_mod, "check_all",
+            lambda *a, **k: [_status(m, ["api"]) for m in cfg.machines],
+        )
+        monkeypatch.setattr(repo_cmd, "_run_graph_fix", lambda *a, **k: None)
+        _stub_github(
+            monkeypatch,
+            labels=["coord", "tier:small", "tier:large"],
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": PR_WORKFLOW, "CLAUDE.md": "#"},
+        )
+        before = config_path.read_text()
+        result = CliRunner().invoke(
+            repo_doctor,
+            ["api", "--config", str(config_path), "--fix"],
+            catch_exceptions=False,
+        )
+        # Still fails (nothing was repaired) — but nothing was WRITTEN either.
+        assert result.exit_code == 1, result.output
+        assert config_path.read_text() == before
+        assert "test_command" not in config_path.read_text()
+        assert "uat_preview" not in config_path.read_text()
 
 
 class TestRepoAddCommand:
@@ -409,6 +697,29 @@ class TestRepoAddCommand:
         from coord.config import load
 
         assert load(tracked).repo("newrepo") is not None
+
+    def test_residue_names_the_new_readiness_checks_as_next_actions(
+        self, config_path, monkeypatch
+    ):
+        """#3073: `coord repo add` prints residue for what it deliberately
+        did NOT do — the readiness checks it now leaves for `coord repo
+        doctor` must be named as consequences, not left implicit."""
+        monkeypatch.setattr(github_ops, "get_repo_default_branch", lambda repo: "main")
+        monkeypatch.setattr(github_ops, "create_label", lambda *a, **k: None)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "newrepo", "--github", "acme/newrepo", "--machines", "laptop",
+                "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "3073" in result.output
+        assert "FAILS" in result.output
+        assert "quality-check" in result.output
+        assert "unreachable" in result.output
 
 
 class TestDoctorWiring:

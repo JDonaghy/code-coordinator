@@ -36,12 +36,26 @@ The five layers, and what each one silently costs when missed:
 
 A sixth, optional layer — **oracle** (#2748, IL-2) — reports oracle-loop
 readiness: whether ``acceptance.drivers`` declares this repo, whether its
-declared ``entrypoint:`` (if any) actually exists on disk, and whether its
+declared ``entrypoint:`` (if any) actually exists on disk, whether its
 driver depends on an input that hasn't shipped yet (``web-playwright``'s
-fixture server, #1538). Unlike the five layers above, having NO acceptance
-driver at all is not a defect — ``coord acceptance mock`` (Gate A) needs
-none — so this layer never CRITs on absence, only on a driver that claims
-to be wired but demonstrably is not.
+fixture server, #1538), and (#3073) whether a declared ``kind`` has a real
+adapter (``SUPPORTED_KINDS``) and whether the repo has already authored a
+Gate-A contract (``tests/acceptance/``) with no driver configured at all —
+the one shape "no driver" is NOT informational for. Unlike the five layers
+above, having NO acceptance driver at all is not by itself a defect —
+``coord acceptance mock`` (Gate A) needs none — so this layer only CRITs on
+a driver that claims to be wired but demonstrably is not, or on evidence
+that a milestone is already oracle-opted-in against a driver that was never
+configured.
+
+A seventh concern, folded into the **contents** layer rather than given its
+own (#3073) since it is configured the same way ``test_command`` is — a
+``repos[]`` field — reports whether a **portal-linked** repo (``coord
+portal link`` recorded against it) can actually reach the customer
+timeline's ``quality-check`` stage: that transition is refused by the
+preview guard without ``uat_preview``/``uat_live_preview``, and even a
+configured one is not verified to *resolve* until #2948 lands. An unlinked
+repo has no timeline to stall, so this is silent for the common case.
 
 Shape mirrors :mod:`coord.fleet_config_health` and :mod:`coord.graph_health`:
 a **facts** layer that does the I/O, a **pure** evaluator over those facts, and
@@ -154,6 +168,16 @@ class GithubFacts:
     # graphify-out/ line in it".
     root_gitignore_has_graphify_out: bool | None = None
     root_gitignore_error: str | None = None
+    # #3073: does `tests/acceptance/` exist on the default branch at all?
+    # Independent of `acceptance.drivers` in coordinator.yml — a non-empty
+    # answer here is direct evidence someone already ran `coord acceptance
+    # mock` / authored a Gate-A contract for this repo, i.e. it is
+    # oracle-opted-in IN PRACTICE even though coordinator.yml never caught
+    # up. See `evaluate_oracle`'s `oracle.opted_in_no_driver` CRIT — the
+    # "no driver yet" WARN is a legitimate intermediate state only when
+    # nothing has actually been authored against it yet.
+    acceptance_dir_present: bool | None = None
+    acceptance_dir_error: str | None = None
 
 
 @dataclass
@@ -277,6 +301,27 @@ class AcceptanceFacts:
 
 
 @dataclass
+class PortalFacts:
+    """Whether this repo is linked to a customer-portal submission at all
+    (#3073) — read from the LOCAL ``portal_store``, never GitHub.
+
+    ``coord portal link`` records a ``(repo, milestone|issue) ->
+    submission_id`` mapping; ANY such link ties this repo to the customer
+    timeline, whose ``quality-check`` transition is refused by the preview
+    guard when the repo has no ``uat_preview``/``uat_live_preview`` (see
+    ``evaluate_contents``'s UAT checks). A repo with no link at all has no
+    timeline to stall, so ``linked=False`` is silence, not a defect.
+    """
+
+    linked: bool = False
+    # Set when the local read itself failed (no DB, a routing hiccup) —
+    # distinct from a proven "not linked": a portal-linked repo whose gate
+    # is unreachable must never be reported as clean just because the probe
+    # couldn't ask (#1525's rule, applied here).
+    error: str | None = None
+
+
+@dataclass
 class RepoFacts:
     """Everything :func:`evaluate` needs, and nothing it has to fetch itself."""
 
@@ -291,6 +336,11 @@ class RepoFacts:
     smoke_command: str | None = None
     smoke_command_source: str | None = None
     capability_rule_count: int = 0
+    # #3073: the two independent per-repo opt-ins into the pre-merge UAT
+    # gate (`coord.merge_queue.requires_uat`) — either one, alone, counts.
+    uat_preview: str | None = None
+    uat_live_preview: bool = False
+    portal: PortalFacts = field(default_factory=PortalFacts)
     acceptance: AcceptanceFacts = field(default_factory=AcceptanceFacts)
     machines: list[MachineFacts] = field(default_factory=list)
     gh: GithubFacts = field(default_factory=GithubFacts)
@@ -451,6 +501,15 @@ def gather_github_facts(
         facts.claude_md_present = ops.repo_file_exists(slug, "CLAUDE.md", branch)
     except Exception as exc:  # noqa: BLE001
         facts.claude_md_error = str(exc)
+
+    # #3073: evidence of oracle opt-in independent of coordinator.yml — see
+    # `GithubFacts.acceptance_dir_present`'s docstring.
+    try:
+        facts.acceptance_dir_present = ops.repo_file_exists(
+            slug, "tests/acceptance", branch,
+        )
+    except Exception as exc:  # noqa: BLE001
+        facts.acceptance_dir_error = str(exc)
 
     # #3037: probed independently from the root-.gitignore check below, so
     # one probe's failure never hides the other's answer — `evaluate_contents`
@@ -704,6 +763,26 @@ def gather_acceptance_facts(
     )
 
 
+def gather_portal_facts(repo_name: str) -> PortalFacts:
+    """Whether *repo_name* has ever been linked to a portal submission
+    (#3073) — a local DB read, never a network call, so this costs nothing
+    extra on every ``coord repo doctor`` run.
+
+    A read failure (no DB on this machine, a routing hiccup through
+    ``board_service``) reports ``error`` rather than silently collapsing to
+    "not linked" — see :class:`PortalFacts`.
+    """
+    try:
+        from coord import portal_store  # noqa: PLC0415
+
+        linked = any(
+            link.repo_name == repo_name for link in portal_store.list_milestone_links()
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe, never a crash
+        return PortalFacts(error=str(exc))
+    return PortalFacts(linked=linked)
+
+
 def gather_facts(
     cfg,
     repo_name: str,
@@ -732,6 +811,9 @@ def gather_facts(
     facts.config_default_branch = repo.default_branch
     facts.config_develop_branch = repo.develop_branch
     facts.build_command = repo.build_command
+    facts.uat_preview = repo.uat_preview
+    facts.uat_live_preview = repo.uat_live_preview
+    facts.portal = gather_portal_facts(repo_name)
 
     smoke_cfg = getattr(cfg, "smoke_tests", None)
     if smoke_cfg is not None:
@@ -1199,6 +1281,7 @@ def evaluate_contents(facts: RepoFacts) -> list[Finding]:
         ))
 
     out.extend(_evaluate_graphify_out_guard(facts))
+    out.extend(_evaluate_uat_portal_readiness(facts))
 
     return out
 
@@ -1262,23 +1345,115 @@ def _evaluate_graphify_out_guard(facts: RepoFacts) -> list[Finding]:
     return []
 
 
+# #3073: a repo can be fully onboarded (config, machines, GitHub, contents,
+# graph all green) and STILL be unreachable from the customer portal it was
+# provisioned for — `coord portal enqueue-status quality-check` is refused
+# by the preview guard for any repo with neither `uat_preview` nor
+# `uat_live_preview` set, and that refusal message is the only place this
+# gap was ever visible. Only reports anything when the repo is actually
+# portal-linked (`PortalFacts.linked`): an unlinked repo has no timeline to
+# stall, so silence there is correct, not a missed check — mirroring
+# `oracle.no_driver`'s "informational, not a failure" stance for a repo that
+# hasn't joined that surface yet.
+def _evaluate_uat_portal_readiness(facts: RepoFacts) -> list[Finding]:
+    portal = facts.portal
+    if portal.error:
+        return [Finding(
+            layer="contents", check="contents.portal_link_unknown", severity=UNKNOWN,
+            summary=(
+                f"could not read portal links for {facts.name} — {portal.error}; "
+                "whether this repo is portal-linked, and therefore whether its "
+                "UAT preview is reachable, is unverified"
+            ),
+        )]
+    if not portal.linked:
+        return []
+
+    if not facts.uat_preview and not facts.uat_live_preview:
+        return [Finding(
+            layer="contents", check="contents.uat_preview_missing", severity=WARN,
+            summary=(
+                f"{facts.name} is linked to a portal submission but has "
+                "neither `uat_preview` nor `uat_live_preview` set — `coord "
+                "portal enqueue-status quality-check` is REFUSED by the "
+                "preview guard for this repo, so `quality-check` is "
+                "unreachable for it and a portal-linked submission can "
+                "never reach that stage; the customer timeline silently "
+                "stalls at `in-progress` and the only place this shows up "
+                "today is the guard's own error message"
+            ),
+            fix=(
+                "set `uat_preview` (a templatable preview URL) or "
+                "`uat_live_preview: true` (the real GitHub Deployment "
+                "lookup) on this repos[] entry"
+            ),
+        )]
+
+    # #2948: a CONFIGURED uat_preview/uat_live_preview is not the same as a
+    # WORKING one — the old `{pr_branch_slug}` template was confirmed live
+    # to never resolve a real Cloudflare Pages preview, and nothing today
+    # verifies the rendered URL actually resolves before the gate trusts it.
+    # Reporting green on presence alone would be exactly the false confidence
+    # #2948 exists to fix — this WARNs unconditionally until that issue
+    # lands, regardless of which of the two fields is set.
+    return [Finding(
+        layer="contents", check="contents.uat_preview_unverified", severity=WARN,
+        summary=(
+            f"{facts.name} has uat_preview/uat_live_preview configured, but "
+            "the rendered preview URL is not verified to actually resolve "
+            "(claude-coordinator#2948) — a configured value is not the same "
+            "as a working one; do not read this as green"
+        ),
+        fix=(
+            "none available yet — #2948 is the URL-resolution work; until it "
+            "lands, treat this repo's UAT verdicts as advisory, not proven"
+        ),
+    )]
+
+
 def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
     """Layer 6 — oracle-loop readiness (#2748, IL-2).
 
-    Deliberately never CRITs on "no driver at all": `coord acceptance mock`
-    (Gate A mock/contract authoring) needs no driver, so a repo that can
-    author mocks but cannot yet run a sealed suite is a legitimate,
-    common intermediate state — CLAUDE.md is explicit that this must read
-    as informational, not a failure. The one thing that DOES CRIT here is a
-    driver that claims to be wired but demonstrably is not (a declared
-    `entrypoint:` missing from disk) — that is not an absent feature, it is
-    a broken one: `coord acceptance run`/`record` would silently report
-    zero tests forever (#1552).
+    Deliberately never CRITs on "no driver at all" BY ITSELF: `coord
+    acceptance mock` (Gate A mock/contract authoring) needs no driver, so a
+    repo that can author mocks but cannot yet run a sealed suite is a
+    legitimate, common intermediate state — CLAUDE.md is explicit that this
+    must read as informational, not a failure. Two things DO CRIT here:
+
+    * a driver that claims to be wired but demonstrably is not (a declared
+      `entrypoint:` missing from disk) — that is not an absent feature, it
+      is a broken one: `coord acceptance run`/`record` would silently
+      report zero tests forever (#1552).
+    * (#3073) `tests/acceptance/` already exists on the repo's default
+      branch — someone has authored a Gate-A contract, i.e. the repo IS
+      oracle-opted-in in practice — but `acceptance.drivers.<name>` is
+      still absent. That is not the "hasn't joined yet" intermediate state;
+      it is a milestone that can be opted into the oracle loop against a
+      driver that flatly does not exist, which `run_driver()` rejects.
     """
     out: list[Finding] = []
     acc = facts.acceptance
 
     if not acc.configured:
+        opted_in = facts.gh.acceptance_dir_present is True
+        if opted_in:
+            out.append(Finding(
+                layer="oracle", check="oracle.opted_in_no_driver", severity=CRIT,
+                summary=(
+                    f"tests/acceptance/ already exists in {facts.github or facts.name} "
+                    "— a Gate-A contract has been authored — but no "
+                    f"`acceptance.drivers.{facts.name}` entry exists in "
+                    "coordinator.yml. This repo is oracle-opted-in in "
+                    "practice; `coord acceptance run`/`record` cannot "
+                    "execute anything for it until a driver is added — not "
+                    "the legitimate 'hasn't joined yet' state"
+                ),
+                fix=(
+                    "add acceptance.drivers." + facts.name + " in coordinator.yml — "
+                    "see docs/ORACLE_LOOP.md for an existing one"
+                ),
+            ))
+            return out
         out.append(Finding(
             layer="oracle", check="oracle.no_driver", severity=WARN,
             summary=(
@@ -1306,6 +1481,26 @@ def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
             + (" (routed)" if acc.routed else "")
         ),
     ))
+
+    # #3073: a `kind` may legitimately be declared ahead of its adapter
+    # (SUPPORTED_KINDS is the source of truth on what `run_driver()` will
+    # actually execute) — so this WARNs, naming the kind, rather than
+    # CRITing. A milestone opted in against it will still be refused at run
+    # time; this is readiness reporting, not a config error.
+    from coord.acceptance_drivers import SUPPORTED_KINDS  # noqa: PLC0415
+
+    unsupported = [k for k in acc.kinds if k not in SUPPORTED_KINDS]
+    if unsupported:
+        out.append(Finding(
+            layer="oracle", check="oracle.kind_unsupported", severity=WARN,
+            summary=(
+                f"acceptance.drivers.{facts.name} declares kind(s) "
+                f"{', '.join(unsupported)} — not in SUPPORTED_KINDS "
+                f"({', '.join(SUPPORTED_KINDS)}). Legal to declare ahead of "
+                "the adapter, but `coord acceptance run`/`record` rejects a "
+                "milestone dispatched against it until the adapter ships"
+            ),
+        ))
 
     # Sealed-path resolvability is NOT reported as its own finding: the only
     # way it can actually fail is a declared `entrypoint:` missing from disk,
