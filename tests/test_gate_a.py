@@ -362,6 +362,51 @@ class TestFindPendingAmends:
         )
         assert pending[0].review_verdict == "approve"
 
+    def test_fix_round_sharing_a_branch_reports_the_current_review(self) -> None:
+        """#3065 review: a fix-round worker (`auto_loop.py`'s
+        `_dispatch_fix`) gets a brand-new `assignment_id` but reuses the
+        SAME `branch` as the original mock-author row, linking back via
+        `review_of_assignment_id=<original assignment_id>`. After a normal
+        request-changes -> fix -> re-review -> approve cycle, the board
+        has two `mock-author` rows for one branch: the stale original
+        (older `dispatched_at`, tied to the superseded request-changes
+        review) and the fix round (newer `dispatched_at`, tied to the
+        current approve review). The branch-dedup must keep the fix
+        round's own verdict, stamped directly on its `review_verdict`
+        field by `record_work_review_verdict` — not fall back to the
+        original's long-superseded review."""
+        original = _mock_author(
+            branch="issue-122-gate-a-amend-1", assignment_id="a1",
+        )
+        stale_review = _review(
+            of_assignment_id="a1", verdict="request-changes", dispatched_at=1500.0,
+        )
+        fix_round = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=900,
+            issue_title="[gate-a-amend] ms-37 — contract correction (fix)",
+            assignment_id="a1-fix",
+            status="done",
+            branch="issue-122-gate-a-amend-1",
+            type="mock-author",
+            dispatched_at=2000.0,
+            review_of_assignment_id="a1",
+            # Stamped by `record_work_review_verdict` once the fix round's
+            # own re-review approved it.
+            review_verdict="approve",
+        )
+        pending = gate_a.find_pending_amends(
+            repo_name="api",
+            tracking_issue=900,
+            all_assignments=[original, stale_review, fix_round],
+            is_merged=lambda _b: False,
+        )
+        assert len(pending) == 1
+        assert pending[0].branch == "issue-122-gate-a-amend-1"
+        assert pending[0].assignment_id == "a1-fix"
+        assert pending[0].review_verdict == "approve"
+
 
 class TestSummarisePendingAmends:
     def test_approved_amend_names_the_branch_and_disclaims_the_approval(

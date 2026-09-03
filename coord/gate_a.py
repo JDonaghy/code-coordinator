@@ -563,27 +563,48 @@ def find_pending_amends(
         and getattr(a, "issue_number", None) == tracking_issue
         and getattr(a, "branch", None)
     ]
-    mock_rows.sort(key=lambda a: getattr(a, "dispatched_at", None) or 0.0)
+
+    # #3065 review: a fix-round worker (`auto_loop.py`'s `_dispatch_fix`,
+    # ~line 1210) gets a brand-new `assignment_id` while reusing the SAME
+    # `branch` (`branch=work.branch`), linking back via
+    # `review_of_assignment_id=work.assignment_id`. So after a normal
+    # request-changes -> fix -> re-review -> approve cycle, two
+    # `mock-author` rows share one branch: the stale original (tied to the
+    # superseded request-changes review) and the fix round (tied to the
+    # current review). Per branch, keep the NEWEST-dispatched row — the
+    # same "sort `dispatched_at` descending, take index 0" convention
+    # `coord/diagnose.py`'s `_latest()` uses to resolve a fix-round chain —
+    # not the oldest, or the stale original wins and its long-superseded
+    # review verdict gets reported as current.
+    by_branch: dict[str, Any] = {}
+    for a in sorted(mock_rows, key=lambda a: getattr(a, "dispatched_at", None) or 0.0, reverse=True):
+        by_branch.setdefault(a.branch, a)
 
     out: list[PendingAmend] = []
-    seen_branches: set[str] = set()
-    for a in mock_rows:
+    for a in sorted(by_branch.values(), key=lambda a: getattr(a, "dispatched_at", None) or 0.0):
         branch = a.branch
-        if branch in seen_branches:
-            continue
-        seen_branches.add(branch)
         if is_merged(branch):
             continue
-        review_verdict: str | None = None
-        reviews = [
-            r
-            for r in rows
-            if getattr(r, "type", None) == "review"
-            and getattr(r, "review_of_assignment_id", None) == a.assignment_id
-        ]
-        if reviews:
-            reviews.sort(key=lambda r: getattr(r, "dispatched_at", None) or 0.0)
-            review_verdict = getattr(reviews[-1], "review_verdict", None)
+        # Prefer the verdict already stamped directly onto this (latest)
+        # row's own `review_verdict` field: `coord/state.py`'s
+        # `record_work_review_verdict()` stamps the winning terminal
+        # verdict onto the *current* work-like row the moment the pipeline
+        # advances (`WORK_LIKE_TYPES` includes `mock-author`), so this is
+        # the same value `coord gates` and the merge gate already trust.
+        # Fall back to scanning standalone `review` rows keyed to this
+        # row's own `assignment_id` only when that field isn't populated
+        # (duck-typed test stand-ins, or a review still in flight).
+        review_verdict: str | None = getattr(a, "review_verdict", None)
+        if review_verdict is None:
+            reviews = [
+                r
+                for r in rows
+                if getattr(r, "type", None) == "review"
+                and getattr(r, "review_of_assignment_id", None) == a.assignment_id
+            ]
+            if reviews:
+                reviews.sort(key=lambda r: getattr(r, "dispatched_at", None) or 0.0)
+                review_verdict = getattr(reviews[-1], "review_verdict", None)
         out.append(
             PendingAmend(
                 branch=branch,
