@@ -2857,6 +2857,30 @@ class TestLedgerDesignRoundPublished:
         assert entry.payload["bundle_key"] == "bundles/sub-001/r2.tar"
         assert entry.source_event_id == portal_store.outbox_source_key(row.id)
 
+    def test_the_ledgered_round_round_trips_through_the_journal_with_no_artifact(
+        self,
+    ) -> None:
+        """Review finding on #3071: the test above only proves the ledger
+        row itself is right — it never round-trips through
+        `render_journal_payload`/`coord journal`, so it never observed that
+        a REALISTIC bare `bundle_key` (this client's default,
+        `"bundles/sub-001/r1.tar"`, with no scheme — exactly what
+        `PortalBridgeClient.upload_bundle` actually returns) yields a null
+        `artifact`, not a URL. `--json`'s contract is "null or a URL"; a bare
+        object key must never be smuggled past it, even though it is still
+        readable in `text`/`details`."""
+        _key, _row = portal_sync.push_design_round_bundle(
+            _UploadClient(), SUB, {"contract.md": "x"},
+            milestone_title="ms-4", tracking_issue_title="Epic",
+            tracking_issue_body="body", config=_ungated(),
+        )
+
+        [entry] = portal_store.render_journal_payload(SUB)["entries"]
+        assert entry["kind"] == portal_store.LEDGER_KIND_DESIGN_ROUND_PUBLISHED
+        assert entry["artifact"] is None
+        assert entry["details"]["bundle_key"] == "bundles/sub-001/r1.tar"
+        assert "bundles/sub-001/r1.tar" in entry["text"]
+
     def test_a_ledger_failure_does_not_fail_the_publish(self, monkeypatch) -> None:
         """The round really has been uploaded and queued by this point; a
         lost timeline row must not turn that into a raised error inside a

@@ -3033,6 +3033,15 @@ def render_ledger_payload(submission_id: str) -> dict[str, Any]:
 #: reads this at.
 _JOURNAL_AUDIT_EVENT_TYPES = ("dispatched", "merged")
 
+#: `list_audit_log` is newest-first (``(ts, id) DESC``) — a single
+#: `limit=200` page can silently drop the earliest `dispatched` row for an
+#: issue with a long business-tier history (many review/test rounds), and
+#: #3071 explicitly promises a run "intake to shipped". Paginate back with a
+#: cursor, the same shape `coord/commands/scorecard.py`'s audit cross-check
+#: already uses, instead of trusting one page to reach the start.
+_JOURNAL_AUDIT_PAGE_SIZE = 200
+_JOURNAL_AUDIT_MAX_PAGES = 10  # 10 * 200 = 2,000 rows per issue
+
 #: The wire `source` for each half of the join, so a renderer (and #3071's
 #: explicitly-out-of-scope coord-web panel, which must be built against the
 #: SHIPPED shape) can tell a ledgered fact from a derived one.
@@ -3099,6 +3108,24 @@ def _journal_entry(
 
 #: How a ledger row's own ``payload`` names the artifact for its kind. Read in
 #: order; the first URL-shaped hit wins.
+#:
+#: ``bundle_url``/``url``/``pr_url`` are forward-compatible slots, not proof
+#: any writer produces them today — none does, as of #3071. The only kind
+#: this module ledgers with a payload naming a bundle is
+#: ``design_round_published``, and its payload only ever carries
+#: ``bundle_key``: the bare R2 object key
+#: :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` returns (e.g.
+#: ``"bundles/sub-001/r1.tar"``), which :func:`_journal_url` correctly
+#: rejects as not URL-shaped. Coord has no public base to turn that key into
+#: something a browser could fetch — only coord-portal, which renders the
+#: bundle, knows how — so a real design round's ``artifact`` is honestly
+#: ``None`` today; the raw key still travels in the entry's ``details`` and
+#: inline in its ``text`` (:func:`design_round_text`) so nothing is lost,
+#: just not promoted into the URL-only field. If coord-portal ever starts
+#: returning a fetchable URL alongside ``bundle_key``, threading it through
+#: as ``bundle_url`` here is what would light this path up — until then,
+#: don't mistake a green test seeded with a scheme (``"r2://bundles/4"``) for
+#: proof this resolves against real data.
 _JOURNAL_ARTIFACT_KEYS = ("bundle_url", "preview_url", "url", "pr_url", "bundle_key")
 
 
@@ -3289,15 +3316,29 @@ def _journal_from_audit(
     gaps: list[str] = []
     for issue_number in issue_numbers:
         try:
-            page = list_audit_log(
-                repo=link.repo_name, issue=issue_number, tier="business", limit=200
-            )
+            rows: list[dict[str, Any]] = []
+            cursor: str | None = None
+            for _page in range(_JOURNAL_AUDIT_MAX_PAGES):
+                page = list_audit_log(
+                    repo=link.repo_name, issue=issue_number, tier="business",
+                    limit=_JOURNAL_AUDIT_PAGE_SIZE, cursor=cursor,
+                )
+                rows.extend(page.get("entries") or [])
+                cursor = page.get("next_cursor")
+                if not page.get("has_more") or not cursor:
+                    break
+            else:
+                gaps.append(
+                    f"audit trail for {link.repo_name}#{issue_number} has more than "
+                    f"{_JOURNAL_AUDIT_MAX_PAGES * _JOURNAL_AUDIT_PAGE_SIZE} business-tier "
+                    "rows — the oldest may be missing from this timeline"
+                )
         except Exception as exc:  # noqa: BLE001 — an unreadable audit row is a gap, not a crash
             gaps.append(
                 f"audit trail unreadable for {link.repo_name}#{issue_number}: {exc}"
             )
             continue
-        for row in page.get("entries") or []:
+        for row in rows:
             if str(row.get("event_type") or "") not in _JOURNAL_AUDIT_EVENT_TYPES:
                 continue
             details = row.get("details")
@@ -3341,7 +3382,15 @@ def render_journal_payload(submission_id: str) -> dict[str, Any]:
                       "source", "details"}]}
 
     ``entries`` is oldest-first. ``artifact`` is ``None`` or a URL — never a
-    bare object key (see :func:`_journal_url`).
+    bare object key (see :func:`_journal_url`). In practice this means a
+    ``design_round_published`` entry's ``artifact`` is ``None`` against real
+    data today: coord only ever learns a bare R2 ``bundle_key`` for a round
+    (see :data:`_JOURNAL_ARTIFACT_KEYS`'s comment), not a URL. The key still
+    reaches a renderer via ``details["bundle_key"]`` and inline in ``text``.
+    A ``merged`` entry's ``artifact`` is the real PR URL when one is on file
+    for the assignment (:func:`coord.state.mark_assignment_merged`), and
+    ``None`` for a merge recorded with no PR on file (e.g. a direct push) —
+    a gap in the pointer, not in the timeline.
     """
     gaps: list[str] = []
 
