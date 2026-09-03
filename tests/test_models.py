@@ -199,3 +199,66 @@ def test_coordinator_owned_docs_fails_open_on_repo_stand_in_missing_attribute():
         github = "acme/api"
 
     assert coordinator_owned_docs(_StandInRepo()) == ["CLAUDE.md"]
+
+
+# ── Repo.uat_preview / uat_live_preview (#2687, #2948) ──────────────────────
+#
+# #2948: `{pr_branch_slug}` — a substitution meant to reconstruct a
+# Cloudflare Pages branch-alias subdomain from the branch name — was removed.
+# Confirmed live (2026-08-29, against JDonaghy/natal-chart) that Cloudflare
+# Pages publishes NO branch aliases at all (`main` itself 404s), so no
+# function of the branch name alone could ever have produced a working URL.
+# `uat_preview` is now an optional override template for a repo whose preview
+# host genuinely IS templatable; `uat_live_preview` opts a repo into the
+# primary resolution path instead — the live GitHub-Deployment lookup in
+# `coord.merge_queue.evaluate_uat_verdict` / `coord.github_ops.
+# get_pr_deployment_url` (outside this module's scope; not re-tested here).
+
+
+def test_uat_live_preview_defaults_false() -> None:
+    repo = Repo(name="api", github="acme/api")
+    assert repo.uat_live_preview is False
+
+
+def test_uat_preview_default_none_and_resolve_returns_none() -> None:
+    repo = Repo(name="api", github="acme/api")
+    assert repo.uat_preview is None
+    assert repo.resolve_uat_preview_url(branch="issue-1-x") is None
+
+
+def test_resolve_uat_preview_url_substitutes_supported_variables() -> None:
+    repo = Repo(
+        name="api", github="acme/api",
+        uat_preview="https://preview/{repo}/{issue_number}/{pr_number}/{branch}",
+    )
+    url = repo.resolve_uat_preview_url(branch="b1", issue_number=42, pr_number=7)
+    assert url == "https://preview/api/42/7/b1"
+
+
+def test_resolve_uat_preview_url_pr_branch_slug_is_no_longer_special() -> None:
+    """#2948: `{pr_branch_slug}` is just an unknown placeholder now — left
+    verbatim, exactly like a typo'd variable name, never silently rendering
+    a plausible-but-dead Cloudflare Pages URL."""
+    repo = Repo(
+        name="natal-chart", github="acme/natal-chart",
+        uat_preview="https://{pr_branch_slug}.natal-chart-3ew.pages.dev/",
+    )
+    url = repo.resolve_uat_preview_url(branch="issue-42-fix-chart-colors")
+    assert url == "https://{pr_branch_slug}.natal-chart-3ew.pages.dev/"
+
+
+def test_resolve_uat_preview_url_unknown_placeholder_left_verbatim() -> None:
+    repo = Repo(
+        name="api", github="acme/api",
+        uat_preview="https://{typo_field}.example.pages.dev/",
+    )
+    assert repo.resolve_uat_preview_url(branch="b1") == (
+        "https://{typo_field}.example.pages.dev/"
+    )
+
+
+def test_resolve_uat_preview_url_malformed_format_spec_falls_back_to_raw() -> None:
+    # `str.format_map` can still raise on a stray "{}" that `__missing__`
+    # can't intercept — never crash the merge gate over a coordinator.yml typo.
+    repo = Repo(name="api", github="acme/api", uat_preview="https://example/{}/")
+    assert repo.resolve_uat_preview_url(branch="b1") == "https://example/{}/"

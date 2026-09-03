@@ -37,27 +37,6 @@ class WorkerPermissionsConfig:
     deny: list[str] = field(default_factory=list)
 
 
-def _cloudflare_branch_slug(branch: str) -> str:
-    """Best-effort Cloudflare Pages branch-alias slug for *branch*.
-
-    Cloudflare Pages derives a preview subdomain from a branch name by
-    lowercasing it, collapsing every run of characters outside
-    ``[a-z0-9-]`` into a single ``-``, trimming leading/trailing ``-``, and
-    truncating to 28 characters (Cloudflare's documented branch-alias
-    length ceiling). This is the ``{pr_branch_slug}`` substitution
-    available in a repo's ``uat_preview`` template.
-
-    #2687: this was ported from Cloudflare's documented branch-alias
-    algorithm, NOT verified against a live deployment — this worker has no
-    network/`gh` access to check a real natal-chart PR preview URL. Confirm
-    against one before switching the gate on for that repo; adjust here if
-    it disagrees.
-    """
-    slug = re.sub(r"[^a-z0-9-]+", "-", branch.lower()).strip("-")
-    slug = re.sub(r"-+", "-", slug)
-    return slug[:28].rstrip("-")
-
-
 class _UatPreviewVars(dict):
     """``dict`` for ``str.format_map`` that leaves an unknown ``{placeholder}``
     unrendered instead of raising ``KeyError`` (see ``Repo.uat_preview``)."""
@@ -133,20 +112,48 @@ class Repo:
     # must match a key in providers.definitions (or be "claude" which is
     # always implicit).  None means "use the global default".
     provider: str | None = None
-    # #2687: per-PR preview URL template for the pre-merge UAT gate — e.g.
-    # "https://{pr_branch_slug}.natal-chart-3ew.pages.dev/". `None` (the
-    # default) is the "not configured" state: `coord.merge_queue.
-    # requires_uat` treats an unset `uat_preview` as "this repo has not
-    # opted in", REGARDLESS of whether "uat" appears in
-    # `pipeline.default_gates` — the deliberate per-repo half of the opt-in
-    # (the other half is adding "uat" to the gate list itself, which is
-    # fleet-wide). Substitution variables available in the template — see
-    # `resolve_uat_preview_url` — are `{pr_branch_slug}` (best-effort
-    # Cloudflare-Pages branch-alias slug), `{branch}` (raw branch name),
-    # `{issue_number}`, `{pr_number}`, and `{repo}`. An unknown `{...}`
-    # placeholder in the template is left unrendered rather than raising, so
-    # a typo shows up as a visibly broken URL instead of crashing the gate.
+    # #2687/#2948: per-PR preview URL template for the pre-merge UAT gate —
+    # e.g. "https://github.com/{repo}/pull/{pr_number}" (natal-chart's actual
+    # interim config, #2948). `None` (the default) is the "no override
+    # configured" state.
+    #
+    # #2948: this is now an OPTIONAL OVERRIDE, not the primary way a repo
+    # opts into the gate. It exists only for a repo whose preview host has a
+    # genuinely templatable URL. The primary path — `coord.merge_queue.
+    # evaluate_uat_verdict` reading the real preview URL off the GitHub
+    # Deployment the CI action already creates per PR — needs no template at
+    # all; see `uat_live_preview` for that opt-in. Before #2948 this template
+    # ALSO offered a `{pr_branch_slug}` substitution meant to reconstruct a
+    # Cloudflare Pages branch-alias subdomain — removed entirely, because it
+    # was confirmed live (2026-08-29, against natal-chart) to never resolve:
+    # Cloudflare Pages publishes no branch aliases at all (`main` itself
+    # 404s), and even the pages.dev subdomain isn't derivable from the
+    # project name, so no algorithm operating on the branch name alone could
+    # ever have produced a working URL. A working preview link there can only
+    # come from the live GitHub Deployment lookup, not a template.
+    #
+    # `coord.merge_queue.requires_uat` treats `uat_preview` OR
+    # `uat_live_preview` as "this repo has opted in", REGARDLESS of whether
+    # "uat" appears in `pipeline.default_gates` — the deliberate per-repo
+    # half of the two-part opt-in (the other half is adding "uat" to the gate
+    # list itself, which is fleet-wide). Substitution variables available in
+    # the template — see `resolve_uat_preview_url` — are `{branch}` (raw
+    # branch name), `{issue_number}`, `{pr_number}`, and `{repo}`. An unknown
+    # `{...}` placeholder in the template is left unrendered rather than
+    # raising, so a typo shows up as a visibly broken URL instead of crashing
+    # the gate.
     uat_preview: str | None = None
+    # #2948: per-repo opt-in to the LIVE preview-URL lookup — the primary
+    # resolution path, used when `uat_preview` is unset (an explicit
+    # `uat_preview` override always wins when both are set). `False` (the
+    # default) means "not opted in", matching `uat_preview is None`'s
+    # existing meaning for `coord.merge_queue.requires_uat` — a repo that
+    # sets neither this nor `uat_preview` never blocks on the UAT gate, no
+    # matter what `pipeline.default_gates` says. Set this for a repo like
+    # natal-chart, whose preview host (Cloudflare Pages) has no derivable
+    # URL of any kind and must be read from the GitHub Deployment the CI
+    # action creates per PR (`coord.github_ops.get_pr_deployment_url`).
+    uat_live_preview: bool = False
 
     def resolve_uat_preview_url(
         self,
@@ -155,19 +162,21 @@ class Repo:
         issue_number: int | None = None,
         pr_number: int | None = None,
     ) -> str | None:
-        """Render this repo's `uat_preview` template for one PR.
+        """Render this repo's `uat_preview` OVERRIDE template for one PR.
 
-        Returns ``None`` when `uat_preview` is unset (repo hasn't opted in).
-        Never raises: an unresolvable `{placeholder}` in the template leaves
-        it unrendered rather than raising ``KeyError`` — see the field
-        docstring.
+        Returns ``None`` when `uat_preview` is unset — including when the
+        repo instead relies on `uat_live_preview`'s live lookup, which this
+        method knows nothing about (see `coord.merge_queue.
+        evaluate_uat_verdict`, which tries this first and falls back to the
+        live lookup). Never raises: an unresolvable `{placeholder}` in the
+        template leaves it unrendered rather than raising ``KeyError`` — see
+        the field docstring.
         """
         if not self.uat_preview:
             return None
         try:
             return self.uat_preview.format_map(
                 _UatPreviewVars(
-                    pr_branch_slug=_cloudflare_branch_slug(branch) if branch else "",
                     branch=branch or "",
                     issue_number=issue_number if issue_number is not None else "",
                     pr_number=pr_number if pr_number is not None else "",

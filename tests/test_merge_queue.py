@@ -427,6 +427,18 @@ class FakeGh:
     # branch, matching pre-#2143 behavior.
     merged_branches: set[str] = field(default_factory=set)
     pr_is_merged_calls: list[tuple[str, str]] = field(default_factory=list)
+    # #2948: branch name -> resolved live preview-deployment URL. Defaults
+    # keep every prior test (none of which set this) inert —
+    # `get_pr_deployment_url` returns None for every branch, matching the
+    # "can't confirm a URL" fail-closed default `evaluate_uat_verdict` relies
+    # on when a repo opts into `uat_live_preview` but the fake has nothing
+    # configured for that branch.
+    deployment_urls: dict[str, str] = field(default_factory=dict)
+    deployment_url_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def get_pr_deployment_url(self, repo: str, branch: str) -> str | None:
+        self.deployment_url_calls.append((repo, branch))
+        return self.deployment_urls.get(branch)
 
     def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
         self.find_pr_calls.append((repo, branch))
@@ -4642,16 +4654,19 @@ class TestSmokeGate:
 
 
 class TestUatGate:
-    """#2687: the pre-merge UAT gate. Two-part opt-in — "uat" must be in the
-    effective gate list AND the entry's own repo must have ``uat_preview``
-    configured — so a repo that hasn't opted in is unaffected even if
+    """#2687/#2948: the pre-merge UAT gate. Two-part opt-in — "uat" must be
+    in the effective gate list AND the entry's own repo must have
+    ``uat_preview`` (an explicit override template) OR ``uat_live_preview``
+    (opt in to the live GitHub-Deployment lookup) configured — so a repo
+    that hasn't opted into either is unaffected even if
     ``pipeline.default_gates`` grows "uat" fleet-wide."""
 
     @staticmethod
     def _config(
         *,
         gates: list[str] | None = None,
-        uat_preview: str | None = "https://{pr_branch_slug}.example.pages.dev/",
+        uat_preview: str | None = "https://preview.example/{branch}",
+        uat_live_preview: bool = False,
         repo_name: str = "api",
     ):
         """A minimal config-like object with a real Repo behind ``.repo()``."""
@@ -4678,7 +4693,10 @@ class TestUatGate:
         # tests observe the uat gate alone, mirroring TestSmokeGate's own
         # review-disabled-by-default isolation.
         cfg.pipeline.default_gates = gates if gates is not None else ["uat", "merge"]
-        cfg._repo = Repo(name=repo_name, github="acme/api", uat_preview=uat_preview)
+        cfg._repo = Repo(
+            name=repo_name, github="acme/api",
+            uat_preview=uat_preview, uat_live_preview=uat_live_preview,
+        )
         return cfg
 
     @staticmethod
@@ -4744,6 +4762,20 @@ class TestUatGate:
         cfg = self._config(gates=["uat", "merge"])
         assert mq.requires_uat(_q("a", required_gates=[]), cfg) is True
 
+    def test_requires_uat_true_via_live_preview_alone(self) -> None:
+        # #2948: `uat_live_preview` is a full per-repo opt-in on its own —
+        # a repo needs no `uat_preview` template at all to turn the gate on.
+        cfg = self._config(
+            gates=["review", "uat", "merge"], uat_preview=None, uat_live_preview=True,
+        )
+        assert mq.requires_uat(_q("a"), cfg) is True
+
+    def test_requires_uat_false_when_neither_uat_option_set(self) -> None:
+        cfg = self._config(
+            gates=["review", "uat", "merge"], uat_preview=None, uat_live_preview=False,
+        )
+        assert mq.requires_uat(_q("a"), cfg) is False
+
     # ── evaluate_uat_verdict ──
 
     def test_evaluate_uat_verdict_missing_names_preview_and_command(self) -> None:
@@ -4753,7 +4785,7 @@ class TestUatGate:
         ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
         assert ok is False
         assert "uat verdict missing" in message
-        assert "preview: https://worker-w1.example.pages.dev/" in message
+        assert "preview: https://preview.example/worker/w1" in message
         assert "coord uat w1 --passed|--failed" in message
 
     def test_evaluate_uat_verdict_passed(self) -> None:
@@ -4794,6 +4826,59 @@ class TestUatGate:
         ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
         assert ok is False
         assert "regressed" in message
+
+    # ── evaluate_uat_verdict: live preview lookup (#2948) ──
+
+    def test_evaluate_uat_verdict_resolves_via_live_deployment_lookup(self) -> None:
+        # No `uat_preview` override — relies entirely on `uat_live_preview`
+        # and a live `gh_ops.get_pr_deployment_url` lookup.
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://abc123.example.pages.dev" in message
+        assert ("acme/api", "worker/w1") in gh.deployment_url_calls
+
+    def test_evaluate_uat_verdict_override_template_wins_over_live_lookup(self) -> None:
+        # An explicit `uat_preview` override always wins, even when the repo
+        # ALSO has `uat_live_preview` set — the live lookup is never even
+        # attempted.
+        cfg = self._config(
+            uat_preview="https://preview.example/{branch}", uat_live_preview=True,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://preview.example/worker/w1" in message
+        assert "abc123" not in message
+        assert gh.deployment_url_calls == []
+
+    def test_evaluate_uat_verdict_unresolved_preview_says_so(self) -> None:
+        # #2948 acceptance bar: `uat_live_preview` is set but the live lookup
+        # finds nothing for this branch — the message must say the URL is
+        # unresolved, never fall back to a constructed guess.
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg, FakeGh())
+        assert ok is False
+        assert "preview:" not in message
+        assert "could not be resolved" in message
+
+    def test_evaluate_uat_verdict_no_gh_ops_says_unresolved(self) -> None:
+        # A caller that doesn't pass gh_ops at all (the default, e.g.
+        # display_error's deliberately I/O-free recompute) never attempts
+        # the live lookup — same "unresolved" wording, not a crash.
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "could not be resolved" in message
 
     # ── merge_gate_failures / passes_merge_gates ──
 
@@ -4841,6 +4926,20 @@ class TestUatGate:
         assert items[0].state == PENDING
         assert items[0].error is not None
         assert items[0].error.startswith("uat verdict missing")
+
+    def test_process_uat_required_event_carries_live_preview_url(self) -> None:
+        # #2948: the live GhOps.get_pr_deployment_url lookup is threaded all
+        # the way through process()'s live gate evaluation, not just through
+        # evaluate_uat_verdict called directly.
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        events = process(items, gh, config=cfg, board=board)
+
+        uat_events = [e for e in events if e.kind == "uat_required"]
+        assert len(uat_events) == 1
+        assert "https://abc123.example.pages.dev" in uat_events[0].message
 
     def test_process_proceeds_when_uat_passed(self) -> None:
         cfg = self._config()

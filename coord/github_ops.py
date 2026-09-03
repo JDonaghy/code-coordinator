@@ -2318,6 +2318,71 @@ def get_pr_head_ref(repo: str, number: int) -> str | None:
     return head_ref or None
 
 
+def get_pr_deployment_url(repo: str, branch: str) -> str | None:
+    """Return the live preview-deployment URL for *branch*'s GitHub
+    Deployment, or ``None`` when one can't be confirmed (#2948).
+
+    Cloudflare Pages (via ``cloudflare/pages-action``, and any similarly-wired
+    per-PR-preview host) does NOT publish a derivable preview URL — it is a
+    per-deployment content hash, not a branch-alias subdomain, and there is no
+    branch-alias fallback either (measured live against natal-chart, see
+    ``docs/CUSTOMER_FACING_APPS.md`` §1 and #2948). The only reliable source
+    is the GitHub Deployment the action creates per push, read straight from
+    the forge instead of guessed:
+
+        gh api repos/{repo}/deployments?ref={branch}
+        gh api repos/{repo}/deployments/{id}/statuses
+
+    Matches on the deployment's **environment name containing "(Preview)"**
+    (Cloudflare Pages' own convention, e.g. ``"natal-chart (Preview)"``), NOT
+    on recency/list order — production deploys are hash URLs too and
+    interleave with previews in the same ``ref`` list, so picking ``[0]``
+    can silently hand back a production URL. Deployments are walked
+    newest-first (GitHub's default order); the first environment-matching
+    deployment whose latest status carries an ``environment_url`` wins.
+
+    Returns ``None`` — never raises — on any ``gh`` failure, a malformed
+    response, a ref with no deployments, or a matched deployment whose
+    statuses carry no URL yet. Every one of those is "can't confirm a real
+    preview URL right now", which callers must treat as unresolved rather
+    than silently falling back to a constructed guess (the #2948 bug this
+    function replaces).
+    """
+    try:
+        deployments = _gh_json(
+            "api", f"repos/{repo}/deployments?ref={branch}",
+            default=None, caller="github_ops.get_pr_deployment_url",
+        )
+    except Exception:  # noqa: BLE001 — any gh failure: no URL to report
+        return None
+    if not isinstance(deployments, list):
+        return None
+    for deployment in deployments:
+        if not isinstance(deployment, dict):
+            continue
+        environment = deployment.get("environment")
+        if not isinstance(environment, str) or "(Preview)" not in environment:
+            continue
+        deployment_id = deployment.get("id")
+        if deployment_id is None:
+            continue
+        try:
+            statuses = _gh_json(
+                "api", f"repos/{repo}/deployments/{deployment_id}/statuses",
+                default=None, caller="github_ops.get_pr_deployment_url",
+            )
+        except Exception:  # noqa: BLE001 — keep looking at other candidates
+            continue
+        if not isinstance(statuses, list):
+            continue
+        for status in statuses:
+            if isinstance(status, dict):
+                url = status.get("environment_url")
+                if isinstance(url, str) and url:
+                    return url
+    return None
+
+
 # #1564: `gh pr checks --json` does NOT have a `conclusion` field — it never
 # has. Requesting it makes `gh` exit 1 with empty stdout, which used to make
 # every single merge look like an unreadable CI status (fail-closed, so it

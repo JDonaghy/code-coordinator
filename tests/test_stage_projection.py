@@ -730,7 +730,7 @@ def test_compute_issue_projection_carries_preview_url_only_when_enabled():
 
 def test_board_projection_shows_uat_badge_only_for_opted_in_repo():
     config = _StubConfig([
-        Repo(name="api", github="acme/api", uat_preview="https://{pr_branch_slug}.example.dev/"),
+        Repo(name="api", github="acme/api", uat_preview="https://{branch}.example.dev/"),
         Repo(name="other", github="acme/other"),  # uat_preview unset — not opted in
     ])
     issues = [
@@ -789,7 +789,7 @@ def test_board_projection_hides_uat_when_gate_not_in_default_gates():
 
 def test_board_projection_resolves_preview_url_for_opted_in_issue():
     config = _StubConfig([
-        Repo(name="api", github="acme/api", uat_preview="https://{pr_branch_slug}.example.dev/"),
+        Repo(name="api", github="acme/api", uat_preview="https://{branch}.example.dev/"),
     ])
     issues = [{"repo_name": "api", "number": 1, "title": "t", "state": "open"}]
     assignments = [_work(status="done", dispatched_at=1.0)]
