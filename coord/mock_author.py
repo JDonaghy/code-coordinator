@@ -35,6 +35,7 @@ PDR-1/#2507) instead of that link sitting unread.
 """
 from __future__ import annotations
 
+import fnmatch
 import uuid
 from typing import Any
 
@@ -401,7 +402,7 @@ def dispatch_acceptance_mock(
 
 
 def collect_mock_bundle_files(
-    repo_github: str, milestone_number: int, branch: str
+    repo_github: str, milestone_number: int, branch: str, driver_mock_glob: str
 ) -> dict[str, str]:
     """Read a rendered Gate-A bundle off *branch* (post-merge) via the
     GitHub Contents API — no local checkout, the same "gh-only wire layer"
@@ -409,13 +410,26 @@ def collect_mock_bundle_files(
     ``coord.acceptance.clear_expected_red_via_pr``'s docstring).
 
     Returns a ``{relative_path: content}`` mapping — ``"contract.md"`` plus
-    every ``mocks/*.html`` fixture under
-    ``tests/acceptance/ms-<milestone_number>/`` — ready to hand straight to
-    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle`. Empty
-    when the directory doesn't exist on *branch* (Gate A hasn't merged
-    anything there yet, or the repo's acceptance driver renders to a
-    different mock glob than ``*.html``) — callers treat that as "nothing
-    to push", not an error.
+    every mock fixture under ``tests/acceptance/ms-<milestone_number>/mocks/``
+    matching *driver_mock_glob* (#3068) — ready to hand straight to
+    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle`. Empty when
+    the directory doesn't exist on *branch* at all (Gate A hasn't merged
+    anything there yet) — callers treat that as "nothing to push", not an
+    error.
+
+    *driver_mock_glob* is the repo's resolved acceptance-driver mock glob
+    (``acceptance.drivers.<repo>.mock`` — e.g. ``"*.html"`` for
+    ``web-playwright``, ``"*.screen"`` for ``tui-tuidriver``), the same value
+    :func:`build_mock_author_briefing` already threads through as
+    ``driver_mock_glob``. This function does NOT hardcode ``*.html`` — it
+    collects whatever the repo's own driver actually renders, matched via
+    `fnmatch` against the mock directory's filenames. It also does NOT judge
+    whether that glob is browser-viewable — that is :func:`_wants_mock_index`'s
+    job (#2512), and callers that push the result somewhere that must be
+    viewable in a browser (a portal design round) must consult it themselves
+    before treating a non-empty return as pushable: a non-``*.html`` glob
+    still returns real, non-empty mock content here, just content nobody can
+    open in a browser.
     """
     ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
     files: dict[str, str] = {}
@@ -431,7 +445,7 @@ def collect_mock_bundle_files(
         # explicit catch is only for a `gh` error shaped differently.
         mock_names = []
     for name in mock_names:
-        if name.endswith(".html"):
+        if fnmatch.fnmatch(name, driver_mock_glob):
             files[f"mocks/{name}"] = github_ops.get_repo_file(
                 repo_github, f"{ms_dir}/mocks/{name}", branch
             )

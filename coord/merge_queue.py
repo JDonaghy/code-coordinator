@@ -6038,6 +6038,12 @@ def _maybe_push_design_round(
     :func:`_maybe_clear_expected_red` right above it, but belt-and-braces
     here too since this reaches out to two different externals (GitHub's
     Contents API and the portal itself).
+
+    #3068: a resolvable driver whose mock glob isn't browser-viewable (or no
+    resolvable driver at all) is a VISIBLE ``design_round_push_skipped``
+    event, not a silent no-op and never a success — a design round that
+    reaches a customer with no viewable mock is exactly the failure this
+    issue named.
     """
     if entry.assignment_type != "mock-author":
         return None
@@ -6078,7 +6084,10 @@ def _maybe_push_design_round(
         # the whole point of the fail-open posture (see docstring above).
         return None
 
-    from coord.mock_author import collect_mock_bundle_files  # noqa: PLC0415
+    from coord.mock_author import (  # noqa: PLC0415
+        _wants_mock_index,
+        collect_mock_bundle_files,
+    )
     from coord.portal_bridge import PortalBridgeError, client_from_config  # noqa: PLC0415
     from coord.portal_sync import PortalSyncError, push_design_round_bundle  # noqa: PLC0415
 
@@ -6086,9 +6095,32 @@ def _maybe_push_design_round(
     if client is None:
         return None
 
+    # #3068: consult the repo's OWN acceptance-driver mock glob rather than
+    # assuming `*.html` — `collect_mock_bundle_files` collects whatever that
+    # glob actually is, and a glob that doesn't render to something
+    # browser-viewable (`_wants_mock_index`, #2512's same "gate on the glob,
+    # not the driver name" rule) must surface as a skip, never as a success:
+    # a design round with no viewable mock is not a design round a customer
+    # should ever see. `driver_for` with no `path` only resolves a FLAT
+    # (unrouted) driver — a routed repo with no way to know which route this
+    # milestone used degrades the same way as "no driver at all": skip, with
+    # a reason, rather than guess `*.html` and risk pushing unviewable mocks.
+    acceptance_cfg = getattr(config, "acceptance", None)
+    driver_cfg = (
+        acceptance_cfg.driver_for(entry.repo_name) if acceptance_cfg is not None else None
+    )
+    if driver_cfg is None or not _wants_mock_index(driver_cfg.mock):
+        glob_desc = repr(driver_cfg.mock) if driver_cfg is not None else "no driver configured"
+        return MergeEvent(
+            entry, "design_round_push_skipped",
+            f"repo {entry.repo_name!r}'s acceptance driver mock glob is not "
+            f"browser-viewable ({glob_desc}) — a design round needs a "
+            f"viewable mock, so nothing was pushed for ms-{milestone_number}",
+        )
+
     try:
         files = collect_mock_bundle_files(
-            entry.repo_github, milestone_number, entry.target_branch
+            entry.repo_github, milestone_number, entry.target_branch, driver_cfg.mock
         )
     except Exception as e:  # noqa: BLE001 — best-effort, see docstring
         return MergeEvent(
