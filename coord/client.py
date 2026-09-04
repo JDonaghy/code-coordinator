@@ -896,6 +896,48 @@ def fetch_portal_link(
     return link if isinstance(link, dict) else None
 
 
+def delete_portal_link(
+    svc: ServiceConfig,
+    repo_name: str,
+    *,
+    milestone_number: int | None = None,
+    issue_number: int | None = None,
+    actor: str = "",
+    timeout: float = _WRITE_TIMEOUT,
+) -> bool:
+    """DELETE one milestone's (or, with ``issue_number``, one issue's)
+    portal link (#3110) — the transport
+    :func:`coord.state.delete_portal_link` uses when ``board_service`` is
+    set. Pass exactly one of ``milestone_number`` / ``issue_number``, same
+    contract as :func:`fetch_portal_link`.
+
+    Unlike that read-side fetch, this is deliberately NOT fail-soft: ``coord
+    portal unlink`` exists precisely so clearing a link that is actively
+    mailing a customer is a supported operation rather than a sqlite edit
+    (#3110's incident), and a caller that can't distinguish "cleared" from
+    "couldn't reach the daemon" would silently believe a flood had stopped
+    when it hadn't. Raises ``httpx.HTTPError`` on transport/HTTP failure.
+    """
+    params: dict[str, str | int] = {"repo_name": repo_name, "actor": actor}
+    if milestone_number is not None:
+        params["milestone_number"] = milestone_number
+    if issue_number is not None:
+        params["issue_number"] = issue_number
+    resp = httpx.request(
+        "DELETE",
+        f"{svc.url}/portal-link",
+        params=params,
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _reraise_with_detail(exc) from exc
+    data = resp.json()
+    return bool(isinstance(data, dict) and data.get("deleted"))
+
+
 def fetch_portal_link_by_submission(
     svc: ServiceConfig, submission_id: str, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> dict | None:

@@ -361,6 +361,84 @@ def test_link_rejects_a_non_integer_milestone_number(config_path):
     assert "must be an integer" in result.output
 
 
+# ── #3110: fan-in guard + `unlink` ───────────────────────────────────────────
+
+
+def test_link_refuses_a_submission_already_linked_elsewhere(config_path):
+    """The flood condition: a second target for a submission_id that's
+    already claimed is refused with a clean CLI error, not a traceback."""
+    run("portal", "link", "--config", config_path, "coord", "5", "sub_hot")
+    result = run(
+        "portal", "link", "--config", config_path, "coord", "--issue", "77", "sub_hot",
+    )
+    assert result.exit_code != 0
+    assert "already linked" in result.output
+
+
+def test_link_force_moves_the_link(config_path):
+    run("portal", "link", "--config", config_path, "coord", "5", "sub_hot")
+    result = run(
+        "portal", "link", "--config", config_path, "coord",
+        "--issue", "77", "sub_hot", "--force",
+    )
+    assert result.exit_code == 0, result.output
+
+    moved = run("portal", "link", "--config", config_path, "coord", "--issue", "77")
+    assert "submission_id=sub_hot" in moved.output
+    # the old target's claim was replaced, not duplicated
+    old = run("portal", "link", "--config", config_path, "coord", "5")
+    assert old.exit_code != 0
+    assert "not linked" in old.output
+
+
+def test_unlink_is_registered():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "unlink" in result.output
+
+
+def test_unlink_removes_a_milestone_link(config_path):
+    run("portal", "link", "--config", config_path, "coord", "5", "sub_hot")
+    result = run("portal", "unlink", "--config", config_path, "coord", "5")
+    assert result.exit_code == 0, result.output
+    assert "unlinked" in result.output
+
+    read = run("portal", "link", "--config", config_path, "coord", "5")
+    assert read.exit_code != 0
+    assert "not linked" in read.output
+
+
+def test_unlink_removes_an_issue_link(config_path):
+    run("portal", "link", "--config", config_path, "coord", "--issue", "42", "sub_hot")
+    result = run("portal", "unlink", "--config", config_path, "coord", "--issue", "42")
+    assert result.exit_code == 0, result.output
+    assert "unlinked" in result.output
+
+    read = run("portal", "link", "--config", config_path, "coord", "--issue", "42")
+    assert read.exit_code != 0
+    assert "not linked" in read.output
+
+
+def test_unlink_reports_when_nothing_to_unlink(config_path):
+    result = run("portal", "unlink", "--config", config_path, "coord", "5")
+    assert result.exit_code != 0
+    assert "not linked" in result.output
+
+
+def test_unlink_rejects_both_milestone_number_and_issue(config_path):
+    result = run(
+        "portal", "unlink", "--config", config_path, "coord", "5", "--issue", "42",
+    )
+    assert result.exit_code != 0
+    assert "not both" in result.output
+
+
+def test_unlink_rejects_unknown_repo(config_path):
+    result = run("portal", "unlink", "--config", config_path, "nope", "5")
+    assert result.exit_code != 0
+    assert "unknown repo" in result.output
+
+
 # ── #2533 (ms-67 PB-3): pull an approved submission into a decomposition chat ──
 
 

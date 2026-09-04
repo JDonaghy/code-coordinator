@@ -4294,9 +4294,34 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
 # :mod:`coord.portal_store`, which calls the functions below the same way
 # :mod:`coord.gate_a` calls :func:`save_gate_a_approval` /
 # :func:`get_gate_a_approval` — this module only knows about plain dicts.
+#
+# #3110: a real customer (``SUB-1EA1D3``) was mailed 161 "shipped" emails
+# because TWO targets (``grocery-list ms-1`` and, wrongly, our own
+# ``coord-portal ms-4``) both carried a link to the same submission_id —
+# #2588's status fold ran once per link and alternated between two answers
+# every tick. Nothing here constrained that fan-in, the write that caused it
+# left no audit trail (the only forensic signal was ``actor=''``, i.e. "not
+# the interactive CLI" — consistent with a hand-run ``curl POST
+# /portal-link``), and clearing it required hand-editing
+# ``board_meta.portal_links`` with sqlite on the daemon host. ``_save_
+# portal_link_local``/``_delete_portal_link_local`` below now (1) refuse a
+# write that would let a submission_id fan out to a second target unless the
+# caller passes ``force=True`` (``coord portal link --force``), in which case
+# the OTHER target's claim is replaced rather than added to, and (2) audit
+# EVERY write/delete at the business tier, keyed off whatever the request
+# itself carries — including an empty ``actor`` — so a future incident's
+# forensic trail exists regardless of whether the caller went through the
+# CLI, a routed thin client, or a raw HTTP call. This is the one choke point
+# every path funnels through (a same-host CLI call reaches it directly; a
+# thin client's HTTP POST/DELETE reaches it via ``post_portal_link``/
+# ``delete_portal_link`` in ``coord/serve_app.py``), which is why the audit
+# call moved here instead of staying in ``coord.commands.portal``'s CLI
+# handler — `record_audit` itself never routes to the daemon (see
+# ``coord/audit.py``), so an audit call left in the CLI would have written
+# to a thin client's own empty local DB instead of the canonical one.
 
 
-def save_portal_link(record: dict) -> None:
+def save_portal_link(record: dict, *, force: bool = False) -> None:
     """Upsert one milestone's (or, since #2665, one issue's) portal
     ``submission_id`` link — routes to the daemon when set (#2751).
 
@@ -4305,12 +4330,21 @@ def save_portal_link(record: dict) -> None:
     that pair is replaced wholesale — relinking is a plain overwrite,
     matching :func:`save_gate_a_approval`'s semantics for the same reason
     (exactly one live link per milestone/issue).
+
+    ``force`` (#3110): pass ``True`` to move a submission_id that is already
+    linked to a DIFFERENT target onto this one instead of refusing — see
+    :func:`_save_portal_link_local` for the fan-in guard this overrides.
+    Omitted from the routed payload when ``False`` so an already-daemon-side
+    caller's request body is unchanged from before #3110.
     """
     svc = _board_service()
-    resp = _route_write(svc, "/portal-link", {"record": record})
+    payload: dict = {"record": record}
+    if force:
+        payload["force"] = True
+    resp = _route_write(svc, "/portal-link", payload)
     if resp is not None:
         return
-    _save_portal_link_local(record)
+    _save_portal_link_local(record, force=force)
 
 
 def _link_target_key(link: dict) -> tuple:
@@ -4325,7 +4359,18 @@ def _link_target_key(link: dict) -> tuple:
     return ("issue", link.get("repo_name"), _as_int(link.get("issue_number")))
 
 
-def _save_portal_link_local(record: dict) -> None:
+def _link_target_desc(link: dict) -> str:
+    """``"ms-3"`` / ``"issue #42"`` for a raw link dict — the plain-dict
+    counterpart to :attr:`coord.portal_store.PortalLink.target_desc`, needed
+    here because this module only ever holds link state as dicts (#3110's
+    conflict/audit messages)."""
+    milestone_number = link.get("milestone_number")
+    if milestone_number is not None:
+        return f"ms-{milestone_number}"
+    return f"issue #{link.get('issue_number')}"
+
+
+def _save_portal_link_local(record: dict, *, force: bool = False) -> None:
     repo_name = record.get("repo_name")
     if not isinstance(repo_name, str) or not repo_name:
         raise ValueError("portal link needs repo_name")
@@ -4337,6 +4382,9 @@ def _save_portal_link_local(record: dict) -> None:
         raise ValueError(
             "portal link needs exactly one of milestone_number or issue_number"
         )
+    submission_id = record.get("submission_id")
+    if not isinstance(submission_id, str) or not submission_id:
+        raise ValueError("portal link needs a submission_id")
     record = {
         **record,
         "milestone_number": int(milestone_number) if has_milestone else None,
@@ -4347,7 +4395,33 @@ def _save_portal_link_local(record: dict) -> None:
     with conn:
         links = _load_portal_links_raw(conn)
         key = _link_target_key(record)
-        remaining = [link for link in links if _link_target_key(link) != key]
+        # #3110: refuse a write that would let SUBMISSION_ID fan out to a
+        # SECOND target — the exact condition that made #2588's status fold
+        # alternate every tick and mailed a real customer 161 times. `force`
+        # is the escape hatch (`coord portal link --force`) for a genuine
+        # relink (e.g. a decomposition re-filed under a new issue number);
+        # it REPLACES the other target's claim rather than adding to it, so
+        # forcing can never itself recreate the fan-in condition.
+        conflicting = [
+            link
+            for link in links
+            if link.get("submission_id") == submission_id
+            and _link_target_key(link) != key
+        ]
+        if conflicting and not force:
+            other = conflicting[0]
+            raise ValueError(
+                f"submission {submission_id!r} is already linked to "
+                f"{other.get('repo_name')} {_link_target_desc(other)} — pass "
+                "force=True (`coord portal link --force`) to move it here "
+                "instead (#3110: a submission_id may map to at most one "
+                "target)"
+            )
+        remaining = [
+            link
+            for link in links
+            if _link_target_key(link) != key and link not in conflicting
+        ]
         remaining.append(record)
         sql.upsert(
             conn,
@@ -4356,6 +4430,37 @@ def _save_portal_link_local(record: dict) -> None:
             ("portal_links", json.dumps(remaining)),
             conflict_columns=["key"],
         )
+
+    # #3110: audit EVERY write here — the one choke point every path funnels
+    # through (see the section docstring above) — rather than in the CLI,
+    # which never routed anywhere useful to begin with (`record_audit`
+    # writes to whatever DB is local to the calling process, not the
+    # daemon's canonical one) and was silent for any non-CLI caller, which
+    # is how a hand-run `curl POST /portal-link` was the leading suspect for
+    # the bogus link with no way to confirm it.
+    _record_audit(
+        tier="business",
+        category="portal",
+        event_type="portal_link",
+        actor=str(record.get("actor") or ""),
+        repo=repo_name,
+        summary=(
+            f"linked {repo_name} {_link_target_desc(record)} to portal "
+            f"submission {submission_id}"
+        ),
+        details={
+            "milestone_number": record["milestone_number"],
+            "issue_number": record["issue_number"],
+            "submission_id": submission_id,
+            "force": force,
+            "replaced": [
+                {"repo_name": c.get("repo_name"), "target": _link_target_desc(c)}
+                for c in conflicting
+            ]
+            if force and conflicting
+            else [],
+        },
+    )
 
 
 def list_portal_links() -> list[dict]:
@@ -4426,6 +4531,116 @@ def _load_portal_links_raw(conn: sqlite3.Connection) -> list[dict]:
     if not isinstance(data, list):
         return []
     return [d for d in data if isinstance(d, dict)]
+
+
+def delete_portal_link(
+    *,
+    repo_name: str,
+    milestone_number: int | None = None,
+    issue_number: int | None = None,
+    actor: str = "",
+) -> bool:
+    """Remove one milestone's or one issue's portal link (#3110) — the
+    supported way to clear a bad or stale link.
+
+    Before this existed, clearing a link that was actively mailing a
+    customer (#3110's incident: two targets carrying the same submission_id,
+    161 duplicate "shipped" emails) meant hand-editing
+    ``board_meta.portal_links`` with sqlite on the daemon host. ``coord
+    portal unlink`` is the CLI surface for this.
+
+    Pass exactly one of ``milestone_number`` / ``issue_number``, same
+    contract as :func:`get_portal_link`. Routes to the daemon when
+    ``board_service`` is set, mirroring :func:`save_portal_link` — an
+    operator clearing an active flood needs this to work from wherever they
+    are, not just the daemon host, and unlike the read-side fetch this is
+    deliberately NOT fail-soft on a routing failure (see
+    :func:`coord.client.delete_portal_link`): "couldn't ask" must not
+    collapse to "cleared" for a destructive, customer-safety-critical write.
+
+    Returns ``True`` if a link was removed, ``False`` if there was nothing
+    to remove.
+    """
+    if (milestone_number is None) == (issue_number is None):
+        raise ValueError(
+            "delete_portal_link needs exactly one of milestone_number or "
+            "issue_number"
+        )
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import delete_portal_link as _delete_portal_link_remote  # noqa: PLC0415
+
+        return _delete_portal_link_remote(
+            svc,
+            repo_name,
+            milestone_number=milestone_number,
+            issue_number=issue_number,
+            actor=actor,
+        )
+    return _delete_portal_link_local(
+        repo_name=repo_name,
+        milestone_number=milestone_number,
+        issue_number=issue_number,
+        actor=actor,
+    )
+
+
+def _delete_portal_link_local(
+    *,
+    repo_name: str,
+    milestone_number: int | None,
+    issue_number: int | None,
+    actor: str = "",
+) -> bool:
+    """Local-DB-only delete — the daemon's own writer, mirroring
+    :func:`_save_portal_link_local`. Called directly by a same-host CLI
+    invocation and by ``coord.serve_app``'s ``DELETE /portal-link`` handler
+    for a routed one — the single choke point both paths funnel through, so
+    the audit call below fires exactly once per delete regardless of caller.
+    """
+    if (milestone_number is None) == (issue_number is None):
+        raise ValueError(
+            "delete_portal_link needs exactly one of milestone_number or "
+            "issue_number"
+        )
+    key = (
+        ("ms", repo_name, milestone_number)
+        if milestone_number is not None
+        else ("issue", repo_name, issue_number)
+    )
+    conn = get_connection()
+    with conn:
+        links = _load_portal_links_raw(conn)
+        removed = [link for link in links if _link_target_key(link) == key]
+        if not removed:
+            return False
+        remaining = [link for link in links if _link_target_key(link) != key]
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("portal_links", json.dumps(remaining)),
+            conflict_columns=["key"],
+        )
+
+    removed_link = removed[0]
+    _record_audit(
+        tier="business",
+        category="portal",
+        event_type="portal_unlink",
+        actor=str(actor or ""),
+        repo=repo_name,
+        summary=(
+            f"unlinked {repo_name} {_link_target_desc(removed_link)} "
+            f"(was submission {removed_link.get('submission_id')})"
+        ),
+        details={
+            "milestone_number": milestone_number,
+            "issue_number": issue_number,
+            "submission_id": removed_link.get("submission_id"),
+        },
+    )
+    return True
 
 
 def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
