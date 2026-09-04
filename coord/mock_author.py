@@ -43,7 +43,7 @@ import httpx
 
 from coord import github_ops
 from coord.acceptance import ms_dirname
-from coord.claim import claim_message, find_work_claim
+from coord.claim import claim_message, claim_remedy_hint, find_work_claim
 from coord.config import Config
 from coord.milestone_chat import _fetch_milestone_issues
 from coord.milestone_dispatch import pick_machine
@@ -338,13 +338,17 @@ def dispatch_acceptance_mock(
     if claim is not None:
         # #1059: make the refusal actionable. The operator's "PERMANENTLY
         # STUCK" report (#1041) was a stale claim they "found no way to clear
-        # through normal coord commands" — so name the escape hatch. A live
-        # claim means a real Gate A worker is already running (leave it); a
-        # dead one is cleared by `coord diagnose <repo> <issue>`.
+        # through normal coord commands" — so name the escape hatch. #3103:
+        # the right escape hatch depends on *what kind* of claim this is — a
+        # dead board session is cleared by `coord diagnose`, but a leftover
+        # `remote_branch` claim (e.g. a squash-merged PR's un-deleted source
+        # branch) is invisible to `coord diagnose` entirely, so naming it
+        # there cost an operator a full diagnostic round trip that could
+        # never have helped. `claim_remedy_hint` picks the remedy that
+        # actually matches the claim's source.
         raise RuntimeError(
-            f"Gate A already in flight: {claim_message(claim)} — if that "
-            f"session is dead, clear it with `coord diagnose {repo_name} "
-            f"{tracking_issue_number}`, then dispatch again"
+            f"Gate A already in flight: {claim_message(claim)} — "
+            f"{claim_remedy_hint(claim, repo_name, tracking_issue_number)}"
         )
 
     # Pick the machine.
