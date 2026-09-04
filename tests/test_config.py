@@ -415,6 +415,27 @@ def test_store_backend_cmd_fails_loud_on_malformed_store_block(
     assert result.exit_code != 0
 
 
+def test_store_backend_cmd_prints_curated_message_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3085 fix-review: a malformed `store:` block must still exit
+    non-zero (see the test above), but the failure a shell script's `fail()`
+    embeds verbatim should be one curated line, not a raw Python traceback --
+    a `deploy/coord-db-backup.sh` failure ends up in the systemd journal an
+    on-call engineer reads."""
+    from click.testing import CliRunner  # noqa: PLC0415
+
+    from coord.cli import main  # noqa: PLC0415
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text("repos: []\nmachines: []\nstore:\n  backend: not-a-real-backend\n")
+    monkeypatch.setenv("COORD_CONFIG", str(p))
+    result = CliRunner().invoke(main, ["store-backend"])
+    assert result.exit_code != 0
+    assert "Traceback (most recent call last)" not in result.output
+    assert "store-backend" in result.output
+
+
 _EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "coordinator.yml"
 
 

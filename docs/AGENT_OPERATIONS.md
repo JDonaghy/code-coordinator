@@ -1553,6 +1553,17 @@ systemctl --user daemon-reload
 systemctl --user enable --now coord-db-backup.timer      # hourly, Persistent=true
 ```
 
+`coord-db-backup.service` carries an explicit `Environment=PATH=` line for the
+same #1831/#2561/#2569 reason as `coord-serve.service`/`coord-notify.service`/
+`coord-drive-queue.service` in this directory: a systemd *user* unit's default
+PATH does not include `~/.local/bin` (where the `coord` shim lives) or
+`~/.coord-venv/bin`, and `coord-db-backup.sh` now shells out to `coord
+store-backend` (#3084/#3085) before touching the filesystem — without the
+override, `command -v coord` fails and the unit refuses on every fire, even
+for the honest `store.backend: sqlite` case. If you ever copy this unit by
+hand instead of `cp`-ing `deploy/coord-db-backup.service` verbatim, keep that
+line.
+
 | | |
 |---|---|
 | target | `/media/crucial/coord-backups/` — Crucial X9 2TB SSD, **ext4** |

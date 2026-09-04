@@ -43,14 +43,19 @@ COORD_BIN="${COORD_BIN:-coord}"
 command -v "$COORD_BIN" >/dev/null 2>&1 \
   || fail "cannot determine the store backend: '$COORD_BIN' not found on \$PATH — refusing to assume sqlite (see #1822)"
 
-# stdout only — stderr can carry unrelated dev-only warnings (e.g. an
-# editable-install worktree not on its default branch) that must not
-# contaminate the one line of output we parse below. Re-run once, capturing
-# stderr, ONLY on failure, purely for a useful error message.
-BACKEND_OUTPUT="$("$COORD_BIN" store-backend 2>/dev/null)"
+# stderr can carry unrelated dev-only warnings (e.g. an editable-install
+# worktree not on its default branch) that must not contaminate the one
+# line of stdout we parse below, so the two streams are kept separate
+# rather than merged — but both are captured in a single invocation
+# (re-running a second time on failure would risk the two calls observing
+# a config file mid-edit differently, and is an avoidable extra subprocess
+# spawn besides). BACKEND_ERR is only used in the fail() message below.
+BACKEND_ERR_FILE="$(mktemp)"
+trap 'rm -f "$BACKEND_ERR_FILE"' EXIT
+BACKEND_OUTPUT="$("$COORD_BIN" store-backend 2>"$BACKEND_ERR_FILE")"
 BACKEND_RC=$?
 if [ "$BACKEND_RC" -ne 0 ]; then
-  BACKEND_ERR="$("$COORD_BIN" store-backend 2>&1 >/dev/null)"
+  BACKEND_ERR="$(cat "$BACKEND_ERR_FILE")"
   fail "cannot determine the store backend: '$COORD_BIN store-backend' exited $BACKEND_RC — refusing to assume sqlite (see #1822): ${BACKEND_ERR:-<no output>}"
 fi
 
