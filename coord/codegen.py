@@ -238,6 +238,12 @@ SCHEMA_DISPLAY_ORDER: tuple[str, ...] = (
     "GateAPacket",
     "GateAApprovalWire",
     "GateAMockWire",
+    "MilestoneListResponse",
+    "MilestoneSummaryWire",
+    "MilestoneDetail",
+    "MilestoneEntryWire",
+    "MilestoneGateColumnsWire",
+    "MilestoneGateAWire",
 )
 
 # (schema name, field name) -> literal TS type, bypassing the mechanical
@@ -287,6 +293,30 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # coord/gate_a.py GateAApproval.verdict — the two VERDICTS a human can
     # record (`coord gate-a --approved|--changes`).
     ("GateAApprovalWire", "verdict"): "'approved' | 'changes'",
+    # #3072 — the milestone roster (coord/dashboard/server.py). Same two
+    # hand-curated enums as the Gate-A packet above, plus GitHub's own
+    # milestone/issue state vocabulary and the four board gate columns,
+    # which are the SAME value sets `Assignment` declares above — kept in
+    # sync by pointing at the same shared type names where one exists
+    # (`AssignmentStatus`, `TestVerdict`) rather than re-spelling them.
+    ("MilestoneSummaryWire", "state"): "'open' | 'closed'",
+    ("MilestoneDetail", "state"): "'open' | 'closed'",
+    # An entry whose issue could not be resolved reports null, not a guess —
+    # see MilestoneEntryWire's docstring.
+    ("MilestoneEntryWire", "state"): "'open' | 'closed' | null",
+    ("MilestoneGateAWire", "state"): (
+        "'approved' | 'missing' | 'stale' | 'changes' | 'exempt'"
+    ),
+    ("MilestoneGateAWire", "verdict"): "'approved' | 'changes' | null",
+    ("MilestoneGateColumnsWire", "status"): "AssignmentStatus | null",
+    ("MilestoneGateColumnsWire", "test_state"): "TestVerdict | null",
+    ("MilestoneGateColumnsWire", "smoke_test"): "'pass' | 'fail' | null",
+    ("MilestoneGateColumnsWire", "review_state"): (
+        "'pending' | 'dispatched' | 'done' | null"
+    ),
+    ("MilestoneGateColumnsWire", "review_verdict"): (
+        "'approve' | 'request-changes' | null"
+    ),
 }
 
 # Hand-authored wire-contract enums — see module docstring for why these are

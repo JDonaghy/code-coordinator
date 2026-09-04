@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as _html_escape
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 from starlette.applications import Starlette
@@ -57,6 +58,10 @@ from coord.models import Assignment
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 from coord.pipeline import PipelineView
 from coord.state import leg_counts, list_drive_queue, load_proposals
+
+if TYPE_CHECKING:  # #3072: annotations only — keep module import cost flat
+    from coord.gate_a import GateADecision
+    from coord.models import Repo
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +171,235 @@ class GateAPacket:
     contract_markdown: str
     mocks: list[GateAMockWire]
     mocks_note: str
+
+
+# ── Milestone roster (#3072) ─────────────────────────────────────────────────
+#
+# ``GET /api/milestones`` + ``GET /api/milestones/{repo}/{number}`` — the one
+# view neither ``/api/board`` nor ``/api/pipeline`` can show: the STORY of a
+# piece of work (one request became a milestone with N slices; here is the
+# Gate-A sign-off; here is 4 of 6 merged), rather than what is moving right
+# now.
+#
+# Every number below is READ, never re-derived:
+#   * roster stats  -> ``coord.plans.aggregate_repo_plans`` (the #974 path
+#     ``coord plans`` itself calls), so the endpoint and the CLI cannot
+#     disagree about ready/blocked/in-flight/done;
+#   * open/closed   -> GitHub's own milestone counters, via
+#     ``github_ops.get_repo_milestones_with_counts``;
+#   * work order    -> ``coord.milestone_order.parse_work_order`` — the
+#     ``## Work order`` block, NOT GitHub milestone membership. Only the
+#     former carries sequence, and the two are routinely different sets;
+#   * gate columns  -> ``coord.gates.gate_columns_for_issue``, the same row
+#     selection + projection ``coord gates`` prints;
+#   * Gate A        -> ``coord.gate_a.evaluate`` via
+#     ``gate_a_decision_for_milestone`` below, shared verbatim with
+#     ``api_gate_a`` (#3069).
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneGateColumnsWire:
+    """One work-order entry's gate columns, as ``coord gates`` reports them.
+
+    A projection of :class:`coord.gates.AssignmentGateRow` for the winning
+    work-like board row (#3072) — deliberately the *columns*, not the live
+    gate decision: rendering a roster must not fan out one ``gh`` SHA
+    comparison per entry. ``None`` on an entry means the board has no
+    work-like row for that issue at all (never dispatched), which is a
+    different fact from "dispatched, no verdict yet" (a row with every
+    verdict column ``null``).
+    """
+
+    assignment_id: str | None
+    status: str | None
+    branch: str | None
+    machine_name: str | None
+    test_state: str | None
+    smoke_test: str | None
+    review_state: str | None
+    review_verdict: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneEntryWire:
+    """One node of a milestone's ``## Work order``, in declared order.
+
+    ``position`` is the 1-based index in that block — the sequence GitHub
+    milestone membership cannot express, and the reason this endpoint reads
+    the work order rather than the milestone's issue list. ``state`` is
+    ``"open"``/``"closed"`` as GitHub reports it, or ``null`` for a declared
+    node that could not be resolved to a live issue (a typo'd number, or one
+    that has since moved repos) — reported as unknown rather than guessed
+    closed, since "not open" is exactly how a work order counts something as
+    done.
+    """
+
+    issue_number: int
+    title: str
+    state: str | None
+    position: int
+    after: list[int]
+    group: str | None
+    gates: MilestoneGateColumnsWire | None
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneGateAWire:
+    """A milestone's Gate-A sign-off, summarised (#3072).
+
+    Deliberately a SUMMARY, not a second copy of #3069's ``GateAPacket``:
+    ``href`` points at ``GET /api/gate-a/{repo}/{tracking_issue}`` for the
+    full packet (contract markdown + every rendered mock), and this carries
+    only what a roster row shows — the live ``state``/``ok``/
+    ``contract_sha`` off :func:`coord.gate_a.evaluate`, plus the recorded
+    human ``verdict``. ``verdict`` is ``null`` when nobody has recorded one
+    yet; ``approved_contract_sha`` is the sha that verdict was recorded
+    against, which differs from ``contract_sha`` exactly when the contract
+    was amended after sign-off (``state == "stale"``).
+    """
+
+    state: str
+    ok: bool
+    contract_sha: str
+    reason: str | None
+    verdict: str | None
+    actor: str | None
+    recorded_at: float | None
+    approved_contract_sha: str | None
+    href: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneSummaryWire:
+    """One row of ``GET /api/milestones`` — a milestone at roster altitude.
+
+    ``open_issues``/``closed_issues`` are GitHub's own counters for the
+    whole milestone; ``work_order_total``/``work_order_done`` and the
+    ready/blocked/in-flight trio are work-order-scoped and come straight off
+    :class:`coord.plans.PlanEntry` (see that class for what each signal
+    means, including the ``needs_you`` vocabulary). The two scopes are
+    different on purpose and are routinely different numbers — the work
+    order is the declared scope of automated dispatch, the milestone is
+    whatever has been filed under it.
+    """
+
+    repo_name: str
+    milestone_number: int
+    title: str
+    state: str
+    tracking_issue: int | None
+    open_issues: int
+    closed_issues: int
+    oracle: bool
+    has_work_order: bool
+    work_order_total: int
+    work_order_done: int
+    ready_frontier: int
+    in_flight: int
+    blocked: int
+    needs_you: list[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneListResponse:
+    """``GET /api/milestones``.
+
+    ``warnings`` carries per-repo fetch failures (a ``gh`` outage, an
+    unreadable repo) as strings instead of failing the whole roster —
+    mirroring ``coord plans``, which prints the same warnings to stderr and
+    still reports every repo it *could* read. A repo with no milestones
+    contributes no rows and no warning.
+    """
+
+    milestones: list[MilestoneSummaryWire]
+    warnings: list[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class MilestoneDetail:
+    """``GET /api/milestones/{repo}/{number}`` — one milestone's story.
+
+    ``entries`` is the ``## Work order`` in declared order (empty when the
+    milestone has no tracking epic, or its epic has no parseable work-order
+    block — ``has_work_order`` tells those apart from a genuinely empty
+    one). ``gate_a`` is ``null`` for a repo that is not opted into the
+    oracle loop (``config.acceptance.has_driver``) — a non-oracle milestone
+    has no Gate A to report, which is a fact, not an error.
+    """
+
+    repo_name: str
+    milestone_number: int
+    title: str
+    state: str
+    tracking_issue: int | None
+    open_issues: int
+    closed_issues: int
+    oracle: bool
+    has_work_order: bool
+    entries: list[MilestoneEntryWire]
+    gate_a: MilestoneGateAWire | None
+    warnings: list[str]
+
+
+def gate_a_decision_for_milestone(
+    config: Config, repo_cfg: "Repo", milestone_number: int
+) -> "tuple[GateADecision, str | None]":
+    """``(decision, contract_text)`` for one milestone's Gate A (#3069).
+
+    The single Gate-A read shared by ``GET /api/gate-a/{repo}/{tracking_issue}``
+    and ``GET /api/milestones/{repo}/{number}`` (#3072), so the roster's
+    summary and the full packet cannot report different states for the same
+    milestone.
+
+    The contract is fetched the same way ``coord gate-a`` fetches it
+    (:func:`coord.acceptance.gate_a_contract_candidates`, trying each #2896
+    candidate root in turn) — identical bytes, so the ``contract_sha`` here
+    is the one the CLI prints. The recorded approval comes off
+    :func:`coord.client.fetch_gate_a_approval` when this dashboard is a thin
+    client (``board_service`` configured) or :func:`coord.state.get_gate_a_approval`
+    directly otherwise — the same daemon-vs-local split every other stateful
+    read in this file uses. The verdict itself is
+    :func:`coord.gate_a.evaluate`, never re-derived.
+
+    ``contract_text`` is ``None`` when no candidate path could be read; the
+    returned decision already accounts for that ("cannot verify"), and
+    callers that have a second source for the text (``api_gate_a``'s mock
+    bundle) use it for display only.
+    """
+    from coord import board_service  # noqa: PLC0415
+    from coord import gate_a as gate_a_mod  # noqa: PLC0415
+    from coord import github_ops  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
+
+    contract_text: str | None = None
+    for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
+        try:
+            contract_text = github_ops.get_repo_file(
+                repo_cfg.github, path, branch=repo_cfg.default_branch
+            )
+            break
+        except RuntimeError:
+            continue
+
+    svc = board_service.resolve()
+    if svc is not None:
+        from coord.client import fetch_gate_a_approval  # noqa: PLC0415
+
+        approval_raw = fetch_gate_a_approval(svc, repo_cfg.name, milestone_number)
+    else:
+        from coord import state  # noqa: PLC0415
+
+        approval_raw = state.get_gate_a_approval(
+            repo_name=repo_cfg.name, milestone_number=milestone_number
+        )
+
+    decision = gate_a_mod.evaluate(
+        repo_name=repo_cfg.name,
+        milestone_number=milestone_number,
+        contract_text=contract_text,
+        approval=approval_raw,
+    )
+    return decision, contract_text
 
 
 _MOCK_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
@@ -778,6 +1012,12 @@ def openapi_spec() -> dict:
     # walks (real dataclasses, unlike the hand-built shapes above) since the
     # handler literally returns `dataclasses.asdict(GateAPacket(...))`.
     gate_a_packet_ref = dataclass_schema(GateAPacket, components)
+    # #3072: GET /api/milestones{,/{repo}/{number}} — same plain
+    # `dataclass_schema` walk as GateAPacket above; both handlers return a
+    # literal `dataclasses.asdict()` of one dataclass, so the spec and the
+    # response cannot drift.
+    milestone_list_ref = dataclass_schema(MilestoneListResponse, components)
+    milestone_detail_ref = dataclass_schema(MilestoneDetail, components)
     # #3027: the four `/api/machines*` endpoints (#3021-#3026) went out
     # carrying a bare `{"200": {"description": "OK"}}` stub — every other
     # surface here has a real `content` schema, this milestone's own
@@ -1585,6 +1825,77 @@ def openapi_spec() -> dict:
                             "no milestone"
                         )
                     },
+                },
+            }
+        },
+        "/api/milestones": {
+            "get": {
+                "summary": (
+                    "#3072: the milestone roster — every tracked milestone "
+                    "with its open/closed counts, work-order progress and "
+                    "oracle opt-in"
+                ),
+                "description": (
+                    "Stats come from coord.plans.aggregate_repo_plans, the "
+                    "same #974 path `coord plans` calls, so this surface and "
+                    "the CLI cannot disagree. Open/closed counts are "
+                    "GitHub's own milestone counters. Optional `?repo=NAME` "
+                    "scopes to one coord-local repo. Per-repo fetch failures "
+                    "are reported in `warnings` rather than failing the "
+                    "roster; a repo with no milestones simply contributes no "
+                    "rows."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": (
+                            "restrict to one coord-local repo name "
+                            "(coordinator.yml); 404 if unknown"
+                        ),
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": milestone_list_ref}
+                        },
+                    },
+                    "404": {"description": "Unknown ?repo="},
+                },
+            }
+        },
+        "/api/milestones/{repo}/{number}": {
+            "get": {
+                "summary": (
+                    "#3072: one milestone's ORDERED `## Work order`, each "
+                    "entry's gate columns, and its Gate-A sign-off"
+                ),
+                "description": (
+                    "`entries` is the tracking epic's `## Work order` block "
+                    "in declared order — NOT GitHub milestone membership, "
+                    "which is a set and carries no sequence. Gate columns "
+                    "per entry are coord.gates.gate_columns_for_issue (the "
+                    "same board row `coord gates` reports on). `gate_a` is "
+                    "null for a repo not opted into the oracle loop, and "
+                    "links to GET /api/gate-a/{repo}/{tracking_issue} "
+                    "(#3069) for the full packet rather than duplicating it."
+                ),
+                "parameters": [
+                    _dashboard_path_param("repo", "repo name (coordinator.yml)"),
+                    _dashboard_path_param("number", "GitHub milestone number"),
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": milestone_detail_ref}
+                        },
+                    },
+                    "404": {"description": "Unknown repo or milestone number"},
                 },
             }
         },
@@ -3787,38 +4098,14 @@ def build_app(
         milestone_number = int(milestone["number"])
         milestone_title = str(milestone.get("title") or "")
 
-        from coord.acceptance import gate_a_contract_candidates, ms_dirname  # noqa: PLC0415
-
-        contract_text: str | None = None
-        for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
-            try:
-                contract_text = github_ops.get_repo_file(
-                    repo_cfg.github, path, branch=repo_cfg.default_branch
-                )
-                break
-            except RuntimeError:
-                continue
-
-        from coord import board_service  # noqa: PLC0415
         from coord import gate_a as gate_a_mod  # noqa: PLC0415
+        from coord.acceptance import ms_dirname  # noqa: PLC0415
 
-        svc = board_service.resolve()
-        if svc is not None:
-            from coord.client import fetch_gate_a_approval  # noqa: PLC0415
-
-            approval_raw = fetch_gate_a_approval(svc, repo_cfg.name, milestone_number)
-        else:
-            from coord import state  # noqa: PLC0415
-
-            approval_raw = state.get_gate_a_approval(
-                repo_name=repo_cfg.name, milestone_number=milestone_number
-            )
-
-        decision = gate_a_mod.evaluate(
-            repo_name=repo_cfg.name,
-            milestone_number=milestone_number,
-            contract_text=contract_text,
-            approval=approval_raw,
+        # #3072: the contract read + approval lookup + `evaluate` call moved
+        # into `gate_a_decision_for_milestone` so `/api/milestones/...` shares
+        # them verbatim rather than growing a second Gate-A read.
+        decision, contract_text = gate_a_decision_for_milestone(
+            config, repo_cfg, milestone_number
         )
 
         from coord import mock_author  # noqa: PLC0415
@@ -3882,6 +4169,319 @@ def build_app(
             mocks_note=mocks_note,
         )
         return JSONResponse(dataclasses.asdict(packet))
+
+    def _milestone_gate_a(
+        repo_cfg: "Repo", milestone_number: int, tracking_issue: int | None,
+        warnings: list[str],
+    ) -> MilestoneGateAWire | None:
+        """A milestone's Gate-A summary, or ``None`` when it has no Gate A.
+
+        ``None`` means one of two things, both non-errors: the repo isn't
+        opted into the oracle loop (``config.acceptance.has_driver`` — Gate A
+        is an oracle-loop concept, exactly as
+        :func:`coord.milestone_dispatch.gate_a_status` treats it), or the
+        lookup itself failed, in which case the reason is appended to
+        *warnings* rather than raised. A roster must not 500 because one
+        milestone's contract could not be fetched.
+        """
+        if not config.acceptance.has_driver(repo_cfg.name):
+            return None
+        try:
+            decision, _ = gate_a_decision_for_milestone(
+                config, repo_cfg, milestone_number
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade, don't fail the page
+            warnings.append(
+                f"could not read Gate A for {repo_cfg.name} milestone "
+                f"{milestone_number}: {exc}"
+            )
+            return None
+        approval = decision.approval
+        return MilestoneGateAWire(
+            state=decision.state,
+            ok=decision.ok,
+            contract_sha=decision.contract_sha,
+            reason=decision.reason,
+            verdict=approval.verdict if approval is not None else None,
+            actor=approval.actor if approval is not None else None,
+            recorded_at=approval.recorded_at if approval is not None else None,
+            approved_contract_sha=(
+                approval.contract_sha if approval is not None else None
+            ),
+            href=(
+                f"/api/gate-a/{repo_cfg.name}/{tracking_issue}"
+                if tracking_issue is not None
+                else None
+            ),
+        )
+
+    async def api_milestones(request: Request) -> JSONResponse:
+        """GET /api/milestones — the milestone roster (#3072).
+
+        Every stat here is :func:`coord.plans.aggregate_repo_plans` — the
+        exact #974 path ``coord plans`` calls, given the exact same three
+        GitHub reads in the same order (milestones, open issues, closed
+        epics) and the same board. A second roster computation would drift,
+        and the drift would be silent because both would look plausible.
+
+        ``?repo=NAME`` scopes to one coord-local repo (404 on an unknown
+        one), mirroring ``coord plans --repo``; without it, every configured
+        repo is included. A repo whose milestone list is empty contributes
+        no rows — an empty roster is ``{"milestones": [], "warnings": []}``,
+        never an error.
+
+        Per-repo fetch failures land in ``warnings`` and the repo is skipped,
+        the same fail-soft ``coord plans`` does with its stderr warnings: one
+        unreachable repo must not blank the other five.
+        """
+        from coord import github_ops  # noqa: PLC0415
+        from coord.plans import aggregate_repo_plans  # noqa: PLC0415
+
+        repo_filter = request.query_params.get("repo")
+        if repo_filter:
+            only = config.repo(repo_filter)
+            if only is None:
+                return JSONResponse(
+                    {"error": f"unknown repo {repo_filter!r}"}, status_code=404
+                )
+            target_repos = [only]
+        else:
+            target_repos = list(config.repos)
+
+        board = _read_board()
+        rows: list[MilestoneSummaryWire] = []
+        warnings: list[str] = []
+
+        for repo_cfg in target_repos:
+            try:
+                milestones = github_ops.get_repo_milestones_with_counts(repo_cfg.github)
+            except RuntimeError as exc:
+                warnings.append(
+                    f"could not list milestones for {repo_cfg.github}: {exc}"
+                )
+                continue
+            if not milestones:
+                continue
+            try:
+                open_issues = github_ops.get_open_issues(repo_cfg.github)
+            except RuntimeError as exc:
+                warnings.append(f"could not fetch issues for {repo_cfg.github}: {exc}")
+                continue
+            # Fail-open exactly like `coord plans`: without closed epics a
+            # milestone whose epic was tidied up reads "no_work_order", which
+            # is wrong but survivable; failing the repo outright is not.
+            try:
+                closed_epics = github_ops.get_closed_epics(repo_cfg.github)
+            except RuntimeError as exc:
+                warnings.append(
+                    f"could not fetch closed epics for {repo_cfg.github}: {exc}"
+                )
+                closed_epics = []
+
+            entries = aggregate_repo_plans(
+                repo_name=repo_cfg.name,
+                repo_github=repo_cfg.github,
+                milestones=milestones,
+                open_issues=open_issues,
+                board=board,
+                closed_tracking_issues=closed_epics,
+            )
+            raw_by_number = {m["number"]: m for m in milestones}
+            oracle = config.acceptance.has_driver(repo_cfg.name)
+            for entry in entries:
+                raw = raw_by_number.get(entry.milestone_number) or {}
+                rows.append(
+                    MilestoneSummaryWire(
+                        repo_name=entry.repo,
+                        milestone_number=entry.milestone_number,
+                        title=entry.title,
+                        state=str(raw.get("state") or "open"),
+                        tracking_issue=entry.tracking_issue,
+                        open_issues=int(raw.get("open_issues") or 0),
+                        closed_issues=int(raw.get("closed_issues") or 0),
+                        oracle=oracle,
+                        has_work_order=entry.has_work_order,
+                        work_order_total=entry.total,
+                        work_order_done=entry.done,
+                        ready_frontier=entry.ready_frontier,
+                        in_flight=entry.in_flight,
+                        blocked=entry.blocked,
+                        needs_you=list(entry.needs_you),
+                    )
+                )
+
+        return JSONResponse(
+            dataclasses.asdict(
+                MilestoneListResponse(milestones=rows, warnings=warnings)
+            )
+        )
+
+    async def api_milestone_detail(request: Request) -> JSONResponse:
+        """GET /api/milestones/{repo}/{number} — one milestone's ordered
+        work order, per-entry gate columns, and Gate-A sign-off (#3072).
+
+        ``entries`` is the tracking epic's ``## Work order`` block parsed by
+        :func:`coord.milestone_order.parse_work_order`, **in declared
+        order** — deliberately not GitHub's milestone membership. They are
+        different things: membership is a set (GitHub returns it in whatever
+        order it likes), the work order is a sequence with ``after:``
+        dependencies, and only the latter is the declared scope of automated
+        dispatch. The tracking epic is found by
+        :func:`coord.plans.find_tracking_issue` over open issues *plus*
+        closed epics, so a milestone left open after its epic was closed
+        still resolves (#974).
+
+        Issue titles and open/closed state come from one ``--state all``
+        listing of the milestone, overlaid with the repo's open issues so a
+        work-order node declared outside this milestone still resolves.
+        Gate columns per entry are :func:`coord.gates.gate_columns_for_issue`
+        — the same board row ``coord gates`` reports on, without its live
+        SHA lookups (see that function for why the roster does not want
+        them).
+        """
+        from coord import github_ops  # noqa: PLC0415
+        from coord.gates import gate_columns_for_issue  # noqa: PLC0415
+        from coord.milestone_order import parse_work_order  # noqa: PLC0415
+        from coord.plans import find_tracking_issue  # noqa: PLC0415
+
+        repo_name = request.path_params["repo"]
+        try:
+            milestone_number = int(request.path_params["number"])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "milestone number must be an integer"}, status_code=404
+            )
+
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            return JSONResponse(
+                {"error": f"unknown repo {repo_name!r}"}, status_code=404
+            )
+
+        try:
+            milestone = github_ops.get_milestone(repo_cfg.github, milestone_number)
+        except RuntimeError as exc:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"could not fetch milestone {milestone_number} in "
+                        f"{repo_name}: {exc}"
+                    )
+                },
+                status_code=404,
+            )
+        if not milestone or milestone.get("number") != milestone_number:
+            return JSONResponse(
+                {"error": f"unknown milestone {repo_name}#{milestone_number}"},
+                status_code=404,
+            )
+
+        warnings: list[str] = []
+        milestone_title = str(milestone.get("title") or "")
+
+        try:
+            open_issues = github_ops.get_open_issues(repo_cfg.github)
+        except RuntimeError as exc:
+            warnings.append(f"could not fetch issues for {repo_cfg.github}: {exc}")
+            open_issues = []
+        try:
+            closed_epics = github_ops.get_closed_epics(repo_cfg.github)
+        except RuntimeError as exc:
+            warnings.append(
+                f"could not fetch closed epics for {repo_cfg.github}: {exc}"
+            )
+            closed_epics = []
+
+        tracking = find_tracking_issue(milestone_number, open_issues + closed_epics)
+        tracking_issue = tracking["number"] if tracking is not None else None
+
+        work_order_nodes = ()
+        if tracking is not None:
+            try:
+                work_order_nodes = parse_work_order(tracking.get("body") or "").nodes
+            except Exception as exc:  # noqa: BLE001 — malformed block, not a crash
+                warnings.append(
+                    f"{repo_name}#{tracking_issue}'s `## Work order` block did "
+                    f"not parse: {exc}"
+                )
+        elif milestone.get("state") != "closed":
+            warnings.append(
+                f"no `epic`-labelled tracking issue under {repo_name} milestone "
+                f"{milestone_number} — there is no work order to order by"
+            )
+
+        # number -> {title, state}. The milestone's own --state all listing is
+        # authoritative for its members; `setdefault` from open issues then
+        # resolves any work-order node declared OUTSIDE this milestone rather
+        # than reporting it as unknown.
+        issue_index: dict[int, dict] = {}
+        if work_order_nodes:
+            try:
+                for issue in github_ops.get_milestone_issues(
+                    repo_cfg.github, milestone_title, state="all"
+                ):
+                    issue_index[issue["number"]] = {
+                        "title": str(issue.get("title") or ""),
+                        "state": (str(issue.get("state") or "").lower() or None),
+                    }
+            except RuntimeError as exc:
+                warnings.append(
+                    f"could not list issues under {repo_cfg.github} milestone "
+                    f"{milestone_number!r}: {exc}"
+                )
+        for issue in open_issues:
+            issue_index.setdefault(
+                issue["number"],
+                {"title": str(issue.get("title") or ""), "state": "open"},
+            )
+
+        board = _read_board()
+        entries: list[MilestoneEntryWire] = []
+        for position, node in enumerate(work_order_nodes, start=1):
+            known = issue_index.get(node.issue_number) or {}
+            row = gate_columns_for_issue(board, repo_cfg.name, node.issue_number)
+            entries.append(
+                MilestoneEntryWire(
+                    issue_number=node.issue_number,
+                    title=str(known.get("title") or ""),
+                    state=known.get("state"),
+                    position=position,
+                    after=list(node.after),
+                    group=node.group,
+                    gates=(
+                        None
+                        if row is None
+                        else MilestoneGateColumnsWire(
+                            assignment_id=row.assignment_id,
+                            status=row.status,
+                            branch=row.branch,
+                            machine_name=row.machine_name,
+                            test_state=row.test_state,
+                            smoke_test=row.smoke_test,
+                            review_state=row.review_state,
+                            review_verdict=row.review_verdict,
+                        )
+                    ),
+                )
+            )
+
+        detail = MilestoneDetail(
+            repo_name=repo_cfg.name,
+            milestone_number=milestone_number,
+            title=milestone_title,
+            state=str(milestone.get("state") or "open"),
+            tracking_issue=tracking_issue,
+            open_issues=int(milestone.get("open_issues") or 0),
+            closed_issues=int(milestone.get("closed_issues") or 0),
+            oracle=config.acceptance.has_driver(repo_cfg.name),
+            has_work_order=bool(work_order_nodes),
+            entries=entries,
+            gate_a=_milestone_gate_a(
+                repo_cfg, milestone_number, tracking_issue, warnings
+            ),
+            warnings=warnings,
+        )
+        return JSONResponse(dataclasses.asdict(detail))
 
     async def terminal_ws(websocket: WebSocket) -> None:
         """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
@@ -4013,6 +4613,10 @@ def build_app(
         Route("/api/portal/needs-input", api_portal_needs_input, methods=["GET"]),
         Route("/api/portal/answer", api_portal_answer, methods=["POST"]),
         Route("/api/gate-a/{repo}/{tracking_issue}", api_gate_a, methods=["GET"]),
+        Route("/api/milestones", api_milestones, methods=["GET"]),
+        Route(
+            "/api/milestones/{repo}/{number}", api_milestone_detail, methods=["GET"]
+        ),
         build_events_route(event_source),
         WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]

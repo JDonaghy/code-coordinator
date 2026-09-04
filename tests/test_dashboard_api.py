@@ -1871,3 +1871,479 @@ class TestGateAPacketAPI:
         ]["200"]["content"]["application/json"]["schema"]
         errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
         assert errors == [], errors
+
+
+# ── GET /api/milestones{,/{repo}/{number}} (#3072) ──────────────────────────
+#
+# The milestone roster. Every test drives the REAL aggregation
+# (`coord.plans.aggregate_repo_plans`, `coord.milestone_order.parse_work_order`,
+# `coord.gates.gate_columns_for_issue`, `coord.gate_a.evaluate`) through faked
+# GitHub reads — never a re-implementation of the roster, which is the whole
+# point of building on the `coord plans` path.
+
+
+#: An epic body whose `## Work order` deliberately declares its nodes in an
+#: order GitHub would never return them in (12 before 10) — the fixture that
+#: makes "ordered by the work order, not by milestone membership" falsifiable.
+_WORK_ORDER_BODY = """\
+Some preamble.
+
+## Work order
+
+- #12  {group: ms-4}
+- #10  {after: #12}
+- #11  {after: #10}
+"""
+
+
+def _ms_config(driver: AcceptanceDriverConfig | None = None) -> Config:
+    drivers = {"portal": driver} if driver is not None else {}
+    return Config(
+        repos=[Repo(name="portal", github="acme/portal", default_branch="main")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["portal"])],
+        acceptance=AcceptanceConfig(drivers=drivers),
+    )
+
+
+def _ms_client(driver: AcceptanceDriverConfig | None = None) -> TestClient:
+    return TestClient(build_app(_ms_config(driver)))
+
+
+def _epic(number: int = 122, milestone_number: int = 4, body: str = _WORK_ORDER_BODY):
+    return {
+        "number": number,
+        "title": "ms-4 epic",
+        "body": body,
+        "labels": [{"name": "epic"}],
+        "milestone": {"number": milestone_number, "title": "ms-4"},
+    }
+
+
+def _milestone(
+    number: int = 4, *, title: str = "ms-4", state: str = "open",
+    open_issues: int = 3, closed_issues: int = 1,
+):
+    return {
+        "number": number,
+        "title": title,
+        "state": state,
+        "open_issues": open_issues,
+        "closed_issues": closed_issues,
+        "description": "",
+    }
+
+
+def _patch_github(monkeypatch, **overrides) -> None:
+    """Point every GitHub read the milestone endpoints make at a fake.
+
+    Defaults describe one open milestone (ms-4) with a three-node work order
+    whose declared order (12, 10, 11) differs from GitHub's membership order
+    (10, 11, 12). Override any single read by keyword.
+    """
+    from coord import github_ops
+
+    defaults = {
+        "get_repo_milestones_with_counts": lambda repo, state="open": [_milestone()],
+        "get_milestone": lambda repo, n: _milestone() if n == 4 else {},
+        "get_open_issues": lambda repo, **kw: [_epic()],
+        "get_closed_epics": lambda repo, **kw: [],
+        "get_milestone_issues": lambda repo, title, state="all": [
+            {"number": 10, "title": "slice one", "state": "CLOSED"},
+            {"number": 11, "title": "slice two", "state": "OPEN"},
+            {"number": 12, "title": "slice zero", "state": "CLOSED"},
+        ],
+        "get_repo_file": _fake_get_repo_file({}),
+    }
+    for name, fn in {**defaults, **overrides}.items():
+        monkeypatch.setattr(github_ops, name, fn)
+
+
+class TestMilestoneListAPI:
+    """`GET /api/milestones` — the roster."""
+
+    def test_unknown_repo_filter_returns_clean_404(self) -> None:
+        client = _ms_client()
+        r = client.get("/api/milestones?repo=nonexistent")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_repo_with_no_milestones_returns_empty_list_not_a_500(
+        self, monkeypatch
+    ) -> None:
+        _patch_github(
+            monkeypatch, get_repo_milestones_with_counts=lambda repo, state="open": []
+        )
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        assert r.status_code == 200
+        assert r.json() == {"milestones": [], "warnings": []}
+
+    def test_row_carries_github_counts_work_order_progress_and_oracle_flag(
+        self, monkeypatch
+    ) -> None:
+        _patch_github(monkeypatch)
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        assert r.status_code == 200
+        rows = r.json()["milestones"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["repo_name"] == "portal"
+        assert row["milestone_number"] == 4
+        assert row["title"] == "ms-4"
+        assert row["state"] == "open"
+        assert row["tracking_issue"] == 122
+        # GitHub's own counters, not a local re-count.
+        assert row["open_issues"] == 3
+        assert row["closed_issues"] == 1
+        assert row["oracle"] is True
+        # Work-order scope is a DIFFERENT number from the milestone's issue
+        # counts: 3 declared nodes, none of them open (only the epic is).
+        assert row["has_work_order"] is True
+        assert row["work_order_total"] == 3
+        assert row["work_order_done"] == 3
+
+    def test_non_oracle_repo_reports_oracle_false(self, monkeypatch) -> None:
+        _patch_github(monkeypatch)
+        client = _ms_client()  # no acceptance driver configured
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        assert r.json()["milestones"][0]["oracle"] is False
+
+    def test_all_closed_milestone_reports_closed_counts_matching_github(
+        self, monkeypatch
+    ) -> None:
+        """A milestone whose issues are all closed must report GitHub's
+        closed count, and must not report its work order as still in
+        progress."""
+        done = _milestone(state="closed", open_issues=0, closed_issues=4)
+        _patch_github(
+            monkeypatch,
+            get_repo_milestones_with_counts=lambda repo, state="open": [done],
+            # The epic itself is closed too — `coord plans`'s #974 rule: a
+            # closed epic is still the tracking issue.
+            get_open_issues=lambda repo, **kw: [],
+            get_closed_epics=lambda repo, **kw: [_epic()],
+        )
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        row = r.json()["milestones"][0]
+        assert row["state"] == "closed"
+        assert row["open_issues"] == 0
+        assert row["closed_issues"] == 4
+        assert row["tracking_issue"] == 122
+        assert row["work_order_done"] == row["work_order_total"] == 3
+        assert row["ready_frontier"] == 0
+
+    def test_repo_fetch_failure_becomes_a_warning_not_a_500(self, monkeypatch) -> None:
+        def _boom(repo, state="open"):
+            raise RuntimeError("gh: API rate limit exceeded")
+
+        _patch_github(monkeypatch, get_repo_milestones_with_counts=_boom)
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["milestones"] == []
+        assert len(body["warnings"]) == 1
+        assert "rate limit" in body["warnings"][0]
+
+    def test_response_matches_its_openapi_schema(self, monkeypatch) -> None:
+        _patch_github(monkeypatch)
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/milestones"]["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+
+class TestMilestoneDetailAPI:
+    """`GET /api/milestones/{repo}/{number}` — one milestone's story."""
+
+    def test_unknown_repo_returns_clean_404(self) -> None:
+        client = _ms_client()
+        r = client.get("/api/milestones/nonexistent/4")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_unknown_milestone_number_returns_clean_404(self, monkeypatch) -> None:
+        _patch_github(monkeypatch, get_milestone=lambda repo, n: {})
+        client = _ms_client()
+        r = client.get("/api/milestones/portal/999")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_milestone_fetch_error_returns_clean_404(self, monkeypatch) -> None:
+        def _raise(repo, n):
+            raise RuntimeError("gh: Not Found")
+
+        _patch_github(monkeypatch, get_milestone=_raise)
+        client = _ms_client()
+        r = client.get("/api/milestones/portal/4")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_non_integer_milestone_number_returns_clean_404(self) -> None:
+        client = _ms_client()
+        r = client.get("/api/milestones/portal/not-a-number")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_entries_follow_the_work_order_not_github_membership(
+        self, monkeypatch
+    ) -> None:
+        """THE acceptance criterion: GitHub hands back milestone membership
+        as 10, 11, 12; the `## Work order` declares 12, 10, 11. Only the
+        latter carries sequence, so that is what the endpoint must return."""
+        _patch_github(monkeypatch)
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_work_order"] is True
+        assert [e["issue_number"] for e in body["entries"]] == [12, 10, 11]
+        assert [e["position"] for e in body["entries"]] == [1, 2, 3]
+        # Titles + live state come from GitHub, joined onto the work order.
+        assert [e["title"] for e in body["entries"]] == [
+            "slice zero", "slice one", "slice two",
+        ]
+        assert [e["state"] for e in body["entries"]] == ["closed", "closed", "open"]
+        # The `after:`/`group:` annotations survive the join.
+        assert body["entries"][0]["group"] == "ms-4"
+        assert body["entries"][1]["after"] == [12]
+        assert body["entries"][2]["after"] == [10]
+
+    def test_milestone_without_a_tracking_epic_reports_no_work_order(
+        self, monkeypatch
+    ) -> None:
+        _patch_github(monkeypatch, get_open_issues=lambda repo, **kw: [])
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_work_order"] is False
+        assert body["entries"] == []
+        assert body["tracking_issue"] is None
+        assert any("no `epic`-labelled" in w for w in body["warnings"])
+
+    def test_entry_carries_the_board_gate_columns_coord_gates_reports(
+        self, monkeypatch
+    ) -> None:
+        """Per-entry gate columns must be the winning work row's, selected
+        the same way `coord gates` selects it — here the LATER of two work
+        rows on the same issue."""
+        _patch_github(monkeypatch)
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="portal", issue_number=10,
+                issue_title="slice one", assignment_id="old",
+                type="work", status="failed",
+                branch="issue-10-first", dispatched_at=100.0,
+                test_state="failed",
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="portal", issue_number=10,
+                issue_title="slice one", assignment_id="new",
+                type="work", status="done",
+                branch="issue-10-second", dispatched_at=200.0,
+                test_state="passed", smoke_test="pass",
+                review_state="done", review_verdict="approve",
+            ),
+        ])
+        client = _ms_client()
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/milestones/portal/4")
+
+        entries = {e["issue_number"]: e for e in r.json()["entries"]}
+        gates = entries[10]["gates"]
+        assert gates["assignment_id"] == "new"
+        assert gates["branch"] == "issue-10-second"
+        assert gates["status"] == "done"
+        assert gates["test_state"] == "passed"
+        assert gates["smoke_test"] == "pass"
+        assert gates["review_state"] == "done"
+        assert gates["review_verdict"] == "approve"
+        # An entry that was never dispatched reports null gates — a
+        # different fact from "dispatched, no verdict yet".
+        assert entries[11]["gates"] is None
+
+    def test_non_oracle_milestone_carries_null_gate_a_not_an_error(
+        self, monkeypatch
+    ) -> None:
+        _patch_github(monkeypatch)
+        client = _ms_client()  # no acceptance driver => not in the oracle loop
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["oracle"] is False
+        assert body["gate_a"] is None
+        assert body["warnings"] == []
+
+    def test_oracle_milestone_carries_its_gate_a_verdict_and_contract_sha(
+        self, rw_db, monkeypatch
+    ) -> None:
+        from coord import gate_a, state
+
+        contract = "# Contract\n\nSome pinned surface text.\n"
+        _patch_github(
+            monkeypatch,
+            get_repo_file=_fake_get_repo_file(
+                {"tests/acceptance/ms-4/contract.md": contract}
+            ),
+        )
+        sha = gate_a.contract_digest(contract)
+        state.save_gate_a_approval(
+            gate_a.make_record(
+                repo_name="portal", milestone_number=4,
+                verdict=gate_a.VERDICT_APPROVED, contract_sha=sha,
+                tracking_issue=122, actor="jane",
+            ).to_dict()
+        )
+
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        gate = r.json()["gate_a"]
+        assert gate["state"] == "approved"
+        assert gate["ok"] is True
+        assert gate["verdict"] == "approved"
+        assert gate["actor"] == "jane"
+        assert gate["contract_sha"] == sha
+        assert gate["approved_contract_sha"] == sha
+        # Links to #3069's full packet rather than duplicating it.
+        assert gate["href"] == "/api/gate-a/portal/122"
+
+    def test_amended_contract_reports_stale_with_both_shas(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """coord-portal ms-4's real shape: a work order, an amendment, and a
+        recorded approval that predates it."""
+        from coord import gate_a, state
+
+        old_sha = gate_a.contract_digest("# Contract v1\n")
+        new_contract = "# Contract v2 — amended\n"
+        _patch_github(
+            monkeypatch,
+            get_repo_file=_fake_get_repo_file(
+                {"tests/acceptance/ms-4/contract.md": new_contract}
+            ),
+        )
+        state.save_gate_a_approval(
+            gate_a.make_record(
+                repo_name="portal", milestone_number=4,
+                verdict=gate_a.VERDICT_APPROVED, contract_sha=old_sha,
+                tracking_issue=122, actor="jane",
+            ).to_dict()
+        )
+
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        gate = r.json()["gate_a"]
+        assert gate["state"] == "stale"
+        assert gate["ok"] is False
+        assert gate["contract_sha"] == gate_a.contract_digest(new_contract)
+        assert gate["approved_contract_sha"] == old_sha
+
+    def test_gate_a_matches_the_dedicated_gate_a_endpoint(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """Both surfaces read `coord.gate_a.evaluate` through the SAME
+        helper, so they cannot report different states for one milestone."""
+        from coord import gate_a, github_ops, state
+
+        contract = "# Contract\n"
+        _patch_github(
+            monkeypatch,
+            get_repo_file=_fake_get_repo_file(
+                {"tests/acceptance/ms-4/contract.md": contract}
+            ),
+        )
+        monkeypatch.setattr(
+            github_ops, "get_issue", _issue_with_milestone(122, 4, "ms-4")
+        )
+        state.save_gate_a_approval(
+            gate_a.make_record(
+                repo_name="portal", milestone_number=4,
+                verdict=gate_a.VERDICT_APPROVED,
+                contract_sha=gate_a.contract_digest(contract),
+                tracking_issue=122, actor="jane",
+            ).to_dict()
+        )
+
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            roster = client.get("/api/milestones/portal/4").json()["gate_a"]
+            packet = client.get(roster["href"]).json()
+
+        assert roster["state"] == packet["state"]
+        assert roster["ok"] == packet["ok"]
+        assert roster["contract_sha"] == packet["contract_sha"]
+        assert roster["verdict"] == packet["approval"]["verdict"]
+
+    def test_gate_a_read_failure_degrades_to_null_with_a_warning(
+        self, monkeypatch
+    ) -> None:
+        from coord import state
+
+        _patch_github(monkeypatch)
+
+        def _boom(**kwargs):
+            raise RuntimeError("board daemon unreachable")
+
+        monkeypatch.setattr(state, "get_gate_a_approval", _boom)
+
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["gate_a"] is None
+        assert any("Gate A" in w for w in body["warnings"])
+
+    def test_response_matches_its_openapi_schema(self, rw_db, monkeypatch) -> None:
+        _patch_github(monkeypatch)
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="portal", issue_number=10,
+                issue_title="slice one", assignment_id="a1",
+                type="work", status="done",
+                branch="issue-10", dispatched_at=200.0, test_state="passed",
+            ),
+        ])
+        client = _ms_client(AcceptanceDriverConfig(kind="web-playwright"))
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/milestones/portal/4")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/milestones/{repo}/{number}"]["get"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
