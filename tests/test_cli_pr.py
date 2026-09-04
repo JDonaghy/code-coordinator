@@ -431,3 +431,134 @@ class TestLegacyPrAssignmentUnchanged:
         assert result.exit_code == 0, result.output
         assert "PR worker dispatched" in result.output
         disp.assert_called_once()
+
+
+class TestPrBody:
+    """`coord pr body` (#3082): read/rewrite an existing PR's body through the
+    seam, so a session barred from raw `gh` can satisfy a "record the numbers
+    in the PR body" acceptance criterion at all."""
+
+    def test_show_prints_the_current_body_without_writing(self, config_file: Path) -> None:
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1\n\nboilerplate"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke("pr", "body", "api", "7", "--show", config_file=config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "Closes #1" in result.output
+        assert "boilerplate" in result.output
+        edit.assert_not_called()
+
+    def test_append_keeps_the_existing_body_and_adds_the_new_section(
+        self, config_file: Path
+    ) -> None:
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1\n\nboilerplate\n"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke(
+                "pr", "body", "api", "7", "--append", "--body", "## Measurement\n\n1 failed",
+                config_file=config_file,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "body appended to" in result.output
+        (slug, number, new_body), _ = edit.call_args
+        assert slug == "acme/api"
+        assert number == 7
+        assert new_body.startswith("Closes #1\n\nboilerplate\n\n## Measurement")
+        assert "1 failed" in new_body
+
+    def test_append_from_a_body_file(self, config_file: Path, tmp_path: Path) -> None:
+        body_file = tmp_path / "measurement.md"
+        body_file.write_text("## Measurement\n\n1772 failed, 12682 passed\n")
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke(
+                "pr", "body", "api", "7", "--append", "--body-file", str(body_file),
+                config_file=config_file,
+            )
+
+        assert result.exit_code == 0, result.output
+        (_, _, new_body), _ = edit.call_args
+        assert "1772 failed, 12682 passed" in new_body
+        assert new_body.startswith("Closes #1")
+
+    def test_replace_refuses_to_drop_a_closing_keyword(self, config_file: Path) -> None:
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1\n\nboilerplate"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke(
+                "pr", "body", "api", "7", "--body", "just the measurement",
+                config_file=config_file,
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "refusing to drop closing keyword" in result.output
+        assert "#1" in result.output
+        edit.assert_not_called()
+
+    def test_replace_that_keeps_the_closing_keyword_is_allowed(self, config_file: Path) -> None:
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1\n\nboilerplate"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke(
+                "pr", "body", "api", "7", "--body", "Closes #1\n\nthe measurement",
+                config_file=config_file,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "body replaced" in result.output
+        edit.assert_called_once_with("acme/api", 7, "Closes #1\n\nthe measurement")
+
+    def test_allow_drop_closing_overrides_the_refusal(self, config_file: Path) -> None:
+        with (
+            patch("coord.github_ops.get_pr_body", return_value="Closes #1\n\nboilerplate"),
+            patch("coord.github_ops.edit_pr_body") as edit,
+        ):
+            result = _invoke(
+                "pr", "body", "api", "7", "--body", "no keyword here",
+                "--allow-drop-closing", config_file=config_file,
+            )
+
+        assert result.exit_code == 0, result.output
+        edit.assert_called_once_with("acme/api", 7, "no keyword here")
+
+    def test_body_and_body_file_are_mutually_exclusive(
+        self, config_file: Path, tmp_path: Path
+    ) -> None:
+        f = tmp_path / "b.md"
+        f.write_text("hi")
+        result = _invoke(
+            "pr", "body", "api", "7", "--body", "b", "--body-file", str(f),
+            config_file=config_file,
+        )
+
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_requires_a_write_option_or_show(self, config_file: Path) -> None:
+        result = _invoke("pr", "body", "api", "7", config_file=config_file)
+
+        assert result.exit_code == 2
+        assert "one of --show, --body or --body-file is required" in result.output
+
+    def test_show_cannot_be_combined_with_a_write(self, config_file: Path) -> None:
+        result = _invoke(
+            "pr", "body", "api", "7", "--show", "--body", "x", config_file=config_file,
+        )
+
+        assert result.exit_code == 2
+        assert "--show cannot be combined" in result.output
+
+    def test_unknown_repo_lists_known_names(self, config_file: Path) -> None:
+        result = _invoke("pr", "body", "nope", "7", "--show", config_file=config_file)
+
+        assert result.exit_code != 0
+        assert "unknown repo" in result.output
+        assert "api" in result.output

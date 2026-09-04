@@ -362,3 +362,124 @@ def pr_merge(
         click.echo(f"error: merge failed: {message}", err=True)
         sys.exit(1)
     click.echo(f"{slug}#{number} merged ({method})")
+
+
+@pr_group.command(
+    "body",
+    help=(
+        "Read or rewrite an existing PR's body through the forge seam. REPO "
+        "is the coordinator.yml repo name, NUMBER the PR number.\n\n"
+        "  coord pr body REPO NUMBER --show\n"
+        "  coord pr body REPO NUMBER (--body TEXT | --body-file F) [--append]\n\n"
+        "Refuses a rewrite that would drop a closing keyword (`Closes #N`) "
+        "the current body carries, unless --allow-drop-closing is given."
+    ),
+)
+@click.argument("repo")
+@click.argument("number", type=int)
+@click.option("--body", default=None, help="New PR body (markdown).")
+@click.option(
+    "--body-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read the new PR body from a file. '-' reads from stdin. Mutually "
+    "exclusive with --body.",
+)
+@click.option(
+    "--append", "append", is_flag=True, default=False,
+    help="Append to the current body (blank-line separated) instead of "
+    "replacing it. The safe default for adding a measurement or evidence "
+    "section to a coordinator-authored body.",
+)
+@click.option(
+    "--show", "show", is_flag=True, default=False,
+    help="Print the PR's current body and exit without writing.",
+)
+@click.option(
+    "--allow-drop-closing", "allow_drop_closing", is_flag=True, default=False,
+    help="Permit a replacement body that drops a closing keyword the current "
+    "body carries (default: refuse).",
+)
+@_CONFIG_OPTION
+def pr_body(
+    repo: str,
+    number: int,
+    body: str | None,
+    body_file: Path | None,
+    append: bool,
+    show: bool,
+    allow_drop_closing: bool,
+    config_path: Path,
+) -> None:
+    """Expose ``github_ops.get_pr_body``/``edit_pr_body`` on the CLI (#3082).
+
+    ``coord pr open`` can set a body at creation time and the merge queue can
+    rewrite one internally (``pr_body_lint``'s closing-keyword downgrade), but
+    until now there was no seam-native way for a *session* to edit an existing
+    PR's body — so a rule like "the PR body must record the re-measured
+    numbers" was unsatisfiable by anyone barred from raw ``gh`` (which, per
+    ``CLAUDE.md``, is every worker and reviewer leg). Same posture as the rest
+    of this module: no forge logic here, every GitHub call goes through
+    ``coord.github_ops``.
+    """
+    if body is not None and body_file is not None:
+        click.echo("error: --body and --body-file are mutually exclusive", err=True)
+        sys.exit(2)
+    if show and (body is not None or body_file is not None or append):
+        click.echo("error: --show cannot be combined with a write option", err=True)
+        sys.exit(2)
+    if not show and body is None and body_file is None:
+        click.echo("error: one of --show, --body or --body-file is required", err=True)
+        sys.exit(2)
+
+    cfg = _load_config(config_path)
+    repo_entry = _resolve_repo(cfg, repo)
+    slug = repo_entry.github
+
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        current = github_ops.get_pr_body(slug, number)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: could not read {slug}#{number}'s body: {e}", err=True)
+        sys.exit(1)
+
+    if show:
+        click.echo(current)
+        return
+
+    if body_file is not None:
+        new_text = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+    else:
+        new_text = body or ""
+
+    if append:
+        new_body = f"{current.rstrip()}\n\n{new_text.strip()}\n" if current.strip() else f"{new_text.strip()}\n"
+    else:
+        new_body = new_text
+        # A rewrite that silently drops `Closes #N` means the issue no longer
+        # auto-closes on merge — a real, invisible regression. Refuse rather
+        # than warn (`coord merge`'s own body rewrite deliberately *downgrades*
+        # keywords; nothing else should remove them by accident).
+        from coord.pr_body_lint import find_closing_references  # noqa: PLC0415
+
+        dropped = [n for n in find_closing_references(current)
+                   if n not in find_closing_references(new_body)]
+        if dropped and not allow_drop_closing:
+            refs = ", ".join(f"#{n}" for n in dropped)
+            click.echo(
+                f"error: refusing to drop closing keyword(s) for {refs} from "
+                f"{slug}#{number}'s body (use --append, keep the keyword, or "
+                f"pass --allow-drop-closing)",
+                err=True,
+            )
+            sys.exit(2)
+
+    try:
+        github_ops.edit_pr_body(slug, number, new_body)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: PR body update failed: {e}", err=True)
+        sys.exit(1)
+
+    verb = "appended to" if append else "replaced"
+    click.echo(f"{slug}#{number} body {verb} ({len(new_body)} chars)")
