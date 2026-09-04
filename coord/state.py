@@ -219,19 +219,32 @@ _UPSERT_SQL = """
         -- it. A row with no stored `finished_at` yet (still running/pending)
         -- is unaffected — every first-time transition proceeds exactly as
         -- before.
+        --
+        -- #3083: every reference to a *stored* (pre-UPDATE) column below is
+        -- qualified `assignments.<col>`, never bare. Inside an `ON CONFLICT
+        -- ... DO UPDATE`, both the target table and the `excluded`
+        -- pseudo-table are in scope and `excluded` carries every column of
+        -- the target — so a bare `finished_at` on the right-hand side is
+        -- genuinely ambiguous. SQLite resolves it to the target row anyway;
+        -- Postgres refuses the whole statement with `AmbiguousColumn:
+        -- column reference "finished_at" is ambiguous` (352 test failures,
+        -- the second-largest signature in the Postgres lane). The SET
+        -- *targets* (left of each `=`) stay unqualified — that half is
+        -- unambiguous by construction and Postgres rejects a qualified one.
         status = CASE
-            WHEN finished_at IS NULL THEN excluded.status
+            WHEN assignments.finished_at IS NULL THEN excluded.status
             WHEN excluded.finished_at IS NOT NULL
-                 AND excluded.finished_at >= finished_at THEN excluded.status
-            ELSE status
+                 AND excluded.finished_at >= assignments.finished_at THEN excluded.status
+            ELSE assignments.status
         END,
         branch             = excluded.branch,
         pr_url             = excluded.pr_url,
         finished_at = CASE
-            WHEN finished_at IS NULL THEN excluded.finished_at
+            WHEN assignments.finished_at IS NULL THEN excluded.finished_at
             WHEN excluded.finished_at IS NOT NULL
-                 AND excluded.finished_at >= finished_at THEN excluded.finished_at
-            ELSE finished_at
+                 AND excluded.finished_at >= assignments.finished_at
+                 THEN excluded.finished_at
+            ELSE assignments.finished_at
         END,
         -- #1337: the unbounded free-text columns (smoke_test_reason,
         -- test_reason, briefing) are EXCLUDED from this whole-board upsert.
@@ -280,9 +293,10 @@ _UPSERT_SQL = """
         -- scoped single-row UPDATEs, not this whole-board upsert, so they are
         -- unaffected by this guard.
         review_state = CASE
-            WHEN review_state IS NOT NULL AND review_state != 'pending'
+            WHEN assignments.review_state IS NOT NULL
+                 AND assignments.review_state != 'pending'
                  AND (excluded.review_state IS NULL OR excluded.review_state = 'pending')
-            THEN review_state
+            THEN assignments.review_state
             ELSE excluded.review_state
         END,
         review_of_assignment_id = excluded.review_of_assignment_id,
@@ -294,24 +308,28 @@ _UPSERT_SQL = """
         files_forbidden    = excluded.files_forbidden,
         required_gates     = excluded.required_gates,
         review_iteration   = excluded.review_iteration,
-        review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
-        review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
+        review_posted_at   = COALESCE(
+            excluded.review_posted_at, assignments.review_posted_at),
+        review_verdict     = COALESCE(excluded.review_verdict, assignments.review_verdict),
         -- #1456: once an override is recorded, preserve it.  A later upsert
         -- from a path that doesn't know about the override (agent reload, thin
         -- client round-trip) must never erase the reviewer's original verdict —
         -- that would restore exactly the silent-rewrite behaviour #1456 fixed.
         review_verdict_original = COALESCE(
-            excluded.review_verdict_original, review_verdict_original),
+            excluded.review_verdict_original, assignments.review_verdict_original),
         review_verdict_override_reason = COALESCE(
-            excluded.review_verdict_override_reason, review_verdict_override_reason),
+            excluded.review_verdict_override_reason,
+            assignments.review_verdict_override_reason),
         -- #821: once a review_head_sha is recorded, preserve it; a later
         -- upsert without the SHA (e.g. from an older code path) must not
         -- erase a captured value.
-        review_head_sha    = COALESCE(excluded.review_head_sha, review_head_sha),
+        review_head_sha    = COALESCE(
+            excluded.review_head_sha, assignments.review_head_sha),
         -- #1475: same COALESCE-preserve pattern as review_head_sha above —
         -- a later upsert without the patch-id (older code path, agent
         -- reload) must not erase a captured value.
-        review_patch_id    = COALESCE(excluded.review_patch_id, review_patch_id),
+        review_patch_id    = COALESCE(
+            excluded.review_patch_id, assignments.review_patch_id),
         -- #1476: scoped-re-review audit trail. review_scoped defaults to 0,
         -- not NULL, so plain COALESCE (which only fires on NULL) can't be
         -- used to "preserve once set" the way it is for the NULL-default
@@ -320,19 +338,21 @@ _UPSERT_SQL = """
         -- is marked scoped, a later upsert (older code path, agent reload)
         -- can never un-mark it. review_scope_base_sha IS NULL-default text,
         -- so it keeps the ordinary COALESCE-preserve pattern.
-        review_scoped      = CASE WHEN review_scoped = 1 THEN 1 ELSE excluded.review_scoped END,
-        review_scope_base_sha = COALESCE(excluded.review_scope_base_sha, review_scope_base_sha),
+        review_scoped      = CASE
+            WHEN assignments.review_scoped = 1 THEN 1 ELSE excluded.review_scoped END,
+        review_scope_base_sha = COALESCE(
+            excluded.review_scope_base_sha, assignments.review_scope_base_sha),
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.
-        cost_usd           = COALESCE(excluded.cost_usd, cost_usd),
+        cost_usd           = COALESCE(excluded.cost_usd, assignments.cost_usd),
         -- #252: same pattern — once a worker has emitted a smoke-test
         -- list, a later upsert without one (e.g. agent reload) can't
         -- erase it.
-        smoke_tests        = COALESCE(excluded.smoke_tests, smoke_tests),
+        smoke_tests        = COALESCE(excluded.smoke_tests, assignments.smoke_tests),
         -- #324: once a provider_name is recorded at dispatch, a later
         -- upsert without one (e.g. agent reload) must not clear it.
-        provider_name      = COALESCE(excluded.provider_name, provider_name),
+        provider_name      = COALESCE(excluded.provider_name, assignments.provider_name),
         -- #1956: once verdict provenance is recorded (a single-row seam
         -- write — issue_store._persist_verdict_source, never this whole-
         -- board upsert itself), a later upsert from a path that doesn't
@@ -341,9 +361,83 @@ _UPSERT_SQL = """
         -- original/review_verdict_override_reason above, for the same
         -- reason: a provenance-bearing column is written once and audited,
         -- never silently reverted.
-        verdict_source        = COALESCE(excluded.verdict_source, verdict_source),
-        verdict_source_reason = COALESCE(excluded.verdict_source_reason, verdict_source_reason)
+        verdict_source        = COALESCE(
+            excluded.verdict_source, assignments.verdict_source),
+        verdict_source_reason = COALESCE(
+            excluded.verdict_source_reason, assignments.verdict_source_reason)
 """
+
+
+#: The dispatch upsert (#3083: hoisted out of
+#: :func:`_record_dispatched_assignment_local`'s inner ``_write()`` so
+#: ``tests/test_sql_dialect.py`` can assert on the statement text itself --
+#: this is the statement whose 21 parameters reached psycopg as 17
+#: placeholders, and the one whose ``DO UPDATE SET`` Postgres refused as
+#: ambiguous. A constant is testable; a literal three frames deep inside a
+#: closure is not.)
+_DISPATCHED_UPSERT_SQL = """INSERT INTO assignments (
+            assignment_id, machine_name, repo_name, repo_github,
+            issue_number, issue_title, status, type, briefing,
+            files_allowed, model, dispatched_at, review_of_assignment_id,
+            review_target, required_gates, review_iteration,
+            provider_name, branch, for_issue_number, driven_by,
+            dispatched_by_assignment_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            -- #1553: a follow-up dispatched off another assignment (review,
+            -- smoke, [fix-N], retry, pr-helper) inherits that parent's
+            -- oracle-loop slice attribution when it didn't set one itself.
+            -- Without this, only the originating `test-author` row knows
+            -- which CHILD issue the work is for and every derived row falls
+            -- back to the milestone's tracking issue — which is exactly the
+            -- "child's Pipeline row shows no activity while 6 sessions run"
+            -- bug. Done as a correlated subquery rather than a Python lookup
+            -- so it costs no extra round trip and covers BOTH write paths
+            -- (the daemon's `/dispatched` handler calls this same function
+            -- server-side). NULL parent / no parent row / non-slice parent
+            -- all resolve to NULL, so ordinary work is untouched.
+            COALESCE(?, (
+                SELECT p.for_issue_number FROM assignments p
+                WHERE p.assignment_id = ?
+            )),
+            ?, ?)
+        ON CONFLICT(assignment_id) DO UPDATE SET
+            status = 'running',
+            machine_name = excluded.machine_name,
+            repo_github = excluded.repo_github,
+            type = excluded.type,
+            briefing = excluded.briefing,
+            model = excluded.model,
+            dispatched_at = excluded.dispatched_at,
+            review_of_assignment_id = excluded.review_of_assignment_id,
+            review_target = excluded.review_target,
+            required_gates = excluded.required_gates,
+            review_iteration = excluded.review_iteration,
+            -- #3083: the stored-value half of every COALESCE below is
+            -- qualified `assignments.<col>` -- see _UPSERT_SQL's matching
+            -- note. A bare column name inside `DO UPDATE SET` is ambiguous
+            -- between the target row and `excluded`; Postgres refuses the
+            -- statement, SQLite silently picks the target.
+            --
+            -- #324: COALESCE so a retry/re-dispatch doesn't clear a
+            -- previously-recorded provider_name from the original dispatch.
+            provider_name = COALESCE(excluded.provider_name, assignments.provider_name),
+            -- #557: COALESCE so a re-dispatch doesn't clear a branch that
+            -- finalize already wrote (mark_notified sets branch on completion).
+            branch = COALESCE(excluded.branch, assignments.branch),
+            -- #1084: COALESCE so a re-dispatch/reload doesn't clear the JIT
+            -- per-issue correlation already recorded for this assignment.
+            for_issue_number = COALESCE(
+                excluded.for_issue_number, assignments.for_issue_number),
+            -- #1499: COALESCE so a re-dispatch/reload doesn't clear the
+            -- drive provenance already recorded for this assignment.
+            driven_by = COALESCE(excluded.driven_by, assignments.driven_by),
+            -- #2417: COALESCE so a re-dispatch/reload doesn't clear the
+            -- calling-worker provenance already recorded for this
+            -- assignment.
+            dispatched_by_assignment_id = COALESCE(
+                excluded.dispatched_by_assignment_id,
+                assignments.dispatched_by_assignment_id
+            )"""
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -1071,89 +1165,36 @@ def _record_dispatched_assignment_local(
     # as-is: `assignment_id` is the primary key and the `ON CONFLICT ...
     # DO UPDATE` makes a re-attempted write idempotent.
     def _write() -> None:
-        sql.execute(conn,
-            """INSERT INTO assignments (
-            assignment_id, machine_name, repo_name, repo_github,
-            issue_number, issue_title, status, type, briefing,
-            files_allowed, model, dispatched_at, review_of_assignment_id,
-            review_target, required_gates, review_iteration,
-            provider_name, branch, for_issue_number, driven_by,
-            dispatched_by_assignment_id
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            -- #1553: a follow-up dispatched off another assignment (review,
-            -- smoke, [fix-N], retry, pr-helper) inherits that parent's
-            -- oracle-loop slice attribution when it didn't set one itself.
-            -- Without this, only the originating `test-author` row knows
-            -- which CHILD issue the work is for and every derived row falls
-            -- back to the milestone's tracking issue — which is exactly the
-            -- "child's Pipeline row shows no activity while 6 sessions run"
-            -- bug. Done as a correlated subquery rather than a Python lookup
-            -- so it costs no extra round trip and covers BOTH write paths
-            -- (the daemon's `/dispatched` handler calls this same function
-            -- server-side). NULL parent / no parent row / non-slice parent
-            -- all resolve to NULL, so ordinary work is untouched.
-            COALESCE(?, (
-                SELECT p.for_issue_number FROM assignments p
-                WHERE p.assignment_id = ?
-            )),
-            ?, ?)
-        ON CONFLICT(assignment_id) DO UPDATE SET
-            status = 'running',
-            machine_name = excluded.machine_name,
-            repo_github = excluded.repo_github,
-            type = excluded.type,
-            briefing = excluded.briefing,
-            model = excluded.model,
-            dispatched_at = excluded.dispatched_at,
-            review_of_assignment_id = excluded.review_of_assignment_id,
-            review_target = excluded.review_target,
-            required_gates = excluded.required_gates,
-            review_iteration = excluded.review_iteration,
-            -- #324: COALESCE so a retry/re-dispatch doesn't clear a
-            -- previously-recorded provider_name from the original dispatch.
-            provider_name = COALESCE(excluded.provider_name, provider_name),
-            -- #557: COALESCE so a re-dispatch doesn't clear a branch that
-            -- finalize already wrote (mark_notified sets branch on completion).
-            branch = COALESCE(excluded.branch, branch),
-            -- #1084: COALESCE so a re-dispatch/reload doesn't clear the JIT
-            -- per-issue correlation already recorded for this assignment.
-            for_issue_number = COALESCE(excluded.for_issue_number, for_issue_number),
-            -- #1499: COALESCE so a re-dispatch/reload doesn't clear the
-            -- drive provenance already recorded for this assignment.
-            driven_by = COALESCE(excluded.driven_by, driven_by),
-            -- #2417: COALESCE so a re-dispatch/reload doesn't clear the
-            -- calling-worker provenance already recorded for this
-            -- assignment.
-            dispatched_by_assignment_id = COALESCE(
-                excluded.dispatched_by_assignment_id, dispatched_by_assignment_id
-            )""",
-        (
-            assignment.assignment_id or "",
-            assignment.machine_name,
-            assignment.repo_name,
-            repo_github,
-            assignment.issue_number,
-            assignment.issue_title,
-            assignment.type,
-            assignment.briefing,
-            json.dumps(list(assignment.files_allowed)),
-            assignment.model,
-            assignment.dispatched_at or time.time(),
-            assignment.review_of_assignment_id,
-            assignment.review_target,
-            json.dumps(list(assignment.required_gates)),
-            assignment.review_iteration,
-            assignment.provider_name,
-            assignment.branch,
-            assignment.for_issue_number,
-            # #1553: parent id for the for_issue_number inheritance subquery
-            # above (same value already bound for the review_of_assignment_id
-            # column — bound twice because sqlite3 qmark params are
-            # positional).
-            assignment.review_of_assignment_id,
-            assignment.driven_by,
-            assignment.dispatched_by_assignment_id,
-        ),
+        sql.execute(
+            conn,
+            _DISPATCHED_UPSERT_SQL,
+            (
+                assignment.assignment_id or "",
+                assignment.machine_name,
+                assignment.repo_name,
+                repo_github,
+                assignment.issue_number,
+                assignment.issue_title,
+                assignment.type,
+                assignment.briefing,
+                json.dumps(list(assignment.files_allowed)),
+                assignment.model,
+                assignment.dispatched_at or time.time(),
+                assignment.review_of_assignment_id,
+                assignment.review_target,
+                json.dumps(list(assignment.required_gates)),
+                assignment.review_iteration,
+                assignment.provider_name,
+                assignment.branch,
+                assignment.for_issue_number,
+                # #1553: parent id for the for_issue_number inheritance subquery
+                # above (same value already bound for the review_of_assignment_id
+                # column — bound twice because sqlite3 qmark params are
+                # positional).
+                assignment.review_of_assignment_id,
+                assignment.driven_by,
+                assignment.dispatched_by_assignment_id,
+            ),
         )
         conn.commit()
 

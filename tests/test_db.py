@@ -169,11 +169,13 @@ class TestIssueCommentsSchema:
     ) -> None:
         """The Azure-blob offload seam column exists but is never populated
         by current code — reserved for a future body_ref migration."""
-        cols = {
-            r[1] for r in isolated_conn.execute(
-                "PRAGMA table_info(issue_comments)"
-            ).fetchall()
-        }
+        # #3083: goes through the seam, not `PRAGMA` — `isolated_conn` is an
+        # alias for the autouse `coord_db` fixture, so under
+        # COORD_TEST_BACKEND=postgres this is a psycopg connection and a
+        # literal PRAGMA is a syntax error. The neighbouring pre-migration
+        # checks below keep their raw PRAGMA on purpose: those run against a
+        # hand-built SQLite *file*, which is SQLite on every backend.
+        cols = {name for name, _type in sql.table_columns(isolated_conn, "issue_comments")}
         assert "body_ref" in cols
 
 
@@ -214,8 +216,12 @@ _GATE_COLUMNS = {
 }
 
 
-def _drive_queue_columns(conn: sqlite3.Connection) -> set[str]:
-    return {r[1] for r in conn.execute("PRAGMA table_info(drive_queue)").fetchall()}
+def _drive_queue_columns(conn) -> set[str]:
+    """#3083: through the seam, because this helper is handed *both* kinds of
+    connection — a raw SQLite file DB (the pre-migration checks) and the
+    autouse fixture connection, which is psycopg under
+    COORD_TEST_BACKEND=postgres and cannot parse a literal PRAGMA."""
+    return {name for name, _type in sql.table_columns(conn, "drive_queue")}
 
 
 class TestDriveQueueDeployGateColumns:
@@ -667,8 +673,9 @@ _PRE_1892_MERGE_QUEUE_TABLE = """
 """
 
 
-def _merge_queue_columns(conn: sqlite3.Connection) -> set[str]:
-    return {r[1] for r in conn.execute("PRAGMA table_info(merge_queue)").fetchall()}
+def _merge_queue_columns(conn) -> set[str]:
+    """#3083: through the seam — see :func:`_drive_queue_columns`."""
+    return {name for name, _type in sql.table_columns(conn, "merge_queue")}
 
 
 class TestMergeQueueCiInfraRerunsColumn:

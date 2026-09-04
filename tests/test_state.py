@@ -94,7 +94,9 @@ class TestClaudeSessionId:
         """The assignments table must have a claude_session_id column."""
         from coord.db import get_connection
         conn = get_connection()
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        # #3083: PRAGMA has no Postgres equivalent — sql.table_columns is
+        # the seam's portable spelling of "what columns does this table have".
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
         assert "claude_session_id" in cols, (
             "assignments table is missing claude_session_id column — "
             "check _migrate_add_columns in coord/db.py"
@@ -164,7 +166,9 @@ class TestStopReason:
         """The assignments table must have a stop_reason column."""
         from coord.db import get_connection
         conn = get_connection()
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        # #3083: PRAGMA has no Postgres equivalent — sql.table_columns is
+        # the seam's portable spelling of "what columns does this table have".
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
         assert "stop_reason" in cols, (
             "assignments table is missing stop_reason column — "
             "check _migrate_add_columns in coord/db.py"
@@ -265,7 +269,9 @@ class TestDispatchedByAssignmentId:
     def test_schema_has_dispatched_by_assignment_id_column(self, coord_db) -> None:
         from coord.db import get_connection
         conn = get_connection()
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        # #3083: PRAGMA has no Postgres equivalent — sql.table_columns is
+        # the seam's portable spelling of "what columns does this table have".
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
         assert "dispatched_by_assignment_id" in cols, (
             "assignments table is missing dispatched_by_assignment_id column — "
             "check _migrate_add_columns in coord/db.py"
@@ -1791,7 +1797,9 @@ class TestSetAssignmentFailureReason:
         from coord.db import get_connection
 
         conn = get_connection()
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        # #3083: PRAGMA has no Postgres equivalent — sql.table_columns is
+        # the seam's portable spelling of "what columns does this table have".
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
         assert "failure_reason" in cols, (
             "assignments table is missing failure_reason column — "
             "check _migrate_add_columns in coord/db.py"

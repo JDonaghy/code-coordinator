@@ -529,11 +529,16 @@ def seed_revision(submission_id: str, revision: int, *, now: float | None = None
     stamp = time.time() if now is None else now
     conn = _conn()
     _ensure_submission_row(conn, submission_id, stamp)
+    # #3083: `MAX(a, b)` is SQLite's two-argument *scalar* max; Postgres
+    # spells that `GREATEST(a, b)` and rejects the two-argument MAX with
+    # `function max(integer, smallint) does not exist`. sql.greatest() is
+    # the seam's name for it -- never an inline dialect branch here.
     sql.execute(
         conn,
-        """
+        f"""
         UPDATE portal_submissions
-           SET last_revision = MAX(last_revision, ?), updated_at = ?
+           SET last_revision = {sql.greatest(conn, "last_revision", "?")},
+               updated_at = ?
          WHERE submission_id = ?
         """,
         (revision, stamp, submission_id),
@@ -730,11 +735,14 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
             )
         elif row.kind == "design_round":
             round_no = _round_number(row.fields)
+            # #3083: two-argument scalar max — `GREATEST` on Postgres. See
+            # seed_revision()'s matching note.
             sql.execute(
                 conn,
-                """
+                f"""
                 UPDATE portal_submissions
-                   SET design_round = MAX(design_round, ?), updated_at = ?
+                   SET design_round = {sql.greatest(conn, "design_round", "?")},
+                       updated_at = ?
                  WHERE submission_id = ?
                 """,
                 (round_no, stamp, row.submission_id),
