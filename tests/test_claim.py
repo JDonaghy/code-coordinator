@@ -7,6 +7,7 @@ import pytest
 from coord.claim import (
     Claim,
     claim_message,
+    claim_remedy_hint,
     find_work_claim,
     has_active_branch_followup,
     has_active_followup,
@@ -148,6 +149,34 @@ def test_claim_message_for_remote_branch() -> None:
     assert "#16" in msg
     assert "remote branch" in msg
     assert "issue-16-foo" in msg
+
+
+# ── claim_remedy_hint (#3103) ────────────────────────────────────────────────
+# A board claim (dead session) and a remote_branch claim (leftover branch) need
+# genuinely different remedies — `coord diagnose` can only clear the former.
+
+
+def test_claim_remedy_hint_for_board_names_diagnose() -> None:
+    hint = claim_remedy_hint(
+        Claim(issue_number=100, repo_name="api", source="board", branch="issue-100-x"),
+        "api", 100,
+    )
+    assert "coord diagnose api 100" in hint
+
+
+def test_claim_remedy_hint_for_remote_branch_names_branch_delete_not_diagnose() -> None:
+    hint = claim_remedy_hint(
+        Claim(
+            issue_number=122, repo_name="coord-portal", source="remote_branch",
+            branch="issue-122-gate-a-amend-portal-epic-client-identity",
+        ),
+        "coord-portal", 122,
+    )
+    assert "git push origin --delete issue-122-gate-a-amend-portal-epic-client-identity" in hint
+    # #3103: naming the wrong remedy is worse than naming none — `coord
+    # diagnose` inspects board stages and cannot clear a remote_branch claim,
+    # so it must not be offered here at all.
+    assert "coord diagnose" not in hint
 
 
 # ── has_active_followup ─────────────────────────────────────────────────────
@@ -547,6 +576,64 @@ def test_drop_merged_branches_keeps_when_default_unknown(monkeypatch) -> None:
 
     monkeypatch.setattr("coord.github_ops._gh", _boom)
     assert claim_mod._drop_merged_branches("acme/api", ["issue-9-x"]) == ["issue-9-x"]
+
+
+def test_drop_merged_branches_drops_squash_merged_branch(monkeypatch) -> None:
+    """#3103: a squash merge lands the PR's content as a NEW commit on the
+    default branch — the branch's own commits are never ancestors of it, so
+    `ahead_by` stays nonzero forever even though the work fully landed. The
+    branch must still be dropped once `pr_is_merged` (GitHub's own PR state,
+    not commit ancestry) confirms the merge.
+    """
+    import coord.claim as claim_mod
+    from coord import github_ops
+
+    # Ancestry alone would keep this branch forever (ahead_by never 0 for a
+    # squash merge) — assert the stub proves that, then assert pr_is_merged
+    # overrides it.
+    monkeypatch.setattr(
+        "coord.github_ops._gh", _gh_stub("main", {"issue-122-amend": 3})
+    )
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: True)
+    assert claim_mod._drop_merged_branches("acme/portal", ["issue-122-amend"]) == []
+
+
+def test_drop_merged_branches_keeps_branch_when_pr_open_and_ahead(monkeypatch) -> None:
+    """No regression: an active branch with an open (or absent) PR, and still
+    ahead of default, remains a claim."""
+    import coord.claim as claim_mod
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh", _gh_stub("main", {"issue-122-live": 2})
+    )
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+    assert claim_mod._drop_merged_branches("acme/portal", ["issue-122-live"]) == [
+        "issue-122-live"
+    ]
+
+
+def test_find_work_claim_skips_squash_merged_remote_branch(monkeypatch) -> None:
+    """End-to-end repro of #3103: a squash-merged Gate-A amend branch must not
+    permanently claim the tracking issue just because it's still "ahead" by
+    commit ancestry."""
+    import json
+
+    from coord import github_ops
+
+    def _fake(*args, **kwargs):
+        path = args[1]
+        if "matching-refs" in path:
+            return json.dumps(
+                [{"ref": "refs/heads/issue-122-gate-a-amend-portal-epic"}]
+            )
+        if "/compare/" in path:
+            return json.dumps({"ahead_by": 4})  # never 0 for a squash merge
+        return json.dumps({"default_branch": "main"})
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: True)
+    assert find_work_claim(122, "coord-portal", "acme/portal", Board()) is None
 
 
 def test_find_work_claim_skips_merged_remote_branch(monkeypatch) -> None:

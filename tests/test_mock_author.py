@@ -11,6 +11,7 @@ from coord.agent import (
     AssignmentSpec,
     default_worker_command,
 )
+from coord.claim import Claim
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config, ModelsConfig
 from coord.models import Machine, Repo
 from coord import github_ops, mock_author
@@ -267,6 +268,41 @@ def test_dispatch_raises_when_gate_a_already_claimed(tmp_path):
             # operator's "PERMANENTLY STUCK" report was a claim they found
             # "no way to clear through normal coord commands".
             assert "coord diagnose api 100" in str(e)
+
+
+def test_dispatch_raises_when_gate_a_claimed_by_squash_merged_branch(tmp_path):
+    """#3103 repro: a squash-merged Gate-A amendment branch left behind on the
+    remote (PR merged, branch never deleted) must not be reported as an
+    in-flight claim, and if some other remote_branch claim genuinely is live,
+    the refusal must NOT tell the operator to run `coord diagnose` — that
+    command inspects board stages, not branches, and structurally cannot
+    clear a `remote_branch` claim."""
+    from coord.models import Board
+
+    cfg = _cfg_with_driver(tmp_path)
+    with patch(
+        "coord.github_ops.get_issue",
+        return_value={
+            "number": 100, "title": "t", "body": "",
+            "milestone": {"number": 9, "title": "M"},
+        },
+    ), patch("coord.board_service.read_board", return_value=Board()), patch(
+        "coord.mock_author.find_work_claim",
+        return_value=Claim(
+            issue_number=100, repo_name="api", source="remote_branch",
+            branch="issue-100-gate-a-amend-stale",
+        ),
+    ):
+        try:
+            mock_author.dispatch_acceptance_mock("api", 100, cfg)
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+            assert "already in flight" in msg
+            assert "git push origin --delete issue-100-gate-a-amend-stale" in msg
+            # The remedy for a genuinely-dead board claim must not be offered
+            # here — it can't clear a remote_branch claim (#3103).
+            assert "coord diagnose" not in msg
 
 
 def test_dispatch_not_blocked_by_stale_chat_session(tmp_path):

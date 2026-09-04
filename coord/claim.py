@@ -113,6 +113,38 @@ def claim_message(claim: Claim) -> str:
     )
 
 
+def claim_remedy_hint(claim: Claim, repo_name: str, issue_number: int) -> str:
+    """The escape hatch to name in a refusal message, matched to *claim.source*.
+
+    #3103: naming the wrong remedy is worse than naming none — an operator who
+    follows it burns a full round trip before learning it was never going to
+    help. The two claim sources need genuinely different remedies because
+    they're different kinds of state:
+
+    - ``"board"``: a board row (dead session, wedged assignment). This is
+      exactly what `coord diagnose <repo> <issue>` inspects and can clear.
+    - ``"remote_branch"``: a leftover branch with no board row at all — most
+      often the source branch of a **squash-merged** PR that GitHub never
+      deleted (the repo's content landed on the default branch as a new
+      commit; the branch itself is just residue). `coord diagnose` inspects
+      board *stages*; it has no branch-deletion path, so it cannot clear this
+      even in principle — it will report a clean bill of health and change
+      nothing (the exact false lead #3103 reported). The real fix is to check
+      whether the branch's PR merged and, if so, delete the stale branch.
+    """
+    if claim.source == "board":
+        return (
+            f"if that session is dead, clear it with `coord diagnose "
+            f"{repo_name} {issue_number}`, then dispatch again"
+        )
+    branch = claim.branch or "<branch>"
+    return (
+        f"if its PR already merged, delete the stale branch with `git push "
+        f"origin --delete {branch}`, then dispatch again; if the PR is still "
+        f"open, wait for it to land (or close it) first"
+    )
+
+
 # ── Dedupe for downstream auto-dispatch (review / smoke) ────────────────────
 
 
@@ -323,35 +355,49 @@ def _repo_default_branch(repo_github: str) -> str | None:
 
 
 def _drop_merged_branches(repo_github: str, branches: list[str]) -> list[str]:
-    """Filter out branches fully merged into the repo's default branch.
+    """Filter out branches that are finished work, not an active claim.
 
-    A branch with zero commits ahead of the default branch is finished work,
-    not an active claim, so it must not block a fresh dispatch. Conservative on
-    every uncertainty — unknown default branch, compare-API error, or a branch
-    that IS ahead — keeps the branch as a claim (fail toward blocking duplicate
-    work, never toward allowing it).
+    Two independent merge signals; either is sufficient to drop a branch:
+
+    1. **`github_ops.pr_is_merged`** (#1150) — asks GitHub directly whether the
+       branch's PR merged, keyed on the branch's *current* tip commit. This is
+       the signal that matters when the repo **squash-merges** (#3103): a
+       squash merge lands the PR's content as a brand-new commit on the
+       default branch and never puts the branch's own commits on it, so
+       ancestry (below) reads "not merged" *forever* even though the work
+       landed hours or days ago — the exact bug that let a squash-merged
+       Gate-A branch permanently block every later amendment on its epic.
+    2. **`ahead_by == 0`** on `compare/{default}...{branch}` — the pre-#3103
+       ancestry check. Still needed for a branch that merged without ever
+       going through a PR (a direct fast-forward/merge push): `pr_is_merged`
+       finds no PR at all in that case and fails open.
+
+    Conservative on every uncertainty — unknown default branch, compare-API
+    error, no merged PR found — keeps the branch as a claim (fail toward
+    blocking duplicate work, never toward allowing it).
     """
     if not branches:
         return branches
     from coord import github_ops
 
     default_branch = _repo_default_branch(repo_github)
-    if not default_branch:
-        return branches  # can't determine merged-ness → keep all (conservative)
     kept: list[str] = []
     for b in branches:
-        if b == default_branch:
+        if default_branch and b == default_branch:
             continue
-        try:
-            cmp = json.loads(
-                github_ops._gh(
-                    "api", f"repos/{repo_github}/compare/{default_branch}...{b}"
+        if github_ops.pr_is_merged(repo_github, b):
+            continue  # PR confirmed merged (survives squash merges, #3103)
+        if default_branch:
+            try:
+                cmp = json.loads(
+                    github_ops._gh(
+                        "api", f"repos/{repo_github}/compare/{default_branch}...{b}"
+                    )
                 )
-            )
-            ahead = cmp.get("ahead_by") if isinstance(cmp, dict) else None
-        except (RuntimeError, ValueError):
-            ahead = None
-        if ahead == 0:
-            continue  # fully merged → not an active claim
-        kept.append(b)  # ahead > 0, or unknown → keep (conservative)
+                ahead = cmp.get("ahead_by") if isinstance(cmp, dict) else None
+            except (RuntimeError, ValueError):
+                ahead = None
+            if ahead == 0:
+                continue  # fully merged by ancestry → not an active claim
+        kept.append(b)  # still ahead, or merged-ness undetermined → keep
     return kept
