@@ -72,6 +72,7 @@ def render_repo_entry(
     depends_on: list[str] | None = None,
     build_command: str | None = None,
     test_command: str | None = None,
+    uat_live_preview: bool = False,
 ) -> str:
     """The ``repos:`` list entry for a new repo, as a YAML fragment.
 
@@ -83,6 +84,12 @@ def render_repo_entry(
     ``coordinator_only_files`` is a security-relevant defect, and a guessed
     ``test_command`` produces a Test stage that runs the wrong suite and calls
     it green.
+
+    ``uat_live_preview`` (#3092) is the one exception that is NOT a guess: it
+    is written only when ``--with-preview`` provisioned the per-PR preview
+    lane in the same command, so the flag and the workflow that makes it true
+    land together. Setting it without that lane is exactly the silent stall
+    ``coord repo doctor``'s #3073 check reports.
     """
     lines = [
         f"  - name: {name}",
@@ -94,6 +101,8 @@ def render_repo_entry(
         lines.append(f'    build_command: "{build_command}"')
     if test_command:
         lines.append(f'    test_command: "{test_command}"')
+    if uat_live_preview:
+        lines.append("    uat_live_preview: true")
     return "\n".join(lines) + "\n"
 
 

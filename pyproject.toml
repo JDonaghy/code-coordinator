@@ -164,6 +164,12 @@ coord = [
     # the `coord-web` repo. Nothing builds into that path any more, so the
     # entry could only ever match zero files — see MANIFEST.in.
     "agents/**/*",
+    # #3092: the per-PR preview-lane deploy workflow(s) `coord repo add
+    # --with-preview` emits. Real `.yml` files rather than embedded Python
+    # string literals so they stay lintable/diffable as YAML — which only
+    # works if they actually ship in the wheel, since coord reaches worker
+    # machines as a PyPI install with no source checkout to read from.
+    "templates/*",
     # #1927: the systemd units the `unit_drift` check diffs installed copies
     # against. Shipped INSIDE the package so the reference is the released
     # artifact for the installed version rather than whatever the host's git

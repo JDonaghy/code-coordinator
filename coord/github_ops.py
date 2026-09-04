@@ -2318,6 +2318,86 @@ def get_pr_head_ref(repo: str, number: int) -> str | None:
     return head_ref or None
 
 
+# #3092: the ONE string that ties a provisioned preview lane to the lookup
+# that reads it back. `cloudflare/pages-action` names the GitHub Deployment's
+# environment "<projectName> (Preview)"; `get_pr_deployment_url` below matches
+# on this marker. Both the generator (`preview_environment_name`, used by
+# `coord repo add --with-preview` to assert at PROVISION time that the
+# workflow it just wrote will actually be readable) and the matcher
+# (`is_preview_environment`) live here so they cannot drift into a mismatch —
+# and a mismatch is silent, because `get_pr_deployment_url` returns None
+# rather than raising.
+PREVIEW_ENVIRONMENT_MARKER = "(Preview)"
+
+
+def preview_environment_name(project_name: str) -> str:
+    """The GitHub Deployment environment name ``cloudflare/pages-action``
+    derives from a Pages ``projectName`` (#3092).
+
+    Pure and vendor-specific by design: it is the action's own convention
+    (``"natal-chart (Preview)"`` for ``projectName: natal-chart``), which is
+    exactly why it can be *asserted* at provision time rather than probed
+    with a throwaway PR.
+    """
+    return f"{project_name} {PREVIEW_ENVIRONMENT_MARKER}"
+
+
+def is_preview_environment(environment: object) -> bool:
+    """True when a GitHub Deployment's ``environment`` names a per-PR
+    preview (#3092).
+
+    The single predicate :func:`get_pr_deployment_url` selects deployments
+    with. Takes ``object`` rather than ``str`` because it is applied straight
+    to a value parsed out of GitHub's JSON, which is not guaranteed to be a
+    string.
+    """
+    return isinstance(environment, str) and PREVIEW_ENVIRONMENT_MARKER in environment
+
+
+def set_repo_secret(repo: str, name: str, value: str) -> None:
+    """Set GitHub Actions secret *name* on *repo* to *value* (#3092).
+
+    Deliberately NOT routed through :func:`_gh`: that helper passes every
+    argument as argv, and ``gh secret set NAME --body <value>`` would put the
+    Cloudflare API token in this host's process table for any local user to
+    read. ``gh`` reads the value from stdin when ``--body`` is omitted, so
+    that is what this does — the value never appears in argv, never in an
+    exception message, and never in :func:`record_gh_call`'s telemetry (which
+    only ever sees the argv this builds).
+
+    Idempotent: ``gh secret set`` overwrites an existing secret of the same
+    name. Raises :class:`GhError` on any failure, consistent with every other
+    write in this module.
+    """
+    args = ["secret", "set", name, "--repo", repo]
+    caller = "github_ops.set_repo_secret"
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            input=value, capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                       detail="gh not found", caller=caller)
+        raise GhError(f"gh {' '.join(args)} failed: gh not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                       detail="timed out", caller=caller)
+        raise GhError(f"gh {' '.join(args)} failed: timed out: {exc}") from exc
+    except OSError as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                       detail=str(exc), caller=caller)
+        raise GhError(f"gh {' '.join(args)} failed: {exc}") from exc
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration,
+                       detail=stderr, caller=caller)
+        raise GhError(f"gh {' '.join(args)} failed: {stderr}")
+    record_gh_call(args, outcome="ok", duration_s=duration, caller=caller)
+
+
 def get_pr_deployment_url(repo: str, branch: str) -> str | None:
     """Return the live preview-deployment URL for *branch*'s GitHub
     Deployment, or ``None`` when one can't be confirmed (#2948).
@@ -2334,7 +2414,9 @@ def get_pr_deployment_url(repo: str, branch: str) -> str | None:
         gh api repos/{repo}/deployments/{id}/statuses
 
     Matches on the deployment's **environment name containing "(Preview)"**
-    (Cloudflare Pages' own convention, e.g. ``"natal-chart (Preview)"``), NOT
+    (Cloudflare Pages' own convention, e.g. ``"natal-chart (Preview)"``, via
+    the shared :func:`is_preview_environment` predicate — #3092 asserts the
+    provisioned ``projectName`` against that same predicate), NOT
     on recency/list order — production deploys are hash URLs too and
     interleave with previews in the same ``ref`` list, so picking ``[0]``
     can silently hand back a production URL. Deployments are walked
@@ -2360,8 +2442,7 @@ def get_pr_deployment_url(repo: str, branch: str) -> str | None:
     for deployment in deployments:
         if not isinstance(deployment, dict):
             continue
-        environment = deployment.get("environment")
-        if not isinstance(environment, str) or "(Preview)" not in environment:
+        if not is_preview_environment(deployment.get("environment")):
             continue
         deployment_id = deployment.get("id")
         if deployment_id is None:

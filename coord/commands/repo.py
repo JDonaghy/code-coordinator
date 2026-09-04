@@ -60,6 +60,7 @@ carries:
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import sys
@@ -403,6 +404,402 @@ _ACCEPTANCE_DRIVER_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
+# ── #3092: the per-PR preview lane ──────────────────────────────────────────
+#
+# `coord repo add` provisions everything a repo needs EXCEPT the one artifact
+# the UAT gate and the customer portal's `quality-check` status both read: a
+# per-PR preview deployment. That step was console work, and it is the one
+# whose absence fails SILENTLY — `coord.github_ops.get_pr_deployment_url`
+# returns None on anything it cannot confirm and never raises, so a repo with
+# no preview lane produces no preview and no error, and the customer timeline
+# just stalls at `in-progress`.
+#
+# Everything it needs is already deterministic, so this follows #2748's
+# reasoning verbatim: the stack decision that picks a CI template is the SAME
+# decision that picks a preview lane. `--template node` + `--with-preview` is
+# one decision, four derived artifacts.
+#
+# Layered so the vendor-specific part is the smallest and LAST piece:
+#   1. emit the deploy workflow (pure file generation, no network),
+#   2. set the two fleet-constant GitHub secrets (`gh secret set`, from the
+#      operator's environment — never stored, never echoed),
+#   3. write `uat_live_preview: true` into the repos[] entry,
+#   4. create the Pages project (`wrangler`) — SKIPPABLE. Steps 1-3 are the
+#      bulk of the value and need no Cloudflare access at all, so absent
+#      credentials they still complete and step 4 is printed as residue with
+#      a runnable command.
+#
+# Explicitly NOT a reconciler: an existing `deploy-cloudflare.yml` is reported
+# and left alone, never overwritten. This adds a lane to a repo being
+# onboarded; it does not manage an existing repo's hand-tuned one.
+
+#: Where the generated workflow lands. Also the path checked for a pre-existing
+#: hand-tuned lane — see `_provision_preview_lane`.
+_PREVIEW_WORKFLOW_PATH = ".github/workflows/deploy-cloudflare.yml"
+
+#: The two secrets `cloudflare/pages-action` needs. Fleet constants — the same
+#: for every repo in the Cloudflare account — so they are read from the
+#: operator's own environment rather than discovered per repo. Their VALUES are
+#: never printed, logged or stored anywhere by this module; only these names.
+_PREVIEW_SECRETS: tuple[str, ...] = ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID")
+
+#: Per-``--template`` preview lane, keyed by the same ``--template`` that picks
+#: the CI workflow and the acceptance driver (#2748's seam). Only ``node`` has
+#: one: a Cloudflare Pages preview is a static/SPA build artifact, and a
+#: `python` or stack-undecided (`generic`) repo has nothing to publish — a
+#: guessed lane there would be a workflow that fails on every PR forever, which
+#: is strictly worse than no lane at all.
+_PREVIEW_TEMPLATES: dict[str, dict[str, str]] = {
+    "node": {"template": "deploy-cloudflare.node.yml", "directory": "dist"},
+}
+
+#: Cloudflare Pages project-name rule: lowercase alphanumerics and hyphens,
+#: starting alphanumeric, max 58 chars. Checked locally so an invalid name is
+#: a refusal *before* the workflow is committed, rather than a `wrangler` error
+#: after — the workflow would then name a project that can never exist.
+_PAGES_PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,57}$")
+
+
+def _preview_template_text(filename: str) -> str:
+    """Read a shipped workflow template out of ``coord/templates/``.
+
+    Read from package data rather than embedded as a string literal (the
+    choice ``_CI_TEMPLATES``/``_GITHOOKS_*`` above made for their own
+    reasons): this one is a whole GitHub Actions workflow with load-bearing
+    ``${{ }}`` expressions, and keeping it as a real ``.yml`` file means it
+    is lintable, diffable and reviewable as YAML instead of as an escaped
+    Python string. ``importlib.resources`` — not ``__file__``-relative paths
+    — because coord ships to worker machines as a PyPI wheel.
+    """
+    from importlib.resources import files  # noqa: PLC0415
+
+    return (files("coord") / "templates" / filename).read_text(encoding="utf-8")
+
+
+def render_preview_workflow(
+    *, ci_template: str, project_name: str, build_directory: str,
+    production_branch: str,
+) -> str:
+    """The `deploy-cloudflare.yml` body for *ci_template* (#3092).
+
+    Pure: no network, no vendor SDK, no Cloudflare credentials. Substitution
+    uses unmistakable ``__COORD_*__`` tokens rather than ``str.format`` or
+    ``string.Template`` because the workflow is *full* of ``${{ secrets.X }}``
+    — both of those would either choke on it or silently mangle it.
+
+    Raises :class:`click.ClickException` when *ci_template* has no preview
+    lane, naming the templates that do.
+    """
+    spec = _PREVIEW_TEMPLATES.get(ci_template)
+    if spec is None:
+        raise click.ClickException(
+            f"--with-preview has no lane for --template {ci_template!r} — a "
+            f"Cloudflare Pages preview publishes a built static/SPA artifact, "
+            f"which {ci_template!r} has nothing to produce. Templates with a "
+            f"preview lane: {', '.join(sorted(_PREVIEW_TEMPLATES))}. Drop "
+            "--with-preview, or use a template that has one."
+        )
+    return (
+        _preview_template_text(spec["template"])
+        .replace("__COORD_PROJECT_NAME__", project_name)
+        .replace("__COORD_BUILD_DIRECTORY__", build_directory)
+        .replace("__COORD_PRODUCTION_BRANCH__", production_branch)
+    )
+
+
+@dataclass
+class _PreviewPlan:
+    """Everything ``--with-preview`` will do, resolved but not yet done — so
+    ``--dry-run`` renders exactly what a real run performs, from the same
+    object rather than from a parallel description that can drift."""
+
+    project_name: str
+    environment_name: str
+    build_directory: str
+    production_branch: str
+    workflow_path: str
+    workflow_content: str
+    #: Secret names only. Values are never held on this object.
+    secret_names: tuple[str, ...]
+    #: Of `secret_names`, the ones absent from the operator's environment.
+    missing_credentials: tuple[str, ...]
+    project_create_command: str
+
+    @property
+    def can_create_project(self) -> bool:
+        return not self.missing_credentials
+
+
+def _assert_preview_environment_resolvable(project_name: str) -> str:
+    """Assert that *project_name* yields an environment name
+    :func:`coord.github_ops.get_pr_deployment_url` will actually match, and
+    return it (#3092).
+
+    This is the whole reason the lane can be provisioned instead of probed.
+    ``cloudflare/pages-action`` derives the GitHub Deployment's environment as
+    ``"<projectName> (Preview)"``, and `projectName` is a parameter we set —
+    so the match is decidable at provision time. A mismatch is precisely the
+    silent-failure mode this lane exists to prevent (`get_pr_deployment_url`
+    returns None, nothing raises, the timeline stalls), so it is checked here
+    against the REAL predicate imported from the seam, never a local copy.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    if not _PAGES_PROJECT_NAME_RE.match(project_name):
+        raise click.ClickException(
+            f"invalid Cloudflare Pages project name {project_name!r} — must be "
+            "lowercase alphanumerics and hyphens, starting with an "
+            "alphanumeric, at most 58 characters. Pass --preview-project to "
+            "set one explicitly (it defaults to the coord repo name)."
+        )
+    environment = github_ops.preview_environment_name(project_name)
+    if not github_ops.is_preview_environment(environment):
+        raise click.ClickException(
+            f"refusing to provision a preview lane: projectName "
+            f"{project_name!r} derives the GitHub Deployment environment "
+            f"{environment!r}, which coord.github_ops.get_pr_deployment_url "
+            "would NOT match — every preview URL lookup for this repo would "
+            "silently return nothing. This is a coord bug, not an operator "
+            "one; report it rather than working around it."
+        )
+    return environment
+
+
+def _build_preview_plan(
+    *, ci_template: str, project_name: str, build_directory: str | None,
+    production_branch: str,
+) -> _PreviewPlan:
+    """Resolve a :class:`_PreviewPlan` — validating everything that can be
+    validated locally, before any write happens."""
+    import os  # noqa: PLC0415
+
+    spec = _PREVIEW_TEMPLATES.get(ci_template)
+    directory = build_directory or (spec or {}).get("directory") or "dist"
+    environment = _assert_preview_environment_resolvable(project_name)
+    content = render_preview_workflow(
+        ci_template=ci_template, project_name=project_name,
+        build_directory=directory, production_branch=production_branch,
+    )
+    missing = tuple(n for n in _PREVIEW_SECRETS if not os.environ.get(n))
+    return _PreviewPlan(
+        project_name=project_name,
+        environment_name=environment,
+        build_directory=directory,
+        production_branch=production_branch,
+        workflow_path=_PREVIEW_WORKFLOW_PATH,
+        workflow_content=content,
+        secret_names=_PREVIEW_SECRETS,
+        missing_credentials=missing,
+        project_create_command=(
+            f"wrangler pages project create {shlex.quote(project_name)} "
+            f"--production-branch {shlex.quote(production_branch)}"
+        ),
+    )
+
+
+def _print_preview_plan(plan: _PreviewPlan, *, github_slug: str) -> None:
+    """``--dry-run``: render every generated file and every command, execute
+    none of them."""
+    click.echo("")
+    click.echo(f"--dry-run: --with-preview would provision {github_slug}'s preview lane")
+    click.echo(
+        f"  environment name (asserted against get_pr_deployment_url): "
+        f"{plan.environment_name!r}"
+    )
+    click.echo("")
+    click.echo(f"  1. commit {plan.workflow_path} to {plan.production_branch}:")
+    for line in plan.workflow_content.splitlines():
+        click.echo(f"       {line}")
+    click.echo("")
+    click.echo(f"  2. set GitHub Actions secrets on {github_slug} (names only, never values):")
+    import os  # noqa: PLC0415
+
+    for name in plan.secret_names:
+        present = "read from $" + name if os.environ.get(name) else (
+            f"NOT SET in this environment — would be residue: "
+            f"`gh secret set {name} --repo {github_slug}`"
+        )
+        click.echo(f"       {name}  ({present})")
+    click.echo("")
+    click.echo("  3. coordinator.yml keys on this repos[] entry:")
+    click.echo("       uat_live_preview: true")
+    click.echo("")
+    if plan.can_create_project:
+        click.echo("  4. create the Cloudflare Pages project:")
+        click.echo(f"       {plan.project_create_command}")
+    else:
+        click.echo(
+            "  4. create the Cloudflare Pages project — SKIPPED (no "
+            f"{'/'.join(plan.missing_credentials)} in this environment), "
+            "reported as residue with this exact command:"
+        )
+        click.echo(f"       {plan.project_create_command}")
+
+
+def _run_wrangler_project_create(plan: _PreviewPlan) -> str | None:
+    """Step 4: create the Pages project. Returns ``None`` on success, or a
+    one-line reason it could not be done — never raises, because steps 1-3
+    have already landed by the time this runs and losing them to a Cloudflare
+    hiccup would be strictly worse than reporting residue."""
+    import shutil  # noqa: PLC0415
+
+    if shutil.which("wrangler") is None:
+        return "`wrangler` is not on PATH"
+    try:
+        result = subprocess.run(
+            [
+                "wrangler", "pages", "project", "create", plan.project_name,
+                "--production-branch", plan.production_branch,
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"`wrangler` failed to run: {exc}"
+    if result.returncode != 0:
+        return f"`wrangler` exited {result.returncode}: {result.stderr.strip()[:300]}"
+    return None
+
+
+def _provision_preview_lane(
+    *, plan: _PreviewPlan, github_slug: str, write_workflow: bool = True,
+) -> list[str]:
+    """Perform steps 1, 2 and 4 of the preview lane (step 3 — the
+    ``uat_live_preview`` config key — is written by the same seatbelted config
+    edit as the rest of the repos[] entry, in :func:`_do_repo_add_core`).
+
+    Returns the residue: the human-runnable commands for whatever could not
+    be done here. Never raises for a *skippable* step — an absent Cloudflare
+    credential must leave steps 1-3 landed and step 4 reported, not roll the
+    whole thing back.
+
+    ``write_workflow=False`` is ``coord repo create``'s path: the repo was
+    created moments ago and the workflow already went out in the SAME seed
+    commit as CLAUDE.md/CI/.githooks, so there is nothing here to write and —
+    the repo being brand new — nothing that could possibly be overwritten.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    residue: list[str] = []
+
+    # ── 1. the workflow — pure file generation, but NEVER an overwrite ────
+    if write_workflow:
+        try:
+            existing = github_ops.repo_file_exists(
+                github_slug, plan.workflow_path, plan.production_branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Could not tell whether one exists. Fail SAFE: not writing is
+            # recoverable; clobbering a hand-tuned deploy workflow is not.
+            residue.append(
+                f"could not check whether {github_slug} already has "
+                f"{plan.workflow_path} ({exc}) — the workflow was NOT written, "
+                "because overwriting a hand-tuned one is unrecoverable. Add it "
+                "by hand, or re-run once `gh` is working."
+            )
+        else:
+            if existing:
+                click.echo(
+                    f"· {plan.workflow_path} already exists on {github_slug}@"
+                    f"{plan.production_branch} — left UNTOUCHED "
+                    "(`--with-preview` adds a lane, it never reconciles an "
+                    "existing one)"
+                )
+                residue.append(
+                    f"{plan.workflow_path} already existed and was NOT "
+                    "modified — confirm by hand that its `projectName` "
+                    f"derives the environment {plan.environment_name!r}, or "
+                    "`get_pr_deployment_url` will silently resolve nothing"
+                )
+            else:
+                try:
+                    github_ops.create_commit_with_files(
+                        github_slug, plan.production_branch,
+                        [(plan.workflow_path, plan.workflow_content, False)],
+                        message=(
+                            "coord repo add --with-preview: per-PR Cloudflare "
+                            "Pages preview lane (#3092)"
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    residue.append(
+                        f"committing {plan.workflow_path} failed ({exc}) — add "
+                        "it by hand; without it every preview URL lookup for "
+                        "this repo silently returns nothing"
+                    )
+                else:
+                    click.echo(
+                        f"✓ committed {plan.workflow_path} to {github_slug}@"
+                        f"{plan.production_branch} (projectName: "
+                        f"{plan.project_name}, directory: "
+                        f"{plan.build_directory})"
+                    )
+
+    # ── 2. the two fleet-constant secrets ────────────────────────────────
+    import os  # noqa: PLC0415
+
+    for name in plan.secret_names:
+        value = os.environ.get(name)
+        if not value:
+            residue.append(
+                f"set the {name} secret: `gh secret set {name} --repo "
+                f"{github_slug}` (reads the value from stdin — never pass it "
+                "on the command line)"
+            )
+            continue
+        try:
+            github_ops.set_repo_secret(github_slug, name, value)
+        except Exception as exc:  # noqa: BLE001
+            # The message deliberately carries `exc`, which comes from a
+            # `gh` invocation whose argv never contained the value.
+            residue.append(
+                f"setting the {name} secret failed ({exc}) — `gh secret set "
+                f"{name} --repo {github_slug}`"
+            )
+        else:
+            click.echo(f"✓ set {name} on {github_slug} (value not logged)")
+
+    # ── 4. the Pages project — the only vendor step, and skippable ───────
+    if not plan.can_create_project:
+        residue.append(
+            f"create the Cloudflare Pages project ({'/'.join(plan.missing_credentials)} "
+            f"absent from this environment, so it was not attempted): "
+            f"`{plan.project_create_command}`"
+        )
+    else:
+        failure = _run_wrangler_project_create(plan)
+        if failure:
+            residue.append(
+                f"create the Cloudflare Pages project — {failure}: "
+                f"`{plan.project_create_command}`"
+            )
+        else:
+            click.echo(
+                f"✓ created Cloudflare Pages project {plan.project_name} "
+                f"(production branch: {plan.production_branch})"
+            )
+
+    return residue
+
+
+def _print_preview_residue(residue: list[str], *, name: str) -> None:
+    """Print what the preview lane could NOT do — with runnable commands, and
+    only when there is something to say."""
+    click.echo("")
+    if not residue:
+        click.echo(
+            f"✓ preview lane complete for {name} — `coord repo doctor {name}` "
+            "should now read clean on the #3073 preview check"
+        )
+        return
+    click.echo("PREVIEW LANE — partially provisioned. Still outstanding:")
+    for item in residue:
+        click.echo(f"  · {item}")
+    click.echo(
+        f"  Until these are done, `coord repo doctor {name}` reports the "
+        "preview lane as incomplete rather than green."
+    )
+
+
 def _render_claude_md_skeleton(name: str) -> str:
     """A minimal ``CLAUDE.md`` for a just-created repo (#2747).
 
@@ -724,6 +1121,38 @@ def _resolve_write_target(explicit: Path | None) -> Path:
 )
 @click.option("--for-submission", "submission_id", default=None, help=_FOR_SUBMISSION_HELP)
 @click.option(
+    "--template", "ci_template", type=click.Choice(sorted(_CI_TEMPLATES)),
+    default="generic", show_default=True,
+    help=(
+        "Which stack this repo is. `coord repo add` onboards an EXISTING repo "
+        "so it seeds no CI — this only selects the --with-preview lane "
+        "(#3092); only `node` has one."
+    ),
+)
+@click.option(
+    "--with-preview", is_flag=True, default=False,
+    help=(
+        "Provision the per-PR preview lane (#3092): commit a "
+        "`deploy-cloudflare.yml` derived from --template, set the two "
+        "Cloudflare GitHub secrets from this environment, write "
+        "`uat_live_preview: true`, and create the Pages project. Without a "
+        "lane, `get_pr_deployment_url` silently resolves nothing and the "
+        "customer timeline stalls at `in-progress` with no error."
+    ),
+)
+@click.option(
+    "--preview-project", default=None,
+    help=(
+        "Cloudflare Pages projectName. Default: the coord repo name. This is "
+        "what derives the `\"<projectName> (Preview)\"` GitHub Deployment "
+        "environment coord matches on — asserted at provision time."
+    ),
+)
+@click.option(
+    "--preview-directory", default=None,
+    help="Build output directory the preview publishes. Default: per --template (node: dist).",
+)
+@click.option(
     "--refresh-live-config/--no-refresh-live-config", "refresh_live",
     default=True, show_default=True,
     help=(
@@ -756,10 +1185,31 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     dry_run: bool,  # noqa: FBT001
     config_path: Path | None,
     submission_id: str | None,
+    ci_template: str,
+    with_preview: bool,  # noqa: FBT001
+    preview_project: str | None,
+    preview_directory: str | None,
     refresh_live: bool,  # noqa: FBT001
     skip_freshness: bool,  # noqa: FBT001
     ssh_timeout: float,
 ) -> None:
+    # #3092: everything about the preview lane that can be decided WITHOUT the
+    # network is decided here, before any write — an unsupported --template or
+    # an invalid Pages project name must refuse while the config is still
+    # untouched, not after the repos[] entry has landed.
+    if with_preview:
+        _assert_preview_environment_resolvable(preview_project or name)
+        render_preview_workflow(
+            ci_template=ci_template, project_name=preview_project or name,
+            build_directory=preview_directory
+            or _PREVIEW_TEMPLATES.get(ci_template, {}).get("directory", "dist"),
+            production_branch=default_branch_override or "main",
+        )
+    elif preview_project or preview_directory:
+        raise click.ClickException(
+            "--preview-project/--preview-directory only mean anything with "
+            "--with-preview — refusing rather than silently ignoring them."
+        )
     # #2861: an unknown submission id / an already-mapped project must refuse
     # BEFORE the repos[] entry is written, not after.
     if submission_id and not dry_run:
@@ -781,13 +1231,30 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         dry_run=dry_run,
         config_path=config_path,
         check_freshness=not skip_freshness,
+        uat_live_preview=with_preview,
     )
+    preview_residue: list[str] | None = None
+    if with_preview:
+        plan = _build_preview_plan(
+            ci_template=ci_template,
+            project_name=preview_project or name,
+            build_directory=preview_directory,
+            production_branch=result["default_branch"],
+        )
+        if dry_run:
+            _print_preview_plan(plan, github_slug=github_slug)
+        else:
+            preview_residue = _provision_preview_lane(
+                plan=plan, github_slug=github_slug,
+            )
     if submission_id and dry_run:
         _print_for_submission_plan(
             name=name, submission_id=submission_id, machines=result["machines"],
             target=result["target"], refresh_live=refresh_live,
         )
         return
+    if preview_residue is not None:
+        _print_preview_residue(preview_residue, name=name)
     if submission_id:
         from coord.config import load as load_config  # noqa: PLC0415
 
@@ -845,6 +1312,7 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
     dry_run: bool,
     config_path: Path | None,
     check_freshness: bool = True,
+    uat_live_preview: bool = False,
 ) -> dict:
     """Everything ``coord repo add`` does except printing the residue block —
     write the ``coordinator.yml`` entry, add the repo to its machines, and
@@ -920,6 +1388,7 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
     entry = render_repo_entry(
         name, github_slug, default_branch,
         build_command=build_command, test_command=test_command,
+        uat_live_preview=uat_live_preview,
     )
     try:
         updated = insert_repo_entry(original, entry)
@@ -953,6 +1422,14 @@ def _do_repo_add_core(  # noqa: PLR0913 — one option per thing the caller can 
         raise click.ClickException(
             f"refusing to write: the edit parsed but repo {name!r} is not in "
             f"the result. {target} is unchanged."
+        )
+    # #3092: the preview lane's step 3. Same seatbelt as everything else here
+    # — a `uat_live_preview` that parsed but did not land is the exact silent
+    # gap this whole option exists to close, so it must refuse, not warn.
+    if uat_live_preview and not getattr(new_cfg.repo(name), "uat_live_preview", False):
+        raise click.ClickException(
+            f"refusing to write: the edit parsed but repo {name!r} does not "
+            f"have uat_live_preview set. {target} is unchanged."
         )
     landed = [m.name for m in new_cfg.machines if name in (m.repos or [])]
     missing = [m for m in machines if m not in landed]
@@ -1754,6 +2231,23 @@ def _run_for_submission(
 )
 @click.option("--for-submission", "submission_id", default=None, help=_FOR_SUBMISSION_HELP)
 @click.option(
+    "--with-preview", is_flag=True, default=False,
+    help=(
+        "Also provision the per-PR preview lane from the SAME --template "
+        "decision (#3092): `deploy-cloudflare.yml`, the two Cloudflare "
+        "secrets, `uat_live_preview: true` and the Pages project. Only "
+        "`--template node` has a lane."
+    ),
+)
+@click.option(
+    "--preview-project", default=None,
+    help="Cloudflare Pages projectName. Default: the coord repo name.",
+)
+@click.option(
+    "--preview-directory", default=None,
+    help="Build output directory the preview publishes. Default: per --template (node: dist).",
+)
+@click.option(
     "--refresh-live-config/--no-refresh-live-config", "refresh_live",
     default=True, show_default=True,
     help=(
@@ -1790,6 +2284,9 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
     dry_run: bool,  # noqa: FBT001
     config_path: Path | None,
     submission_id: str | None,
+    with_preview: bool,  # noqa: FBT001
+    preview_project: str | None,
+    preview_directory: str | None,
     refresh_live: bool,  # noqa: FBT001
     skip_freshness: bool,  # noqa: FBT001
     ssh_timeout: float,
@@ -1835,6 +2332,23 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
             machines=machines,
         )
 
+    # #3092: same rule for the preview lane — `--with-preview --template
+    # python` (no lane) or an invalid Pages project name must refuse here, not
+    # after a repo has been created and seeded on GitHub.
+    if with_preview:
+        _assert_preview_environment_resolvable(preview_project or name)
+        render_preview_workflow(
+            ci_template=ci_template, project_name=preview_project or name,
+            build_directory=preview_directory
+            or _PREVIEW_TEMPLATES.get(ci_template, {}).get("directory", "dist"),
+            production_branch="main",
+        )
+    elif preview_project or preview_directory:
+        raise click.ClickException(
+            "--preview-project/--preview-directory only mean anything with "
+            "--with-preview — refusing rather than silently ignoring them."
+        )
+
     try:
         exists = github_ops.repo_exists(github_slug)
     except Exception as exc:  # noqa: BLE001
@@ -1856,6 +2370,18 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
             f"the {ci_template!r} CI workflow + .githooks/, then run the "
             f"equivalent of `coord repo add {name} --github {github_slug}`"
         )
+        if with_preview:
+            _print_preview_plan(
+                _build_preview_plan(
+                    ci_template=ci_template,
+                    project_name=preview_project or name,
+                    build_directory=preview_directory,
+                    # Nothing exists yet to read a default branch from, and
+                    # `create_repo` makes `main`.
+                    production_branch="main",
+                ),
+                github_slug=github_slug,
+            )
         if submission_id:
             _print_for_submission_plan(
                 name=name, submission_id=submission_id, machines=machines,
@@ -1890,6 +2416,23 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
         f"(--template {ci_template}), .githooks/, and graphify-out/.gitignore..."
     )
     files = _seed_files(name, ci_template)
+    preview_plan: _PreviewPlan | None = None
+    if with_preview:
+        # #3092: the preview workflow rides along in the SAME seed commit
+        # rather than a second one. The repo was created seconds ago, so
+        # there is nothing here that could be overwritten — the
+        # never-clobber check belongs to `coord repo add`'s path, where the
+        # repo pre-dates the command.
+        preview_plan = _build_preview_plan(
+            ci_template=ci_template,
+            project_name=preview_project or name,
+            build_directory=preview_directory,
+            production_branch=default_branch,
+        )
+        files = [
+            *files,
+            (preview_plan.workflow_path, preview_plan.workflow_content, False),
+        ]
     try:
         github_ops.create_commit_with_files(
             github_slug, default_branch, files,
@@ -1927,7 +2470,13 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
         # side effect — re-fetching here would be a second network round trip
         # answering a question nothing could have changed since.
         check_freshness=False,
+        uat_live_preview=with_preview,
     )
+    preview_residue: list[str] | None = None
+    if preview_plan is not None:
+        preview_residue = _provision_preview_lane(
+            plan=preview_plan, github_slug=github_slug, write_workflow=False,
+        )
     # #2748 (IL-2): a stack-appropriate acceptance.drivers entry, so the repo
     # is oracle-loop-ready on day one instead of residue item 6 nobody
     # performs. `generic` writes nothing — see
@@ -1940,6 +2489,9 @@ def repo_create(  # noqa: PLR0913 — one option per thing the command can set
             f"✓ wrote acceptance.drivers.{name} "
             f"({_ACCEPTANCE_DRIVER_TEMPLATES[ci_template]['kind']})"
         )
+
+    if preview_residue is not None:
+        _print_preview_residue(preview_residue, name=name)
 
     if submission_id:
         # #2861: the four residue items `repo create` prints are exactly what
