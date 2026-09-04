@@ -1879,6 +1879,300 @@ class TestSyncSubmissionStatuses:
         assert by_submission["sub-issue"].status == "planned"
 
 
+def _status_values(submission_id: str = SUB) -> list[str]:
+    """Every status ever queued for a submission, oldest first — the outbox
+    shape #3096 was diagnosed from (`SELECT status FROM portal_outbox WHERE
+    kind='status'`)."""
+    return [
+        r.fields["status"]
+        for r in portal_store.outbox_for_submission(submission_id)
+        if r.kind == portal_sync.KIND_STATUS
+    ]
+
+
+class TestOscillationBetweenTwoLinks:
+    """#3096, the actual production incident: SUB-1EA1D3 accumulated 322
+    status rows alternating in-progress/shipped, one PAIR per daemon tick a
+    second apart, and mailed a real customer 100+ times over seven days.
+
+    The cause was two `coord portal link` records naming one submission_id —
+    a milestone-scoped one (several issues, one still open -> in-progress)
+    and an issue-scoped one (#2665; that issue closed -> shipped). Each tick
+    folded both independently and enqueued whichever answer each produced;
+    #2588's churn guard compared only against the LAST queued status, so
+    every push differed from its predecessor and none was suppressed.
+    """
+
+    @staticmethod
+    def _both_links_on_one_submission():
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+
+    @staticmethod
+    def _oscillating_folds(monkeypatch):
+        # The milestone sees an open sibling -> in-progress.
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues",
+            lambda *a: [_issue(77, "CLOSED"), _issue(78, "OPEN")],
+        )
+        # The lone linked issue is closed -> shipped.
+        monkeypatch.setattr(
+            portal_sync, "_single_issue_as_list", lambda *a: [_issue(77, "CLOSED")]
+        )
+
+    def test_repeated_ticks_produce_one_stable_status_not_an_alternation(
+        self, monkeypatch,
+    ):
+        """The regression test for the flood itself: consecutive ticks over
+        the exact state that produced 322 rows must produce ONE."""
+        self._both_links_on_one_submission()
+        self._oscillating_folds(monkeypatch)
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        board = _board_with_started("acme-portal", {78})
+
+        for _ in range(5):
+            portal_sync.sync_submission_statuses(config, board=board)
+
+        assert _status_values() == ["in-progress"]
+
+    def test_the_losing_link_reports_rather_than_pushing(self, monkeypatch):
+        """Refused AND escalated. Silently skipping the duplicate would fix
+        the flood and hide the misconfiguration that caused it — and "no
+        surface in coord reported anything wrong" is half of why this ran for
+        seven days."""
+        self._both_links_on_one_submission()
+        self._oscillating_folds(monkeypatch)
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+
+        results = portal_sync.sync_submission_statuses(
+            config, board=_board_with_started("acme-portal", {78})
+        )
+
+        refused = [r for r in results if r.failed]
+        assert len(refused) == 1
+        assert refused[0].submission_id == SUB
+        assert refused[0].row is None
+        assert "issue #77" in refused[0].reason
+        assert "not the authoritative link" in refused[0].reason
+        # names the winner, so an operator knows which one to drop
+        assert "ms-5" in refused[0].reason
+
+    def test_milestone_link_wins_over_issue_link(self, monkeypatch):
+        """A milestone link folds every issue in the submission; an issue
+        link only ever sees its own. The complete answer wins."""
+        self._both_links_on_one_submission()
+        self._oscillating_folds(monkeypatch)
+
+        assert portal_sync.authoritative_link(SUB).milestone_number == 5
+
+    def test_the_merge_time_caller_refuses_the_same_link_the_tick_does(
+        self, monkeypatch,
+    ):
+        """Both automatic callers reach the outbox through
+        `_fold_status_for_link`, so `coord.merge_queue._maybe_push_status`
+        entering by issue number cannot push what the tick refuses."""
+        self._both_links_on_one_submission()
+        self._oscillating_folds(monkeypatch)
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+
+        result = portal_sync.fold_status_for_issue(config, "acme-portal", 77)
+
+        assert result.row is None
+        assert result.failed is True
+        assert "not the authoritative link" in result.reason
+        assert _status_values() == []
+
+    def test_a_single_link_is_unaffected(self, monkeypatch):
+        """Fails open on the ordinary case — one link, which is every
+        submission in the system except the one that flooded."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.status == "shipped"
+        assert result.row is not None
+        assert result.failed is False
+
+
+class TestStatusReentryGuard:
+    """#3096: the customer vocabulary is a lifecycle, not a state machine
+    that revisits. #2588's guard suppressed a REPEAT (`A -> A`); these cover
+    the ALTERNATION (`A -> B -> A`) it could never see."""
+
+    @staticmethod
+    def _linked_config():
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        return FakeConfig({"acme-portal": FakeRepoCfg()})
+
+    def test_alternating_fold_is_refused_after_one_round_trip(self, monkeypatch):
+        config = self._linked_config()
+        board = _board_with_started("acme-portal", {1, 2})
+        open_then_closed = [
+            [_issue(1, "OPEN"), _issue(2, "CLOSED")],   # in-progress
+            [_issue(1, "CLOSED"), _issue(2, "CLOSED")],  # shipped
+            [_issue(1, "OPEN"), _issue(2, "CLOSED")],   # in-progress again
+        ]
+        for issues in open_then_closed:
+            monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a, _i=issues: _i)
+            result = portal_sync.fold_status_for_milestone(
+                config, "acme-portal", 5, board=board,
+            )
+
+        # The third fold wanted in-progress again — a genuine CHANGE from the
+        # last push, which is exactly what #2588's guard waves through.
+        assert result.status == "in-progress"
+        assert result.row is None
+        assert result.failed is True
+        assert _status_values() == ["in-progress", "shipped"]
+
+    def test_shipped_is_terminal(self, monkeypatch):
+        """`shipped` is the terminal one (coord-portal `src/notifications.ts`)
+        — a submission cannot un-ship, whatever the fold computes."""
+        config = self._linked_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+        first = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        assert first.status == "shipped"
+
+        # A brand-new issue lands under the shipped milestone.
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues",
+            lambda *a: [_issue(1, "CLOSED"), _issue(2, "OPEN")],
+        )
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.status == "planned"
+        assert result.row is None
+        assert result.failed is True
+        assert "terminal" in result.reason
+        assert _status_values() == ["shipped"]
+
+    def test_re_shipping_after_shipped_stays_the_quiet_unchanged_no_op(
+        self, monkeypatch,
+    ):
+        """The overwhelmingly common post-ship tick: still shipped. #2588's
+        churn guard catches it first, so it must NOT be reported as a
+        failure — an error line on every tick of every shipped submission
+        would be its own kind of flood."""
+        config = self._linked_config()
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+        portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+        result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
+
+        assert result.row is None
+        assert result.failed is False
+        assert "unchanged" in result.reason
+
+    def test_the_ordinary_forward_lifecycle_still_flows(self, monkeypatch):
+        """planned -> in-progress -> shipped is three distinct statuses and
+        must still produce three pushes."""
+        config = self._linked_config()
+        board = _board_with_started("acme-portal", {1})
+        stages = [
+            (None, [_issue(1, "OPEN")]),
+            (board, [_issue(1, "OPEN")]),
+            (board, [_issue(1, "CLOSED")]),
+        ]
+        for b, issues in stages:
+            monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a, _i=issues: _i)
+            portal_sync.fold_status_for_milestone(config, "acme-portal", 5, board=b)
+
+        assert _status_values() == ["planned", "in-progress", "shipped"]
+
+
+class TestStatusFloodCeiling:
+    """#3096's backstop: a per-submission ceiling that holds regardless of
+    which bug is upstream of it. 322 pushes for one submission while every
+    other in the system had four should have tripped something."""
+
+    @staticmethod
+    def _linked_config():
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        return FakeConfig({"acme-portal": FakeRepoCfg()})
+
+    @staticmethod
+    def _fill_to_ceiling(now: float):
+        # Six rows, none of them `shipped`, so the re-entry guard above lets
+        # a `shipped` fold through and the ceiling is what stops it.
+        for status in (
+            "describing", "in-design", "planned", "in-progress", "on-hold", "on-hold",
+        ):
+            enqueue_status(SUB, status, now=now)
+
+    def test_pushes_over_the_ceiling_are_refused_and_reported(self, monkeypatch):
+        config = self._linked_config()
+        self._fill_to_ceiling(1000.0)
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+
+        result = portal_sync.fold_status_for_milestone(
+            config, "acme-portal", 5, now=1000.0,
+        )
+
+        assert result.status == "shipped"
+        assert result.row is None
+        assert result.failed is True
+        assert "ceiling" in result.reason
+        assert "shipped" not in _status_values()
+
+    def test_the_window_rolls_so_a_long_lived_submission_is_not_frozen(
+        self, monkeypatch,
+    ):
+        """A submission legitimately moves through the vocabulary more than a
+        handful of times over months — just never in one day."""
+        config = self._linked_config()
+        self._fill_to_ceiling(1000.0)
+        monkeypatch.setattr(
+            portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
+        )
+
+        later = 1000.0 + 25 * 60 * 60
+        result = portal_sync.fold_status_for_milestone(
+            config, "acme-portal", 5, now=later,
+        )
+
+        assert result.row is not None
+        assert result.status == "shipped"
+
+    def test_a_healthy_submission_never_comes_near_it(self, monkeypatch):
+        """Calibration check: the whole planned -> in-progress -> shipped
+        lifecycle inside one tick-window stays well under the ceiling —
+        every non-flooding submission measured in production had <= 4 status
+        rows, ever."""
+        config = self._linked_config()
+        board = _board_with_started("acme-portal", {1})
+        for b, issues in (
+            (None, [_issue(1, "OPEN")]),
+            (board, [_issue(1, "OPEN")]),
+            (board, [_issue(1, "CLOSED")]),
+        ):
+            monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a, _i=issues: _i)
+            result = portal_sync.fold_status_for_milestone(
+                config, "acme-portal", 5, board=b, now=1000.0,
+            )
+            assert result.failed is False
+
+        assert len(_status_values()) == 3
+
+
 class TestSyncTickStatusFold:
     """The end-to-end wiring through `sync_tick`: a folded, changed status
     is queued AND drained within the same tick (#2588's ordering — status
