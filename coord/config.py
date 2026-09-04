@@ -1567,8 +1567,13 @@ class StoreConfig:
     engine is live is a deployment property, not something an individual
     client negotiates per request, so every machine pointed at the same
     ``coord serve`` daemon's database must set the same ``store:`` block (or
-    none). Nothing in this repo currently cross-checks that across machines
-    (#829 territory).
+    none). ``coord doctor`` (#3084) cross-checks THIS machine's own
+    resolved backend (:func:`coord.db.resolve_store_backend`) against the
+    daemon's live ``GET /healthz`` ``store_backend`` when a ``board_service``
+    is configured at all -- it does not (yet) sweep every OTHER machine in
+    the fleet the way its per-machine ``/health`` loop does for
+    capabilities, so a mismatch between two thin clients that never proxy
+    through each other is still invisible (#829 territory).
 
     Setting this block chooses the connection target only — it says nothing
     about whether the schema has actually been migrated to Postgres (#828)

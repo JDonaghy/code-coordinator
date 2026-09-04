@@ -94,6 +94,23 @@ def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
     return resp.json()
 
 
+def fetch_healthz(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
+    """GET /healthz → the daemon's liveness-probe body (#3084).
+
+    Never auth-gated on the daemon side (``serve_app``'s bearer-auth
+    middleware exempts this one route, see its module docstring), so this
+    succeeds even when *svc* carries no/a stale token -- the same property
+    ``/healthz`` has always had for a direct curl, just now reachable through
+    this client too. Raises ``httpx.HTTPError`` on transport/HTTP failure,
+    same as every other ``fetch_*`` in this module; a caller that wants
+    "daemon unreachable" to degrade rather than raise (``coord doctor``'s
+    store-backend cross-check, #3084) catches it there.
+    """
+    resp = httpx.get(f"{svc.url}/healthz", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def fetch_assignment(
     svc: ServiceConfig, assignment_id: str, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> dict | None:

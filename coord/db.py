@@ -234,6 +234,35 @@ def _resolve_store_target() -> _StoreTarget:
     return _StoreTarget(backend=sql.DIALECT_POSTGRES, dsn=store.dsn)
 
 
+def resolve_store_backend() -> tuple[str, str | None]:
+    """Public, DSN-redacting view of which backend :func:`get_connection`
+    will open (#3084) — the one accessor every operator-facing surface (the
+    ``coord serve`` banner, ``GET /healthz``, ``coord doctor``) goes through
+    to answer "which store am I on?" without ever having a chance to print a
+    raw DSN. Wraps :func:`_resolve_store_target`, the same resolution
+    ``get_connection()`` itself uses, so this can never drift from the
+    backend a connection actually opens against.
+
+    Returns ``(backend, redacted_target)``. *redacted_target* is ``None``
+    for SQLite -- there is no DSN, and a caller that wants to name the
+    on-disk file uses :data:`DB_PATH` itself, same as always -- or
+    :func:`coord.sql.redact_dsn`'s host/dbname-only rendering of the
+    configured Postgres DSN when the resolved backend is
+    :data:`coord.sql.DIALECT_POSTGRES`. There is no code path here that can
+    return the raw DSN.
+
+    Like :func:`_resolve_store_target`, a config problem unrelated to an
+    explicit ``store:`` block fails open to SQLite; an explicit, broken
+    ``store:`` block still raises (see that function's docstring) -- this
+    wrapper changes nothing about that contract, it only adds redaction on
+    top of the resolved target.
+    """
+    target = _resolve_store_target()
+    if target.backend == sql.DIALECT_POSTGRES:
+        return target.backend, sql.redact_dsn(target.dsn or "")
+    return target.backend, None
+
+
 def get_connection() -> Any:
     """Return this process's connection, opening it on first call.
 

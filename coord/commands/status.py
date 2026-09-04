@@ -1346,6 +1346,56 @@ def _release_lag_lines(report) -> list[tuple[bool, str]]:
     return out
 
 
+def _store_backend_lines(
+    local_backend: str, daemon_backend: str | None, *, daemon_error: str | None
+) -> list[tuple[bool, str]]:
+    """Render the local-vs-daemon storage-backend cross-check as ``coord
+    doctor`` lines (#3084).
+
+    ``coord.config.StoreConfig``'s own docstring names exactly this gap:
+    every machine pointed at the same ``coord serve`` daemon must set the
+    same ``store:`` block, and "nothing in this repo currently cross-checks
+    that across machines". A thin client configured for a different backend
+    than the daemon it proxies to is the half-cut-fleet failure #829 will
+    eventually create for real -- this closes the "and it is silent today"
+    half of that gap.
+
+    *local_backend* is this machine's own resolved ``store.backend``
+    (:func:`coord.db.resolve_store_backend`, reading THIS machine's
+    ``coordinator.yml``/``$COORD_CONFIG`` directly -- the same resolution
+    ``coord.db.get_connection()``'s write path uses, independent of any
+    daemon-fetched config). *daemon_backend* is the daemon's own
+    ``/healthz`` ``store_backend`` field, or ``None`` when this machine has
+    no ``board_service`` configured (the daemon host itself, or any machine
+    not proxying through one -- nothing to compare against, not a problem).
+    *daemon_error* is set instead when a ``board_service`` IS configured but
+    the GET failed (unreachable daemon, old daemon, etc.) -- reported, but
+    never escalated to CRIT: an unreachable daemon is already surfaced
+    elsewhere in this command, and guessing at agreement/disagreement from
+    no data would be worse than saying nothing.
+    """
+    out: list[tuple[bool, str]] = [(False, f"  · local store.backend: {local_backend}")]
+    if daemon_error is not None:
+        out.append((False, f"  · daemon /healthz store_backend: unavailable ({daemon_error})"))
+        return out
+    if daemon_backend is None:
+        return out  # no board_service configured -- nothing to cross-check
+    out.append((False, f"  · daemon /healthz store_backend: {daemon_backend}"))
+    if daemon_backend != local_backend:
+        out.append(
+            (
+                True,
+                f"  ✗ CRIT: local store.backend={local_backend!r} disagrees with "
+                f"daemon store_backend={daemon_backend!r} — this machine is "
+                "configured for a different storage engine than the daemon "
+                "it proxies to (the #829 half-cut-fleet failure). Fix: align "
+                "this machine's coordinator.yml `store:` block with the "
+                "daemon's.",
+            )
+        )
+    return out
+
+
 @click.command(
     help=(
         "Fleet-wide prereq report: is this machine fit to be routed work?\n\n"
@@ -1691,6 +1741,37 @@ def doctor(
             f"quiet_hours configured ({names}) — an overlapping window "
             "could leave it with no awake machine to route to"
         )
+
+    # #3084: which storage engine is THIS machine pointed at, and does that
+    # agree with the daemon it proxies to (if any)? See
+    # `_store_backend_lines`'s docstring for why this closes a gap
+    # `StoreConfig`'s own docstring calls out as unchecked. Fail-soft on the
+    # daemon GET itself (`fetch_healthz` can raise `httpx.HTTPError`) --
+    # doctor must still report everything else even when the daemon is
+    # unreachable, same posture as the board read above.
+    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.db import resolve_store_backend  # noqa: PLC0415
+
+    local_backend, _redacted_target = resolve_store_backend()
+    daemon_store_backend: str | None = None
+    daemon_store_error: str | None = None
+    store_svc = resolve_board_service()
+    if store_svc is not None:
+        from coord.client import fetch_healthz  # noqa: PLC0415
+
+        try:
+            daemon_store_backend = fetch_healthz(store_svc, timeout=timeout).get("store_backend")
+        except Exception as exc:  # noqa: BLE001 — doctor must still report everything else
+            daemon_store_error = str(exc)
+
+    click.echo("")
+    click.echo("store backend (#3084):")
+    for is_problem, line in _store_backend_lines(
+        local_backend, daemon_store_backend, daemon_error=daemon_store_error
+    ):
+        click.echo(line)
+        if is_problem:
+            any_problem = True
 
     if any_problem:
         sys.exit(1)
