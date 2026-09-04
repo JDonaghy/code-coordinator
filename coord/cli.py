@@ -53,6 +53,7 @@ from coord.commands.setup import (
     config_cmd,
     init,
     install_skills,
+    store_backend_cmd,
     version,
 )
 from coord.commands.agent_ops import agent, pause, quiet_hours, unpause
@@ -402,6 +403,7 @@ def main() -> None:
 # pre-#747 cli.py exactly.
 main.add_command(version)
 main.add_command(config_cmd)
+main.add_command(store_backend_cmd)
 main.add_command(init)
 main.add_command(agent)
 main.add_command(status)

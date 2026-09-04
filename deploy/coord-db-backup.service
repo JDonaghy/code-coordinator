@@ -5,6 +5,11 @@
 # A systemd *user* unit (mirrors coord-serve/coord-web/coord-notify/
 # coord-drive-queue), Type=oneshot, timer-fired. Runs
 # ~/.local/bin/coord-db-backup.sh (deploy/coord-db-backup.sh), which:
+#   - first asks `coord store-backend` (#3084/#3085) which storage engine is
+#     actually configured and refuses outright, before touching the
+#     filesystem, when it isn't sqlite — a Postgres cutover (#829) leaves the
+#     old coord.db file, if present at all, dead and frozen, and every check
+#     below would otherwise pass against it and log a false "ok",
 #   - refuses to run unless the destination directory's parent is an actual
 #     mountpoint (default /media/crucial) — the external SSD must be
 #     physically present, or it would otherwise write "backups" onto the
@@ -20,9 +25,13 @@
 #   - prunes snapshots beyond `COORD_BACKUP_RETAIN` (default 168 ≈ 7 days
 #     hourly), never touching `.REJECTED` files.
 #
-# Install ONLY on the box that owns ~/.coord/coord.db (dellserver in
+# Install ONLY on the box that owns the SQLite store (dellserver in
 # production — the same host that runs coord-serve/coord-web/coord-notify/
-# coord-drive-queue).
+# coord-drive-queue). #3085: the script itself asks `coord store-backend`
+# (coord.db.resolve_store_backend(), #3084) which backend is actually
+# configured and refuses -- exits non-zero, writes no snapshot -- when it is
+# not sqlite, so a post-#829 Postgres cutover on this box turns into a failed
+# systemd unit instead of a silent hourly snapshot of a dead file.
 #
 # NOT a substitute for off-box backup: this protects against db corruption,
 # a bad migration, accidental deletion and OS-disk failure. It does NOT

@@ -357,6 +357,64 @@ def test_config_cmd_surfaces_unknown_repo_key(tmp_path: Path) -> None:
     assert "api" in result.output
 
 
+def test_store_backend_cmd_defaults_to_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3085: `coord store-backend` -- the accessor `deploy/coord-db-backup.sh`
+    consumes -- must answer "sqlite" when no `store:` block is configured at
+    all, same fail-open contract as `coord.db.resolve_store_backend()`."""
+    from click.testing import CliRunner  # noqa: PLC0415
+
+    from coord.cli import main  # noqa: PLC0415
+
+    monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "no-such-coordinator.yml"))
+    result = CliRunner().invoke(main, ["store-backend"])
+    assert result.exit_code == 0
+    assert result.output.strip() == "sqlite"
+
+
+def test_store_backend_cmd_reports_postgres_with_redacted_dsn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured postgres backend prints its name plus a host/dbname-only
+    target -- never the raw DSN (the password must not leak into a log a
+    shell script might echo)."""
+    from click.testing import CliRunner  # noqa: PLC0415
+
+    from coord.cli import main  # noqa: PLC0415
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos: []\nmachines: []\n"
+        "store:\n  backend: postgres\n  dsn: postgresql://user:sekret@dbhost:5432/coord\n"
+    )
+    monkeypatch.setenv("COORD_CONFIG", str(p))
+    result = CliRunner().invoke(main, ["store-backend"])
+    assert result.exit_code == 0
+    assert result.output.startswith("postgres")
+    assert "sekret" not in result.output
+    assert "dbhost" in result.output
+
+
+def test_store_backend_cmd_fails_loud_on_malformed_store_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit-but-invalid `store:` block must exit non-zero rather than
+    silently answering "sqlite" -- the one config problem
+    `resolve_store_backend()` deliberately lets raise. This is what makes
+    `deploy/coord-db-backup.sh` refuse instead of guessing when the config is
+    simply broken."""
+    from click.testing import CliRunner  # noqa: PLC0415
+
+    from coord.cli import main  # noqa: PLC0415
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text("repos: []\nmachines: []\nstore:\n  backend: not-a-real-backend\n")
+    monkeypatch.setenv("COORD_CONFIG", str(p))
+    result = CliRunner().invoke(main, ["store-backend"])
+    assert result.exit_code != 0
+
+
 _EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "coordinator.yml"
 
 
