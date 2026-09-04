@@ -51,16 +51,26 @@ def store_backend_cmd() -> None:
     store-backend section makes the identical local-only call for the
     identical reason -- see its docstring.)
 
-    A malformed *explicit* ``store:`` block still raises ``ConfigError`` here,
-    uncaught -- same contract as ``resolve_store_backend()`` itself: that one
-    config problem must fail loud (nonzero exit, a traceback on stderr) rather
-    than silently answering "sqlite". Callers such as
-    ``deploy/coord-db-backup.sh`` treat any nonzero exit from this command as
-    "could not determine the backend" and refuse to guess.
+    A malformed *explicit* ``store:`` block still fails loud here -- same
+    contract as ``resolve_store_backend()`` itself: that one config problem
+    must produce a nonzero exit rather than silently answering "sqlite".
+    Callers such as ``deploy/coord-db-backup.sh`` treat any nonzero exit from
+    this command as "could not determine the backend" and refuse to guess.
+    ``ConfigError`` is caught here and turned into a single curated line on
+    stderr rather than left to propagate as a raw Python traceback -- still a
+    loud nonzero exit naming the problem, just a cleaner one for an on-call
+    engineer reading a systemd journal (a shell script embeds this command's
+    stderr verbatim into its own failure message; a multi-line traceback
+    there is noise, not signal).
     """
+    from coord.config import ConfigError  # noqa: PLC0415
     from coord.db import resolve_store_backend  # noqa: PLC0415
 
-    backend, redacted_target = resolve_store_backend()
+    try:
+        backend, redacted_target = resolve_store_backend()
+    except ConfigError as exc:
+        click.echo(f"store-backend: invalid store config: {exc}", err=True)
+        raise SystemExit(1) from None
     if redacted_target:
         click.echo(f"{backend} {redacted_target}")
     else:

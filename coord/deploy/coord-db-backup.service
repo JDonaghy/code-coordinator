@@ -60,6 +60,18 @@ Documentation=https://github.com/JDonaghy/code-coordinator/issues/1822
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/coord-db-backup.sh
+# #3085 fix-review: this unit carried NO Environment=PATH= at all. A systemd
+# *user* unit's default PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:
+# /usr/bin:/sbin:/bin[:/snap/bin] — it does NOT include ~/.local/bin (where
+# the `coord` shim lives) or ~/.coord-venv/bin, so `coord-db-backup.sh`'s
+# `command -v "$COORD_BIN"` (default plain `coord`, #3085) would fail on
+# every single fire, turning the new "cannot determine the store backend"
+# refusal into a permanent false negative for the honest sqlite case — the
+# exact #1831/#2561/#2569 PATH gap already fixed on coord-serve.service,
+# coord-notify.service and coord-drive-queue.service in this directory.
+# Byte-identical to coord-drive-queue.service's line (same host, same role
+# family — see that unit's comment for the full ordering rationale).
+Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # `VACUUM INTO` on a live, busy coord.db can stall under lock contention.
 # Generous relative to a normal run (a snapshot this size takes seconds),
 # well below the timer's hourly cadence (coord-db-backup.timer) so a

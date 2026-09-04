@@ -106,7 +106,6 @@ def _shared_non_unit_files() -> list[str]:
 SHARED_NON_UNIT_FILES = _shared_non_unit_files()
 
 
-
 def test_source_deploy_dir_has_units() -> None:
     """Guards the guard: an empty source dir would make every other
     assertion here vacuously true."""
