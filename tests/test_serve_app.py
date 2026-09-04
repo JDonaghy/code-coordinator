@@ -378,6 +378,31 @@ def test_healthz_reports_configured_postgres_backend(cli, monkeypatch):
     assert resp.json()["store_backend"] == "postgres"
 
 
+def test_healthz_survives_broken_store_block(cli, monkeypatch):
+    """Review fix (#3084): an explicit-but-invalid `store:` block makes
+    `resolve_store_backend()` -> `_resolve_store_target()` raise `ConfigError`
+    "LOUD" by design (see that function's docstring in coord/db.py) -- correct
+    for a caller about to *use* the backend, but /healthz is a liveness probe
+    the issue requires to stay unconditional. Before this fix the handler had
+    no try/except around the call, so this exact config shape (`backend:
+    postgres` with no `dsn`, or a typo'd `backend:`) turned the probe into an
+    unhandled 500 instead of its usual `{"status": "ok", ...}` -- worst case
+    during a live #829 cutover edit. It must still answer 200, with
+    `store_backend` degraded to "unknown" rather than the request failing."""
+    import coord.db as db_mod
+    from coord.config import ConfigError
+
+    def _boom():
+        raise ConfigError("store.backend must be one of ('sqlite', 'postgres'), got 'bogus'")
+
+    monkeypatch.setattr(db_mod, "_resolve_store_target", _boom)
+    resp = cli.get("/healthz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["store_backend"] == "unknown"
+
+
 def test_healthz_never_leaks_a_raw_dsn(cli, monkeypatch):
     """#3084 acceptance: no raw DSN (password included) reaches /healthz --
     only the redacted host/dbname does. Drives the real

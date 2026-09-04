@@ -5699,9 +5699,23 @@ def build_app(
         # STORE_SERVICE.md §4's expand/migrate/contract rule -- an older
         # daemon simply omits the field, which existing schema consumers
         # already tolerate since they only read the keys they know about.
+        #
+        # `resolve_store_backend()` deliberately raises ConfigError for an
+        # explicit-but-invalid `store:` block (see `_resolve_store_target`'s
+        # docstring in coord/db.py) -- correct for callers that are about to
+        # *use* the backend, but /healthz is a liveness probe, not one of
+        # those callers: the daemon's real, already-open connection is
+        # unaffected by a bad on-disk edit (see db.py's "Connection-sharing
+        # model"), so a config typo must never turn this endpoint's 200 into
+        # a 500. Catch broadly, not just ConfigError -- any resolution
+        # failure here degrades to "unknown" rather than taking the probe
+        # down, matching this file's other "must never be fatal" handlers.
         from coord.db import resolve_store_backend  # noqa: PLC0415
 
-        backend, _redacted_target = resolve_store_backend()
+        try:
+            backend, _redacted_target = resolve_store_backend()
+        except Exception:  # noqa: BLE001 — /healthz must stay a pure liveness probe
+            backend = "unknown"
         return JSONResponse(
             {
                 "status": "ok",
