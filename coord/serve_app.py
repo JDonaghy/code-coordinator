@@ -5690,12 +5690,25 @@ def build_app(
         # detect a too-old daemon before negotiating. schema_version stays
         # for back-compat (pre-#1943 callers read it as "the" version) and
         # is always equal to schema_max.
+        #
+        # #3084: store_backend answers "which storage engine is this daemon
+        # actually pointed at?" -- a config read (`coord.db.resolve_store_
+        # backend`, which resolves the SAME `store:` block `get_connection()`
+        # does), never a DB connection attempt, so this stays a pure liveness
+        # probe: no DB access, never auth-gated. Additive per docs/
+        # STORE_SERVICE.md §4's expand/migrate/contract rule -- an older
+        # daemon simply omits the field, which existing schema consumers
+        # already tolerate since they only read the keys they know about.
+        from coord.db import resolve_store_backend  # noqa: PLC0415
+
+        backend, _redacted_target = resolve_store_backend()
         return JSONResponse(
             {
                 "status": "ok",
                 "schema_version": SCHEMA_VERSION,
                 "schema_min": MIN_SCHEMA_VERSION,
                 "schema_max": SCHEMA_VERSION,
+                "store_backend": backend,
             }
         )
 

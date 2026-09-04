@@ -575,9 +575,10 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
         import uvicorn
 
         from coord.dao import SqliteStore
-        from coord.db import DB_PATH
+        from coord.db import DB_PATH, resolve_store_backend
         from coord.serve_app import build_app as build_serve_app
         from coord.serve_app import configure_daemon_logging, resolve_serve_token
+        from coord.sql import DIALECT_POSTGRES
 
     # #2862: turn the daemon's own logging on BEFORE anything else runs.
     # Without this the root logger has no handler and sits at WARNING, and
@@ -607,9 +608,23 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
     store = SqliteStore(DB_PATH)
     app = build_serve_app(store, cfg, token=token)
     auth = "bearer-token" if token else "OPEN (tailnet ACL only)"
+    # #3084: `SqliteStore(DB_PATH)` above is constructed unconditionally, but
+    # `SqliteStore._connect()` (coord/dao.py) resolves its OWN backend via
+    # the same `coord.db._resolve_store_target()` this wraps, and ignores
+    # `DB_PATH` entirely once that resolves to Postgres -- so printing
+    # `db={DB_PATH}` under `backend: postgres` used to name a file this
+    # process never opens. Never print a raw DSN here: `resolve_store_backend`
+    # only ever hands back a redacted host/dbname, and this banner's stdout
+    # routinely ends up in a journal or a GitHub comment.
+    backend, redacted_target = resolve_store_backend()
+    store_desc = (
+        f"backend={backend} target={redacted_target}"
+        if backend == DIALECT_POSTGRES
+        else f"backend={backend} db={DB_PATH}"
+    )
     click.echo(
         f"coord serve: control center at http://{bind_host}:{bind_port} "
-        f"(config={cfg.path}, db={DB_PATH}, auth={auth})"
+        f"(config={cfg.path}, {store_desc}, auth={auth})"
     )
     if not token:
         click.echo(

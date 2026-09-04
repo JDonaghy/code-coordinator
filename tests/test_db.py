@@ -1200,6 +1200,66 @@ class TestResolveStoreTarget:
         assert target.backend == sql.DIALECT_SQLITE
 
 
+# ── resolve_store_backend (#3084) ────────────────────────────────────────────
+
+
+class TestResolveStoreBackend:
+    """Public, DSN-redacting wrapper around `_resolve_store_target()`
+    (#3084) -- the one accessor the `coord serve` banner, `GET /healthz`,
+    and `coord doctor` all go through so a raw DSN can never reach any of
+    those surfaces."""
+
+    def test_sqlite_backend_has_no_redacted_target(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "does-not-exist.yml"))
+        backend, redacted = db_mod.resolve_store_backend()
+        assert backend == sql.DIALECT_SQLITE
+        assert redacted is None
+
+    def test_postgres_backend_returns_redacted_host_and_dbname(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            _VALID_REPOS_MACHINES_YAML
+            + "store:\n  backend: postgres\n"
+            + "  dsn: postgresql://admin:s3cret-password@dbhost:5432/coorddb\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        backend, redacted = db_mod.resolve_store_backend()
+        assert backend == sql.DIALECT_POSTGRES
+        assert redacted == "postgresql://dbhost:5432/coorddb"
+
+    def test_postgres_backend_never_returns_the_raw_dsn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """#3084 acceptance: no raw DSN (password included) reaches any
+        caller of this accessor."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            _VALID_REPOS_MACHINES_YAML
+            + "store:\n  backend: postgres\n"
+            + "  dsn: postgresql://admin:s3cret-password@dbhost:5432/coorddb\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        _backend, redacted = db_mod.resolve_store_backend()
+        assert "s3cret-password" not in (redacted or "")
+        assert "admin" not in (redacted or "")
+
+    def test_matches_get_connections_own_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """This wrapper must never drift from the backend `get_connection()`
+        itself would open -- it's a thin wrapper around the exact same
+        `_resolve_store_target()` call, not a second, independent read."""
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_VALID_REPOS_MACHINES_YAML + "store:\n  backend: sqlite\n")
+        monkeypatch.setenv("COORD_CONFIG", str(config_path))
+        backend, _redacted = db_mod.resolve_store_backend()
+        assert backend == db_mod._resolve_store_target().backend
+
+
 # ── get_connection() Postgres per-thread routing (#827) ─────────────────────
 
 
