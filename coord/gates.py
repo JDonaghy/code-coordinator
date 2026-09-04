@@ -67,7 +67,7 @@ class AssignmentGateRow:
     # the row is BOOKED to (the tracking/epic issue for an oracle-loop
     # slice), `for_issue_number` is what it's actually FOR (the child), when
     # set. Surfaced on every row so a query that only matched via
-    # `effective_issue_number` (see `build_gate_report`) is legible rather
+    # `effective_issue_number` (see `assignments_for_issue`) is legible rather
     # than silently showing rows under the "wrong" issue with no explanation.
     issue_number: int
     for_issue_number: int | None
@@ -206,6 +206,63 @@ def _select_winning_work_assignment(work_like: list["Assignment"]) -> "Assignmen
     return winner
 
 
+def assignments_for_issue(
+    board: "Board", repo_name: str, issue_number: int
+) -> list["Assignment"]:
+    """Every board row (active + completed) belonging to
+    ``(repo_name, issue_number)``, oldest dispatch first.
+
+    #1730: matches on the raw ``issue_number`` (a tracking issue keeps
+    finding its own rows) OR the #1553 *effective* issue — a
+    ``for_issue_number`` resolving to *issue_number* means the row's work is
+    FOR the issue being asked about even though it is booked to a different
+    (tracking) issue.
+
+    Extracted from :func:`build_gate_report` (#3072) so the dashboard's
+    milestone roster selects rows by exactly the same predicate ``coord
+    gates`` does, rather than growing a second, subtly-different "find this
+    issue's assignments" scan that would drift the moment the effective-issue
+    rule changes again.
+    """
+    matching = [
+        a
+        for a in (list(board.active) + list(board.completed))
+        if a.repo_name == repo_name
+        and (a.issue_number == issue_number or effective_issue_number(a) == issue_number)
+    ]
+    matching.sort(key=lambda a: a.dispatched_at or 0.0)
+    return matching
+
+
+def gate_columns_for_issue(
+    board: "Board", repo_name: str, issue_number: int
+) -> AssignmentGateRow | None:
+    """The gate columns of the work-like row that ``coord gates`` treats as
+    winning for ``(repo_name, issue_number)`` — or ``None`` when the board
+    has no work-like row for it at all (#3072).
+
+    The cheap, **board-only** half of :func:`build_gate_report`: same row
+    selection (:func:`assignments_for_issue` +
+    :func:`_select_winning_work_assignment`), same
+    :class:`AssignmentGateRow` projection, but none of the live gate
+    *decision* — no ``gh`` branch/base SHA lookups, no merge-queue load, no
+    ``is_interactive`` DB backfill. That matters for the caller this exists
+    for: the dashboard's milestone roster renders gate columns for every
+    entry in a work order at once, and paying ``build_gate_report``'s live
+    lookups N times per page load would be a per-request fan-out for a
+    decision it does not display. Callers that need "*why* would this
+    refuse" still want :func:`build_gate_report`.
+    """
+    work_like = [
+        a
+        for a in assignments_for_issue(board, repo_name, issue_number)
+        if a.type in WORK_LIKE_TYPES
+    ]
+    if not work_like:
+        return None
+    return _row_from_assignment(_select_winning_work_assignment(work_like))
+
+
 def _find_verdict_unparseable_review(
     entry: "mq.QueuedMerge", board: "Board",
 ) -> "Assignment | None":
@@ -276,20 +333,11 @@ def build_gate_report(
     """
     from coord import merge_queue as mq  # noqa: PLC0415
 
-    # #1730: match on the raw `issue_number` (the tracking issue keeps
-    # finding its own rows) OR the #1553 *effective* issue — a `for_issue_number`
-    # that resolves to *issue_number* means this row's work is FOR the issue
-    # being queried even though it's booked to a different (tracking) issue.
-    # #1553 taught the TUI this resolution (`Assignment::effective_issue_number`);
-    # this CLI had never been updated to match, so `coord gates <repo>
-    # <child>` reported "no assignments found" for oracle-loop slices whose
-    # only board row carried the tracking issue in `issue_number`.
-    matching = [
-        a
-        for a in (list(board.active) + list(board.completed))
-        if a.repo_name == repo_name
-        and (a.issue_number == issue_number or effective_issue_number(a) == issue_number)
-    ]
+    # #1730's raw-or-effective issue matching, and the oldest-first ordering,
+    # now live in `assignments_for_issue` — shared with #3072's
+    # `gate_columns_for_issue` so the dashboard cannot select a different row
+    # than this command reports on.
+    matching = assignments_for_issue(board, repo_name, issue_number)
     report = GateReport(repo_name=repo_name, issue_number=issue_number)
     if not matching:
         report.notes.append(
@@ -297,7 +345,6 @@ def build_gate_report(
         )
         return report
 
-    matching.sort(key=lambda a: a.dispatched_at or 0.0)
     report.rows = [_row_from_assignment(a) for a in matching]
     _backfill_is_interactive(report.rows)
 

@@ -3243,6 +3243,52 @@ def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
     return results
 
 
+def get_repo_milestones_with_counts(repo: str, *, state: str = "open") -> list[dict]:
+    """Milestones for *repo*, carrying GitHub's own open/closed issue counts.
+
+    Same REST listing (and the same one paginated ``gh api`` call) as
+    :func:`get_repo_milestones`, projecting the four extra fields GitHub
+    already computes for every milestone: ``state``, ``open_issues``,
+    ``closed_issues`` and ``description``. Backs the dashboard's
+    ``GET /api/milestones`` roster (#3072), where "how many of this
+    milestone's issues are closed" is a headline column — and where deriving
+    it locally would mean either a second ``--state all`` issue fetch per
+    milestone or a count that quietly disagrees with what GitHub's own
+    milestone page shows.
+
+    A deliberate *sibling* of :func:`get_repo_milestones` rather than a
+    widening of it: that function is the identity-only lookup every
+    title→number resolution path uses (``coord milestone assign``, ``coord
+    plans``), and every one of those callers would otherwise start paying
+    for fields it discards. The returned dicts are a strict superset of
+    ``get_repo_milestones``'s, so anything that accepts one accepts the
+    other — :func:`coord.plans.aggregate_repo_plans` takes this list
+    directly.
+
+    Returns ``[]`` for a repo with no milestones (not an error).
+    """
+    raw = _gh(
+        "api", "--paginate",
+        f"repos/{repo}/milestones?state={state}",
+        "--jq",
+        ".[] | {number: .number, title: .title, state: .state, "
+        "open_issues: .open_issues, closed_issues: .closed_issues, "
+        "description: .description}",
+        caller="github_ops.get_repo_milestones_with_counts")
+    # One compact JSON object per line, same as get_repo_milestones — and the
+    # same #1353 rule: skip a single malformed line rather than letting it
+    # discard every well-formed milestone alongside it.
+    results = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parsed = _json_loads_or(line, default=None)
+        if parsed is not None:
+            results.append(parsed)
+    return results
+
+
 def get_milestone(repo: str, milestone_number: int) -> dict:
     """Fetch a single milestone by number; returns ``{number, title, ...}``.
 
