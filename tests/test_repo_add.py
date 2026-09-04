@@ -1136,3 +1136,600 @@ class TestFreshnessGuardScope:
         from coord.config import load
 
         assert load(dev_config).repo("grocery") is not None
+
+
+# ── #3092: the per-PR preview lane ──────────────────────────────────────────
+#
+# `coord repo add` provisioned everything a repo needs EXCEPT the artifact the
+# UAT gate and the customer portal's `quality-check` both read: a per-PR
+# preview deployment. That gap fails SILENTLY — `get_pr_deployment_url`
+# returns None on anything it cannot confirm and never raises — so these tests
+# are written around that specific failure mode rather than around "did the
+# command run": the load-bearing assertions are that the projectName the
+# workflow carries actually derives an environment `get_pr_deployment_url`
+# resolves, and that the doctor CRITs when the config claims a lane the repo
+# does not have.
+
+
+def _stub_preview_add(monkeypatch, *, default_branch="main", workflow_exists=False):
+    """Stub the forge seam `coord repo add --with-preview` touches, recording
+    every call. Nothing here reaches a real GitHub repo or a real Cloudflare
+    account."""
+    calls: dict[str, list] = {"seed": [], "secrets": [], "labels": [], "exists": []}
+
+    def _create_commit_with_files(repo, branch, files, message):
+        calls["seed"].append(
+            {"repo": repo, "branch": branch, "files": list(files), "message": message}
+        )
+        return "deadbeef"
+
+    def _set_repo_secret(repo, name, value):
+        calls["secrets"].append({"repo": repo, "name": name, "value": value})
+
+    def _repo_file_exists(repo, path, branch):
+        calls["exists"].append({"repo": repo, "path": path, "branch": branch})
+        return workflow_exists
+
+    monkeypatch.setattr(github_ops, "get_repo_default_branch", lambda repo: default_branch)
+    monkeypatch.setattr(github_ops, "create_label", lambda repo, label, **kw: None)
+    monkeypatch.setattr(github_ops, "create_commit_with_files", _create_commit_with_files)
+    monkeypatch.setattr(github_ops, "set_repo_secret", _set_repo_secret)
+    monkeypatch.setattr(github_ops, "repo_file_exists", _repo_file_exists)
+    # Step 4 is the only vendor-specific piece and is deliberately skippable —
+    # every test here runs with no `wrangler` on PATH unless it says otherwise.
+    monkeypatch.setattr(repo_cmd, "_run_wrangler_project_create", lambda plan: "`wrangler` is not on PATH")
+    return calls
+
+
+def _with_cloudflare_creds(monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token-do-not-log")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "cf-account-id")
+
+
+def _without_cloudflare_creds(monkeypatch):
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+
+
+class TestPreviewLaneDryRun:
+    def test_dry_run_renders_every_artifact_and_touches_nothing(
+        self, config_path, monkeypatch
+    ):
+        """The issue's headline acceptance: `coord repo add --template node
+        --with-preview --dry-run` prints the workflow, the secret NAMES (never
+        values), the config keys and the project-create command, and touches
+        nothing."""
+        calls = _stub_preview_add(monkeypatch)
+        _with_cloudflare_creds(monkeypatch)
+        before = config_path.read_text()
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--dry-run", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        # 1. the workflow, rendered in full
+        assert ".github/workflows/deploy-cloudflare.yml" in result.output
+        assert "cloudflare/pages-action" in result.output
+        assert "projectName: grocery" in result.output
+        assert "directory: dist" in result.output
+        # 2. secret NAMES, never values
+        assert "CLOUDFLARE_API_TOKEN" in result.output
+        assert "CLOUDFLARE_ACCOUNT_ID" in result.output
+        assert "cf-token-do-not-log" not in result.output
+        # 3. the config key
+        assert "uat_live_preview: true" in result.output
+        # 4. the project-create command
+        assert "wrangler pages project create grocery" in result.output
+        # ...and the assertion that ties 1 to the lookup that reads it back
+        assert "grocery (Preview)" in result.output
+
+        # Touched NOTHING.
+        assert config_path.read_text() == before
+        assert calls["seed"] == []
+        assert calls["secrets"] == []
+        assert calls["labels"] == []
+
+    def test_dry_run_names_the_project_create_residue_when_creds_are_absent(
+        self, config_path, monkeypatch
+    ):
+        _stub_preview_add(monkeypatch)
+        _without_cloudflare_creds(monkeypatch)
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--dry-run", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "NOT SET in this environment" in result.output
+        assert "gh secret set CLOUDFLARE_API_TOKEN --repo acme/grocery" in result.output
+        assert "wrangler pages project create grocery" in result.output
+
+
+class TestPreviewLaneProvisioning:
+    def test_a_real_run_commits_the_workflow_sets_secrets_and_writes_the_config(
+        self, config_path, monkeypatch
+    ):
+        calls = _stub_preview_add(monkeypatch)
+        _with_cloudflare_creds(monkeypatch)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        # 1. the workflow, committed to the real default branch
+        assert len(calls["seed"]) == 1
+        seed = calls["seed"][0]
+        assert seed["repo"] == "acme/grocery"
+        assert seed["branch"] == "main"
+        paths = {p for p, _c, _e in seed["files"]}
+        assert paths == {".github/workflows/deploy-cloudflare.yml"}
+        workflow = dict((p, c) for p, c, _e in seed["files"])[
+            ".github/workflows/deploy-cloudflare.yml"
+        ]
+        assert "cloudflare/pages-action" in workflow
+        assert "projectName: grocery" in workflow
+
+        # 2. the two secrets, with the values from the environment
+        assert calls["secrets"] == [
+            {"repo": "acme/grocery", "name": "CLOUDFLARE_API_TOKEN",
+             "value": "cf-token-do-not-log"},
+            {"repo": "acme/grocery", "name": "CLOUDFLARE_ACCOUNT_ID",
+             "value": "cf-account-id"},
+        ]
+        # ...never echoed
+        assert "cf-token-do-not-log" not in result.output
+
+        # 3. the config key actually landed and PARSES as the opt-in
+        from coord.config import load
+
+        repo = load(config_path).repo("grocery")
+        assert repo is not None
+        assert repo.uat_live_preview is True
+
+    def test_absent_credentials_still_land_steps_1_to_3_and_report_step_4(
+        self, config_path, monkeypatch
+    ):
+        """Steps 1-3 are the bulk of the value and need no Cloudflare access
+        at all — an operator without credentials must still get them."""
+        calls = _stub_preview_add(monkeypatch)
+        _without_cloudflare_creds(monkeypatch)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        assert len(calls["seed"]) == 1          # step 1 done
+        assert calls["secrets"] == []           # step 2 skipped, not attempted
+        from coord.config import load
+
+        assert load(config_path).repo("grocery").uat_live_preview is True  # step 3 done
+
+        # step 4 (and the skipped secrets) reported as residue, with runnable
+        # commands — not silently dropped.
+        assert "PREVIEW LANE — partially provisioned" in result.output
+        assert "gh secret set CLOUDFLARE_API_TOKEN --repo acme/grocery" in result.output
+        assert "wrangler pages project create grocery" in result.output
+
+    def test_an_existing_deploy_workflow_is_left_untouched_and_reported(
+        self, config_path, monkeypatch
+    ):
+        """Not a reconciler: this adds a lane to a repo being onboarded and
+        must never overwrite a hand-tuned deploy-cloudflare.yml."""
+        calls = _stub_preview_add(monkeypatch, workflow_exists=True)
+        _with_cloudflare_creds(monkeypatch)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert calls["exists"] == [{
+            "repo": "acme/grocery",
+            "path": ".github/workflows/deploy-cloudflare.yml",
+            "branch": "main",
+        }]
+        assert calls["seed"] == []              # nothing written over it
+        assert "left UNTOUCHED" in result.output
+        assert "already existed and was NOT" in result.output
+        # The rest of the lane still ran.
+        assert [s["name"] for s in calls["secrets"]] == [
+            "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+        ]
+
+    def test_an_unreadable_workflow_check_fails_safe_without_writing(
+        self, config_path, monkeypatch
+    ):
+        """"Could not tell" must never be read as "no file there" — not
+        writing is recoverable, clobbering a hand-tuned workflow is not."""
+        calls = _stub_preview_add(monkeypatch)
+        _with_cloudflare_creds(monkeypatch)
+
+        def _boom(repo, path, branch):
+            raise RuntimeError("gh: HTTP 403: rate limited")
+
+        monkeypatch.setattr(github_ops, "repo_file_exists", _boom)
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert calls["seed"] == []
+        assert "the workflow was NOT written" in result.output
+        assert "rate limited" in result.output
+
+    def test_a_completed_lane_says_so_instead_of_printing_empty_residue(
+        self, config_path, monkeypatch
+    ):
+        _stub_preview_add(monkeypatch)
+        _with_cloudflare_creds(monkeypatch)
+        monkeypatch.setattr(repo_cmd, "_run_wrangler_project_create", lambda plan: None)
+
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "preview lane complete for grocery" in result.output
+        assert "PREVIEW LANE — partially provisioned" not in result.output
+
+
+class TestPreviewLaneRefusals:
+    def test_a_template_with_no_lane_refuses_before_writing_anything(
+        self, config_path, monkeypatch
+    ):
+        calls = _stub_preview_add(monkeypatch)
+        before = config_path.read_text()
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "python",
+                "--with-preview", "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "no lane for --template 'python'" in result.output
+        assert config_path.read_text() == before
+        assert calls["seed"] == []
+        assert calls["secrets"] == []
+
+    def test_an_invalid_pages_project_name_refuses_before_writing_anything(
+        self, config_path, monkeypatch
+    ):
+        _stub_preview_add(monkeypatch)
+        before = config_path.read_text()
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--preview-project", "Grocery List",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "invalid Cloudflare Pages project name" in result.output
+        assert config_path.read_text() == before
+
+    def test_preview_options_without_with_preview_refuse_rather_than_no_op(
+        self, config_path, monkeypatch
+    ):
+        _stub_preview_add(monkeypatch)
+        result = CliRunner().invoke(
+            repo_add,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--preview-project", "grocery", "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "only mean anything with --with-preview" in result.output
+
+    def test_without_with_preview_no_uat_key_is_written(self, config_path, monkeypatch):
+        """The flag and the workflow that makes it true land together, or
+        neither does — a `uat_live_preview` with no lane IS the silent stall."""
+        _stub_preview_add(monkeypatch)
+        result = CliRunner().invoke(
+            repo_add,
+            ["grocery", "--github", "acme/grocery", "--config", str(config_path)],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        from coord.config import load
+
+        assert load(config_path).repo("grocery").uat_live_preview is False
+
+
+class TestPreviewEnvironmentNameIsAssertedNotGuessed:
+    """The whole reason the lane can be PROVISIONED rather than probed with a
+    throwaway PR: `cloudflare/pages-action` derives the Deployment environment
+    as `"<projectName> (Preview)"`, and projectName is a parameter we set. A
+    mismatch here is invisible at runtime — `get_pr_deployment_url` returns
+    None and never raises — so it is pinned end to end."""
+
+    def _project_name_from(self, workflow: str) -> str:
+        for line in workflow.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("projectName:"):
+                return stripped.split(":", 1)[1].strip()
+        raise AssertionError(f"no projectName in generated workflow:\n{workflow}")
+
+    def test_the_generated_workflows_project_name_resolves_through_the_real_lookup(
+        self,
+    ):
+        workflow = repo_cmd.render_preview_workflow(
+            ci_template="node", project_name="grocery",
+            build_directory="dist", production_branch="main",
+        )
+        project = self._project_name_from(workflow)
+
+        # Exactly the JSON GitHub returns for a repo whose PR was published by
+        # `cloudflare/pages-action` with this projectName — including a
+        # PRODUCTION deployment first in the list, which must not win.
+        deployments = [
+            {"id": 2, "environment": f"{project} (Production)"},
+            {"id": 1, "environment": github_ops.preview_environment_name(project)},
+        ]
+        statuses = {
+            2: [{"environment_url": "https://prod.example.pages.dev"}],
+            1: [{"environment_url": "https://ed9f21ad.grocery-3ew.pages.dev"}],
+        }
+
+        def _gh_json(*args, default=None, caller=""):
+            endpoint = args[1]
+            if "/deployments?" in endpoint:
+                return deployments
+            return statuses[int(endpoint.rsplit("/", 2)[1])]
+
+        with patch("coord.github_ops._gh_json", side_effect=_gh_json):
+            url = github_ops.get_pr_deployment_url("acme/grocery", "issue-1-x")
+        assert url == "https://ed9f21ad.grocery-3ew.pages.dev"
+
+    def test_a_project_name_the_lookup_could_not_match_is_refused_at_provision_time(
+        self, monkeypatch
+    ):
+        """If the generator and the matcher ever drift, provisioning must
+        refuse — not ship a lane whose URL silently never resolves."""
+        monkeypatch.setattr(github_ops, "is_preview_environment", lambda env: False)
+        with pytest.raises(Exception, match="would NOT match"):
+            repo_cmd._assert_preview_environment_resolvable("grocery")
+
+
+class TestRepoCreateWithPreview:
+    def test_the_preview_workflow_rides_the_same_seed_commit(
+        self, config_path, monkeypatch
+    ):
+        calls = _stub_create(monkeypatch)
+        monkeypatch.setattr(github_ops, "set_repo_secret", lambda *a, **k: None)
+        monkeypatch.setattr(
+            repo_cmd, "_run_wrangler_project_create", lambda plan: None
+        )
+        _with_cloudflare_creds(monkeypatch)
+
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "node",
+                "--with-preview", "--config", str(config_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        # ONE commit, carrying the preview workflow alongside the rest of the
+        # seed — the repo is seconds old, so there is nothing to overwrite and
+        # no reason for a second round trip.
+        assert len(calls["seed"]) == 1
+        paths = {p for p, _c, _e in calls["seed"][0]["files"]}
+        assert ".github/workflows/deploy-cloudflare.yml" in paths
+        assert ".github/workflows/ci.yml" in paths
+
+        from coord.config import load
+
+        assert load(config_path).repo("grocery").uat_live_preview is True
+
+    def test_a_template_with_no_lane_refuses_before_creating_the_repo(
+        self, config_path, monkeypatch
+    ):
+        calls = _stub_create(monkeypatch)
+        result = CliRunner().invoke(
+            repo_create,
+            [
+                "grocery", "--github", "acme/grocery", "--template", "generic",
+                "--with-preview", "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert calls["create_repo"] == []
+        assert calls["seed"] == []
+
+
+class TestSetRepoSecretKeepsTheValueOffArgv:
+    """`gh secret set NAME --body <value>` would put the Cloudflare API token
+    in this host's process table. The value goes over stdin instead — pinned,
+    because the failure is invisible from the outside."""
+
+    def test_the_value_goes_over_stdin_and_never_into_argv(self):
+        with patch("coord.github_ops.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            github_ops.set_repo_secret("acme/grocery", "CLOUDFLARE_API_TOKEN", "s3cret")
+        argv = run.call_args.args[0]
+        assert argv == [
+            "gh", "secret", "set", "CLOUDFLARE_API_TOKEN", "--repo", "acme/grocery",
+        ]
+        assert "s3cret" not in argv
+        assert run.call_args.kwargs["input"] == "s3cret"
+
+    def test_a_failure_raises_without_echoing_the_value(self):
+        with patch("coord.github_ops.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, "", "HTTP 403: forbidden")
+            with pytest.raises(RuntimeError) as exc:
+                github_ops.set_repo_secret("acme/grocery", "CLOUDFLARE_API_TOKEN", "s3cret")
+        assert "forbidden" in str(exc.value)
+        assert "s3cret" not in str(exc.value)
+
+
+class TestDoctorReadsTheProvisionedLaneAsClean:
+    """#3073's preview check, against the two repo shapes `--with-preview`
+    produces and fails to produce. Lives here rather than in the doctor's own
+    file because the thing under test is whether THIS command's output
+    satisfies that check — a `uat_live_preview: true` with no workflow behind
+    it is precisely the silent stall (`get_pr_deployment_url` -> None, no
+    error anywhere, timeline stuck at `in-progress`)."""
+
+    def _facts(self, *, workflows, files):
+        from coord import repo_onboard
+
+        class _Ops:
+            @staticmethod
+            def get_repo_default_branch(slug):
+                return "main"
+
+            @staticmethod
+            def list_repo_labels(slug):
+                return ["coord"]
+
+            @staticmethod
+            def list_repo_workflows(slug):
+                return workflows
+
+            @staticmethod
+            def get_repo_file(slug, path, branch):
+                return files[path]
+
+            @staticmethod
+            def repo_file_exists(slug, path, branch):
+                return path in files
+
+        gh = repo_onboard.gather_github_facts("acme/grocery", ops=_Ops())
+        return repo_onboard.RepoFacts(
+            name="grocery", configured=True, github="acme/grocery",
+            uat_live_preview=True,
+            portal=repo_onboard.PortalFacts(linked=True),
+            gh=gh,
+        )
+
+    def _generated_workflow(self):
+        return repo_cmd.render_preview_workflow(
+            ci_template="node", project_name="grocery",
+            build_directory="dist", production_branch="main",
+        )
+
+    def test_a_repo_provisioned_by_with_preview_reads_clean(self):
+        from coord import repo_onboard
+
+        facts = self._facts(
+            workflows=[
+                {"name": "CI", "path": ".github/workflows/ci.yml"},
+                {"name": "Deploy", "path": ".github/workflows/deploy-cloudflare.yml"},
+            ],
+            files={
+                ".github/workflows/ci.yml": "name: CI\non:\n  pull_request:\njobs: {}\n",
+                ".github/workflows/deploy-cloudflare.yml": self._generated_workflow(),
+            },
+        )
+        assert facts.gh.preview_workflows == ["Deploy"]
+        assert repo_onboard._evaluate_uat_portal_readiness(facts) == []
+
+    def test_uat_live_preview_with_no_lane_crits_instead_of_stalling_silently(self):
+        from coord import repo_onboard
+
+        facts = self._facts(
+            workflows=[{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            files={".github/workflows/ci.yml": "name: CI\non:\n  pull_request:\njobs: {}\n"},
+        )
+        findings = repo_onboard._evaluate_uat_portal_readiness(facts)
+        assert [f.check for f in findings] == ["contents.uat_preview_lane_missing"]
+        assert findings[0].severity == repo_onboard.CRIT
+        assert "--with-preview" in (findings[0].fix or "")
+
+    def test_a_push_only_pages_action_is_not_a_preview_lane(self):
+        """A `pages-action` behind a push-only trigger publishes production,
+        never a preview — counting it would call the stall green."""
+        from coord import repo_onboard
+
+        push_only = self._generated_workflow().replace("  pull_request:\n", "")
+        facts = self._facts(
+            workflows=[{"name": "Deploy", "path": ".github/workflows/deploy.yml"}],
+            files={".github/workflows/deploy.yml": push_only},
+        )
+        assert facts.gh.preview_workflows == []
+        assert [f.check for f in repo_onboard._evaluate_uat_portal_readiness(facts)] == [
+            "contents.uat_preview_lane_missing"
+        ]
+
+    def test_a_comment_naming_pages_action_is_not_a_lane(self):
+        """Parsed, not grepped — this repo's own generated template carries a
+        header comment naming `cloudflare/pages-action`."""
+        from coord import repo_onboard
+
+        assert repo_onboard.workflow_publishes_preview_deployment(
+            "# uses cloudflare/pages-action\n"
+            "name: CI\non:\n  pull_request:\njobs:\n  a:\n    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+        ) is False
+
+    def test_unreadable_workflows_are_unknown_not_a_pass_and_not_a_crit(self):
+        from coord import repo_onboard
+
+        class _Ops:
+            @staticmethod
+            def get_repo_default_branch(slug):
+                return "main"
+
+            @staticmethod
+            def list_repo_labels(slug):
+                return []
+
+            @staticmethod
+            def list_repo_workflows(slug):
+                return [{"name": "Deploy", "path": ".github/workflows/deploy.yml"}]
+
+            @staticmethod
+            def get_repo_file(slug, path, branch):
+                raise RuntimeError("gh: HTTP 403")
+
+            @staticmethod
+            def repo_file_exists(slug, path, branch):
+                return False
+
+        gh = repo_onboard.gather_github_facts("acme/grocery", ops=_Ops())
+        assert gh.preview_workflows is None
+        facts = repo_onboard.RepoFacts(
+            name="grocery", configured=True, github="acme/grocery",
+            uat_live_preview=True,
+            portal=repo_onboard.PortalFacts(linked=True), gh=gh,
+        )
+        findings = repo_onboard._evaluate_uat_portal_readiness(facts)
+        assert [f.check for f in findings] == ["contents.uat_preview_lane_unknown"]
+        assert findings[0].severity == repo_onboard.UNKNOWN

@@ -178,6 +178,15 @@ class GithubFacts:
     # nothing has actually been authored against it yet.
     acceptance_dir_present: bool | None = None
     acceptance_dir_error: str | None = None
+    # #3092: names of workflows that actually publish a per-PR preview
+    # deployment (`cloudflare/pages-action` et al). An EMPTY list is a proven
+    # "this repo has no preview lane" — which, on a repo carrying
+    # `uat_live_preview: true`, is the silent stall `get_pr_deployment_url`
+    # can never report (it returns None and never raises). `None` means the
+    # workflow sweep couldn't answer; see `workflow_error`, which this shares
+    # — nothing extra is fetched for it, it is a fold of workflow content the
+    # `pr_triggered_workflows` probe already reads.
+    preview_workflows: list[str] | None = None
 
 
 @dataclass
@@ -410,6 +419,60 @@ def workflow_triggers_on_pull_request(content: str) -> bool:
     return False
 
 
+# #3092: GitHub Actions `uses:` prefixes for actions that publish a per-PR
+# preview AND create the GitHub Deployment `coord.github_ops.
+# get_pr_deployment_url` reads the URL back out of. Prefix-matched so a
+# version pin (`@v1`, `@<sha>`) still counts.
+#
+# Deliberately a small allow-list of actions this fleet has actually verified
+# creates a Deployment, not a fuzzy "mentions cloudflare" match: the finding
+# this feeds says "your preview lane works", and a workflow that deploys
+# without creating a Deployment (e.g. a bare `wrangler pages deploy` step)
+# produces exactly the silent None `get_pr_deployment_url` cannot report.
+# Calling that green would be worse than saying nothing.
+PREVIEW_DEPLOY_ACTIONS: tuple[str, ...] = (
+    "cloudflare/pages-action",
+    "cloudflare/wrangler-action",
+)
+
+
+def workflow_publishes_preview_deployment(content: str) -> bool:
+    """True when a GitHub Actions workflow's YAML *content* runs an action
+    that publishes a per-PR preview as a GitHub Deployment (#3092).
+
+    Pure. Parses rather than greps, for the same reason
+    :func:`workflow_triggers_on_pull_request` does: the action name appears in
+    comments and in `if:` expressions of workflows that do no such thing, and
+    this repo's own seeded template has a header comment naming it.
+    Unparseable content returns ``False``; the caller distinguishes that from
+    "could not read" by whether it got content at all.
+    """
+    import yaml  # noqa: PLC0415 — keep module import-light
+
+    try:
+        doc = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return False
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            uses = step.get("uses")
+            if isinstance(uses, str) and uses.startswith(PREVIEW_DEPLOY_ACTIONS):
+                return True
+    return False
+
+
 # #3037: matches a root `.gitignore` line that ignores `graphify-out/` —
 # `graphify-out`, `graphify-out/`, a root-anchored `/graphify-out/`, or a
 # trailing `*`/`**` glob, all of which git treats as "ignore the directory".
@@ -473,6 +536,7 @@ def gather_github_facts(
         workflows = ops.list_repo_workflows(slug)
         facts.workflow_count = len(workflows)
         pr_triggered: list[str] = []
+        preview: list[str] = []
         unreadable: list[str] = []
         for wf in workflows:
             path = wf.get("path") or ""
@@ -486,7 +550,17 @@ def gather_github_facts(
                 continue
             if workflow_triggers_on_pull_request(content):
                 pr_triggered.append(name)
+                # #3092: a preview lane is only a lane if it runs on PRs —
+                # a `pages-action` step behind a push-only trigger publishes
+                # production, never a preview, so it must not count here.
+                if workflow_publishes_preview_deployment(content):
+                    preview.append(name)
         facts.pr_triggered_workflows = pr_triggered
+        # Only a PROVEN answer: if any workflow file was unreadable, an empty
+        # list here would be indistinguishable from "there is no lane", which
+        # is exactly the finding it feeds. Leave it None instead (#1525).
+        if not unreadable:
+            facts.preview_workflows = preview
         if unreadable and not pr_triggered:
             # Never let an unreadable workflow file masquerade as a proven
             # "nothing triggers on pull_request" CRIT.
@@ -1389,24 +1463,79 @@ def _evaluate_uat_portal_readiness(facts: RepoFacts) -> list[Finding]:
             ),
         )]
 
-    # #2948: a CONFIGURED uat_preview/uat_live_preview is not the same as a
+    # #3092: `uat_live_preview: true` is the LIVE GitHub-Deployment lookup, so
+    # unlike a `uat_preview` URL template it has one provable prerequisite: a
+    # workflow that actually publishes a per-PR preview Deployment. That is
+    # what `coord repo add --with-preview` provisions, and its absence is the
+    # exact silent stall this layer exists to surface —
+    # `get_pr_deployment_url` returns None and never raises, so the customer
+    # timeline just sits at `in-progress` with no error anywhere.
+    if facts.uat_live_preview:
+        previews = facts.gh.preview_workflows
+        if previews is None:
+            # Couldn't read the repo's workflows. Not a pass and not a
+            # failure — #1525's rule.
+            return [Finding(
+                layer="contents", check="contents.uat_preview_lane_unknown",
+                severity=UNKNOWN,
+                summary=(
+                    f"{facts.name} has `uat_live_preview: true`, but this "
+                    "repo's workflows could not be read, so whether a per-PR "
+                    "preview deployment is actually published is unverified"
+                    + (f" — {facts.gh.workflow_error}" if facts.gh.workflow_error else "")
+                ),
+            )]
+        if not previews:
+            return [Finding(
+                layer="contents", check="contents.uat_preview_lane_missing",
+                severity=CRIT,
+                summary=(
+                    f"{facts.name} has `uat_live_preview: true` but NO "
+                    "pull_request-triggered workflow publishes a preview "
+                    "deployment (none uses "
+                    f"{' / '.join(PREVIEW_DEPLOY_ACTIONS)}). The UAT gate and "
+                    "the portal's `quality-check` both read that Deployment, "
+                    "and `get_pr_deployment_url` returns None rather than "
+                    "raising when there is none — so every PR produces no "
+                    "preview AND no error, and the customer timeline stalls "
+                    "at `in-progress` silently"
+                ),
+                fix=(
+                    "provision the lane: `coord repo add --template node "
+                    f"--with-preview` (#3092) writes "
+                    ".github/workflows/deploy-cloudflare.yml, sets the two "
+                    "Cloudflare secrets and creates the Pages project. Run it "
+                    "with --dry-run first to see the exact workflow and "
+                    "commands"
+                ),
+            )]
+        # A lane exists and is PR-triggered, and the environment name it
+        # derives is asserted at provision time against the same predicate
+        # `get_pr_deployment_url` matches on. Nothing left to warn about.
+        return []
+
+    # #2948: a CONFIGURED `uat_preview` URL TEMPLATE is not the same as a
     # WORKING one — the old `{pr_branch_slug}` template was confirmed live
     # to never resolve a real Cloudflare Pages preview, and nothing today
     # verifies the rendered URL actually resolves before the gate trusts it.
     # Reporting green on presence alone would be exactly the false confidence
-    # #2948 exists to fix — this WARNs unconditionally until that issue
-    # lands, regardless of which of the two fields is set.
+    # #2948 exists to fix. This no longer fires for `uat_live_preview` (#3092,
+    # above), which is checked against a real, provable prerequisite instead
+    # of being warned about on principle.
     return [Finding(
         layer="contents", check="contents.uat_preview_unverified", severity=WARN,
         summary=(
-            f"{facts.name} has uat_preview/uat_live_preview configured, but "
+            f"{facts.name} has a `uat_preview` URL template configured, but "
             "the rendered preview URL is not verified to actually resolve "
             "(claude-coordinator#2948) — a configured value is not the same "
             "as a working one; do not read this as green"
         ),
         fix=(
-            "none available yet — #2948 is the URL-resolution work; until it "
-            "lands, treat this repo's UAT verdicts as advisory, not proven"
+            "prefer `uat_live_preview: true`, which reads the real GitHub "
+            "Deployment instead of constructing a URL — `coord repo add "
+            "--with-preview` (#3092) provisions the lane that makes it "
+            "resolve. Until then, treat this repo's UAT verdicts as "
+            "advisory, not proven"
         ),
     )]
 

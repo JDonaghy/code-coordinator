@@ -1,0 +1,51 @@
+# Per-PR preview deploy — seeded by `coord repo add --with-preview` (#3092).
+#
+# This is the lane the UAT gate and the customer portal's `quality-check`
+# status both depend on. Without it `coord.github_ops.get_pr_deployment_url`
+# returns None on every PR and never raises, so the customer timeline stalls
+# at `in-progress` with no error anywhere — the silent failure this file
+# exists to prevent (docs/CUSTOMER_FACING_APPS.md §1).
+#
+# Two things here are load-bearing and must not be "cleaned up":
+#
+#   * `permissions: deployments: write` — without it `cloudflare/pages-action`
+#     publishes to Cloudflare but creates NO GitHub Deployment, which is the
+#     only place coord can read the per-deployment hash URL from (Pages
+#     preview URLs are not derivable from the branch name and there is no
+#     branch-alias fallback).
+#   * `projectName` — `cloudflare/pages-action` derives the Deployment's
+#     environment name as "<projectName> (Preview)", and that exact string is
+#     what `get_pr_deployment_url` matches on. Renaming the Pages project
+#     without editing this line silently unresolves every preview URL.
+#
+# The build below is deliberately the SAME build CI runs, in one job, so the
+# URL a customer signs off on is the artifact that was tested rather than a
+# separate ad-hoc build (coord-portal#107).
+name: Deploy (Cloudflare Pages)
+
+on:
+  push:
+    branches: [__COORD_PRODUCTION_BRANCH__]
+  pull_request:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm run build
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: __COORD_PROJECT_NAME__
+          directory: __COORD_BUILD_DIRECTORY__
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
