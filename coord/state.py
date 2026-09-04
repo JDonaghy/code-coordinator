@@ -2385,6 +2385,54 @@ def reset_work_test_state(repo_name: str, issue_number: int) -> int:
     return cur.rowcount
 
 
+def promote_advisory_with_commits(assignment_id: str) -> bool:
+    """#3099: undo the #1357 false-positive ``advisory`` downgrade for one row.
+
+    ``coord drive --accept-advisory`` already treats an ADVISORY row whose
+    branch demonstrably carries commits as a good ``done`` that got
+    mis-flagged (``coord.drive._decide_advisory``) — but the driver itself
+    never dispatches the Test/Review/Merge stages (``coord.smoke.
+    dispatch_pending_smoke`` / ``coord.review.dispatch_pending_reviews`` /
+    ``coord.merge_queue`` do), and every one of those gates on
+    ``status == 'done'`` alone. Left at ``status='advisory'`` forever, the
+    row livelocks: the driver prints "proceeding per --accept-advisory"
+    every poll and nothing downstream ever moves.
+
+    Flips ``status`` ``'advisory'`` → ``'done'`` and, if ``review_state``
+    was stamped ``'advisory'`` (``coord.reconcile``'s own #448 downgrade
+    write, made specifically to keep the review-dispatch loop from picking
+    up a genuinely empty branch), resets it to ``NULL`` — the same "make it
+    re-eligible" value :func:`reset_work_review_state` already uses —  so
+    ``dispatch_pending_reviews``'s ``review_state in (None, 'pending')``
+    gate re-admits the row once a Test verdict lands.
+
+    Scoped to a ``WHERE status='advisory'`` guard so calling this twice (or
+    racing another writer that already resolved the row a different way,
+    e.g. a human running ``coord retry``) is a no-op the second time rather
+    than clobbering a status this call didn't itself decide. Returns
+    whether a row was actually updated — callers use this to decide whether
+    their in-memory mirror of the row also needs the same two fields
+    updated.
+
+    Deliberately a plain local write, not routed through the daemon HTTP
+    seam like :func:`record_test_verdict` — mirrors
+    :func:`reset_work_review_state`, whose only callers (``coord diagnose``
+    here; ``coord.smoke.dispatch_pending_smoke`` for this function) already
+    run on the coordinator host with direct DB access, never from a thin
+    client.
+    """
+    conn = get_connection()
+    cur = sql.execute(
+        conn,
+        "UPDATE assignments SET status='done', review_state = CASE "
+        "WHEN review_state='advisory' THEN NULL ELSE review_state END "
+        "WHERE assignment_id=? AND status='advisory'",
+        (assignment_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def clear_issue_context_by_source(
     repo_name: str, issue_number: int, source: str
 ) -> int:
