@@ -6774,6 +6774,15 @@ def build_app(
         # #2751: upsert a milestone's/issue's portal submission_id link on
         # the shared DB for a thin client's `coord portal link`. Mirrors
         # post_gate_a_approval above — same seam, same error posture.
+        #
+        # #3110: `_save_portal_link_local` now also (a) refuses a write that
+        # would fan a submission_id out to a second target unless `force` is
+        # set, and (b) audits every write at the business tier — both landed
+        # here, the one choke point every write funnels through (a same-host
+        # CLI call reaches `_save_portal_link_local` directly; this handler
+        # is the other path in, including a hand-run `curl POST
+        # /portal-link` — the leading suspect for #3110's bogus link, and
+        # exactly the caller this endpoint must audit).
         from coord import state  # noqa: PLC0415
 
         body = await _read_json(request)
@@ -6784,8 +6793,9 @@ def build_app(
             return JSONResponse(
                 {"error": "portal-link needs a 'record' object"}, status_code=400
             )
+        force = bool(body.get("force") or False)
         try:
-            state._save_portal_link_local(record)
+            state._save_portal_link_local(record, force=force)
         except (TypeError, KeyError, ValueError) as e:
             return JSONResponse({"error": f"bad portal-link: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
@@ -6794,6 +6804,51 @@ def build_app(
                 status_code=503,
             )
         return JSONResponse({"ok": True})
+
+    async def delete_portal_link(request: Request) -> Response:
+        # #3110: DELETE counterpart to post_portal_link above — the daemon
+        # side of `coord portal unlink`, so clearing a bad/stale link (the
+        # incident: an unrelated product epic's link mailed a real customer
+        # 161 "shipped" emails) is a supported operation instead of a
+        # hand-run sqlite edit on the daemon host. Not thin-client-refused,
+        # mirroring get_portal_link/post_portal_link above (#2751) — an
+        # operator clearing an active flood needs this to work from
+        # wherever they are, not just the daemon host.
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_ms = request.query_params.get("milestone_number")
+        raw_issue = request.query_params.get("issue_number")
+        actor = request.query_params.get("actor") or ""
+        if not repo_name or (raw_ms is None) == (raw_issue is None):
+            return JSONResponse(
+                {
+                    "error": "repo_name and exactly one of milestone_number/"
+                    "issue_number are required"
+                },
+                status_code=400,
+            )
+        try:
+            milestone_number = int(raw_ms) if raw_ms is not None else None
+            issue_number = int(raw_issue) if raw_issue is not None else None
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "milestone_number/issue_number must be an int"},
+                status_code=400,
+            )
+        try:
+            deleted = state._delete_portal_link_local(
+                repo_name=repo_name,
+                milestone_number=milestone_number,
+                issue_number=issue_number,
+                actor=actor,
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "portal-link delete failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"deleted": deleted})
 
     async def post_portal_decision(request: Request) -> Response:
         # #2749 (IL-3): the running-context ledger's one agent-writable
@@ -10616,6 +10671,7 @@ def build_app(
         Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
         Route("/portal-link", get_portal_link, methods=["GET"]),
         Route("/portal-link", post_portal_link, methods=["POST"]),
+        Route("/portal-link", delete_portal_link, methods=["DELETE"]),
         Route(
             "/portal-link-by-submission",
             get_portal_link_by_submission,

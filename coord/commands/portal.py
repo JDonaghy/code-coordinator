@@ -47,6 +47,16 @@ commands above, ``link`` now routes its read/write through the daemon
 The remaining agent-reachable write, ``publish-mocks``, is left on the
 refuse-outright side for now — same follow-up Option A above.
 
+**``unlink`` (#3110) is ``link``'s DELETE counterpart**, same routing (``DELETE
+/portal-link`` via ``coord.state.delete_portal_link``) and the same reason:
+clearing a bad link that is actively mailing a customer cannot wait for
+someone to ssh to the daemon host and hand-edit ``board_meta`` with sqlite —
+the remedy the #3110 incident actually needed. ``link`` itself now also
+refuses a write that would let one ``submission_id`` fan out to a second
+target (unless ``--force``), and every ``link``/``unlink`` write is audited
+at the business tier regardless of caller — see
+``coord.state._save_portal_link_local``/``_delete_portal_link_local``.
+
 **``ledger`` and ``decision`` are the next two (#2749, IL-3, epic #2746).**
 The running-context ledger's whole point is that a fresh session on ANY
 machine can be briefed without a prior session's transcript, so ``ledger``
@@ -380,12 +390,25 @@ def portal_push(config_path, submission_id: str, revision: int, status: str) -> 
         "--issue N SUBMISSION_ID`."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help=(
+        "#3110: SUBMISSION_ID may map to at most one target — the write is "
+        "refused when it is already linked to a DIFFERENT milestone/issue "
+        "(the fan-in condition that made #2588's status fold alternate and "
+        "mailed a real customer 161 times). Pass --force to move it here "
+        "instead; the other target's claim is replaced, not added to."
+    ),
+)
 def portal_link(
     config_path,
     repo: str,
     target: str | None,
     submission_id: str | None,
     issue_number: int | None,
+    force: bool,
 ) -> None:
     """Record, or read, one milestone's (or, with --issue, one issue's)
     portal submission_id link (#2507, #2665).
@@ -420,9 +443,21 @@ def portal_link(
     and its system prompt treats this exact command as a mandatory,
     non-optional step. See ``coord/state.py``'s ``portal_links`` section for
     why the rest of the bridge's state stays local-only for now.
+
+    **#3110: refuses a fan-in write, and every write is audited.** A
+    SUBMISSION_ID that is already linked to a DIFFERENT milestone/issue is
+    refused unless ``--force`` is passed — two targets carrying the same
+    submission_id is exactly what made #2588's status fold alternate every
+    tick and mailed a real customer 161 duplicate "shipped" emails. The
+    write is now audited at the business tier regardless of caller (CLI,
+    routed thin client, or a raw HTTP call) — see
+    ``coord.state._save_portal_link_local``. To clear a bad link, use
+    ``coord portal unlink`` below rather than hand-editing
+    ``board_meta.portal_links``.
     """
+    import httpx  # noqa: PLC0415
+
     from coord import portal_store  # noqa: PLC0415
-    from coord.audit import record_audit  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_cfg = cfg.repo(repo)
@@ -481,42 +516,122 @@ def portal_link(
         )
         return
 
-    link = (
-        portal_store.link_milestone(
-            repo_name=repo_cfg.name,
-            milestone_number=milestone_number,
-            submission_id=submission_id,
-            actor=_actor(),
-        )
-        if milestone_number is not None
-        else portal_store.link_issue(
-            repo_name=repo_cfg.name,
-            issue_number=issue_number,
-            submission_id=submission_id,
-            actor=_actor(),
-        )
-    )
-    record_audit(
-        tier="business",
-        category="portal",
-        event_type="portal_link",
-        actor=link.actor,
-        summary=(
-            f"linked {repo_cfg.name} {target_desc} to portal "
-            f"submission {submission_id}"
-        ),
-        repo=repo_cfg.name,
-        details={
-            "milestone_number": milestone_number,
-            "issue_number": issue_number,
-            "submission_id": submission_id,
-        },
-    )
+    try:
+        if milestone_number is not None:
+            portal_store.link_milestone(
+                repo_name=repo_cfg.name,
+                milestone_number=milestone_number,
+                submission_id=submission_id,
+                actor=_actor(),
+                force=force,
+            )
+        else:
+            portal_store.link_issue(
+                repo_name=repo_cfg.name,
+                issue_number=issue_number,
+                submission_id=submission_id,
+                actor=_actor(),
+                force=force,
+            )
+    except (ValueError, httpx.HTTPError) as exc:
+        # #3110: ValueError is the local fan-in-guard refusal
+        # (`coord.state._save_portal_link_local`); HTTPError is the same
+        # refusal surfacing as a 400 through the daemon when this runs on a
+        # thin client, or a routing failure (connection refused, timeout).
+        # Either way this is a clean, named CLI error, not a traceback.
+        click.secho(f"error: {exc}", fg="red")
+        raise SystemExit(1) from exc
     click.secho(
         f"linked: {repo_cfg.name} {target_desc} -> "
         f"submission_id={submission_id}",
         fg="green",
     )
+
+
+@portal_group.command("unlink")
+@_CONFIG_OPTION
+@click.argument("repo")
+@click.argument("target", metavar="MILESTONE_NUMBER", required=False, default=None)
+@click.option(
+    "--issue", "issue_number", type=int, default=None,
+    help=(
+        "Unlink REPO's single ISSUE_NUMBER instead of a milestone (#2665). "
+        "Mutually exclusive with MILESTONE_NUMBER."
+    ),
+)
+def portal_unlink(
+    config_path, repo: str, target: str | None, issue_number: int | None
+) -> None:
+    """Remove one milestone's (or, with --issue, one issue's) portal
+    submission_id link (#3110).
+
+    The supported way to clear a bad or stale link. Before this command
+    existed, clearing a link that was actively mailing a customer required
+    hand-editing ``board_meta.portal_links`` with sqlite on the daemon host
+    — the remedy #3110's incident used, and explicitly not an acceptable one
+    for a customer-facing flood. Exits 0 and reports success when a link was
+    removed, exits 1 with "not linked" when there was nothing to remove.
+
+    **Not thin-client-refused**, mirroring ``link`` above (#2751) — routes
+    through the daemon (``DELETE /portal-link``,
+    ``coord.state.delete_portal_link``) so an operator can clear an active
+    flood from wherever they are, not just the daemon host. Unlike ``link``,
+    this has no read mode: pass MILESTONE_NUMBER or --issue N to remove that
+    target's link, full stop.
+    """
+    import httpx  # noqa: PLC0415
+
+    from coord import portal_store  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.secho(f"error: unknown repo {repo!r}", fg="red")
+        raise SystemExit(2)
+
+    milestone_number: int | None = None
+    if issue_number is not None:
+        if target is not None:
+            click.secho(
+                "error: pass MILESTONE_NUMBER or --issue, not both", fg="red"
+            )
+            raise SystemExit(2)
+        target_desc = f"issue #{issue_number}"
+    elif target is not None:
+        try:
+            milestone_number = int(target)
+        except ValueError:
+            click.secho(
+                f"error: MILESTONE_NUMBER must be an integer, got {target!r} "
+                "(use --issue N to unlink a single issue instead)",
+                fg="red",
+            )
+            raise SystemExit(2)
+        target_desc = f"ms-{milestone_number}"
+    else:
+        click.secho("error: pass MILESTONE_NUMBER or --issue N", fg="red")
+        raise SystemExit(2)
+
+    try:
+        deleted = (
+            portal_store.unlink_milestone(
+                repo_name=repo_cfg.name,
+                milestone_number=milestone_number,
+                actor=_actor(),
+            )
+            if milestone_number is not None
+            else portal_store.unlink_issue(
+                repo_name=repo_cfg.name, issue_number=issue_number, actor=_actor()
+            )
+        )
+    except httpx.HTTPError as exc:
+        click.secho(f"error: could not reach the daemon: {exc}", fg="red")
+        raise SystemExit(1) from exc
+
+    if not deleted:
+        click.echo(f"{repo_cfg.name} {target_desc}: not linked — nothing to unlink")
+        raise SystemExit(1)
+    click.secho(f"unlinked: {repo_cfg.name} {target_desc}", fg="green")
 
 
 # ── #2533 (ms-67 PB-3): pull an approved submission into a decomposition chat ──

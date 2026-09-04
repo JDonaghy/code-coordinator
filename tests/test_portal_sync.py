@@ -1905,11 +1905,53 @@ class TestOscillationBetweenTwoLinks:
 
     @staticmethod
     def _both_links_on_one_submission():
-        portal_store.link_milestone(
-            repo_name="acme-portal", milestone_number=5, submission_id=SUB
-        )
-        portal_store.link_issue(
-            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        """Construct the pathological "two live links, one submission_id"
+        state this whole class exercises #3096's arbitration backstop over.
+
+        #3110 made `coord.state._save_portal_link_local` refuse a normal
+        `link_milestone`/`link_issue` write that would create exactly this
+        shape — its own escape hatch (`force=True`) deliberately REPLACES
+        the other target's claim rather than leaving both alive, since
+        leaving both alive is the flood bug itself. So this can no longer be
+        reached through the public write path at all, which is the right
+        outcome going forward — but the arbitration this class tests is a
+        BACKSTOP for data that predates the guard, or slipped past it some
+        other way (a stale replica, a hand-edited board_meta row), and that
+        backstop still needs a way to be exercised. Write both records
+        directly to `board_meta`, bypassing the guard on purpose.
+        """
+        import json
+
+        from coord import sql
+        from coord.db import get_connection
+
+        conn = get_connection()
+        links = [
+            {
+                "repo_name": "acme-portal",
+                "milestone_number": 5,
+                "issue_number": None,
+                "submission_id": SUB,
+                "linked_at": 0.0,
+                "actor": "",
+                "schema": 1,
+            },
+            {
+                "repo_name": "acme-portal",
+                "milestone_number": None,
+                "issue_number": 77,
+                "submission_id": SUB,
+                "linked_at": 0.0,
+                "actor": "",
+                "schema": 1,
+            },
+        ]
+        sql.upsert(
+            conn,
+            "board_meta",
+            ["key", "value"],
+            ("portal_links", json.dumps(links)),
+            conflict_columns=["key"],
         )
 
     @staticmethod

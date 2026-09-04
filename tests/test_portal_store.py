@@ -283,6 +283,258 @@ class TestLinkIssue:
         )
 
 
+class TestFanInGuard3110:
+    """#3110: a real customer was mailed 161 duplicate "shipped" emails
+    because two targets (a genuine milestone link and a bogus one against
+    coord's own product epic) both carried the same submission_id. A write
+    that would create a second target for a submission_id already claimed
+    elsewhere must be refused unless the caller explicitly forces it — and
+    forcing REPLACES the other target's claim rather than adding to it, so
+    the escape hatch can never itself recreate the fan-in condition."""
+
+    def test_second_target_for_the_same_submission_is_refused(self, coord_db) -> None:
+        from coord.portal_store import link_issue, link_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        with pytest.raises(ValueError, match="already linked"):
+            link_issue(repo_name="acme-portal", issue_number=77, submission_id="sub_x")
+
+    def test_refusal_names_the_existing_target(self, coord_db) -> None:
+        from coord.portal_store import link_issue, link_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        with pytest.raises(ValueError, match=r"acme-portal ms-5"):
+            link_issue(repo_name="acme-portal", issue_number=77, submission_id="sub_x")
+
+    def test_force_moves_the_link_and_drops_the_other_claim(self, coord_db) -> None:
+        from coord.portal_store import (
+            get_issue_link,
+            get_milestone_link,
+            link_issue,
+            link_milestone,
+        )
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id="sub_x", force=True
+        )
+
+        assert get_issue_link(repo_name="acme-portal", issue_number=77).submission_id == "sub_x"
+        # #3110: force REPLACES — leaving the old link alive would just
+        # reproduce the exact fan-in condition this guard exists to prevent.
+        assert get_milestone_link(repo_name="acme-portal", milestone_number=5) is None
+
+    def test_relinking_the_same_target_is_not_a_conflict(self, coord_db) -> None:
+        """Overwriting a target's OWN link with a fresh submission_id is
+        ordinary relinking (pre-#3110 behavior), not a fan-in conflict —
+        there is no "other" target here."""
+        from coord.portal_store import get_milestone_link, link_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_old")
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_new")
+
+        assert (
+            get_milestone_link(repo_name="acme-portal", milestone_number=5).submission_id
+            == "sub_new"
+        )
+
+    def test_daemon_endpoint_refuses_without_force_and_accepts_with_it(
+        self, tmp_path
+    ) -> None:
+        """The DELETE/POST `/portal-link` daemon route (`coord.serve_app.
+        post_portal_link`) is the other write path a fan-in write can arrive
+        through — a hand-run `curl POST /portal-link` was the leading
+        suspect for #3110's actual incident. It must apply the same guard."""
+        import sqlite3
+
+        from starlette.testclient import TestClient
+
+        from coord import db
+        from coord.config import load as load_config
+        from coord.dao import SqliteStore
+        from coord.db import _ensure_schema
+        from coord.serve_app import build_app
+
+        cfg_path = tmp_path / "coordinator-portal-fanin.yml"
+        cfg_path.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n\n"
+            "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+            "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+        )
+        db_path = tmp_path / "board.db"
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        conn.commit()
+        db.override_connection(conn)
+
+        ms_record = {
+            "repo_name": "api",
+            "milestone_number": 1,
+            "issue_number": None,
+            "submission_id": "sub-hot",
+            "linked_at": 0.0,
+            "actor": "",
+            "schema": 1,
+        }
+        issue_record = {
+            "repo_name": "api",
+            "milestone_number": None,
+            "issue_number": 99,
+            "submission_id": "sub-hot",
+            "linked_at": 0.0,
+            "actor": "",
+            "schema": 1,
+        }
+        app = build_app(SqliteStore(db_path), load_config(cfg_path))
+        with TestClient(app) as cli:
+            first = cli.post("/portal-link", json={"record": ms_record})
+            refused = cli.post("/portal-link", json={"record": issue_record})
+            forced = cli.post(
+                "/portal-link", json={"record": issue_record, "force": True}
+            )
+
+        assert first.status_code == 200
+        assert refused.status_code == 400
+        assert "already linked" in refused.json()["error"]
+        assert forced.status_code == 200
+
+
+class TestPortalLinkAudit3110:
+    """#3110: every `/portal-link` write must be audited at the business
+    tier — before this, `post_portal_link` wrote no audit row at all, so
+    there was no way to determine what wrote the bogus link that mailed a
+    customer 161 times. The only forensic signal was `actor=''`."""
+
+    def test_link_write_is_audited(self, coord_db) -> None:
+        from coord.audit import query_audit_log
+        from coord.portal_store import link_milestone
+
+        link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id="sub_x",
+            actor="john",
+        )
+        entries = query_audit_log(event_type="portal_link")["entries"]
+        assert len(entries) == 1
+        assert entries[0]["actor"] == "john"
+        assert entries[0]["repo"] == "acme-portal"
+        assert entries[0]["details"]["submission_id"] == "sub_x"
+
+    def test_a_write_with_no_actor_is_still_audited(self, coord_db) -> None:
+        """The incident's own forensic gap: a hand-run `curl POST
+        /portal-link` carries no actor. That write must still land in
+        `audit_log` — with an empty actor, not silently nowhere."""
+        from coord.state import _save_portal_link_local
+
+        _save_portal_link_local(
+            {"repo_name": "acme-portal", "milestone_number": 5, "submission_id": "sub_x"}
+        )
+        from coord.audit import query_audit_log
+
+        entries = query_audit_log(event_type="portal_link")["entries"]
+        assert len(entries) == 1
+        assert entries[0]["actor"] == ""
+
+    def test_unlink_is_audited(self, coord_db) -> None:
+        from coord.audit import query_audit_log
+        from coord.portal_store import link_milestone, unlink_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        unlink_milestone(repo_name="acme-portal", milestone_number=5, actor="john")
+
+        entries = query_audit_log(event_type="portal_unlink")["entries"]
+        assert len(entries) == 1
+        assert entries[0]["actor"] == "john"
+        assert entries[0]["details"]["submission_id"] == "sub_x"
+
+
+class TestUnlink3110:
+    """#3110: `coord portal unlink` (`coord.portal_store.unlink_milestone`/
+    `unlink_issue`, `coord.state.delete_portal_link`) — the supported way to
+    clear a bad link, replacing a hand sqlite edit on the daemon host."""
+
+    def test_unlink_milestone_removes_the_link(self, coord_db) -> None:
+        from coord.portal_store import get_milestone_link, link_milestone, unlink_milestone
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        assert unlink_milestone(repo_name="acme-portal", milestone_number=5) is True
+        assert get_milestone_link(repo_name="acme-portal", milestone_number=5) is None
+
+    def test_unlink_issue_removes_the_link(self, coord_db) -> None:
+        from coord.portal_store import get_issue_link, link_issue, unlink_issue
+
+        link_issue(repo_name="acme-portal", issue_number=77, submission_id="sub_x")
+        assert unlink_issue(repo_name="acme-portal", issue_number=77) is True
+        assert get_issue_link(repo_name="acme-portal", issue_number=77) is None
+
+    def test_unlinking_an_unlinked_target_reports_false(self, coord_db) -> None:
+        from coord.portal_store import unlink_milestone
+
+        assert unlink_milestone(repo_name="acme-portal", milestone_number=5) is False
+
+    def test_unlink_does_not_touch_a_different_target(self, coord_db) -> None:
+        from coord.portal_store import get_milestone_link, link_milestone, unlink_issue
+
+        link_milestone(repo_name="acme-portal", milestone_number=5, submission_id="sub_x")
+        unlink_issue(repo_name="acme-portal", issue_number=5, actor="john")
+        assert (
+            get_milestone_link(repo_name="acme-portal", milestone_number=5).submission_id
+            == "sub_x"
+        )
+
+    def test_daemon_delete_endpoint(self, tmp_path) -> None:
+        """`DELETE /portal-link` — the daemon side of `coord portal unlink`
+        for a thin client, mirroring `test_daemon_portal_link_endpoints`."""
+        import sqlite3
+
+        from starlette.testclient import TestClient
+
+        from coord import db
+        from coord.config import load as load_config
+        from coord.dao import SqliteStore
+        from coord.db import _ensure_schema
+        from coord.serve_app import build_app
+
+        cfg_path = tmp_path / "coordinator-portal-unlink.yml"
+        cfg_path.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n\n"
+            "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+            "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+        )
+        db_path = tmp_path / "board.db"
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        conn.commit()
+        db.override_connection(conn)
+
+        ms_record = {
+            "repo_name": "api",
+            "milestone_number": 1,
+            "issue_number": None,
+            "submission_id": "sub-hot",
+            "linked_at": 0.0,
+            "actor": "",
+            "schema": 1,
+        }
+        app = build_app(SqliteStore(db_path), load_config(cfg_path))
+        with TestClient(app) as cli:
+            cli.post("/portal-link", json={"record": ms_record})
+            missing = cli.request(
+                "DELETE", "/portal-link", params={"repo_name": "api", "issue_number": 2}
+            )
+            deleted = cli.request(
+                "DELETE",
+                "/portal-link",
+                params={"repo_name": "api", "milestone_number": 1, "actor": "john"},
+            )
+            gone = cli.get("/portal-link", params={"repo_name": "api", "milestone_number": 1})
+
+        assert missing.json() == {"deleted": False}
+        assert deleted.json() == {"deleted": True}
+        assert gone.json() == {"link": None}
+
+
 class TestGetLinkBySubmission:
     """The reverse lookup #2509's verdict consumer needs: an inbound event
     carries only `submission_id` and must resolve back to `(repo,
