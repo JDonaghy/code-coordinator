@@ -18,6 +18,7 @@ import sqlite3
 
 import pytest
 
+from coord import sql
 from coord.audit import record_audit
 from coord.models import Proposal
 from coord.state import record_dispatched, record_test_verdict, mark_notified
@@ -50,16 +51,19 @@ def _dispatch(coord_db, *, assignment_id: str = "aid-1", issue_number: int = 42)
 
 class TestSchema:
     def test_audit_log_table_exists_with_expected_columns(self, coord_db) -> None:
-        cols = {row[1] for row in coord_db.execute("PRAGMA table_info(audit_log)").fetchall()}
+        # #3083: `PRAGMA table_info` is SQLite-only and a hard syntax error
+        # against psycopg — sql.table_columns is the seam's portable form.
+        cols = {name for name, _type in sql.table_columns(coord_db, "audit_log")}
         assert cols == {
             "id", "ts", "tier", "category", "event_type", "actor",
             "repo", "issue", "assignment_id", "machine", "summary", "details_json",
         }
 
     def test_indexes_exist(self, coord_db) -> None:
-        names = {
-            row[1] for row in coord_db.execute("PRAGMA index_list(audit_log)").fetchall()
-        }
+        # #3083: `PRAGMA index_list` likewise. Asserted as a subset, not an
+        # exact set: the two backends disagree on whether a PRIMARY KEY
+        # materializes a listed index, and only these two are deliberate.
+        names = set(sql.index_names(coord_db, "audit_log"))
         assert "idx_audit_log_ts" in names
         assert "idx_audit_log_assignment" in names
 

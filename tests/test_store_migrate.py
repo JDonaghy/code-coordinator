@@ -419,7 +419,11 @@ class TestRunImport:
             conn.close()
 
         with scratch_database(tmp_path, "target.db") as target_conn:
-            sql.execute(target_conn, "PRAGMA foreign_keys=ON")
+            # #3083: `PRAGMA foreign_keys=ON` is SQLite-only — a hard
+            # syntax error against psycopg, and unnecessary there (Postgres
+            # always enforces). sql.enable_foreign_keys() is the seam's name
+            # for the intent, and a documented no-op on Postgres.
+            sql.enable_foreign_keys(target_conn)
             report = store_migrate.run_import(
                 sqlite_path=tmp_path / "source.db", target_connector=lambda: target_conn
             )
@@ -469,7 +473,11 @@ class TestRunImport:
         """
         source_path = self._seed_split_workflow_source(tmp_path)
         with scratch_database(tmp_path, "target.db") as target_conn:
-            sql.execute(target_conn, "PRAGMA foreign_keys=ON")
+            # #3083: `PRAGMA foreign_keys=ON` is SQLite-only — a hard
+            # syntax error against psycopg, and unnecessary there (Postgres
+            # always enforces). sql.enable_foreign_keys() is the seam's name
+            # for the intent, and a documented no-op on Postgres.
+            sql.enable_foreign_keys(target_conn)
             store_migrate.run_import(sqlite_path=source_path, target_connector=lambda: target_conn)
 
             # The target now holds FK-linked rows -- exactly the state the

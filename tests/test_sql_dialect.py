@@ -1017,6 +1017,124 @@ def test_resync_identity_sequence_handles_empty_table_against_real_postgres(pg_c
     assert new_id == 1
 
 
+# ── #3083's six signatures, against a real server ───────────────────────────
+#
+# The fake-connection tests further down assert on the SQL text that *would*
+# reach a driver; these assert the server actually accepts it. Every one of
+# them reproduced a real `postgres`-job failure before #3083, and each skips
+# (never silently passes) without psycopg + a reachable server -- see the
+# `pg_conn` fixture.
+
+
+def test_qmark_via_the_proxy_round_trips_against_real_postgres(pg_conn):
+    """Signature 1: `the query has 0 placeholders but N parameters were
+    passed` -- what ~460 test bodies' direct `conn.execute("... ?")` hit."""
+    conn = sql.translating_connection(pg_conn)
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+    conn.execute("INSERT INTO t (id, a) VALUES (?, ?)", (1, "x"))
+    pg_conn.commit()
+    assert conn.execute("SELECT a FROM t WHERE id = ?", (1,)).fetchone()[0] == "x"
+
+
+def test_named_params_via_the_proxy_round_trip_against_real_postgres(pg_conn):
+    """Signature 4: `syntax error at or near ":"`."""
+    conn = sql.translating_connection(pg_conn)
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+    conn.execute("INSERT INTO t (id, a) VALUES (:id, :a)", {"id": 1, "a": "x"})
+    pg_conn.commit()
+    assert conn.execute("SELECT a FROM t WHERE id = ?", (1,)).fetchone()[0] == "x"
+
+
+def test_state_upserts_are_accepted_by_a_real_postgres_server(pg_conn):
+    """Signatures 2 and 3 at once, against the real schema:
+    `AmbiguousColumn: column reference "finished_at" is ambiguous` and
+    `the query has 17 placeholders but 21 parameters were passed`.
+
+    Both statements are run verbatim, through the seam, against a schema
+    built by ``coord.db._ensure_schema`` -- so this fails if either the
+    ``DO UPDATE SET`` qualification or the comment-aware translation
+    regresses, and it cannot pass vacuously (the second call of each pair
+    exercises the conflict branch, not just the insert).
+    """
+    from coord.db import _ensure_schema
+    from coord.models import Assignment
+    from coord.state import (
+        _DISPATCHED_UPSERT_SQL,
+        _UPSERT_SQL,
+        _assignment_upsert_params,
+    )
+
+    _ensure_schema(pg_conn)
+    pg_conn.commit()
+
+    # #1553's correlated-subquery upsert: 21 parameters, and the four after
+    # the "child's Pipeline row" comment are the ones that used to vanish.
+    dispatch_params = (
+        "aid-1", "m1", "repo", "acme/repo", 7, "title", "work", "briefing",
+        "[]", "model", 1000.0, None, None, "[]", 0, "claude", "issue-7", None,
+        None, None, None,
+    )
+    assert len(dispatch_params) == _qmark_placeholder_count(_DISPATCHED_UPSERT_SQL)
+    sql.execute(pg_conn, _DISPATCHED_UPSERT_SQL, dispatch_params)
+    sql.execute(pg_conn, _DISPATCHED_UPSERT_SQL, dispatch_params)  # the DO UPDATE half
+    pg_conn.commit()
+
+    # The whole-board upsert, with its params built by the same function
+    # save_board() uses -- so the tuple can never drift from the statement.
+    assignment = Assignment(
+        assignment_id="aid-1",
+        machine_name="m1",
+        repo_name="repo",
+        issue_number=7,
+        issue_title="title",
+        status="done",
+        finished_at=2000.0,
+    )
+    board_params = _assignment_upsert_params(assignment)
+    assert len(board_params) == _qmark_placeholder_count(_UPSERT_SQL)
+    sql.execute(pg_conn, _UPSERT_SQL, board_params)
+    sql.execute(pg_conn, _UPSERT_SQL, board_params)  # the DO UPDATE half
+    pg_conn.commit()
+
+    # Indexed positionally: `pg_conn` deliberately applies no row factory
+    # (it is `sql.connect()`'s raw result), unlike the `coord_db` fixture.
+    status, finished_at = sql.execute(
+        pg_conn,
+        "SELECT status, finished_at FROM assignments WHERE assignment_id = ?",
+        ("aid-1",),
+    ).fetchone()
+    assert status == "done"
+    assert finished_at == 2000.0
+
+
+def test_index_names_round_trips_against_real_postgres(pg_conn):
+    """Signature 5: `syntax error at or near "PRAGMA"` -- index
+    introspection, which SQLite spells as a pragma."""
+    sql.execute(pg_conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+    sql.execute(pg_conn, "CREATE INDEX idx_t_a ON t (a)")
+    pg_conn.commit()
+    assert "idx_t_a" in sql.index_names(pg_conn, "t")
+
+
+def test_enable_foreign_keys_is_accepted_by_a_real_postgres_server(pg_conn):
+    """Signature 5, the other half: the no-op must genuinely emit nothing
+    rather than a PRAGMA the server would reject."""
+    sql.enable_foreign_keys(pg_conn)
+    assert sql.execute(pg_conn, "SELECT 1").fetchone()[0] == 1
+
+
+def test_greatest_round_trips_against_real_postgres(pg_conn):
+    """Signature 6: `function max(integer, smallint) does not exist`."""
+    sql.execute(pg_conn, "CREATE TABLE s (id TEXT PRIMARY KEY, rev INTEGER)")
+    sql.execute(pg_conn, "INSERT INTO s VALUES (?, ?)", ("x", 5))
+    pg_conn.commit()
+    stmt = f"UPDATE s SET rev = {sql.greatest(pg_conn, 'rev', '?')} WHERE id = ?"
+    sql.execute(pg_conn, stmt, (3, "x"))
+    assert sql.execute(pg_conn, "SELECT rev FROM s").fetchone()[0] == 5
+    sql.execute(pg_conn, stmt, (9, "x"))
+    assert sql.execute(pg_conn, "SELECT rev FROM s").fetchone()[0] == 9
+
+
 # ── redact_dsn (#828) ────────────────────────────────────────────────────
 
 
@@ -1092,6 +1210,559 @@ def test_resync_identity_sequence_postgres_calls_setval_with_table_and_column():
     assert 'MAX("id")' in sent_sql
     assert '"widgets"' in sent_sql
     assert sent_params == ("widgets", "id")
+
+
+# ── #3083 helpers: SQL-text scanners shared by the tests and the ratchets ───
+
+
+def _scan_placeholders(sql_text: str) -> tuple[int, list[str]]:
+    """``(count of bare ``?``, [named ``:param`` names])`` in *sql_text*,
+    counting only placeholders **outside** quoted string literals and
+    ``--``/``/* */`` SQL comments.
+
+    The comment half is exactly what ``coord.sql._qmark_to_pyformat`` was
+    missing before #3083 (a rhetorical ``-- which cursor?`` in coord/db.py's
+    schema DDL, an apostrophe in coord/state.py's dispatch upsert), and it
+    is needed here for the same reason: this is the reference answer the
+    seam's own translation is checked against.
+    """
+    qmarks = 0
+    named: list[str] = []
+    in_string: str | None = None
+    i, n = 0, len(sql_text)
+    while i < n:
+        ch = sql_text[i]
+        if in_string is not None:
+            if ch == in_string:
+                if sql_text[i : i + 2] == in_string * 2:
+                    i += 2
+                    continue
+                in_string = None
+            i += 1
+            continue
+        if sql_text[i : i + 2] == "--":
+            end = sql_text.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if sql_text[i : i + 2] == "/*":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql_text[j : j + 2] == "/*":
+                    depth += 1
+                    j += 2
+                elif sql_text[j : j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            i = j
+            continue
+        if ch in ("'", '"'):
+            in_string = ch
+            i += 1
+            continue
+        if ch == "?":
+            qmarks += 1
+            i += 1
+            continue
+        if ch == ":":
+            if sql_text[i : i + 2] == "::":  # Postgres cast, not a placeholder
+                i += 2
+                continue
+            match = sql._NAMED_PARAM_RE.match(sql_text, i)
+            if match is not None:
+                named.append(match.group(1))
+                i = match.end()
+                continue
+        i += 1
+    return qmarks, named
+
+
+def _qmark_placeholder_count(sql_text: str) -> int:
+    return _scan_placeholders(sql_text)[0]
+
+
+def _named_placeholders(sql_text: str) -> list[str]:
+    return _scan_placeholders(sql_text)[1]
+
+
+#: Words that may legitimately appear bare on the right-hand side of a
+#: ``DO UPDATE SET`` — SQL keywords, operators and function names, none of
+#: which are column references.
+_DO_UPDATE_NON_COLUMNS = {
+    "CASE", "WHEN", "THEN", "ELSE", "END", "COALESCE", "NULL", "AND", "OR",
+    "NOT", "IS", "IN", "SELECT", "FROM", "WHERE", "CAST", "AS", "DO",
+    "UPDATE", "SET", "ON", "CONFLICT", "NOTHING", "excluded", "MAX", "MIN",
+    "GREATEST", "LEAST", "TRUE", "FALSE", "DEFAULT",
+}
+
+
+def _unqualified_do_update_refs(sql_text: str) -> list[str]:
+    """Bare (unqualified) column references on the right-hand side of
+    *sql_text*'s ``ON CONFLICT ... DO UPDATE SET`` clause.
+
+    Inside a ``DO UPDATE``, both the target table and the ``excluded``
+    pseudo-row are in scope, and ``excluded`` carries every column of the
+    target — so a bare column name on the right-hand side is ambiguous.
+    Postgres raises ``AmbiguousColumn``; SQLite silently resolves it to the
+    target row, which is why this cannot be caught by running the SQLite
+    suite. The SET *targets* (left of each ``=``, at clause depth) are
+    excluded here: those are unambiguous by construction, and Postgres
+    rejects a qualified one.
+    """
+    if "DO UPDATE SET" not in sql_text:
+        return []
+    body = sql_text.split("DO UPDATE SET", 1)[1]
+    body = re.sub(r"--[^\n]*", " ", body)
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
+    body = re.sub(r"'(?:[^']|'')*'", " '' ", body)
+
+    tokens = [m.group(0) for m in re.finditer(r"[A-Za-z_]\w*|[(),.=]|\S", body)]
+    offenders: list[str] = []
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token == "(":
+            depth += 1
+            continue
+        if token == ")":
+            depth -= 1
+            continue
+        if not re.fullmatch(r"[A-Za-z_]\w*", token):
+            continue
+        if token in _DO_UPDATE_NON_COLUMNS:
+            continue
+        previous = tokens[index - 1] if index else None
+        following = tokens[index + 1] if index + 1 < len(tokens) else None
+        if previous == ".":          # `excluded.x` / `assignments.x` — qualified
+            continue
+        if following == ".":         # the qualifier itself
+            continue
+        if depth == 0 and following == "=" and previous in (None, ","):
+            continue                 # a SET target, not a reference
+        offenders.append(token)
+    return sorted(set(offenders))
+
+
+def _two_argument_max_sites(path: Path) -> list[str]:
+    """``"file:line: text"`` for every SQL literal in *path* naming a
+    two-argument ``MAX(a, b)`` — SQLite's scalar max, which Postgres spells
+    ``GREATEST`` and rejects as ``function max(integer, smallint) does not
+    exist``.
+
+    The one-argument aggregate ``MAX(x)`` is identical on both backends and
+    is deliberately not flagged; the discriminator is a comma at the
+    function's own paren depth.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    docstring_ids = _docstring_constant_ids(tree)
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        if id(node) in docstring_ids:
+            continue  # prose, e.g. a docstring explaining `max(0, x - y)`
+        text = node.value
+        if not _SQL_LIKE_RE.match(text):
+            continue
+        for match in re.finditer(r"\bMAX\s*\(", text, re.IGNORECASE):
+            depth, i, n = 1, match.end(), len(text)
+            while i < n and depth:
+                ch = text[i]
+                if ch in ("'", '"'):
+                    quote, i = ch, i + 1
+                    while i < n and text[i] != quote:
+                        i += 1
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 1:
+                    sites.append(f"{path.name}:{node.lineno}: {match.group(0)}...")
+                    depth = 0
+                    break
+                i += 1
+    return sites
+
+
+# ── #3083: one seam-level test per Postgres-lane failure signature ──────────
+#
+# #3083's second acceptance bullet: each of the six mechanically-diagnosable
+# signatures in the `postgres` job gets a test that exercises the *seam*
+# directly, not only the call site that happened to surface it. Fixing a
+# call site without one just moves the next occurrence a commit away — the
+# same reasoning #2096 makes about a fix nobody can show was ever red.
+#
+# Each test below names its signature verbatim in the docstring, and each is
+# red against the pre-#3083 code:
+#
+#   1. `the query has 0 placeholders but N parameters were passed`
+#      — TranslatingConnection did not exist, so ~460 test bodies' direct
+#        `conn.execute("... ?", params)` reached psycopg untranslated.
+#   2. `AmbiguousColumn: column reference "finished_at" is ambiguous`
+#      — coord/state.py's upserts referenced stored columns unqualified
+#        inside `DO UPDATE SET`, where `excluded` also has them.
+#   3. `the query has 17 placeholders but 21 parameters were passed`
+#      — _qmark_to_pyformat had no notion of SQL comments, so an apostrophe
+#        in one opened a phantom string literal that ate 4 placeholders.
+#   4. `syntax error at or near ":"`
+#      — translate() rewrote `?` only, never sqlite3's `named` paramstyle.
+#   5. `syntax error at or near "PRAGMA"`
+#      — no portable index-introspection / FK-enforcement helper existed, so
+#        call sites carried literal PRAGMA text.
+#   6. `function max(integer, smallint) does not exist`
+#      — no sql.greatest(); the two-argument scalar MAX went out verbatim.
+
+
+class TestSignatureZeroPlaceholders:
+    """`the query has 0 placeholders but N parameters were passed`.
+
+    The largest signature in the lane (~460), and the most misleading: the
+    statement is not mistranslated, it is *untranslated* — `?` simply is not
+    a placeholder in Postgres, so psycopg counts zero of them and refuses
+    the parameters. :class:`coord.sql.TranslatingConnection` is the fix, and
+    ``tests/backends.py`` is the one place that installs it.
+    """
+
+    def test_direct_conn_execute_translates_qmark_to_pyformat(self):
+        raw = _FakePostgresConnection()
+        conn = sql.translating_connection(raw)
+
+        conn.execute("SELECT a FROM t WHERE b = ? AND c = ?", ("x", "y"))
+
+        [(sent_sql, sent_params)] = raw.cur.executed
+        assert sent_sql == "SELECT a FROM t WHERE b = %s AND c = %s"
+        assert sent_sql.count("%s") == len(sent_params) == 2
+
+    def test_direct_conn_executemany_translates_too(self):
+        raw = _FakePostgresConnection()
+        conn = sql.translating_connection(raw)
+
+        conn.executemany("INSERT INTO t (a, b) VALUES (?, ?)", [(1, 2), (3, 4)])
+
+        [(sent_sql, seq)] = raw.cur.executemany_calls
+        assert sent_sql == "INSERT INTO t (a, b) VALUES (%s, %s)"
+        assert seq == [(1, 2), (3, 4)]
+
+    def test_wrapping_sqlite_leaves_the_statement_alone(self, memdb):
+        """qmark is SQLite's native style, so the proxy must be a pure
+        pass-through there — the default lane must not change shape."""
+        conn = sql.translating_connection(memdb)
+        conn.execute("INSERT INTO t (id, a) VALUES (?, ?)", (1, "x"))
+
+        assert conn.execute("SELECT a FROM t WHERE id = ?", (1,)).fetchone()[0] == "x"
+
+    def test_proxy_is_transparent_for_everything_else(self, memdb):
+        """Only the three statement-running methods are intercepted; the
+        rest of the connection has to behave as if the proxy weren't there,
+        or wrapping it in ``tests/backends.py`` breaks the whole suite."""
+        conn = sql.translating_connection(memdb)
+
+        assert sql.detect_dialect(conn) == sql.DIALECT_SQLITE
+        assert sql.unwrap(conn) is memdb
+        assert getattr(conn, "closed", False) is False  # coord/db.py's #3082 check
+        conn.row_factory = sqlite3.Row  # settable attribute forwards
+        assert memdb.row_factory is sqlite3.Row
+        with conn:  # context manager forwards (state.py's `with conn:` writes)
+            conn.execute("INSERT INTO t (id) VALUES (?)", (1,))
+        assert memdb.cursor().execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+    def test_wrapping_is_idempotent(self):
+        once = sql.translating_connection(_FakePostgresConnection())
+        assert sql.translating_connection(once) is once
+
+    def test_seam_functions_accept_a_wrapped_connection(self):
+        """`sql.execute(conn, ...)` must keep working when handed the proxy
+        — the fixture hands the *same* object to both the test body and
+        every ``coord/`` writer under test."""
+        raw = _FakePostgresConnection()
+        sql.execute(sql.translating_connection(raw), "SELECT ? ", (1,))
+        assert raw.cur.executed == [("SELECT %s ", (1,))]
+
+
+class TestSignatureAmbiguousFinishedAt:
+    """`AmbiguousColumn: column reference "finished_at" is ambiguous`.
+
+    Inside `ON CONFLICT ... DO UPDATE SET`, both the target table and the
+    `excluded` pseudo-row are in scope, and `excluded` carries *every*
+    column of the target — so an unqualified stored-column reference on the
+    right-hand side is genuinely ambiguous. SQLite silently resolves it to
+    the target row; Postgres refuses the statement.
+    """
+
+    def test_state_upsert_qualifies_every_stored_column_reference(self):
+        """The regression guard for ``coord/state.py``'s two upserts: no
+        bare column name may appear on the right-hand side of a
+        ``DO UPDATE SET``."""
+        from coord.state import _UPSERT_SQL
+
+        offenders = _unqualified_do_update_refs(_UPSERT_SQL)
+        assert not offenders, (
+            "unqualified column reference(s) on the right-hand side of "
+            "coord/state.py's _UPSERT_SQL DO UPDATE SET (#3083) — Postgres "
+            f"rejects these as ambiguous against `excluded`: {offenders}"
+        )
+
+    def test_finished_at_cas_still_means_the_same_thing_on_sqlite(self, memdb):
+        """Qualifying must be *only* a disambiguation: the #1451 CAS still
+        has to refuse a stale terminal write."""
+        sql.execute(memdb, "CREATE TABLE a (id TEXT PRIMARY KEY, status TEXT, finished_at REAL)")
+        sql.execute(memdb, "INSERT INTO a VALUES ('x', 'done', 100.0)")
+        upsert = """
+            INSERT INTO a (id, status, finished_at) VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = CASE
+                    WHEN a.finished_at IS NULL THEN excluded.status
+                    WHEN excluded.finished_at IS NOT NULL
+                         AND excluded.finished_at >= a.finished_at THEN excluded.status
+                    ELSE a.status
+                END
+        """
+        sql.execute(memdb, upsert, ("x", "failed", 50.0))  # stale — refused
+        assert sql.execute(memdb, "SELECT status FROM a").fetchone()[0] == "done"
+        sql.execute(memdb, upsert, ("x", "merged", 200.0))  # newer — accepted
+        assert sql.execute(memdb, "SELECT status FROM a").fetchone()[0] == "merged"
+
+
+class TestSignaturePlaceholderCountMismatch:
+    """`the query has 17 placeholders but 21 parameters were passed`.
+
+    An apostrophe inside a ``--`` comment used to open a string literal the
+    translator never saw closed, so every ``?`` after it was treated as
+    string content. ``coord/state.py``'s dispatch upsert has exactly that
+    comment ("the child's Pipeline row"), four placeholders after it, and 21
+    parameters — hence 17 vs 21.
+    """
+
+    def test_apostrophe_in_a_line_comment_does_not_swallow_placeholders(self):
+        text = (
+            "INSERT INTO t (a, b) VALUES (\n"
+            "    ?,\n"
+            "    -- which is exactly the \"child's Pipeline row\" bug\n"
+            "    ?)"
+        )
+        assert sql.translate(text, sql.DIALECT_POSTGRES).count("%s") == 2
+
+    def test_apostrophe_in_a_block_comment_does_not_swallow_placeholders(self):
+        text = "SELECT ? /* the worker's own note */ , ? FROM t"
+        assert sql.translate(text, sql.DIALECT_POSTGRES).count("%s") == 2
+
+    def test_question_mark_inside_a_comment_is_not_a_placeholder(self):
+        text = "SELECT a FROM t -- which cursor?\nWHERE b = ?"
+        translated = sql.translate(text, sql.DIALECT_POSTGRES)
+        assert translated.count("%s") == 1
+        assert "which cursor?" in translated
+
+    def test_percent_inside_a_comment_is_still_doubled(self):
+        """pyformat is %-formatting, so a literal `%` anywhere — including a
+        comment — must be escaped or psycopg misparses the statement."""
+        translated = sql.translate("SELECT ? -- 100% sure\n", sql.DIALECT_POSTGRES)
+        assert "100%% sure" in translated
+
+    @pytest.mark.parametrize(
+        "name",
+        ["_UPSERT_SQL", "_DISPATCHED_UPSERT_SQL"],
+    )
+    def test_every_state_upsert_keeps_its_placeholder_count(self, name):
+        """The two statements this signature was measured on, pinned: what
+        goes in as ``?`` must come out as ``%s``, one for one."""
+        import coord.state as state_mod
+
+        text = getattr(state_mod, name)
+        translated = sql.translate(text, sql.DIALECT_POSTGRES)
+        assert translated.count("%s") == _qmark_placeholder_count(text)
+
+    def test_state_upserts_round_trip_against_the_active_backend(self, coord_db):
+        """Both statements run, twice each, against a real schema on
+        whichever backend ``COORD_TEST_BACKEND`` selects.
+
+        The paired assertions are the point: a parameter tuple that no
+        longer matches its statement's placeholder count is exactly how
+        signature 3 presented, and the `?`-vs-`%s` count is checked against
+        the *translated* text, so a translation that silently drops
+        placeholders fails here even on the SQLite lane where the statement
+        itself would still run.
+        """
+        from coord.models import Assignment
+        from coord.state import (
+            _DISPATCHED_UPSERT_SQL,
+            _UPSERT_SQL,
+            _assignment_upsert_params,
+        )
+
+        dispatch_params = (
+            "aid-1", "m1", "repo", "acme/repo", 7, "title", "work", "briefing",
+            "[]", "model", 1000.0, None, None, "[]", 0, "claude", "issue-7",
+            None, None, None, None,
+        )
+        assert len(dispatch_params) == _qmark_placeholder_count(_DISPATCHED_UPSERT_SQL)
+        sql.execute(coord_db, _DISPATCHED_UPSERT_SQL, dispatch_params)
+        sql.execute(coord_db, _DISPATCHED_UPSERT_SQL, dispatch_params)
+
+        assignment = Assignment(
+            assignment_id="aid-1",
+            machine_name="m1",
+            repo_name="repo",
+            issue_number=7,
+            issue_title="title",
+            status="done",
+            finished_at=2000.0,
+        )
+        board_params = _assignment_upsert_params(assignment)
+        assert len(board_params) == _qmark_placeholder_count(_UPSERT_SQL)
+        sql.execute(coord_db, _UPSERT_SQL, board_params)
+        sql.execute(coord_db, _UPSERT_SQL, board_params)
+        coord_db.commit()
+
+        row = sql.execute(
+            coord_db,
+            "SELECT status, finished_at FROM assignments WHERE assignment_id = ?",
+            ("aid-1",),
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["finished_at"] == 2000.0
+
+    def test_comment_awareness_does_not_break_real_string_literals(self):
+        """The fix must not overcorrect: a `?` inside a genuine quoted
+        string is still data, and a quote inside a comment still isn't."""
+        text = "SELECT 'why?' FROM t -- it's fine\nWHERE a = ? AND b = 'ok?'"
+        translated = sql.translate(text, sql.DIALECT_POSTGRES)
+        assert translated.count("%s") == 1
+        assert "'why?'" in translated and "'ok?'" in translated
+
+
+class TestSignatureNamedPlaceholderSyntaxError:
+    """`syntax error at or near ":"`.
+
+    sqlite3 supports a second paramstyle — ``named`` (``:name``, bound from
+    a dict) — and a handful of statements use it. The seam only ever
+    rewrote ``?``, so those reached Postgres verbatim.
+    """
+
+    def test_named_placeholders_become_pyformat(self):
+        translated = sql.translate(
+            "INSERT INTO t (a, b) VALUES (:a, :b)", sql.DIALECT_POSTGRES
+        )
+        assert translated == "INSERT INTO t (a, b) VALUES (%(a)s, %(b)s)"
+
+    def test_named_placeholders_are_untouched_on_sqlite(self):
+        text = "INSERT INTO t (a) VALUES (:a)"
+        assert sql.translate(text, sql.DIALECT_SQLITE) == text
+
+    def test_named_placeholder_inside_a_string_literal_survives(self):
+        translated = sql.translate(
+            "SELECT ':not_a_param' FROM t WHERE a = :a", sql.DIALECT_POSTGRES
+        )
+        assert "':not_a_param'" in translated
+        assert "%(a)s" in translated
+
+    def test_postgres_cast_operator_is_not_a_named_placeholder(self):
+        """``::`` is Postgres's cast operator — mangling it would break
+        every statement the seam itself emits with one."""
+        assert (
+            sql.translate("SELECT x::int FROM t WHERE y = ?", sql.DIALECT_POSTGRES)
+            == "SELECT x::int FROM t WHERE y = %s"
+        )
+
+    def test_named_statement_round_trips_through_the_proxy_with_a_dict(self):
+        raw = _FakePostgresConnection()
+        conn = sql.translating_connection(raw)
+
+        conn.execute("INSERT INTO t (a, b) VALUES (:a, :b)", {"a": 1, "b": 2})
+
+        [(sent_sql, sent_params)] = raw.cur.executed
+        assert sent_sql == "INSERT INTO t (a, b) VALUES (%(a)s, %(b)s)"
+        assert sent_params == {"a": 1, "b": 2}
+
+    def test_named_statement_still_round_trips_against_sqlite(self, memdb):
+        conn = sql.translating_connection(memdb)
+        conn.execute("INSERT INTO t (id, a) VALUES (:id, :a)", {"id": 1, "a": "x"})
+        assert conn.execute("SELECT a FROM t").fetchone()[0] == "x"
+
+
+class TestSignaturePragmaSyntaxError:
+    """`syntax error at or near "PRAGMA"`.
+
+    ``PRAGMA`` is SQLite-only with no Postgres spelling at all, so the seam
+    cannot translate it — the rule (``coord/serve_app.py``'s
+    ``_wal_checkpoint_tick``, #2782) is that a caller asks for the *intent*
+    through a named helper and the seam decides what that becomes.
+    """
+
+    def test_index_names_reports_declared_indexes_on_sqlite(self, memdb):
+        sql.execute(memdb, "CREATE INDEX idx_t_a ON t (a)")
+        assert "idx_t_a" in sql.index_names(memdb, "t")
+
+    def test_index_names_is_empty_for_a_table_with_no_indexes(self, memdb):
+        assert sql.index_names(memdb, "t") == []
+
+    def test_index_names_postgres_queries_pg_indexes_not_pragma(self):
+        conn = _FakePostgresConnection(fetchall_result=[("idx_t_a",)])
+        assert sql.index_names(conn, "t") == ["idx_t_a"]
+        [(sent_sql, sent_params)] = conn.cur.executed
+        assert "PRAGMA" not in sent_sql
+        assert "pg_indexes" in sent_sql
+        assert sent_params == ("t",)
+
+    def test_index_names_postgres_tolerates_a_dict_row_factory(self):
+        conn = _FakePostgresConnection(fetchall_result=[{"name": "idx_t_a"}])
+        assert sql.index_names(conn, "t") == ["idx_t_a"]
+
+    def test_enable_foreign_keys_turns_them_on_for_sqlite(self, memdb):
+        sql.enable_foreign_keys(memdb)
+        assert sql.execute(memdb, "PRAGMA foreign_keys").fetchone()[0] == 1
+
+    def test_enable_foreign_keys_is_a_documented_noop_on_postgres(self):
+        """Postgres enforces declared constraints unconditionally — there is
+        no session switch, so this must emit *nothing* rather than a PRAGMA
+        the server cannot parse."""
+        conn = _FakePostgresConnection()
+        sql.enable_foreign_keys(conn)
+        assert conn.cur.executed == []
+
+
+class TestSignatureTwoArgumentMax:
+    """`function max(integer, smallint) does not exist`.
+
+    SQLite overloads ``MAX`` as both the one-argument aggregate and a
+    multi-argument scalar. Postgres has only the aggregate; the scalar is
+    ``GREATEST``. The error names an argument-type mismatch, which is why
+    this one is easy to misread as a casting problem.
+    """
+
+    def test_greatest_emits_max_on_sqlite(self, memdb):
+        assert sql.greatest(memdb, "a", "?") == "MAX(a, ?)"
+
+    def test_greatest_emits_greatest_on_postgres(self):
+        conn = _FakePostgresConnection()
+        assert sql.greatest(conn, "a", "?") == "GREATEST(a, ?)"
+
+    def test_greatest_takes_more_than_two_operands(self):
+        conn = _FakePostgresConnection()
+        assert sql.greatest(conn, "a", "b", "?") == "GREATEST(a, b, ?)"
+
+    def test_greatest_refuses_a_single_operand(self, memdb):
+        """A one-argument ``MAX`` is the *aggregate*, spelled identically on
+        both backends — routing it through here would silently rewrite it to
+        ``GREATEST`` and change its meaning."""
+        with pytest.raises(ValueError, match="two operands"):
+            sql.greatest(memdb, "a")
+
+    def test_greatest_monotonic_update_still_only_raises_on_sqlite(self, memdb):
+        """The behaviour both ``coord/portal_store.py`` call sites depend
+        on: the counter never goes backwards."""
+        sql.execute(memdb, "CREATE TABLE s (id TEXT PRIMARY KEY, rev INTEGER)")
+        sql.execute(memdb, "INSERT INTO s VALUES ('x', 5)")
+        stmt = f"UPDATE s SET rev = {sql.greatest(memdb, 'rev', '?')} WHERE id = ?"
+        sql.execute(memdb, stmt, (3, "x"))
+        assert sql.execute(memdb, "SELECT rev FROM s").fetchone()[0] == 5
+        sql.execute(memdb, stmt, (9, "x"))
+        assert sql.execute(memdb, "SELECT rev FROM s").fetchone()[0] == 9
+
+    def test_portal_store_names_no_bare_two_argument_max(self):
+        """``coord/portal_store.py``'s two sites go through the seam — the
+        file-scoped half of the ratchet leg below."""
+        offenders = _two_argument_max_sites(Path(sql.__file__).parent / "portal_store.py")
+        assert not offenders, offenders
 
 
 # ── the ratchet: no raw `?` reaches a driver outside the seam (#2768, #1948) ─
@@ -1315,53 +1986,15 @@ def _contains_bare_placeholder(sql_text: str) -> bool:
     """Does *sql_text* contain a ``?`` outside a quoted string literal or a
     ``--``/``/* */`` SQL comment?
 
-    Extends :func:`coord.sql._qmark_to_pyformat`'s quote-tracking with
-    comment-awareness — needed because coord/db.py's schema DDL has a
+    Delegates to :func:`_scan_placeholders` (#3083), which is the same
+    quote- and comment-aware scan this used to carry inline — kept as one
+    implementation so the ratchet and the seam-level placeholder-count
+    assertions can never disagree about what counts as a placeholder.
+    Comment-awareness is load-bearing: coord/db.py's schema DDL has a
     rhetorical "?" inside a ``--`` comment (``"which cursor?"``) that is not
     a placeholder and must not trip this check.
     """
-    in_string: str | None = None
-    in_line_comment = False
-    in_block_comment = False
-    i, n = 0, len(sql_text)
-    while i < n:
-        ch = sql_text[i]
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-        if in_block_comment:
-            if sql_text[i : i + 2] == "*/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_string is not None:
-            if ch == in_string:
-                if sql_text[i : i + 2] == in_string * 2:
-                    i += 2
-                    continue
-                in_string = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            in_string = ch
-            i += 1
-            continue
-        if sql_text[i : i + 2] == "--":
-            in_line_comment = True
-            i += 2
-            continue
-        if sql_text[i : i + 2] == "/*":
-            in_block_comment = True
-            i += 2
-            continue
-        if ch == "?":
-            return True
-        i += 1
-    return False
+    return _qmark_placeholder_count(sql_text) > 0
 
 
 def test_no_bare_placeholder_in_sql_literal_outside_the_dialect_seam():
@@ -1550,5 +2183,122 @@ def test_no_sqlite_only_construct_in_statement_text_outside_db_and_seam():
         "SQLite-only construct (PRAGMA/AUTOINCREMENT/INSERT OR IGNORE) in "
         "statement text outside coord/db.py and the coord.sql dialect seam "
         "(#2782/#1948) — route this through a coord.sql seam helper "
+        "instead:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no unrouted named `:param` placeholder (#3083) ────
+#
+# The fifth leg. #2768's third leg (`_contains_bare_placeholder` above)
+# catches a raw `?` in an unrouted SQL literal — and that is *all* it
+# catches, because it was written when `?` was the only paramstyle anyone
+# in this tree used. sqlite3 supports a second one, `named` (`:name`, bound
+# from a dict), and statements written in it sailed straight past the
+# ratchet and straight into Postgres as `syntax error at or near ":"` (34
+# failures across three test files). Closing the `:` class without a
+# ratchet leg would just leave it to reopen the way the `?` class did.
+#
+# Two things it deliberately does NOT flag, both of which the tree contains
+# today: a `:name` inside a literal that IS routed through the seam (that is
+# the seam doing its job — `translate()` rewrites it to `%(name)s`), and a
+# Sphinx role (`:func:`, `:class:`) in a docstring that happens to begin
+# with a SQL keyword. Docstrings are excluded by AST position rather than by
+# pattern, and `sql._NAMED_PARAM_RE`'s trailing guard rejects a `:role:`
+# anyway.
+
+
+def _docstring_constant_ids(tree: ast.AST) -> set[int]:
+    """``id()`` of every ``ast.Constant`` that is a module/class/function
+    docstring — prose, never statement text."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def test_no_unrouted_named_placeholder_in_sql_literal_outside_the_dialect_seam():
+    """No SQL string literal in ``coord/**`` outside the seam carries a
+    ``:name`` placeholder unless it is provably routed through
+    ``coord.sql`` (#3083) — the ``?`` leg's named-paramstyle sibling.
+
+    ``?`` and ``:name`` are two spellings of the same mistake against
+    Postgres: neither is a placeholder there. The ``?`` half has been
+    ratcheted since #2768; this closes the half that was open, so a
+    statement cannot re-enter the tree in the paramstyle nobody was
+    watching.
+
+    Deliberately introducing e.g. ``_RAW_SQL = "SELECT * FROM t WHERE id =
+    :id"`` in any ``coord/`` module, unrouted to ``coord.sql``, makes this
+    red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        _src, tree = _parse(path)
+        protected_ids = _reachable_seam_literal_ids(tree)
+        docstring_ids = _docstring_constant_ids(tree)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in protected_ids or id(node) in docstring_ids:
+                continue
+            text = node.value
+            if not _SQL_LIKE_RE.match(text):
+                continue
+            names = _named_placeholders(text)
+            if not names:
+                continue
+            violations.append(f"{rel}:{node.lineno}: {', '.join(':' + n for n in names)}")
+    assert not violations, (
+        "named `:param` placeholder(s) in a SQL string literal outside the "
+        "coord.sql dialect seam (#3083/#2768/#1948) — `:name` is no more a "
+        "Postgres placeholder than `?` is (`syntax error at or near \":\"`). "
+        "Route this SQL through coord.sql.execute()/executemany() so "
+        "translate() can rewrite it to `%(name)s`:\n" + "\n".join(violations)
+    )
+
+
+# ── the ratchet, extended: no bare two-argument `MAX(` outside the seam ─────
+#
+# The sixth leg (#3083). `MAX(a, b)` is SQLite's *scalar* max; Postgres has
+# only the aggregate and spells the scalar `GREATEST`, failing with
+# `function max(integer, smallint) does not exist` — an error that names an
+# argument-type mismatch and so reads as a casting problem rather than a
+# spelling one. It is invisible on SQLite by construction, which is exactly
+# the shape of bug a ratchet is for. The one-argument aggregate is identical
+# on both backends and is not flagged; `coord/sql.py` itself is exempt,
+# because `greatest()` is where the SQLite spelling is supposed to live.
+
+
+def test_no_two_argument_max_in_statement_text_outside_the_dialect_seam():
+    """No ``coord/**`` module outside ``coord/sql.py`` names a
+    two-argument ``MAX(a, b)`` in its own statement text — that is the
+    SQLite-only scalar, and it must go through
+    :func:`coord.sql.greatest` (#3083).
+
+    Deliberately reintroducing e.g. ``"UPDATE t SET n = MAX(n, ?)"`` in
+    ``coord/portal_store.py`` makes this red.
+    """
+    violations = []
+    for rel, path in _tree_modules():
+        for site in _two_argument_max_sites(path):
+            violations.append(f"{rel}: {site}")
+    assert not violations, (
+        "two-argument `MAX(a, b)` in statement text outside the coord.sql "
+        "dialect seam (#3083) — that is SQLite's scalar max; Postgres "
+        "spells it GREATEST and rejects this with `function max(integer, "
+        "smallint) does not exist`. Route it through coord.sql.greatest() "
         "instead:\n" + "\n".join(violations)
     )
