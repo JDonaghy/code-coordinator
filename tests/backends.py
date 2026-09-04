@@ -230,6 +230,25 @@ def _open_postgres() -> BackendSession:
     conn.commit()
 
     def _teardown() -> None:
+        # #3082 review: a test that exercises get_connection()'s
+        # closed-connection handling (or calls coord.db.close() directly --
+        # this IS the connection override_connection() installed) can leave
+        # `conn` already closed by the time this teardown runs. Before this
+        # guard, teardown unconditionally tried `conn.rollback()` /
+        # `DROP SCHEMA` on it, which raised
+        # `psycopg.OperationalError: the connection is closed` here --
+        # the exact signature this issue exists to eliminate, just moved
+        # from a test body into its teardown. There is no connection left to
+        # roll back or drop a schema through at that point, so this is
+        # best-effort cleanup only: the private schema is leaked in the
+        # Postgres database for a test that itself closed its connection,
+        # same as it would be if the process were killed mid-test. Harmless
+        # in CI (the `postgres:16` service container is thrown away with the
+        # job) and in a local run against a scratch server -- `_next_schema_
+        # name()`'s counter means it can never collide with a later test's
+        # schema either way.
+        if getattr(conn, "closed", False):
+            return
         try:
             conn.rollback()
             with conn.cursor() as cur:
