@@ -3003,3 +3003,88 @@ class TestDiffPureRenames:
     def test_no_renames_in_a_plain_diff(self) -> None:
         diff = "diff --git a/src/foo.py b/src/foo.py\n"
         assert github_ops.diff_pure_renames(diff) == []
+
+
+class TestGetRepoMilestonesWithCounts:
+    """#3072: the roster projection — milestones plus GitHub's own open/closed
+    issue counters, backing ``GET /api/milestones`` on ``coord web``."""
+
+    def test_parses_the_jq_output_and_keeps_githubs_counts(self) -> None:
+        jq_output = (
+            '{"number": 4, "title": "ms-4", "state": "open", '
+            '"open_issues": 3, "closed_issues": 1, "description": ""}\n'
+            '{"number": 9, "title": "ms-9", "state": "closed", '
+            '"open_issues": 0, "closed_issues": 7, "description": ""}\n'
+        )
+        fake_result = MagicMock(returncode=0, stdout=jq_output, stderr="")
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            results = github_ops.get_repo_milestones_with_counts("acme/api")
+
+        assert results == [
+            {"number": 4, "title": "ms-4", "state": "open",
+             "open_issues": 3, "closed_issues": 1, "description": ""},
+            {"number": 9, "title": "ms-9", "state": "closed",
+             "open_issues": 0, "closed_issues": 7, "description": ""},
+        ]
+        args = mock_run.call_args[0][0]
+        assert "repos/acme/api/milestones?state=open" in " ".join(args)
+        assert args[args.index("--jq") + 1] == github_ops.MILESTONE_COUNTS_JQ
+
+    def test_returns_the_superset_get_repo_milestones_returns(self) -> None:
+        """`coord.plans.aggregate_repo_plans` takes this list directly, so
+        every key `get_repo_milestones` promises must still be present —
+        otherwise the roster silently aggregates against a different shape
+        than `coord plans` does."""
+        jq_output = (
+            '{"number": 4, "title": "ms-4", "state": "open", '
+            '"open_issues": 3, "closed_issues": 1, "description": ""}\n'
+        )
+        fake_result = MagicMock(returncode=0, stdout=jq_output, stderr="")
+        with patch("subprocess.run", return_value=fake_result):
+            (row,) = github_ops.get_repo_milestones_with_counts("acme/api")
+
+        assert {"number", "title"} <= set(row)
+
+    def test_skips_a_single_malformed_line(self) -> None:
+        """#1353's rule, inherited from `get_repo_milestones`: one bad line
+        must not discard every well-formed milestone alongside it."""
+        jq_output = (
+            '{"number": 4, "title": "ms-4", "state": "open", '
+            '"open_issues": 3, "closed_issues": 1, "description": ""}\n'
+            'not json at all\n'
+        )
+        fake_result = MagicMock(returncode=0, stdout=jq_output, stderr="")
+        with patch("subprocess.run", return_value=fake_result):
+            results = github_ops.get_repo_milestones_with_counts("acme/api")
+
+        assert [r["number"] for r in results] == [4]
+
+    def test_no_milestones_is_an_empty_list_not_an_error(self) -> None:
+        fake_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=fake_result):
+            assert github_ops.get_repo_milestones_with_counts("acme/api") == []
+
+    def test_forwards_state_query_param(self) -> None:
+        fake_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            github_ops.get_repo_milestones_with_counts("acme/api", state="all")
+
+        assert "state=all" in " ".join(mock_run.call_args[0][0])
+
+    def test_jq_filter_is_valid_jq_syntax(self) -> None:
+        """The #967 guard, for this filter: `.[].{...}` (no pipe) is invalid
+        jq and fails the whole call end to end — a class of bug every
+        mocked-`subprocess.run` test above is blind to. Runs the ACTUAL
+        pinned filter through a real jq engine.
+        """
+        jq = pytest.importorskip("jq")
+
+        sample = [
+            {"number": 4, "title": "ms-4", "state": "open", "open_issues": 3,
+             "closed_issues": 1, "description": "d", "html_url": "ignored"},
+        ]
+        result = jq.compile(github_ops.MILESTONE_COUNTS_JQ).input_value(sample).all()
+        assert result == [
+            {"number": 4, "title": "ms-4", "state": "open",
+             "open_issues": 3, "closed_issues": 1, "description": "d"},
+        ]
