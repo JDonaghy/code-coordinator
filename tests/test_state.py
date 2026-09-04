@@ -1128,6 +1128,121 @@ class TestReconcileBoardWriteHelpers:
         assert remaining == []
 
 
+class TestPromoteAdvisoryWithCommits:
+    """#3099: `coord.smoke.dispatch_pending_smoke` used to skip every
+    ``status='advisory'`` row unconditionally (``if completed.status !=
+    'done': continue``), even the #1357 false-positive shape where the
+    branch demonstrably carries commits — `coord drive --accept-advisory`
+    accepts that row and falls through to Test/Review/Merge, but the daemon
+    never actually dispatched Test for it, so nothing downstream ever
+    moved. `promote_advisory_with_commits` is the DB-level fix: it undoes
+    the mis-classification directly, and this class covers its four
+    contractual guarantees in isolation from the smoke-dispatch call site
+    (covered separately in tests/test_smoke.py)."""
+
+    def _insert_advisory_work(
+        self,
+        *,
+        assignment_id: str,
+        branch: str | None = "issue-3099-x",
+        review_state: str | None = None,
+    ) -> None:
+        from coord.db import get_connection
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        assignment = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=3099,
+            issue_title="t",
+            assignment_id=assignment_id,
+            status="advisory",
+            branch=branch,
+            type="work",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/myrepo")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='advisory' WHERE assignment_id=?",
+            (assignment_id,),
+        )
+        if review_state is not None:
+            conn.execute(
+                "UPDATE assignments SET review_state=? WHERE assignment_id=?",
+                (review_state, assignment_id),
+            )
+        conn.commit()
+
+    def test_promotes_advisory_to_done_and_clears_advisory_review_state(
+        self, coord_db
+    ) -> None:
+        from coord.db import get_connection
+        from coord.state import promote_advisory_with_commits
+
+        self._insert_advisory_work(assignment_id="adv-1", review_state="advisory")
+
+        updated = promote_advisory_with_commits("adv-1")
+
+        assert updated is True
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT status, review_state FROM assignments WHERE assignment_id=?",
+            ("adv-1",),
+        ).fetchone()
+        assert row[0] == "done"
+        assert row[1] is None
+
+    def test_leaves_a_non_advisory_review_state_untouched(self, coord_db) -> None:
+        """Only the specific 'advisory' stamp (reconcile.py's own #448
+        downgrade write) is cleared — a row that had already progressed to
+        review_state='dispatched'/'done' some other way must not be
+        silently reset."""
+        from coord.db import get_connection
+        from coord.state import promote_advisory_with_commits
+
+        self._insert_advisory_work(assignment_id="adv-2", review_state="dispatched")
+
+        promote_advisory_with_commits("adv-2")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT status, review_state FROM assignments WHERE assignment_id=?",
+            ("adv-2",),
+        ).fetchone()
+        assert row[0] == "done"
+        assert row[1] == "dispatched"
+
+    def test_is_a_noop_when_status_is_not_advisory(self, coord_db) -> None:
+        """Scoped `WHERE status='advisory'` guard: calling this on a row
+        some other writer already resolved a different way (a human's
+        `coord retry`, a race) must not clobber that outcome."""
+        from coord.db import get_connection
+        from coord.state import promote_advisory_with_commits
+
+        self._insert_advisory_work(assignment_id="adv-3")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='failed' WHERE assignment_id=?",
+            ("adv-3",),
+        )
+        conn.commit()
+
+        updated = promote_advisory_with_commits("adv-3")
+
+        assert updated is False
+        row = conn.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", ("adv-3",)
+        ).fetchone()
+        assert row[0] == "failed"
+
+    def test_returns_false_for_unknown_assignment_id(self, coord_db) -> None:
+        from coord.state import promote_advisory_with_commits
+
+        assert promote_advisory_with_commits("does-not-exist") is False
+
+
 class TestResetWedgedTestAuthorReview:
     """#1180: repairs a test-author/mock-author row whose review_state was
     stamped 'done' by a pre-#1150 work_is_terminal false positive (tracking-

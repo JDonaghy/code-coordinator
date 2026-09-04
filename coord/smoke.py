@@ -1475,6 +1475,55 @@ def dispatch_smoke(
 # ── Bulk dispatch (#1426) ────────────────────────────────────────────────────
 
 
+def _promote_advisory_row_if_commits_present(
+    completed: Assignment, config: Config
+) -> bool:
+    """#3099: promote one ``status='advisory'`` row to ``'done'`` in place,
+    IFF its branch is confirmed to carry commits ahead of the base branch —
+    the #1357 false-positive signature.
+
+    Mutates ``completed`` (the in-memory board row) AND persists the same
+    two fields to the DB via :func:`coord.state.promote_advisory_with_commits`
+    so the promotion survives even a tick that goes on to skip dispatching
+    Test for this row for an unrelated reason (no capability-matched
+    machine this pass, a dedupe hit, ...) — mirroring how `dispatch_smoke`
+    itself already persists `test_state='running'`/`'blocked'` directly
+    rather than relying solely on the caller's `if dispatched: write_board`.
+
+    Returns whether the row is (now) eligible to fall through to the
+    ordinary `status == 'done'` handling below — ``False`` for a genuinely
+    empty branch (``ahead == 0``) or an unconfirmable one (``ahead is
+    None``, e.g. a transient `gh api compare` failure or a repo missing
+    from `config`), both of which are left at `'advisory'` for a LATER pass
+    (or an operator) to resolve rather than guessed at here.
+    """
+    if not completed.assignment_id:
+        return False
+    ahead = github_ops.branch_commits_ahead_for_assignment(completed, config)
+    if not (isinstance(ahead, int) and not isinstance(ahead, bool) and ahead > 0):
+        return False
+    from coord.state import promote_advisory_with_commits
+
+    if not promote_advisory_with_commits(completed.assignment_id):
+        # Lost a race — some other writer already moved this row off
+        # 'advisory' (e.g. an operator's `coord retry`/`coord assign
+        # --force` between this scan starting and this UPDATE running).
+        # Don't guess at what it became; the normal `status != 'done'`
+        # check right after this call handles every outcome correctly.
+        return False
+    completed.status = "done"
+    if completed.review_state == "advisory":
+        completed.review_state = None
+    logger.info(
+        "dispatch_pending_smoke: promoted %s#%s row %s from 'advisory' to "
+        "'done' — branch %r carries %d confirmed commit(s) ahead of base "
+        "(the #1357 signature, #3099).",
+        completed.repo_name, completed.issue_number, completed.assignment_id,
+        completed.branch, ahead,
+    )
+    return True
+
+
 def dispatch_pending_smoke(
     board: Board,
     config: Config,
@@ -1512,6 +1561,32 @@ def dispatch_pending_smoke(
     for completed in board.completed:
         if completed.type not in WORK_LIKE_TYPES:
             continue
+        if completed.status == "advisory":
+            # #3099: an ADVISORY row whose branch demonstrably carries
+            # commits is the #1357 false positive — `coord drive
+            # --accept-advisory` already treats it as a good `done` that
+            # got mis-flagged and falls through to the Test/Review/Merge
+            # gates (`coord.drive._decide_advisory`), but the driver never
+            # dispatches those stages itself (this function does, for
+            # Test) — and this loop used to skip every `advisory` row
+            # unconditionally, right below. That left the row stuck
+            # forever: the driver prints "proceeding per
+            # --accept-advisory" every poll, and nothing downstream ever
+            # moves, because `status` never actually became `'done'`.
+            #
+            # The daemon has no session-scoped `--accept-advisory` flag to
+            # consult (this runs unattended, independent of any particular
+            # `coord drive` invocation), so it uses the same OBJECTIVE
+            # signal `_decide_advisory` itself gates on: a confirmed,
+            # positive commit count ahead of the base branch (#2553's
+            # `branch_commits_ahead_for_assignment` — a `gh api compare`
+            # call, no local checkout needed, unlike `coord.drive`'s own
+            # git-based verifier). `ahead in (0, None)` — genuinely empty,
+            # or unconfirmable — is left alone on purpose: those are
+            # #2416's bounded `coord retry` loop's and #2426's "could not
+            # verify, wait" case's territory respectively, not this one's.
+            if not _promote_advisory_row_if_commits_present(completed, config):
+                continue
         if completed.status != "done":
             continue
         if completed.test_state is not None:

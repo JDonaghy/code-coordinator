@@ -2292,6 +2292,113 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     assert result == [sentinel]
 
 
+# ── #3099: an ADVISORY row with confirmed commits is the #1357 false
+# positive and must be promoted to 'done' so Test actually dispatches,
+# instead of being skipped forever (the livelock #3099 reports: `coord
+# drive --accept-advisory` accepts the row locally, but nothing ever told
+# `dispatch_pending_smoke` — the two halves of #1357 disagreed). ────────────
+
+
+def test_dispatch_pending_smoke_promotes_advisory_row_with_confirmed_commits(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 3
+    )
+    monkeypatch.setattr(
+        "coord.state.promote_advisory_with_commits", lambda aid: True
+    )
+
+    row = replace(_completed(), status="advisory", review_state="advisory")
+    board = Board(completed=[row])
+    sentinel = object()
+    with _patch("coord.smoke.dispatch_smoke", return_value=sentinel) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert mock_dispatch.called, "promoted row must fall through to the normal 'done' dispatch"
+    assert result == [sentinel]
+    # The in-memory row is promoted too — a later dispatcher scanning the
+    # SAME board object (e.g. dispatch_pending_reviews on a later tick) must
+    # see 'done', not the stale 'advisory' this call started with.
+    assert row.status == "done"
+    assert row.review_state is None
+
+
+def test_dispatch_pending_smoke_leaves_zero_commit_advisory_row_alone(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """`ahead == 0` is a genuinely empty branch — #2416's bounded `coord
+    retry` loop owns that recovery, not an auto-promotion here."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 0
+    )
+
+    row = replace(_completed(), status="advisory")
+    board = Board(completed=[row])
+    with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert result == []
+    assert not mock_dispatch.called
+    assert row.status == "advisory"
+
+
+def test_dispatch_pending_smoke_leaves_unconfirmable_advisory_row_alone(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """`ahead is None` (repo missing from config, a transient `gh api
+    compare` failure) must never be read as "safe to promote" — #2426's
+    same fail-closed polarity as the driver's own git-based check."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: None
+    )
+
+    row = replace(_completed(), status="advisory")
+    board = Board(completed=[row])
+    with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert result == []
+    assert not mock_dispatch.called
+    assert row.status == "advisory"
+
+
+def test_dispatch_pending_smoke_does_not_dispatch_when_the_db_promotion_races(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """`promote_advisory_with_commits` returning False means some other
+    writer already resolved the row a different way between this scan
+    starting and the UPDATE running (e.g. an operator's `coord retry`) — the
+    in-memory row must be left exactly as read, not guessed at."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 5
+    )
+    monkeypatch.setattr(
+        "coord.state.promote_advisory_with_commits", lambda aid: False
+    )
+
+    row = replace(_completed(), status="advisory")
+    board = Board(completed=[row])
+    with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert result == []
+    assert not mock_dispatch.called
+    assert row.status == "advisory"
+
+
 # ── #1819: one branch, one Test run ─────────────────────────────────────────
 #
 # After a fix round an issue has TWO `work` rows on the SAME branch
