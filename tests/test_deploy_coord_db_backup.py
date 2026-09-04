@@ -82,6 +82,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,16 @@ def _run(
     path_entries = [str(fakebin)]
     if extra_path is not None:
         path_entries.append(str(extra_path))
+    # Running the venv's interpreter directly (`.venv/bin/python -m pytest`,
+    # as scripts/coord-test-runner.sh does) does NOT put `.venv/bin` on
+    # $PATH -- only `activate` does -- even though that's exactly where this
+    # venv's `coord` console script lives. Resolve it from the running
+    # interpreter rather than trusting the ambient $PATH, so `coord
+    # store-backend` (the #3085 guard, the script's first move) can find the
+    # real binary either way. Appended after fakebin/extra_path but before
+    # the ambient $PATH so an activated-venv or system-install environment,
+    # where ambient $PATH already resolves `coord` correctly, is unaffected.
+    path_entries.append(str(Path(sys.executable).parent))
     path_entries.append(env.get("PATH", ""))
     env["PATH"] = os.pathsep.join(path_entries)
     env["FAKE_MOUNTPOINT_EXIT"] = "0" if mounted else "1"
