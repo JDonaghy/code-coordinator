@@ -1227,6 +1227,34 @@ class TestGetConnectionPostgresPerThread:
     threads -- see coord/db.py's module docstring, "Connection-sharing
     model"."""
 
+    def _clear_override_without_closing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reset the override slot for this test WITHOUT calling ``.close()``
+        on the real connection the autouse ``coord_db`` fixture installed
+        there (#3082 review, non-blocking finding).
+
+        Every test below replaces routing with a fake Postgres connection
+        for its own duration, and needs ``_conn`` cleared first so
+        ``get_connection()`` doesn't just keep returning the fixture's real
+        override. The original code did this by calling the module's
+        ``close()``, which also calls ``.close()`` on whatever ``_conn``
+        currently is -- on the real Postgres backend (``COORD_TEST_BACKEND=
+        postgres``) that is the *fixture's own connection*, so closing it
+        here left ``tests/backends.py``'s teardown (schema DROP + rollback)
+        to run against an already-closed connection afterwards, raising
+        ``psycopg.OperationalError: the connection is closed`` at fixture
+        teardown -- a spurious error with nothing to do with this issue,
+        invisible on SQLite only because ``_open_sqlite()`` has no teardown
+        to trip over it.
+
+        ``monkeypatch.setattr`` restores whatever ``_conn`` held before this
+        call once the test ends, regardless of what the test body
+        reassigns it to in between (``override_connection()``, the real
+        ``close()`` in a ``finally`` block, ...) -- so the fixture's real
+        connection is always intact again by the time its own teardown
+        runs.
+        """
+        monkeypatch.setattr(db_mod, "_conn", None)
+
     def _route_to_fake_postgres(self, monkeypatch: pytest.MonkeyPatch) -> list[_FakePgConn]:
         opened: list[_FakePgConn] = []
 
@@ -1248,7 +1276,7 @@ class TestGetConnectionPostgresPerThread:
     def test_same_thread_reuses_the_same_connection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        close()  # undo the isolated_conn fixture's override for this test
+        self._clear_override_without_closing(monkeypatch)
         opened = self._route_to_fake_postgres(monkeypatch)
         try:
             first = db_mod.get_connection()
@@ -1261,7 +1289,7 @@ class TestGetConnectionPostgresPerThread:
     def test_different_threads_get_different_connections(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        close()
+        self._clear_override_without_closing(monkeypatch)
         opened = self._route_to_fake_postgres(monkeypatch)
         results: dict[str, object] = {}
 
@@ -1287,7 +1315,7 @@ class TestGetConnectionPostgresPerThread:
     def test_override_connection_wins_over_postgres_routing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        close()
+        self._clear_override_without_closing(monkeypatch)
         opened = self._route_to_fake_postgres(monkeypatch)
         override_conn = sqlite3.connect(":memory:")
         override_connection(override_conn)
@@ -1300,7 +1328,7 @@ class TestGetConnectionPostgresPerThread:
     def test_close_closes_this_threads_postgres_connection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        close()
+        self._clear_override_without_closing(monkeypatch)
         self._route_to_fake_postgres(monkeypatch)
         conn = db_mod.get_connection()
         assert isinstance(conn, _FakePgConn)
@@ -1323,7 +1351,7 @@ class TestGetConnectionPostgresPerThread:
         assertion: get_connection() hands back the same (now-closed) object
         both times, since nothing ever discarded it from the thread-local
         cache."""
-        close()
+        self._clear_override_without_closing(monkeypatch)
         opened = self._route_to_fake_postgres(monkeypatch)
         try:
             first = db_mod.get_connection()
@@ -1344,7 +1372,7 @@ class TestGetConnectionPostgresPerThread:
         normal resolution path, which under pytest means the #1960/#827
         production-database guards fire loudly instead of silently returning
         a dead connection -- a strict improvement over wedging forever."""
-        close()
+        self._clear_override_without_closing(monkeypatch)
         fake = _FakePgConn("postgresql://user@host/db")
         override_connection(fake)
         fake.close()
