@@ -218,7 +218,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "HTTP write path.",
     ),
     "test_portal_store.py": Classification(
-        10, (BUCKET_C,),
+        12, (BUCKET_C,),
         "The portal daemon-endpoint pattern, once per endpoint under test: a "
         "file board.db opened with check_same_thread=False (TestClient runs "
         "the handler on a worker thread the autouse connection cannot serve) "
@@ -255,7 +255,20 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "same two reasons: TestClient runs the handler on a worker thread the "
         "autouse connection cannot serve (hence check_same_thread=False), and "
         "the same file has to be handed to SqliteStore *by path* for the read "
-        "side, which scratch_database() cannot yield.",
+        "side, which scratch_database() cannot yield. "
+        "+2 for #3110's two `/portal-link` write-guard seams: "
+        "TestFanInGuard3110.test_daemon_endpoint_refuses_without_force_and_"
+        "accepts_with_it proves a POST that would fan one submission_id out "
+        "to a second target is refused (400) unless `force` is set — the "
+        "write that mailed a real customer 161 duplicate emails — and "
+        "TestUnlink3110.test_daemon_delete_endpoint covers the new DELETE "
+        "`/portal-link`, the daemon side of `coord portal unlink` that "
+        "replaces the hand sqlite edit the incident needed. Both are the same daemon-endpoint shape as every entry "
+        "above, and for exactly the same two reasons: the refusal is enforced "
+        "inside the handler, which TestClient runs on a worker thread the "
+        "autouse connection cannot serve (check_same_thread=False), and the "
+        "read-back has to go through the SqliteStore the app opened *by "
+        "path*, which scratch_database() cannot yield.",
     ),
     "test_milestone_gate.py": Classification(
         3, (BUCKET_C,),

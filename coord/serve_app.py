@@ -3353,6 +3353,22 @@ def openapi_spec() -> dict:
                                             "is replaced wholesale."
                                         ),
                                     },
+                                    "force": {
+                                        "type": "boolean",
+                                        "default": False,
+                                        "description": (
+                                            "#3110: without this, a write "
+                                            "whose submission_id is already "
+                                            "linked to a DIFFERENT target is "
+                                            "refused with 400 — that fan-in "
+                                            "is what mailed a real customer "
+                                            "161 duplicate emails. With it "
+                                            "the link MOVES: the other "
+                                            "target's claim is dropped, so "
+                                            "the escape hatch cannot itself "
+                                            "recreate the fan-in."
+                                        ),
+                                    },
                                 },
                                 "required": ["record"],
                             }
@@ -3364,7 +3380,69 @@ def openapi_spec() -> dict:
                         "description": "OK",
                         "content": {"application/json": {"schema": ok_response}},
                     },
-                    "400": {"description": "Bad portal-link"},
+                    "400": {
+                        "description": (
+                            "Bad portal-link — malformed record, or (#3110) "
+                            "its submission_id is already linked to another "
+                            "target and `force` was not set"
+                        )
+                    },
+                },
+            },
+            "delete": {
+                "summary": (
+                    "#3110: clear a milestone's/issue's portal link — "
+                    "`coord portal unlink`. The supported way to stop a bad "
+                    "link's notification fan-out, replacing the hand sqlite "
+                    "edit of `board_meta` the incident actually needed. Like "
+                    "GET/POST above it is not thin-client-refused (#2751): "
+                    "an operator killing an active flood needs it to work "
+                    "from wherever they are."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "milestone_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                    {
+                        "name": "actor", "in": "query", "required": False,
+                        "schema": {"type": "string"},
+                        "description": (
+                            "Recorded on the `portal_unlink` audit entry; "
+                            "empty when the caller does not identify itself."
+                        ),
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — {'deleted': true} if a link was removed, "
+                            "{'deleted': false} if that target had none"
+                        ),
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"deleted": {"type": "boolean"}},
+                                    "required": ["deleted"],
+                                }
+                            }
+                        },
+                    },
+                    "400": {
+                        "description": (
+                            "Missing repo_name, or not exactly one of "
+                            "milestone_number/issue_number"
+                        )
+                    },
                 },
             },
         },
