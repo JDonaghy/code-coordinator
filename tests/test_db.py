@@ -1308,6 +1308,52 @@ class TestGetConnectionPostgresPerThread:
         assert conn.closed is True
         assert getattr(db_mod._pg_thread_local, "conn", None) is None
 
+    def test_get_connection_reopens_after_the_cached_connection_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#3082: the per-thread cache has no invalidation path -- before the
+        fix, once ``_pg_thread_local.conn`` was populated, get_connection()
+        returned it unconditionally forever, even after something (the
+        server, a schema-per-test teardown) closed it out from under this
+        process. That is exactly what surfaced as 1,342 of the postgres
+        job's failures: ``psycopg.OperationalError: the connection is
+        closed`` on whatever statement ran next.
+
+        Without the fix this goes red on the ``second is not first``
+        assertion: get_connection() hands back the same (now-closed) object
+        both times, since nothing ever discarded it from the thread-local
+        cache."""
+        close()
+        opened = self._route_to_fake_postgres(monkeypatch)
+        try:
+            first = db_mod.get_connection()
+            first.close()  # simulate the server (or driver) dropping it
+            second = db_mod.get_connection()
+            assert second is not first
+            assert second.closed is False
+            assert len(opened) == 2  # the original open, plus the reopen
+        finally:
+            close()
+
+    def test_get_connection_discards_a_closed_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#3082 suspect 2: ``override_connection()`` always wins over the
+        thread-local cache, so a closed override that is never re-installed
+        must not be handed back forever either. Discarding it re-enters the
+        normal resolution path, which under pytest means the #1960/#827
+        production-database guards fire loudly instead of silently returning
+        a dead connection -- a strict improvement over wedging forever."""
+        close()
+        fake = _FakePgConn("postgresql://user@host/db")
+        override_connection(fake)
+        fake.close()
+        try:
+            with pytest.raises(db_mod.ProductionDatabaseGuardError):
+                db_mod.get_connection()
+        finally:
+            close()
+
 
 class TestOpenPostgresPytestGuard:
     def test_open_postgres_refuses_under_pytest(self) -> None:

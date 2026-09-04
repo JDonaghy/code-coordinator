@@ -39,6 +39,15 @@ deployment" (#827's own framing), so there is no live traffic to measure yet.
 backend — this is what lets ``tests/conftest.py``'s autouse ``coord_db``
 fixture keep injecting one in-memory SQLite connection without any test
 needing to know this function branches on the configured backend at all.
+
+Neither cache had an invalidation path before #3082: once a connection was
+cached, ``get_connection()`` returned it unconditionally forever, so a
+Postgres session the server (or a schema-per-test teardown) had already
+closed kept being handed back dead, surfacing as ``psycopg.OperationalError:
+the connection is closed`` on whatever statement ran next. Both caches now
+go through :func:`_connection_is_closed` before being returned — see that
+function's docstring — so a closed cached connection is discarded and
+reopened instead.
 """
 
 from __future__ import annotations
@@ -65,6 +74,36 @@ _conn: Any | None = None
 # "Connection-sharing model" section. Unused (empty) for the SQLite-only
 # fleet this ships into; only ever populated by get_connection() below.
 _pg_thread_local = threading.local()
+
+
+def _connection_is_closed(conn: Any) -> bool:
+    """True when *conn* is a driver connection that is already closed (#3082).
+
+    :func:`get_connection` calls this on every cached connection it is about
+    to hand back — the ``_conn`` singleton/override slot and the per-thread
+    Postgres cache alike — so a connection the server or driver already
+    closed out from under this process is never handed back a second time.
+    Before #3082 neither cache had any invalidation path at all: once
+    populated, both were returned unconditionally until something called
+    :func:`close`, so a dropped Postgres session (schema-per-test teardown
+    in ``tests/backends.py``, or — the shape this must also cover — a
+    production daemon's connection dropped by the server) wedged every
+    later ``get_connection()`` call on that thread onto the same dead
+    object, surfacing as ``psycopg.OperationalError: the connection is
+    closed`` on whatever statement ran next.
+
+    Checked via ``getattr(conn, "closed", False)`` rather than importing
+    psycopg — an optional dependency, see ``coord/sql.py``'s module
+    docstring for why nothing in this seam imports a driver directly:
+    psycopg3 exposes a bool ``.closed``, psycopg2 an int (``0`` open,
+    non-zero closed) — either way, truthy means closed.
+    ``sqlite3.Connection`` has no ``.closed`` attribute at all, so this
+    always reads False for it: the SQLite singleton path (and any test's
+    ``sqlite3.connect`` override) is byte-identical to before #3082, exactly
+    matching the module docstring's "unchanged from before this issue"
+    promise for that backend.
+    """
+    return bool(getattr(conn, "closed", False))
 
 
 def __getattr__(name: str) -> Path:
@@ -202,13 +241,23 @@ def get_connection() -> Any:
     returns the process-wide singleton (unchanged); Postgres returns this
     THREAD's lazily-opened connection. ``override_connection()`` always wins
     over either, regardless of which thread calls this.
+
+    #3082: neither cache is trusted blindly — :func:`_connection_is_closed`
+    is checked first, and a connection that already closed underneath this
+    process is discarded and reopened rather than handed back dead. See that
+    function's docstring for the incident this closes.
     """
     global _conn
     if _conn is not None:
-        return _conn
+        if not _connection_is_closed(_conn):
+            return _conn
+        _conn = None
     target = _resolve_store_target()
     if target.backend == sql.DIALECT_POSTGRES:
         conn = getattr(_pg_thread_local, "conn", None)
+        if conn is not None and _connection_is_closed(conn):
+            conn = None
+            _pg_thread_local.conn = None
         if conn is None:
             conn = _open_postgres(target.dsn)
             _pg_thread_local.conn = conn
