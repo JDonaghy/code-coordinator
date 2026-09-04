@@ -12,21 +12,41 @@ idempotency) runs on every machine with no server or driver required.
 ``COORD_TEST_BACKEND=postgres`` (CI's ``postgres`` job) points the exact same
 tests at a real Postgres schema, so ``run_import``'s Postgres write path
 gets a real round trip, not just a dialect-primitive assertion.
+
+#3086 adds the rehearsal and content-verification modes to that. Two things
+worth knowing before reading the bottom half of this file:
+
+- The **default** scratch factory
+  (``store_migrate.postgres_scratch_schema``) calls
+  ``coord.db.refuse_postgres_under_pytest``, so no test can ever reach a live
+  server through it -- deliberately, and
+  ``TestRunRehearsal::test_default_factory_refuses_to_touch_a_real_server_under_pytest``
+  asserts exactly that. Tests inject a ``ScratchTarget`` over
+  ``tests/backends.py``'s ``scratch_database`` instead, which is how the
+  rehearsal *orchestration* still gets exercised against a real Postgres
+  schema when the ``postgres`` job runs (and against a second SQLite file
+  everywhere else).
+- ``TestVerificationOracleCanFail`` is the #2096 half: an oracle that has
+  never failed is not an oracle, so each test there injects a real divergence
+  into the import path and asserts the verification catches it **and names the
+  right table and column**.
 """
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
+from typing import Any, Iterator
 
 import pytest
 from click.testing import CliRunner
 
 from coord import db as coord_db
 from coord import sql
-from coord import store_migrate
+from coord import store_migrate, store_parity
 from coord.commands.store_migrate import migrate_to_postgres
-from tests.backends import scratch_database
+from tests.backends import BACKEND_POSTGRES, active_backend, scratch_database
 
 
 def _open_source(tmp_path: Path, name: str = "source.db") -> sqlite3.Connection:
@@ -578,3 +598,619 @@ class TestMigrateToPostgresCli:
         )
         assert result.exit_code != 0
         assert "type-affinity" in result.output
+
+
+# ── #3086: content verification, timing and the rehearsal ────────────────
+
+
+def _seed_rich_source(tmp_path: Path, name: str = "source.db") -> Path:
+    """A source with rows in a text-keyed table, an integer-surrogate-keyed
+    table and a plain one -- enough shapes that ``compare_dumps``'s keyed and
+    surrogate-key paths both get exercised by the verification tests."""
+    conn = coord_db._open(tmp_path / name)
+    try:
+        conn.execute(
+            "INSERT INTO machines (name, host, capabilities, repos) VALUES (?, ?, ?, ?)",
+            ("precision", "precision.local", "gtk,browser", "coord"),
+        )
+        conn.execute(
+            "INSERT INTO machines (name, host) VALUES (?, ?)", ("nuc", "nuc.local")
+        )
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, state) VALUES (?, ?, ?, ?)",
+            ("coord", 3086, "rehearse the cutover", "open"),
+        )
+        for i in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"a{i}", "coord", "o/coord", f"issue-{i}", "main", i, f"t{i}", "queued"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return tmp_path / name
+
+
+@contextlib.contextmanager
+def _scratch_target(tmp_path: Path, name: str = "rehearsal.db") -> Iterator[Any]:
+    """A ``ScratchTarget`` over ``tests/backends.py``'s ``scratch_database``.
+
+    This is the *scratch_factory* seam :func:`store_migrate.run_rehearsal`
+    documents: the production factory
+    (``store_migrate.postgres_scratch_schema``) calls
+    ``coord.db.refuse_postgres_under_pytest`` and so can never be exercised
+    from a test -- deliberately, and there is a test below asserting exactly
+    that. Injecting here means the rehearsal *orchestration* still runs
+    against a second SQLite file by default and against a real Postgres schema
+    when ``COORD_TEST_BACKEND=postgres`` (CI's ``postgres`` job), which is what
+    #3086's acceptance asks for.
+    """
+    with scratch_database(tmp_path, name) as conn:
+        yield store_migrate.ScratchTarget(conn=conn, name=f"test scratch ({name})")
+
+
+class TestVerifyImport:
+    """``--verify``: content parity, the check row counts cannot make."""
+
+    def test_clean_import_has_no_content_differences(self, tmp_path: Path) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+            assert report.row_counts_ok
+            assert report.parity is not None
+            assert report.parity.differences == (), report.parity.render()
+            assert report.content_ok is True
+            assert report.ok
+
+    def test_excluded_bookkeeping_tables_are_not_reported_as_differences(
+        self, tmp_path: Path
+    ) -> None:
+        """``schema_version``/``schema_version_new`` are deliberately never
+        imported (the target re-derives its own on connect), so a verification
+        that dumped whole databases would manufacture a difference on exactly
+        the two tables the importer is *correct* to skip."""
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+            assert report.parity is not None
+            assert "schema_version" not in report.parity.tables_compared
+            assert "schema_version_new" not in report.parity.tables_compared
+            assert "machines" in report.parity.tables_compared
+
+    def test_verify_is_off_by_default(self, tmp_path: Path) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path, target_connector=lambda: target.conn
+            )
+            assert report.parity is None
+            assert report.content_ok is None
+            assert report.ok  # row counts alone still gate the default path
+
+    def test_dry_run_never_verifies(self, tmp_path: Path) -> None:
+        source_path = _seed_rich_source(tmp_path)
+
+        def _boom() -> Any:
+            raise AssertionError("target must not be opened during a dry run")
+
+        report = store_migrate.run_import(
+            sqlite_path=source_path, dry_run=True, verify=True, target_connector=_boom
+        )
+        assert report.parity is None
+
+
+class TestVerificationOracleCanFail:
+    """#2096: an oracle that has never failed is not an oracle.
+
+    Each test below injects a **real** divergence into the import path -- the
+    same technique ``tests/test_write_parity.py`` uses when it reverts
+    ``coord.state._UPSERT_SQL`` to its pre-#2726 ``INSERT OR REPLACE`` form --
+    and asserts the migration verification catches it *and names the right
+    table and column*. "It reported something" is not enough: #829 has to
+    classify the entries, so the report has to be specific.
+    """
+
+    def _lossy_import_table(self, table: str, column: str) -> Any:
+        """The real :func:`store_migrate.import_table`, then one column blanked
+        on the target -- an importer that copies every row but loses a column's
+        values. Row counts are **identical**, which is the whole point: this is
+        precisely the failure row-count parity (#828's only check) cannot see.
+        """
+        real = store_migrate.import_table
+
+        def _patched(source_conn: Any, target_conn: Any, name: str) -> Any:
+            result = real(source_conn, target_conn, name)
+            if name == table:
+                sql.execute(target_conn, f'UPDATE "{table}" SET "{column}" = NULL')
+                target_conn.commit()
+            return result
+
+        return _patched
+
+    def test_lost_column_values_are_caught_and_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        monkeypatch.setattr(
+            store_migrate,
+            "import_table",
+            self._lossy_import_table("machines", "capabilities"),
+        )
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+
+        # Row counts still match -- the injected bug is invisible to them.
+        assert report.row_counts_ok
+        assert report.content_ok is False
+        assert not report.ok
+
+        assert report.parity is not None
+        machines = report.parity.for_table("machines")
+        assert machines, report.parity.render()
+        cells = [d for d in machines if d.kind == store_parity.KIND_CELL]
+        assert {d.column for d in cells} == {"capabilities"}
+        offending = next(d for d in cells if d.value_a == "gtk,browser")
+        assert offending.value_b is None
+        # And it renders as text a human can act on, naming both sides.
+        assert "machines" in report.parity.render()
+        assert "capabilities" in report.parity.render()
+
+    def test_dropped_row_is_caught_and_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An importer that silently loses a row. Row counts catch this one
+        too -- the assertion is that content parity *also* does, and says
+        which row, so the two gates agree instead of one hiding the other."""
+        real = store_migrate.import_table
+
+        def _patched(source_conn: Any, target_conn: Any, name: str) -> Any:
+            result = real(source_conn, target_conn, name)
+            if name == "machines":
+                sql.execute(target_conn, "DELETE FROM machines WHERE name = 'nuc'")
+                target_conn.commit()
+            return result
+
+        monkeypatch.setattr(store_migrate, "import_table", _patched)
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+
+        assert report.content_ok is False
+        assert report.parity is not None
+        only_in_source = [
+            d
+            for d in report.parity.for_table("machines")
+            if d.kind == store_parity.KIND_ROW_ONLY_IN_A
+        ]
+        assert len(only_in_source) == 1
+        assert only_in_source[0].value_a["name"] == "nuc"
+
+    def test_drifted_surrogate_ids_are_caught_not_normalised_away(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The check that pins ``rank_surrogate_keys=False``.
+
+        #2885 normalises a single-column integer primary key to its rank,
+        because two *independent* replays legitimately land on different
+        sequence values. A migration is not that: the importer copies every id
+        verbatim, so an id that moved is a real finding. With ranking left on,
+        this divergence would compare clean -- which is exactly the assertion
+        at the bottom.
+        """
+        real = store_migrate.import_table
+
+        def _patched(source_conn: Any, target_conn: Any, name: str) -> Any:
+            result = real(source_conn, target_conn, name)
+            if name == "merge_queue":
+                sql.execute(target_conn, "UPDATE merge_queue SET id = id + 100")
+                target_conn.commit()
+            return result
+
+        monkeypatch.setattr(store_migrate, "import_table", _patched)
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+            assert report.row_counts_ok
+            assert report.content_ok is False
+            assert "merge_queue" in report.parity.tables_with_differences()
+
+            # ...and the same two databases DO compare clean under #2885's
+            # rank normalisation, proving the migration check needs its own
+            # setting rather than the replay harness's default.
+            tables = [t.table for t in report.tables]
+            source_conn = sql.connect(
+                backend=sql.DIALECT_SQLITE, sqlite_path=source_path, read_only=True
+            )
+            try:
+                sql.apply_row_factory(source_conn)
+                ranked = store_parity.compare_dumps(
+                    store_parity.dump_database(source_conn, label="a", tables=tables),
+                    store_parity.dump_database(target.conn, label="b", tables=tables),
+                )
+            finally:
+                source_conn.close()
+            assert "merge_queue" not in ranked.tables_with_differences()
+
+
+class TestImportTiming:
+    """The rehearsal's primary deliverable: a number you can size an outage
+    with. Without it the mode is decorative."""
+
+    def test_per_table_and_total_elapsed_are_reported(self, tmp_path: Path) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        with _scratch_target(tmp_path) as target:
+            report = store_migrate.run_import(
+                sqlite_path=source_path, target_connector=lambda: target.conn
+            )
+        assert report.tables
+        assert all(t.elapsed_seconds >= 0.0 for t in report.tables)
+        assert report.elapsed_seconds > 0.0
+        # The total covers the audits and the verification too, not just the
+        # sum of the per-table writes -- it is what the cutover actually costs.
+        assert report.elapsed_seconds >= sum(t.elapsed_seconds for t in report.tables)
+
+    def test_dry_run_is_timed_but_writes_nothing(self, tmp_path: Path) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        report = store_migrate.run_import(
+            sqlite_path=source_path,
+            dry_run=True,
+            target_connector=lambda: pytest.fail("dry run opened the target"),
+        )
+        assert report.elapsed_seconds > 0.0
+        assert all(t.elapsed_seconds == 0.0 for t in report.tables)
+
+
+class TestRunRehearsal:
+    def test_clean_rehearsal_verifies_times_and_drops_the_target(
+        self, tmp_path: Path
+    ) -> None:
+        source_path = _seed_rich_source(tmp_path)
+        seen: list[store_migrate.ScratchTarget] = []
+
+        @contextlib.contextmanager
+        def _factory() -> Iterator[store_migrate.ScratchTarget]:
+            with _scratch_target(tmp_path) as target:
+                seen.append(target)
+                yield target
+
+        report = store_migrate.run_rehearsal(
+            sqlite_path=source_path, scratch_factory=_factory
+        )
+
+        assert report.ok
+        assert report.parity is not None and report.parity.is_clean
+        assert report.elapsed_seconds > 0.0
+        assert report.scratch_target
+        # Nothing left behind on a clean run: the scratch target is named in
+        # the report but was NOT marked for retention.
+        assert report.retained_target == ""
+        assert seen and seen[0].keep is False
+
+    def test_failed_rehearsal_retains_and_names_the_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dropping the evidence on failure is the wrong default (#3086)."""
+        real = store_migrate.import_table
+
+        def _patched(source_conn: Any, target_conn: Any, name: str) -> Any:
+            result = real(source_conn, target_conn, name)
+            if name == "machines":
+                sql.execute(target_conn, "UPDATE machines SET host = 'drifted'")
+                target_conn.commit()
+            return result
+
+        monkeypatch.setattr(store_migrate, "import_table", _patched)
+        source_path = _seed_rich_source(tmp_path)
+        seen: list[store_migrate.ScratchTarget] = []
+
+        @contextlib.contextmanager
+        def _factory() -> Iterator[store_migrate.ScratchTarget]:
+            with _scratch_target(tmp_path) as target:
+                seen.append(target)
+                yield target
+
+        report = store_migrate.run_rehearsal(
+            sqlite_path=source_path, scratch_factory=_factory
+        )
+
+        assert not report.ok
+        assert report.retained_target == report.scratch_target != ""
+        assert seen and seen[0].keep is True
+
+    def test_aborted_rehearsal_carries_the_retained_target_on_the_exception(
+        self, tmp_path: Path
+    ) -> None:
+        conn = coord_db._open(tmp_path / "source.db")
+        try:
+            conn.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title) VALUES (?, ?, ?, ?, ?)",
+                ("a1", "m1", "r1", "not-a-number", "t1"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        @contextlib.contextmanager
+        def _factory() -> Iterator[store_migrate.ScratchTarget]:
+            with _scratch_target(tmp_path) as target:
+                yield target
+
+        with pytest.raises(store_migrate.ImportAborted) as excinfo:
+            store_migrate.run_rehearsal(
+                sqlite_path=tmp_path / "source.db", scratch_factory=_factory
+            )
+        assert excinfo.value.retained_target
+
+    def test_default_factory_refuses_to_touch_a_real_server_under_pytest(self) -> None:
+        """``refuse_postgres_under_pytest`` is a correct guard and #3086 must
+        not weaken it -- the rehearsal's default scratch factory calls it on
+        its own account, so no test can ever reach a live server this way."""
+        with pytest.raises(coord_db.ProductionDatabaseGuardError):
+            with store_migrate.postgres_scratch_schema(
+                "postgresql://u:p@nonexistent.invalid/coord"
+            ):
+                pytest.fail("the pytest guard did not fire")
+
+    def test_the_guard_message_never_leaks_the_dsn(self) -> None:
+        with pytest.raises(coord_db.ProductionDatabaseGuardError) as excinfo:
+            with store_migrate.postgres_scratch_schema(
+                "postgresql://coorduser:s3cr3tpw@dbhost.example:5432/coord"
+            ):
+                pytest.fail("the pytest guard did not fire")
+        assert "s3cr3tpw" not in str(excinfo.value)
+        assert "coorduser" not in str(excinfo.value)
+        assert "dbhost.example" in str(excinfo.value)
+
+
+class TestRehearsalCli:
+    """``coord migrate-to-postgres --rehearse`` / ``--verify`` output and exit
+    codes. ``run_rehearsal``/``run_import`` are stubbed where a real target
+    would be needed: the guard above means a CLI test can never open one, and
+    what is under test here is the rendering and the exit status."""
+
+    def _report(
+        self, *, parity: Any, retained: str = "", scratch: str = "host=db dbname=coord schema s1"
+    ) -> store_migrate.ImportReport:
+        report = store_migrate.ImportReport(dry_run=False)
+        report.tables = [
+            store_migrate.TableReport("machines", 2, 2, elapsed_seconds=0.5),
+            store_migrate.TableReport("issues", 1, 1, elapsed_seconds=1.25),
+        ]
+        report.elapsed_seconds = 2.0
+        report.parity = parity
+        report.scratch_target = scratch
+        report.retained_target = retained
+        return report
+
+    def _clean_parity(self) -> store_parity.ParityReport:
+        return store_parity.ParityReport(
+            label_a="source (sqlite)",
+            label_b="imported target",
+            differences=(),
+            tables_compared=("issues", "machines"),
+        )
+
+    def _dirty_parity(self) -> store_parity.ParityReport:
+        return store_parity.ParityReport(
+            label_a="source (sqlite)",
+            label_b="imported target",
+            differences=(
+                store_parity.Difference(
+                    "machines",
+                    store_parity.KIND_CELL,
+                    key="'nuc'",
+                    column="host",
+                    value_a="nuc.local",
+                    value_b=None,
+                ),
+            ),
+            tables_compared=("issues", "machines"),
+        )
+
+    def test_rehearsal_prints_timing_parity_and_the_dropped_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.commands.store_migrate.run_rehearsal",
+            lambda **kwargs: self._report(parity=self._clean_parity()),
+        )
+        conn = coord_db._open(tmp_path / "source.db")
+        conn.close()
+
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://coorduser:s3cr3tpw@dbhost.example:5432/coord",
+                "--rehearse",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "2.00s elapsed" in result.output      # the outage-sizing number
+        assert "1.25" in result.output               # the per-table breakdown
+        assert "no differences" in result.output     # the parity report
+        assert "Scratch target dropped" in result.output
+        # The runbook facts #3086 documents rather than changes.
+        assert "commits PER TABLE" in result.output
+        assert "COORD_TEST_POSTGRES_DSN" in result.output
+        assert "coord.db.latest" in result.output
+        # ...and still no credential anywhere in the output.
+        assert "s3cr3tpw" not in result.output
+        assert "coorduser" not in result.output
+
+    def test_failed_content_parity_exits_non_zero_and_names_the_residue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.commands.store_migrate.run_rehearsal",
+            lambda **kwargs: self._report(
+                parity=self._dirty_parity(), retained="host=db dbname=coord schema s1"
+            ),
+        )
+        conn = coord_db._open(tmp_path / "source.db")
+        conn.close()
+
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://u:p@host/db",
+                "--rehearse",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "content parity FAILED" in result.output
+        assert "machines" in result.output and "host" in result.output
+        assert "RETAINED for inspection" in result.output
+        assert "Scratch target dropped" not in result.output
+
+    def test_verify_on_a_real_import_exits_non_zero_on_a_dirty_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--verify`` is available on the real (non-rehearsal) import too."""
+        captured: dict[str, Any] = {}
+
+        def _fake_run_import(**kwargs: Any) -> store_migrate.ImportReport:
+            captured.update(kwargs)
+            return self._report(parity=self._dirty_parity(), scratch="")
+
+        monkeypatch.setattr("coord.commands.store_migrate.run_import", _fake_run_import)
+        conn = coord_db._open(tmp_path / "source.db")
+        conn.close()
+
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://u:p@host/db",
+                "--verify",
+            ],
+        )
+        assert captured["verify"] is True
+        assert result.exit_code != 0
+        assert "content parity FAILED" in result.output
+
+    def test_import_without_verify_says_content_was_not_checked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.commands.store_migrate.run_import",
+            lambda **kwargs: self._report(parity=None, scratch=""),
+        )
+        conn = coord_db._open(tmp_path / "source.db")
+        conn.close()
+
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            [
+                "--source",
+                str(tmp_path / "source.db"),
+                "--dsn",
+                "postgresql://u:p@host/db",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Content NOT verified" in result.output
+
+    def test_rehearse_and_dry_run_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            ["--source", str(tmp_path / "nope.db"), "--rehearse", "--dry-run"],
+        )
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
+    def test_rehearse_rejects_force(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            ["--source", str(tmp_path / "nope.db"), "--rehearse", "--force"],
+        )
+        assert result.exit_code != 0
+        assert "meaningless with --rehearse" in result.output
+
+    def test_dry_run_help_says_plainly_it_never_opens_the_target(self) -> None:
+        """The two modes must not be confused: --dry-run's own help has to say
+        it proves nothing about the target."""
+        result = CliRunner().invoke(migrate_to_postgres, ["--help"])
+        assert result.exit_code == 0
+        text = " ".join(result.output.split())
+        assert "SOURCE-ONLY" in text
+        assert "without opening or writing the target" in text
+        assert "use --rehearse" in text
+
+    def test_dry_run_still_reports_source_counts_only(self, tmp_path: Path) -> None:
+        """#3086 must not change --dry-run: it stays the cheap source audit."""
+        source_path = _seed_rich_source(tmp_path)
+        result = CliRunner().invoke(
+            migrate_to_postgres,
+            ["--source", str(source_path), "--dsn", "postgresql://u:p@host/db", "--dry-run"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Audits passed" in result.output
+        assert "no target opened, no rows written" in result.output
+        assert "source rows" in result.output
+        assert "Content NOT verified" not in result.output
+
+
+@pytest.mark.skipif(
+    active_backend() != BACKEND_POSTGRES,
+    reason=(
+        "rehearsal-against-real-Postgres check: needs COORD_TEST_BACKEND=postgres "
+        "(CI's `postgres` job). Every other test in this file runs the same "
+        "orchestration against a second SQLite file, so a laptop with no server "
+        "still covers it -- this one exists to prove the target really was "
+        "Postgres when the job that can prove it runs."
+    ),
+)
+def test_rehearsal_runs_against_a_real_postgres_target(tmp_path: Path) -> None:
+    """#3086 acceptance: the rehearsal orchestration is exercised against a
+    **real** Postgres when CI's ``postgres`` job runs this file.
+
+    The value the SQLite default cannot give: Postgres enforces every FK at
+    insert time, rejects the type drift SQLite tolerates, and needs the
+    identity-sequence resync :func:`store_migrate.import_table` does. A green
+    row-count *and* a clean content report here is the first evidence that the
+    cutover's write path actually works end to end.
+    """
+    source_path = _seed_rich_source(tmp_path)
+
+    @contextlib.contextmanager
+    def _factory() -> Iterator[store_migrate.ScratchTarget]:
+        with _scratch_target(tmp_path) as target:
+            assert sql.detect_dialect(target.conn) == sql.DIALECT_POSTGRES
+            yield target
+
+    report = store_migrate.run_rehearsal(sqlite_path=source_path, scratch_factory=_factory)
+    assert report.ok, report.parity.render() if report.parity else "row counts"
+    assert report.parity is not None and report.parity.is_clean
+    assert report.elapsed_seconds > 0.0
+    assert report.retained_target == ""
