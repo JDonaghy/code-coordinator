@@ -3243,6 +3243,22 @@ def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
     return results
 
 
+#: The ``--jq`` projection :func:`get_repo_milestones_with_counts` sends.
+#:
+#: A named module constant rather than an inline literal so the #967
+#: regression guard (an invalid filter — ``.[].{...}`` with no pipe — that
+#: made the whole call fail end to end, and which no mocked-``subprocess``
+#: test could catch) can run THIS EXACT string through a real jq engine.
+#: :func:`get_repo_milestones`'s own filter is pinned the same way, by
+#: source-regex, in ``tests/test_cli_milestone_assign.py``; this one is
+#: split across several source lines, so it needs a name to be reachable.
+MILESTONE_COUNTS_JQ = (
+    ".[] | {number: .number, title: .title, state: .state, "
+    "open_issues: .open_issues, closed_issues: .closed_issues, "
+    "description: .description}"
+)
+
+
 def get_repo_milestones_with_counts(repo: str, *, state: str = "open") -> list[dict]:
     """Milestones for *repo*, carrying GitHub's own open/closed issue counts.
 
@@ -3270,10 +3286,7 @@ def get_repo_milestones_with_counts(repo: str, *, state: str = "open") -> list[d
     raw = _gh(
         "api", "--paginate",
         f"repos/{repo}/milestones?state={state}",
-        "--jq",
-        ".[] | {number: .number, title: .title, state: .state, "
-        "open_issues: .open_issues, closed_issues: .closed_issues, "
-        "description: .description}",
+        "--jq", MILESTONE_COUNTS_JQ,
         caller="github_ops.get_repo_milestones_with_counts")
     # One compact JSON object per line, same as get_repo_milestones — and the
     # same #1353 rule: skip a single malformed line rather than letting it
