@@ -118,6 +118,7 @@ from __future__ import annotations
 import datetime
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -789,7 +790,7 @@ def enqueue_relayed_answer(
 # fold does not attempt to make (`describing`, `in-design`, `needs-input`,
 # `on-hold`) — see `docs/CUSTOMER_PORTAL.md` for the full mapping table.
 #
-# Two callers, same fold, same churn guard:
+# Two callers, same fold, same guards:
 #   * `coord.merge_queue._maybe_push_status` — right after a `type="work"`
 #     merge closes an issue (the #2508/PDR-3 pattern this issue asks to
 #     extend from design rounds to status), for immediacy.
@@ -798,6 +799,15 @@ def enqueue_relayed_answer(
 #     the self-healing sweep that also catches "work started" (no merge
 #     involved to hook) and anything the merge-time push missed (the daemon
 #     was down, the portal was unreachable, ...).
+#
+# "Same guards" is load-bearing, not incidental (#3096). Both callers reach
+# the outbox only through `_fold_status_for_link`, and every bound on
+# customer notification lives inside it — so there is no path by which one
+# caller can push a status the other would have refused. When those two
+# callers WERE able to disagree — two `coord portal link` records naming one
+# submission_id, folded independently one second apart in the same tick — the
+# result was 322 outbox rows alternating in-progress/shipped and 100+ mails
+# to a real customer over seven days.
 
 #: The three automatically-derived customer statuses (#2588). Every other
 #: entry in `coord.portal_bridge.SUBMISSION_STATUSES` is out of this fold's
@@ -917,6 +927,24 @@ def _single_issue_as_list(repo_cfg: Any, issue_number: int) -> list[dict[str, An
     return [issue]
 
 
+def _queued_status_rows(submission_id: str) -> list["portal_store.OutboxRow"]:
+    """Every STATUS row ever queued for *submission_id*, oldest first, in any
+    outbox state (pending, draft, applied, rejected, held).
+
+    Deliberately every state, not just ``applied``: a row that was queued is
+    a row that will be pushed, and the guards below exist to stop a push from
+    being *created*, not to audit what the portal ended up storing.
+
+    Reads the local ``portal_outbox`` directly, same as the #2588 churn guard
+    always has — every automatic caller of the fold runs on the daemon host,
+    which is where that table lives.
+    """
+    return [
+        r for r in portal_store.outbox_for_submission(submission_id)
+        if r.kind == KIND_STATUS
+    ]
+
+
 def _last_queued_status(submission_id: str) -> str | None:
     """The status of the most recently queued STATUS row for *submission_id*
     (any outbox state — pending, applied, rejected, held), or ``None`` if
@@ -928,14 +956,211 @@ def _last_queued_status(submission_id: str) -> str | None:
     portal a write — it does not save this submission's outbox from filling
     with (or the customer from a second identical mail past) an unchanged
     push. See this module's docstring, "Churn must not become mail."
+
+    **This guard suppresses a repeat and nothing else** — #3096: it cannot
+    see an ALTERNATION. When the fold flipped ``in-progress`` -> ``shipped``
+    -> ``in-progress`` once per tick, every push genuinely differed from the
+    one before it, so this comparison passed 322 consecutive times and a
+    customer got 100+ "your project has shipped" mails over seven days. The
+    guards below are the ones that bound that; this one stays because it is
+    still the cheapest and most common suppression.
     """
-    rows = [
-        r for r in portal_store.outbox_for_submission(submission_id)
-        if r.kind == KIND_STATUS
-    ]
+    rows = _queued_status_rows(submission_id)
     if not rows:
         return None
     return rows[-1].fields.get("status")
+
+
+# ── #3096: the three bounds on automatic customer notification ──────────────
+#
+# One flood, three independent things that should have stopped it and didn't.
+# Each guard below is deliberately allowed to be redundant with the others:
+# the failure mode being defended against is customer-facing, unbounded, and
+# was invisible in every coord surface for seven days, so "this one is already
+# covered by that one" is not a reason to drop either.
+#
+#   1. `_authoritative_link_block_reason` — the ROOT CAUSE. Two links pointing
+#      at one submission_id made two callers in the same tick fold two
+#      different answers, one second apart.
+#   2. `_reentry_block_reason` — the LIFECYCLE. A customer status is a
+#      lifecycle, not a state machine that revisits; `shipped` is terminal.
+#   3. `_flood_block_reason` — the BACKSTOP. A per-submission ceiling that
+#      holds regardless of which bug is upstream of it.
+
+
+def _link_target_identity(link: "portal_store.PortalLink") -> tuple:
+    """The ``(repo, milestone, issue)`` triple that identifies WHICH target a
+    link is scoped to — the thing two links pointing at one submission differ
+    in. Compared instead of the whole :class:`~coord.portal_store.PortalLink`
+    so a difference in ``linked_at``/``actor`` between two reads of the same
+    record cannot read as "a different link".
+    """
+    return (link.repo_name, link.milestone_number, link.issue_number)
+
+
+def _link_precedence(link: "portal_store.PortalLink") -> tuple:
+    """Sort key picking the ONE link allowed to fold status for a submission.
+
+    Milestone-scoped beats issue-scoped: a milestone link folds *every* issue
+    in the submission, so its answer is the complete one, while an issue link
+    (#2665) only ever sees its own single issue and will read ``shipped`` the
+    moment that one issue closes — which is exactly the pair of answers that
+    oscillated in #3096. Ties break on ``(repo_name, number)`` so the choice
+    is total and deterministic: two callers in the same tick must not be able
+    to disagree about which link is authoritative, or the reconciliation is
+    worth nothing.
+    """
+    number = link.milestone_number
+    if number is None:
+        number = link.issue_number
+    return (
+        0 if link.milestone_number is not None else 1,
+        link.repo_name or "",
+        number if number is not None else 0,
+    )
+
+
+def authoritative_link(submission_id: str) -> "portal_store.PortalLink | None":
+    """The single link permitted to fold customer status for *submission_id*,
+    or ``None`` when nothing is recorded for it (#3096).
+
+    ``coord portal link`` overwrites per TARGET — ``(repo, milestone)`` or
+    ``(repo, issue)`` — and nothing has ever stopped two different targets
+    from naming the same ``submission_id``. That is not a corrupt state, it
+    is a reachable one (an operator links the milestone, then links a
+    milestone-less follow-up issue to the same customer submission), and it
+    is what SUB-1EA1D3 was in: :func:`sync_submission_statuses` folded both
+    links independently, one second apart, and enqueued whichever answer each
+    one produced.
+
+    So the fold picks one and only one. This is the "they must not both be
+    authoritative" half of #3096, and it lives here — one function both
+    automatic callers (the daemon tick and
+    :func:`coord.merge_queue._maybe_push_status`) reach through
+    :func:`_fold_status_for_link` — precisely so neither can be reconciled
+    without the other.
+    """
+    candidates = [
+        link for link in portal_store.list_milestone_links()
+        if link.submission_id == submission_id
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=_link_precedence)
+
+
+def _authoritative_link_block_reason(link: "portal_store.PortalLink") -> str | None:
+    """Why *link* must not fold status for its submission, or ``None`` if it
+    is the authoritative one (#3096).
+
+    Fails **open** when no links can be read at all (``authoritative_link``
+    returns ``None`` — a thin client with an empty local DB, a monkeypatched
+    test seam): a link we were handed but cannot corroborate is still folded,
+    same posture the rest of this bridge takes on an unreadable record.
+    """
+    winner = authoritative_link(link.submission_id)
+    if winner is None or _link_target_identity(winner) == _link_target_identity(link):
+        return None
+    return (
+        f"{link.target_desc} is not the authoritative link for "
+        f"{link.submission_id} ({winner.target_desc} is) — two links on one "
+        "submission fold to two different statuses and oscillate (#3096); "
+        "drop one with `coord portal link`"
+    )
+
+
+def _reentry_block_reason(submission_id: str, status: str) -> str | None:
+    """Why folding *submission_id* into *status* would be a RE-ENTRY rather
+    than a lifecycle step, or ``None`` if it is a genuine forward move
+    (#3096).
+
+    The customer vocabulary is a lifecycle, not a state machine that
+    revisits, and ``shipped`` is the terminal one (coord-portal's
+    ``src/notifications.ts``). Two rules follow:
+
+    * once ``shipped`` has been queued, the automatic fold pushes nothing
+      further — a submission cannot un-ship;
+    * a status this submission has already been notified into is never
+      pushed a second time.
+
+    Rule two is what the #2588 churn guard could not do: it compared against
+    the LAST queued status only, so `A -> B -> A` slipped through every time.
+    This compares against every status ever queued, which is the difference
+    between suppressing a repeat and suppressing an alternation.
+
+    Scoped to the automatic fold on purpose. A human running `coord portal
+    enqueue-status`, and the question/relayed-answer consumers that nudge a
+    submission off ``needs-input``, all go through :func:`enqueue_status`
+    directly and are unaffected — they are deliberate acts with a person
+    behind them, not a loop.
+
+    The cost, stated plainly: a submission whose fold legitimately wants to
+    re-enter a status (work re-opened under a shipped milestone) stops being
+    auto-notified and reports the refusal on every tick until an operator
+    resolves it. That is the trade #3096 asks for — a stuck status an
+    operator can see beats an unbounded mail flood nobody can.
+    """
+    seen = {
+        s for s in (r.fields.get("status") for r in _queued_status_rows(submission_id))
+        if s
+    }
+    if not seen:
+        return None
+    if STATUS_SHIPPED in seen and status != STATUS_SHIPPED:
+        return (
+            f"{submission_id} was already notified {STATUS_SHIPPED!r}, which is "
+            f"terminal — refusing to re-notify it {status!r} (#3096)"
+        )
+    if status in seen:
+        return (
+            f"{submission_id} has already been notified {status!r} once — "
+            "refusing to re-enter a status the customer has already seen "
+            "(#3096); the fold is oscillating"
+        )
+    return None
+
+
+#: #3096: how far back :func:`_flood_block_reason` counts, and how many
+#: automatic status pushes one submission may make inside that window.
+#: Calibrated against the production outbox on 2026-09-04: every submission in
+#: the system except the one that flooded had FOUR status rows or fewer, ever,
+#: so a ceiling of six per rolling day is far above any observed healthy rate
+#: and still holds the worst case to single digits.
+_STATUS_PUSH_WINDOW_SEC = 24 * 60 * 60
+_STATUS_PUSH_CEILING = 6
+
+
+def _flood_block_reason(submission_id: str, now: float | None) -> str | None:
+    """Why *submission_id* has had too many automatic status pushes to take
+    another one right now, or ``None`` if it is under the ceiling (#3096).
+
+    The backstop, and the only one of the three guards that does not need to
+    understand the bug it is defending against. 322 pushes for one submission
+    while every other in the system had four should have tripped *something*;
+    nothing in coord noticed, and the flood was found only because the
+    recipient mentioned it in conversation. A ceiling here would have capped
+    it at single digits no matter which of the other two bugs caused it.
+
+    Rolling window rather than a lifetime total: a long-lived submission
+    legitimately moves through the status vocabulary more than a handful of
+    times over months, but never more than a handful of times in one day.
+
+    Reported as a failure (``StatusFoldResult.failed``), so it reaches
+    :func:`sync_tick`'s error list and, at merge time, a
+    ``status_push_failed`` merge event — refuse AND escalate, since a
+    submission that hits this ceiling has a bug upstream of it by definition.
+    """
+    stamp = time.time() if now is None else now
+    cutoff = stamp - _STATUS_PUSH_WINDOW_SEC
+    recent = [r for r in _queued_status_rows(submission_id) if r.enqueued_at >= cutoff]
+    if len(recent) < _STATUS_PUSH_CEILING:
+        return None
+    return (
+        f"{submission_id} has had {len(recent)} automatic status pushes in the "
+        f"last {int(_STATUS_PUSH_WINDOW_SEC // 3600)}h (ceiling "
+        f"{_STATUS_PUSH_CEILING}) — refusing to notify the customer again "
+        "until someone looks at why (#3096)"
+    )
 
 
 @dataclass(frozen=True)
@@ -954,8 +1179,15 @@ class StatusFoldResult:
     reason: str
     row: "portal_store.OutboxRow | None" = None
     #: True only for a genuine failure worth surfacing (a GitHub read
-    #: failure, `enqueue_status` refusing) — never set for the common,
-    #: silent-by-design outcomes (no link on file, no issues yet, unchanged).
+    #: failure, `enqueue_status` refusing, or — #3096 — a refused push: a
+    #: duplicate link, a re-entered status, a submission over the flood
+    #: ceiling) — never set for the common, silent-by-design outcomes (no
+    #: link on file, no issues yet, unchanged).
+    #:
+    #: #3096's refusals are deliberately loud rather than silent. The whole
+    #: reason a customer got 100+ mails over seven days is that no surface in
+    #: coord reported anything wrong; a refusal that logged nothing would
+    #: bound the damage and keep the invisibility.
     failed: bool = False
 
     @property
@@ -1062,11 +1294,25 @@ def _fold_status_for_link(
     :func:`fold_status_for_issue` (#2665): everything downstream of "the link
     is resolved" is identical between the two shapes — only how the member
     issue(s) are read off GitHub (*issues_fn*) differs.
+
+    Also the single choke point every automatic status push passes through,
+    which is why #3096's three guards live here and not in either caller: the
+    daemon tick and the merge-queue hook must not be able to disagree about
+    whether a push is allowed, and the only way to guarantee that is for
+    there to be one place that decides.
     """
     repo_cfg = config.repo(repo_name) if config is not None else None
     if repo_cfg is None:
         return StatusFoldResult(
             link.submission_id, None, f"{repo_name!r} is not in coordinator.yml",
+        )
+
+    # #3096 guard 1 (the root cause) — before the GitHub read, so a duplicate
+    # link costs nothing per tick beyond the local lookup that rejects it.
+    not_authoritative = _authoritative_link_block_reason(link)
+    if not_authoritative is not None:
+        return StatusFoldResult(
+            link.submission_id, None, not_authoritative, failed=True,
         )
 
     try:
@@ -1089,6 +1335,20 @@ def _fold_status_for_link(
             link.submission_id, status,
             "unchanged since last push — not re-notifying (#2588)",
         )
+
+    # #3096 guard 2 (the lifecycle) — the fold WANTS to move, but into a
+    # status this submission has already been notified into. That is an
+    # oscillation, not progress, and it is reported rather than pushed.
+    reentry = _reentry_block_reason(link.submission_id, status)
+    if reentry is not None:
+        return StatusFoldResult(link.submission_id, status, reentry, failed=True)
+
+    # #3096 guard 3 (the backstop) — last thing before the enqueue, so it
+    # bounds every automatic push regardless of which guard above let it
+    # through or what future caller arrives here.
+    flooding = _flood_block_reason(link.submission_id, now)
+    if flooding is not None:
+        return StatusFoldResult(link.submission_id, status, flooding, failed=True)
 
     try:
         row = enqueue_status(link.submission_id, status, config=config, now=now)
@@ -1172,6 +1432,13 @@ def sync_submission_statuses(
     (chosen by which of ``milestone_number``/``issue_number`` the link
     carries), both of which never raise, so one broken link (an unresolvable
     repo, a GitHub outage) can never stop the rest from folding.
+
+    Every link is still *walked* even when several name the same submission —
+    :func:`authoritative_link` (#3096) lets exactly one of them fold and the
+    rest come back as failed results naming the winner. That is deliberate:
+    silently skipping the losers would fix the flood and hide the
+    misconfiguration that caused it, and the misconfiguration is the thing an
+    operator has to go and undo.
     """
     if config is None:
         return []

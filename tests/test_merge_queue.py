@@ -2265,6 +2265,48 @@ class TestStatusPushOnMerge:
         assert len(rows) == 1
         assert rows[0].fields["status"] == "shipped"
 
+    def test_milestone_less_issue_folds_through_its_issue_link(
+        self, monkeypatch,
+    ) -> None:
+        """#3096: this hook and the daemon tick must fold the SAME set of
+        links. A milestone-less issue with a `coord portal link --issue`
+        (#2665) on it was visible to the tick and invisible here, so the two
+        automatic callers saw different link universes and could reach
+        different answers for one submission."""
+        from coord import portal_store
+        portal_store.link_issue(
+            repo_name="api", issue_number=1, submission_id="sub_2",
+        )
+        cfg = self._config()
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda repo, n: {"number": n, "state": "CLOSED"},
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="work")],
+            _MockAuthorGh(issue_milestone_number=None),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "status_queued"
+        assert "sub_2" in events[-1].message
+        assert "shipped" in events[-1].message
+
+    def test_milestone_less_unlinked_issue_stays_a_silent_no_op(self) -> None:
+        """The overwhelmingly common case — no link on file — must still cost
+        nothing and say nothing."""
+        cfg = self._config()
+
+        events = process(
+            [_q("w1", size=10, assignment_type="work")],
+            _MockAuthorGh(issue_milestone_number=None),
+            config=cfg, board=self._board(),
+        )
+
+        assert not [e for e in events if e.kind.startswith("status_")]
+        assert any(e.kind == "merged" for e in events)
+
     def test_unchanged_status_produces_no_event(self, monkeypatch) -> None:
         self._link()
         cfg = self._config()

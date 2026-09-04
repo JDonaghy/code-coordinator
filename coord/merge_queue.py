@@ -6270,6 +6270,18 @@ def _maybe_push_status(
     `coord.serve_app._portal_sync_tick`) is the self-healing half: it also
     catches "work started" (no merge involved to hook here) and anything
     this hook missed (the daemon was down, the portal was unreachable).
+
+    #3096 — **the two halves must fold the same link universe.** This hook
+    used to resolve only the merged issue's MILESTONE, so a milestone-less
+    issue with a `coord portal link --issue` on it (#2665) was visible to the
+    tick and invisible here; the two callers saw different sets of links and
+    could reach different answers for the same submission. It now falls back
+    to the issue-scoped fold when the merged issue carries no milestone,
+    which is the same either/or `sync_submission_statuses` branches on. The
+    "which link wins when several name one submission" half of that
+    reconciliation lives one level down, in
+    `coord.portal_sync.authoritative_link`, so both callers inherit it rather
+    than each implementing it.
     """
     if entry.assignment_type not in CLOSES_ISSUE_TYPES:
         return None
@@ -6289,14 +6301,20 @@ def _maybe_push_status(
         )
     milestone = (issue_data or {}).get("milestone") or {}
     milestone_number = milestone.get("number")
-    if milestone_number is None:
-        return None
 
-    from coord.portal_sync import fold_status_for_milestone  # noqa: PLC0415
-
-    result = fold_status_for_milestone(
-        config, entry.repo_name, milestone_number, board=board,
+    from coord.portal_sync import (  # noqa: PLC0415
+        fold_status_for_issue,
+        fold_status_for_milestone,
     )
+
+    if milestone_number is not None:
+        result = fold_status_for_milestone(
+            config, entry.repo_name, milestone_number, board=board,
+        )
+    else:
+        result = fold_status_for_issue(
+            config, entry.repo_name, entry.issue_number, board=board,
+        )
     if result.row is not None:
         return MergeEvent(
             entry, "status_queued",
