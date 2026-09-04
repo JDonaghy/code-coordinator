@@ -79,6 +79,34 @@ def _units(directory: Path) -> dict[str, Path]:
 SOURCE_UNITS = _units(SOURCE_DIR)
 
 
+def _shared_non_unit_files() -> list[str]:
+    """Files that exist under BOTH `deploy/` and `coord/deploy/` and are not
+    `*.service`/`*.timer` — i.e. everything the parametrized unit-identity
+    test below does not already cover.
+
+    `coord/deploy/README.md` says the `*.sh` helpers "are not copied here",
+    but `coord-db-backup.sh` *is* (since #2098), and `[tool.setuptools.
+    package-data]` ships the whole directory via a `deploy/*` glob — so that
+    copy really does go out in the wheel. #3085 found it a release behind:
+    the repo-root script had grown the `coord store-backend` refusal and the
+    packaged one still had none, so the wheel shipped the exact pre-fix
+    script this issue exists to replace. Nothing reads the packaged copy
+    today, which is precisely why the drift was silent.
+    """
+    packaged_units = set(_units(PACKAGED_DIR))
+    shared: list[str] = []
+    for path in sorted(PACKAGED_DIR.iterdir()):
+        if not path.is_file() or path.name in packaged_units:
+            continue
+        if (SOURCE_DIR / path.name).is_file():
+            shared.append(path.name)
+    return shared
+
+
+SHARED_NON_UNIT_FILES = _shared_non_unit_files()
+
+
+
 def test_source_deploy_dir_has_units() -> None:
     """Guards the guard: an empty source dir would make every other
     assertion here vacuously true."""
@@ -112,6 +140,29 @@ def test_packaged_unit_is_byte_identical(name: str) -> None:
     assert packaged.read_bytes() == (SOURCE_DIR / name).read_bytes(), (
         f"coord/deploy/{name} has drifted from deploy/{name}. deploy/ is the "
         f"source of truth — run: cp deploy/{name} coord/deploy/{name}"
+    )
+
+
+def test_shared_non_unit_files_are_known() -> None:
+    """Guards the guard: if the only shared non-unit file ever stops being
+    copied, the parametrized test below silently covers nothing."""
+    assert "coord-db-backup.sh" in SHARED_NON_UNIT_FILES, (
+        "coord/deploy/coord-db-backup.sh is gone. If that removal was "
+        "deliberate (coord/deploy/README.md does say *.sh helpers are not "
+        "copied here), delete this test with it — but do not leave a "
+        "packaged copy around unguarded."
+    )
+
+
+@pytest.mark.parametrize("name", SHARED_NON_UNIT_FILES)
+def test_packaged_non_unit_file_is_byte_identical(name: str) -> None:
+    """#3085: `coord/deploy/coord-db-backup.sh` sat a release behind
+    `deploy/coord-db-backup.sh` because only `*.service`/`*.timer` were
+    checked, while `package-data`'s `deploy/*` glob shipped it regardless."""
+    assert (PACKAGED_DIR / name).read_bytes() == (SOURCE_DIR / name).read_bytes(), (
+        f"coord/deploy/{name} has drifted from deploy/{name}, and the wheel "
+        f"ships the stale copy. deploy/ is the source of truth — run: "
+        f"cp deploy/{name} coord/deploy/{name}"
     )
 
 
