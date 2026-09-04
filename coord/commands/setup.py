@@ -24,6 +24,49 @@ def version() -> None:
     click.echo(f"coord {__version__}")
 
 
+@click.command(
+    "store-backend",
+    help=(
+        "Print the resolved store backend (sqlite/postgres) for THIS machine, "
+        "reading local config only -- no daemon, no network. Output on "
+        "success is one line: '<backend>' or '<backend> <redacted-target>'."
+    ),
+)
+def store_backend_cmd() -> None:
+    """Deliberately the narrowest possible surface over
+    :func:`coord.db.resolve_store_backend` (#3084/#3085).
+
+    Every other config-reading command in this file (``config_cmd`` below,
+    ``coord doctor``) goes through ``_load_config``, which -- correctly, for
+    those commands -- redirects to the daemon over the network when this
+    machine is a thin client (``resolve_board_service()`` returns non-None,
+    e.g. `precision`'s ``~/.coord/client.toml``, no local
+    ``coordinator.yml`` at all -- see ``tests/test_ambient_home_isolation.py``
+    for the incident that shape caused). ``resolve_store_backend()`` reads
+    THIS machine's local ``coordinator.yml``/``$COORD_CONFIG`` directly and
+    never redirects -- exactly the "which store am I on, right here" question
+    a shell script consuming this command's stdout needs answered without a
+    network round trip, an unreachable-daemon failure mode, or a
+    fleet-wide config it didn't ask for. (``coord doctor``'s own
+    store-backend section makes the identical local-only call for the
+    identical reason -- see its docstring.)
+
+    A malformed *explicit* ``store:`` block still raises ``ConfigError`` here,
+    uncaught -- same contract as ``resolve_store_backend()`` itself: that one
+    config problem must fail loud (nonzero exit, a traceback on stderr) rather
+    than silently answering "sqlite". Callers such as
+    ``deploy/coord-db-backup.sh`` treat any nonzero exit from this command as
+    "could not determine the backend" and refuse to guess.
+    """
+    from coord.db import resolve_store_backend  # noqa: PLC0415
+
+    backend, redacted_target = resolve_store_backend()
+    if redacted_target:
+        click.echo(f"{backend} {redacted_target}")
+    else:
+        click.echo(backend)
+
+
 @click.command("config", help="Load coordinator.yml and pretty-print the parsed config.")
 @_CONFIG_OPTION
 def config_cmd(config_path: Path) -> None:

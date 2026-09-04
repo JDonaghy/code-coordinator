@@ -51,6 +51,28 @@ a *shell script's* behaviour when the binary is present -- on a machine
 without it, this file has nothing to say, and saying nothing must not look
 like "the branch broke the backup script". The stdlib `sqlite3` *module* is
 always available, so the guard keys on the CLI only.
+
+#3085 -- A THIRD SEAM: `coord` ITSELF, ON A REAL $PATH.
+
+The refusal tests below (`test_refuses_when_backend_is_*`,
+`test_refuses_when_coord_command_is_unavailable`) exercise the script's new
+first move -- asking `coord store-backend` (coord.db.resolve_store_backend(),
+#3084) which storage engine is actually configured, and refusing before
+touching the filesystem when the answer isn't sqlite. Unlike `mountpoint` and
+`sqlite3` above, `coord` itself is NOT faked: it is the real, installed
+`coord` command (this repo's own dev/CI venv provides it), driven through a
+real `coordinator.yml` fixture -- there is no seam to fake, `coord
+store-backend` is the thing under test. `_run`'s `coord_config` /
+`extra_env` (for `COORD_BIN`) parameters exist for exactly this. Every
+existing (pre-#3085) test in this file, and any new one that doesn't pass
+`coord_config`, gets `$COORD_CONFIG` pinned to a path that never exists --
+see `_run`'s own comment -- so "no store: block" resolves to sqlite
+deterministically, never from whatever happens to be sitting in the real
+`$HOME` of the machine running the suite (the exact ambient-leak class
+`tests/test_ambient_home_isolation.py` exists to catch, one paragraph above).
+These new tests need no `sqlite3` CLI at all -- the backend refusal exits
+before the script's first `sqlite3` invocation -- but they still fall under
+the file's module-wide skip for consistency with the rest of this file.
 """
 
 from __future__ import annotations
@@ -116,6 +138,8 @@ def _run(
     retain: int | None = None,
     mounted: bool = True,
     extra_path: Path | None = None,
+    coord_config: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir(exist_ok=True)
@@ -134,6 +158,17 @@ def _run(
         env["COORD_BACKUP_RETAIN"] = str(retain)
     else:
         env.pop("COORD_BACKUP_RETAIN", None)
+    # #3085: the script now shells out to `coord store-backend`, which reads
+    # $COORD_CONFIG (falling back to ~/.coord/coordinator.yml, then
+    # ./coordinator.yml) -- exactly the ambient-state leak
+    # tests/test_ambient_home_isolation.py exists to catch. Pin it to a path
+    # that never exists by default, so every existing test in this file keeps
+    # exercising the documented "absent store: block == sqlite" fail-open
+    # behaviour deterministically, regardless of what happens to be sitting
+    # in the real $HOME or $COORD_CONFIG of the machine running the suite.
+    env["COORD_CONFIG"] = str(coord_config) if coord_config is not None else str(tmp_path / "no-such-coordinator.yml")
+    if extra_env:
+        env.update(extra_env)
 
     return subprocess.run(
         ["bash", str(BACKUP_SCRIPT)],
@@ -338,3 +373,92 @@ def test_retention_prunes_oldest_beyond_RETAIN_and_never_touches_REJECTED(tmp_pa
     # .REJECTED is never touched by pruning, regardless of RETAIN.
     assert rejected.exists()
     assert "3 snapshots retained" in result.stdout
+
+
+# ── #3085: refuse a dead SQLite file after a Postgres cutover ──────────────
+
+
+def _write_store_config(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(f"repos: []\nmachines: []\n{body}")
+    return p
+
+
+def test_refuses_when_backend_is_postgres_and_writes_no_snapshot(tmp_path: Path) -> None:
+    """The issue's own refusal-path smoke test, driven for real: with a
+    postgres `store:` block, the script must exit non-zero, name the backend
+    and #1822, and leave the backup directory empty -- even though the
+    SQLite source file is perfectly healthy (VACUUM INTO, integrity_check
+    and the assignments check would all happily pass against it, which is
+    exactly the false-green failure this issue is about)."""
+    cfg = _write_store_config(
+        tmp_path,
+        "store:\n  backend: postgres\n  dsn: postgresql://user:pass@dbhost:5432/coord\n",
+    )
+    src = tmp_path / "coord.db"
+    _make_source_db(src, rows=5)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True, coord_config=cfg)
+
+    assert result.returncode != 0
+    assert "postgres" in result.stderr
+    assert "1822" in result.stderr
+    assert not dest_dir.exists() or not list(dest_dir.iterdir())
+
+
+def test_backend_refusal_takes_priority_over_the_mountpoint_check(tmp_path: Path) -> None:
+    """The backend check runs first, before any filesystem guard -- a
+    Postgres-configured host must get the backend message even when the SSD
+    also happens to be unplugged, not a misleading mountpoint complaint."""
+    cfg = _write_store_config(
+        tmp_path,
+        "store:\n  backend: postgres\n  dsn: postgresql://user:pass@dbhost:5432/coord\n",
+    )
+    src = tmp_path / "coord.db"
+    _make_source_db(src)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=False, coord_config=cfg)
+
+    assert result.returncode != 0
+    assert "postgres" in result.stderr
+    assert "not a mountpoint" not in result.stderr
+    assert not dest_dir.exists() or not list(dest_dir.iterdir())
+
+
+def test_succeeds_with_an_explicit_sqlite_backend_block(tmp_path: Path) -> None:
+    """Acceptance criterion: `store.backend: sqlite` (written out explicitly,
+    not just the default absent-block case) must behave byte-for-byte like
+    today -- a real snapshot gets written."""
+    cfg = _write_store_config(tmp_path, "store:\n  backend: sqlite\n")
+    src = tmp_path / "coord.db"
+    _make_source_db(src, rows=2)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True, coord_config=cfg)
+
+    assert result.returncode == 0, result.stderr
+    assert len(_snapshots(dest_dir)) == 1
+
+
+def test_refuses_when_coord_command_is_unavailable(tmp_path: Path) -> None:
+    """If the accessor itself can't be reached at all (here: `$COORD_BIN`
+    points at a name that isn't on `$PATH`), the script must refuse loudly
+    rather than fall back to assuming sqlite -- the issue's own "grep-free
+    failure, not a silent SQLite assumption" requirement."""
+    src = tmp_path / "coord.db"
+    _make_source_db(src)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(
+        tmp_path,
+        src=src,
+        dest_dir=dest_dir,
+        mounted=True,
+        extra_env={"COORD_BIN": "coord-does-not-exist-3085"},
+    )
+
+    assert result.returncode != 0
+    assert "cannot determine the store backend" in result.stderr
+    assert not dest_dir.exists() or not list(dest_dir.iterdir())

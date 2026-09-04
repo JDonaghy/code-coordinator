@@ -14,6 +14,21 @@
 # NOT a substitute for off-box backup: this protects against db corruption, a
 # bad migration, accidental deletion and OS-disk failure. It does NOT protect
 # against the machine being lost, stolen or burned. See #1822.
+#
+# #3085: this lane protects a live SQLite coord.db, full stop. After a
+# Postgres cutover (#829) the SQLite file, if it is even still there, is a
+# frozen, dead snapshot of pre-cutover state -- every guard below (mountpoint,
+# VACUUM INTO, integrity_check, the assignments-non-empty check) would pass
+# against it happily and print a green "ok" line for a backup that would roll
+# the fleet back to before the cutover. So the very first thing this script
+# does is ask `coord` which backend is actually configured (`coord
+# store-backend`, a thin wrapper over coord.db.resolve_store_backend() --
+# #3084/#3085) rather than re-parsing coordinator.yml's `store:` block here in
+# bash, and refuses to run at all, before touching the filesystem, when the
+# answer isn't sqlite. If `coord` itself can't answer (not on PATH, or exits
+# nonzero for any reason -- including a malformed `store:` block, which
+# resolve_store_backend() deliberately raises on), this also refuses rather
+# than falling back to assuming sqlite.
 set -uo pipefail
 
 SRC="${COORD_DB:-$HOME/.coord/coord.db}"
@@ -23,6 +38,30 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$DEST_DIR/coord.db.$STAMP"
 
 fail() { echo "coord-db-backup: FAILED: $*" >&2; exit 1; }
+
+COORD_BIN="${COORD_BIN:-coord}"
+command -v "$COORD_BIN" >/dev/null 2>&1 \
+  || fail "cannot determine the store backend: '$COORD_BIN' not found on \$PATH — refusing to assume sqlite (see #1822)"
+
+# stdout only — stderr can carry unrelated dev-only warnings (e.g. an
+# editable-install worktree not on its default branch) that must not
+# contaminate the one line of output we parse below. Re-run once, capturing
+# stderr, ONLY on failure, purely for a useful error message.
+BACKEND_OUTPUT="$("$COORD_BIN" store-backend 2>/dev/null)"
+BACKEND_RC=$?
+if [ "$BACKEND_RC" -ne 0 ]; then
+  BACKEND_ERR="$("$COORD_BIN" store-backend 2>&1 >/dev/null)"
+  fail "cannot determine the store backend: '$COORD_BIN store-backend' exited $BACKEND_RC — refusing to assume sqlite (see #1822): ${BACKEND_ERR:-<no output>}"
+fi
+
+# stdout is "<backend>" or "<backend> <redacted target>" — first word only.
+BACKEND="$(printf '%s\n' "$BACKEND_OUTPUT" | awk 'NF { print $1; exit }')"
+[ -n "$BACKEND" ] \
+  || fail "cannot determine the store backend: '$COORD_BIN store-backend' printed nothing — refusing to assume sqlite (see #1822)"
+
+if [ "$BACKEND" != "sqlite" ]; then
+  fail "the configured store backend is '$BACKEND', not sqlite — this lane only protects the SQLite file and does not know how to back up $BACKEND. No snapshot written. The real, backend-agnostic answer is #1822 (continuous backup + verified restore), which this issue does not replace."
+fi
 
 [ -f "$SRC" ] || fail "source db not found: $SRC"
 
