@@ -29,8 +29,19 @@ style every call site written *before* this seam existed already uses.
 paramstyle before running the statement; SQLite needs no translation (qmark
 is already its native style) and Postgres gets ``?`` rewritten to ``%s``.
 
-One case is genuinely non-trivial: a literal ``?`` inside a quoted SQL string
-(``'why?'``) must NOT be rewritten -- see :func:`_qmark_to_pyformat`.
+Two cases are genuinely non-trivial, and both are places a ``?`` is *not* a
+placeholder: inside a quoted SQL string (``'why?'``), and inside a ``--`` or
+``/* */`` SQL comment (``-- which cursor?``) -- see
+:func:`_qmark_to_pyformat`.  The comment case is not hypothetical: an
+apostrophe in an ordinary English word inside a ``--`` comment (#3083's
+``-- ... the "child's Pipeline row" bug``) used to open a phantom string
+literal that swallowed every placeholder after it, so ``coord/state.py``'s
+21-placeholder dispatch upsert reached psycopg with 17.
+
+Callers may also write sqlite3's ``named`` paramstyle (``:name``, bound from
+a dict) -- a handful of test-harness statements do.  Those translate to
+psycopg's ``pyformat`` ``%(name)s`` in the same pass, so a named statement
+is no less routed through this seam than a qmark one.
 
 ``ON CONFLICT ... DO UPDATE SET col = excluded.col`` is *already* portable
 (SQLite adopted Postgres's UPSERT syntax in 3.24, the version bundled with
@@ -173,8 +184,12 @@ def detect_dialect(conn: Any) -> str:
     Both ``psycopg`` (v3) and ``psycopg2`` connections resolve to
     :data:`DIALECT_POSTGRES` -- Postgres is Postgres regardless of which
     driver generation opened the connection.
+
+    A :class:`TranslatingConnection` is unwrapped first, so the dialect is
+    always read off the real driver connection underneath rather than off
+    the proxy's own module.
     """
-    module = type(conn).__module__.partition(".")[0]
+    module = type(unwrap(conn)).__module__.partition(".")[0]
     try:
         return _DRIVER_DIALECTS[module]
     except KeyError:
@@ -254,10 +269,19 @@ def connect(
 # ── paramstyle translation ───────────────────────────────────────────────
 
 
-def _qmark_to_pyformat(sql: str) -> str:
-    """Rewrite sqlite3-style ``?`` placeholders to psycopg-style ``%s``.
+#: A sqlite3 ``named``-paramstyle placeholder: ``:name``.  The leading
+#: ``(?<![\w:])`` keeps ``tier:small`` (a word-attached colon -- never a
+#: placeholder) and the second half of a ``::`` cast from matching; the
+#: trailing ``(?![\w:])`` keeps ``::`` itself and a Sphinx-style ``:func:``
+#: role from being mistaken for one.
+_NAMED_PARAM_RE = re.compile(r"(?<![\w:]):([A-Za-z_]\w*)(?![\w:])")
 
-    Two things make this non-trivial rather than a blind ``sql.replace("?",
+
+def _qmark_to_pyformat(sql: str) -> str:
+    """Rewrite sqlite3-style placeholders -- positional ``?`` and named
+    ``:name`` -- to psycopg-style ``%s`` / ``%(name)s``.
+
+    Three things make this non-trivial rather than a blind ``sql.replace("?",
     "%s")``:
 
     1. A ``?`` inside a quoted SQL string literal (``'why?'``) is data, not a
@@ -265,13 +289,28 @@ def _qmark_to_pyformat(sql: str) -> str:
        scanner that tracks whether it is inside a ``'...'``/``"..."``
        literal (honoring the standard doubled-quote escape, e.g.
        ``'it''s ok?'``) and only rewrites ``?`` outside one.
-    2. ``pyformat`` is literally Python ``%``-formatting under the hood, so
+    2. A ``?`` inside a ``--`` line comment or a ``/* ... */`` block comment
+       is likewise not a placeholder -- and, far more dangerously, neither
+       is an **apostrophe** in one.  Before #3083 this scanner had no notion
+       of comments at all, so an ordinary English possessive inside a ``--``
+       comment (``-- ... the "child's Pipeline row" bug``, in
+       ``coord/state.py``'s dispatch upsert) opened a string literal that
+       never closed until the next stray quote, silently swallowing every
+       placeholder in between: 21 ``?`` went in and 17 ``%s`` came out, and
+       psycopg refused the statement with "the query has 17 placeholders but
+       21 parameters were passed".  Comments are therefore skipped as a unit
+       here, exactly as ``tests/test_sql_dialect.py``'s ratchet already did
+       when *detecting* placeholders.  Block comments nest, matching
+       Postgres (SQLite does not nest them, but a nesting scanner accepts a
+       strict superset, so no statement either backend accepts is
+       mistranslated).
+    3. ``pyformat`` is literally Python ``%``-formatting under the hood, so
        ANY literal ``%`` in the statement -- including inside a string
-       literal, e.g. ``LIKE '%foo%'`` -- must be doubled to ``%%`` or
-       psycopg misparses the format string.  qmark has no such character, so
-       this class of bug cannot exist before translation; it can only be
-       introduced by it, which is why this function must be the one to fix
-       it up rather than leaving it to callers.
+       literal or a comment, e.g. ``LIKE '%foo%'`` -- must be doubled to
+       ``%%`` or psycopg misparses the format string.  qmark has no such
+       character, so this class of bug cannot exist before translation; it
+       can only be introduced by it, which is why this function must be the
+       one to fix it up rather than leaving it to callers.
     """
     out: list[str] = []
     in_string: str | None = None  # active quote char ("'" or '"'), or None
@@ -299,6 +338,28 @@ def _qmark_to_pyformat(sql: str) -> str:
             i += 1
             continue
         # Not inside a string literal.
+        if sql[i : i + 2] == "--":
+            # Line comment: copy verbatim to (and including) the newline.
+            end = sql.find("\n", i)
+            end = n if end == -1 else end
+            out.append(sql[i:end].replace("%", "%%"))
+            i = end
+            continue
+        if sql[i : i + 2] == "/*":
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if sql[j : j + 2] == "/*":
+                    depth += 1
+                    j += 2
+                elif sql[j : j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append(sql[i:j].replace("%", "%%"))
+            i = j
+            continue
         if ch in ("'", '"'):
             in_string = ch
             out.append(ch)
@@ -306,6 +367,19 @@ def _qmark_to_pyformat(sql: str) -> str:
             continue
         if ch == "?":
             out.append("%s")
+            i += 1
+            continue
+        if ch == ":":
+            if sql[i : i + 2] == "::":  # Postgres cast operator, not a param
+                out.append("::")
+                i += 2
+                continue
+            match = _NAMED_PARAM_RE.match(sql, i)
+            if match is not None:
+                out.append(f"%({match.group(1)})s")
+                i = match.end()
+                continue
+            out.append(ch)
             i += 1
             continue
         if ch == "%":
@@ -358,6 +432,119 @@ def executemany(conn: Any, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> 
     cur = conn.cursor()
     cur.executemany(translate(sql, dialect), seq_of_params)
     return cur
+
+
+# ── the translating connection proxy (#3083) ─────────────────────────────
+
+
+class TranslatingConnection:
+    """A DB-API connection that translates paramstyle on its own
+    ``.execute()``/``.executemany()`` -- everything else proxies straight
+    through to the connection it wraps (#3083).
+
+    **Why this exists.** ``coord/**`` never calls ``conn.execute()``: the
+    #2768 ratchet refuses it, so every shipped statement already routes
+    through :func:`execute` above.  ``tests/**`` is the other half of the
+    tree, and it is *not* ratcheted -- roughly 460 test bodies write
+    ``get_connection().execute("... WHERE id = ?", (x,))`` directly against
+    the connection ``tests/conftest.py``'s autouse fixture handed them.  On
+    SQLite that is correct and idiomatic; against psycopg it is the single
+    largest failure class in the Postgres lane, and it fails in the most
+    confusing way available -- ``the query has 0 placeholders but 3
+    parameters were passed``, because ``?`` is not a placeholder in
+    Postgres at all, so the statement is not mistranslated, it is
+    *untranslated*.
+
+    Fixing that at 460 call sites would be a mechanical rewrite of most of
+    the suite, and would have to be redone for every test written after it.
+    Fixing it here is one object: ``tests/backends.py`` -- the single
+    chokepoint #2884 built precisely so "point the suite at another backend"
+    stays a one-function change -- wraps the connection it hands to
+    ``coord.db.override_connection()``, and every existing and future
+    ``conn.execute("... ?")`` in the suite goes through :func:`translate`
+    without knowing it.  Named (``:name``) statements come along for free,
+    since :func:`translate` handles both paramstyles.
+
+    **Transparent, deliberately.** ``__getattr__``/``__setattr__`` forward
+    to the wrapped connection, so ``conn.commit()``, ``conn.rollback()``,
+    ``conn.cursor()``, ``conn.close()``, ``conn.row_factory = ...`` and
+    ``getattr(conn, "closed", False)`` (``coord/db.py``'s #3082
+    already-closed check) all behave exactly as they did.  Only the three
+    statement-running methods are intercepted.  :func:`detect_dialect`
+    unwraps, so the whole rest of this module keeps reading the dialect off
+    the real driver connection and a wrapped connection can be passed to
+    every seam function unchanged.
+    """
+
+    __slots__ = ("_coord_seam_conn",)
+
+    def __init__(self, conn: Any) -> None:
+        object.__setattr__(self, "_coord_seam_conn", conn)
+
+    # -- the translating third of the surface ------------------------------
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        """``cursor.execute()`` with *sql* translated to the wrapped
+        connection's paramstyle.
+
+        ``params`` is passed through untouched -- a sequence stays a
+        sequence and a mapping stays a mapping, matching the paramstyle
+        :func:`translate` just rewrote the statement into.
+        """
+        conn = self._coord_seam_conn
+        cur = conn.cursor()
+        cur.execute(translate(sql, detect_dialect(conn)), params)
+        return cur
+
+    def executemany(self, sql: str, seq_of_params: Iterable[Any]) -> Any:
+        """:meth:`execute`'s bulk sibling."""
+        conn = self._coord_seam_conn
+        cur = conn.cursor()
+        cur.executemany(translate(sql, detect_dialect(conn)), seq_of_params)
+        return cur
+
+    def executescript(self, script: str) -> Any:
+        """Multi-statement DDL/DML, via :func:`executescript` -- which is a
+        per-backend *execution mechanism* split, not a translation."""
+        return executescript(self._coord_seam_conn, script)
+
+    # -- the transparent two thirds ----------------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._coord_seam_conn, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._coord_seam_conn, name, value)
+
+    def __enter__(self) -> "TranslatingConnection":
+        self._coord_seam_conn.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        return self._coord_seam_conn.__exit__(*exc_info)
+
+    def __repr__(self) -> str:
+        return f"TranslatingConnection({self._coord_seam_conn!r})"
+
+
+def unwrap(conn: Any) -> Any:
+    """The real driver connection underneath *conn*.
+
+    A :class:`TranslatingConnection` yields the connection it wraps;
+    anything else is returned unchanged, so every caller can apply this
+    unconditionally without first asking what it was handed.
+    """
+    inner = getattr(conn, "_coord_seam_conn", None)
+    return conn if inner is None else inner
+
+
+def translating_connection(conn: Any) -> TranslatingConnection:
+    """Wrap *conn* in a :class:`TranslatingConnection` -- idempotent, so
+    re-wrapping an already-wrapped connection is a no-op rather than a
+    stack of proxies."""
+    if isinstance(conn, TranslatingConnection):
+        return conn
+    return TranslatingConnection(conn)
 
 
 # ── upsert / insert_ignore ───────────────────────────────────────────────
@@ -426,6 +613,49 @@ def insert_ignore(conn: Any, table: str, columns: Sequence[str], params: Sequenc
     else:  # pragma: no cover -- detect_dialect already raised for anything else
         raise UnsupportedDialectError(dialect)
     return execute(conn, sql, params)
+
+
+# ── scalar functions (#3083) ─────────────────────────────────────────────
+
+
+def greatest(conn: Any, *operands: str) -> str:
+    """SQL text for "the largest of these expressions" -- ``MAX(a, b)`` on
+    SQLite, ``GREATEST(a, b)`` on Postgres (#3083).
+
+    This is a genuine spelling divergence, and a nastily quiet one: SQLite
+    overloads ``MAX`` as *both* the aggregate (one argument) and a
+    multi-argument scalar, so ``SET last_revision = MAX(last_revision, ?)``
+    reads as perfectly ordinary SQL and works.  Postgres has no
+    multi-argument ``MAX`` at all -- the scalar is spelled ``GREATEST`` --
+    and rejects it at *plan* time with ``function max(integer, smallint)
+    does not exist``, so the failure names an argument-type mismatch rather
+    than the actual problem, which is the function name.
+
+    Returns the SQL *fragment*, not a cursor: both call sites
+    (``coord/portal_store.py``'s two monotonic "only ever raises" counters)
+    embed it mid-``UPDATE``, so a helper that ran the statement would have
+    to reimplement their surrounding SQL.  The operands are SQL
+    expressions, not bound values -- pass ``"?"`` for a bound one, and it
+    translates with the rest of the statement.
+
+    ``conn`` (rather than a bare dialect string) keeps this consistent with
+    every other function here: the live connection is the single source of
+    truth for which backend is active (#2719), so no call site has to
+    resolve a dialect itself just to build a fragment.
+    """
+    if len(operands) < 2:
+        raise ValueError(
+            "sql.greatest() needs at least two operands -- a one-argument "
+            "MAX() is the *aggregate*, which is spelled identically on both "
+            f"backends and needs no seam (got: {operands!r})"
+        )
+    dialect = detect_dialect(conn)
+    joined = ", ".join(operands)
+    if dialect == DIALECT_SQLITE:
+        return f"MAX({joined})"
+    if dialect == DIALECT_POSTGRES:
+        return f"GREATEST({joined})"
+    raise UnsupportedDialectError(dialect)  # pragma: no cover -- detect_dialect raised
 
 
 # ── row factory ───────────────────────────────────────────────────────────
@@ -771,6 +1001,79 @@ def primary_key_columns(conn: Any, table: str) -> tuple[str, ...]:
             except (KeyError, TypeError, IndexError):
                 names.append(row[0])
         return tuple(names)
+    raise UnsupportedDialectError(dialect)
+
+
+def index_names(conn: Any, table: str) -> list[str]:
+    """Every index name declared on *table* (empty when it has none, or when
+    *table* doesn't exist) -- :func:`table_columns`'s sibling, portable for
+    the same reason (#3083).
+
+    SQLite's ``PRAGMA index_list(...)`` returns one row per index with the
+    name in column 1; Postgres exposes the same thing through the
+    ``pg_indexes`` catalog view, filtered to the session's own schema so a
+    schema-per-test harness (``tests/backends.py``) sees only its own.
+    Neither spelling belongs at a call site: a ``PRAGMA`` outside this seam
+    and ``coord/db.py`` is exactly what ``tests/test_sql_dialect.py``'s
+    #2782 ratchet refuses.
+
+    Same table-name interpolation constraint as :func:`table_columns` -- a
+    pragma cannot bind its target object -- and the same call-site
+    discipline: hardcoded table constants, never user input.
+
+    Note the two backends do not agree on what counts as *an index*:
+    Postgres materializes a PRIMARY KEY / UNIQUE constraint as a real,
+    listed index, SQLite lists an auto-index only for some of them.  So
+    assert on the indexes you deliberately created (``idx_...``), not on the
+    exact set.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        rows = execute(conn, f"PRAGMA index_list({table})").fetchall()  # noqa: S608 -- table name, not user input
+        return [row[1] for row in rows]
+    if dialect == DIALECT_POSTGRES:
+        rows = execute(
+            conn,
+            "SELECT indexname AS name FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND tablename = ? "
+            "ORDER BY indexname",
+            (table,),
+        ).fetchall()
+        names: list[str] = []
+        for row in rows:
+            try:
+                names.append(row["name"])
+            except (KeyError, TypeError, IndexError):
+                names.append(row[0])
+        return names
+    raise UnsupportedDialectError(dialect)
+
+
+def enable_foreign_keys(conn: Any) -> None:
+    """Make *conn* enforce declared ``FOREIGN KEY`` constraints (#3083).
+
+    SQLite does **not** enforce foreign keys unless the connection opts in
+    with ``PRAGMA foreign_keys=ON`` -- it is off by default, per-connection,
+    and silently so, which is why ``coord.store_migrate`` has a whole
+    referential-integrity audit for rows a connection that never set it left
+    orphaned.  Postgres enforces declared constraints unconditionally: there
+    is no session switch to flip, so this is a **documented no-op** there
+    rather than an oversight.
+
+    The point of naming it is that the call site then reads as its intent
+    ("this connection must enforce FKs") and is portable, instead of
+    carrying literal ``PRAGMA`` text that is a hard syntax error against
+    psycopg -- the ``syntax error at or near "PRAGMA"`` class #3083 closes.
+    Same shape as :func:`apply_connection_setup`, which already does this
+    for the writer connections ``coord/db.py`` opens; this is the standalone
+    form for a caller that opened its connection some other way.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        execute(conn, "PRAGMA foreign_keys=ON")
+        return
+    if dialect == DIALECT_POSTGRES:
+        return  # always enforced; no session switch exists
     raise UnsupportedDialectError(dialect)
 
 

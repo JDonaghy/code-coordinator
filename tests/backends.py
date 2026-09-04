@@ -213,7 +213,28 @@ def _open_sqlite() -> BackendSession:
 
 def _open_postgres() -> BackendSession:
     """A private Postgres schema for one test — see the module docstring for
-    why schema-per-test rather than rollback-per-test or truncate."""
+    why schema-per-test rather than rollback-per-test or truncate.
+
+    The connection handed back is wrapped in
+    :class:`coord.sql.TranslatingConnection` (#3083). Roughly 460 test
+    bodies in this suite write ``get_connection().execute("... WHERE id =
+    ?", (x,))`` — or the ``:name`` variant — directly against the
+    connection this function hands to ``override_connection()``. That is
+    correct, idiomatic SQLite, and against psycopg it is the single largest
+    failure class in the Postgres lane (``the query has 0 placeholders but
+    N parameters were passed``: ``?`` is not a placeholder in Postgres, so
+    those statements are not mistranslated, they are *untranslated*).
+
+    Wrapping here rather than rewriting 460 call sites is the same bet this
+    module is built on: ``coord/sql.py`` already owns paramstyle, and this
+    module is the one chokepoint that decides what kind of connection the
+    autouse fixture hands over, so a statement written against sqlite3's
+    paramstyle reaches psycopg translated no matter which test wrote it —
+    including tests written after this one. The SQLite path is deliberately
+    *not* wrapped: there is nothing to translate (qmark is native), and
+    leaving it as a bare ``sqlite3.Connection`` keeps the default lane
+    byte-for-byte what it has always been.
+    """
     from coord import sql
 
     psycopg = _import_psycopg()
@@ -261,7 +282,9 @@ def _open_postgres() -> BackendSession:
         finally:
             conn.close()
 
-    return BackendSession(BACKEND_POSTGRES, conn, teardown=_teardown)
+    return BackendSession(
+        BACKEND_POSTGRES, sql.translating_connection(conn), teardown=_teardown
+    )
 
 
 def open_named_session(backend: str) -> BackendSession:
