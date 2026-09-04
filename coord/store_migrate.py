@@ -48,16 +48,57 @@ whether the source is clean):
 No ``INTEGER`` -> ``BOOLEAN`` conversion happens anywhere in this module —
 that conversion was explicitly ruled out of scope by #2724 and reaffirmed by
 this issue's rewrite.
+
+Three modes, and what each one actually proves (#3086)
+------------------------------------------------------
+``--dry-run`` audits the **source** and never opens the target. That makes it a
+source-integrity check, not a rehearsal: it cannot answer *will the target
+accept these rows*, *is the imported data the same data*, or *how long is the
+fleet down*. It stays exactly that cheap -- #3086 added the other two modes
+rather than growing this one.
+
+``--verify`` (:func:`verify_import`) answers the second question on **any**
+real import, rehearsal or cutover: it dumps both sides through #2885's parity
+oracle (now ``coord.store_parity``) and diffs them, naming table / row key /
+column / both values. Row-count parity -- all this module checked before -- is
+precisely the check that cannot see SQLite's lax type affinity,
+``INSERT OR REPLACE`` -> ``ON CONFLICT`` semantics, or identity-sequence
+resync going wrong, because every one of those preserves the row count.
+
+``--rehearse`` (:func:`run_rehearsal`) answers all three: it creates a scratch
+target, runs the **real** :func:`run_import` into it (deliberately *not* a
+second import path -- a rehearsal that exercises different code proves
+nothing), verifies content, reports per-table and total elapsed time, and drops
+the scratch target. Rehearse against ``deploy/coord-db-backup.sh``'s latest
+``VACUUM INTO`` snapshot rather than the live database: it exercises the
+restore path too, and cannot touch live data.
+
+Two existing behaviours a rehearsal makes visible, both documented rather than
+changed (adjudicated by #828; #3086 explicitly does not revisit them):
+
+- :func:`import_table` **commits per table**, so a mid-import failure leaves a
+  partially populated target that needs ``--force`` to retry. Harmless on a
+  scratch target; know it before the real run.
+- ``coord.db.refuse_postgres_under_pytest`` raises whenever
+  ``PYTEST_CURRENT_TEST`` is set, so a pytest run against a rehearsal database
+  must be reached through ``COORD_TEST_POSTGRES_DSN`` / ``tests/backends.py``,
+  never through ``coordinator.yml``'s ``store.dsn``.
+  :func:`postgres_scratch_schema` calls that guard on its own account for the
+  same reason -- it is a correct guard and #3086 does not weaken it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
-from coord import sql
+from coord import sql, store_parity
+from coord.store_parity import ParityReport
 
 # schema_version/schema_version_new are migration *bookkeeping*, not data --
 # see the module docstring, point 2. Re-derived by the target's own connect
@@ -107,7 +148,15 @@ class ReferentialIntegrityViolation:
 class ImportAborted(RuntimeError):
     """Raised before any target write -- a pre-flight audit failed, the
     source is missing, or the target already has rows and ``force`` wasn't
-    passed."""
+    passed.
+
+    :attr:`retained_target` is set by :func:`run_rehearsal` when the abort left
+    a scratch target on the server, so the CLI can name what it left behind
+    rather than silently dropping the evidence or leaving the operator to hunt
+    for it (#3086). Empty on every other path.
+    """
+
+    retained_target: str = ""
 
 
 # A badly-drifted, large production database could name thousands of
@@ -135,6 +184,12 @@ class TableReport:
     table: str
     source_rows: int
     target_rows: int
+    #: Wall-clock seconds :func:`import_table` spent on this table, including
+    #: its identity-sequence resync and its own ``commit()``. 0.0 on a dry run
+    #: (nothing was written) -- #3086: the per-table breakdown is what tells an
+    #: operator *which* table owns the quiet window, which a single total does
+    #: not.
+    elapsed_seconds: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -145,10 +200,42 @@ class TableReport:
 class ImportReport:
     tables: list[TableReport] = field(default_factory=list)
     dry_run: bool = False
+    #: Wall-clock seconds for the whole run -- audits, writes and (when
+    #: requested) verification. This is #829's outage-sizing number, so it
+    #: deliberately measures everything the cutover will actually do, not just
+    #: the sum of :attr:`TableReport.elapsed_seconds`.
+    elapsed_seconds: float = 0.0
+    #: The content-parity diff between source and imported target, or ``None``
+    #: when verification was not requested. A ``ParityReport`` has no
+    #: truthiness protocol on purpose (#2885) -- read :attr:`ok` /
+    #: ``parity.is_clean``, never ``if report.parity:``.
+    parity: ParityReport | None = None
+    #: Name of the scratch target a rehearsal created, and whether it survived
+    #: the run. ``retained_target`` is non-empty **only** when the rehearsal
+    #: left something behind -- dropping the evidence on failure is the wrong
+    #: default (#3086), so a failed rehearsal names what it kept.
+    scratch_target: str = ""
+    retained_target: str = ""
+
+    @property
+    def row_counts_ok(self) -> bool:
+        return all(t.ok for t in self.tables)
+
+    @property
+    def content_ok(self) -> bool | None:
+        """``None`` when verification did not run, else whether it was clean."""
+        return None if self.parity is None else self.parity.is_clean
 
     @property
     def ok(self) -> bool:
-        return all(t.ok for t in self.tables)
+        """Everything that was actually checked came back clean.
+
+        Row-count parity always; content parity too when ``--verify``/
+        ``--rehearse`` asked for it. Both gates, not either -- a run whose
+        counts match but whose content diverges is exactly the failure #3086
+        exists to catch, and it must not exit 0.
+        """
+        return self.row_counts_ok and self.content_ok is not False
 
 
 # ── source introspection ─────────────────────────────────────────────────
@@ -391,6 +478,7 @@ def import_table(source_conn: Any, target_conn: Any, table: str) -> TableReport:
     is how the app writes today) would be handed an id this import already
     used and rejected as a primary-key violation.
     """
+    started = time.perf_counter()
     columns = [name for name, _ in sql.table_columns(source_conn, table)]
     collist = ", ".join(f'"{c}"' for c in columns)
     cur = sql.execute(source_conn, f'SELECT {collist} FROM "{table}"')  # noqa: S608
@@ -405,9 +493,57 @@ def import_table(source_conn: Any, target_conn: Any, table: str) -> TableReport:
     for identity_column in sql.identity_columns(target_conn, table):
         sql.resync_identity_sequence(target_conn, table, identity_column)
     target_conn.commit()
+    elapsed = time.perf_counter() - started
     return TableReport(
-        table=table, source_rows=len(rows), target_rows=table_row_count(target_conn, table)
+        table=table,
+        source_rows=len(rows),
+        target_rows=table_row_count(target_conn, table),
+        elapsed_seconds=elapsed,
     )
+
+
+SOURCE_LABEL = "source (sqlite)"
+TARGET_LABEL = "imported target"
+
+
+def verify_import(
+    source_conn: Any, target_conn: Any, tables: Sequence[str]
+) -> ParityReport:
+    """Content-level parity between the source and the imported target
+    (#3086), via #2885's oracle in ``coord.store_parity``.
+
+    Row-count parity -- everything this module checked before -- is exactly
+    the check that cannot see the failure modes this migration actually has:
+    SQLite's lax type affinity, the 37 per-site ``INSERT OR REPLACE`` ->
+    ``ON CONFLICT`` judgements, and identity-sequence resync all preserve the
+    row count while changing the data. :func:`coord.store_parity.compare_dumps`
+    returns a **diff, not a boolean** -- a report naming table, row key,
+    column and both values -- because on cutover day #829 has to classify the
+    entries, and "False" would tell it nothing.
+
+    Two deliberate arguments to the dump:
+
+    - *tables* restricts the comparison to what the importer actually copies.
+      ``schema_version``/``schema_version_new`` are excluded by design (the
+      target re-derives its own migration bookkeeping on connect, see
+      :data:`_EXCLUDED_TABLES`), and the target additionally holds every table
+      its own ``_ensure_schema`` created even when the source never had one.
+      An unrestricted dump would manufacture differences on precisely the
+      tables the importer is *correct* to leave alone.
+    - ``rank_surrogate_keys=False``. #2885 normalises a single-column integer
+      primary key to its rank because two *independent* replays legitimately
+      land on different sequence values. That is not this situation: the
+      importer copies every id verbatim (``GENERATED BY DEFAULT AS IDENTITY``
+      accepts an explicit value) and then resyncs the sequence, so an id that
+      moved is a real finding and must not be normalised away.
+    """
+    source_dump = store_parity.dump_database(
+        source_conn, label=SOURCE_LABEL, tables=tables, rank_surrogate_keys=False
+    )
+    target_dump = store_parity.dump_database(
+        target_conn, label=TARGET_LABEL, tables=tables, rank_surrogate_keys=False
+    )
+    return store_parity.compare_dumps(source_dump, target_dump)
 
 
 def run_import(
@@ -416,6 +552,7 @@ def run_import(
     dsn: str = "",
     force: bool = False,
     dry_run: bool = False,
+    verify: bool = False,
     target_connector: Callable[[], Any] | None = None,
 ) -> ImportReport:
     """Import *sqlite_path* into the Postgres database *dsn* points at.
@@ -446,6 +583,14 @@ def run_import(
     "insert or replace everything" risks masking a genuine double-run
     mistake instead of catching it.
 
+    *verify*, when set, additionally runs :func:`verify_import` after the last
+    table lands and stores its :class:`~coord.store_parity.ParityReport` on
+    ``report.parity`` -- the content-level check row counts cannot make. It is
+    available on the **real** cutover import, not just on ``--rehearse``: a
+    rehearsal that verifies and a cutover that doesn't would leave the run that
+    actually matters unchecked. Ignored on a dry run, which never opens the
+    target and so has nothing to compare against.
+
     *target_connector*, when given, replaces the default
     ``coord.db.open_postgres_connection(dsn)`` -- used by this module's own
     tests to point the target at a second SQLite/Postgres database opened
@@ -456,6 +601,7 @@ def run_import(
     function does not close the connection it returns -- the caller
     (whoever constructed it) owns that lifecycle.
     """
+    started = time.perf_counter()
     sqlite_path = Path(sqlite_path)
     if not sqlite_path.exists():
         raise ImportAborted(f"source SQLite database not found: {sqlite_path}")
@@ -491,6 +637,7 @@ def run_import(
                         table=table, source_rows=table_row_count(source_conn, table), target_rows=0
                     )
                 )
+            report.elapsed_seconds = time.perf_counter() - started
             return report
 
         owns_target = target_connector is None
@@ -532,9 +679,163 @@ def run_import(
             for table in tables:
                 _ensure_target_table(source_conn, target_conn, table)
                 report.tables.append(import_table(source_conn, target_conn, table))
+            if verify:
+                report.parity = verify_import(source_conn, target_conn, tables)
+            report.elapsed_seconds = time.perf_counter() - started
             return report
         finally:
             if owns_target:
                 target_conn.close()
     finally:
         source_conn.close()
+
+
+# ── rehearsal ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ScratchTarget:
+    """A throwaway import target created for a rehearsal.
+
+    *name* is how an operator finds it again on the server (a Postgres schema
+    name, or a file path on SQLite). *keep* is set by the rehearsal when the
+    run failed: the scratch target is then **left in place**, because dropping
+    the evidence of a failed migration rehearsal is the wrong default -- the
+    whole reason to rehearse is to inspect what went wrong.
+    """
+
+    conn: Any
+    name: str
+    keep: bool = False
+
+
+def _scratch_schema_name() -> str:
+    """A readable, collision-free name for one rehearsal's scratch schema.
+
+    Timestamp + pid rather than a uuid, for the same reason
+    ``tests/backends.py`` picks ``coord_test_gw3_41207_12``: when a run dies
+    and leaves one behind, a human reading ``\\dn`` has to be able to tell
+    which rehearsal it came from and how old it is.
+    """
+    return f"coord_rehearsal_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+
+
+@contextlib.contextmanager
+def postgres_scratch_schema(dsn: str) -> Iterator[ScratchTarget]:
+    """A private, freshly-migrated Postgres schema on the server *dsn* names,
+    dropped on a clean exit and **retained** on a failure.
+
+    A schema rather than a whole database: it needs only ``CREATE`` on the
+    configured database (no ``CREATEDB`` role attribute, no second connection
+    to ``postgres``), it is a single ``DROP SCHEMA ... CASCADE`` to remove, and
+    ``search_path`` makes every unqualified table name in ``coord/`` resolve
+    into it without a single call site knowing it exists -- the same mechanism
+    ``tests/backends.py`` uses for per-test isolation, for the same reasons.
+
+    The schema is migrated by ``coord.db._ensure_schema``, the one migration
+    implementation both backends share (#827), so the rehearsal target is
+    created exactly the way the cutover target will be.
+
+    ``coord.db.refuse_postgres_under_pytest`` is called first and deliberately:
+    it raises whenever ``PYTEST_CURRENT_TEST`` is set, so a test can never
+    reach a real server through this path. Tests of the rehearsal orchestration
+    inject a *scratch_factory* instead (see :func:`run_rehearsal`), which is
+    how they follow ``COORD_TEST_POSTGRES_DSN`` / ``tests/backends.py``. That
+    guard is correct and is not weakened here.
+    """
+    from coord import db as coord_db  # noqa: PLC0415 -- keeps psycopg optional at import time
+
+    redacted = sql.redact_dsn(dsn)
+    coord_db.refuse_postgres_under_pytest(f"a rehearsal scratch schema on {redacted}")
+
+    schema = _scratch_schema_name()
+    conn = sql.connect(backend=sql.DIALECT_POSTGRES, dsn=dsn)
+    target = ScratchTarget(conn=conn, name=f"{redacted} schema {schema}")
+    try:
+        sql.apply_connection_setup(conn)
+        sql.apply_row_factory(conn)
+        sql.execute(conn, f'CREATE SCHEMA "{schema}"')
+        # search_path is a session setting, so every later statement on this
+        # connection resolves unqualified table names into the private schema.
+        sql.execute(conn, f'SET search_path TO "{schema}"')
+        conn.commit()
+        coord_db._ensure_schema(conn)
+        yield target
+    except BaseException:
+        # Never drop on the way out of an exception: a rehearsal that explodes
+        # mid-import is exactly when the operator wants the partial target.
+        target.keep = True
+        raise
+    finally:
+        try:
+            if not target.keep:
+                conn.rollback()
+                # Reset search_path first -- dropping the schema the session
+                # points at is legal but leaves the connection resolving into
+                # a schema that no longer exists.
+                sql.execute(conn, "SET search_path TO public")
+                sql.execute(conn, f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                conn.commit()
+        finally:
+            conn.close()
+
+
+def run_rehearsal(
+    *,
+    sqlite_path: str | Path,
+    dsn: str = "",
+    scratch_factory: Callable[[], contextlib.AbstractContextManager[ScratchTarget]] | None = None,
+) -> ImportReport:
+    """Import *sqlite_path* into a throwaway target, verify content, time it,
+    and drop the target (#3086).
+
+    This is deliberately **not** a new import path: it calls :func:`run_import`
+    with ``verify=True`` exactly as the real cutover will, against a scratch
+    target instead of the production one. A rehearsal that exercised different
+    code would prove nothing about the cutover.
+
+    What it answers that ``--dry-run`` cannot:
+
+    - *Will the target accept these rows?* -- the rows are really written, so
+      every constraint Postgres enforces and SQLite doesn't gets hit for real.
+    - *Is the imported data the same data?* -- :func:`verify_import`, content
+      not counts.
+    - *How long is the fleet down?* -- ``report.elapsed_seconds`` plus the
+      per-table breakdown. Run it while the fleet is quiet (``coord status``
+      shows no active assignments) so the number is representative; the
+      rehearsal itself reads a snapshot and writes only to the scratch target,
+      so it does not require the fleet to be down.
+
+    Residue policy: the scratch target is dropped when the rehearsal succeeds
+    and **retained** when it does not, with its name on
+    ``report.retained_target``. Both halves matter -- a rehearsal that leaves
+    schemas lying around on every green run is a rehearsal nobody runs twice,
+    and one that destroys the evidence of a red run is a rehearsal that taught
+    you nothing.
+
+    *scratch_factory* replaces the default Postgres-schema target. Tests pass
+    ``tests/backends.py``'s ``scratch_database``, which follows
+    ``COORD_TEST_BACKEND`` -- so the orchestration below runs on a laptop with
+    no server (a second SQLite file) and against a real Postgres schema when
+    CI's ``postgres`` job sets that variable, without either case reaching a
+    server through ``coordinator.yml``.
+    """
+    factory = scratch_factory or (lambda: postgres_scratch_schema(dsn))
+    with factory() as target:
+        try:
+            report = run_import(
+                sqlite_path=sqlite_path,
+                verify=True,
+                target_connector=lambda: target.conn,
+            )
+        except ImportAborted as exc:
+            # The context manager already retains the target on any exception;
+            # carry its name out on the exception so the CLI can name what it
+            # left behind instead of the operator having to go find it.
+            exc.retained_target = target.name
+            raise
+        report.scratch_target = target.name
+        if not report.ok:
+            target.keep = True
+            report.retained_target = target.name
+        return report

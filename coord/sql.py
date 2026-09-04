@@ -728,6 +728,52 @@ def table_columns(conn: Any, table: str) -> list[tuple[str, str]]:
     raise UnsupportedDialectError(dialect)
 
 
+def primary_key_columns(conn: Any, table: str) -> tuple[str, ...]:
+    """*table*'s primary-key column names, in key order (empty when it has
+    none) -- :func:`table_columns`'s sibling, and portable for the same
+    reason (#3086).
+
+    The two backends spell this completely differently: SQLite carries key
+    position in ``PRAGMA table_info``'s ``pk`` column (0 for "not part of the
+    key", otherwise the 1-based position), while Postgres joins
+    ``information_schema.table_constraints`` to ``key_column_usage``. This
+    lived as a private helper in ``tests/write_parity.py`` (#2885) until
+    ``coord/store_parity.py`` needed it from shipped code -- and a ``PRAGMA``
+    in any ``coord/**`` module other than this seam and ``coord/db.py`` is
+    exactly what ``tests/test_sql_dialect.py``'s #2782 ratchet exists to
+    refuse, so the dialect branch belongs here rather than at the call site.
+
+    Same table-name interpolation constraint as :func:`table_columns`: a
+    pragma cannot bind its target object, and every call site passes a name
+    discovered from the database's own catalog, never user input.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        rows = execute(conn, f"PRAGMA table_info({table})").fetchall()  # noqa: S608 -- table name, not user input
+        keyed = [(int(row[5]), row[1]) for row in rows if int(row[5]) > 0]
+        return tuple(name for _, name in sorted(keyed))
+    if dialect == DIALECT_POSTGRES:
+        rows = execute(
+            conn,
+            "SELECT kcu.column_name AS name FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage kcu "
+            "  ON tc.constraint_name = kcu.constraint_name "
+            " AND tc.table_schema = kcu.table_schema "
+            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+            "  AND tc.table_schema = current_schema() AND tc.table_name = ? "
+            "ORDER BY kcu.ordinal_position",
+            (table,),
+        ).fetchall()
+        names: list[str] = []
+        for row in rows:
+            try:
+                names.append(row["name"])
+            except (KeyError, TypeError, IndexError):
+                names.append(row[0])
+        return tuple(names)
+    raise UnsupportedDialectError(dialect)
+
+
 def foreign_keys(conn: Any, table: str) -> list[tuple[str, str, str]]:
     """Return ``[(from_column, ref_table, ref_column), ...]`` for every FK
     *table* declares (empty if none, or if *table* doesn't exist) --
