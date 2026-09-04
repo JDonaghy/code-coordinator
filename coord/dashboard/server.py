@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as _html_escape
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from starlette.applications import Starlette
@@ -775,6 +775,91 @@ async def _poll_once(
     return possibly_stuck
 
 
+# ── Journal (#3091) ──────────────────────────────────────────────────────────
+#
+# ``GET /api/journal/{submission_id}`` — the one view that renders a piece of
+# work as a NARRATIVE rather than current state, served to someone who is not
+# at a terminal (a client mid-screen-share, a phone). Built directly on
+# #3071's aggregator (:func:`coord.portal_store.render_journal_payload`) —
+# the same read ``coord journal --json`` prints — so the CLI and this
+# endpoint can never disagree about what happened. A second aggregation
+# would drift, and the drift would be invisible because both would look
+# plausible.
+
+
+def _journal_title(mirror: dict[str, Any]) -> str:
+    """Best-effort display name for a submission (#3091).
+
+    Mirrors :mod:`coord.approved_work`'s ``project_label`` alias convention
+    as a tiny local copy rather than importing its private alias table
+    across the module boundary (the same convention
+    ``coord.commands.portal._issue_title_for_display`` documents for itself).
+    coord-portal does not send a human-readable title today (coord-portal#146)
+    — this renders ``""`` until/unless a future portal change adds one.
+    """
+    for key in ("project_label", "projectLabel"):
+        value = mirror.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+@dataclasses.dataclass(frozen=True)
+class JournalEntryWire:
+    """One timeline entry — the exact shape
+    :func:`coord.portal_store.render_journal_payload` (#3071) produces for
+    each of ``entries``, field-for-field. ``artifact`` is ``null`` or a URL,
+    never a bare object key (see that function's docstring)."""
+
+    ts: float
+    kind: str
+    actor: str
+    text: str
+    artifact: str | None
+    source: str
+    details: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class JournalLinkWire:
+    """The submission's repo/milestone (or repo/issue) link, when one is on
+    file — a plain mirror of :meth:`coord.portal_store.PortalLink.to_dict`.
+    Exactly one of ``milestone_number``/``issue_number`` is set."""
+
+    repo_name: str
+    milestone_number: int | None
+    issue_number: int | None
+    submission_id: str
+    linked_at: float
+    actor: str
+    schema: int
+
+
+@dataclasses.dataclass(frozen=True)
+class JournalResponse:
+    """``GET /api/journal/{submission_id}`` (#3091).
+
+    ``entries`` and ``gaps`` are #3071's ``render_journal_payload`` output,
+    untouched — the CLI and this endpoint read the identical aggregation.
+    ``title``/``customer_status`` are the submission-identity fields the CLI
+    doesn't need (it already has the id on its command line): ``title`` is
+    best-effort (see :func:`_journal_title`) and ``customer_status`` is the
+    submission's ``last_status`` (``""`` for a submission coord has never
+    seen — the same "unknown is not an error" posture as an empty timeline).
+
+    **Never raises.** An unlinked or unknown ``submission_id`` comes back
+    ``200`` with ``entries: []`` and a gap explaining why, exactly like
+    ``coord journal`` — never a 404, never a 500.
+    """
+
+    submission_id: str
+    title: str
+    customer_status: str
+    link: JournalLinkWire | None
+    gaps: list[str]
+    entries: list[JournalEntryWire]
+
+
 def openapi_spec() -> dict:
     """#757: the dashboard's OpenAPI 3 document.
 
@@ -1018,6 +1103,9 @@ def openapi_spec() -> dict:
     # response cannot drift.
     milestone_list_ref = dataclass_schema(MilestoneListResponse, components)
     milestone_detail_ref = dataclass_schema(MilestoneDetail, components)
+    # #3091: GET /api/journal/{submission_id} — same plain `dataclass_schema`
+    # walk; the handler returns a literal `dataclasses.asdict(JournalResponse)`.
+    journal_response_ref = dataclass_schema(JournalResponse, components)
     # #3027: the four `/api/machines*` endpoints (#3021-#3026) went out
     # carrying a bare `{"200": {"description": "OK"}}` stub — every other
     # surface here has a real `content` schema, this milestone's own
@@ -1896,6 +1984,39 @@ def openapi_spec() -> dict:
                         },
                     },
                     "404": {"description": "Unknown repo or milestone number"},
+                },
+            }
+        },
+        "/api/journal/{submission_id}": {
+            "get": {
+                "summary": (
+                    "#3091: SUBMISSION_ID's whole run as one ordered "
+                    "timeline — the served counterpart to `coord journal "
+                    "--json`"
+                ),
+                "description": (
+                    "Built directly on #3071's aggregator "
+                    "(coord.portal_store.render_journal_payload) — the "
+                    "SAME read `coord journal --json` prints — so this "
+                    "endpoint and the CLI can never disagree about what "
+                    "happened. `entries` carries `ts`/`kind`/`actor`/"
+                    "`text`/`artifact` (null or a URL, never a bare "
+                    "object key) plus `source`/`details`. Never raises: "
+                    "an unlinked or unknown submission_id comes back 200 "
+                    "with an empty `entries` and a `gaps` entry explaining "
+                    "why, never a 404 or 500. A partially readable run "
+                    "returns the entries it could read plus the gaps."
+                ),
+                "parameters": [
+                    _dashboard_path_param("submission_id", "portal submission id"),
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK — always, even for an unknown submission_id",
+                        "content": {
+                            "application/json": {"schema": journal_response_ref}
+                        },
+                    },
                 },
             }
         },
@@ -4483,6 +4604,58 @@ def build_app(
         )
         return JSONResponse(dataclasses.asdict(detail))
 
+    async def api_journal(request: Request) -> JSONResponse:
+        """GET /api/journal/{submission_id} — one submission's whole run as
+        an ordered timeline, served (#3091).
+
+        Reuses #3071's aggregator (:func:`coord.portal_store.
+        render_journal_payload`) wholesale — the exact read ``coord journal
+        --json`` prints — so this endpoint and the CLI can never disagree
+        about what happened. A second aggregation would drift, and the
+        drift would be invisible because both would look plausible.
+
+        Inherits that function's never-raises posture, belt and braces: an
+        unlinked or unknown ``submission_id`` comes back ``200`` with an
+        empty ``entries`` and a ``gaps`` entry saying why — never a 404,
+        never a 500 — and a broken local read (e.g. an unreadable
+        ``portal_submissions`` row) degrades the identity fields to their
+        empty defaults rather than failing the whole response.
+        """
+        from coord import portal_store  # noqa: PLC0415
+
+        submission_id = request.path_params["submission_id"]
+
+        try:
+            payload = portal_store.render_journal_payload(submission_id)
+        except Exception as exc:  # noqa: BLE001 — never raise, #3071's own posture
+            payload = {
+                "link": None,
+                "gaps": [f"journal unreadable: {exc}"],
+                "entries": [],
+            }
+
+        try:
+            record = portal_store.get_submission(submission_id)
+        except Exception:  # noqa: BLE001 — an unreadable identity is not a 500
+            record = None
+
+        mirror = (
+            record.customer
+            if record is not None and isinstance(record.customer, dict)
+            else {}
+        )
+        link_dict = payload.get("link")
+
+        response = JournalResponse(
+            submission_id=submission_id,
+            title=_journal_title(mirror),
+            customer_status=record.last_status if record is not None else "",
+            link=JournalLinkWire(**link_dict) if link_dict else None,
+            gaps=list(payload.get("gaps") or []),
+            entries=[JournalEntryWire(**e) for e in payload.get("entries") or []],
+        )
+        return JSONResponse(dataclasses.asdict(response))
+
     async def terminal_ws(websocket: WebSocket) -> None:
         """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
 
@@ -4617,6 +4790,7 @@ def build_app(
         Route(
             "/api/milestones/{repo}/{number}", api_milestone_detail, methods=["GET"]
         ),
+        Route("/api/journal/{submission_id}", api_journal, methods=["GET"]),
         build_events_route(event_source),
         WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]

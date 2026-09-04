@@ -244,6 +244,9 @@ SCHEMA_DISPLAY_ORDER: tuple[str, ...] = (
     "MilestoneEntryWire",
     "MilestoneGateColumnsWire",
     "MilestoneGateAWire",
+    "JournalResponse",
+    "JournalEntryWire",
+    "JournalLinkWire",
 )
 
 # (schema name, field name) -> literal TS type, bypassing the mechanical

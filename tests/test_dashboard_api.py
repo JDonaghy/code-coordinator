@@ -2347,3 +2347,203 @@ class TestMilestoneDetailAPI:
         ]["200"]["content"]["application/json"]["schema"]
         errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
         assert errors == [], errors
+
+
+# ── #3091: GET /api/journal/{submission_id} ─────────────────────────────────
+#
+# Built directly on #3071's aggregator (`coord.portal_store.
+# render_journal_payload`) — the same read `coord journal --json` prints —
+# so the acceptance bar (issue #3091) is that this endpoint and the CLI can
+# never disagree, curled against a real running app rather than trusted from
+# unit tests alone.
+
+JSUB = "sub-journal-3091"
+
+
+def _journal_seed_applied(kind: str, fields: dict, *, now: float):
+    """Queue a coord-owned fact and mark it applied — the state the
+    journal's outbox fold reads. Mirrors tests/test_portal_store.py's
+    identical helper."""
+    from coord import portal_store
+
+    row = portal_store.enqueue(JSUB, kind, fields, now=now)
+    portal_store.mark_applied(row, now=now)
+    return row
+
+
+def _journal_seed_signoff(verdict: str = "approved", comments: str = "ship it", *, now: float):
+    from coord import portal_store
+
+    portal_store.record_events(
+        [
+            {
+                "id": f"ev-{verdict}",
+                "submission_id": JSUB,
+                "type": f"signoff.{verdict}",
+                "data": {"verdict": verdict, "comments": comments},
+            }
+        ],
+        now=now,
+    )
+
+
+class TestJournalAPI:
+    def test_full_history_matches_the_cli_entry_for_entry_and_in_order(
+        self, rw_db
+    ) -> None:
+        """Acceptance bullet 1: a submission with a full history returns
+        entries in the same order `coord journal` prints them, and the two
+        outputs agree entry-for-entry."""
+        from click.testing import CliRunner
+
+        from coord import portal_store
+        from coord.audit import record_audit
+        from coord.cli import main
+
+        portal_store.link_issue(repo_name="api", issue_number=42, submission_id=JSUB)
+        _journal_seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "r2://bundles/4"}},
+            now=10.0,
+        )
+        _journal_seed_applied(
+            "preview", {"preview_url": "https://pr-7.pages.dev"}, now=20.0,
+        )
+        _journal_seed_signoff(now=30.0)
+        record_audit(
+            tier="business", category="dispatch", event_type="dispatched",
+            actor="drive", summary="Dispatched work to precision: api#42",
+            repo="api", issue=42, ts=40.0,
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: api#42",
+            repo="api", issue=42, ts=50.0,
+            details={"pr_url": "https://github.com/acme/api/pull/7"},
+        )
+
+        cli_result = CliRunner().invoke(main, ["journal", JSUB, "--json"])
+        assert cli_result.exit_code == 0, cli_result.output
+        cli_payload = __import__("json").loads(cli_result.output)
+
+        client = _client()
+        r = client.get(f"/api/journal/{JSUB}")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["submission_id"] == JSUB
+        assert body["entries"] == cli_payload["entries"]
+        assert [e["kind"] for e in body["entries"]] == [
+            "design_round_published", "preview_published",
+            "signoff_recorded", "dispatched", "merged",
+        ]
+
+    def test_unlinked_submission_returns_200_with_empty_timeline(self, rw_db) -> None:
+        """Acceptance bullet 2: a submission coord knows about (it has a
+        customer mirror) but that nobody ever ran `coord portal link` on
+        — no dispatch/merge history is resolvable without a link, and
+        (with no design rounds/previews/sign-offs either) the timeline is
+        genuinely empty, not an error."""
+        from coord import portal_store
+
+        portal_store.mirror_customer_facts(JSUB, {"project_label": "Acme rebuild"})
+        assert portal_store.get_link_by_submission(JSUB) is None
+
+        client = _client()
+        r = client.get(f"/api/journal/{JSUB}")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["entries"] == []
+        assert body["link"] is None
+        assert body["title"] == "Acme rebuild"
+        assert any("no repo/milestone linked" in g for g in body["gaps"])
+
+    def test_unknown_submission_id_returns_200_not_500(self, rw_db) -> None:
+        """Acceptance bullet 3."""
+        client = _client()
+        r = client.get("/api/journal/sub-never-seen-anywhere")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["submission_id"] == "sub-never-seen-anywhere"
+        assert body["entries"] == []
+        assert body["title"] == ""
+        assert body["customer_status"] == ""
+
+    def test_every_artifact_is_null_or_an_absolute_url(self, rw_db) -> None:
+        """Acceptance bullet 4."""
+        from coord import portal_store
+        from coord.audit import record_audit
+
+        portal_store.link_issue(repo_name="api", issue_number=9, submission_id=JSUB)
+        _journal_seed_applied(
+            "design_round",
+            {"design_round": {"round": 1, "bundle_key": "bundles/sub/r1.tar"}},
+            now=10.0,
+        )
+        _journal_seed_applied(
+            "preview", {"preview_url": "https://pr-9.pages.dev"}, now=20.0,
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="Merged: api#9",
+            repo="api", issue=9, ts=30.0,
+        )
+
+        client = _client()
+        r = client.get(f"/api/journal/{JSUB}")
+
+        assert r.status_code == 200
+        entries = r.json()["entries"]
+        assert entries  # non-trivial fixture
+        for entry in entries:
+            artifact = entry["artifact"]
+            assert artifact is None or "://" in artifact
+
+    def test_link_and_identity_fields_are_populated_when_on_file(
+        self, rw_db
+    ) -> None:
+        from coord import portal_store
+
+        portal_store.link_milestone(
+            repo_name="api", milestone_number=4, submission_id=JSUB
+        )
+        portal_store.mirror_customer_facts(JSUB, {"project_label": "Acme rebuild"})
+
+        client = _client()
+        r = client.get(f"/api/journal/{JSUB}")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["title"] == "Acme rebuild"
+        assert body["link"] == {
+            "repo_name": "api",
+            "milestone_number": 4,
+            "issue_number": None,
+            "submission_id": JSUB,
+            "linked_at": body["link"]["linked_at"],
+            "actor": "",
+            "schema": body["link"]["schema"],
+        }
+
+    def test_response_matches_its_openapi_schema(self, rw_db) -> None:
+        from coord import portal_store
+
+        portal_store.link_milestone(
+            repo_name="api", milestone_number=4, submission_id=JSUB
+        )
+        _journal_seed_applied(
+            "preview", {"preview_url": "https://pr-7.pages.dev"}, now=1.0,
+        )
+
+        client = _client()
+        r = client.get(f"/api/journal/{JSUB}")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/journal/{submission_id}"]["get"]["responses"][
+            "200"
+        ]["content"]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
