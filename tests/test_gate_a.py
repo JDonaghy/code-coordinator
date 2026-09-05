@@ -477,6 +477,33 @@ class TestFindInteractiveControls:
     def test_no_mocks_yields_no_controls(self) -> None:
         assert gate_a.find_interactive_controls("<p>just a static screen</p>") == []
 
+    def test_single_quoted_href_is_recognised(self) -> None:
+        """#3131 review: `href='#s-error'` is just as valid HTML as the
+        double-quoted form — the double-quote-only regex silently yielded
+        zero controls for this, a quiet false-negative."""
+        html = "<a id='nav-error' href='#s-error'>Error</a>"
+        controls = gate_a.find_interactive_controls(html)
+        assert controls == [
+            gate_a.InteractiveControl(control_id="nav-error", target_id="s-error")
+        ]
+
+    def test_single_quoted_id_is_recognised(self) -> None:
+        """Same either-quote-style fix as href, applied to the `id`
+        attribute — `id='nav-error'` must not silently fall back to the
+        synthetic `->#target` id."""
+        html = '<a id=\'nav-error\' href="#s-error">Error</a>'
+        controls = gate_a.find_interactive_controls(html)
+        assert controls == [
+            gate_a.InteractiveControl(control_id="nav-error", target_id="s-error")
+        ]
+
+    def test_mismatched_quote_styles_do_not_cross_match(self) -> None:
+        """The fragment must be closed by the SAME quote character it
+        opened with — `href="#s-error'` (mismatched) is malformed markup,
+        not a control this should extract a fragment from."""
+        html = "<a id=\"nav-error\" href=\"#s-error'>Error</a>"
+        assert gate_a.find_interactive_controls(html) == []
+
 
 class TestUnpinnedInteractiveControls:
     def test_control_and_target_named_together_is_pinned(self) -> None:
@@ -511,6 +538,20 @@ class TestUnpinnedInteractiveControls:
         contract = "- there is a `nav-error` control\n- `#s-error` exists\n"
         controls = [gate_a.InteractiveControl("nav-error", "s-error")]
         assert gate_a.unpinned_interactive_controls(contract, controls) == controls
+
+    def test_substring_of_another_id_does_not_falsely_pin(self) -> None:
+        """#3131 review: a naive `token in line` check would read a control
+        id that happens to be a substring of another (longer) id as
+        "mentioned" — e.g. `err` inside `nav-error` — and silently
+        under-report a real gap. `nav-error`/`s-error` are pinned together
+        here, but `err`/`error` (neither of which is really named on its
+        own) must NOT be read as pinned just because they are substrings of
+        what IS on the line."""
+        contract = "- clicking `nav-error` makes `#s-error` the only visible screen\n"
+        real = gate_a.InteractiveControl("nav-error", "s-error")
+        fake = gate_a.InteractiveControl("err", "error")
+        assert gate_a.unpinned_interactive_controls(contract, [real]) == []
+        assert gate_a.unpinned_interactive_controls(contract, [fake]) == [fake]
 
 
 class TestInteractiveContractGaps:

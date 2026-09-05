@@ -665,6 +665,15 @@ def summarise_pending_amends(pending: Iterable[PendingAmend]) -> list[str]:
 # enrichment on top of the existing approved/stale/changes verdict (same
 # relationship `find_pending_amends`/`summarise_pending_amends` have to
 # `evaluate()`), not a new terminal state.
+#
+# "Not wired into evaluate()" is deliberate; "wired into nothing at all"
+# was a review-caught bug (#3131 review), not a design choice — the I/O
+# half (resolving the milestone's mock glob, reading the mock bundle off
+# the default branch) lives where `find_pending_amends`'s own I/O half
+# lives: `coord/commands/gate_a.py`'s `_interactive_gap_lines`, called from
+# `coord gate-a`'s read path right alongside `_pending_amend_lines`, so an
+# operator sees an unpinned control on every plain read — not only when a
+# second PR remembers to wire it in.
 
 
 @dataclass(frozen=True)
@@ -686,8 +695,20 @@ class InteractiveControl:
 
 
 _ANCHOR_TAG_RE = re.compile(r"<a\b([^>]*)>", re.IGNORECASE)
-_HREF_FRAGMENT_RE = re.compile(r'href\s*=\s*"#([^"#]+)"', re.IGNORECASE)
-_ID_ATTR_RE = re.compile(r'\bid\s*=\s*"([^"]+)"', re.IGNORECASE)
+# #3131 review: match either quote style — `href='#s-error'` is just as
+# valid HTML as `href="#s-error"`, and the double-quote-only version of this
+# regex silently yielded zero controls for a single-quoted anchor (a quiet
+# false-negative, not an error). Group 1 is the quote character (used as a
+# backreference so the fragment can't swallow a stray opposite quote);
+# group 2 is the fragment itself.
+_HREF_FRAGMENT_RE = re.compile(r'href\s*=\s*(["\'])#([^"\'#]+)\1', re.IGNORECASE)
+# Same either-quote-style fix as _HREF_FRAGMENT_RE above, and for the same
+# reason: `id='nav-error'` is exactly as valid as `id="nav-error"`, and a
+# double-quote-only pattern would silently fall back to the synthetic
+# `"->#<target>"` id for a single-quoted control instead of raising — a
+# quiet behavior change, not an error, so easy to miss without a test
+# exercising it.
+_ID_ATTR_RE = re.compile(r'\bid\s*=\s*(["\'])([^"\']+)\1', re.IGNORECASE)
 
 
 def find_interactive_controls(mock_html: str) -> list[InteractiveControl]:
@@ -702,6 +723,17 @@ def find_interactive_controls(mock_html: str) -> list[InteractiveControl]:
     no target to pin a destination against) — a genuinely dead link like
     that is a separate, already-covered "does the control do anything at
     all" concern, not this function's job.
+
+    Deliberately scoped to anchor-based `href="#target"` navigation ONLY —
+    not `:checked` + `<label>` tabs/toggles or `<details>` disclosure, even
+    though `_interactive_mock_instruction` (`coord/mock_author.py`) teaches
+    the mock-author all three. `:target` is specifically the mechanism that
+    decides which `.screen` is visible (the question a Gate-A contract most
+    needs pinned); a `:checked` tab or a `<details>` panel changes what is
+    *revealed within* a screen, not which screen is showing, and has no
+    single `id`-pair shape this regex-based approach could reliably extract.
+    That is a real, deliberate gap in coverage — a tab wired to nothing
+    would not be caught here — not an oversight.
     """
     out: list[InteractiveControl] = []
     for m in _ANCHOR_TAG_RE.finditer(mock_html):
@@ -709,13 +741,29 @@ def find_interactive_controls(mock_html: str) -> list[InteractiveControl]:
         href_match = _HREF_FRAGMENT_RE.search(attrs)
         if href_match is None:
             continue
-        target = href_match.group(1).strip()
+        target = href_match.group(2).strip()
         if not target:
             continue
         id_match = _ID_ATTR_RE.search(attrs)
-        control_id = id_match.group(1).strip() if id_match else f"->#{target}"
+        control_id = id_match.group(2).strip() if id_match else f"->#{target}"
         out.append(InteractiveControl(control_id=control_id, target_id=target))
     return out
+
+
+def _contains_id_token(line: str, token: str) -> bool:
+    """Does *line* contain *token* as a whole id, not merely as a substring
+    of some longer id or word? (#3131 review)
+
+    A plain ``token in line`` check treats a control id that happens to be
+    a substring of another control's id — or of unrelated contract prose —
+    as "mentioned", which silently under-reports a real gap. Id characters
+    routinely include ``-`` (``nav-error``, ``s-error``), so the boundary
+    checked here is "not immediately adjacent to another word/hyphen
+    character" — plain regex ``\\b`` would not do, since it treats ``-``
+    itself as a boundary and would still let e.g. ``"err"`` match inside
+    ``"nav-error"``.
+    """
+    return re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", line) is not None
 
 
 def unpinned_interactive_controls(
@@ -731,14 +779,20 @@ def unpinned_interactive_controls(
     exists to catch at contract-authoring time rather than after ship.
 
     Case-insensitive, since Markdown prose and `id`/`href` attributes don't
-    reliably agree on case.
+    reliably agree on case. Matching is whole-id, via :func:`_contains_id_token`
+    — not a bare substring test — so a control id that happens to be a
+    substring of another control's id (or of unrelated contract prose)
+    cannot produce a false "pinned" verdict.
     """
     lines = contract_text.lower().splitlines()
     gaps: list[InteractiveControl] = []
     for control in controls:
         control_id = control.control_id.lower()
         target_id = control.target_id.lower()
-        if any(control_id in line and target_id in line for line in lines):
+        if any(
+            _contains_id_token(line, control_id) and _contains_id_token(line, target_id)
+            for line in lines
+        ):
             continue
         gaps.append(control)
     return gaps

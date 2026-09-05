@@ -86,6 +86,51 @@ def _pending_amend_lines(repo_cfg, tracking_issue: int) -> list[str]:
     return gate_a_mod.summarise_pending_amends(pending)
 
 
+def _interactive_gap_lines(
+    repo_cfg, config, milestone_number: int, contract_text: str
+) -> list[str]:
+    """#3131 review: surface interactive-control contract gaps on every
+    read, the same neighborhood `_pending_amend_lines` surfaces pending
+    amends in — without this, `gate_a.interactive_contract_gaps` /
+    `summarise_interactive_gaps` were reachable from nowhere but their own
+    tests, so a human running `coord gate-a --approved` on a milestone with
+    an interactive mock would see nothing about an unpinned control: exactly
+    the coord-portal#307 "control exists but goes nowhere" gap this module
+    exists to catch. Returns `[]` (silently) whenever the repo's acceptance
+    driver has no browser-viewable mock glob, or no mock in the bundle has
+    any `:target` control — both true for every milestone today, since
+    `INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED` stays off — so this is a
+    zero-behavior-change addition until that flag flips.
+
+    Same best-effort, silent-on-failure, purely-additive posture as
+    `_pending_amend_lines`: a transient GitHub error here must never fail
+    the read, only skip the enrichment.
+    """
+    try:
+        from coord import mock_author  # noqa: PLC0415
+
+        glob, _reason = mock_author.resolve_viewable_mock_glob(
+            config.acceptance, repo_cfg.name
+        )
+        if glob is None:
+            return []
+        bundle = mock_author.collect_mock_bundle_files(
+            repo_cfg.github, milestone_number, repo_cfg.default_branch, glob
+        )
+        mocks = {name: html for name, html in bundle.items() if name != "contract.md"}
+        if not mocks:
+            return []
+        gaps = gate_a_mod.interactive_contract_gaps(mocks, contract_text)
+    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        log.debug(
+            "interactive-contract-gap enrichment failed for ms-%s",
+            milestone_number,
+            exc_info=True,
+        )
+        return []
+    return gate_a_mod.summarise_interactive_gaps(gaps)
+
+
 def _fetch_contract(repo_cfg, config, milestone_number: int) -> str | None:
     """*milestone_number*'s Gate-A contract text, trying every acceptance
     search root *config* declares for *repo_cfg* (#2896) — a bare milestone
@@ -206,6 +251,10 @@ def gate_a(
         if decision.approval is not None and decision.approval.note:
             click.echo(f"  note: {decision.approval.note}")
         for line in _pending_amend_lines(repo_cfg, tracking_issue):
+            click.echo(line)
+        for line in _interactive_gap_lines(
+            repo_cfg, cfg, milestone_number, contract_text
+        ):
             click.echo(line)
         if not decision.ok:
             click.echo("")

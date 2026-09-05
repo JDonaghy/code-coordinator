@@ -227,6 +227,132 @@ class TestGateACommand:
         assert result.exit_code == 2
         assert "milestone" in result.output
 
+    def test_read_only_invocation_surfaces_an_unpinned_interactive_control(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """#3131 review: `gate_a.interactive_contract_gaps` /
+        `summarise_interactive_gaps` must actually be reachable from
+        `coord gate-a`'s read path — before this wiring they were called
+        from nowhere but their own unit tests, so a human approving Gate A
+        on a milestone with an interactive mock would see nothing about a
+        control the contract never pins a destination for (the
+        coord-portal#307 "control exists but goes nowhere" gap this module
+        exists to catch)."""
+        config_yaml = """\
+repos:
+  - name: portal
+    github: acme/portal
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [portal]
+    repo_paths:
+      portal: /tmp/portal
+acceptance:
+  drivers:
+    portal:
+      kind: web-playwright
+      run: pytest
+      mock: "*.html"
+"""
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(config_yaml)
+
+        contract = "# Contract\n\n- there is a `nav-error` link\n"
+        mock_html = '<a id="nav-error" href="#s-error">Error</a>'
+
+        def _repo_file(repo: str, path: str, branch: str | None = None) -> str:
+            if path.endswith("contract.md"):
+                return contract
+            if path.endswith("mocks/walkthrough.html"):
+                return mock_html
+            raise RuntimeError("404")
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "ms-37 epic", "milestone": {"number": 37}, "labels": []},
+        ), patch(
+            "coord.github_ops.get_repo_file", side_effect=_repo_file
+        ), patch(
+            "coord.github_ops.repo_file_exists", return_value=True
+        ), patch(
+            "coord.github_ops.list_repo_dir", return_value=["walkthrough.html"]
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["gate-a", "--approved", "portal", "900", "--config", str(config_file)],
+            )
+            assert result.exit_code == 0, result.output
+
+            result = CliRunner().invoke(
+                main, ["gate-a", "portal", "900", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "walkthrough.html" in result.output
+        assert "nav-error" in result.output
+        assert "s-error" in result.output
+        assert "never pins that" in result.output
+
+    def test_read_only_invocation_omits_interactive_gap_lines_when_fully_pinned(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """The mirror case: a contract that DOES pin every control's
+        destination gets no interactive-gap noise on an otherwise-clean
+        read."""
+        config_yaml = """\
+repos:
+  - name: portal
+    github: acme/portal
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [portal]
+    repo_paths:
+      portal: /tmp/portal
+acceptance:
+  drivers:
+    portal:
+      kind: web-playwright
+      run: pytest
+      mock: "*.html"
+"""
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(config_yaml)
+
+        contract = "# Contract\n\n- clicking `nav-error` makes `#s-error` visible\n"
+        mock_html = '<a id="nav-error" href="#s-error">Error</a>'
+
+        def _repo_file(repo: str, path: str, branch: str | None = None) -> str:
+            if path.endswith("contract.md"):
+                return contract
+            if path.endswith("mocks/walkthrough.html"):
+                return mock_html
+            raise RuntimeError("404")
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "ms-37 epic", "milestone": {"number": 37}, "labels": []},
+        ), patch(
+            "coord.github_ops.get_repo_file", side_effect=_repo_file
+        ), patch(
+            "coord.github_ops.repo_file_exists", return_value=True
+        ), patch(
+            "coord.github_ops.list_repo_dir", return_value=["walkthrough.html"]
+        ):
+            CliRunner().invoke(
+                main,
+                ["gate-a", "--approved", "portal", "900", "--config", str(config_file)],
+            )
+            result = CliRunner().invoke(
+                main, ["gate-a", "portal", "900", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "never pins that" not in result.output
+
     def test_verdict_is_audited(self, config_file: Path, coord_db) -> None:
         _run(config_file, ["--approved", "api", "900"])
         rows = coord_db.execute(

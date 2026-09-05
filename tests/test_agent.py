@@ -1859,6 +1859,57 @@ def test_default_worker_command_embeds_claude_md_for_mock_author_type(tmp_path: 
     assert "Gate A first." in argv[idx + 1]
 
 
+def test_mock_author_system_prompt_omits_interactive_carveout_by_default() -> None:
+    """#3131 review: the `:target` interactive-walkthrough exception must
+    only reach a mock-author session's system prompt while
+    `coord.mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED` is true —
+    otherwise an operator's own free-text
+    `coord acceptance mock ... --amend "make this a :target interactive
+    walkthrough"` could satisfy "the seed briefing explicitly calls for it"
+    and trigger the pre-coord-portal#314 CSP degrade the flag exists to
+    prevent, even though the flag itself stayed off."""
+    from coord import mock_author
+
+    assert not mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1120,
+        issue_title="[gate-a] t",
+        briefing="b",
+        type="mock-author",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    system_prompt = argv[idx + 1]
+    assert ":target" not in system_prompt
+    assert "‹INTERACTIVE_CARVEOUT›" not in system_prompt
+
+
+def test_mock_author_system_prompt_includes_interactive_carveout_when_enabled(
+    monkeypatch,
+) -> None:
+    """The mirror case: once the flag is flipped on, the exception text
+    (and its #3131 framing) reaches the system prompt as before."""
+    from coord import mock_author
+
+    monkeypatch.setattr(mock_author, "INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED", True)
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1120,
+        issue_title="[gate-a] t",
+        briefing="b",
+        type="mock-author",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    system_prompt = argv[idx + 1]
+    assert ":target" in system_prompt
+    assert "#3131" in system_prompt
+    assert "‹INTERACTIVE_CARVEOUT›" not in system_prompt
+
+
 def test_default_worker_command_no_claude_md_is_a_noop(tmp_path: Path) -> None:
     """A repo with no CLAUDE.md must not blow up or inject an empty section
     header into the system prompt."""
