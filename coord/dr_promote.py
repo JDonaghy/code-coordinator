@@ -436,6 +436,20 @@ def check_settings_checkout(
     Refusals: absent, dirty, behind, no upstream, or an unreadable git state.
     An *ahead* checkout (unpushed commits) is a note, not a refusal — it is
     #3120's concern and cannot make the promoted daemon run on stale config.
+
+    *runner* is injectable for the behind-check only; ``probe_config_drift``
+    owns its own ``subprocess`` seam by design (its whole "this module runs
+    exactly five read-only git invocations and nothing else" assertion is
+    written against it) and is not re-plumbed through this one.
+
+    **One deliberate divergence from ``coord.config.resolve_config_path``**:
+    this asks about ``$COORD_CONFIG`` then ``<coord_dir>/coordinator.yml``,
+    and *not* the CWD-relative ``./coordinator.yml`` dev fallback — the same
+    two rules ``config_drift`` replicates, for the same reason (a
+    systemd-launched daemon has no meaningful current directory, so a config
+    that only resolves from a shell's CWD is not one the promoted daemon would
+    come up on). A host where only the CWD fallback exists is therefore
+    reported *absent* here, which is the refusal an operator wants.
     """
     from coord.health.checks.config_drift import probe_config_drift  # noqa: PLC0415
     from coord.health.context import build_context  # noqa: PLC0415
@@ -1154,13 +1168,27 @@ def build_plan(
     units = plan_units(runner=runner)
     missing_units = [u.name for u in units if u.action.startswith("blocked")]
     if missing_units:
+        # All of them missing usually means the *query* failed, not that ten
+        # separate units were each forgotten — `_timer_states` returns `{}`
+        # when there is no systemd user session to ask at all. Saying so is
+        # the difference between an operator running the install step and an
+        # operator wondering why `systemctl --user` is unavailable.
+        whole_query = len(missing_units) == len(units)
         blockers.append(
             Blocker(
                 STEP_UNITS,
                 f"{len(missing_units)} daemon unit(s) systemd does not know "
-                f"about here ({', '.join(missing_units)}) — install them first "
-                "(`coord release propagate`, or copy deploy/ into "
-                "~/.config/systemd/user and `systemctl --user daemon-reload`)",
+                f"about here ({', '.join(missing_units)}) — "
+                + (
+                    "systemd returned no state for ANY of them, so either none "
+                    "is installed on this host or there is no `systemctl "
+                    "--user` session to ask. "
+                    if whole_query
+                    else ""
+                )
+                + "Install them first (`coord release propagate`, or copy "
+                "deploy/ into ~/.config/systemd/user and `systemctl --user "
+                "daemon-reload`)",
             )
         )
 
