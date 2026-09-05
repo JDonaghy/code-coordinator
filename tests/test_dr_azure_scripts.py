@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -180,6 +181,12 @@ def _write_stub(path: Path, body: str) -> None:
 @pytest.fixture
 def lane(tmp_path: Path) -> dict:
     """A stubbed azure-workers environment: recording binaries + an env file."""
+    # The lane parses `az` JSON with jq (a documented preflight prereq, and what
+    # epic-up.sh/epic-down.sh already use). Guarded narrowly rather than at
+    # module level: the ACL, secret-table and readiness tests below need no jq
+    # and must keep running even on a host without it.
+    if shutil.which("jq") is None:
+        pytest.skip("jq is not installed; the azure-workers scripts require it (preflight section A)")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     _write_stub(bindir / "az", _AZ_STUB)
