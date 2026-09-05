@@ -19,6 +19,12 @@ accumulate as exactly the FIFO backlog the panel exists to work through.
 A later ``changes_requested`` on the same submission takes it back off the
 list — last verdict wins, not "was ever approved".
 
+**#3106 addendum.** ``post-shipped`` (ongoing maintenance against an
+already-shipped release — see :mod:`coord.portal_sync`'s module docstring)
+is treated as pulled for the same reason ``shipped`` is: a submission only
+ever reaches it after being fully decomposed, linked, and shipped once
+already, so it can never mean "nobody has acted on this yet".
+
 **What takes a row back off the list once it *is* approved (#2660).** An
 approved verdict never expires on its own, so something else has to say
 "this one has already been pulled" — that is :data:`_PULLED_STATUSES`,
@@ -164,12 +170,17 @@ _TEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 #: "What takes a row back off the list" section (#2660) for the full
 #: reasoning. Kept as plain string literals rather than importing
 #: :mod:`coord.portal_sync`'s ``STATUS_*`` constants: that module only names
-#: three of these (``STATUS_PLANNED`` / ``STATUS_IN_PROGRESS`` /
-#: ``STATUS_SHIPPED``), ``quality-check`` has no constant of its own there,
-#: and pulling in half a set by name while spelling the other half out
-#: would be a worse reader experience than one literal tuple here, next to
-#: the rule it encodes.
-_PULLED_STATUSES = frozenset({"planned", "in-progress", "quality-check", "shipped"})
+#: four of these (``STATUS_PLANNED`` / ``STATUS_IN_PROGRESS`` /
+#: ``STATUS_SHIPPED`` / ``STATUS_POST_SHIPPED``), ``quality-check`` has no
+#: constant of its own there, and pulling in most of a set by name while
+#: spelling the rest out would be a worse reader experience than one literal
+#: tuple here, next to the rule it encodes.
+#:
+#: ``post-shipped`` (#3106) is included for the same reason ``shipped`` is
+#: — see the module docstring's "#3106 addendum".
+_PULLED_STATUSES = frozenset(
+    {"planned", "in-progress", "quality-check", "shipped", "post-shipped"}
+)
 
 #: ``portal_submissions.last_status`` values that mean "intake happened,
 #: nothing else has" — the #2661 "brand new, nobody has acted on this yet"

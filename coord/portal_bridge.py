@@ -70,6 +70,20 @@ MAX_PUSH_UPDATES = 50
 #: coord-portal's ``src/submissions.ts`` ``SUBMISSION_STATUS_TEXT`` — a value
 #: outside this set has no pill and no screen on the portal side, and
 #: ``isSubmissionStatus`` rejects it as ``invalid_value:status``.
+#:
+#: ``post-shipped`` (#3106) is the one addition since ms-3: before it,
+#: ``shipped`` was the terminal value in both directions
+#: (:func:`coord.portal_sync._reentry_block_reason`), so a client whose
+#: release had shipped could never be told about a later bug fix or small
+#: enhancement — the fold either got stuck re-notifying ``shipped`` (a no-op,
+#: #2588's churn guard) or was refused outright as an "un-ship" (#3096's
+#: terminal-status guard). ``post-shipped`` covers exactly that: ongoing
+#: maintenance against an already-shipped release, distinct from a full new
+#: release cycle. This is a cross-repo change — coord owns the enum, the
+#: fold (:func:`coord.portal_sync.fold_submission_status`) and the re-entry
+#: guard, but coord-portal still has to learn to render and email this value
+#: (``src/submissions.ts``'s ``SUBMISSION_STATUS_TEXT`` / ``isSubmissionStatus``)
+#: before a push of it does anything visible on the customer's screen.
 SUBMISSION_STATUSES = (
     "describing",
     "in-design",
@@ -80,6 +94,7 @@ SUBMISSION_STATUSES = (
     "needs-input",
     "on-hold",
     "shipped",
+    "post-shipped",
 )
 
 #: Fields coord is the sole writer of (coord-portal's ``COORD_OWNED_FIELDS``,
