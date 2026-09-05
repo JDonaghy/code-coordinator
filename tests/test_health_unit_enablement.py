@@ -243,6 +243,67 @@ def test_missing_unit_warn_fix_line_installs_and_enables_from_packaged_copy(
     assert "systemctl --user enable --now coord-backup.timer" in detail
 
 
+def test_missing_templated_unit_remedy_actually_enables_it(tmp_path, monkeypatch) -> None:
+    """Review finding (fix iteration 1): `coord-agent.service` is the one
+    manifest unit that is a systemd *template* (#1928's `<MACHINE_NAME>`/
+    `<PORT>`), so a required-but-missing `coord-agent.service` takes the
+    templated branch of `_missing_unit_remedy`. The previous shape of that
+    branch reused `unit_drift._templated_remedy` verbatim (which ends in
+    `systemctl --user restart {service}` — correct for ITS caller, where the
+    unit is already enabled and only its content drifted) and appended
+    `enable --now` only after a trailing `#`. Everything after `#` is a
+    shell comment: copy-pasting the whole detail string (the entire point of
+    a fix line) would render+reload+restart but never actually enable the
+    unit — reproducing the exact "disabled unit produces zero evidence"
+    failure shape (#2098) this check exists to catch. The fix line must
+    instead end in a real, chained `enable --now coord-agent.service`."""
+    # coord-agent.service is never installed on this host at all.
+    monkeypatch.setattr(ue, "_is_enabled", lambda name, **kw: ("enabled", None))
+    monkeypatch.setattr(
+        ue, "resolve_role", lambda coord_dir: _declare(ROLE_WORKER, source="file", raw="worker")
+    )
+    results = ue.probe_unit_enablement(make_ctx(tmp_path))
+    detail = {r.subject: r.detail for r in results}["coord-agent.service"]
+    enable_cmd = "systemctl --user enable --now coord-agent.service"
+    assert "sed " in detail  # #1928: rendered from the template, never a bare cp
+    assert "systemctl --user daemon-reload" in detail
+    assert enable_cmd in detail
+    # The enable command must be part of the executable `&&` chain right
+    # after the daemon-reload step — not sitting after a `#`, which would
+    # make it an inert comment instead of something that actually runs.
+    reload_idx = detail.index("systemctl --user daemon-reload")
+    enable_idx = detail.index(enable_cmd)
+    assert reload_idx < enable_idx
+    assert "#" not in detail[reload_idx:enable_idx]
+
+
+def test_masked_required_unit_is_not_reported_as_never_installed(tmp_path, monkeypatch) -> None:
+    """Non-blocking review concern: a role-required unit the fleet
+    deliberately masks (`coord-release-propagate.timer` on dellserver, per
+    the manual-release-rolls policy) must not be reported as "never
+    installed" by the #3128 branch. `systemctl --user mask` leaves a symlink
+    to `/dev/null` at the installed path, and `/dev/null` exists — so
+    `installed_path.exists()` is True and this unit never enters the
+    "required but missing" branch at all; it falls through to the
+    pre-existing "installed but not enabled" WARN path, unchanged by #3128.
+    That falls out of the code by construction, but was unasserted."""
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True)
+    masked = installed_dir / "coord-release-propagate.timer"
+    masked.symlink_to("/dev/null")
+    monkeypatch.setattr(ue, "_is_enabled", lambda name, **kw: ("masked", None))
+    monkeypatch.setattr(
+        ue, "resolve_role", lambda coord_dir: _declare(ROLE_DAEMON, source="file", raw="daemon")
+    )
+    results = ue.probe_unit_enablement(make_ctx(tmp_path))
+    by_subject = {r.subject: r for r in results}
+    r = by_subject["coord-release-propagate.timer"]
+    assert r.severity is Severity.WARN
+    assert r.values.get("required") is not True
+    assert "never installed" not in r.headroom
+    assert r.values["state"] == "masked"
+
+
 def test_declared_daemon_role_fully_installed_and_enabled_is_ok(tmp_path, monkeypatch) -> None:
     """#3128 acceptance 4: a daemon host with every manifest unit installed
     AND enabled reports OK across the board — the new branch never fires a
