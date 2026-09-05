@@ -20,9 +20,12 @@ from pathlib import Path
 
 from coord.deploy_manifest import (
     ROLE_DAEMON,
+    ROLE_ENV_VAR,
     ROLE_UNITS,
     ROLE_WORKER,
+    RoleDeclaration,
     all_manifest_units,
+    resolve_role,
     units_for_role,
 )
 
@@ -112,3 +115,84 @@ def test_doc_table_roles_match_manifest() -> None:
             assert name not in units_for_role(ROLE_WORKER)
         else:  # pragma: no cover - guard against a role spelling this test doesn't know
             raise AssertionError(f"unrecognized role text for {name!r}: {role_text!r}")
+
+
+# ── resolve_role (#3128) ─────────────────────────────────────────────────
+#
+# `unit_enablement` is the only consumer, and per that module's own tests it
+# never re-reads `~/.coord/role`/`COORD_ROLE` itself — so the file/env
+# parsing contract lives entirely here.
+
+
+def test_resolve_role_defaults_to_worker_when_nothing_declared(tmp_path) -> None:
+    """No file, no env var: the safe majority, and `declared=False` is what
+    lets `unit_enablement` stay byte-identical to pre-#3128 behaviour."""
+    result = resolve_role(tmp_path / ".coord", env={})
+    assert result == RoleDeclaration(role=ROLE_WORKER, raw=None, source="default", valid=True)
+    assert result.declared is False
+
+
+def test_resolve_role_reads_the_coord_dir_role_file(tmp_path) -> None:
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "role").write_text("daemon\n")
+    result = resolve_role(coord_dir, env={})
+    assert result.role == ROLE_DAEMON
+    assert result.raw == "daemon"
+    assert result.source == "file"
+    assert result.valid is True
+    assert result.declared is True
+
+
+def test_resolve_role_env_var_wins_over_file(tmp_path) -> None:
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "role").write_text("daemon\n")
+    result = resolve_role(coord_dir, env={ROLE_ENV_VAR: "worker"})
+    assert result.role == ROLE_WORKER
+    assert result.source == "env"
+    assert result.valid is True
+    assert result.declared is True
+
+
+def test_resolve_role_is_case_insensitive_and_strips_whitespace(tmp_path) -> None:
+    result = resolve_role(tmp_path / ".coord", env={ROLE_ENV_VAR: "  DAEMON  "})
+    assert result.role == ROLE_DAEMON
+    assert result.valid is True
+
+
+def test_resolve_role_unknown_value_falls_back_to_worker_but_is_flagged_invalid(tmp_path) -> None:
+    """#3128 acceptance: an unparseable/unknown role never raises and never
+    silently reads as `daemon` — it falls back to `worker` with `valid=False`
+    so `unit_enablement` can still raise the fact as a WARN."""
+    result = resolve_role(tmp_path / ".coord", env={ROLE_ENV_VAR: "production"})
+    assert result.role == ROLE_WORKER
+    assert result.raw == "production"
+    assert result.valid is False
+    assert result.declared is True
+
+
+def test_resolve_role_missing_coord_dir_does_not_raise(tmp_path) -> None:
+    """`<coord_dir>/role` under a `coord_dir` that doesn't exist at all must
+    read the same as "nothing declared" (#3117 is precisely the scenario
+    where a fresh/rebuilt host has no `~/.coord/` yet)."""
+    result = resolve_role(tmp_path / "does-not-exist", env={})
+    assert result == RoleDeclaration(role=ROLE_WORKER, raw=None, source="default", valid=True)
+
+
+def test_resolve_role_blank_file_reads_as_undeclared(tmp_path) -> None:
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "role").write_text("   \n")
+    result = resolve_role(coord_dir, env={})
+    assert result.declared is False
+    assert result.role == ROLE_WORKER
+
+
+def test_resolve_role_result_is_always_a_valid_role_key() -> None:
+    """Every `RoleDeclaration.role` this function can return must be usable
+    directly as `units_for_role(result.role)` without the caller
+    re-validating it first — including the `valid=False` fallback case."""
+    for role in (ROLE_WORKER, ROLE_DAEMON, "worker", "bogus", ""):
+        result = resolve_role(Path("/nonexistent"), env={ROLE_ENV_VAR: role} if role else {})
+        assert result.role in ROLE_UNITS
