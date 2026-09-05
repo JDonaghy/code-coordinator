@@ -3088,3 +3088,78 @@ class TestGetRepoMilestonesWithCounts:
             {"number": 4, "title": "ms-4", "state": "open",
              "open_issues": 3, "closed_issues": 1, "description": "d"},
         ]
+
+
+class TestDrCredentialProbes:
+    """#3129: the two `coord dr promote` capability probes, whose argv moved
+    into this module so the #1902/#2135 chokepoint invariant still holds.
+
+    `tests/test_dr_promote.py` covers the *verdicts* these produce, end to end
+    against a real `gh` shim on ``$PATH``. What that lane cannot see is the
+    argv itself, which is exactly what moving it here put at risk — so these
+    pin the two shapes, and pin that a refusal comes back as a value rather
+    than an exception (this path grades a refusal; it must not raise on one).
+    """
+
+    def test_push_probe_argv_includes_the_jq_filter(self) -> None:
+        """`--jq .permissions.push` is load-bearing: without it `gh` returns
+        the whole repo object and the caller's true/false parse fails."""
+        seen: list[list[str]] = []
+
+        def run(argv):
+            seen.append(list(argv))
+            return 0, "true\n"
+
+        code, out = github_ops.probe_repo_push_permission("acme/api", run=run)
+
+        assert seen == [["gh", "api", "repos/acme/api", "--jq",
+                         ".permissions.push"]]
+        assert (code, out) == (0, "true\n")
+
+    def test_issues_probe_argv_asks_for_one_issue(self) -> None:
+        seen: list[list[str]] = []
+
+        def run(argv):
+            seen.append(list(argv))
+            return 0, "[]\n"
+
+        code, out = github_ops.probe_issues_readable("acme/api", run=run)
+
+        assert seen == [["gh", "api", "repos/acme/api/issues?per_page=1"]]
+        assert (code, out) == (0, "[]\n")
+
+    @pytest.mark.parametrize(
+        "probe",
+        [github_ops.probe_repo_push_permission, github_ops.probe_issues_readable],
+        ids=["push", "issues"],
+    )
+    def test_a_refusal_is_returned_not_raised(self, probe) -> None:
+        """The failing verdict has to be reachable: `dr promote` renders
+        "this token cannot merge here" as a blocker, which it can only do if
+        the non-zero exit arrives as a return value."""
+        code, out = probe(
+            "acme/api", run=lambda argv: (1, "gh: HTTP 401 Bad credentials")
+        )
+
+        assert code == 1
+        assert "401" in out
+
+    @pytest.mark.parametrize(
+        "probe",
+        [github_ops.probe_repo_push_permission, github_ops.probe_issues_readable],
+        ids=["push", "issues"],
+    )
+    def test_probes_do_not_touch_the_throttle_or_telemetry_seams(
+        self, probe, monkeypatch
+    ) -> None:
+        """They run on a host whose store is mid-restore, so they must not
+        write `github_throttle`/`forge_availability` state — which is the
+        whole reason they take a runner instead of calling `_gh`."""
+        def boom(*args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("DR probe reached the _gh backoff/telemetry seam")
+
+        monkeypatch.setattr(github_ops, "_gh", boom)
+        monkeypatch.setattr(github_ops.github_throttle, "consult", boom)
+        monkeypatch.setattr(github_ops, "record_gh_call", boom)
+
+        assert probe("acme/api", run=lambda argv: (0, "ok"))[0] == 0

@@ -220,6 +220,28 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "prove) is tested through a monkeypatched backend and adds no site "
         "here.",
     ),
+    "test_dr_promote.py": Classification(
+        2, (BUCKET_A,),
+        "#3129's DR-promote lane — rung D3, the third file of the same "
+        "on-disk-file lane as test_backup.py and test_dr_verify.py directly "
+        "above, and filed A for the same reason. Both sites are a real "
+        "SQLite *file* whose file-ness is the subject, because this rung is "
+        "about a store that leaves one machine and is stood back up on "
+        "another: the first seeds the snapshot restic will restore "
+        "(`_ensure_schema` + the #748 board fixture written to a path inside "
+        "the fake restic repo), and the second — `store_assignments()` — "
+        "re-opens the *restored* file by path to count `assignments`, which "
+        "is the parity assertion the whole rung exists to make. The autouse "
+        "coord_db fixture cannot serve either: there is no path to hand "
+        "restic, and the file under assertion is one a subprocess created. "
+        "scratch_database() is out for the usual backend-following reason — "
+        "under COORD_TEST_BACKEND=postgres there is no file for restic to "
+        "snapshot and no restored file to re-open, so these would be "
+        "asserting about a different recovery story than the one shipped. "
+        "The credential, unit-state and git halves of this file go through "
+        "real subprocess shims on $PATH rather than a database and add no "
+        "site here.",
+    ),
     "test_test_orchestrator.py": Classification(
         2, (BUCKET_A,),
         "Judgement call: _migrate_add_columns idempotency + PRAGMA "
