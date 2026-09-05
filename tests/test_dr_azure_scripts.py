@@ -168,7 +168,10 @@ sys.exit(0)
 _COORD_STUB = r"""#!/usr/bin/env python3
 import os, sys
 if "sessions" in sys.argv:
-    print(os.environ.get("STUB_SESSIONS_JSON", "[]"))
+    # `coord sessions --json`'s real shape (coord/commands/sessions.py,
+    # sessions_cmd): a top-level OBJECT keyed "sessions", not a bare array --
+    # see dr_live_sessions in dr-down.sh for why that distinction matters.
+    print(os.environ.get("STUB_SESSIONS_JSON", '{"sessions": []}'))
 sys.exit(0)
 """
 
@@ -380,6 +383,22 @@ def test_refuses_when_the_server_tag_exists_but_nothing_grants_it_7435(lane: dic
     _assert_created_nothing(lane)
 
 
+def test_a_multi_port_grant_still_satisfies_the_7435_check(lane: dict, tmp_path: Path) -> None:
+    """A destination written as `tag:coord-server:7433,7435` grants exactly what
+    a single-port `tag:coord-server:7435` would, and must not be treated as
+    ungranted merely because the port list has more than one entry -- the
+    shipped tailnet-acl.hujson itself uses this multi-port form for the
+    operator grant (rule with dst `tag:coord-server:22,7433,7434,7435`)."""
+    acl = tmp_path / "multi-port-acl.hujson"
+    acl.write_text(
+        '{\n  "tagOwners": { "tag:coord-server": ["autogroup:admin"] },\n'
+        '  "acls": [ { "src": ["tag:coord-worker"], "dst": ["tag:coord-server:7433,7435"] } ],\n}\n'
+    )
+    result = _run_dr_up(lane, "--dry-run", "--acl-file", str(acl))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "nothing grants :7435" not in (result.stdout + result.stderr)
+
+
 def test_refuses_when_the_key_vault_lacks_a_required_secret(lane: dict) -> None:
     lane["env"]["STUB_VAULT_SECRETS"] = ",".join(
         s for s in REQUIRED_SECRETS if s != "restic-password"
@@ -478,6 +497,45 @@ def test_the_secret_table_is_the_single_source_of_truth() -> None:
     assert "dr_secret_names required" in up
     for name in REQUIRED_SECRETS:
         assert f'"{name}"' not in up, f"dr-up.sh hardcodes the secret name {name!r}"
+
+
+def test_the_board_token_secret_exports_the_name_its_real_consumer_reads() -> None:
+    """`coord.dr_promote.check_board_token_credential()` resolves the daemon's
+    bearer token via `coord.serve_app.resolve_serve_token()`, which only ever
+    reads `$COORD_SERVE_TOKEN` (or ~/.coord/serve_token) -- never a
+    `COORD_BOARD_TOKEN` of this script's own invention. A mismatch here means
+    the credential can never report anything but "missing", no matter how
+    successfully it was fetched from Key Vault, and `dr_advertise_ready` can
+    then never pass in a real run (#2085)."""
+    result = _source(PROVISION_SERVER, "dr_secret_env board-token")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "COORD_SERVE_TOKEN"
+
+
+def test_persist_board_token_writes_the_file_resolve_serve_token_reads(tmp_path: Path) -> None:
+    """The env var alone only reaches THIS process; `coord serve` is started as
+    a separate systemd --user unit that does not inherit it, and survives
+    every future restart on its own. `resolve_serve_token()`'s only source
+    that survives that is the token FILE, so that is what must be written."""
+    target = tmp_path / "coord-home" / ".coord" / "serve_token"
+    result = _source(
+        PROVISION_SERVER, f'dr_persist_board_token "{SECRET_SENTINEL}" "{target}"'
+    )
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == SECRET_SENTINEL
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert SECRET_SENTINEL not in result.stdout
+    assert SECRET_SENTINEL not in result.stderr
+
+
+def test_persist_board_token_is_a_no_op_when_nothing_was_obtained(tmp_path: Path) -> None:
+    """The fetch step already reports a missing board-token as a blocker; this
+    function must not paper over that with an empty (or stale) token file."""
+    target = tmp_path / "serve_token"
+    result = _source(PROVISION_SERVER, f'dr_persist_board_token "" "{target}"')
+    assert result.returncode == 0, result.stderr
+    assert not target.exists()
 
 
 def test_boot_path_reports_which_secrets_it_obtained(tmp_path: Path) -> None:
@@ -715,7 +773,7 @@ def test_dr_down_refuses_when_a_live_interactive_session_is_on_the_machine(lane:
     silently."""
     lane["env"]["STUB_HEALTH_BODY"] = json.dumps({"machine": "coord-dr", "active": 0})
     lane["env"]["STUB_SESSIONS_JSON"] = json.dumps(
-        [{"machine": "coord-dr", "name": "merge-3130"}]
+        {"sessions": [{"machine": "coord-dr", "session_name": "merge-3130"}]}
     )
     result = _run_dr_down(lane, "--machine", "coord-dr")
     assert result.returncode != 0, result.stdout
@@ -726,7 +784,7 @@ def test_dr_down_refuses_when_a_live_interactive_session_is_on_the_machine(lane:
 def test_dr_down_force_skips_the_drain_and_the_session_check(lane: dict) -> None:
     lane["env"]["STUB_HEALTH_BODY"] = json.dumps({"machine": "coord-dr", "active": 5})
     lane["env"]["STUB_SESSIONS_JSON"] = json.dumps(
-        [{"machine": "coord-dr", "name": "merge-3130"}]
+        {"sessions": [{"machine": "coord-dr", "session_name": "merge-3130"}]}
     )
     result = _run_dr_down(lane, "--machine", "coord-dr", "--force")
     assert result.returncode == 0, result.stdout + result.stderr

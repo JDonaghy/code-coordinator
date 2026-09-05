@@ -60,11 +60,23 @@ DR_SERVER_TAG="tag:coord-server"
 # The `required` column is what gates readiness. `git-push-identity` is
 # optional because a merge-capable `github-token` already authenticates a
 # push over HTTPS; a separate SSH deploy key is a nicety, not a blocker.
+#
+# `board-token` deliberately exports `COORD_SERVE_TOKEN`, NOT some
+# `COORD_BOARD_TOKEN` of our own invention: the daemon's bearer token is
+# resolved by `coord.serve_app.resolve_serve_token()`, which only ever reads
+# `$COORD_SERVE_TOKEN` or `~/.coord/serve_token` (`check_board_token_credential`
+# in coord/dr_promote.py is the consumer). A name that consumer never looks at
+# would make this credential permanently report "missing" no matter how
+# successfully it was fetched from Key Vault -- exactly the two-definitions-
+# of-the-same-fact split brain #2085 exists to catch. See
+# dr_persist_board_token() below for the other half: the env var only reaches
+# THIS process, but the daemon systemd starts afterwards needs the token to
+# survive into its own, unrelated process.
 # --------------------------------------------------------------------------
 dr_server_secret_table() {
     cat <<'EOF'
 github-token|GITHUB_TOKEN|required|github
-board-token|COORD_BOARD_TOKEN|required|board
+board-token|COORD_SERVE_TOKEN|required|board
 restic-password|RESTIC_PASSWORD|required|restic
 backup-repository|COORD_BACKUP_REPOSITORY|required|restic
 azure-account-name|AZURE_ACCOUNT_NAME|required|restic
@@ -157,6 +169,39 @@ dr_fetch_secrets() {
         fi
         unset value
     done < <(dr_secret_names)
+}
+
+# dr_persist_board_token <token-value> [target-file]
+#
+# The board token is the one credential in the table that has to outlive this
+# process. Every other secret (github-token, restic-*) is only ever read from
+# the environment WHILE `coord dr promote` is running -- the restore and the
+# GitHub probe both happen inside that one invocation. The board token is
+# different: `coord serve` is started as a systemd --user unit (`coord dr
+# promote`'s start_units()), which does NOT inherit this script's exported
+# environment -- `systemctl --user enable --now` talks to the user's systemd
+# manager over its own bus connection, not this shell -- and it is
+# `Restart=always`, so it will be re-exec'd by systemd again on every future
+# crash or reboot, long after $COORD_SERVE_TOKEN has left every process that
+# ever held it.
+#
+# `coord.serve_app.resolve_serve_token()`'s only source that survives that is
+# `SERVE_TOKEN_FILE` (~/.coord/serve_token), so that is where it has to land.
+# Exporting the env var (which the generic `set -a; source "$SECRETS_FILE"`
+# step already does) covers `check_board_token_credential()`'s probe and
+# `verify_board()`'s request inside *this* run of `coord dr promote`; this
+# function covers every run after it.
+#
+# A no-op, not a failure, when the value is empty: the "secret was not
+# obtained" blocker is already reported by dr_ready_blockers from the fetch
+# step, and this function has nothing to persist in that case.
+dr_persist_board_token() {
+    local value="$1" target="${2:-$HOME/.coord/serve_token}"
+    [[ -n "$value" ]] || return 0
+    install -d -m 0700 "$(dirname "$target")"
+    # umask, not chmod-after: a world-readable window, however short, is a
+    # window (same reasoning as dr_fetch_secrets' own outfile).
+    ( umask 0177; printf '%s' "$value" > "$target" )
 }
 
 # dr_obtained_csv <status-lines> -> comma-separated names that were obtained.
@@ -337,6 +382,11 @@ main() {
     # shellcheck source=/dev/null
     source "$SECRETS_FILE"
     set +a
+
+    # Persist the board token where `coord serve` will find it on every future
+    # restart -- see dr_persist_board_token's own comment for why the export
+    # two lines up is not enough on its own.
+    dr_persist_board_token "${COORD_SERVE_TOKEN:-}"
 
     echo
     echo "=== 2/4  restore + start the daemon (coord dr promote) ==="

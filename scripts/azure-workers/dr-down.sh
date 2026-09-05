@@ -86,12 +86,20 @@ dr_wait_for_drain() {
 #
 # Interactive tmux sessions are invisible to /health's assignment count, so a
 # testing or merge agent someone is driving by hand would be killed silently.
+#
+# `coord sessions --remote --json` (coord/commands/sessions.py, sessions_cmd)
+# emits a top-level OBJECT -- `{"sessions": [...]}` -- with each entry keyed
+# `session_name`, never a bare array keyed `name`/`session`. Parse the real
+# shape, not an assumed one: a `type=="array"` guard against that object is
+# always false, so it always took the `else empty` branch and reported no
+# sessions no matter what was actually running -- silently defeating the one
+# check this function exists to make.
 dr_live_sessions() {
     local machine="$1" sessions
     sessions="$(coord sessions --remote --json 2>/dev/null || true)"
     [[ -n "$sessions" ]] || return 0
     jq -r --arg m "$machine" \
-        'if type=="array" then (.[] | select((.machine // "")==$m) | (.name // .session // "?")) else empty end' \
+        '.sessions[]? | select((.machine // "")==$m) | (.session_name // "?")' \
         <<<"$sessions" 2>/dev/null || true
 }
 
@@ -188,7 +196,7 @@ EOF
     log "4/5  delete $RG"
     # Takes the VM, OS disk, NIC, NSG, VNet, NAT Gateway, public IP, the Key
     # Vault private endpoint and its DNS zone link -- everything billable.
-    az group delete -n "$RG" --yes --no-wait
+    az group delete -n "$RG" --yes --no-wait -o none
 
     # ----------------------------------------------------------------------
     log "5/5  confirm deletion actually started"
