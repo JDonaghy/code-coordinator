@@ -3061,6 +3061,8 @@ def revalidation_candidates(
     board,
     config,
     gh_ops: "GhOps | None" = None,
+    *,
+    skip_review: bool = False,
 ) -> list[RevalidationCandidate]:
     """The subset of *items* ``--revalidate`` is allowed to re-test (#1769).
 
@@ -3075,12 +3077,20 @@ def revalidation_candidates(
       excluded: a re-test cannot safely paper over the #1640 "was a verdict
       ever written?" disagreement, and #1769's acceptance criteria name a
       genuinely-missing verdict as out of scope;
-    * **no other gate is failing.** Concretely, the smoke failure is the only
-      entry in :func:`merge_gate_failures`, so an entry that also needs a
-      review is left alone. CI is not evaluated here (it needs a PR number and
-      a live ``gh`` round trip); :func:`process` still enforces it afterwards,
-      so a red-CI entry that was revalidated simply stays blocked on CI —
-      it is never merged.
+    * **no other gate is failing** — evaluated AFTER *skip_review* is applied
+      (#3107). Concretely, the smoke failure is the only entry left in
+      :func:`merge_gate_failures` once a review failure is discarded for a
+      ``--skip-review`` run, so an entry that also needs a review is left
+      alone UNLESS that same invocation already waived it. Composing
+      ``--skip-review`` with ``--revalidate`` is the one combination an
+      operator needs — a branch with an unfixable review finding but a merely
+      stale test verdict — and evaluating this predicate against the raw,
+      unwaived gate set (as before #3107) made that combination inexpressible:
+      the waiver would print, then ``--revalidate`` would refuse anyway because
+      it still saw the review block the same run had just bypassed. CI is not
+      evaluated here (it needs a PR number and a live ``gh`` round trip);
+      :func:`process` still enforces it afterwards, so a red-CI entry that was
+      revalidated simply stays blocked on CI — it is never merged.
 
     This is the *eligibility* half of ``--revalidate``. The re-test itself and
     the verdict write live in :mod:`coord.revalidate`; nothing here mutates
@@ -3095,6 +3105,8 @@ def revalidation_candidates(
         if not requires_smoke(entry, config):
             continue
         failures = merge_gate_failures(entry, config, board, gh_ops)
+        if skip_review:
+            failures = [f for f in failures if f.gate != "review"]
         # Blocked *solely* on smoke — a review/other block means a human (or
         # another stage) still owes this entry something a re-test can't give.
         if len(failures) != 1 or failures[0].gate != "smoke":

@@ -1700,6 +1700,105 @@ class TestOnlyPathRevalidates:
         assert _states() == {"w1": mq.PENDING, "w2": mq.PENDING}
 
 
+CONFIG_YAML_REVIEW = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    test_command: "true"
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: {repo_path}
+reviews:
+  enabled: true
+pipeline:
+  default_gates: [review, test, merge]
+ci_store:
+  type: none
+"""
+
+
+@pytest.fixture
+def blackbox_review_and_stale(git_fleet: Path, tmp_path: Path, coord_db):
+    """One entry blocked on BOTH gates at once: a `request-changes` review
+    verdict AND a test verdict staled by a base move (#3107's reproduction —
+    claude-coordinator#3083). Reviews are enabled and required, unlike
+    `blackbox` above."""
+    from coord.state import save_board
+
+    cfg = tmp_path / "coordinator.yml"
+    cfg.write_text(CONFIG_YAML_REVIEW.format(repo_path=str(git_fleet)))
+
+    entry = _entry("w1", issue=101)
+    entry.branch_head_sha = "branch-sha-101"
+    mq.save_queue([entry])
+    work = _tested_work("w1", issue=101)
+    review = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=101,
+        issue_title="[review] issue 101", assignment_id="rev1", type="review",
+        status="done", branch="issue-101-w1",
+        review_of_assignment_id="w1", review_verdict="request-changes",
+    )
+    save_board(Board(active=[], completed=[work, review]))
+    _stamp_anchors(
+        "w1", head_sha="branch-sha-101", base_sha="base-old", patch_id="patch-101",
+    )
+    return cfg, git_fleet
+
+
+class TestSkipReviewComposesWithRevalidate:
+    """#3107: `coord merge --only X --skip-review --revalidate` must resolve
+    BOTH gates on one entry that needs both waived/satisfied — the review
+    waiver from `--skip-review` has to be visible to `--revalidate`'s own
+    "blocked solely on staleness" eligibility check, in the SAME run.
+
+    Before the fix, `--skip-review` printed its waiver line and
+    `--revalidate` refused anyway ("no entry is blocked solely on a stale
+    test verdict"), because eligibility was computed against the raw,
+    unwaived gate set — so the entry stayed PENDING despite the waiver.
+    """
+
+    def test_revalidate_alone_declines_a_review_blocked_stale_entry(
+        self, blackbox_review_and_stale,
+    ) -> None:
+        """Sanity check for the bug report itself: without --skip-review,
+        --revalidate must still (correctly) refuse — a review block is not
+        something a re-test can resolve."""
+        cfg, checkout = blackbox_review_and_stale
+        with patch("coord.revalidate.revalidate") as reval:
+            result = _invoke(
+                ["merge", "--config", str(cfg), "--only", "w1", "--revalidate"],
+                checkout,
+            )
+
+        reval.assert_not_called()
+        assert result.exit_code == 0, result.output
+        assert "no entry is blocked solely on a stale test verdict" in result.output
+        assert _states() == {"w1": mq.PENDING}
+
+    def test_skip_review_and_revalidate_together_merge_it(
+        self, blackbox_review_and_stale,
+    ) -> None:
+        cfg, checkout = blackbox_review_and_stale
+        result = _invoke(
+            [
+                "merge", "--config", str(cfg), "--only", "w1",
+                "--skip-review", "--revalidate",
+            ],
+            checkout,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "--skip-review: review-approval gate bypassed" in result.output
+        # The one line that was missing before the fix — --revalidate actually
+        # ran the re-test instead of declining outright.
+        assert "--revalidate: PASSED" in result.output
+        assert _states() == {"w1": mq.MERGED}, result.output
+
+
 class _FakeTimeModule:
     """Drop-in replacement for the stdlib `time` module as seen by
     `coord.ci_store.wait_for_ci_settle` — `sleep` advances the same counter
