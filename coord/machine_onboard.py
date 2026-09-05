@@ -180,8 +180,9 @@ class Finding:
 # ── Credential hygiene ───────────────────────────────────────────────────────
 #
 # Layer 8 touches every secret the fleet has. The probe is written never to
-# emit a credential in the first place (it asks `gh auth status` WITHOUT
-# `--show-token`, stats credential files rather than reading them, and asks
+# emit a credential in the first place (it asks `gh api ... --jq
+# .permissions.push` rather than `gh auth status --show-token`, so the token
+# is never echoed; stats credential files rather than reading them; and asks
 # `coord.client` whether the board accepted the token rather than for the
 # token) — but a free-form error string from any of those is still attacker-
 # adjacent text we then paste into a finding. So every reason that survives
@@ -638,7 +639,9 @@ def probe_coord_on_worker_path(
 #   * identity: does this machine hold the credentials its role needs.
 #
 # Credential discipline, enforced in the SCRIPT and again on parse:
-#   - `gh auth status` is run WITHOUT `--show-token`;
+#   - forge permission is read via `gh api repos/<slug> --jq
+#     .permissions.push`, never `gh auth status --show-token` — the token
+#     itself is never echoed;
 #   - credential files are `stat`ed, never read;
 #   - the board token is never returned — the probe asks `coord.client`
 #     whether the DAEMON accepted it, which is both stronger evidence and
@@ -835,13 +838,9 @@ def probe_binaries(capabilities: list[str] | None, role: str) -> list[str]:
     comparing the two would manufacture a #1671 CRIT out of a machine that
     simply has no GTK dev libs.
     """
-    from coord.prereqs import ALL_PREREQS  # noqa: PLC0415
-
     caps = set(capabilities or [])
     out: list[str] = []
-    for prereq in ALL_PREREQS:
-        if prereq.capability is not None and prereq.capability not in caps:
-            continue
+    for prereq in _prereqs_for_capabilities(caps):
         if not is_binary_resolution_probe(prereq):
             continue
         if prereq.binary not in out:
@@ -862,6 +861,20 @@ def is_binary_resolution_probe(prereq: "Prereq") -> bool:
         and bool(prereq.binary)
         and prereq.tool == prereq.binary
     )
+
+
+def _prereqs_for_capabilities(caps: set[str]) -> list["Prereq"]:
+    """Prereqs in scope for a machine that declares ``caps``: capability-free
+    prereqs (they apply to every machine) plus ones whose capability is
+    declared.
+
+    Shared by :func:`probe_binaries` (the login-shell half of the #1671
+    comparison) and :func:`evaluate_toolchain` (layer 7) so the two filters
+    cannot drift apart.
+    """
+    from coord.prereqs import ALL_PREREQS  # noqa: PLC0415
+
+    return [p for p in ALL_PREREQS if p.capability is None or p.capability in caps]
 
 
 def parse_shell_probe(stdout: str) -> ShellProbe:
@@ -976,7 +989,7 @@ def probe_machine_shell(
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return ShellProbe(error=f"ssh probe failed: {exc}")
+        return ShellProbe(error=redact(f"ssh probe failed: {exc}"))
     if result.returncode != 0 and _SHELL_PROBE_MARKER not in (result.stdout or ""):
         detail = (result.stderr or result.stdout or "").strip().splitlines()[-1:]
         return ShellProbe(
@@ -1914,6 +1927,14 @@ def evaluate_toolchain(facts: MachineFacts) -> list[Finding]:
     says so.
     """
     if not facts.reachable:
+        # #3137 review: the capability/version verdicts below genuinely need
+        # /health and cannot be produced without it — but _role_tool_findings
+        # is gathered entirely over SSH (facts.shell_probed /
+        # facts.login_path_tools) and has nothing to do with agent
+        # reachability. A daemon host straight off a fresh OS install (SSH
+        # up, coord-agent not yet running) is exactly the scenario this layer
+        # exists for, and dropping the role-tool check here would silently
+        # swallow the restic CRIT the whole layer was written to surface.
         return [
             Finding(
                 layer="toolchain", check="toolchain.unprobed", severity=UNKNOWN,
@@ -1924,15 +1945,13 @@ def evaluate_toolchain(facts: MachineFacts) -> list[Finding]:
                 ),
                 subject=facts.name,
             )
-        ]
+        ] + _role_tool_findings(facts)
 
-    from coord.prereqs import ALL_CAPABILITY_NAMES, ALL_PREREQS  # noqa: PLC0415
+    from coord.prereqs import ALL_CAPABILITY_NAMES  # noqa: PLC0415
 
     out: list[Finding] = []
     caps = set(facts.declared_capabilities)
-    relevant = [
-        p for p in ALL_PREREQS if p.capability is None or p.capability in caps
-    ]
+    relevant = _prereqs_for_capabilities(caps)
     for prereq in sorted(relevant, key=lambda p: p.tool):
         out.append(_toolchain_finding(facts, prereq))
 

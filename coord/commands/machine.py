@@ -430,8 +430,9 @@ def _print_add_residue(
     help=(
         "Grade this machine against ROLE instead of the role it declares in "
         "~/.coord/role (#3128). Answers 'what would this host be missing if it "
-        "were the daemon?' without touching the host. Default: the host's own "
-        "declaration, read over --ssh; absent that, #3128's `worker` default."
+        "were ROLE?' (e.g. --role daemon) without touching the host. Default: "
+        "the host's own declaration, read over --ssh; absent that, #3128's "
+        "`worker` default."
     ),
 )
 @click.option(
