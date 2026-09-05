@@ -1492,13 +1492,14 @@ def test_the_backoff_widens_with_the_attempt_number():
 def test_the_backoff_deferrals_own_write_never_moves_its_own_anchor():
     """THE #2273 post-review "moving target" regression.
 
-    Production runs a 180s tick against a 300s dispatch-failure floor —
-    shorter than the backoff it is supposed to pace. Before this fix, the
-    backoff-deferral's own per-tick status write (`deferrals`/`last_reason`)
-    re-stamped `reason_at`, which `_retry_backoff_reason` also read its
-    anchor from — so every tick that observed the entry still backing off
-    reset the very clock the backoff was measured against, and `age` never
-    grew past one tick interval. It could never finish waiting.
+    Production runs a 180s tick against a (now #3145-widened, 660s)
+    dispatch-failure floor — shorter than the backoff it is supposed to
+    pace. Before this fix, the backoff-deferral's own per-tick status write
+    (`deferrals`/`last_reason`) re-stamped `reason_at`, which
+    `_retry_backoff_reason` also read its anchor from — so every tick that
+    observed the entry still backing off reset the very clock the backoff
+    was measured against, and `age` never grew past one tick interval. It
+    could never finish waiting.
 
     Reproduced here WITHOUT any DB layer: each simulated tick applies only
     the fields the deferral's own `updates` dict actually contains back onto
@@ -1518,15 +1519,16 @@ def test_the_backoff_deferrals_own_write_never_moves_its_own_anchor():
         retry_backoff_at=death,
     )
     # No board-visible assignment at all — the exact #2273 direction-2 tier
-    # (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS, 300s) this issue's incident hit.
+    # (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS, 660s as of #3145) this issue's
+    # incident hit.
     facts = IssueFacts(known=True, issue_state="open")
     view = BoardView(issues={entry_key(REPO, 1650): facts})
 
-    # Several ticks, each only 60s apart — shorter than the 300s floor —
+    # Several ticks, each only 60s apart — shorter than the 660s floor —
     # simulating the production 180s timer against it. `age` measured from
-    # the fixed `death` anchor never reaches 300s across any of these (max
-    # 179s, at the last iteration), so every one must still defer.
-    for tick_now in (death, death + 60, death + 120, death + 179):
+    # the fixed `death` anchor never reaches 660s across any of these (max
+    # 599s, at the last iteration), so every one must still defer.
+    for tick_now in (death, death + 60, death + 120, death + 599):
         plan = plan_tick([live], view, capacity=1, now=tick_now)
         assert plan.launch is None
         backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
@@ -1545,8 +1547,8 @@ def test_the_backoff_deferrals_own_write_never_moves_its_own_anchor():
             last_reason=backoff[0].reason,
         )
 
-    # 305s after the ORIGINAL death — past the 300s floor — relaunches.
-    plan = plan_tick([live], view, capacity=1, now=death + 305)
+    # 665s after the ORIGINAL death — past the 660s floor — relaunches.
+    plan = plan_tick([live], view, capacity=1, now=death + 665)
     assert plan.launch is not None and plan.launch.issue == 1650
 
 
@@ -1598,7 +1600,7 @@ def test_a_dispatch_failure_that_created_no_assignment_backs_off_longer():
             attempts=1,
             launched_at=launched_at,
             # Comfortably past RETRY_BACKOFF_SECONDS[0] (60s) but nowhere
-            # near DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (300s).
+            # near DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (660s as of #3145).
             retry_backoff_at=NOW - 90.0,
         )
     ]
@@ -1615,7 +1617,7 @@ def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():
     assignment for this launch — by itself indistinguishable from a genuine
     dispatch failure) EXCEPT the entry's own `last_reason` already names a
     merge-gate block. `_retry_backoff_reason` must not widen the spacing to
-    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` (300s) on top of a reason that
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` (660s as of #3145) on top of a reason that
     already says the real cause is a merge-gate block, not a dispatch
     failure — the same "one question, one answer" fix `_is_merge_gate_block_
     reason` already applies to the escalation text, now also applied to the
@@ -1629,8 +1631,8 @@ def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():
             attempts=1,
             launched_at=launched_at,
             # Same 90s elapsed as the widened-backoff test above: clears the
-            # plain RETRY_BACKOFF_SECONDS[0] (60s) but not the widened 300s
-            # floor.
+            # plain RETRY_BACKOFF_SECONDS[0] (60s) but not the widened 660s
+            # floor (#3145).
             retry_backoff_at=NOW - 90.0,
             last_reason=(
                 "merge attempted 3 times without landing. (attempt 2/5) — "
@@ -2287,7 +2289,7 @@ def test_the_real_death_cause_survives_multiple_backoff_ticks_2411():
     ]
     # No board-visible assignment (`last_dispatched_at` unset) — the #2273
     # dispatch-only tier, so the backoff floor is
-    # DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (300s), comfortably wider than
+    # DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (660s as of #3145), comfortably wider than
     # the plain RETRY_BACKOFF_SECONDS[0] (60s) this test's tick spacing
     # would otherwise outrun.
     facts = IssueFacts(known=True, issue_state="open")
@@ -2318,7 +2320,7 @@ def test_the_real_death_cause_survives_multiple_backoff_ticks_2411():
     )
 
     # Several later ticks, comfortably inside the widened dispatch-failure
-    # backoff floor (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS == 300s — no
+    # backoff floor (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS == 660s as of #3145 — no
     # board-visible assignment was ever created for this synthetic entry).
     for tick_now in (NOW + 30, NOW + 90, NOW + 200):
         plan = plan_tick([live], view, capacity=1, now=tick_now)

@@ -1173,6 +1173,14 @@ def build_app(
         return JSONResponse(server.list_repos())
 
     async def assign(request: Request) -> JSONResponse:
+        # #3145 audit note: `server.assign()` below runs inline on the loop
+        # and does do some blocking subprocess work (`_setup_worktree`'s
+        # `git worktree add`, etc.) — the same class of bug just fixed for
+        # `worktree_clean`. Left alone here deliberately: it's bounded to
+        # ordinary git/process latency (not the 600s-class `build_command`
+        # path this issue is about), and changing dispatch to run off-loop
+        # is a separate, larger question. Worth a tracked follow-up rather
+        # than another silent pass if this handler is revisited.
         try:
             body = await request.json()
         except ValueError:
@@ -1190,6 +1198,10 @@ def build_app(
         return JSONResponse(assignment.to_dict(), status_code=202)
 
     async def cancel(request: Request) -> JSONResponse:
+        # #3145 audit note: same as `assign` above — `server.cancel()`
+        # below does blocking process wait/kill work inline on the loop.
+        # Left alone for the same reason (bounded to ordinary
+        # process-signal latency; out of scope for this issue).
         assignment_id = request.path_params["id"]
         # #1567: ?rescue=1 opts into pushing the WIP commit to a disposable
         # rescue/<id> ref. Default (no query param, or any falsy value) is
@@ -1904,6 +1916,16 @@ def build_app(
             protect = [str(x) for x in raw_protect if isinstance(x, str)]
         else:
             protect = None
+        # #3145 review note: this shares the default `asyncio.to_thread`
+        # executor with `health`/`restart_services`/`graph_fix`/
+        # `drive_queue_reconcile`. A burst of concurrent `/worktree-clean`
+        # calls (e.g. several repos finalizing near-simultaneously, each
+        # running its own pre-stash build) could saturate that pool and
+        # delay other to_thread-based endpoints queuing behind it — a
+        # milder version of the same freeze, bounded by pool size instead
+        # of one global loop. Not the incident scenario (single in-flight
+        # call), so left as the same pattern rather than a dedicated
+        # executor; worth revisiting if concurrent finalizes become common.
         result = await asyncio.to_thread(
             server.clean_worktrees, recent_secs=recent_secs, protect=protect
         )
