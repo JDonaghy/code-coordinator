@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any, NamedTuple
 
@@ -3564,3 +3565,66 @@ def post_pr_review(repo: str, number: int, verdict: str, body: str) -> None:
         raise ValueError(f"Invalid review verdict: {verdict!r} (must be 'approve' or 'request-changes')")
     _gh("pr", "review", str(number), "--repo", repo, flag, "--body", body,
         caller="github_ops.post_pr_review")
+
+
+# ── DR credential probes (#3129, rung D3 of epic #3117) ─────────────────────
+#
+# `coord dr promote` asks GitHub two read-only capability questions on a
+# standby host: "may this token merge here?" and "may it read issues?". Those
+# two argv constructions live HERE, not in coord/dr_promote.py, because this
+# module is the repo's single `gh` chokepoint (#1902/#2135) — the invariant
+# `scripts/check_gh_argv_containment.py` enforces, and the reason the eventual
+# forge port is a refactor rather than a rewrite. A future non-GitHub forge
+# reimplements these two functions and `dr promote` follows for free.
+#
+# What does NOT move here is the *execution* policy. These take the caller's
+# runner (`coord.dr_promote._run`) rather than calling `_gh` themselves, for
+# three reasons specific to the DR path:
+#
+#   * `_gh` raises on a non-zero exit; the promote checks need the exit code
+#     and the output, because "the token cannot push to repo 4 of 5" is a
+#     *verdict to render*, not an exception to swallow.
+#   * `_gh` consults and feeds `coord.github_throttle`'s shared backoff and
+#     records `forge_availability` telemetry — both of which write to the very
+#     store this command is in the middle of restoring, on a host whose board
+#     is not up yet.
+#   * `dr_promote._run` scrubs credentials out of captured output and maps a
+#     missing binary to exit 127 rather than an exception; the probes must
+#     keep exactly those semantics.
+#
+# So: the seam owns the argv, the caller owns how it is run.
+
+#: What the two probes below expect of their *run* argument: take an argv,
+#: return ``(returncode, combined stdout+stderr)``, and do not raise for the
+#: ordinary failures. :func:`coord.dr_promote._run` is the implementation.
+GhProbeRunner = Callable[[Sequence[str]], tuple[int, str]]
+
+
+def probe_repo_push_permission(slug: str, *, run: GhProbeRunner) -> tuple[int, str]:
+    """Ask GitHub whether this token may **push to** (and so merge on) *slug*.
+
+    Returns the runner's ``(returncode, output)`` verbatim. On success the
+    output is GitHub's own ``.permissions.push`` answer for the authenticated
+    identity — the literal string ``true`` or ``false``, possibly with
+    surrounding whitespace; the caller parses and grades it. Anything else
+    (a non-zero exit, an unparseable body) is the caller's *unknown*, never a
+    silent pass: see :func:`coord.dr_promote.check_github_credential`.
+
+    Per repo on purpose — a token can be fine on four repos and useless on the
+    fifth, and a merge-capability check that averages that is not a check.
+    """
+    return run(["gh", "api", f"repos/{slug}", "--jq", ".permissions.push"])
+
+
+def probe_issues_readable(slug: str, *, run: GhProbeRunner) -> tuple[int, str]:
+    """Ask GitHub whether this token may **read issues** on *slug*.
+
+    Separate from :func:`probe_repo_push_permission` because issue access is
+    separately grantable — and separately revocable — from repo metadata, so
+    a token that answers ``push: true`` can still be unable to read the issue
+    bodies the coordinator's whole message bus is made of.
+
+    Requests a single issue (``per_page=1``): the smallest response that still
+    proves the endpoint answered for this identity.
+    """
+    return run(["gh", "api", f"repos/{slug}/issues?per_page=1"])

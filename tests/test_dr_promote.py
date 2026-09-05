@@ -132,7 +132,15 @@ sys.stderr.write("fake systemctl: unhandled %s\n" % (args,)); sys.exit(2)
 '''
 
 _GH_SHIM = r'''#!/usr/bin/env python3
-"""Stand-in gh: answers repo permissions and an issues read."""
+"""Stand-in gh: answers repo permissions and an issues read.
+
+Deliberately as strict about argv as the real `gh` is about semantics. The
+push probe is only answered `true`/`false` when `--jq .permissions.push` is
+actually present: without it real gh returns the repo's whole JSON body, which
+the caller would then fail to parse. A shim that ignored the flag would answer
+`true` either way and hide a dropped `--jq` — the one thing #3129's move of
+this argv into coord/github_ops.py could plausibly get wrong.
+"""
 import json, os, sys
 
 path = os.environ["FAKE_GH_STATE"]
@@ -151,6 +159,11 @@ if args[:1] == ["api"] and len(args) >= 2:
     answer = state.get("push", {}).get(slug, state.get("push_default", True))
     if answer is None:
         sys.stderr.write("gh: HTTP 401 Bad credentials\n"); sys.exit(1)
+    if args[2:] != ["--jq", ".permissions.push"]:
+        # What real gh does without the filter: the full repo object.
+        sys.stdout.write(json.dumps({"full_name": slug,
+                                     "permissions": {"push": answer}}) + "\n")
+        sys.exit(0)
     sys.stdout.write("true\n" if answer else "false\n"); sys.exit(0)
 
 sys.stderr.write("fake gh: unhandled %s\n" % (args,)); sys.exit(2)
