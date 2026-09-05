@@ -352,21 +352,27 @@ genuinely mounted somewhere else**; the default is the real production path, not
 `tests/test_provision_machine.py` drives the real script end to end, but against stub binaries —
 `apt-get`, `snap`, `sudo`, `gh` and friends all exit 0. That proves the phase ordering, the
 idempotency and the credential hygiene, and it cannot prove that a package name resolves on the OS
-this targets. `scripts/verify-provision-noble.sh` closes that half: it fetches the official Ubuntu
-24.04 `ubuntu-base` root filesystem, unpacks it in an unprivileged user namespace (no root, no
-hypervisor, no docker) and runs the script's real install surfaces against the real archive, the
-real github-cli apt source and real PyPI, ending on a machine-readable `NOBLE_VERIFY: ok=…`
-trailer. Its package list and the `gh` floor are parsed out of `provision-machine.sh` rather than
-retyped, so they cannot drift.
+this targets, or that the thing the units start actually answers. `scripts/verify-provision-noble.sh`
+closes as much of that as is reachable without a hypervisor: it fetches the official Ubuntu 24.04
+`ubuntu-base` root filesystem, **verifies it against Ubuntu's published `SHA256SUMS`**, unpacks it
+in an unprivileged user namespace (no root, no hypervisor, no docker) and runs three tiers against
+it, ending on a machine-readable `NOBLE_VERIFY: ok=…` trailer.
 
 ```bash
-scripts/verify-provision-noble.sh          # ~3 min, ~200 MB of downloads, cached
+scripts/verify-provision-noble.sh          # ~8 min, ~400 MB of downloads, cached
+scripts/verify-provision-noble.sh --skip-live --skip-units   # tier 1 only, ~3 min
 ```
 
-**It is necessary, not sufficient.** A chroot has no PID 1, so systemd, the coord-agent unit, the
-ten daemon units, linger, `snap install`, `tailscale up`, `gh auth login`, a live `/health` and a
-live `/board` are all out of its reach and still need a throwaway-VM run. The harness says so in
-its own header, and prints which checks it skipped.
+| tier | what it runs, with nothing stubbed |
+|---|---|
+| 1 — install surfaces | every `BASE_REQUIREMENTS` package against the real archive, the real github-cli apt source and its version floor, `restic`, `libgtk-4-dev`, the browser packaging, and a real `pip install code-coordinator[server]` from real PyPI into a real venv. The package list and the `gh` floor are **parsed out of** `provision-machine.sh`, never retyped, so they cannot drift. |
+| 2 — the live seams | re-enters the same rootfs with `unshare --net`, so `127.0.0.1` is that rootfs's own loopback and the real default ports are free. Starts the PyPI-installed `coord agent` on **7433** and `coord serve` on **7435** as actual processes and drives them over actual HTTP: `GET /health`, `GET /healthz`, `GET /board`. Then runs `coord status` and `coord machine doctor` against that live pair and checks the doctor's own `MACHINE_DOCTOR:` trailer, asserting its `[agent.*]` and `[network.*]` layers grade the listener they just talked to. The private netns is not incidental — it is why this tier can never read, or disturb, the fleet agent on the host you run it from. |
+| 3 — the daemon units | installs `systemd` into the rootfs (for `systemd-analyze` only — nothing is started), renders every unit in `ROLE_UNITS[daemon]` **plus each timer's companion `.service`** through the same `render_unit()` call `phase_daemon_units` uses, checks every `ExecStart` resolves to a real executable after `%h` expansion, and runs `systemd-analyze verify --user` on each. That is what catches a bad directive, a broken `[Install]`, or #1928's literal `<MACHINE_NAME>`. |
+
+**It is still necessary, not sufficient.** A chroot has no PID 1, so `systemctl --user enable
+--now`, linger, the `is-enabled` re-query, `snap install`, `tailscale up`, `gh auth login` and a
+real dispatch landing on the agent are all out of its reach and still need a throwaway-VM run. The
+harness says exactly that in its own header, and prints which checks it skipped.
 
 Its first run paid for itself: it proved the browser capability was a **silent false green** on
 24.04. `apt-cache policy chromium` reports `Candidate: (none)` — the package does not exist in

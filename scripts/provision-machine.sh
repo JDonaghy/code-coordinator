@@ -87,6 +87,11 @@ COORD_DIR="${COORD_PROVISION_COORD_DIR:-$HOME/.coord}"
 SETTINGS_DIR="${COORD_SETTINGS_DIR:-$HOME/src/coord-settings}"
 SRC_DIR="${COORD_PROVISION_SRC_DIR:-$HOME/src}"
 SYSTEMD_USER_DIR="${COORD_PROVISION_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
+# Where the units' ExecStart= lines say the packaged helper scripts live:
+# `coord-db-backup.service` runs `%h/.local/bin/coord-db-backup.sh`, and
+# `%h` is systemd's specifier for the unit owner's home. Not the unit dir —
+# see phase_daemon_units.
+LOCAL_BIN_DIR="${COORD_PROVISION_LOCAL_BIN:-$HOME/.local/bin}"
 # The documented production mountpoint (docs/AGENT_OPERATIONS.md's backup
 # table, "target: /media/crucial/coord-backups/") is what
 # coord/deploy/coord-db-backup.sh (unchanged by this script) hardcodes, so
@@ -1057,7 +1062,7 @@ phase_daemon_units() {
     # installed distribution — the released artifact, which cannot drift with
     # whatever this checkout happens to hold (#1927).
     local plan
-    plan="$("$py" - "$SYSTEMD_USER_DIR" "$MACHINE_NAME" "$AGENT_PORT" <<'PY'
+    plan="$("$py" - "$SYSTEMD_USER_DIR" "$MACHINE_NAME" "$AGENT_PORT" "$LOCAL_BIN_DIR" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1066,15 +1071,34 @@ from coord.deploy_units import render_unit
 from coord.health.checks.unit_drift import packaged_unit_dir
 
 dest = Path(sys.argv[1]); machine, port = sys.argv[2], sys.argv[3]
+helper_dest = Path(sys.argv[4])
 ref = packaged_unit_dir()
 if ref is None:
     print("ERROR|this install ships no coord/deploy/ — upgrade the Python lane first")
     raise SystemExit(0)
 dest.mkdir(parents=True, exist_ok=True)
 
-for unit in units_for_role(ROLE_DAEMON):
+manifest = list(units_for_role(ROLE_DAEMON))
+
+# ROLE_UNITS names what should be ENABLED, which for a timer is the timer.
+# The unit a timer actually runs is the .service of the same stem, and
+# `Unit=` defaults to it implicitly — so it is never named in ROLE_UNITS and
+# would not be installed here. An enabled timer whose .service file is
+# missing is the worst possible shape: `is-enabled` says `enabled`, the timer
+# arms, and every single fire dies with "Unit coord-db-backup.service not
+# found" in a journal nobody reads. Install those companions too (they are
+# pulled in by the timer, so they are deliberately NOT separately enabled).
+companions = []
+for unit in manifest:
+    if unit.endswith(".timer"):
+        companion = unit[: -len(".timer")] + ".service"
+        if companion not in manifest and (ref / companion).exists():
+            companions.append(companion)
+
+for unit in manifest + companions:
     if unit == "coord-agent.service":
         continue  # install-agent.sh owns it, and already installed it.
+    suffix = "-DEP" if unit in companions else ""
     src = ref / unit
     if not src.exists():
         print(f"ERROR|{unit} is in ROLE_UNITS but not packaged in {ref}")
@@ -1088,17 +1112,26 @@ for unit in units_for_role(ROLE_DAEMON):
         print(f"MASKED|{unit}")   # an operator's explicit "never run this" (#2812)
         continue
     if target.exists() and target.read_text(encoding="utf-8") == text:
-        print(f"SAME|{unit}")
+        print(f"SAME{suffix}|{unit}")
         continue
     action = "UPDATED" if target.exists() else "NEW"
     tmp = target.with_name(target.name + ".coord-tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(target)
-    print(f"{action}|{unit}")
+    print(f"{action}{suffix}|{unit}")
 
-# The helper scripts the units above ExecStart, shipped alongside them.
+# The helper scripts the units above ExecStart, shipped alongside them —
+# into ~/.local/bin, NOT the unit dir. `coord-db-backup.service` says
+# `ExecStart=%h/.local/bin/coord-db-backup.sh`, and %h is the unit owner's
+# HOME; a helper dropped next to the .service file is not on that path, so
+# the unit installs and enables cleanly and then dies on every fire with
+# status=203/EXEC. That is invisible from `is-enabled` — which is the whole
+# #2082 failure shape — and on a daemon host it means the hourly coord.db
+# snapshot silently never runs. Caught by tier 3 of
+# scripts/verify-provision-noble.sh, which resolves every rendered ExecStart.
+helper_dest.mkdir(parents=True, exist_ok=True)
 for helper in sorted(ref.glob("*.sh")):
-    target = dest / helper.name
+    target = helper_dest / helper.name
     text = helper.read_text(encoding="utf-8")
     if target.exists() and target.read_text(encoding="utf-8") == text:
         print(f"SAME|{helper.name}")
@@ -1107,6 +1140,22 @@ for helper in sorted(ref.glob("*.sh")):
     target.write_text(text, encoding="utf-8")
     target.chmod(0o755)
     print(f"{action}|{helper.name}")
+
+# #2096, applied to systemd: a unit that installs and enables cleanly is not
+# a unit that runs. Resolve every rendered ExecStart NOW, while there is an
+# operator watching, instead of letting it surface as 203/EXEC in a journal
+# nobody reads. `%h` is systemd's specifier for the unit owner's home.
+home = str(Path.home())
+for unit_path in sorted(dest.glob("*.service")):
+    for line in unit_path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("ExecStart="):
+            continue
+        parts = line[len("ExecStart="):].lstrip("-+!:@").split()
+        if not parts:
+            continue
+        binary = Path(parts[0].replace("%h", home))
+        if not binary.exists():
+            print(f"DEADEXEC|{unit_path.name} runs {parts[0]}, which does not exist")
 PY
 )"
 
@@ -1119,7 +1168,19 @@ PY
             NEW)     changed "installed $unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
             UPDATED) changed "refreshed $unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
             SAME)    unchanged "$unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
+            # A timer's companion .service: installed so the timer has
+            # something to run, never separately enabled (the timer pulls it).
+            NEW-DEP)     changed "installed $unit (fired by its timer)" ;;
+            UPDATED-DEP) changed "refreshed $unit (fired by its timer)" ;;
+            SAME-DEP)    unchanged "$unit (fired by its timer)" ;;
             MASKED)  warn "$unit is masked by an operator — left masked (#2812)" ;;
+            DEADEXEC)
+                warn "$unit.
+      systemd will enable and arm it happily and then fail every start with
+      203/EXEC, which 'is-enabled' cannot see. If the missing file is a *.sh
+      helper, it is not in this coord release's packaged coord/deploy/ — copy
+      it from the repo's deploy/ into $LOCAL_BIN_DIR by hand, or drop the unit."
+                ;;
         esac
     done <<< "$plan"
     [[ $errors -eq 0 ]] || die "$errors unit(s) could not be installed — see above."
