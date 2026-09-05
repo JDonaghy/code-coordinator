@@ -591,17 +591,20 @@ def restored_schema_version(path: Path) -> int:
     ``0`` when the table is absent — a pre-#2598 database, or something that
     is not a coord store at all. Both are a schema gap, and both are named as
     one rather than crashing.
+
+    Delegates to :func:`coord.db._read_schema_version` rather than
+    re-running the same query by hand — that function's docstring documents
+    non-obvious care (notably the #2983 rollback a Postgres "table doesn't
+    exist yet" abort needs before the connection is usable again) that a
+    from-scratch reimplementation here would silently drop.
     """
+    from coord import db as _db  # noqa: PLC0415
+
     conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=Path(path), read_only=True)
     try:
-        row = sql.execute(conn, "SELECT MAX(version) FROM schema_version").fetchone()
-    except sql.driver_errors():
-        return 0
+        return _db._read_schema_version(conn)
     finally:
         conn.close()
-    if not row or row[0] is None:
-        return 0
-    return int(row[0])
 
 
 def check_schema(path: Path, *, expected: int | None = None) -> StepResult:
@@ -1016,4 +1019,11 @@ def _default_transport() -> Any:
     except Exception as exc:  # noqa: BLE001 — a bad config must not eat the alert path
         _log().warning("dr verify: could not load coordinator.yml for the alert: %s", exc)
         return NullTransport()
-    return build_transport(getattr(cfg, "notifications", None))
+    notif = getattr(cfg, "notifications", None)
+    if notif is None or not getattr(notif, "enabled", False):
+        # Master switch is off (or the block is absent entirely) — every other
+        # caller of this machinery (coord/notifier/service.py, drive_queue.py's
+        # self-cordon escalation) honors this, and dr verify must not be the one
+        # alert path in the fleet that pages a phone an operator explicitly muted.
+        return NullTransport()
+    return build_transport(notif)
