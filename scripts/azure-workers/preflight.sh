@@ -326,7 +326,7 @@ else
         warn "Key Vault secret set + server quota skipped — needs an authenticated az session"
     else
         server_gate "Key Vault holds the server credential set" check_vault_secrets "$VAULT"
-        server_gate "vCPU quota for $VM_SIZE in $LOCATION" check_quota "$LOCATION" "$VM_SIZE" 4
+        server_gate "vCPU quota for $VM_SIZE in $LOCATION" check_quota "$LOCATION" "$VM_SIZE" "$DR_VCPUS_NEEDED"
     fi
     server_gate "tailnet hostname '$DR_MACHINE' is free" check_hostname_collision "$DR_MACHINE"
 fi

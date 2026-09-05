@@ -151,7 +151,16 @@ check_acl_tag() {
         echo "  joins with no grants at all: nothing can reach its board."
         return 1
     fi
-    if ! grep -q "$DR_SERVER_TAG:7435" "$acl"; then
+    # A plain substring match on "$DR_SERVER_TAG:7435" only recognises the
+    # single-port destination form ("tag:coord-server:7435"). This file's own
+    # convention keeps worker-facing grants single-port (see tests: below), but
+    # an equally valid multi-port destination ("tag:coord-server:7433,7435")
+    # would silently fail this check even though it grants exactly what is
+    # asked. Match 7435 anywhere in a comma-separated port list instead of only
+    # as the sole port -- still not real JSON parsing (this whole gate is
+    # explicitly about the POLICY FILE, see the function comment above), just a
+    # less brittle grep.
+    if ! grep -qE "\"${DR_SERVER_TAG}:([0-9]+,)*7435(,[0-9]+)*\"" "$acl"; then
         echo "$DR_SERVER_TAG is declared in $acl but nothing grants :7435 to it"
         echo "  A board no worker can reach is not a recovered fleet."
         return 1
@@ -328,10 +337,12 @@ render_plan() {
                        $DR_SERVER_TAG -> tag:coord-worker : 7433  (the daemon dials OUT)
   4. boot path         provision-server.sh --vault $vault
 EOF
-    # Indented one level: these are step 4's sub-items, and they come from
-    # provision-server.sh's own table rather than a second copy here.
+    # Aligned under step 4's own text (5 spaces, matching how step 2's
+    # sub-items line up under "deployment" above): these are step 4's
+    # sub-items, and they come from provision-server.sh's own table rather
+    # than a second copy here.
     dr_server_plan "$vault" "$DR_SECRETS_FILE_DEFAULT" "/var/lib/coord/dr-promote.json" \
-        | sed 's/^/   /'
+        | sed 's/^/     /'
     cat <<EOF
   5. teardown          ./dr-down.sh --machine $machine
 EOF
