@@ -400,6 +400,30 @@ def test_briefing_includes_worker_commit_messages() -> None:
     assert "Worker's own claims" in briefing
     assert "Fix #804: guard ctrl-h backspace in insert mode" in briefing
     assert "Address review nit" in briefing
+    # #3112 fix-review: the commit *body* — not just its headline — must
+    # survive into the briefing. This is the exact vimcode#804 scenario: the
+    # "state the test was observed RED" claim lives in the body, and a
+    # headline-only render silently drops it.
+    assert "Observed RED against unfixed develop." in briefing
+
+
+def test_briefing_commit_messages_are_capped_in_count_and_length() -> None:
+    """Regression (#3112 fix-review): an unbounded number/size of commit
+    messages must not blow up every future review's prompt. The newest
+    messages are kept when capping the count."""
+    many_commits = [f"Commit number {i}" for i in range(30)]
+    huge_commit = "Huge commit\n\n" + ("x" * 5000)
+    briefing = build_review_briefing(
+        **_briefing_kwargs(commit_messages=[*many_commits, huge_commit])
+    )
+    # Only the newest MAX_COMMIT_MESSAGES are kept; the oldest are dropped
+    # and a note says so.
+    assert "Commit number 0" not in briefing
+    assert "Commit number 29" in briefing
+    assert "earlier commit message(s) omitted" in briefing
+    # A single oversized message body is clamped, not embedded verbatim.
+    assert "x" * 5000 not in briefing
+    assert "[truncated]" in briefing
 
 
 def test_briefing_worker_claims_survive_whitespace_only_inputs() -> None:

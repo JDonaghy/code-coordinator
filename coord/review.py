@@ -61,6 +61,17 @@ from coord.refine_chat import MAX_CLAUDE_MD_CHARS
 
 log = logging.getLogger(__name__)
 
+# #3112 fix-review: the "Worker's own claims" section embeds full commit
+# messages (headline + body), not just the headline — a repo-override rule
+# that requires a specific *statement* (e.g. vimcode's "state the test was
+# observed RED") is typically made in a commit body, not its first line.
+# These two caps mirror the clamping every other embed in this module
+# already does (MAX_CLAUDE_MD_CHARS, github_ops.truncate_diff_text) so a
+# long-lived branch with many fix-review round trips can't blow up every
+# future review's prompt with an unbounded number/size of commit messages.
+MAX_COMMIT_MESSAGES = 20
+MAX_COMMIT_MESSAGE_CHARS = 1000
+
 
 # ── Review output parsing ────────────────────────────────────────────────────
 
@@ -1693,7 +1704,13 @@ def build_review_briefing(
     was unverifiable by the reviewer even when the worker made the claim
     somewhere, because nothing carried it into this briefing. Both are
     optional and rendered only when non-empty; when both are empty this adds
-    no section at all (mirrors every other optional block here).
+    no section at all (mirrors every other optional block here). Each commit
+    message is embedded in full (headline + body, not just the headline) and
+    clamped to :data:`MAX_COMMIT_MESSAGE_CHARS`; the list itself is capped to
+    the newest :data:`MAX_COMMIT_MESSAGES` entries — the same "clamp every
+    embed" discipline as ``MAX_CLAUDE_MD_CHARS``/``truncate_diff_text`` above,
+    since a multi-round fix-review branch can otherwise grow this section
+    without bound.
     """
 
     lines: list[str] = []
@@ -1803,9 +1820,35 @@ def build_review_briefing(
             lines.append("")
             lines.append("### Commit messages")
             lines.append("")
-            for msg in _commits:
-                headline = msg.splitlines()[0] if msg.splitlines() else msg
+            # get_pr_commit_messages returns commits in chronological order
+            # (oldest first) — keep the *newest* ones when capping, since a
+            # later commit (e.g. a fix-review round addressing a repo-override
+            # rule) is more likely to carry the claim a reviewer needs than
+            # the branch's earliest commit.
+            omitted_commits = max(0, len(_commits) - MAX_COMMIT_MESSAGES)
+            shown_commits = _commits[omitted_commits:]
+            for msg in shown_commits:
+                # Keep the full message (headline + body), not just the
+                # headline — the body is exactly where a worker states a
+                # multi-sentence claim (e.g. "Observed RED against unfixed
+                # develop."). Render the headline as the bullet and the body
+                # as an indented blockquote so multi-line messages stay
+                # readable instead of one giant run-on bullet.
+                clamped = msg
+                if len(clamped) > MAX_COMMIT_MESSAGE_CHARS:
+                    clamped = clamped[:MAX_COMMIT_MESSAGE_CHARS] + "\n…[truncated]"
+                msg_lines = clamped.splitlines()
+                headline, body_lines = msg_lines[0], msg_lines[1:]
                 lines.append(f"- {headline}")
+                for body_line in body_lines:
+                    stripped = body_line.strip()
+                    if stripped:
+                        lines.append(f"  > {stripped}")
+            if omitted_commits > 0:
+                lines.append(
+                    f"- …and {omitted_commits} earlier commit message(s) omitted "
+                    "— inspect the branch's full log directly if needed."
+                )
 
     if diff_text and diff_text.strip():
         # #612: embed the merge-base (three-dot) diff verbatim so the reviewer
