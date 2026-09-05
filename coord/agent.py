@@ -4401,7 +4401,11 @@ being built.
 declared medium, under `tests/acceptance/ms-NN/mocks/` — something the \
 operator can look at and react to, not a text description. For a \
 `web-playwright` driver: one hand-authored, self-contained `.html` file \
-PER SCREEN STATE (not one giant multi-state file). Each must OPEN IN A \
+PER SCREEN STATE (not one giant multi-state file) — UNLESS the seed \
+briefing explicitly calls for a CSS-only `:target` interactive walkthrough \
+(#3131), in which case the screens it covers belong TOGETHER in that one \
+file by design: `:target` needs them sharing a single document and \
+stylesheet to switch which one is visible. Each file must OPEN IN A \
 BROWSER AND LOOK LIKE THE SCREEN — inline `<style>` CSS is expected and \
 encouraged, since the mock is the visual contract as well as the \
 structural one. Do not ship a bare DOM skeleton with no styling and call \

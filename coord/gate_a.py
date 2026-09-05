@@ -68,6 +68,11 @@ __all__ = [
     "PendingAmend",
     "find_pending_amends",
     "summarise_pending_amends",
+    "InteractiveControl",
+    "find_interactive_controls",
+    "unpinned_interactive_controls",
+    "interactive_contract_gaps",
+    "summarise_interactive_gaps",
 ]
 
 #: The two verdicts an operator can record, mirroring ``coord test
@@ -637,4 +642,145 @@ def summarise_pending_amends(pending: Iterable[PendingAmend]) -> list[str]:
         lines.append(
             "    the approval above covers the contract on main, NOT that branch"
         )
+    return lines
+
+
+# ── #3131: the contract half of interactive (CSS-only `:target`) mocks ─────
+#
+# A design-round mock is no longer necessarily one static picture — it may
+# be a CSS-only `:target` walkthrough (`coord/mock_author.py`'s
+# `_interactive_mock_instruction`) where anchor links switch which `.screen`
+# is visible with no script. That is a strict improvement ONLY if the
+# Gate-A contract pins where each control leads, not merely that it exists:
+# coord-portal#307 shipped a button pinned as *present*, wired to
+# `href="#"`, with the sealed suite green throughout. A contract line that
+# only names a control (e.g. "there is a `nav-error` link") is the exact
+# same gap in prose form — it says nothing about the destination, so
+# nothing downstream can catch a `href="#"` no-op that renders correctly
+# but goes nowhere.
+#
+# This is deliberately read-only, pure text/markup analysis — no I/O, no
+# GitHub, no board — mirroring `evaluate()`'s own posture, and NOT wired
+# into `evaluate()` itself: an interactive-control gap is advisory
+# enrichment on top of the existing approved/stale/changes verdict (same
+# relationship `find_pending_amends`/`summarise_pending_amends` have to
+# `evaluate()`), not a new terminal state.
+
+
+@dataclass(frozen=True)
+class InteractiveControl:
+    """One `:target`-navigation control found in a rendered mock (#3131).
+
+    ``control_id`` is the DOM id of the clickable element itself (its own
+    ``id="..."`` attribute, e.g. ``"nav-error"``) — what a contract line
+    names when it says "clicking X" — falling back to a synthetic
+    ``"->#<target>"`` label when the control carries no id of its own, so a
+    gap is still reported rather than silently dropped.
+
+    ``target_id`` is the fragment it navigates to (the ``s-error`` in
+    ``href="#s-error"``) — what `:target` actually switches on.
+    """
+
+    control_id: str
+    target_id: str
+
+
+_ANCHOR_TAG_RE = re.compile(r"<a\b([^>]*)>", re.IGNORECASE)
+_HREF_FRAGMENT_RE = re.compile(r'href\s*=\s*"#([^"#]+)"', re.IGNORECASE)
+_ID_ATTR_RE = re.compile(r'\bid\s*=\s*"([^"]+)"', re.IGNORECASE)
+
+
+def find_interactive_controls(mock_html: str) -> list[InteractiveControl]:
+    """Every `:target`-navigation control in *mock_html*.
+
+    Deliberately regex-based, not a full HTML parse: a rendered Gate-A mock
+    is small, hand-authored, single-file markup, and the only shape this
+    needs to recognise is "a link that changes which `.screen` is showing"
+    — not arbitrary HTML. An `<a href="#">` with an EMPTY fragment is
+    skipped on purpose: that is the exact inert shape coord-portal#307
+    shipped, so it is not itself counted as a navigating control (there is
+    no target to pin a destination against) — a genuinely dead link like
+    that is a separate, already-covered "does the control do anything at
+    all" concern, not this function's job.
+    """
+    out: list[InteractiveControl] = []
+    for m in _ANCHOR_TAG_RE.finditer(mock_html):
+        attrs = m.group(1)
+        href_match = _HREF_FRAGMENT_RE.search(attrs)
+        if href_match is None:
+            continue
+        target = href_match.group(1).strip()
+        if not target:
+            continue
+        id_match = _ID_ATTR_RE.search(attrs)
+        control_id = id_match.group(1).strip() if id_match else f"->#{target}"
+        out.append(InteractiveControl(control_id=control_id, target_id=target))
+    return out
+
+
+def unpinned_interactive_controls(
+    contract_text: str, controls: Iterable[InteractiveControl]
+) -> list[InteractiveControl]:
+    """Which *controls* the contract text does NOT pin a destination for.
+
+    "Pinned" means some line of *contract_text* names both the control's id
+    and its target id together — not merely that the control's id appears
+    somewhere. A contract line like "there is a `nav-error` link" would
+    satisfy a bare "is this control mentioned" check while saying nothing
+    about where it goes, which is precisely the coord-portal#307 gap this
+    exists to catch at contract-authoring time rather than after ship.
+
+    Case-insensitive, since Markdown prose and `id`/`href` attributes don't
+    reliably agree on case.
+    """
+    lines = contract_text.lower().splitlines()
+    gaps: list[InteractiveControl] = []
+    for control in controls:
+        control_id = control.control_id.lower()
+        target_id = control.target_id.lower()
+        if any(control_id in line and target_id in line for line in lines):
+            continue
+        gaps.append(control)
+    return gaps
+
+
+def interactive_contract_gaps(
+    mocks: dict[str, str], contract_text: str
+) -> dict[str, list[InteractiveControl]]:
+    """Per-mock-file interactive-control gaps against *contract_text*.
+
+    *mocks* is a ``{filename: html}`` mapping — the same shape
+    :func:`coord.mock_author.collect_mock_bundle_files` returns for a
+    rendered bundle. Returns ``{}`` when no mock has any `:target` control,
+    or every control every mock has is pinned somewhere in the contract.
+    Only files with at least one unpinned control appear in the result, so
+    a caller can test ``bool(interactive_contract_gaps(...))`` directly for
+    "is this contract missing anything".
+    """
+    out: dict[str, list[InteractiveControl]] = {}
+    for name, html in mocks.items():
+        controls = find_interactive_controls(html)
+        if not controls:
+            continue
+        gaps = unpinned_interactive_controls(contract_text, controls)
+        if gaps:
+            out[name] = gaps
+    return out
+
+
+def summarise_interactive_gaps(
+    gaps_by_mock: dict[str, list[InteractiveControl]],
+) -> list[str]:
+    """Human-readable lines for :func:`interactive_contract_gaps`'s result —
+    same "purely additive, never changes exit code or verdict" posture as
+    :func:`summarise_pending_amends`."""
+    lines: list[str] = []
+    for name, gaps in gaps_by_mock.items():
+        for gap in gaps:
+            lines.append(
+                f"  ! {name}: control {gap.control_id!r} navigates to "
+                f"#{gap.target_id} but contract.md never pins that "
+                "destination (#3131) — a control existing is not a "
+                "contract; where it leads is"
+            )
     return lines

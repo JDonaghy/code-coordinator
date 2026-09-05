@@ -50,6 +50,21 @@ from coord.milestone_dispatch import pick_machine
 from coord.models import Machine, Proposal
 
 
+#: #3131: teach the mock-author the CSS-only `:target` interactive-walkthrough
+#: technique so a design-round mock can be clicked through, not just looked
+#: at. Hard-gated OFF until coord-portal#314 ships: `serveBundle` falls back
+#: to `default-src 'self'` for `style-src`, which forbids the bundle's own
+#: inline `<style>` — measured on the 2026-09-05 prototype, that turns an
+#: interactive mock into every `.screen` stacked at once with the nav inert,
+#: strictly worse than today's static degrade. `mock_author.py`'s own
+#: `build_design_round`/`collect_mock_bundle_files` (PDR-3) auto-push a
+#: merged Gate-A mock straight to the customer-facing portal, so teaching
+#: this technique before #314 lands would ship the broken shape
+#: automatically, not just risk it. Flip this the moment #314 merges — the
+#: instruction text below is otherwise ready to go.
+INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED = False
+
+
 def _wants_mock_index(driver_mock_glob: str) -> bool:
     """#2512: the navigation-index post-render step only makes sense for
     HTML mocks — an `index.html` full of `<a href>`s to `.screen` text-grid
@@ -148,6 +163,51 @@ def _mock_index_instruction(ms_dir: str) -> str:
     )
 
 
+def _interactive_mock_instruction(ms_dir: str) -> str:
+    """#3131: the CSS-only `:target` walkthrough technique + its hard
+    constraints, verbatim to both briefing builders below — same "single
+    shared instruction, not free-handed per milestone" posture as
+    :func:`_mock_index_instruction`. Only ever appended when
+    :data:`INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED` is true; see that flag's
+    docstring for why it defaults off."""
+    return (
+        "This mock set may use CSS-only `:target` interactive walkthroughs "
+        "(#3131) instead of a static picture of the happy path — a design "
+        "round is asked to approve BEHAVIOR (what a broken input does, what "
+        "the format picker offers, what the empty state says), not just "
+        "layout, and a click-through shows that where a screenshot plus a "
+        "caption cannot. Anchor links switch which `.screen` is visible with "
+        "no script: `.screen{display:none} .screen:target{display:block}`, "
+        "plus a default-screen rule "
+        "(`body:not(:has(.screen:target)) #s-start{display:block}`). "
+        "`:checked` + `<label>` covers tabs/toggles, `<details>` covers "
+        "disclosure, `:hover`/`:focus-within` covers affordances.\n"
+        "Hard constraints, not preferences:\n"
+        "- NO JavaScript, ever. The portal serves mocks with "
+        "`script-src 'none'`, and a `.js` file has no recognized content "
+        "type so `nosniff` refuses to execute it even if referenced — a "
+        "mock that depends on script is silently inert to whoever views it.\n"
+        "- Put every screen state in ONE self-contained `.html` file when "
+        "you use `:target` navigation — the mock route serves with no "
+        "trailing slash, so a relative link to a second file (e.g. "
+        "`screen-2.html`) resolves outside the route and 404s. One file, "
+        "one shared stylesheet, `:target` sections — no such failure mode.\n"
+        "- Put open questions INSIDE the interface, not in a footnote — "
+        "e.g. render \"XML — in scope?\" as a visible entry in the format "
+        "menu itself, not a note below the picture. A question the "
+        "customer meets while clicking gets answered; one in closing prose "
+        "often does not.\n"
+        "Every clickable control is a new place for \"exists but goes "
+        "nowhere\" to hide green (coord-portal#307: a button pinned as "
+        "*present*, shipped as `href=\"#\"`, sealed suite passing). So in "
+        f"`{ms_dir}/contract.md`, pin WHERE each control leads, not merely "
+        "that it exists — one line naming both the control and its "
+        "destination together, e.g. \"clicking `nav-error` makes "
+        "`#s-error` the only visible `.screen`\". A line that only says "
+        "the control exists is the same contract gap that let #307 through."
+    )
+
+
 def build_mock_author_briefing(
     *,
     repo_slug: str,
@@ -195,6 +255,8 @@ def build_mock_author_briefing(
     )
     if _wants_mock_index(driver_mock_glob):
         parts.append(_mock_index_instruction(ms_dir))
+        if INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED:
+            parts.append(_interactive_mock_instruction(ms_dir))
     return "\n".join(parts)
 
 
@@ -258,6 +320,8 @@ def build_mock_author_amend_briefing(
             "script is the single source of truth so every milestone's "
             "mock set gets the same glue page."
         )
+        if INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED:
+            parts.append(_interactive_mock_instruction(ms_dir))
     parts.append("")
     parts.append("--- Requested correction ---")
     parts.append(amend_text.strip())
@@ -506,6 +570,14 @@ def collect_mock_bundle_files(
     before treating a non-empty return as pushable: a non-``*.html`` glob
     still returns real, non-empty mock content here, just content nobody can
     open in a browser.
+
+    #3131: this is also the auto-push path that makes
+    :data:`INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED` hard-gated off until
+    coord-portal#314 (the CSP `style-src` fix) ships — whatever this
+    function collects lands in front of a paying customer with no human in
+    the loop, so a `:target` walkthrough rendered before that fix would
+    auto-ship the "every screen stacked, nav inert" degrade, not merely
+    risk it.
     """
     ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
     files: dict[str, str] = {}
