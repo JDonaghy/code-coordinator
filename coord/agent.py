@@ -154,7 +154,14 @@ _ADVISORY_TYPES = ("work",)
 # Kept as a literal tuple (not an import of WORK_LIKE_TYPES) because
 # `coord/agent.py` is the agent-side module and must stay importable on a
 # fleet machine without the coordinator's model layer.
-_ZERO_COMMIT_TYPES = ("work", "mock-author", "test-author")
+#
+# ``epic-decompose`` (#3132) gets a real worktree + branch and is documented
+# (see WRITE_CAPABLE_SPEC_TYPES above) to commit/push the first slice's
+# implementation — same mutation shape as `work`/`mock-author`, so a clean
+# exit with zero commits ahead of base is exactly as much a contradiction
+# here as it is for those two, and must not be trusted as a real "done"
+# (the #1534/#2316 truncation incident this constant exists to catch).
+_ZERO_COMMIT_TYPES = ("work", "mock-author", "test-author", "epic-decompose")
 
 # #1394: assignment types whose worktree, when left dirty, holds real source
 # the worker meant to ship — so an automatic WIP commit on the assignment
@@ -166,7 +173,12 @@ _ZERO_COMMIT_TYPES = ("work", "mock-author", "test-author")
 #     markers — committing those to the branch would be actively harmful.
 # Excluded types are still never force-deleted while dirty; they're preserved
 # by KEEPING the worktree (see `AgentServer._rescue_uncommitted_work`).
-_WIP_RESCUE_TYPES = ("work", "fix", "test-author", "mock-author")
+#
+# ``epic-decompose`` (#3132) is included for the same reason as `work`/
+# `test-author`/`mock-author`: it leaves real, worth-keeping source in the
+# worktree (the first slice's implementation), so a dirty exit deserves a
+# rescue commit rather than force-deletion.
+_WIP_RESCUE_TYPES = ("work", "fix", "test-author", "mock-author", "epic-decompose")
 
 # #1394: subject prefix for the coordinator's rescue commit.  Deliberately
 # loud — it lands on the assignment branch and a human (or the adversarial

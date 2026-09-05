@@ -1450,6 +1450,74 @@ class TestEpicDecomposeBriefing:
         # this is an ADDENDUM, not a replacement.
         assert "Decompose fully; queue the first batch" in wire_briefing
 
+    def test_contract_add_child_invocation_has_no_flag(self) -> None:
+        """Regression for the #3132 review finding: an earlier draft of this
+        contract told the worker to run `coord milestone add-child <repo>
+        <epic> --child <issue>`, but the real CLI
+        (``coord.commands.milestone.milestone_add_child_cmd``) takes REPO
+        EPIC ISSUE as three positional arguments and has no ``--child``
+        option at all — a worker following the old text verbatim hit
+        `Error: No such option: --child` on its very first registration
+        command and never linked a single child issue to the epic.
+        """
+        # The old, broken invocation was
+        # "coord milestone add-child <repo> <epic> --child <issue>" — assert
+        # the correct positional-only invocation is present instead of that.
+        assert (
+            "coord milestone add-child <repo> <this epic's issue number> "
+            "<new issue number>"
+        ) in EPIC_DECOMPOSE_CONTRACT
+        assert "add-child <repo>" in EPIC_DECOMPOSE_CONTRACT
+        assert "--child <" not in EPIC_DECOMPOSE_CONTRACT
+
+    def test_contract_add_child_invocation_matches_real_cli_argv_shape(
+        self, tmp_path,
+    ) -> None:
+        """Black-box: actually run the ``coord milestone add-child`` argv
+        shape the contract prescribes (REPO EPIC ISSUE, positional, no
+        flag) through the real Click command and confirm it succeeds —
+        rather than trusting the docstring text alone. This is the argv
+        check the reviewer noted was missing: a substring match on
+        "add-child" alone would not have caught the old ``--child`` typo.
+        """
+        from click.testing import CliRunner
+
+        from coord.cli import main
+
+        config_yaml = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+"""
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(config_yaml)
+
+        def get_issue(repo, number):
+            if number == 1120:
+                return {
+                    "number": 1120, "title": "epic",
+                    "body": "Epic intro.\n", "state": "OPEN",
+                }
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            # Exactly the argv shape EPIC_DECOMPOSE_CONTRACT's step 1
+            # prescribes: REPO EPIC ISSUE, all positional, no --child.
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "1120", "1050", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
+
 
 class TestPostBriefing:
     @patch("coord.dispatch.github_ops.post_issue_comment")

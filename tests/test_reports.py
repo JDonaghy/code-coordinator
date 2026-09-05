@@ -214,6 +214,21 @@ class TestFoldIssueActivity:
         row = fold_issue_activity(entries, WINDOW).rows[0]
         assert row["fix_iterations"] == 0
 
+    def test_epic_decompose_dispatches_count_as_fix_iterations(self) -> None:
+        """#3132 review: ``_WORK_LIKE_TYPES`` here used to be a hardcoded
+        frozenset independent of ``coord.models.WORK_LIKE_TYPES`` (the exact
+        split-brain shape #1141 already hit once for ``mock-author``), so
+        adding ``epic-decompose`` to the canonical set would silently NOT
+        have flowed through to this report without also touching this
+        module. It's a real attempt at the issue — same mutation shape as
+        ``work``/``mock-author`` — so it must count."""
+        entries = [
+            _ev(10, "dispatch", "dispatched", details={"type": "epic-decompose"}),
+            _ev(20, "dispatch", "dispatched", details={"type": "epic-decompose"}),
+        ]
+        row = fold_issue_activity(entries, WINDOW).rows[0]
+        assert row["fix_iterations"] == 1  # first dispatch starts it, second is the fix
+
     def test_entries_may_arrive_newest_first(self) -> None:
         """The audit read path is newest-first; ordered lists must still come
         out in chronological order."""

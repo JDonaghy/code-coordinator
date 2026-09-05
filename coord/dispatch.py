@@ -223,9 +223,10 @@ Your job, in order:
 1. **Decompose fully.** Read the epic's own decomposition/handoff \
 instructions (if it carries them, follow those verbatim) and file every \
 child issue this epic implies. Register each one against this epic with \
-`coord milestone add-child <repo> <this epic's issue number> --child <new \
-issue number>` so the epic's checklist and this epic's tracking stay in \
-sync — never hand-edit the checklist directly.
+`coord milestone add-child <repo> <this epic's issue number> <new issue \
+number>` (REPO EPIC ISSUE, all positional — no `--child` flag) so the \
+epic's checklist and this epic's tracking stay in sync — never hand-edit \
+the checklist directly.
 2. **Queue the first batch.** At most 6 of the newly-filed children, \
 chained serially so they land one at a time: `coord drive-queue add <repo> \
 <child 1>`, then `coord drive-queue add <repo> <child 2> --after <repo>#\
@@ -833,12 +834,35 @@ def dispatch(
                 + "\n"
             )
     elif proposal.type == EPIC_DECOMPOSE_TYPE and proposal.issue_number:
+        # #3132 review: an epic-decompose worker gets a real worktree + branch
+        # and implements the first slice (see WRITE_CAPABLE_SPEC_TYPES'
+        # comment in coord/agent.py) — the same file-overlap exposure as a
+        # `work` dispatch on this repo, so it gets the same #1720 dispatch-
+        # time fence against other in-flight work-like assignments. Advisory
+        # only; never blocks this dispatch (see
+        # coord.overlap_fence.compute_overlap_fence's fail-open contract).
+        overlap_fence = ""
+        if repo is not None and repo.github:
+            from coord.overlap_fence import compute_overlap_fence  # noqa: PLC0415
+
+            overlap_fence = compute_overlap_fence(
+                proposal.repo_name,
+                repo.github,
+                default_branch,
+                exclude_issue_number=proposal.issue_number,
+            )
+
         # #3132: append (not prepend — unlike the #603/#945 work-stage
         # blocks above, there is no per-issue context digest or oracle-loop
         # contract to lead with here) the decompose-and-queue contract so a
         # worker sees it durably from the coordinator itself, not only from
         # whatever the epic's own body happens to say.
-        briefing_text = briefing_text + "\n\n" + epic_decompose_briefing(proposal.issue_number)
+        briefing_text = (
+            briefing_text
+            + overlap_fence
+            + "\n\n"
+            + epic_decompose_briefing(proposal.issue_number)
+        )
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
