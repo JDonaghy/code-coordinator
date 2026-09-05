@@ -347,6 +347,38 @@ The store phase's SSD mount check defaults to `/media/crucial` — the same moun
 `$COORD_PROVISION_BACKUP_MOUNT`. **Only override it if a given `--role server` host's SSD is
 genuinely mounted somewhere else**; the default is the real production path, not a placeholder.
 
+### Verifying it against the real OS without a VM
+
+`tests/test_provision_machine.py` drives the real script end to end, but against stub binaries —
+`apt-get`, `snap`, `sudo`, `gh` and friends all exit 0. That proves the phase ordering, the
+idempotency and the credential hygiene, and it cannot prove that a package name resolves on the OS
+this targets. `scripts/verify-provision-noble.sh` closes that half: it fetches the official Ubuntu
+24.04 `ubuntu-base` root filesystem, unpacks it in an unprivileged user namespace (no root, no
+hypervisor, no docker) and runs the script's real install surfaces against the real archive, the
+real github-cli apt source and real PyPI, ending on a machine-readable `NOBLE_VERIFY: ok=…`
+trailer. Its package list and the `gh` floor are parsed out of `provision-machine.sh` rather than
+retyped, so they cannot drift.
+
+```bash
+scripts/verify-provision-noble.sh          # ~3 min, ~200 MB of downloads, cached
+```
+
+**It is necessary, not sufficient.** A chroot has no PID 1, so systemd, the coord-agent unit, the
+ten daemon units, linger, `snap install`, `tailscale up`, `gh auth login`, a live `/health` and a
+live `/board` are all out of its reach and still need a throwaway-VM run. The harness says so in
+its own header, and prints which checks it skipped.
+
+Its first run paid for itself: it proved the browser capability was a **silent false green** on
+24.04. `apt-cache policy chromium` reports `Candidate: (none)` — the package does not exist in
+noble — and `chromium-browser` is a 50 KB transitional deb whose entire `/usr/bin/chromium-browser`
+is a stub that prints *"requires the chromium snap to be installed"* and exits 1, with a postinst
+that installs no snap. So `apt-get install chromium-browser` exits 0, puts a name on `PATH`, and
+leaves the machine advertising a `browser` capability it cannot honour — which is what #1678's
+standing UNMET probe looks like from the inside. The script now installs the **snap** and probes by
+asking a candidate binary for its `--version`, never by asking `PATH` whether a name exists. If the
+browser resolves under `/snap/bin`, `coord-agent`'s unit `PATH` must contain `/snap/bin` too or the
+capability stays unmet for the agent even though it works in your login shell.
+
 Four things about it are load-bearing:
 
 **The contract is the doctor, not the phase count.** The script ends by running `coord machine

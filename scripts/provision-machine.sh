@@ -887,6 +887,43 @@ _agent_health() {
 
 # ── Phase 8: toolchains (worker, server) ─────────────────────────────────────
 
+# `command -v chromium-browser` is NOT evidence of a browser on the one OS this
+# script targets, and believing it is what #1678 looks like from the inside.
+# Verified on a pristine Ubuntu 24.04.4 rootfs:
+#
+#   apt-cache policy chromium          ->  Candidate: (none)
+#   apt-cache policy chromium-browser  ->  Candidate: 2:1snap1-0ubuntu2
+#
+# i.e. `chromium` does not exist as a deb in noble at all, and `chromium-browser`
+# is a 50 KB TRANSITIONAL package whose entire /usr/bin/chromium-browser is
+#
+#   if ! [ -x /snap/bin/chromium ]; then
+#       echo "Command '$0' requires the chromium snap to be installed." >&2
+#       exit 1
+#   fi
+#
+# with a postinst that installs no snap. So the historical
+# `chromium-browser || chromium` pair plus a `have chromium-browser` check
+# resolves, on noble, to "install a stub, find the stub on PATH, declare a
+# browser" — apt exits 0, the check passes, and the machine advertises a
+# capability it cannot honour. That silent false green is exactly the standing
+# UNMET browser probe. The probe below therefore asks a candidate for its
+# --version (which needs no display) instead of asking PATH whether a name
+# exists, and tries the stub name LAST so the snap wrapper wins when both are
+# present.
+BROWSER_BIN=""
+browser_works() {
+    local bin
+    BROWSER_BIN=""
+    for bin in chromium google-chrome google-chrome-stable chromium-browser; do
+        have "$bin" || continue
+        "$bin" --version >/dev/null 2>&1 || continue
+        BROWSER_BIN="$bin"
+        return 0
+    done
+    return 1
+}
+
 phase_toolchains() {
     if [[ -z "$CAPABILITIES" ]]; then
         unchanged "no capabilities declared — nothing to install"
@@ -922,20 +959,47 @@ and re-run (this script is safe to re-run from the top)."
                     changed "installed gtk4 $(pkg-config --modversion gtk4)"
                 fi ;;
             browser)
-                if have chromium || have chromium-browser || have google-chrome; then
-                    unchanged "a browser is present"
+                if browser_works; then
+                    unchanged "browser: $BROWSER_BIN $("$BROWSER_BIN" --version 2>/dev/null | head -1)"
                 else
-                    apt_update_once
-                    sudo apt-get install -y -qq --no-install-recommends chromium-browser \
-                        || sudo apt-get install -y -qq --no-install-recommends chromium \
-                        || die "apt-get install of both chromium-browser and chromium failed —
-check apt sources/network and re-run (this script is safe to re-run from the top)."
-                    have chromium || have chromium-browser \
-                        || die "browser install reported success but no chromium binary is on PATH.
-The 'browser' capability reading unmet is what makes webapp Test stages retry
-forever with no board-visible reason (#1678)."
-                    changed "installed a browser"
-                fi ;;
+                    # snap FIRST, and apt only as the non-noble fallback — see
+                    # browser_works() for why apt cannot produce a working
+                    # chromium on the one OS this script targets.
+                    if have snap; then
+                        sudo snap install chromium \
+                            || die "snap install chromium failed. On Ubuntu 24.04 the snap is the
+only packaging that yields a working chromium (see 'apt-cache policy chromium'
+— no candidate). Check snapd is running and re-run."
+                        # A snap lands in /snap/bin, which a non-login shell's
+                        # PATH need not contain — so without this the probe
+                        # below would fail an install that actually worked.
+                        case ":$PATH:" in *":/snap/bin:"*) ;; *) PATH="/snap/bin:$PATH" ;; esac
+                        export PATH
+                    else
+                        apt_update_once
+                        sudo apt-get install -y -qq --no-install-recommends chromium \
+                            || sudo apt-get install -y -qq --no-install-recommends chromium-browser \
+                            || die "apt-get install of both chromium and chromium-browser failed,
+and there is no 'snap' on this host to fall back to — check apt sources/network
+and re-run (this script is safe to re-run from the top)."
+                    fi
+                    hash -r 2>/dev/null || true
+                    browser_works \
+                        || die "browser install reported success but no browser answers --version.
+On Ubuntu 24.04 this is the expected outcome of the apt path alone: the
+'chromium-browser' deb is a stub that exits 1 without the snap. The 'browser'
+capability reading unmet is what makes webapp Test stages retry forever with no
+board-visible reason (#1678)."
+                    changed "installed a browser: $BROWSER_BIN $("$BROWSER_BIN" --version 2>/dev/null | head -1)"
+                fi
+                case "$(command -v "$BROWSER_BIN")" in
+                    /snap/bin/*)
+                        warn "the browser resolves to $(command -v "$BROWSER_BIN"), i.e. /snap/bin.
+      coord-agent's unit PATH must contain /snap/bin or the agent will not see
+      it and the 'browser' capability probe stays unmet (#1678) even though the
+      browser works from your login shell. Layer 7 of 'coord machine doctor
+      --ssh' is what tells you which of the two you have." ;;
+                esac ;;
             *)
                 warn "no toolchain rule for capability '$cap' — layer 7 will tell you
       whether the agent can actually see the tool it implies." ;;
