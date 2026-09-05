@@ -444,16 +444,24 @@ RETRY_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 300.0, 1200.0)
 # is true) landed inside ONE dellserver agent stall and burned the whole
 # budget, landing the row in `blocked` with no code-side evidence at all —
 # recoverable only by a manual `drive-queue remove` + `add`. 300s was
-# narrower than `coord/agent.py::_run_pre_stash_build`'s own 600s
-# `subprocess.run` timeout, the single best-documented cause of a
-# same-agent stall, so a same-spacing retry could (and did) land inside the
-# very stall it was retrying. 660.0 clears that 600s worst case with a 60s
-# margin: a dispatch-only death's next attempt is now guaranteed to fire
-# only after any single such stall has already ended, so it either
-# succeeds or fails for a genuinely different reason — never "recurs within
-# one agent-stall window" (this constant cannot see OTHER stall causes —
-# e.g. the shared `asyncio.to_thread` pool saturating, or a wedged agent —
-# so it bounds the known worst case, not every possible one).
+# narrower than `coord.agent.PRE_STASH_BUILD_TIMEOUT_SECONDS` (600s), the
+# ceiling on the single best-documented cause of a same-agent stall, so a
+# same-spacing retry could (and did) land inside the very stall it was
+# retrying. 660.0 clears that 600s worst case with a 60s margin: a
+# dispatch-only death's next attempt is now guaranteed to fire only after
+# any single such stall has already ended, so it either succeeds or fails
+# for a genuinely different reason — never "recurs within one agent-stall
+# window" (this constant cannot see OTHER stall causes — e.g. the shared
+# `asyncio.to_thread` pool saturating, or a wedged agent — so it bounds the
+# known worst case, not every possible one).
+#
+# That ordering is the whole point of the number, so it is CHECKED, not just
+# documented: `tests/test_drive_queue.py::test_the_dispatch_failure_backoff_
+# outlasts_a_pre_stash_build_stall` imports both constants and drives a real
+# `plan_tick` at the stall's own ceiling. `coord.agent` is deliberately NOT
+# imported here (it is a heavy module on the CLI tick path, and the
+# dependency runs agent -> drive_queue, not back); the test carries the
+# cross-module link instead, and fails if either side moves alone.
 DISPATCH_FAILURE_MIN_BACKOFF_SECONDS = 660.0
 
 # ── the per-repo ceiling (#1972) ─────────────────────────────────────────────
