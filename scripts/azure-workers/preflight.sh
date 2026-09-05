@@ -3,21 +3,44 @@
 # anything that creates resources. Read-only — creates nothing, changes nothing.
 #
 #   ./preflight.sh --vault kv-coord-jd-prod [--location eastus] [--vm-size Standard_D8as_v7]
+#   ./preflight.sh --role server --vault kv-coord-jd-prod     # the #3130 DR board
 #
 # Exit 0 = clear to run bootstrap-shared.sh. Exit 1 = at least one FAIL.
+#
+# --role server (#3130, rung D4) checks the *other* role in this lane: a board
+# daemon standing in for a lost site, rather than a worker. It runs dr-up.sh's
+# OWN gate functions rather than a second copy of them, so a check that passes
+# here and a check that passes in `dr-up.sh --dry-run` cannot drift apart
+# (#2085). It also drops section H: in a site-loss scenario the daemon host is
+# precisely the thing that is gone, so `ssh dellserver` failing is the premise,
+# not a blocker.
 set -uo pipefail   # deliberately NOT -e: we want every check to run
 
-VAULT=""; LOCATION="eastus"; VM_SIZE="Standard_D8as_v7"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VAULT=""; LOCATION="eastus"; VM_SIZE=""; ROLE="worker"
 DAEMON_HOST="${DAEMON_HOST:-dellserver}"
+DR_MACHINE="coord-dr"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --vault)    VAULT="$2"; shift 2 ;;
         --location) LOCATION="$2"; shift 2 ;;
         --vm-size)  VM_SIZE="$2"; shift 2 ;;
         --daemon)   DAEMON_HOST="$2"; shift 2 ;;
+        --role)     ROLE="$2"; shift 2 ;;
+        --machine)  DR_MACHINE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+case "$ROLE" in
+    worker|server) ;;
+    *) echo "unknown --role '$ROLE' (expected: worker, server)" >&2; exit 2 ;;
+esac
+# Role-appropriate default SKU. A board daemon serves HTTP and runs sqlite; it
+# is not a build box.
+if [[ -z "$VM_SIZE" ]]; then
+    if [[ "$ROLE" == "server" ]]; then VM_SIZE="Standard_D4as_v7"; else VM_SIZE="Standard_D8as_v7"; fi
+fi
 
 PASS=0; WARN=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
@@ -101,7 +124,12 @@ fi
 
 # ==========================================================================
 hdr "D. Compute quota in $LOCATION"
-if (( SKIP_AZURE )); then warn "skipped — needs an authenticated az session"; else
+if [[ "$ROLE" == "server" ]]; then
+    # Section I runs dr-up.sh's own check_quota for the SERVER SKU. Running
+    # this worker-sized (8 vCPU) check too would report a second, different
+    # quota verdict for the same subscription — two answers to one question.
+    warn "skipped — --role server: section I checks quota for the server SKU ($VM_SIZE)"
+elif (( SKIP_AZURE )); then warn "skipped — needs an authenticated az session"; else
 # TWO limits apply and both bite. The per-family limit gates the SKU; the
 # regional "cores" total gates everything at once, so it is what decides
 # whether you can run more than one worker (or a worker while the image
@@ -201,6 +229,11 @@ if command -v tailscale >/dev/null 2>&1; then
         ok "tailscale up ($(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("MagicDNSSuffix","?"))' 2>/dev/null || echo "?"))"
         if tailscale status 2>/dev/null | grep -q "$DAEMON_HOST"; then
             ok "$DAEMON_HOST visible on the tailnet"
+        elif [[ "$ROLE" == "server" ]]; then
+            # The premise of --role server is that the daemon host is gone.
+            # Failing on its absence would make the DR preflight unusable in
+            # exactly the scenario it exists for.
+            warn "$DAEMON_HOST not on the tailnet — expected for a site loss; that is why you are running --role server"
         else
             bad "$DAEMON_HOST not on the tailnet — epic-up registers the machine there"
         fi
@@ -211,10 +244,17 @@ fi
 # The ACL cannot be inspected without a Tailscale API key, so this is on you.
 warn "confirm by hand: tag:coord-worker exists in the tailnet ACL, and an OAuth"
 warn "  client with auth_keys scope is tagged with it (bootstrap prompts for its secret)"
+if [[ "$ROLE" == "server" ]]; then
+    warn "  ...and tag:coord-server too (section I checks the policy FILE; the live"
+    warn "  tailnet needs \$TAILSCALE_API_KEY to be checkable at all)"
+fi
 
 # ==========================================================================
 hdr "H. Daemon host ($DAEMON_HOST)"
-if ssh -o BatchMode=yes -o ConnectTimeout=8 "$DAEMON_HOST" true 2>/dev/null; then
+if [[ "$ROLE" == "server" ]]; then
+    warn "skipped — --role server presumes $DAEMON_HOST is gone. epic-up/down edit its"
+    warn "  coordinator.yml over ssh; dr-up.sh does not, because there is nothing to edit."
+elif ssh -o BatchMode=yes -o ConnectTimeout=8 "$DAEMON_HOST" true 2>/dev/null; then
     ok "ssh $DAEMON_HOST works without a password"
 
     REMOTE_COORD='c=""; for p in "$HOME/.coord-venv/bin/coord" "$HOME/.local/bin/coord" "$(command -v coord 2>/dev/null)"; do [ -n "$p" ] && [ -x "$p" ] && { c="$p"; break; }; done; echo "$c"'
@@ -252,11 +292,57 @@ else
 fi
 
 # ==========================================================================
+# I. DR board server (#3130) — only for --role server.
+#
+# Every check here is dr-up.sh's OWN gate function, called directly. That is
+# deliberate: a preflight that says "clear" and a `dr-up.sh --dry-run` that then
+# refuses would be two answers to one question (#2085). Sourcing dr-up.sh is
+# side-effect-free — its main() is behind a BASH_SOURCE guard — but it does set
+# -e, which this script deliberately does not want, so it is turned back off.
+if [[ "$ROLE" == "server" ]]; then
+hdr "I. DR board server role"
+if [[ ! -f "$HERE/dr-up.sh" ]]; then
+    bad "dr-up.sh not found next to preflight.sh ($HERE) — cannot check the server role"
+else
+    # shellcheck source=./dr-up.sh
+    source "$HERE/dr-up.sh"
+    set +e   # dr-up.sh sets -euo pipefail; preflight runs every check regardless
+
+    server_gate() {  # server_gate <label> <fn> [args...]
+        local label="$1"; shift
+        local out
+        if out="$("$@" 2>&1)"; then
+            ok "$label"
+        else
+            bad "$label"
+        fi
+        [[ -n "$out" ]] && sed 's/^/        /' <<<"$out"
+        return 0
+    }
+
+    server_gate "easy-azure server module" check_server_module "${EASY_AZURE_DIR:-}"
+    server_gate "tailnet policy carries tag:coord-server" check_acl_tag "$HERE/tailnet-acl.hujson"
+    if (( SKIP_AZURE )); then
+        warn "Key Vault secret set + server quota skipped — needs an authenticated az session"
+    else
+        server_gate "Key Vault holds the server credential set" check_vault_secrets "$VAULT"
+        server_gate "vCPU quota for $VM_SIZE in $LOCATION" check_quota "$LOCATION" "$VM_SIZE" 4
+    fi
+    server_gate "tailnet hostname '$DR_MACHINE' is free" check_hostname_collision "$DR_MACHINE"
+fi
+fi
+
+# ==========================================================================
 printf '\n\033[1m%s\033[0m\n' "Summary"
 printf '  %d passed, %d warnings, %d failed\n' "$PASS" "$WARN" "$FAIL"
 if (( FAIL > 0 )); then
     printf '\n\033[31mNot ready.\033[0m Fix the FAILs above, then re-run.\n'
     exit 1
 fi
-printf '\n\033[32mClear to run:\033[0m ./bootstrap-shared.sh --rg rg-coord-shared --vault %s\n' "${VAULT:-<name>}"
+if [[ "$ROLE" == "server" ]]; then
+    printf '\n\033[32mClear to run:\033[0m ./dr-up.sh --dry-run --vault %s\n' "${VAULT:-<name>}"
+    printf 'The dry-run re-runs these same gates and prints the full plan without creating anything.\n'
+else
+    printf '\n\033[32mClear to run:\033[0m ./bootstrap-shared.sh --rg rg-coord-shared --vault %s\n' "${VAULT:-<name>}"
+fi
 printf 'Review the WARNs first — the tailnet ACL one is not machine-checkable.\n'

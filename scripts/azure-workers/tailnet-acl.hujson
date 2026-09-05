@@ -1,11 +1,18 @@
 // Tailnet policy for johnfdonaghy@gmail.com
 // Phase 0: isolate ephemeral coord worker VMs from the rest of the tailnet.
+// #3130 (D4): add the inverse role -- an ephemeral DR *board server*.
 //
 // WARNING: defining "acls" switches the tailnet from default-allow to default-deny.
 // The first rule below preserves your current device-to-device access. Do not omit it.
 {
   "tagOwners": {
     "tag:coord-worker": ["autogroup:admin"],
+    // A DR board server (#3130). Deliberately a DIFFERENT tag, not a widening
+    // of tag:coord-worker: a worker may only reach OUT, a server must be
+    // reachable, and the two grants are near-inverses. Widening the worker tag
+    // to cover both would hand every ephemeral worker the server's inbound
+    // surface -- which is exactly the containment rule 3 exists to provide.
+    "tag:coord-server": ["autogroup:admin"],
   },
 
   "hosts": {
@@ -44,9 +51,46 @@
     //   "src":    ["autogroup:member"],
     //   "dst":    ["10.0.0.0/16:*"],
     // },
+
+    // ---------------------------------------------------------------------
+    // #3130 — the DR board server role. The inverse of rules 2+3.
+    // ---------------------------------------------------------------------
+
+    // 5. Your devices may reach a DR board server: SSH for debug, the agent
+    //    (7433), the dashboard (7434) and the board daemon (7435). Rule 2's
+    //    worker equivalent deliberately stops at 7433 because a worker has no
+    //    board and no dashboard to serve.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:coord-server:22,7433,7434,7435"],
+    },
+
+    // 6. A worker VM may reach a DR board server's board daemon, and nothing
+    //    else on it — the same single destination rule 3 grants for dellserver.
+    //    This is what lets an ephemeral worker follow the board to Azure after
+    //    a site loss without any ACL edit during the incident.
+    {
+      "action": "accept",
+      "src":    ["tag:coord-worker"],
+      "dst":    ["tag:coord-server:7435"],
+    },
+
+    // 7. A DR board server may reach agents on 7433 — and ONLY 7433.
+    //    The daemon calls OUT to each agent (the agent never calls back), so
+    //    without this the DR board serves /board and can dispatch nothing.
+    //    Note what is absent: no :22, no :*, no reach into your machines'
+    //    other ports. A compromised DR server is contained the same way a
+    //    compromised worker is.
+    {
+      "action": "accept",
+      "src":    ["tag:coord-server"],
+      "dst":    ["tag:coord-worker:7433", "autogroup:member:7433"],
+    },
   ],
 
-  // Workers never advertise routes and never act as an exit node.
+  // Workers never advertise routes and never act as an exit node. Neither does
+  // a DR server: it is a board, not a gateway.
   "autoApprovers": {},
 
   "tests": [
@@ -75,6 +119,45 @@
     {
       "src":    "100.85.221.28",
       "accept": ["100.116.209.7:22", "100.97.107.88:7435"],
+    },
+
+    // ---- #3130: the DR board server -------------------------------------
+    // A worker CAN reach the DR board on 7435. This is the rule that makes a
+    // site-loss recovery reachable at all; if a future edit drops it, the save
+    // is rejected rather than producing a board nothing can talk to.
+    {
+      "src":    "tag:coord-worker",
+      "accept": ["tag:coord-server:7435"],
+    },
+    // ...and STILL cannot reach an operator machine. Adding the server role
+    // must not have widened tag:coord-worker as a side effect.
+    {
+      "src":  "tag:coord-worker",
+      "deny": [
+        "tag:coord-server:22",   // not even SSH into the DR box
+        "100.116.209.7:22",      // precision
+        "100.85.221.28:7435",    // elitebook is not a board
+      ],
+    },
+    // The DR board can dial agents on 7433 (that is the dispatch direction)...
+    {
+      "src":    "tag:coord-server",
+      "accept": ["tag:coord-worker:7433", "100.116.209.7:7433"],
+    },
+    // ...and is contained the same way a worker is: no SSH into your machines.
+    {
+      "src":  "tag:coord-server",
+      "deny": [
+        "100.116.209.7:22",   // precision
+        "100.85.221.28:22",   // elitebook
+        "100.97.107.88:22",   // dellserver SSH
+        "tag:coord-worker:22",
+      ],
+    },
+    // An operator can reach the DR board and its dashboard.
+    {
+      "src":    "100.85.221.28",
+      "accept": ["tag:coord-server:7435", "tag:coord-server:7434", "tag:coord-server:22"],
     },
   ],
 }
