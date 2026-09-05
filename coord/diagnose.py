@@ -1346,6 +1346,18 @@ def _reset_review_stage(
         review_of_assignment_id=assignment_id,
     )
     res.actions_taken.append(f"deleted {deleted} review row(s) → stage grey")
+    # #3113: the raw DELETE above never goes through
+    # ``coord.issue_store._update_local_state`` — the ONLY other seam that
+    # releases a ``review_claims`` row (on a review assignment's own
+    # terminal-status write). A review still ``status="running"`` (a live or
+    # wedged session — precisely what ``--reset`` exists to unstick) has its
+    # row deleted here without ever releasing its claim, so every future
+    # ``dispatch_review`` for this work assignment would lose
+    # ``claim_review_dispatch`` forever and deny with the misleading "lost
+    # the atomic dispatch-claim race" reason — even though nothing is
+    # racing. Release explicitly; idempotent when no claim is held (a
+    # completed/terminal review already released it via the hook above).
+    state.release_review_dispatch_claim(assignment_id)
     updated = state.reset_work_review_state(
         repo_name, issue_number, assignment_id=assignment_id
     )

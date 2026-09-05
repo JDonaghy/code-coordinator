@@ -948,6 +948,43 @@ def test_reset_review_real_db_deletes_review_when_latest_is_the_review_row(
     assert row[1] is None
 
 
+def test_reset_review_releases_stale_dispatch_claim(monkeypatch, config, coord_db) -> None:
+    """#3113 regression: `--reset` against a review row still `status="running"`
+    (a live or wedged session — precisely what `--reset` exists to unstick) must
+    release that work assignment's `review_claims` row, not just delete the
+    review row. Before the fix, the raw `DELETE FROM assignments` in
+    `_reset_review_stage` never touched `review_claims` (only a terminal-status
+    write through `coord.issue_store._update_local_state` releases it), so the
+    very next `dispatch_review` call would call `claim_review_dispatch("w1")`
+    and lose forever — permanently and silently killing review dispatch for a
+    work assignment `--reset` was supposed to unstick.
+    """
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="done",
+        dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="running", dispatched_at=200.0, review_of="w1",
+    ))
+    # Simulate the claim taken when `rv1` was dispatched — never released,
+    # because the row is still "running" (no terminal-status write yet).
+    assert state.claim_review_dispatch("w1") is True
+
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(aid="rv1", typ="review", status="running", dispatched_at=200.0, review_of="w1"),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    # The claim must be gone — a fresh claim attempt for "w1" must succeed.
+    assert state.claim_review_dispatch("w1") is True
+
+
 def test_reset_review_real_db_resets_test_author_via_review_fk_sparing_sibling(
     monkeypatch, config, coord_db
 ) -> None:

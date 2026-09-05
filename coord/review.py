@@ -2414,569 +2414,589 @@ def dispatch_review(
         )
     _claim_held = True
 
-    # #459: skip review if a work or conflict-fix is actively rewriting the
-    # branch for this issue (e.g. a coord-bounce fix iteration). Reviewing
-    # stale code now would produce a verdict on code that's about to change.
-    # Leave the caller's review_state as "pending" so the next reconcile pass
-    # retries once the active fix finishes.
-    #
-    # #1553: compare on the *effective* issue (see
-    # ``coord.models.effective_issue_number``), not the raw
-    # ``completed.issue_number``. For an oracle-loop acceptance slice,
-    # ``issue_number`` is the shared tracking issue, so keying on it here
-    # would match ANY in-flight work/conflict-fix under that milestone (an
-    # unrelated child) rather than only a live rewrite of THIS row's branch.
-    # ``has_active_work_followup`` itself already keys its scan on the
-    # effective issue; this call site has to match or the guard silently
-    # stops firing for exactly the slices #1553 restored visibility for.
-    from coord.models import effective_issue_number
-
-    if has_active_work_followup(
-        board,
-        repo_name=completed.repo_name,
-        issue_number=effective_issue_number(completed),
-    ):
-        return _deny(
-            "a work or fix assignment is actively rewriting the branch for "
-            f"issue #{completed.issue_number} in {completed.repo_name!r} — "
-            "review deferred until it finishes. If nothing is actually "
-            "running, this may be a phantom 'running' row left by a worker "
-            "that died mid-fix; check with: coord diagnose "
-            f"{completed.repo_name} {completed.issue_number}"
-        )
-
-    repo = config.repo(completed.repo_name)
-    if repo is None:
-        return _deny(f"repo {completed.repo_name!r} not found in config")
-
-    # #522: the review chokepoint. Never (re)dispatch a review for work that
-    # is already done on GitHub — issue closed OR PR merged. This is the second
-    # flood vector (reviews of already-merged #349/#194) that the auto-loop
-    # fix-dispatch guard alone didn't cover. Mark the row done so the pending-
-    # review loop stops treating it as eligible. Fail-open inside
-    # work_is_terminal, so a transient gh error never blocks a real review.
-    #
-    # #2639: `trust_issue_closed_for(completed.type)` — a test-author/
-    # mock-author row's `issue_number` is the milestone's tracking issue,
-    # not this row's own deliverable, so a closed tracking epic must not
-    # read as "this row is already reviewed" (it would deny dispatch and
-    # stamp review_state='done' with no real review ever run). Only
-    # `pr_is_merged` (branch/commit-scoped, #1150) may decide for those.
-    if github_ops.work_is_terminal(
-        repo.github,
-        completed.issue_number,
-        completed.branch,
-        cache=terminal_cache,
-        trust_issue_closed=trust_issue_closed_for(completed.type),
-    ):
-        completed.review_state = "done"
-        return _deny(
-            f"issue #{completed.issue_number} is already closed or its PR "
-            "already merged on GitHub — review is moot"
-        )
-
-    # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-dispatched reviews are
-    # an unattended path, so refuse to route them through a provider
-    # whose capabilities mark it ``human_attended_only``.  Deferred import
-    # keeps the review module free of a module-level cycle with the
-    # provider registry.  On refusal we return None (same as "auto_dispatch
-    # off" / "machine unreachable") so callers leave review_state as
-    # 'pending' and retry on the next notify call — consistent with how
-    # _reassign handles the same guard in reconcile.py.
-    #
-    # #1811: ``spec_provider=config.reviews.provider`` — a review-only
-    # override that outranks ``repo.provider`` in the same precedence chain
-    # (spec > repo > providers.default) every other dispatch path already
-    # uses. ``None`` (unset) resolves to exactly the same effective name as
-    # before this field existed, so an unconfigured deployment sees no
-    # behavior change. The guard still refuses a ``human_attended_only``
-    # resolution regardless of which link in the chain supplied it — a
-    # named ``reviews.provider`` gets no exemption from the #437 gate.
-    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
     try:
-        review_provider_name = guard_unattended_dispatch(
-            spec_provider=config.reviews.provider,
-            repo_provider=repo.provider,
-            providers_cfg=config.providers,
-            models_cfg=config.models,
-            where="auto-dispatch review",
+        # #459: skip review if a work or conflict-fix is actively rewriting the
+        # branch for this issue (e.g. a coord-bounce fix iteration). Reviewing
+        # stale code now would produce a verdict on code that's about to change.
+        # Leave the caller's review_state as "pending" so the next reconcile pass
+        # retries once the active fix finishes.
+        #
+        # #1553: compare on the *effective* issue (see
+        # ``coord.models.effective_issue_number``), not the raw
+        # ``completed.issue_number``. For an oracle-loop acceptance slice,
+        # ``issue_number`` is the shared tracking issue, so keying on it here
+        # would match ANY in-flight work/conflict-fix under that milestone (an
+        # unrelated child) rather than only a live rewrite of THIS row's branch.
+        # ``has_active_work_followup`` itself already keys its scan on the
+        # effective issue; this call site has to match or the guard silently
+        # stops firing for exactly the slices #1553 restored visibility for.
+        from coord.models import effective_issue_number
+
+        if has_active_work_followup(
+            board,
+            repo_name=completed.repo_name,
+            issue_number=effective_issue_number(completed),
+        ):
+            return _deny(
+                "a work or fix assignment is actively rewriting the branch for "
+                f"issue #{completed.issue_number} in {completed.repo_name!r} — "
+                "review deferred until it finishes. If nothing is actually "
+                "running, this may be a phantom 'running' row left by a worker "
+                "that died mid-fix; check with: coord diagnose "
+                f"{completed.repo_name} {completed.issue_number}"
+            )
+
+        repo = config.repo(completed.repo_name)
+        if repo is None:
+            return _deny(f"repo {completed.repo_name!r} not found in config")
+
+        # #522: the review chokepoint. Never (re)dispatch a review for work that
+        # is already done on GitHub — issue closed OR PR merged. This is the second
+        # flood vector (reviews of already-merged #349/#194) that the auto-loop
+        # fix-dispatch guard alone didn't cover. Mark the row done so the pending-
+        # review loop stops treating it as eligible. Fail-open inside
+        # work_is_terminal, so a transient gh error never blocks a real review.
+        #
+        # #2639: `trust_issue_closed_for(completed.type)` — a test-author/
+        # mock-author row's `issue_number` is the milestone's tracking issue,
+        # not this row's own deliverable, so a closed tracking epic must not
+        # read as "this row is already reviewed" (it would deny dispatch and
+        # stamp review_state='done' with no real review ever run). Only
+        # `pr_is_merged` (branch/commit-scoped, #1150) may decide for those.
+        if github_ops.work_is_terminal(
+            repo.github,
+            completed.issue_number,
+            completed.branch,
+            cache=terminal_cache,
+            trust_issue_closed=trust_issue_closed_for(completed.type),
+        ):
+            completed.review_state = "done"
+            return _deny(
+                f"issue #{completed.issue_number} is already closed or its PR "
+                "already merged on GitHub — review is moot"
+            )
+
+        # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-dispatched reviews are
+        # an unattended path, so refuse to route them through a provider
+        # whose capabilities mark it ``human_attended_only``.  Deferred import
+        # keeps the review module free of a module-level cycle with the
+        # provider registry.  On refusal we return None (same as "auto_dispatch
+        # off" / "machine unreachable") so callers leave review_state as
+        # 'pending' and retry on the next notify call — consistent with how
+        # _reassign handles the same guard in reconcile.py.
+        #
+        # #1811: ``spec_provider=config.reviews.provider`` — a review-only
+        # override that outranks ``repo.provider`` in the same precedence chain
+        # (spec > repo > providers.default) every other dispatch path already
+        # uses. ``None`` (unset) resolves to exactly the same effective name as
+        # before this field existed, so an unconfigured deployment sees no
+        # behavior change. The guard still refuses a ``human_attended_only``
+        # resolution regardless of which link in the chain supplied it — a
+        # named ``reviews.provider`` gets no exemption from the #437 gate.
+        from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+        try:
+            review_provider_name = guard_unattended_dispatch(
+                spec_provider=config.reviews.provider,
+                repo_provider=repo.provider,
+                providers_cfg=config.providers,
+                models_cfg=config.models,
+                where="auto-dispatch review",
+            )
+        except ValueError as exc:
+            print(f"[review] skipping auto-dispatch review: {exc}")
+            return _deny(f"blocked by human-attended-only policy: {exc}")
+
+        # #934: resolve this issue's base branch — `feature/ms-NN` when it
+        # belongs to a milestone and the repo opted into the git model,
+        # `repo.default_branch` (today's behavior) otherwise. Resolved once and
+        # reused for the PR base, the diff-command text in the briefing, and the
+        # `branch` payload field below, so they never disagree. The milestone
+        # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
+        # opted in — a non-opted-in repo pays zero extra cost.
+        base_branch = _resolve_pr_base_branch(
+            completed, repo, milestone_fetcher=milestone_fetcher
         )
-    except ValueError as exc:
-        print(f"[review] skipping auto-dispatch review: {exc}")
-        return _deny(f"blocked by human-attended-only policy: {exc}")
 
-    # #934: resolve this issue's base branch — `feature/ms-NN` when it
-    # belongs to a milestone and the repo opted into the git model,
-    # `repo.default_branch` (today's behavior) otherwise. Resolved once and
-    # reused for the PR base, the diff-command text in the briefing, and the
-    # `branch` payload field below, so they never disagree. The milestone
-    # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
-    # opted in — a non-opted-in repo pays zero extra cost.
-    base_branch = _resolve_pr_base_branch(
-        completed, repo, milestone_fetcher=milestone_fetcher
-    )
-
-    # #1534: ZERO-COMMIT GATE.  Refuse to spend a metered review on a branch
-    # that carries no commits over its base — there is literally nothing to
-    # review, and every second of that reviewer's budget is wasted.  This is
-    # the same reasoning as #946's merge enqueue gate, one stage earlier.
-    #
-    # The observed incident: a `test-author` killed by the Claude session
-    # usage limit was recorded `done` with an empty branch, and a review was
-    # auto-dispatched against it.  The reviewer diffed nothing against nothing
-    # and (thanks to #873) returned a null verdict, so even that produced no
-    # signal — the empty slice looked authored *and* reviewed for two days.
-    #
-    # Deliberately placed AFTER the `work_is_terminal` chokepoint (so an
-    # already-merged branch keeps its existing `review_state="done"`
-    # resolution) but BEFORE `pr_lookup` (which would otherwise open a PR for
-    # the empty branch as a side effect of the check).
-    #
-    # FAIL-OPEN: `branch_commits_ahead` returns None — never 0 — on any gh
-    # failure, so a network blip can never strand a real review.  Only a
-    # definite `ahead_by == 0` from GitHub blocks.
-    _ahead_check = commits_ahead_checker or github_ops.branch_commits_ahead
-    _ahead = _ahead_check(repo.github, base_branch, completed.branch)
-    if _ahead == 0:
-        log.warning(
-            "[review] branch %r for %s has 0 commits ahead of %s — refusing to "
-            "auto-dispatch a review against an empty diff (#1534). The work "
-            "assignment did not produce anything; re-dispatch it instead.",
-            completed.branch, completed.assignment_id, base_branch,
-        )
-        completed.review_state = "zero_commits"
-        return _deny(
-            f"branch {completed.branch!r} has 0 commits ahead of {base_branch} "
-            "— refusing to review an empty diff; re-dispatch the work instead"
-        )
-
-    pr = pr_lookup(
-        repo.github,
-        branch=completed.branch,
-        default_branch=base_branch,
-        issue_number=completed.issue_number,
-        issue_title=completed.issue_title,
-        assignment_type=completed.type,
-    )
-
-    # #904 (fix #1): build a ranked list of ALL eligible reviewer machines so
-    # we can fall through to the next if one rejects the dispatch.  This
-    # replaces the previous single-pick → silent-return-None path that could
-    # park a work row at the merge gate forever when config drift caused a
-    # "does not handle repo" 400 from the first (and only tried) machine.
-    candidates = _ranked_reviewer_candidates(
-        completed.machine_name, completed.repo_name, board, config
-    )
-    if not candidates:
-        return _deny(
-            f"no eligible reviewer machine configured for repo "
-            f"{completed.repo_name!r}"
-        )
-
-    # #586: if the branch isn't on the remote, only the original worker machine
-    # has it locally — any cross-machine reviewer would crash on git-fetch.
-    # Narrow the candidate list to just that machine; if it's unavailable too,
-    # stall visibly with "branch_not_on_remote".
-    any_cross_machine = any(not same for _, same in candidates)
-    if any_cross_machine and completed.branch:
-        _check_remote = remote_branch_checker or github_ops.branch_exists_on_remote
-        if not _check_remote(repo.github, completed.branch):
+        # #1534: ZERO-COMMIT GATE.  Refuse to spend a metered review on a branch
+        # that carries no commits over its base — there is literally nothing to
+        # review, and every second of that reviewer's budget is wasted.  This is
+        # the same reasoning as #946's merge enqueue gate, one stage earlier.
+        #
+        # The observed incident: a `test-author` killed by the Claude session
+        # usage limit was recorded `done` with an empty branch, and a review was
+        # auto-dispatched against it.  The reviewer diffed nothing against nothing
+        # and (thanks to #873) returned a null verdict, so even that produced no
+        # signal — the empty slice looked authored *and* reviewed for two days.
+        #
+        # Deliberately placed AFTER the `work_is_terminal` chokepoint (so an
+        # already-merged branch keeps its existing `review_state="done"`
+        # resolution) but BEFORE `pr_lookup` (which would otherwise open a PR for
+        # the empty branch as a side effect of the check).
+        #
+        # FAIL-OPEN: `branch_commits_ahead` returns None — never 0 — on any gh
+        # failure, so a network blip can never strand a real review.  Only a
+        # definite `ahead_by == 0` from GitHub blocks.
+        _ahead_check = commits_ahead_checker or github_ops.branch_commits_ahead
+        _ahead = _ahead_check(repo.github, base_branch, completed.branch)
+        if _ahead == 0:
             log.warning(
-                "[review] branch %r not on remote for %s — routing review back "
-                "to original worker machine %s to avoid cross-machine fetch failure",
-                completed.branch, completed.assignment_id, completed.machine_name,
+                "[review] branch %r for %s has 0 commits ahead of %s — refusing to "
+                "auto-dispatch a review against an empty diff (#1534). The work "
+                "assignment did not produce anything; re-dispatch it instead.",
+                completed.branch, completed.assignment_id, base_branch,
             )
-            # #2240: same cordon-blind set as the candidate ranking above —
-            # this branch NARROWS to the worker machine, so reading a
-            # cordoned worker as "unavailable" here would strand the review
-            # at `branch_not_on_remote` for exactly the reason #2240 names.
-            from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
-            paused = follow_on_paused_set(config.machines)
-            worker_machine = next(
-                (m for m in config.machines if m.name == completed.machine_name),
-                None,
+            completed.review_state = "zero_commits"
+            return _deny(
+                f"branch {completed.branch!r} has 0 commits ahead of {base_branch} "
+                "— refusing to review an empty diff; re-dispatch the work instead"
             )
-            if (
-                worker_machine is not None
-                and worker_machine.can_work_on(completed.repo_name)
-                and worker_machine.name not in paused
-            ):
-                # Restrict to just the worker machine — it has the branch locally.
-                candidates = [(worker_machine, True)]
-            else:
-                # Original machine also unavailable — stall visibly.
-                log.error(
-                    "[review] branch %r not on remote for %s and original machine "
-                    "%s is unavailable (paused or not configured) — "
-                    "review BLOCKED until branch is pushed to origin",
-                    completed.branch, completed.assignment_id, completed.machine_name,
-                )
-                completed.review_state = "branch_not_on_remote"
-                return _deny(
-                    f"branch {completed.branch!r} not on remote and original "
-                    f"worker machine {completed.machine_name!r} is unavailable "
-                    "(paused or not configured) — push the branch to origin "
-                    "or unpause the worker machine"
-                )
 
-    # Compute the parts that are constant across all candidate machines.
-
-    # #612: merge-base diff — embedded verbatim so the reviewer reviews exactly
-    # the branch's own changes (a stale-base diff sweeps in already-merged
-    # commits as spurious deletions, #546).  Best-effort: None keeps the
-    # fallback three-dot git-diff instructions in the briefing.
-    # #1475: fetch the full, untruncated diff once — it's the input to the
-    # content-hash (`review_patch_id` below) and must never be the mutated,
-    # truncated-with-a-trailer string (hashing that gives a patch-id that can
-    # never match the merge-time `branch_patch_id`, which is computed from an
-    # uncapped compare-API diff). The display copy shown to the reviewer is
-    # then truncated locally from the same fetch — no second `gh` call.
-    _diff = diff_fetcher or github_ops.pr_diff
-    full_diff_text = _diff(repo.github, pr["number"], max_chars=None) if pr else None
-    diff_text = (
-        github_ops.truncate_diff_text(full_diff_text) if full_diff_text is not None else None
-    )
-
-    fetch_body = issue_body_fetcher or _fetch_issue_body
-    issue_body = fetch_body(repo.github, completed.issue_number)
-
-    # #2192: free pre-review nudge (see diff_missing_test_coverage docstring).
-    # Logged only, ahead of the paid reviewer dispatch below — never gates,
-    # never denies, never mutates `completed`. A false positive here must
-    # never cost a round trip, so nothing downstream reads this.
-    #
-    # Deliberately `log.warning`, not `log.info` (#2192 review follow-up):
-    # this repo has zero `logging.basicConfig`/`setLevel`/`addHandler` calls
-    # outside tests (see coord/interactive.py:888-898's #865 note on the same
-    # trap), so the root logger sits at Python's default WARNING floor with
-    # no handler attached — an `INFO` record is filtered before it reaches
-    # anywhere and is a silent no-op under every real entry point (`coord
-    # serve`, `coord notify`, `reconcile()`). `WARNING` clears that floor and
-    # is picked up by `logging`'s handler-of-last-resort, which prints
-    # straight to stderr with zero configuration — confirmed empirically:
-    # `logging.getLogger("coord.review").warning(...)` in a bare subprocess
-    # writes to stderr; `.info(...)` writes nothing.
-    if diff_missing_test_coverage(full_diff_text):
-        log.warning(
-            "[review] %s: diff touches user-visible source with zero test "
-            "files changed — matches #2132's 'missing test only' pattern "
-            "(free static check, non-blocking; dispatching review as normal)",
-            completed.assignment_id,
-        )
-
-    # #1811: does the resolved review provider share the worker's model
-    # family? ``completed.provider_name`` is the *resolved* name recorded at
-    # work-dispatch time (spec > repo > providers.default); ``None`` means a
-    # row predating #324 or a path that doesn't set it, which the rest of
-    # the codebase (e.g. coord/gates.py's TUI rendering) treats as the
-    # implicit "claude" default. Provider co-location is a larger loss of
-    # independence than machine co-location (a fresh session removes shared
-    # context, but not shared blind spots) — surfaced below in the
-    # reviewer's own briefing, mirroring ``same_as_worker``.
-    worker_provider_name = completed.provider_name or "claude"
-    provider_same_as_worker = review_provider_name == worker_provider_name
-    if provider_same_as_worker:
-        log.info(
-            "[review] %s: reviewer provider %r matches worker provider — "
-            "reduced independence (shared model family)",
-            completed.assignment_id, review_provider_name,
-        )
-
-    # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
-    # #1430: deliberately not consulting models.labels — the reviewer's
-    # effort scales with diff size, not the original work issue's tier
-    # label, and #911 already pins this deliberately.
-    review_model_alias = config.models.default
-    review_model_wire = config.models.resolve(review_model_alias)
-
-    # #821: capture branch HEAD SHA once; staleness detected post-review.
-    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
-    review_head_sha: str | None = None
-    try:
-        review_head_sha = _get_sha(repo.github, completed.branch)
-    except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
-        pass
-
-    # #1475: fingerprint the *full* merge-base diff (`full_diff_text`, computed
-    # above) — not the display-truncated `diff_text` — so this matches the
-    # merge-time counterpart (`get_branch_patch_id`, also uncapped) for any PR
-    # whose diff exceeds the display truncation threshold. Stored alongside
-    # review_head_sha so a later commit-bound staleness check (a rebase moving
-    # the SHA) can carry the approval forward when the content is byte-identical.
-    _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
-    review_patch_id: str | None = None
-    try:
-        review_patch_id = _compute_patch_id(full_diff_text)
-    except Exception:  # noqa: BLE001 — fail-safe: missing patch-id is not blocking
-        pass
-
-    # #603: per-issue context digest (cross-repo deps / prior findings).
-    from coord.state import issue_context_block  # noqa: PLC0415
-    context_prefix = issue_context_block(completed.repo_name, completed.issue_number)
-
-    # #944 sealing v1: flag tests/acceptance/ as sealed when this repo has an
-    # oracle-loop acceptance driver configured — the reviewer must reject any
-    # diff that touches it (docs/ORACLE_LOOP.md).
-    #
-    # #1552: the set is DERIVED from the driver definition rather than
-    # hardcoded to that one literal. `tests/acceptance/` alone fits a
-    # directory-discovered suite (`pytest tests/acceptance/{ms}`) and is
-    # structurally unsatisfiable for an entry-point-linked one
-    # (`cargo test --test acceptance` sees nothing until `tui/tests/
-    # acceptance.rs` include!s the slice) — under #1175's blanket refusal a
-    # `test-author` on the Rust route could only wire its slice in and be
-    # bounced, or leave it unwired and ship dead code. Each route now
-    # declares its own `entrypoint:`.
-    sealed_paths = config.acceptance.sealed_paths(completed.repo_name)
-    sealed_entrypoints = config.acceptance.entrypoints(completed.repo_name)
-
-    # #2966: coordinator-owned docs (repo's own CLAUDE.md plus anything it
-    # additionally lists under coordinator_only_files) — see
-    # coordinator_owned_docs' docstring for why this doesn't depend on the
-    # repo actually configuring coordinator_only_files.
-    coordinator_doc_paths = coordinator_owned_docs(repo)
-
-    client = http_client or httpx
-
-    # Iterate candidates in priority order.  On agent rejection (4xx from a
-    # misconfigured agent, health-check filter on a drifted config, etc.) we
-    # log a warning and try the next candidate instead of giving up silently.
-    # Only definitive rejections (4xx responses or health-check exclusions) set
-    # had_rejection=True; transient network failures leave the row as "pending"
-    # so the next reconcile/notify pass retries automatically.
-    had_rejection = False
-    for machine, same_as_worker in candidates:
-        # Fix #2 (PREVENTATIVE): pre-filter against the agent's /health
-        # ``repos`` list so a drifted local config can't pick a machine that
-        # will 400.  Fail-open: None means "probe failed, include anyway".
-        # #1485: an empty list is NOT the same as None here — it means "this
-        # agent has no local coordinator.yml at all" (the expected, correct
-        # state for a worker-only machine — coordinator.yml lives on
-        # dellserver only), which matches the agent's own interpretation in
-        # AgentServer.assign (`if self.repos and spec.repo_name not in
-        # self.repos`, coord/agent.py) where an empty list is falsy and means
-        # "no restriction, accept everything." Treat `[]` the same way here —
-        # only a *non-empty* advertised list that omits the repo is a genuine
-        # drift signal worth skipping the candidate for.
-        _hc = health_checker if health_checker is not None else _fetch_agent_advertised_repos
-        advertised = _hc(machine.host)
-        if advertised and completed.repo_name not in advertised:
-            log.warning(
-                "[review] skipping candidate %s: /health advertises repos %r "
-                "but repo %r is not listed — possible config drift",
-                machine.name, advertised, completed.repo_name,
-            )
-            had_rejection = True
-            continue
-
-        repo_path = machine.repo_path(completed.repo_name)
-        if repo_path is None:
-            log.warning(
-                "[review] skipping candidate %s: no repo_path for %r",
-                machine.name, completed.repo_name,
-            )
-            continue
-
-        claude_md = claude_md_reader(Path(repo_path).expanduser())
-
-        # #476 / #612: briefing is rebuilt per candidate because same_as_worker
-        # (warning note in the briefing) and claude_md path can differ between
-        # machines.
-        briefing = context_prefix + build_review_briefing(
-            pr_number=pr["number"] if pr else None,
-            pr_url=pr["url"] if pr else None,
-            repo_github=repo.github,
-            repo_name=repo.name,
+        pr = pr_lookup(
+            repo.github,
+            branch=completed.branch,
+            default_branch=base_branch,
             issue_number=completed.issue_number,
             issue_title=completed.issue_title,
-            issue_body=issue_body,
-            branch=completed.branch,
-            worker_machine=completed.machine_name,
-            same_as_worker=same_as_worker,
-            provider_same_as_worker=provider_same_as_worker,
-            review_provider=review_provider_name,
-            reviews_cfg=config.reviews,
-            repo_claude_md=claude_md,
-            review_head_sha=review_head_sha,
-            default_branch=base_branch,
-            # #476: a fix worker carries review_iteration > 0; its re-review is
-            # scoped to the fix delta rather than re-reviewing the whole PR.
-            review_iteration=getattr(completed, "review_iteration", 0) or 0,
-            diff_text=diff_text,
-            sealed_paths=sealed_paths,
-            sealed_entrypoints=sealed_entrypoints,
-            coordinator_doc_paths=coordinator_doc_paths,
             assignment_type=completed.type,
         )
 
-        payload = {
-            "repo_name": completed.repo_name,
-            "repo_path": repo_path,
-            "issue_number": completed.issue_number,
-            "issue_title": f"[review] {completed.issue_title}",
-            "briefing": briefing,
-            "files_allowed": [],
-            "files_forbidden": [],
-            "pull_repos": [],
-            "type": "review",
-            "model": review_model_wire,
-            "system_prompt": REVIEWER_SYSTEM_PROMPT,
-            "review_target": str(pr["number"]) if pr else completed.branch,
-            # #255: review checkout uses the PR branch, but the agent's worktree
-            # setup still consults `branch` as the integration base when no PR
-            # branch exists locally yet.  Match the work-dispatch path.
-            "branch": base_branch or "main",
-        }
-        # #1811: carry the resolved review provider onto the wire the same
-        # way coord.dispatch.dispatch() does for work — without this the
-        # agent's own AssignmentSpec.provider stays None and it silently
-        # runs its legacy default worker command regardless of what
-        # guard_unattended_dispatch resolved above, which is exactly the
-        # "configuration appears to work while doing nothing" trap #1811
-        # calls out. Gated by the same helper dispatch() uses so a vanilla,
-        # uncustomized "claude" resolution keeps an unconfigured
-        # deployment's wire payload byte-identical to before this field
-        # existed.
-        from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+        # #904 (fix #1): build a ranked list of ALL eligible reviewer machines so
+        # we can fall through to the next if one rejects the dispatch.  This
+        # replaces the previous single-pick → silent-return-None path that could
+        # park a work row at the merge gate forever when config drift caused a
+        # "does not handle repo" 400 from the first (and only tried) machine.
+        candidates = _ranked_reviewer_candidates(
+            completed.machine_name, completed.repo_name, board, config
+        )
+        if not candidates:
+            return _deny(
+                f"no eligible reviewer machine configured for repo "
+                f"{completed.repo_name!r}"
+            )
 
-        if review_provider_name and _wire_payload_needs_provider_field(
-            review_provider_name, config,
-        ):
-            payload["provider"] = review_provider_name
-
-        url = f"http://{machine.host}:{AGENT_PORT}/assign"
-        try:
-            resp = client.post(url, json=payload, timeout=15)
-            resp.raise_for_status()
-            agent_response = resp.json()
-        except httpx.HTTPStatusError as exc:
-            # Fix #1 (PRIMARY): the agent definitively rejected the dispatch
-            # (e.g. 400 "does not handle repo 'x'").  Try the next candidate
-            # instead of silently returning None and leaving review_state as
-            # 'pending' (#904).
-            #
-            # #904 (fix #2): only a 4xx is a *definitive* rejection — it means
-            # the agent looked at the request and refused it (bad repo, bad
-            # payload, etc.), which is a config-drift signal.  A 5xx means the
-            # agent's own handler blew up (mid-restart, disk full, unhandled
-            # exception) and says nothing about whether this agent/repo pairing
-            # is valid — treat it like the transient network branch below so
-            # the row stays "pending" and retries next pass instead of
-            # permanently stalling as "no_eligible_reviewer".
-            if exc.response.is_client_error:
+        # #586: if the branch isn't on the remote, only the original worker machine
+        # has it locally — any cross-machine reviewer would crash on git-fetch.
+        # Narrow the candidate list to just that machine; if it's unavailable too,
+        # stall visibly with "branch_not_on_remote".
+        any_cross_machine = any(not same for _, same in candidates)
+        if any_cross_machine and completed.branch:
+            _check_remote = remote_branch_checker or github_ops.branch_exists_on_remote
+            if not _check_remote(repo.github, completed.branch):
                 log.warning(
-                    "[review] agent %s rejected dispatch with HTTP %d — "
-                    "trying next reviewer candidate",
-                    machine.name, exc.response.status_code,
+                    "[review] branch %r not on remote for %s — routing review back "
+                    "to original worker machine %s to avoid cross-machine fetch failure",
+                    completed.branch, completed.assignment_id, completed.machine_name,
+                )
+                # #2240: same cordon-blind set as the candidate ranking above —
+                # this branch NARROWS to the worker machine, so reading a
+                # cordoned worker as "unavailable" here would strand the review
+                # at `branch_not_on_remote` for exactly the reason #2240 names.
+                from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+                paused = follow_on_paused_set(config.machines)
+                worker_machine = next(
+                    (m for m in config.machines if m.name == completed.machine_name),
+                    None,
+                )
+                if (
+                    worker_machine is not None
+                    and worker_machine.can_work_on(completed.repo_name)
+                    and worker_machine.name not in paused
+                ):
+                    # Restrict to just the worker machine — it has the branch locally.
+                    candidates = [(worker_machine, True)]
+                else:
+                    # Original machine also unavailable — stall visibly.
+                    log.error(
+                        "[review] branch %r not on remote for %s and original machine "
+                        "%s is unavailable (paused or not configured) — "
+                        "review BLOCKED until branch is pushed to origin",
+                        completed.branch, completed.assignment_id, completed.machine_name,
+                    )
+                    completed.review_state = "branch_not_on_remote"
+                    return _deny(
+                        f"branch {completed.branch!r} not on remote and original "
+                        f"worker machine {completed.machine_name!r} is unavailable "
+                        "(paused or not configured) — push the branch to origin "
+                        "or unpause the worker machine"
+                    )
+
+        # Compute the parts that are constant across all candidate machines.
+
+        # #612: merge-base diff — embedded verbatim so the reviewer reviews exactly
+        # the branch's own changes (a stale-base diff sweeps in already-merged
+        # commits as spurious deletions, #546).  Best-effort: None keeps the
+        # fallback three-dot git-diff instructions in the briefing.
+        # #1475: fetch the full, untruncated diff once — it's the input to the
+        # content-hash (`review_patch_id` below) and must never be the mutated,
+        # truncated-with-a-trailer string (hashing that gives a patch-id that can
+        # never match the merge-time `branch_patch_id`, which is computed from an
+        # uncapped compare-API diff). The display copy shown to the reviewer is
+        # then truncated locally from the same fetch — no second `gh` call.
+        _diff = diff_fetcher or github_ops.pr_diff
+        full_diff_text = _diff(repo.github, pr["number"], max_chars=None) if pr else None
+        diff_text = (
+            github_ops.truncate_diff_text(full_diff_text) if full_diff_text is not None else None
+        )
+
+        fetch_body = issue_body_fetcher or _fetch_issue_body
+        issue_body = fetch_body(repo.github, completed.issue_number)
+
+        # #2192: free pre-review nudge (see diff_missing_test_coverage docstring).
+        # Logged only, ahead of the paid reviewer dispatch below — never gates,
+        # never denies, never mutates `completed`. A false positive here must
+        # never cost a round trip, so nothing downstream reads this.
+        #
+        # Deliberately `log.warning`, not `log.info` (#2192 review follow-up):
+        # this repo has zero `logging.basicConfig`/`setLevel`/`addHandler` calls
+        # outside tests (see coord/interactive.py:888-898's #865 note on the same
+        # trap), so the root logger sits at Python's default WARNING floor with
+        # no handler attached — an `INFO` record is filtered before it reaches
+        # anywhere and is a silent no-op under every real entry point (`coord
+        # serve`, `coord notify`, `reconcile()`). `WARNING` clears that floor and
+        # is picked up by `logging`'s handler-of-last-resort, which prints
+        # straight to stderr with zero configuration — confirmed empirically:
+        # `logging.getLogger("coord.review").warning(...)` in a bare subprocess
+        # writes to stderr; `.info(...)` writes nothing.
+        if diff_missing_test_coverage(full_diff_text):
+            log.warning(
+                "[review] %s: diff touches user-visible source with zero test "
+                "files changed — matches #2132's 'missing test only' pattern "
+                "(free static check, non-blocking; dispatching review as normal)",
+                completed.assignment_id,
+            )
+
+        # #1811: does the resolved review provider share the worker's model
+        # family? ``completed.provider_name`` is the *resolved* name recorded at
+        # work-dispatch time (spec > repo > providers.default); ``None`` means a
+        # row predating #324 or a path that doesn't set it, which the rest of
+        # the codebase (e.g. coord/gates.py's TUI rendering) treats as the
+        # implicit "claude" default. Provider co-location is a larger loss of
+        # independence than machine co-location (a fresh session removes shared
+        # context, but not shared blind spots) — surfaced below in the
+        # reviewer's own briefing, mirroring ``same_as_worker``.
+        worker_provider_name = completed.provider_name or "claude"
+        provider_same_as_worker = review_provider_name == worker_provider_name
+        if provider_same_as_worker:
+            log.info(
+                "[review] %s: reviewer provider %r matches worker provider — "
+                "reduced independence (shared model family)",
+                completed.assignment_id, review_provider_name,
+            )
+
+        # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
+        # #1430: deliberately not consulting models.labels — the reviewer's
+        # effort scales with diff size, not the original work issue's tier
+        # label, and #911 already pins this deliberately.
+        review_model_alias = config.models.default
+        review_model_wire = config.models.resolve(review_model_alias)
+
+        # #821: capture branch HEAD SHA once; staleness detected post-review.
+        _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+        review_head_sha: str | None = None
+        try:
+            review_head_sha = _get_sha(repo.github, completed.branch)
+        except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
+            pass
+
+        # #1475: fingerprint the *full* merge-base diff (`full_diff_text`, computed
+        # above) — not the display-truncated `diff_text` — so this matches the
+        # merge-time counterpart (`get_branch_patch_id`, also uncapped) for any PR
+        # whose diff exceeds the display truncation threshold. Stored alongside
+        # review_head_sha so a later commit-bound staleness check (a rebase moving
+        # the SHA) can carry the approval forward when the content is byte-identical.
+        _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
+        review_patch_id: str | None = None
+        try:
+            review_patch_id = _compute_patch_id(full_diff_text)
+        except Exception:  # noqa: BLE001 — fail-safe: missing patch-id is not blocking
+            pass
+
+        # #603: per-issue context digest (cross-repo deps / prior findings).
+        from coord.state import issue_context_block  # noqa: PLC0415
+        context_prefix = issue_context_block(completed.repo_name, completed.issue_number)
+
+        # #944 sealing v1: flag tests/acceptance/ as sealed when this repo has an
+        # oracle-loop acceptance driver configured — the reviewer must reject any
+        # diff that touches it (docs/ORACLE_LOOP.md).
+        #
+        # #1552: the set is DERIVED from the driver definition rather than
+        # hardcoded to that one literal. `tests/acceptance/` alone fits a
+        # directory-discovered suite (`pytest tests/acceptance/{ms}`) and is
+        # structurally unsatisfiable for an entry-point-linked one
+        # (`cargo test --test acceptance` sees nothing until `tui/tests/
+        # acceptance.rs` include!s the slice) — under #1175's blanket refusal a
+        # `test-author` on the Rust route could only wire its slice in and be
+        # bounced, or leave it unwired and ship dead code. Each route now
+        # declares its own `entrypoint:`.
+        sealed_paths = config.acceptance.sealed_paths(completed.repo_name)
+        sealed_entrypoints = config.acceptance.entrypoints(completed.repo_name)
+
+        # #2966: coordinator-owned docs (repo's own CLAUDE.md plus anything it
+        # additionally lists under coordinator_only_files) — see
+        # coordinator_owned_docs' docstring for why this doesn't depend on the
+        # repo actually configuring coordinator_only_files.
+        coordinator_doc_paths = coordinator_owned_docs(repo)
+
+        client = http_client or httpx
+
+        # Iterate candidates in priority order.  On agent rejection (4xx from a
+        # misconfigured agent, health-check filter on a drifted config, etc.) we
+        # log a warning and try the next candidate instead of giving up silently.
+        # Only definitive rejections (4xx responses or health-check exclusions) set
+        # had_rejection=True; transient network failures leave the row as "pending"
+        # so the next reconcile/notify pass retries automatically.
+        had_rejection = False
+        for machine, same_as_worker in candidates:
+            # Fix #2 (PREVENTATIVE): pre-filter against the agent's /health
+            # ``repos`` list so a drifted local config can't pick a machine that
+            # will 400.  Fail-open: None means "probe failed, include anyway".
+            # #1485: an empty list is NOT the same as None here — it means "this
+            # agent has no local coordinator.yml at all" (the expected, correct
+            # state for a worker-only machine — coordinator.yml lives on
+            # dellserver only), which matches the agent's own interpretation in
+            # AgentServer.assign (`if self.repos and spec.repo_name not in
+            # self.repos`, coord/agent.py) where an empty list is falsy and means
+            # "no restriction, accept everything." Treat `[]` the same way here —
+            # only a *non-empty* advertised list that omits the repo is a genuine
+            # drift signal worth skipping the candidate for.
+            _hc = health_checker if health_checker is not None else _fetch_agent_advertised_repos
+            advertised = _hc(machine.host)
+            if advertised and completed.repo_name not in advertised:
+                log.warning(
+                    "[review] skipping candidate %s: /health advertises repos %r "
+                    "but repo %r is not listed — possible config drift",
+                    machine.name, advertised, completed.repo_name,
                 )
                 had_rejection = True
-            else:
+                continue
+
+            repo_path = machine.repo_path(completed.repo_name)
+            if repo_path is None:
                 log.warning(
-                    "[review] agent %s returned server error HTTP %d (transient) — "
-                    "trying next reviewer candidate",
-                    machine.name, exc.response.status_code,
+                    "[review] skipping candidate %s: no repo_path for %r",
+                    machine.name, completed.repo_name,
                 )
-            continue
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
-            # Transient network failure — try next candidate, and if all
-            # fail transiently, leave review_state unchanged so the next
+                continue
+
+            claude_md = claude_md_reader(Path(repo_path).expanduser())
+
+            # #476 / #612: briefing is rebuilt per candidate because same_as_worker
+            # (warning note in the briefing) and claude_md path can differ between
+            # machines.
+            briefing = context_prefix + build_review_briefing(
+                pr_number=pr["number"] if pr else None,
+                pr_url=pr["url"] if pr else None,
+                repo_github=repo.github,
+                repo_name=repo.name,
+                issue_number=completed.issue_number,
+                issue_title=completed.issue_title,
+                issue_body=issue_body,
+                branch=completed.branch,
+                worker_machine=completed.machine_name,
+                same_as_worker=same_as_worker,
+                provider_same_as_worker=provider_same_as_worker,
+                review_provider=review_provider_name,
+                reviews_cfg=config.reviews,
+                repo_claude_md=claude_md,
+                review_head_sha=review_head_sha,
+                default_branch=base_branch,
+                # #476: a fix worker carries review_iteration > 0; its re-review is
+                # scoped to the fix delta rather than re-reviewing the whole PR.
+                review_iteration=getattr(completed, "review_iteration", 0) or 0,
+                diff_text=diff_text,
+                sealed_paths=sealed_paths,
+                sealed_entrypoints=sealed_entrypoints,
+                coordinator_doc_paths=coordinator_doc_paths,
+                assignment_type=completed.type,
+            )
+
+            payload = {
+                "repo_name": completed.repo_name,
+                "repo_path": repo_path,
+                "issue_number": completed.issue_number,
+                "issue_title": f"[review] {completed.issue_title}",
+                "briefing": briefing,
+                "files_allowed": [],
+                "files_forbidden": [],
+                "pull_repos": [],
+                "type": "review",
+                "model": review_model_wire,
+                "system_prompt": REVIEWER_SYSTEM_PROMPT,
+                "review_target": str(pr["number"]) if pr else completed.branch,
+                # #255: review checkout uses the PR branch, but the agent's worktree
+                # setup still consults `branch` as the integration base when no PR
+                # branch exists locally yet.  Match the work-dispatch path.
+                "branch": base_branch or "main",
+            }
+            # #1811: carry the resolved review provider onto the wire the same
+            # way coord.dispatch.dispatch() does for work — without this the
+            # agent's own AssignmentSpec.provider stays None and it silently
+            # runs its legacy default worker command regardless of what
+            # guard_unattended_dispatch resolved above, which is exactly the
+            # "configuration appears to work while doing nothing" trap #1811
+            # calls out. Gated by the same helper dispatch() uses so a vanilla,
+            # uncustomized "claude" resolution keeps an unconfigured
+            # deployment's wire payload byte-identical to before this field
+            # existed.
+            from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+
+            if review_provider_name and _wire_payload_needs_provider_field(
+                review_provider_name, config,
+            ):
+                payload["provider"] = review_provider_name
+
+            url = f"http://{machine.host}:{AGENT_PORT}/assign"
+            try:
+                resp = client.post(url, json=payload, timeout=15)
+                resp.raise_for_status()
+                agent_response = resp.json()
+            except httpx.HTTPStatusError as exc:
+                # Fix #1 (PRIMARY): the agent definitively rejected the dispatch
+                # (e.g. 400 "does not handle repo 'x'").  Try the next candidate
+                # instead of silently returning None and leaving review_state as
+                # 'pending' (#904).
+                #
+                # #904 (fix #2): only a 4xx is a *definitive* rejection — it means
+                # the agent looked at the request and refused it (bad repo, bad
+                # payload, etc.), which is a config-drift signal.  A 5xx means the
+                # agent's own handler blew up (mid-restart, disk full, unhandled
+                # exception) and says nothing about whether this agent/repo pairing
+                # is valid — treat it like the transient network branch below so
+                # the row stays "pending" and retries next pass instead of
+                # permanently stalling as "no_eligible_reviewer".
+                if exc.response.is_client_error:
+                    log.warning(
+                        "[review] agent %s rejected dispatch with HTTP %d — "
+                        "trying next reviewer candidate",
+                        machine.name, exc.response.status_code,
+                    )
+                    had_rejection = True
+                else:
+                    log.warning(
+                        "[review] agent %s returned server error HTTP %d (transient) — "
+                        "trying next reviewer candidate",
+                        machine.name, exc.response.status_code,
+                    )
+                continue
+            except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                # Transient network failure — try next candidate, and if all
+                # fail transiently, leave review_state unchanged so the next
+                # reconcile/notify pass retries automatically.
+                log.warning(
+                    "[review] agent %s unreachable (%s) — trying next reviewer candidate",
+                    machine.name, exc,
+                )
+                continue
+
+            # Dispatch accepted — record the review assignment and return.
+            review_assignment = Assignment(
+                machine_name=machine.name,
+                repo_name=completed.repo_name,
+                issue_number=completed.issue_number,
+                issue_title=f"[review] {completed.issue_title}",
+                files_allowed=[],
+                files_forbidden=[],
+                briefing=briefing,
+                assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+                status="running",
+                branch=completed.branch,
+                pr_url=pr.get("url") if pr else None,
+                dispatched_at=now if now is not None else time.time(),
+                type="review",
+                review_target=str(pr["number"]) if pr else completed.branch,
+                review_of_assignment_id=completed.assignment_id,
+                model=review_model_alias,
+                # #1811: record the resolved review provider the same way
+                # coord.dispatch.dispatch() records the work provider — so the
+                # TUI/audit trail can distinguish a review that ran through
+                # `reviews.provider`/`repo.provider` from one that fell through
+                # to `providers.default`, instead of guessing "claude" for every
+                # review row the way a `None` here used to force.
+                provider_name=review_provider_name,
+                review_head_sha=review_head_sha,
+                review_patch_id=review_patch_id,
+                # #1553: a review of an oracle-loop acceptance slice is work for
+                # the CHILD issue, not for the milestone's tracking issue that
+                # `completed.issue_number` carries. Inherit the slice attribution
+                # so the child's Pipeline row shows the review as activity and
+                # its cost rolls up to the child. None for every ordinary review
+                # (the parent has no `for_issue_number`), so nothing changes for
+                # non-slice work. See `coord.models.effective_issue_number`.
+                for_issue_number=completed.for_issue_number,
+            )
+            board.active.append(review_assignment)
+
+            from coord.state import record_dispatched_assignment  # noqa: PLC0415
+            record_dispatched_assignment(
+                assignment=review_assignment,
+                repo_github=repo.github,
+            )
+
+            return review_assignment
+
+        # All candidates exhausted.  Distinguish definitive rejection (config
+        # drift, drifted agent config) from transient network failures.
+        if had_rejection:
+            # At least one agent definitively rejected the repo — stall visibly
+            # with a named state so `coord status` can surface an actionable error
+            # and the pending-review loop stops silently retrying (#904).
+            log.error(
+                "[review] all reviewer candidates rejected dispatch for %s "
+                "(repo=%r, branch=%r) — setting review_state='no_eligible_reviewer'. "
+                "Check that every agent's repos list includes %r.",
+                completed.assignment_id, completed.repo_name, completed.branch,
+                completed.repo_name,
+            )
+            completed.review_state = "no_eligible_reviewer"
+            completed.review_dispatch_reason = (
+                f"all reviewer candidates rejected dispatch for repo "
+                f"{completed.repo_name!r} (config drift — check every agent's "
+                "repos list)"
+            )
+        else:
+            # Only transient failures — leave review_state unchanged so the next
             # reconcile/notify pass retries automatically.
             log.warning(
-                "[review] agent %s unreachable (%s) — trying next reviewer candidate",
-                machine.name, exc,
+                "[review] all reviewer candidates unreachable for %s "
+                "(repo=%r) — will retry on next reconcile/notify pass",
+                completed.assignment_id, completed.repo_name,
             )
-            continue
+            completed.review_dispatch_reason = (
+                f"all reviewer candidates unreachable for repo "
+                f"{completed.repo_name!r} — transient, will retry automatically"
+            )
+        # #3113: this tail doesn't go through `_deny` (it sets `review_state`
+        # directly, distinguishing the rejected/unreachable cases) but it is
+        # still a path that produced no dispatched review, so the claim taken
+        # above must be released the same way every `_deny(...)` call releases
+        # it — otherwise a transient "all candidates unreachable" pass would
+        # permanently strand this work assignment behind a claim nothing else
+        # will ever clear.
+        if _claim_held:
+            from coord.state import release_review_dispatch_claim  # noqa: PLC0415
 
-        # Dispatch accepted — record the review assignment and return.
-        review_assignment = Assignment(
-            machine_name=machine.name,
-            repo_name=completed.repo_name,
-            issue_number=completed.issue_number,
-            issue_title=f"[review] {completed.issue_title}",
-            files_allowed=[],
-            files_forbidden=[],
-            briefing=briefing,
-            assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
-            status="running",
-            branch=completed.branch,
-            pr_url=pr.get("url") if pr else None,
-            dispatched_at=now if now is not None else time.time(),
-            type="review",
-            review_target=str(pr["number"]) if pr else completed.branch,
-            review_of_assignment_id=completed.assignment_id,
-            model=review_model_alias,
-            # #1811: record the resolved review provider the same way
-            # coord.dispatch.dispatch() records the work provider — so the
-            # TUI/audit trail can distinguish a review that ran through
-            # `reviews.provider`/`repo.provider` from one that fell through
-            # to `providers.default`, instead of guessing "claude" for every
-            # review row the way a `None` here used to force.
-            provider_name=review_provider_name,
-            review_head_sha=review_head_sha,
-            review_patch_id=review_patch_id,
-            # #1553: a review of an oracle-loop acceptance slice is work for
-            # the CHILD issue, not for the milestone's tracking issue that
-            # `completed.issue_number` carries. Inherit the slice attribution
-            # so the child's Pipeline row shows the review as activity and
-            # its cost rolls up to the child. None for every ordinary review
-            # (the parent has no `for_issue_number`), so nothing changes for
-            # non-slice work. See `coord.models.effective_issue_number`.
-            for_issue_number=completed.for_issue_number,
-        )
-        board.active.append(review_assignment)
+            release_review_dispatch_claim(completed.assignment_id)
+            _claim_held = False
+        return None
+    except Exception:
+        # #3113: any unhandled exception in the ~500 lines between the
+        # claim above and a successful dispatch (pr_lookup, briefing
+        # assembly, JSON handling of agent_response, ...) used to
+        # propagate straight past every `_deny(...)` release path,
+        # permanently stranding this work assignment's review dispatch
+        # behind a claim nothing would ever clear (no row is created for
+        # a raised exception, so the terminal-status release hook in
+        # `coord.issue_store._update_local_state` never fires either).
+        # This is the safety net: release-then-reraise, so the caller
+        # still sees the original failure (fail-open, like every other
+        # transient-error path in this function) but the claim is never
+        # left held by a session that no longer exists to release it.
+        if _claim_held:
+            from coord.state import release_review_dispatch_claim  # noqa: PLC0415
 
-        from coord.state import record_dispatched_assignment  # noqa: PLC0415
-        record_dispatched_assignment(
-            assignment=review_assignment,
-            repo_github=repo.github,
-        )
-
-        return review_assignment
-
-    # All candidates exhausted.  Distinguish definitive rejection (config
-    # drift, drifted agent config) from transient network failures.
-    if had_rejection:
-        # At least one agent definitively rejected the repo — stall visibly
-        # with a named state so `coord status` can surface an actionable error
-        # and the pending-review loop stops silently retrying (#904).
-        log.error(
-            "[review] all reviewer candidates rejected dispatch for %s "
-            "(repo=%r, branch=%r) — setting review_state='no_eligible_reviewer'. "
-            "Check that every agent's repos list includes %r.",
-            completed.assignment_id, completed.repo_name, completed.branch,
-            completed.repo_name,
-        )
-        completed.review_state = "no_eligible_reviewer"
-        completed.review_dispatch_reason = (
-            f"all reviewer candidates rejected dispatch for repo "
-            f"{completed.repo_name!r} (config drift — check every agent's "
-            "repos list)"
-        )
-    else:
-        # Only transient failures — leave review_state unchanged so the next
-        # reconcile/notify pass retries automatically.
-        log.warning(
-            "[review] all reviewer candidates unreachable for %s "
-            "(repo=%r) — will retry on next reconcile/notify pass",
-            completed.assignment_id, completed.repo_name,
-        )
-        completed.review_dispatch_reason = (
-            f"all reviewer candidates unreachable for repo "
-            f"{completed.repo_name!r} — transient, will retry automatically"
-        )
-    # #3113: this tail doesn't go through `_deny` (it sets `review_state`
-    # directly, distinguishing the rejected/unreachable cases) but it is
-    # still a path that produced no dispatched review, so the claim taken
-    # above must be released the same way every `_deny(...)` call releases
-    # it — otherwise a transient "all candidates unreachable" pass would
-    # permanently strand this work assignment behind a claim nothing else
-    # will ever clear.
-    if _claim_held:
-        from coord.state import release_review_dispatch_claim  # noqa: PLC0415
-
-        release_review_dispatch_claim(completed.assignment_id)
-        _claim_held = False
-    return None
+            release_review_dispatch_claim(completed.assignment_id)
+            _claim_held = False
+        raise
 
 
 def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, now=None):

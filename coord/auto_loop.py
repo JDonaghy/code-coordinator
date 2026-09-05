@@ -755,6 +755,13 @@ def _merge_blocking_review_findings(
 
     _add(primary_findings.body)
 
+    # Deliberately not filtered to status=="done" here: a sibling review
+    # that hasn't completed yet has no cached findings, so `_load_review_findings`
+    # below returns None for it and it's skipped by the `continue` — harmless
+    # today. But `_load_review_findings` has a fallback chain (cache miss ->
+    # log parse -> GitHub fetch) that could someday read a still-running
+    # review's partial output; if it ever does, this loop would need an
+    # explicit terminal-status filter to keep from folding in a partial verdict.
     others = [
         a
         for a in list(board.completed) + list(board.active)
