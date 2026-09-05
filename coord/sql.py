@@ -1172,6 +1172,29 @@ def sqlite_wal_checkpoint_truncate(conn: Any) -> tuple[int, int, int]:
     return (row[0], row[1], row[2]) if row else (0, 0, 0)
 
 
+def sqlite_integrity_check(conn: Any) -> str:
+    """Run ``PRAGMA integrity_check`` and return SQLite's one-word verdict --
+    ``"ok"``, or the first line of its corruption report.
+
+    Lives here for the same reason :func:`sqlite_journal_mode` and
+    :func:`sqlite_wal_checkpoint_truncate` do: the ``PRAGMA`` statement text
+    is SQLite-only, and this module is the one place in the tree allowed to
+    spell one (enforced by ``tests/test_sql_dialect.py::
+    test_no_sqlite_only_construct_in_statement_text_outside_db_and_seam``).
+    Its caller is :func:`coord.backup.verify_sqlite_snapshot`, which has
+    already resolved that the artifact it is verifying is a SQLite file.
+
+    A healthy database answers with the single row ``("ok",)``; a corrupt one
+    answers with one row per problem found.  Only the first is returned --
+    the caller's contract is "``ok`` or a reason", not a full report -- and an
+    empty result (which SQLite does not produce, but a stubbed connection in a
+    test can) degrades to ``"<no output>"`` rather than an ``IndexError``.
+    SQLite-only: callers must already know *conn* is a SQLite connection.
+    """
+    rows = execute(conn, "PRAGMA integrity_check").fetchall()
+    return str(rows[0][0]) if rows else "<no output>"
+
+
 def driver_error(conn: Any) -> type[BaseException]:
     """The DB-API ``Error`` base class *conn*'s driver raises (#2766).
 

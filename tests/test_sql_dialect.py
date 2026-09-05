@@ -499,6 +499,49 @@ def test_sqlite_wal_checkpoint_truncate_returns_three_ints(tmp_path):
         conn.close()
 
 
+# ── integrity helper: sqlite_integrity_check (#3118) ─────────────────────
+#
+# The backup lane's verify-before-it-counts gate calls this instead of
+# spelling `PRAGMA integrity_check` in coord/backup.py, where the SQLite-only
+# statement-text ratchet below would (correctly) reject it.
+
+
+def test_sqlite_integrity_check_reports_ok_on_a_healthy_database(memdb):
+    sql.execute(memdb, "CREATE TABLE integrity_probe (id INTEGER PRIMARY KEY)")
+    assert sql.sqlite_integrity_check(memdb) == "ok"
+
+
+def test_sqlite_integrity_check_returns_the_first_line_of_a_corruption_report(monkeypatch):
+    """A corrupt database answers with one row *per problem found*; the
+    caller's contract is "ok, or a reason", so only the first is returned.
+
+    Driven through a stub rather than a hand-corrupted file: the point being
+    pinned is the multi-row -> single-string reduction, and SQLite chooses
+    for itself how many rows a given kind of damage produces.
+    """
+
+    class _Cursor:
+        def fetchall(self):
+            return [("*** in database main ***",), ("Page 42 is never used",)]
+
+    monkeypatch.setattr(sql, "execute", lambda conn, statement, params=(): _Cursor())
+    assert sql.sqlite_integrity_check(object()) == "*** in database main ***"
+
+
+def test_sqlite_integrity_check_degrades_to_a_placeholder_on_an_empty_result(monkeypatch):
+    """Real SQLite always answers with at least one row, but a caller that
+    turned an empty result into an IndexError would report a snapshot as
+    *unverifiable for an unrelated reason* — so this degrades to a legible
+    non-"ok" verdict, which every caller already rejects."""
+
+    class _Cursor:
+        def fetchall(self):
+            return []
+
+    monkeypatch.setattr(sql, "execute", lambda conn, statement, params=(): _Cursor())
+    assert sql.sqlite_integrity_check(object()) == "<no output>"
+
+
 # ── row factory ──────────────────────────────────────────────────────────
 
 
