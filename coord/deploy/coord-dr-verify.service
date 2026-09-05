@@ -1,0 +1,104 @@
+# coord-dr-verify — continuously prove the OFF-SITE backup actually restores
+# (#3119, rung D2 of epic #3117). Paired with coord-dr-verify.timer.
+#
+# coord-backup.timer (#3118) makes an off-box copy exist. This unit is the
+# difference between having backups and having recovery: every run it pulls
+# the newest off-site snapshot back down through `coord backup restore --into
+# <scratch>` — the real off-site path, credentials included, NOT a re-read of
+# the local copy — and then tries to prove it is usable:
+#
+#   1. structural : PRAGMA integrity_check (sqlite) / pg_restore --list (pg),
+#   2. content    : per-table row counts against live, within a tolerance for
+#                   the snapshot lagging live by up to one backup interval. A
+#                   table that is EMPTY in the restore while live is not is a
+#                   hard failure regardless of tolerance — that is the shape a
+#                   truncated-but-openable restore takes, and integrity_check
+#                   is perfectly happy with it,
+#   3. schema     : the restored schema_version matches what the INSTALLED
+#                   coord expects. A backup that restores cleanly but is three
+#                   migrations behind is a recovery that fails at daemon start,
+#   4. parity     : a throwaway `coord serve` is booted against the scratch DB
+#                   on an ephemeral port and asked for GET /board. This is the
+#                   step that proves RECOVERABILITY rather than merely
+#                   restorability,
+#   5. cleanup    : the scratch copy is removed on every exit path, including
+#                   a mid-restore failure and a ^C,
+#   6. report     : success is quiet; failure alerts through the notifier.
+#
+# Every failure mode this catches is silent by nature — an expired credential,
+# a retention policy that pruned the wrong side, a snapshot that uploads fine
+# and restores to a truncated file, a migration that landed on the live DB but
+# not on whatever the restore path reconstructs. None of them announce
+# themselves and all of them are discovered at the worst possible moment. The
+# fleet already owns the cautionary version: until #3085, coord-db-backup.sh
+# would have printed a cheerful green "ok" for a snapshot of a dead
+# pre-cutover file. VERIFYING THE ARTIFACT IS NOT VERIFYING THE RECOVERY.
+#
+# FRESHNESS IS ITS OWN FAILURE. Each run writes ~/.coord/last_verify.json
+# (timestamp, snapshot id, outcome, measured restore duration). A verify that
+# has not run in $COORD_DR_VERIFY_MAX_AGE_HOURS (default 12) is a failure, not
+# an absence of news — `coord dr status` reports exactly that and exits
+# non-zero without needing a run to fail. The measured restore duration is
+# also #3117's Domain-A RTO input: read it out of last_verify.json rather than
+# estimating it later.
+#
+# THE ALERT MUST NOT SHARE A FAILURE DOMAIN WITH THE THING IT WATCHES. The
+# 2026-08-22 venv incident fired detection correctly into an alert channel
+# that was inside the blast radius. Two mitigations, both cheap:
+#   - the failure alert goes out over the existing notifier (an OFF-BOX ntfy
+#     server; docs/NOTIFIER.md — "tells you when NOBODY IS COMING"), never a
+#     new transport built for this lane,
+#   - $COORD_DR_VERIFY_MIRROR (os.pathsep-separated paths) mirrors
+#     last_verify.json somewhere a DIFFERENT machine can read, so that machine
+#     can run `coord dr status --record <mirror>` and go stale-and-loud when
+#     this host stops running at all.
+#
+# CREDENTIALS COME FROM THE ENVIRONMENT ONLY, exactly as for coord-backup: the
+# restore reuses coord/backup.py's restic seam, which never puts a secret in
+# argv (argv is world-readable in /proc), and coord/dr_verify.py scrubs every
+# credential value out of anything it logs, persists or alerts. The
+# EnvironmentFile below is the SAME mode-0600 file coord-backup.service reads
+# — there is one set of repository credentials, not two.
+#
+# A systemd *user* unit (mirrors coord-backup.service), Type=oneshot,
+# timer-fired. Install ONLY on the daemon host — the box that owns the store
+# (dellserver in production).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-dr-verify.service deploy/coord-dr-verify.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-dr-verify.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-dr-verify.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# See docs/AGENT_OPERATIONS.md → "Daemon-host unit inventory".
+
+[Unit]
+Description=Prove the off-site coordinator backup actually restores (#3119)
+Documentation=https://github.com/JDonaghy/code-coordinator/issues/3119
+# Not Requires=: a DR verify is worth running even on a host where the push
+# lane is currently broken — that is exactly the state it exists to report.
+After=coord-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/coord dr verify
+# A systemd *user* unit's default PATH does NOT include ~/.local/bin (where
+# the `coord` shim lives), ~/.coord-venv/bin, or wherever restic was
+# installed — the #1831/#2561/#2569 gap. Byte-identical to
+# coord-backup.service's line (same host, same role family): `restic` is
+# expected on /usr/bin or /usr/local/bin, both present below. The parity step
+# additionally spawns a `python -m coord.cli serve` child, which inherits this.
+Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# The same mode-0600 credential file coord-backup.service reads — one set of
+# repository credentials for the lane that writes and the lane that verifies.
+# Optional (leading `-`) on purpose: a missing file then produces coord's own
+# curated "no backup repository configured" refusal in the journal rather than
+# a bare systemd load error.
+EnvironmentFile=-%h/.coord/backup.env
+# A verify is a full download + restore + a daemon boot. Generous, but well
+# below the timer's cadence so a wedged run cannot run into the next fire.
+TimeoutStartSec=3600

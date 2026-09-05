@@ -1149,6 +1149,7 @@ two in sync; `tests/test_deploy_manifest.py` cross-checks it.
 | `coord-release-propagate.timer` | daemon host | **below** |
 | `coord-db-backup.timer` | daemon host | **below** |
 | `coord-backup.timer` | daemon host | `deploy/coord-backup.service` header (#3118) |
+| `coord-dr-verify.timer` | daemon host | `deploy/coord-dr-verify.service` header (#3119) |
 
 Workers (precision, elitebook) run `coord-agent` **only**.
 
@@ -1162,6 +1163,23 @@ Keep both. `coord-backup` additionally needs `restic` installed and a
 mode-0600 `~/.coord/backup.env` holding `COORD_BACKUP_REPOSITORY` and the
 repository password — credentials never live in `coordinator.yml` and are
 never passed on the command line.
+
+**`coord-dr-verify.timer` is the third lane, and the only one that proves
+*recovery* (#3119).** Every 6 h it pulls the newest off-site snapshot back
+down through `coord backup restore --into <scratch>` — the real off-site path,
+credentials included — and runs four checks against it: `integrity_check`,
+per-table row counts against live (a table that is *empty* in the restore
+while live is not fails regardless of tolerance), the restored
+`schema_version` against what the installed `coord` expects, and a throwaway
+`coord serve` booted on an ephemeral port answering `GET /board`. Success is
+quiet; failure alerts through the notifier. Each run writes
+`~/.coord/last_verify.json` — and **a verify that has not run in 12 h is
+itself a failure**: `coord dr status` reports that and exits non-zero without
+needing a run to fail. Set `COORD_DR_VERIFY_MIRROR` to a path another machine
+can read so that machine can run `coord dr status --record <mirror>` when this
+host is the thing that died — an alert originating on the dead host is not an
+alert (2026-08-22). The restore duration in `last_verify.json` is #3117's
+Domain-A RTO input; read it there rather than estimating it.
 
 **Checkable, not just prose (#2098).** `coord doctor` / `coord health` run
 `unit_enablement` (`coord/health/checks/unit_enablement.py`) on every

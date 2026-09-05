@@ -55,6 +55,7 @@ ROLE_UNITS: dict[str, tuple[str, ...]] = {
         "coord-release-propagate.timer",
         "coord-db-backup.timer",
         "coord-backup.timer",
+        "coord-dr-verify.timer",
     ),
 }
 
