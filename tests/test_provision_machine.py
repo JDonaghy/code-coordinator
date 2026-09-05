@@ -316,6 +316,11 @@ class Box:
     state: Path
     settings: Path
     env: dict[str, str]
+    #: Stands in for the host's own ``/usr/bin`` — on PATH *after* the stub
+    #: fleet, so anything written here is reachable only when no stub shadows
+    #: it. Empty by default; a test writes into it to model a host that ships
+    #: a tool of its own. See ``_browser_box``.
+    system: Path
 
     def run(self, *args: str, stdin: str = "", **env: str) -> subprocess.CompletedProcess:
         merged = {**self.env, **env}
@@ -334,7 +339,8 @@ def box(tmp_path: Path) -> Box:
     home = tmp_path / "home"
     binder = tmp_path / "bin"
     state = tmp_path / "state"
-    for d in (home, binder, state):
+    system = tmp_path / "system"
+    for d in (home, binder, state, system):
         d.mkdir(parents=True)
     log = tmp_path / "invocations.log"
     log.touch()
@@ -380,7 +386,14 @@ def box(tmp_path: Path) -> Box:
 
     env = {
         "HOME": str(home),
-        "PATH": f"{binder}:/usr/local/bin:/usr/bin:/bin",
+        # The real /usr/local/bin:/usr/bin:/bin have to stay on the end:
+        # python3 must be the genuine interpreter (below), and the script
+        # leans on coreutils throughout. That means every name the stub fleet
+        # does NOT shadow falls through to whatever this host happens to have
+        # installed — so a test that needs a tool to be *absent* must shadow
+        # it explicitly rather than assume. `system` sits between the two as
+        # a controllable stand-in for that fall-through.
+        "PATH": f"{binder}:{system}:/usr/local/bin:/usr/bin:/bin",
         "COORD_STUB_LOG": str(log),
         "COORD_STUB_STATE": str(state),
         "COORD_STUB_BIN": str(binder),
@@ -392,7 +405,8 @@ def box(tmp_path: Path) -> Box:
         "LANG": "C.UTF-8",
     }
     (tmp_path / "ssd").mkdir()
-    return Box(home=home, bin=binder, log=log, state=state, settings=settings, env=env)
+    return Box(home=home, bin=binder, log=log, state=state, settings=settings,
+               env=env, system=system)
 
 
 def _ok(result: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
@@ -1012,18 +1026,47 @@ exit 1
 """
 
 
+# Every name `browser_works()` tries, in its order. Pinned against the script
+# by the test below, because this harness has to shadow ALL of them.
+#
+# It used to shadow only `chromium` (by deleting the working stub), which is
+# true of a fleet box and false of a GitHub Actions ubuntu-24.04 runner: that
+# image preinstalls BOTH Google Chrome and Chromium into /usr/bin, which this
+# fixture's PATH deliberately still reaches (python3 must be real). So the
+# probe found a genuine, genuinely-working browser, `browser_works` returned 0
+# for real, and the two "there is no browser here" tests below inverted —
+# green on every fleet machine and on a laptop, red in every full-suite CI job.
+BROWSER_PROBE_NAMES = ("chromium", "google-chrome", "google-chrome-stable",
+                       "chromium-browser")
+
+# On PATH, executable, and no more a browser than a missing file is. Shadowing
+# with this rather than deleting is what makes "absent" mean absent regardless
+# of what the host underneath has installed.
+_NOT_A_BROWSER = "exit 127\n"
+
+
+def test_the_harness_pins_every_browser_name_the_script_probes():
+    """If `browser_works()` grows a candidate, `_browser_box` must shadow it
+    too — otherwise the host's own copy of that browser silently answers the
+    probe and the negative tests below stop testing anything."""
+    m = re.search(r"^browser_works\(\)\s*\{.*?^\s*for bin in ([^;]+); do",
+                  SCRIPT.read_text(encoding="utf-8"), re.M | re.S)
+    assert m, "could not find browser_works()'s candidate loop"
+    assert tuple(m.group(1).split()) == BROWSER_PROBE_NAMES
+
+
 def _browser_box(box: Box, *, stub: bool, snap: str | None) -> Box:
     """Reshape the stub fleet for the browser capability. The default fleet has
-    a working `chromium`, which is the case that never needed fixing."""
-    (box.bin / "chromium").unlink()
+    a working `chromium`, which is the case that never needed fixing.
+
+    Shadows every candidate in `BROWSER_PROBE_NAMES` so "no working browser"
+    holds on a host that ships one of its own (see that constant)."""
+    for name in BROWSER_PROBE_NAMES:
+        _restub(box, name, _NOT_A_BROWSER)
     if stub:
-        path = box.bin / "chromium-browser"
-        path.write_text(f"#!/usr/bin/env bash\n{_LOGGER}{NOBLE_CHROMIUM_STUB}", encoding="utf-8")
-        path.chmod(0o755)
+        _restub(box, "chromium-browser", NOBLE_CHROMIUM_STUB)
     if snap is not None:
-        path = box.bin / "snap"
-        path.write_text(f"#!/usr/bin/env bash\n{_LOGGER}{snap}", encoding="utf-8")
-        path.chmod(0o755)
+        _restub(box, "snap", snap)
     return box
 
 
@@ -1079,6 +1122,36 @@ def test_a_working_browser_is_left_alone_and_the_stub_never_shadows_it(box: Box)
     out = _ok(box.run("--role", "worker", *BROWSER_ARGS)).stdout
     assert "NOCHANGE: [toolchains] browser: chromium" in out, out
     assert "snap" not in box.invocations
+
+
+@pytest.mark.parametrize("preinstalled", BROWSER_PROBE_NAMES)
+def test_a_browser_the_host_ships_cannot_leak_into_the_no_browser_case(
+    box: Box, preinstalled: str
+):
+    """The harness's own isolation, as a test — this is the CI failure that
+    made it necessary.
+
+    `box.system` models the host's `/usr/bin`: on PATH, but behind the stub
+    fleet. A GitHub Actions ubuntu-24.04 runner ships a working Google Chrome
+    AND Chromium there, so before `_browser_box` shadowed every candidate the
+    negative browser tests quietly asserted the opposite of what they read —
+    passing on a fleet box, failing in CI. Parametrised over every candidate
+    so no single name can regress the shadowing on its own."""
+    host_browser = box.system / preinstalled
+    host_browser.write_text(
+        "#!/usr/bin/env bash\nprintf 'Chromium 151.0.7922.0\\n'\nexit 0\n", encoding="utf-8"
+    )
+    host_browser.chmod(0o755)
+
+    _browser_box(box, stub=True, snap="exit 0\n")
+    result = box.run("--role", "worker", *BROWSER_ARGS)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "no browser answers --version" in combined, combined
+    # The host's browser must not have been consulted, let alone believed.
+    assert "151.0.7922.0" not in combined, combined
+    assert "NOCHANGE: [toolchains] browser" not in combined, combined
 
 
 # ── A failed install reaches the operator as THIS script's message ───────────
