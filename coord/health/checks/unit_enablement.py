@@ -59,8 +59,9 @@ from coord.deploy_manifest import (
     units_for_role,
 )
 from coord.health.checks.unit_drift import (
+    _KNOWN_PLACEHOLDER_VALUES,
+    _PLACEHOLDER_RE,
     _is_templated,
-    _templated_remedy,
     resolve_reference,
     resolve_systemd_user_dir,
 )
@@ -89,6 +90,51 @@ from coord.health.registry import check
 _SYSTEMCTL_TIMEOUT = 5.0
 
 _ENABLED_STATES = {"enabled", "enabled-runtime", "alias"}
+
+
+def _missing_templated_unit_remedy(
+    deploy_text: str, deploy_path, installed_path, name: str
+) -> str:
+    """The fix line for a required-but-never-installed *templated* manifest
+    unit — today, only `coord-agent.service` (#1928's `<MACHINE_NAME>`/
+    `<PORT>`) — as part of #3128.
+
+    A sibling of `unit_drift._templated_remedy`, not a call to it: that
+    function's known-placeholder branch ends in `systemctl --user restart
+    {service}` (with the `.timer`/`.service` suffix stripped to the bare
+    service stem), which is correct for *its* caller — a unit that is
+    already installed and enabled, where only the *content* drifted, so a
+    restart is all that is needed to pick up the render. Here the unit was
+    never installed at all: it is not loaded, let alone enabled, so a
+    `restart` is not guaranteed to start it and — even where it does — never
+    enables it, leaving the unit running-but-not-enabled and silently
+    reproducing the exact "disabled unit produces zero evidence" failure
+    shape (#2098) this whole check exists to catch. The command chain here
+    ends in `enable --now {name}` instead — targeting *name* in full,
+    suffix included, the same reasoning as the non-templated branch below
+    (stripping `.timer` would silently enable `coord-backup.service` instead
+    of `coord-backup.timer`).
+
+    The whole point of this fix line is that an operator can copy-paste it
+    verbatim into a shell, so — unlike the previous shape of this remedy —
+    nothing here is appended after a trailing `#` comment: every step that
+    must actually run is part of the `&&` chain.
+    """
+    names = sorted(set(_PLACEHOLDER_RE.findall(deploy_text)))
+    if names and all(n in _KNOWN_PLACEHOLDER_VALUES for n in names):
+        sed_args = " ".join(f'-e "s/<{n}>/{_KNOWN_PLACEHOLDER_VALUES[n]}/"' for n in names)
+        return (
+            f"{deploy_path} is a TEMPLATE — do not cp it verbatim (#1928). Render "
+            f"it for this host first: sed {sed_args} {deploy_path} > {installed_path} "
+            f"&& systemctl --user daemon-reload && systemctl --user enable --now {name}"
+        )
+    return (
+        f"{deploy_path} is a TEMPLATE ({', '.join(names)} placeholder(s)) — copying "
+        "it verbatim installs those as literal text and the unit will not start. "
+        f"See the install instructions at the top of {deploy_path} (sed substitution "
+        f"or install-agent.sh) to render it for this host, then systemctl --user "
+        f"daemon-reload && systemctl --user enable --now {name}."
+    )
 
 
 def _missing_unit_remedy(name: str, installed_path, reference) -> str:
@@ -122,14 +168,13 @@ def _missing_unit_remedy(name: str, installed_path, reference) -> str:
         )
     # #1928: coord-agent.service is a template (`<MACHINE_NAME>`/`<PORT>`) —
     # a bare `cp` installs the placeholders as literal text and the unit
-    # refuses to start. Reuse unit_drift's own templated-unit remedy instead
-    # of re-deriving "how do you safely install this unit" a second time.
-    # `_templated_remedy`'s own convention strips the suffix (it emits
-    # `restart`, not `enable --now`) — only reachable here for
-    # `coord-agent.service`, which has no timer to conflate the strip with.
+    # refuses to start. `_missing_templated_unit_remedy` is a sibling of
+    # unit_drift's own templated-unit remedy (see its docstring for why it
+    # is not a call to that function) — only reachable here for
+    # `coord-agent.service`, which has no timer to conflate the `enable
+    # --now` target with.
     if _is_templated(deploy_text):
-        base = _templated_remedy(deploy_text, deploy_path, installed_path, name.rsplit(".", 1)[0])
-        return f"{base}   # not currently installed on this host — also needs enable --now {name}"
+        return _missing_templated_unit_remedy(deploy_text, deploy_path, installed_path, name)
     return (
         f"cp {deploy_path} {installed_path} && systemctl --user daemon-reload "
         f"&& systemctl --user enable --now {name}   # reference: {reference.label}"
