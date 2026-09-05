@@ -43,6 +43,7 @@ from coord.drive_queue import (
     build_board_view,
     detect_unreachable_waits,
     compute_leg_counts,
+    dispatch_type_for_labels,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -57,7 +58,7 @@ from coord.drive_queue import (
     unreachable_wait_alert,
     validate_enqueue,
 )
-from coord.models import MERGE_LANDED_MARKER
+from coord.models import EPIC_DECOMPOSE_TYPE, MERGE_LANDED_MARKER
 
 REPO = "claude-coordinator"
 
@@ -71,6 +72,34 @@ def entry(issue: int, **kw) -> QueueEntry:
     base: dict = {"repo": REPO, "issue": issue, "position": issue}
     base.update(kw)
     return QueueEntry(**base)
+
+
+class TestDispatchTypeForLabels:
+    """#3132: `coord drive-queue add <repo> <epic>` must select
+    `type="epic-decompose"` for an epic-labelled issue without the operator
+    passing a flag — this is the pure decision `coord.drive.decide()`'s WORK
+    stage consults (via `state.issue_labels`, already on hand off `/board`,
+    no extra I/O) every tick, so the selection is never stale relative to
+    the issue's current labels."""
+
+    def test_epic_label_selects_epic_decompose(self) -> None:
+        assert dispatch_type_for_labels(["epic"]) == EPIC_DECOMPOSE_TYPE
+
+    def test_epic_label_among_others_still_selects_epic_decompose(self) -> None:
+        assert dispatch_type_for_labels(["bug", "epic", "priority:high"]) == (
+            EPIC_DECOMPOSE_TYPE
+        )
+
+    def test_ordinary_issue_selects_work(self) -> None:
+        assert dispatch_type_for_labels(["bug"]) == "work"
+
+    def test_no_labels_selects_work(self) -> None:
+        assert dispatch_type_for_labels([]) == "work"
+
+    def test_none_labels_selects_work(self) -> None:
+        """Fail-soft: an issue this driver knows nothing about (labels not
+        yet resolved) must never accidentally read as an epic."""
+        assert dispatch_type_for_labels(None) == "work"
 
 
 def board(

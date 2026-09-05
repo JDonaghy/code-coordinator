@@ -4625,6 +4625,7 @@ def _dispatch_headless(
     issue_title: str,
     driven_by: str | None = None,
     provider: str | None = None,
+    dispatch_type: str | None = None,
 ) -> None:
     """The plain (non --interactive) HTTP-dispatch path: build a Proposal,
     run the claim + dependency-freshness checks, POST to the agent server,
@@ -4640,6 +4641,18 @@ def _dispatch_headless(
     pre-#1707 behaviour exactly: ``Proposal.provider`` stays ``None`` and
     ``coord.dispatch.dispatch()``'s spec → repo → providers.default
     precedence chain falls through to the repo/global default unchanged.
+
+    ``dispatch_type`` (#3132): the raw ``--type`` flag value, already
+    validated by ``assign()``'s ``click.Choice(["work", "epic-decompose"])``
+    and against being combined with ``--interactive``/``--plan-only``/any
+    ``--*-of`` flavour before this function runs (mirroring how *provider*
+    is pre-validated above). ``None`` (the default — no flag given, or
+    ``coord drive``'s own work-stage dispatch for a non-epic issue)
+    reproduces pre-#3132 behaviour exactly: the type is ``"plan"`` or
+    ``"work"`` per *plan_only*, same as before this parameter existed.
+    ``coord.drive.decide()``'s WORK stage is the other caller that ever
+    passes something other than ``None`` here — see
+    ``coord.drive_queue.dispatch_type_for_labels``.
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import (  # noqa: PLC0415
@@ -4715,7 +4728,7 @@ def _dispatch_headless(
         rationale="manual assignment via coord assign",
         briefing=briefing,
         model=resolved_model,
-        type="plan" if effective_plan_only else "work",
+        type="plan" if effective_plan_only else (dispatch_type or "work"),
         required_gates=resolved_gates,
         issue_labels=issue_labels,
         driven_by=driven_by,
@@ -4730,6 +4743,11 @@ def _dispatch_headless(
             click.echo("  mode: plan-only (dispatch.require_plan=true; use --no-plan to override)")
         else:
             click.echo("  mode: plan-only (read-only, no worktree)")
+    elif dispatch_type and dispatch_type != "work":
+        # #3132: state the non-default type explicitly — the same
+        # "don't make the operator infer it from output" posture the
+        # model/provider echoes below take.
+        click.echo(f"  type: {dispatch_type}")
     if resolved_model:
         # #1454: state *why* this model was picked — a silent fall-through
         # to models.default (stale/missing label) used to be indistinguishable

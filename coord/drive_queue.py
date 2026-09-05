@@ -103,7 +103,44 @@ from coord.merge_queue import (
     is_ci_unreadable_reason,
     is_stale_smoke_reason,
 )
-from coord.models import is_merge_landed_reason, is_policy_refusal_reason
+from coord.milestone_order import TRACKING_ISSUE_LABEL
+from coord.models import EPIC_DECOMPOSE_TYPE, is_merge_landed_reason, is_policy_refusal_reason
+
+# ── dispatch type selection (#3132) ─────────────────────────────────────────
+#
+# An epic/tracking issue (``TRACKING_ISSUE_LABEL``) dispatched as ordinary
+# ``type="work"`` auto-closes on merge — the exact #1314 shape
+# (``coord.dispatch.enforce_epic_dispatch_guard``) that left every one of
+# quadraui#783-788's epics permanently ``blocked`` in this very queue: the
+# guard correctly refuses the dispatch, and nothing upstream of it ever
+# picked a different type to retry with. This is that "something": given the
+# issue's own labels (already on hand — see ``coord.drive_state.IssueState.
+# issue_labels``, itself read straight off the cached `/board` payload, no
+# extra I/O), decide the type the WORK stage should dispatch with, so an
+# operator queuing an epic never has to remember a flag `coord drive-queue
+# add` doesn't even expose.
+
+
+def dispatch_type_for_labels(issue_labels: Iterable[str] | None) -> str:
+    """The WORK-stage dispatch ``type`` for an issue carrying *issue_labels*.
+
+    :data:`coord.models.EPIC_DECOMPOSE_TYPE` when the issue carries
+    ``TRACKING_ISSUE_LABEL`` (an epic) — that type is WORK_LIKE but
+    deliberately NOT in ``CLOSES_ISSUE_TYPES`` (see ``coord/models.py``), so
+    dispatching it never trips the #1314 guard and never auto-closes the
+    epic on merge. Plain ``"work"`` for everything else — the overwhelming
+    majority of issues, and the pre-#3132 behaviour, unchanged.
+
+    Pure and total: never raises, never does I/O.  ``None``/empty
+    *issue_labels* reads the same as "no epic label" — a fail-soft default,
+    not a special case, since that's already what "issue has no labels at
+    all" means for every other label-driven decision in this codebase (see
+    ``coord.models.test_mode_from_labels``, the same posture).
+    """
+    if issue_labels and TRACKING_ISSUE_LABEL in issue_labels:
+        return EPIC_DECOMPOSE_TYPE
+    return "work"
+
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
