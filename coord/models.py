@@ -359,9 +359,25 @@ class Machine:
 # `tests/acceptance/ms-NN/**` and needs a `skipped` test verdict — but was
 # never added when mock-author landed, so every per-issue JIT acceptance
 # slice silently stalled before review/merge with no error (confirmed live,
-# #1141). Keep this set — not a bare string check — as the single source of
-# truth so a future work-like type only needs to be added here.
-WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author"})
+# #1141). "epic-decompose" (#3132) is also structurally identical — it opens
+# a real PR (the first slice's implementation) that must reach review/merge
+# like any other work — but unlike "work" its ``issue_number`` is the
+# epic/tracking issue itself, never something that PR resolves (see
+# CLOSES_ISSUE_TYPES below). Keep this set — not a bare string check — as
+# the single source of truth so a future work-like type only needs to be
+# added here.
+WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author", "epic-decompose"})
+
+# #3132: the dispatch type for handing an epic/tracking issue to a worker for
+# IN-PICKUP decomposition — file every child issue, queue the first batch
+# (see docstring on ``coord.dispatch.epic_decompose_briefing``), implement
+# only the first slice, and leave the epic open (its checklist, not this
+# PR, is what closes it). Named here — not just inlined as a string literal
+# — so every membership check below (``WORK_LIKE_TYPES``, deliberately NOT
+# ``CLOSES_ISSUE_TYPES``) and every other module that dispatches or guards
+# this type (``coord.dispatch``, ``coord.drive``, ``coord.drive_queue``,
+# ``coord.agent.WRITE_CAPABLE_SPEC_TYPES``) reference the exact same string.
+EPIC_DECOMPOSE_TYPE = "epic-decompose"
 
 # #1175: subset of WORK_LIKE_TYPES whose entire job is writing under a
 # repo's sealed acceptance paths (docs/ORACLE_LOOP.md — today just
@@ -414,6 +430,16 @@ SEALED_MANIFEST_FILENAME = "manifest.yml"
 # per-slice issue), never something the contract/fixture PR resolves.
 # Verified against confirmed-live behaviour (PR #1139 correctly used
 # "Refs #1117"), not merely assumed.
+#
+# #3132: "epic-decompose" stays OUT of this set for the identical reason —
+# its ``issue_number`` IS the epic/tracking issue by design (that's the
+# entire point of the type: hand the epic itself to a worker for in-pickup
+# decomposition), and closing it the moment the first slice merges is
+# precisely the bug this exclusion prevents (the epic would read "done"
+# while every remaining child issue sits unfiled — the same shape
+# claude-coordinator#1041 hit for "work"). See
+# ``coord.dispatch.enforce_epic_dispatch_guard`` for the dispatch-time half
+# of this guarantee.
 CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 
 # #1142: the assignment `type` `coord pr` gives its PR-opening helper session
@@ -481,21 +507,32 @@ def trust_issue_closed_for(assignment_type: str | None) -> bool:
     """Whether :func:`coord.github_ops.work_is_terminal` may trust
     ``issue_is_closed`` for a row of *assignment_type* (#2639).
 
-    ``False`` only for :data:`SEALED_PATH_AUTHOR_TYPES` (``test-author``/
-    ``mock-author``), whose ``issue_number`` is always the milestone's
-    *tracking* issue — never this row's own deliverable (the per-slice issue
-    lives in ``for_issue_number``) — so a tracking epic that's closed for
-    most of a milestone's life must not read as "this row is done".
+    ``False`` for any :data:`WORK_LIKE_TYPES` member whose ``issue_number``
+    is NOT its own deliverable — i.e. everything in ``WORK_LIKE_TYPES -
+    CLOSES_ISSUE_TYPES`` (``test-author``/``mock-author``, whose
+    ``issue_number`` is always the milestone's *tracking* issue — the
+    per-slice issue lives in ``for_issue_number``; and, since #3132,
+    ``epic-decompose``, whose ``issue_number`` is the epic itself, deliberately
+    never closed by its own merge — see :data:`CLOSES_ISSUE_TYPES`). A
+    tracking/epic issue can stay open (or closed) for reasons with nothing to
+    do with THIS row's own landed-ness, so trusting ``issue_is_closed`` here
+    would report every such row "terminal" — or never terminal — regardless
+    of whether this row's own branch ever landed.
 
     ``True`` for everything else, including :data:`CLOSES_ISSUE_TYPES`
     (``work``, whose ``issue_number`` genuinely is its own deliverable — the
-    #522 flood guard requires this) and interactive ``--merge-of`` sessions
-    (``type="conflict-fix"`` with no sealed-path semantics). Within
-    :data:`WORK_LIKE_TYPES` ∪ interactive-merge-session, ``WORK_LIKE_TYPES -
-    SEALED_PATH_AUTHOR_TYPES == CLOSES_ISSUE_TYPES``, so this reduces to a
-    single "trust it unless sealed-path-authoring" rule — kept as one shared
-    helper (rather than re-deriving ``type not in SEALED_PATH_AUTHOR_TYPES``
-    at each ``work_is_terminal`` call site) so the two families can't drift.
+    #522 flood guard requires this), any assignment type outside
+    :data:`WORK_LIKE_TYPES` entirely (``review``, ``smoke``, ...), and
+    interactive ``--merge-of`` sessions (``type="conflict-fix"`` with no
+    tracking-issue semantics) — matching the pre-#3132 behaviour for every
+    type that existed before it. Derived from ``CLOSES_ISSUE_TYPES``
+    membership (rather than re-deriving ``type not in
+    SEALED_PATH_AUTHOR_TYPES`` at each call site, which silently assumed
+    ``WORK_LIKE_TYPES - SEALED_PATH_AUTHOR_TYPES == CLOSES_ISSUE_TYPES`` — an
+    invariant #3132 broke by adding a third WORK_LIKE_TYPES member that is
+    neither sealed-path-authoring nor closes-issue) so a future work-like
+    type only needs to pick a side of ``CLOSES_ISSUE_TYPES``, never touch
+    this function.
 
     Every call site that can process a :data:`WORK_LIKE_TYPES` row (or an
     interactive merge session) should pass
@@ -503,7 +540,9 @@ def trust_issue_closed_for(assignment_type: str | None) -> bool:
     :func:`coord.github_ops.work_is_terminal` rather than relying on that
     kwarg's ``True`` default.
     """
-    return assignment_type not in SEALED_PATH_AUTHOR_TYPES
+    if assignment_type in WORK_LIKE_TYPES:
+        return assignment_type in CLOSES_ISSUE_TYPES
+    return True
 
 # #685: the per-issue Test-stage POLICY labels, and the one pure function that
 # reads them. ``test-mode:auto`` → the headless Test stage auto-dispatches

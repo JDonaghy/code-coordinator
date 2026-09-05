@@ -5293,6 +5293,12 @@ def _user_message_line(text: str) -> bytes:
 # whole job is to mutate GitHub (`coord issue create` / `coord milestone
 # create`/`add-child`) and the drive queue (`coord drive-queue add`), the
 # same "no worktree, but real mutation" shape ``milestone-chat`` has above.
+# ``epic-decompose`` (#3132, ``coord.models.EPIC_DECOMPOSE_TYPE``) gets a
+# real worktree + branch and commits/pushes the first slice's implementation
+# — same mutation shape as ``work``/``mock-author`` — AND files child issues
+# / queues them (`coord issue create`, `coord milestone add-child`, `coord
+# drive-queue add`), the same GitHub-mutation shape ``decomposition-chat``
+# has, so it belongs here on both counts.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
@@ -5303,6 +5309,7 @@ WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "mock-author",
     "test-author",
     "pr-helper",
+    "epic-decompose",
 })
 
 

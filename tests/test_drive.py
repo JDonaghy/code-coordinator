@@ -415,6 +415,29 @@ def test_dispatch_work_passes_model_and_briefing_file():
     )
 
 
+def test_epic_labelled_issue_dispatches_with_epic_decompose_type():
+    """#3132: `state.issue_labels` carrying 'epic' must make the WORK stage
+    dispatch `--type epic-decompose` instead of the ordinary type="work"
+    default — otherwise `coord drive-queue add <repo> <epic>` still hits
+    the #1314 guard exactly as before this issue, since decide() is what
+    actually builds the `coord assign` argv the tick launches."""
+    action = step(state(issue_labels=("epic",)))
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+        "--type", "epic-decompose",
+    )
+
+
+def test_non_epic_labels_dispatch_plain_work():
+    action = step(state(issue_labels=("bug", "priority:high")))
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+
+
 def test_plan_flag_dispatches_a_plan_only_assignment_first():
     action = step(state(), DriveOptions(machine="precision", do_plan=True))
     assert action.command == (

@@ -1022,6 +1022,31 @@ def approve(
 )
 
 
+@click.option(
+    "--type",
+    "cli_dispatch_type",
+    default=None,
+    type=click.Choice(["work", "epic-decompose"]),
+    help=(
+        "#3132: override the headless dispatch type — default 'work'. "
+        "'epic-decompose' hands ISSUE (which must carry the 'epic' label) "
+        "to a worker for in-pickup decomposition instead of ordinary "
+        "closes-on-merge work: file every child issue, queue the first "
+        "batch, implement only the first slice, and leave the epic open "
+        "(coord.dispatch.epic_decompose_briefing states the full contract). "
+        "Unlike 'work', merging the resulting PR never auto-closes ISSUE "
+        "(coord.models.CLOSES_ISSUE_TYPES) — that is the entire point; see "
+        "coord.dispatch.enforce_epic_dispatch_guard for why plain 'work' "
+        "against an epic is refused instead. 'mock-author'/'test-author' "
+        "are NOT valid here — they have their own dedicated `coord "
+        "acceptance mock`/`coord acceptance author` commands. Not supported "
+        "with --interactive, --plan-only, or any of the other dispatch-"
+        "shape flags above (--review-of, --fix-of, ...) — those already "
+        "pick their own type."
+    ),
+)
+
+
 def assign(
     machine: str,
     repo: str,
@@ -1053,6 +1078,7 @@ def assign(
     audit_of: str | None,
     milestone_chat_of: str | None,
     chat_add_child: str | None,
+    cli_dispatch_type: str | None,
 ) -> None:
     cfg = _load_config(config_path)
 
@@ -1155,6 +1181,38 @@ def assign(
             err=True,
         )
         sys.exit(2)
+
+    # #3132: --type only has meaning on the plain headless dispatch shape —
+    # every other flavour (interactive, plan-only, or one of the --*-of
+    # dispatch shapes) already picks its own type. Checked here, before the
+    # issue-title fetch below, same reasoning as --provider's --interactive
+    # check just above: an unsupported combination must fail before any
+    # network call, not after. The individual flags (not yet folded into
+    # `_set_flavours`, computed further down after the fetch) are checked
+    # directly — same conflict, just read from the raw parameters.
+    if cli_dispatch_type is not None:
+        _early_conflicts = [
+            name for name, on in (
+                ("--interactive", interactive),
+                ("--plan-only", plan_only),
+                ("--review-of", review_of is not None),
+                ("--fix-of", fix_of is not None),
+                ("--troubleshoot", troubleshoot),
+                ("--chat", chat),
+                ("--rework-of", rework_of is not None),
+                ("--smoke-of", smoke_of is not None),
+                ("--merge-of", merge_of is not None),
+                ("--audit-of", audit_of is not None),
+                ("--milestone-chat-of", milestone_chat_of is not None),
+            ) if on
+        ]
+        if _early_conflicts:
+            click.echo(
+                f"error: --type is not supported with {', '.join(_early_conflicts)} "
+                "(that flag already selects a dispatch type/shape of its own)",
+                err=True,
+            )
+            sys.exit(2)
 
     # #2086: fails fast, before the (harmless, read-only) issue-title fetch
     # below — see _require_interactive_tty's docstring for the full
@@ -1427,6 +1485,7 @@ def assign(
         force=force, no_pull=no_pull, skip_freshness=skip_freshness,
         cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
         issue_data=issue_data, issue_title=issue_title, driven_by=driven_by,
+        dispatch_type=cli_dispatch_type,
     )
 
 

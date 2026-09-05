@@ -111,6 +111,7 @@ from coord.interactive import (
     tmux_session_alive,
 )
 from coord.dead_end import DeadEnd, detect_dead_end
+from coord.drive_queue import dispatch_type_for_labels
 from coord.failure_class import (
     classify_failure,
     environmental_backoff_secs,
@@ -2431,6 +2432,17 @@ def _dispatch_work_stage(
         args += ["--model", opts.model]
     if opts.briefing_file:
         args += ["--briefing-file", opts.briefing_file]
+    # #3132: an epic/tracking issue gets `type="epic-decompose"`, never the
+    # default `type="work"` — the latter is exactly the shape #1314's guard
+    # refuses (auto-closing the epic on merge while its real children stay
+    # open), which is why `coord drive-queue add <repo> <epic>` used to sit
+    # permanently `blocked` with nothing upstream ever picking a different
+    # type to retry with. `state.issue_labels` is already on hand — read off
+    # the cached `/board` payload by `coord.drive_state.project` — no extra
+    # I/O here. See `coord.drive_queue.dispatch_type_for_labels`.
+    dispatch_type = dispatch_type_for_labels(state.issue_labels)
+    if dispatch_type != "work":
+        args += ["--type", dispatch_type]
     return Action(
         kind=RUN,
         label=f"WORK: coord assign {machine} {state.repo} {state.issue}",

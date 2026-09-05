@@ -631,6 +631,18 @@ class TestProcess:
         merged = [e for e in events if e.kind == "merged"]
         assert merged and "left open" in merged[0].message
 
+    def test_epic_decompose_merge_does_not_close_the_epic(self) -> None:
+        # #3132 acceptance: merging an "epic-decompose" entry's PR must
+        # leave the epic OPEN — asserted here against `process()`'s actual
+        # behavior (the `close_issue` call it does or doesn't make), not
+        # just the PR body text a separate test already covers above.
+        items = [_q("a", assignment_type="epic-decompose")]
+        events = process(items, gh := FakeGh())
+        assert items[0].state == MERGED
+        assert gh.close_calls == []
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "left open" in merged[0].message
+
     def test_successful_merge_dismisses_the_drive_escalation(self, coord_db) -> None:
         # #1767: a merge landing through `coord merge` is exactly the kind
         # of resolution that should clear a stale drive escalation for the
@@ -713,6 +725,17 @@ class TestProcess:
         entry = _q("a", assignment_type="work")
         body = _briefing_body(entry)
         assert body.startswith("Closes #1\n\n")
+
+    def test_briefing_body_uses_refs_for_epic_decompose(self) -> None:
+        # #3132: like mock-author, epic-decompose's issue_number is the
+        # epic itself — the fallback create_pr body must use the
+        # non-closing "Refs #N", never "Closes #N".
+        from coord.merge_queue import _briefing_body
+
+        entry = _q("a", assignment_type="epic-decompose")
+        body = _briefing_body(entry)
+        assert "Refs #1" in body
+        assert "Closes #1" not in body
 
     def test_conflict_does_not_halt_other_repo_groups(self) -> None:
         """A conflict in one (repo, target) group must not touch other groups."""
