@@ -1875,6 +1875,18 @@ def build_app(
         entirely against a new agent, both work.  A protected entry is
         counted as ``kept`` in the response; the return shape is
         unchanged.
+
+        #3145: ``clean_worktrees`` can run a per-worktree pre-stash
+        ``build_command`` (``_stash_artifacts`` -> ``_run_pre_stash_build``,
+        ``coord/agent.py``) with up to a 600s ``subprocess.run`` timeout
+        *per worktree*. This handler is `async def`, so Starlette does not
+        thread it automatically — calling the synchronous method inline
+        here blocked the whole uvicorn event loop (every ``/health``,
+        ``/assign``, ``/status`` on this agent) for up to 600s, which is
+        exactly what happened on dellserver on 2026-09-05 (616s with zero
+        served requests). Same fix as ``health``/``restart_services``/
+        ``graph_fix``/``drive_queue_reconcile`` above: hand it to a worker
+        thread and await it instead of calling it inline.
         """
         body: dict = {}
         try:
@@ -1892,7 +1904,9 @@ def build_app(
             protect = [str(x) for x in raw_protect if isinstance(x, str)]
         else:
             protect = None
-        result = server.clean_worktrees(recent_secs=recent_secs, protect=protect)
+        result = await asyncio.to_thread(
+            server.clean_worktrees, recent_secs=recent_secs, protect=protect
+        )
         return JSONResponse(result)
 
     async def restart(request: Request) -> JSONResponse:
