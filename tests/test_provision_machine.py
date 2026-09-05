@@ -14,14 +14,20 @@ before the slow phases", "no credential reaches a log or a non-0600 file",
 being restated as a unit test against an extracted helper.
 
 What a stub fleet structurally cannot answer is "do these package names
-resolve on the OS this targets?" — a stubbed ``apt-get`` says yes to
-everything. ``scripts/verify-provision-noble.sh`` answers that half against a
-real Ubuntu 24.04 root filesystem with no stubs at all (and found the #1678
-browser false green that ``test_a_chromium_browser_that_is_only_a_name_on_path
-_is_not_a_browser`` below now pins). What neither can reach is systemd, a real
-``tailscale up``/``gh auth login``, and a live agent taking a dispatch: that is
-still the throwaway-VM run the issue asks for, and it is in the PR's
-SMOKE_TESTS block, not here.
+resolve on the OS this targets?" and "does the thing the units start actually
+answer?" — a stubbed ``apt-get`` says yes to everything and a stubbed ``curl``
+invents a ``/health``. ``scripts/verify-provision-noble.sh`` answers those
+against a real Ubuntu 24.04 root filesystem with no stubs at all: real
+packages, a real PyPI venv, a real ``coord agent`` answering ``/health`` and a
+real ``coord serve`` answering ``/board`` on the real default ports inside a
+private network namespace, and every daemon unit rendered and parsed by
+noble's own ``systemd-analyze``. (Its first run found the #1678 browser false
+green that ``test_a_chromium_browser_that_is_only_a_name_on_path_is_not_a_browser``
+below now pins.) What neither can reach is systemd as PID 1 — ``systemctl
+--user enable --now``, linger, ``snap install`` — nor a real ``tailscale
+up``/``gh auth login``, nor a live agent taking a dispatch: that is still the
+throwaway-VM run the issue asks for, and it is in the PR's SMOKE_TESTS block,
+not here.
 
 The daemon-unit phase is the exception that proves the rule: it runs the
 **real** ``coord.deploy_manifest`` / ``coord.deploy_units`` /
@@ -210,9 +216,11 @@ exit 0
 def _install_agent_stub(real_python: str) -> str:
     """A stand-in for ``install-agent.sh``: the venv + the agent unit.
 
-    Faithful to the two things the real one guarantees and this script relies
-    on — an executable ``$VENV/bin/coord`` that answers ``coord version``, and
-    an installed+enabled ``coord-agent.service`` — and to nothing else.
+    Faithful to the three things the real one guarantees and this script
+    relies on — an executable ``$VENV/bin/coord`` that answers ``coord
+    version``, the ``~/.local/bin/coord`` shim (#2936) that half the packaged
+    units ``ExecStart``, and an installed+enabled ``coord-agent.service`` —
+    and to nothing else.
     ``COORD_STUB_INSTALL_AGENT_FAIL_ONCE`` makes the first invocation die
     partway (after creating a *broken* venv directory), which is the #2911
     shape the resumability test drives.
@@ -237,6 +245,9 @@ WRAP
 chmod +x "$venv/bin/python"
 printf '[Service]\\nExecStart=%s/bin/coord agent\\n' "$venv" > "$units/coord-agent.service"
 : > "$COORD_STUB_STATE/units/coord-agent"
+shim="${{COORD_PROVISION_LOCAL_BIN:-$HOME/.local/bin}}"
+mkdir -p "$shim"
+ln -sf "$venv/bin/coord" "$shim/coord"
 exit 0
 """
 
@@ -502,6 +513,55 @@ def test_server_installs_exactly_the_manifests_units_and_confirms_each_enabled(b
     backup_env = box.home / ".coord" / "backup.env"
     assert (box.home / ".coord" / "role").read_text().strip() == "daemon"
     assert backup_env.exists() or "backup.env" in out
+
+
+def test_every_installed_unit_has_something_to_run(box: Box):
+    """An `enabled` timer whose companion `.service` is missing, or a service
+    whose `ExecStart=` points at a path nothing put there, is the worst shape
+    in this whole script: `systemctl --user is-enabled` says `enabled`, the
+    unit file looks byte-for-byte right, and every fire dies unread in the
+    journal (`Unit not found` / `status=203/EXEC`). That is the #2082 failure
+    class, and on a rebuilt dellserver it means the hourly coord.db snapshot
+    silently never runs.
+
+    Found by tier 3 of scripts/verify-provision-noble.sh, which resolves the
+    same ExecStarts against a real Ubuntu 24.04 rootfs; pinned here so it
+    cannot come back without a stub-speed test failing first.
+    """
+    result = _ok(box.run("--role", "server", *WORKER_ARGS))
+    out = result.stdout + result.stderr   # warn() goes to stderr
+    unit_dir = box.home / ".config/systemd/user"
+
+    for timer in sorted(unit_dir.glob("*.timer")):
+        companion = unit_dir / (timer.name[: -len(".timer")] + ".service")
+        assert companion.exists(), (
+            f"{timer.name} is installed and enabled but {companion.name} — the "
+            f"unit it fires — was never installed, so every fire is a no-op"
+        )
+
+    checked = 0
+    for service in sorted(unit_dir.glob("*.service")):
+        for line in service.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("ExecStart="):
+                continue
+            # systemd's own expansions: %h is the unit owner's home, and a
+            # leading -/+/!/: is a modifier, not part of the path.
+            command = line[len("ExecStart="):].lstrip("-+!:@").split()[0]
+            resolved = Path(command.replace("%h", str(box.home)))
+            checked += 1
+            if resolved.exists():
+                continue
+            # It may be genuinely unresolvable — `coord-web-dist-build.sh` is
+            # in the repo's deploy/ but NOT in the wheel's coord/deploy/, so
+            # no amount of correct installing produces it. What must never
+            # happen is that going unsaid: the run has to name the unit.
+            assert f"{service.name} runs {command}" in out, (
+                f"{service.name}: ExecStart={command} resolves to {resolved}, "
+                f"which this run never created (203/EXEC on every start) — and "
+                f"the run said nothing about it"
+            )
+            assert "203/EXEC" in out, "the warning must say what the symptom looks like"
+    assert checked >= len(list(unit_dir.glob("*.service"))), "no ExecStart was checked"
 
 
 def test_the_script_names_no_units_of_its_own(box: Box):
@@ -928,7 +988,135 @@ def test_a_working_browser_is_left_alone_and_the_stub_never_shadows_it(box: Box)
     assert "snap" not in box.invocations
 
 
+# ── A failed install reaches the operator as THIS script's message ───────────
+#
+# Under `set -euo pipefail` a bare `sudo apt-get install ...` that fails aborts
+# the script instantly with apt's own error and nothing else — no phase name,
+# no "safe to re-run", no hint about which apt source to look at. Every install
+# call is therefore written `cmd || die "..."`. These pin that: the stub fleet's
+# `apt-get` exits 0 for everything by default, so a deliberately failing one is
+# the only way any of these paths is exercised at all.
+
+_FAILING_APT = """
+case "$1" in
+    update) exit 0 ;;
+esac
+printf 'E: Unable to locate package (stub)\\n' >&2
+exit 100
+"""
+
+
+def _restub(box: Box, name: str, body: str) -> None:
+    """Replace one stub in an existing box, keeping the argv logger."""
+    path = box.bin / name
+    path.write_text(f"#!/usr/bin/env bash\n{_LOGGER}{body}", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _real_python3() -> str:
+    import shutil
+
+    found = shutil.which("python3", path="/usr/local/bin:/usr/bin:/bin")
+    assert found, "no system python3 to wrap"
+    return found
+
+
+def test_a_failed_base_package_install_names_the_packages_and_says_re_run(box: Box):
+    """phase_base_packages. The probe that fails here is `python3 -m ensurepip
+    --version` — the #2911 trap itself — so the missing package is python3-venv,
+    the one whose absence bricks the venv layer three phases later."""
+    _restub(box, "python3", f"""
+if [ "$1" = "-m" ] && [ "$2" = "ensurepip" ]; then
+    printf 'No module named ensurepip\\n' >&2
+    exit 1
+fi
+exec {_real_python3()} "$@"
+""")
+    _restub(box, "apt-get", _FAILING_APT)
+
+    result = box.run("--role", "thin-client", "--machine", "testbox",
+                     "--host", "testbox.tail.ts.net")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "apt-get install failed for: python3-venv" in combined, combined
+    assert "safe to re-run from the top" in combined, combined
+    # It must not have carried on into the credential prompts on a box whose
+    # base layer is broken.
+    assert "coord machine doctor" not in box.invocations
+
+
+def test_a_failed_gh_install_names_the_github_cli_source_not_just_apt(box: Box):
+    """phase_cred_tools. gh is installed from a THIRD-PARTY apt source, so
+    "check apt sources" has to point at that source specifically — a stock
+    Ubuntu mirror being fine tells the operator nothing about why this failed."""
+    _restub(box, "gh", 'printf "gh version 2.10.0 (stub)\\n"\nexit 0\n')
+    _restub(box, "apt-get", _FAILING_APT)
+    # The keyring/source-list writes are root-owned paths the transparent
+    # `sudo` stub cannot satisfy in a test HOME; stub the three coreutils they
+    # use so the failure under test is apt's, not a permission error.
+    for tool in ("dd", "tee"):          # these two are piped into
+        _restub(box, tool, "cat >/dev/null 2>&1 || true\nexit 0\n")
+    for tool in ("install", "chmod"):   # these two are not
+        _restub(box, tool, "exit 0\n")
+
+    result = box.run("--role", "worker", *WORKER_ARGS)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "apt-get install gh failed" in combined, combined
+    assert "github-cli apt source" in combined, combined
+
+
+def test_a_failed_gtk_install_is_the_scripts_message_not_a_raw_apt_abort(box: Box):
+    """phase_toolchains, the `gtk` capability."""
+    _restub(box, "pkg-config", "exit 1\n")   # gtk4 is not visible
+    _restub(box, "apt-get", _FAILING_APT)
+
+    result = box.run("--role", "worker", "--machine", "testbox",
+                     "--host", "testbox.tail.ts.net",
+                     "--repos", "api", "--capabilities", "gtk")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "apt-get install libgtk-4-dev failed" in combined, combined
+    assert "safe to re-run from the top" in combined, combined
+
+
+def test_a_failed_snap_install_explains_why_apt_is_not_the_fallback(box: Box):
+    """phase_toolchains, the `browser` capability, on a host that HAS snap.
+    The die text has to carry the noble-specific reason, because the obvious
+    next move — "just apt-get install chromium" — cannot work there (#1678)."""
+    _browser_box(box, stub=True, snap="exit 1\n")   # snapd present but failing
+
+    result = box.run("--role", "worker", *BROWSER_ARGS)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "snap install chromium failed" in combined, combined
+    assert "apt-cache policy chromium" in combined, combined
+    assert "apt-get install" not in box.invocations
+
+
+# ── Argument parsing ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("flag", ["--role", "--machine", "--host",
+                                  "--capabilities", "--repos", "--port"])
+def test_a_value_taking_flag_with_no_value_gets_the_usage_not_a_bash_error(
+    box: Box, flag: str
+):
+    """`shift 2` with one positional left fails outright, and under `set -e`
+    that aborts with bash's own "shift count out of range" — which names
+    neither the flag nor what it wanted."""
+    result = box.run(flag)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert f"{flag} requires a value" in combined, combined
+    assert "shift count out of range" not in combined, combined
+    assert "usage: provision-machine.sh" in combined, combined
+
+
 # ── The real-surface harness (scripts/verify-provision-noble.sh) ─────────────
+
+
+NOBLE_HARNESS = REPO_ROOT / "scripts" / "verify-provision-noble.sh"
 
 
 def test_the_noble_harness_derives_its_inventory_from_the_script_not_a_copy():
@@ -936,16 +1124,57 @@ def test_the_noble_harness_derives_its_inventory_from_the_script_not_a_copy():
     these package names resolve on the OS this targets?" — so it must read the
     package list and the gh floor OUT of provision-machine.sh. A second, hand-
     maintained copy would drift and quietly stop verifying the real thing."""
-    harness = REPO_ROOT / "scripts" / "verify-provision-noble.sh"
-    assert harness.exists() and os.access(harness, os.X_OK)
-    text = harness.read_text(encoding="utf-8")
+    assert NOBLE_HARNESS.exists() and os.access(NOBLE_HARNESS, os.X_OK)
+    text = NOBLE_HARNESS.read_text(encoding="utf-8")
     assert "BASE_REQUIREMENTS" in text and "GH_MIN_VERSION" in text
     assert "provision-machine.sh" in text
-    # #2096: a machine-readable verdict, and an honest statement of the gap it
-    # does not close, so nobody reads a green here as the VM run.
+    # #2096: a machine-readable verdict, so nobody has to eyeball a wall of
+    # output to know whether it passed.
     assert "NOBLE_VERIFY: ok=" in text
-    for uncovered in ("systemd", "tailscale up", "gh auth login", "/health", "/board"):
+
+
+def test_the_noble_harness_actually_drives_the_live_seams_it_names():
+    """Tier 2 exists because the previous version of this harness could only
+    say it did NOT cover /health and /board. Saying so is not covering them:
+    the script must start the real daemons and make the real requests."""
+    text = NOBLE_HARNESS.read_text(encoding="utf-8")
+    for live in ("coord agent", "coord serve", "/health", "/healthz", "/board",
+                 "coord status", "coord machine doctor", "MACHINE_DOCTOR: "):
+        assert live in text, f"tier 2 must actually exercise {live}"
+    # The private netns is the safety property, not a detail: without it this
+    # tier would talk to (and be graded against) the fleet agent on whatever
+    # host the harness is run from.
+    assert "--net" in text and "ip link set lo up" in text
+
+
+def test_the_noble_harness_parses_the_daemon_units_with_real_systemd():
+    """Tier 3. `systemd-analyze verify` is a static parser — it needs no PID 1
+    — so the ten units CAN be checked here even though they cannot be
+    started. Rendering must go through the same call phase_daemon_units uses,
+    or this grades a hand-copied approximation of the shipped units."""
+    text = NOBLE_HARNESS.read_text(encoding="utf-8")
+    assert "systemd-analyze verify" in text
+    for shared in ("units_for_role", "ROLE_DAEMON", "render_unit", "packaged_unit_dir"):
+        assert shared in text, f"tier 3 must render through {shared}"
+    assert "ExecStart" in text
+
+
+def test_the_noble_harness_is_honest_about_what_it_still_cannot_reach():
+    """#2096. Three tiers of real coverage make it MORE tempting, not less, to
+    read a green here as the throwaway-VM run. The header must keep naming the
+    surfaces that are structurally out of a chroot's reach."""
+    text = NOBLE_HARNESS.read_text(encoding="utf-8")
+    for uncovered in ("tailscale up", "gh auth login", "snap", "PID 1",
+                      "necessary, not sufficient"):
         assert uncovered in text, f"the harness must say it cannot cover {uncovered}"
+
+
+def test_the_noble_harness_verifies_the_rootfs_it_downloads():
+    """The tarball is the trust root of every result the harness reports, and
+    it is cached across runs — so "it came over https once" is not enough."""
+    text = NOBLE_HARNESS.read_text(encoding="utf-8")
+    assert "SHA256SUMS" in text and "sha256sum" in text
+    assert "--no-checksum" in text, "there must be a knowing opt-out, not a silent skip"
 
 
 # ── Documentation seam ───────────────────────────────────────────────────────
