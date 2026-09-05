@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from coord.models import WORK_LIKE_TYPES
+
 __all__ = [
     "ReportError",
     "UnknownReportError",
@@ -601,7 +603,13 @@ STALL_QUIET_SECONDS = 2 * 3600.0
 
 # A work-like dispatch is a real attempt at the issue; a review/smoke/plan
 # dispatch is not, and must not count as a fix iteration.
-_WORK_LIKE_TYPES = frozenset({"work", "mock-author", "test-author"})
+#
+# #3132 review: this used to be a locally-hardcoded frozenset independent of
+# `coord.models.WORK_LIKE_TYPES`, which drifted once already (mock-author
+# missing here, per #1141) and would have drifted again the moment
+# `epic-decompose` was added there without a matching update here. Import
+# the canonical set instead of re-declaring it.
+_WORK_LIKE_TYPES = WORK_LIKE_TYPES
 
 
 def fold_issue_activity(

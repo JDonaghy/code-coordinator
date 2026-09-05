@@ -32,6 +32,8 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _WIP_RESCUE_TYPES,
+    _ZERO_COMMIT_TYPES,
     _base_checkout_write_guard_tools,
     _git,
     _sealed_write_guard_tools,
@@ -4219,6 +4221,25 @@ def test_reap_review_type_gets_no_stash_diagnostic(tmp_path: Path) -> None:
     assert final.zero_commit_reason is None
     assert final.stash_unmatched_globs is None
     server.shutdown()
+
+
+class TestEpicDecomposeWorkLikeGating:
+    """#3132 review: ``epic-decompose`` gets a real worktree + branch and
+    commits/pushes the first slice's implementation — the same mutation
+    shape as ``work``/``mock-author`` (see ``WRITE_CAPABLE_SPEC_TYPES``'s
+    comment in coord/agent.py). It must therefore share those types'
+    membership in both zero-commit-detection constants, or a truncated
+    epic-decompose session (killed before it commits anything) reads as an
+    ordinary clean ``done`` instead of the unconfirmed/truncated result it
+    is (the #1534/#2316 incident class), and a dirty epic-decompose
+    worktree gets force-deleted instead of rescued.
+    """
+
+    def test_zero_commit_types_includes_epic_decompose(self) -> None:
+        assert "epic-decompose" in _ZERO_COMMIT_TYPES
+
+    def test_wip_rescue_types_includes_epic_decompose(self) -> None:
+        assert "epic-decompose" in _WIP_RESCUE_TYPES
 
 
 def _init_repo_with_remote(path: Path) -> Path:

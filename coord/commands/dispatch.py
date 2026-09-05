@@ -16,6 +16,7 @@ import httpx
 
 from coord import github_ops
 from coord.config import describe_model_choice
+from coord.models import EPIC_DECOMPOSE_TYPE
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 from coord.commands.dispatch_workers import (
@@ -1026,7 +1027,7 @@ def approve(
     "--type",
     "cli_dispatch_type",
     default=None,
-    type=click.Choice(["work", "epic-decompose"]),
+    type=click.Choice(["work", EPIC_DECOMPOSE_TYPE]),
     help=(
         "#3132: override the headless dispatch type — default 'work'. "
         "'epic-decompose' hands ISSUE (which must carry the 'epic' label) "
@@ -1045,8 +1046,6 @@ def approve(
         "pick their own type."
     ),
 )
-
-
 def assign(
     machine: str,
     repo: str,
