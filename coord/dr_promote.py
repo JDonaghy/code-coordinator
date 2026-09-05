@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from coord import backup, deploy_manifest, dr_verify
+from coord import backup, deploy_manifest, dr_verify, github_ops
 
 LOGGER_NAME = "coord.dr_promote"
 
@@ -665,16 +665,23 @@ def check_github_credential(
 ) -> Credential:
     """Can the GitHub token *read issues* and *merge*, per repo?
 
-    Two read-only probes, both through ``gh`` (this repo's only GitHub
-    transport — see ``coord.github_ops``):
+    Two read-only probes, both owned by ``coord.github_ops`` — this repo's
+    single ``gh`` chokepoint (#1902/#2135), which is where every ``gh`` argv
+    construction lives:
 
-    * ``gh api repos/<slug>`` per configured repo, reading
-      ``.permissions.push``. Authenticating at all proves read; ``push: true``
-      is GitHub's own answer to "may this identity merge here", per repo,
-      which is the granularity that actually matters — a token can be fine on
-      four repos and useless on the fifth.
-    * ``gh api repos/<slug>/issues?per_page=1`` once, because issue access is
-      separately grantable (and separately disable-able) from repo metadata.
+    * :func:`coord.github_ops.probe_repo_push_permission` per configured repo,
+      reading ``.permissions.push``. Authenticating at all proves read;
+      ``push: true`` is GitHub's own answer to "may this identity merge here",
+      per repo, which is the granularity that actually matters — a token can
+      be fine on four repos and useless on the fifth.
+    * :func:`coord.github_ops.probe_issues_readable` once, because issue
+      access is separately grantable (and separately disable-able) from repo
+      metadata.
+
+    Both are handed :func:`_run` as their runner rather than calling
+    ``github_ops._gh``: this path must grade a refusal instead of raising on
+    it, and must not write throttle/telemetry state into the store the
+    promotion is still restoring. See the comment above those two functions.
 
     A repo that answers ``push: false``, an unparseable answer, or a ``gh``
     that is not installed all come back not-ok and named. Nothing here reads a
@@ -693,13 +700,14 @@ def check_github_credential(
             CRED_GITHUB, CRED_UNKNOWN, "not probed (--no-network)"
         )
 
+    def probe(argv: Sequence[str]) -> tuple[int, str]:
+        return _run(argv, runner=runner)
+
     mergeable: list[str] = []
     refused: list[str] = []
     unknown: list[str] = []
     for slug in slugs:
-        code, out = _run(
-            ["gh", "api", f"repos/{slug}", "--jq", ".permissions.push"], runner=runner
-        )
+        code, out = github_ops.probe_repo_push_permission(slug, run=probe)
         if code != 0:
             unknown.append(f"{slug} ({out.splitlines()[-1] if out else 'gh failed'})")
             continue
@@ -711,9 +719,7 @@ def check_github_credential(
         else:
             unknown.append(f"{slug} (unparseable .permissions.push: {answer!r})")
 
-    code, issues_out = _run(
-        ["gh", "api", f"repos/{slugs[0]}/issues?per_page=1"], runner=runner
-    )
+    code, issues_out = github_ops.probe_issues_readable(slugs[0], run=probe)
     issues_ok = code == 0
     issues_note = (
         f"reads issues on {slugs[0]}"
