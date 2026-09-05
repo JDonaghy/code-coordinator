@@ -33,6 +33,7 @@ from coord import state
 from coord.cli import main
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
     DRIVE_STARTUP_GRACE_SECONDS,
     PARK_STALE_SECONDS,
     QUEUE_ALERT_ISSUE,
@@ -56,6 +57,55 @@ REPO = "claude-coordinator"
 # about: the whole point is that a quadraui entry can ride alongside an
 # in-progress claude-coordinator one.
 OTHER_REPO = "quadraui"
+
+#: How far to age a died-and-now-backing-off entry so that its NEXT tick is
+#: clear of BOTH clock gates such an entry sits behind: #1794's startup grace
+#: (`DRIVE_STARTUP_GRACE_SECONDS`) and #2273's dispatch-failure backoff floor
+#: (`DISPATCH_FAILURE_MIN_BACKOFF_SECONDS`).
+#:
+#: DERIVED from the two constants on purpose, rather than written as the plain
+#: number it used to be. Both were 300.0 until #3145 widened the backoff floor
+#: to 660.0 (to outlast `coord.agent.PRE_STASH_BUILD_TIMEOUT_SECONDS`), and at
+#: that moment every site below that had hardcoded `DRIVE_STARTUP_GRACE_SECONDS
+#: + 60` stopped clearing the backoff — the two windows had only ever been
+#: equal by coincidence, so a bump to one silently stranded the relaunch tick
+#: inside the other and five tests started asserting `waiting` where they meant
+#: `running`/`blocked`. Deriving it means the next move of either constant
+#: re-paces these tests instead of breaking them.
+#:
+#: Only for the sites that must clear the WIDENED (dispatch-failure) floor.
+#: Tests whose death reason already names a merge-gate block deliberately keep
+#: `DRIVE_STARTUP_GRACE_SECONDS + 60`: `_is_merge_gate_block_reason` exempts
+#: them from the widened floor (#2424), and using this longer age there would
+#: hide that carve-out by clearing the wide window they are pinned NOT to be in.
+PAST_BOTH_RETRY_GATES_SECONDS = (
+    max(DRIVE_STARTUP_GRACE_SECONDS, DISPATCH_FAILURE_MIN_BACKOFF_SECONDS) + 60
+)
+
+
+def _pre_stash_build_stall_seconds() -> float:
+    """The mirror image of the constant above, and the age the widened floor
+    actually exists to cover: the far end of a full-length pre-stash build
+    (`coord.agent.PRE_STASH_BUILD_TIMEOUT_SECONDS`), the best-documented cause
+    of the agent stall #3145 is about. A died entry aged this far must STILL
+    be backing off — otherwise its one remaining attempt is spent inside the
+    very stall that killed the first.
+
+    Anchored to the AGENT's ceiling rather than derived from
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` on purpose: a value derived from
+    the floor would slide along with it and could never observe the floor
+    being narrowed, which is the one regression worth catching here. (The
+    arithmetic half of the same invariant — that the floor is wider than this
+    ceiling at all — is
+    `tests/test_drive_queue.py::test_the_dispatch_failure_backoff_outlasts_a_pre_stash_build_stall`.)
+
+    A function, with the import inside it, because `coord.agent` is a heavy
+    module these CLI tests otherwise never touch.
+    """
+    from coord.agent import PRE_STASH_BUILD_TIMEOUT_SECONDS  # noqa: PLC0415
+
+    return PRE_STASH_BUILD_TIMEOUT_SECONDS
+
 
 _CONFIG_YAML = f"""\
 repos:
@@ -1812,11 +1862,27 @@ def _die_and_relaunch(cli, coord_db, issue: int) -> None:
     spent attempt sitting `waiting`) now needs two — this is that pair,
     factored out because several existing regression tests simulate more
     than one death in sequence.
+
+    The relaunch is ASSERTED here, not assumed. This helper's whole contract
+    is "the entry ends this call `running`", and every caller's later
+    assertions (`attempts == 2`, `state == "blocked"`, an escalation row) are
+    only meaningful if it held. When #3145 widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` past the ageing this helper used
+    to hardcode, the second `tick` silently did nothing and five callers
+    failed far downstream on a confusing `'waiting' == 'blocked'` — none of
+    them at the step that actually broke. Checking the postcondition where it
+    is produced turns that into one honest failure at the real site.
     """
     _backdate(issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
     cli("tick")  # retry: attempt spent, backs off
-    _backdate_reason(coord_db, issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    _backdate_reason(coord_db, issue, PAST_BOTH_RETRY_GATES_SECONDS)
     cli("tick")  # backoff cleared: relaunches
+    entry = queued(issue)
+    assert entry["state"] == STATE_RUNNING, (
+        f"_die_and_relaunch did not relaunch {REPO}#{issue}: state="
+        f"{entry['state']!r} attempts={entry['attempts']} "
+        f"last_reason={entry['last_reason']!r}"
+    )
 
 
 def test_back_to_back_ticks_launch_exactly_one_drive(cli, seed, launches):
@@ -1892,7 +1958,17 @@ def test_a_relaunch_after_retry_waits_out_the_2273_backoff(
 ):
     """The spacing itself, end to end: a THIRD tick, run before the backoff
     has elapsed, still does not relaunch; ageing `reason_at` past it lets a
-    FOURTH tick relaunch normally."""
+    FOURTH tick relaunch normally.
+
+    #3145 adds the middle step that makes the WIDTH of the window observable
+    from the CLI, not just the existence of a window: a tick aged out to the
+    far end of a full-length pre-stash build
+    (`coord.agent.PRE_STASH_BUILD_TIMEOUT_SECONDS`) must ALSO still defer.
+    Without it this test passes against any floor at all — including the
+    300.0s floor that produced the incident, where this entry's one remaining
+    attempt would be spent inside the very agent stall that killed the first.
+    Now the deferral has a verdict that can fail.
+    """
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
@@ -1905,7 +1981,20 @@ def test_a_relaunch_after_retry_waits_out_the_2273_backoff(
     assert len(launches) == 1, launches  # still paced
     assert queued(1762)["state"] == "waiting"
 
-    _backdate_reason(coord_db, 1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    # A full-length pre-stash build has now elapsed since the death — far
+    # past the plain 60s tier, and the exact stall length the widened floor
+    # exists to outlast. Still no relaunch.
+    _backdate_reason(coord_db, 1762, _pre_stash_build_stall_seconds())
+    inside_widened = cli("tick")
+    assert inside_widened.exit_code == 0, inside_widened.output
+    assert len(launches) == 1, (
+        "relaunched while a full-length pre-stash build could still be "
+        "holding the agent — the retry budget is being spent inside one "
+        f"stall window again (#3145): {launches}"
+    )
+    assert queued(1762)["state"] == "waiting"
+
+    _backdate_reason(coord_db, 1762, PAST_BOTH_RETRY_GATES_SECONDS)
     relaunched = cli("tick")
     assert relaunched.exit_code == 0, relaunched.output
     assert len(launches) == 2, launches

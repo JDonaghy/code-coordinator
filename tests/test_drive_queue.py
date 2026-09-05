@@ -19,6 +19,7 @@ import pytest
 
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
     DRIVE_STARTUP_GRACE_SECONDS,
     EMPTY_BRANCH_MAX_ATTEMPTS,
     HOLD_ARMED,
@@ -1610,6 +1611,90 @@ def test_a_dispatch_failure_that_created_no_assignment_backs_off_longer():
     assert plan.launch is None
     backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
     assert len(backoff) == 1 and backoff[0].backing_off is True
+
+
+def test_the_dispatch_failure_backoff_outlasts_a_pre_stash_build_stall():
+    """#3145's second acceptance bullet, as a gate that can actually fail.
+
+    The bullet: "#2273's retry spacing should not exhaust the drive-queue
+    attempt budget within a single agent-stall window." `DEFAULT_MAX_ATTEMPTS`
+    is 2, so `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` is the ONLY gap between a
+    died launch's first and last chance — and on 2026-09-05 both of
+    vimcode#821's attempts (bare `httpx` timeouts, `assign()` never reached,
+    so `_dispatch_produced_nothing` is true) landed inside one dellserver
+    stall and spent the whole budget. The best-documented cause of such a
+    stall is bounded by `coord.agent.PRE_STASH_BUILD_TIMEOUT_SECONDS`, so the
+    fix is that the gap must be wider than that ceiling.
+
+    Until this test, that relationship existed only as prose at the constant
+    and as hand-copied `600`/`660` literals in two modules — the shape #2085
+    calls split-brain, and a "gate" with no reachable failing verdict: every
+    other backoff test observes only that SOME window exists, and passes just
+    as happily against the 300.0 floor that produced the incident. Both halves
+    below fail if either constant moves alone:
+
+    1. the ordering between the two modules' numbers, asserted directly; and
+    2. what that ordering buys, driven through the real `plan_tick`: a tick
+       fired at the very last instant of a full-length pre-stash-build stall
+       must STILL defer, and only a tick past the floor may relaunch. Part 2
+       is the one that matters — it is the planner's own verdict, not
+       arithmetic about the planner's inputs.
+    """
+    # Imported here, not at module scope: `coord.agent` is a heavy module and
+    # the dependency direction is agent -> drive_queue, never back. The
+    # cross-module link deliberately lives in this test rather than in
+    # `coord/drive_queue.py`'s import block.
+    from coord.agent import PRE_STASH_BUILD_TIMEOUT_SECONDS  # noqa: PLC0415
+
+    # (1) The ordering. A margin, not just `>=`: a retry firing at the exact
+    # instant a stall ends still races it.
+    assert DISPATCH_FAILURE_MIN_BACKOFF_SECONDS > PRE_STASH_BUILD_TIMEOUT_SECONDS, (
+        f"the dispatch-failure retry gap ({DISPATCH_FAILURE_MIN_BACKOFF_SECONDS}s) "
+        f"is not wider than the pre-stash build stall it must outlast "
+        f"({PRE_STASH_BUILD_TIMEOUT_SECONDS}s) — with DEFAULT_MAX_ATTEMPTS="
+        f"{DEFAULT_MAX_ATTEMPTS} that single gap is the entire retry budget, so "
+        "both attempts can again be spent inside one agent stall (#3145)"
+    )
+
+    # (2) What it buys. The death is recorded the moment the stall begins; the
+    # stall runs its full ceiling; a tick at that exact moment must not
+    # relaunch into it.
+    death = NOW
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=death - DRIVE_STARTUP_GRACE_SECONDS - 60.0,
+            retry_backoff_at=death,
+        )
+    ]
+    # No board-visible assignment at all — `_dispatch_produced_nothing` is
+    # true, which is exactly the client-side-timeout-against-a-stalled-agent
+    # shape the widened floor is for.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+
+    still_stalled = plan_tick(
+        entries, view, capacity=1, now=death + PRE_STASH_BUILD_TIMEOUT_SECONDS
+    )
+    assert still_stalled.launch is None, (
+        "the last attempt was relaunched while a full-length pre-stash build "
+        "could still be holding the agent — the #3145 incident exactly"
+    )
+    backoff = [d for d in still_stalled.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1 and backoff[0].backing_off is True
+
+    # And the window does end: past the floor, the same entry relaunches. A
+    # gate that only ever defers would pass part 2 vacuously.
+    cleared = plan_tick(
+        entries,
+        view,
+        capacity=1,
+        now=death + DISPATCH_FAILURE_MIN_BACKOFF_SECONDS + 1.0,
+    )
+    assert cleared.launch is not None and cleared.launch.issue == 1650
 
 
 def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():

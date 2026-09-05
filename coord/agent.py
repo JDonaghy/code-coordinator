@@ -377,6 +377,20 @@ _PTY_INJECT_RETRY_BACKOFF_S = 0.4
 _FIRST_OUTPUT_TIMEOUT = 600.0    # seconds of zero output before the watchdog kills
 NO_FIRST_OUTPUT_EXIT = 124       # exit code reported when the TTFT watchdog fires
 
+# #3145: the pre-stash `build_command`'s own ceiling (`_run_pre_stash_build`
+# below), named here rather than inlined at its `subprocess.run` call because a
+# SECOND module is sized against it: `coord/drive_queue.py`'s
+# `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` is deliberately wider than this, so a
+# dispatch-only death's one remaining retry fires only AFTER any single such
+# stall has ended rather than landing inside the very stall it is retrying
+# (the 2026-09-05 vimcode#821 shape). Two hand-copied literals in two modules
+# answering one question is the split-brain #2085 warns about, so the ordering
+# between them is asserted directly, in
+# `tests/test_drive_queue.py::test_the_dispatch_failure_backoff_outlasts_a_pre_stash_build_stall`
+# — raising this ceiling (or lowering that floor) without moving the other
+# fails that test instead of silently re-opening the incident.
+PRE_STASH_BUILD_TIMEOUT_SECONDS = 600.0
+
 # #2131: distinct exit code for a leg killed by the per-leg spend ceiling. It
 # must NOT collide with NO_FIRST_OUTPUT_EXIT (or any plausible worker exit
 # code) — `_reap` keys the `spend_ceiling_reason` stamp off it, and that stamp
@@ -2370,11 +2384,12 @@ def _run_pre_stash_build(
     executed so that build artifacts exist in the worktree regardless of which
     feature flags the worker itself used during development.
 
-    The command is run via ``/bin/sh -c`` in *worktree* with a 10-minute
-    timeout.  stdout and stderr are captured and appended to *log_path* (if
-    set) so the operator can diagnose build failures.  Returns ``True`` on
-    exit code 0, ``False`` on any failure.  Never raises — this is best-effort
-    pre-stash housekeeping.
+    The command is run via ``/bin/sh -c`` in *worktree* with a
+    ``PRE_STASH_BUILD_TIMEOUT_SECONDS`` (10-minute) timeout.  stdout and
+    stderr are captured and appended to *log_path* (if set) so the operator
+    can diagnose build failures.  Returns ``True`` on exit code 0, ``False``
+    on any failure.  Never raises — this is best-effort pre-stash
+    housekeeping.
     """
     try:
         result = subprocess.run(
@@ -2384,7 +2399,7 @@ def _run_pre_stash_build(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=600,
+            timeout=PRE_STASH_BUILD_TIMEOUT_SECONDS,
         )
         ok = result.returncode == 0
         if log_path:
