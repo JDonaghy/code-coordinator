@@ -54,6 +54,7 @@ ROLE_UNITS: dict[str, tuple[str, ...]] = {
         "coord-drive-queue.timer",
         "coord-release-propagate.timer",
         "coord-db-backup.timer",
+        "coord-backup.timer",
     ),
 }
 
