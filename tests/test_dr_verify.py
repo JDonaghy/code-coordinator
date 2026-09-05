@@ -149,6 +149,25 @@ def make_store(path: Path) -> Path:
     return path
 
 
+def hollow_out_assignments(path: Path) -> Path:
+    """Empty *path*'s `assignments` table, leaving the store otherwise valid.
+
+    This is what a truncated-but-openable restore looks like: `integrity_check`
+    passes, the schema is current, and the board is gone. Two rungs need that
+    exact shape — the content check (`assignments` empty in the restore while
+    live's is not) and the parity check (`/board` (restored) serves 0 while
+    `/board` (live) serves some) — so they share one implementation rather
+    than each opening their own connection to write the same DELETE.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DELETE FROM assignments")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 @pytest.fixture
 def coord_home(tmp_path, monkeypatch) -> Path:
     """An isolated `$COORD_DIR` whose `coord.db` is a real, populated store."""
@@ -310,11 +329,7 @@ def test_empty_assignments_table_fails_even_though_integrity_check_passes(lane):
     a hard failure, because it is exactly what a truncated-but-openable
     restore looks like from the content side.
     """
-    hollow = make_store(lane.scratch_root / "hollow.db")
-    conn = sqlite3.connect(str(hollow))
-    conn.execute("DELETE FROM assignments")
-    conn.commit()
-    conn.close()
+    hollow = hollow_out_assignments(make_store(lane.scratch_root / "hollow.db"))
     snapshot_id = upload_raw(hollow)
 
     result = run_cli(lane, "--snapshot", snapshot_id, "--no-parity")
@@ -514,11 +529,7 @@ def test_parity_fails_hard_when_restored_board_serves_zero_but_live_serves_some(
     pytest.importorskip("uvicorn")
     restored_dir = tmp_path / "zero-restore"
     restored_dir.mkdir()
-    restored = make_store(restored_dir / "coord.db")
-    conn = sqlite3.connect(str(restored))
-    conn.execute("DELETE FROM assignments")
-    conn.commit()
-    conn.close()
+    restored = hollow_out_assignments(make_store(restored_dir / "coord.db"))
 
     with pytest.raises(dr_verify.DRVerifyError, match="parity check failed") as excinfo:
         dr_verify.check_parity(restored, live_assignments=5)
