@@ -153,6 +153,95 @@ def test_briefing_omits_index_script_for_non_html_driver():
     assert "gen_mock_index.py" not in out
 
 
+# ── #3131: CSS-only `:target` interactive walkthroughs ──────────────────────
+#
+# Hard-gated off by default (blocked on coord-portal#314's CSP fix — see
+# `INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED`'s docstring), so these tests
+# monkeypatch the flag on to exercise the instruction text itself: a flag
+# that is never observed in both states is a gate that can never fail.
+
+
+def test_interactive_instruction_omitted_by_default():
+    """The flag defaults off (blocked on coord-portal#314) — a fresh-render
+    briefing must not teach the `:target` technique until that ships."""
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="web-playwright",
+        driver_mock_glob="*.html",
+    )
+    assert ":target" not in out
+    assert not mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED
+
+
+def test_interactive_instruction_included_when_enabled(monkeypatch):
+    monkeypatch.setattr(mock_author, "INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED", True)
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="web-playwright",
+        driver_mock_glob="*.html",
+    )
+    assert ":target" in out
+    assert "NO JavaScript" in out
+    assert "ONE self-contained" in out
+    assert "tests/acceptance/ms-2/contract.md" in out
+
+
+def test_interactive_instruction_still_omitted_for_non_html_driver_when_enabled(
+    monkeypatch,
+):
+    """The `:target` technique only applies to HTML mocks — gated on the
+    same `_wants_mock_index` glob check as the navigation-index step, not a
+    separate condition that could drift from it."""
+    monkeypatch.setattr(mock_author, "INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED", True)
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/tui",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="tui-tuidriver",
+        driver_mock_glob="*.screen",
+    )
+    assert ":target" not in out
+
+
+def test_amend_interactive_instruction_omitted_by_default():
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        amend_text="fix a typo",
+        driver_mock_glob="*.html",
+    )
+    assert ":target" not in out
+
+
+def test_amend_interactive_instruction_included_when_enabled(monkeypatch):
+    monkeypatch.setattr(mock_author, "INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED", True)
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        amend_text="fix a typo",
+        driver_mock_glob="*.html",
+    )
+    assert ":target" in out
+    assert "coord-portal#307" in out
+
+
 def test_mock_author_system_prompt_pins_the_locked_html_mock_shape():
     """docs/ORACLE_LOOP.md's locked (2026-07-28) decision: a `.html` mock
     must be self-contained, open in a browser, and LOOK like the screen —
@@ -162,6 +251,16 @@ def test_mock_author_system_prompt_pins_the_locked_html_mock_shape():
     assert "OPEN IN A BROWSER AND LOOK LIKE THE SCREEN" in MOCK_AUTHOR_SYSTEM_PROMPT
     assert "inline" in MOCK_AUTHOR_SYSTEM_PROMPT.lower()
     assert "data-testid" in MOCK_AUTHOR_SYSTEM_PROMPT
+
+
+def test_mock_author_system_prompt_carves_out_target_walkthroughs():
+    """#3131: the "one file per screen state" rule above would directly
+    contradict a CSS-only `:target` walkthrough, which needs every screen
+    it covers sharing ONE document/stylesheet to toggle visibility — so the
+    system prompt must name the exception rather than silently fight the
+    seed briefing's own instruction once #3131's flag is enabled."""
+    assert "#3131" in MOCK_AUTHOR_SYSTEM_PROMPT
+    assert ":target" in MOCK_AUTHOR_SYSTEM_PROMPT
 
 
 # ── dispatch_acceptance_mock ─────────────────────────────────────────────────

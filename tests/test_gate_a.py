@@ -436,6 +436,123 @@ class TestSummarisePendingAmends:
         assert gate_a.summarise_pending_amends([]) == []
 
 
+# ── #3131: interactive (CSS-only `:target`) mock contract gaps ─────────────
+
+
+class TestFindInteractiveControls:
+    def test_finds_a_navigating_anchor_with_its_own_id(self) -> None:
+        html = '<a id="nav-error" href="#s-error">Error</a>'
+        controls = gate_a.find_interactive_controls(html)
+        assert controls == [
+            gate_a.InteractiveControl(control_id="nav-error", target_id="s-error")
+        ]
+
+    def test_falls_back_to_a_synthetic_id_when_the_anchor_has_none(self) -> None:
+        html = '<a href="#s-empty">Empty state</a>'
+        controls = gate_a.find_interactive_controls(html)
+        assert controls == [
+            gate_a.InteractiveControl(control_id="->#s-empty", target_id="s-empty")
+        ]
+
+    def test_bare_hash_href_is_not_a_navigating_control(self) -> None:
+        """coord-portal#307's exact inert shape — `href="#"` with an empty
+        fragment — must not be reported as a control at all: there is no
+        target to pin a destination against, so this is a different (and
+        already-covered) "does the control do anything" concern."""
+        html = '<a id="nav-dead" href="#">Nowhere</a>'
+        assert gate_a.find_interactive_controls(html) == []
+
+    def test_ignores_anchors_with_no_href(self) -> None:
+        html = '<a id="just-an-anchor">Not a link</a>'
+        assert gate_a.find_interactive_controls(html) == []
+
+    def test_finds_multiple_controls_across_a_document(self) -> None:
+        html = (
+            '<nav><a id="nav-start" href="#s-start">Start</a>'
+            '<a id="nav-error" href="#s-error">Error</a></nav>'
+        )
+        controls = gate_a.find_interactive_controls(html)
+        assert {c.control_id for c in controls} == {"nav-start", "nav-error"}
+
+    def test_no_mocks_yields_no_controls(self) -> None:
+        assert gate_a.find_interactive_controls("<p>just a static screen</p>") == []
+
+
+class TestUnpinnedInteractiveControls:
+    def test_control_and_target_named_together_is_pinned(self) -> None:
+        contract = (
+            "# Contract\n\n"
+            "- clicking `nav-error` makes `#s-error` the only visible "
+            "`.screen`\n"
+        )
+        controls = [gate_a.InteractiveControl("nav-error", "s-error")]
+        assert gate_a.unpinned_interactive_controls(contract, controls) == []
+
+    def test_control_mentioned_without_its_destination_is_a_gap(self) -> None:
+        """The coord-portal#307 shape in prose form: the contract names the
+        control but never says where it goes."""
+        contract = "# Contract\n\n- there is a `nav-error` link\n"
+        controls = [gate_a.InteractiveControl("nav-error", "s-error")]
+        assert gate_a.unpinned_interactive_controls(contract, controls) == controls
+
+    def test_control_not_mentioned_at_all_is_a_gap(self) -> None:
+        contract = "# Contract\n\nno mention of any control here\n"
+        controls = [gate_a.InteractiveControl("nav-error", "s-error")]
+        assert gate_a.unpinned_interactive_controls(contract, controls) == controls
+
+    def test_case_insensitive(self) -> None:
+        contract = "- Clicking `NAV-ERROR` shows `#S-ERROR`\n"
+        controls = [gate_a.InteractiveControl("nav-error", "s-error")]
+        assert gate_a.unpinned_interactive_controls(contract, controls) == []
+
+    def test_control_and_target_on_different_lines_still_a_gap(self) -> None:
+        """Same-line proximity is the whole check — two facts scattered
+        across the document is not "pinned together"."""
+        contract = "- there is a `nav-error` control\n- `#s-error` exists\n"
+        controls = [gate_a.InteractiveControl("nav-error", "s-error")]
+        assert gate_a.unpinned_interactive_controls(contract, controls) == controls
+
+
+class TestInteractiveContractGaps:
+    def test_static_mock_with_no_controls_yields_no_gaps(self) -> None:
+        mocks = {"screen.html": "<p>static picture, no links</p>"}
+        assert gate_a.interactive_contract_gaps(mocks, "# Contract\n") == {}
+
+    def test_fully_pinned_walkthrough_yields_no_gaps(self) -> None:
+        mocks = {
+            "walkthrough.html": '<a id="nav-error" href="#s-error">Error</a>'
+        }
+        contract = "- clicking `nav-error` makes `#s-error` visible\n"
+        assert gate_a.interactive_contract_gaps(mocks, contract) == {}
+
+    def test_only_files_with_gaps_appear_in_the_result(self) -> None:
+        mocks = {
+            "pinned.html": '<a id="nav-ok" href="#s-ok">Ok</a>',
+            "gap.html": '<a id="nav-error" href="#s-error">Error</a>',
+        }
+        contract = "- clicking `nav-ok` makes `#s-ok` visible\n"
+        gaps = gate_a.interactive_contract_gaps(mocks, contract)
+        assert list(gaps.keys()) == ["gap.html"]
+        assert gaps["gap.html"] == [
+            gate_a.InteractiveControl("nav-error", "s-error")
+        ]
+
+
+class TestSummariseInteractiveGaps:
+    def test_names_the_file_control_and_destination(self) -> None:
+        gaps = {
+            "walkthrough.html": [gate_a.InteractiveControl("nav-error", "s-error")]
+        }
+        lines = gate_a.summarise_interactive_gaps(gaps)
+        assert len(lines) == 1
+        assert "walkthrough.html" in lines[0]
+        assert "nav-error" in lines[0]
+        assert "s-error" in lines[0]
+
+    def test_no_gaps_yields_no_lines(self) -> None:
+        assert gate_a.summarise_interactive_gaps({}) == []
+
+
 # ── the park marker ─────────────────────────────────────────────────────────
 
 
