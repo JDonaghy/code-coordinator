@@ -2547,6 +2547,56 @@ def test_dispatch_review_releases_claim_on_early_deny_path(
     assert retried is not None
 
 
+def test_dispatch_review_releases_claim_on_unhandled_exception(
+    two_machine_config: Config, coord_db,
+) -> None:
+    """#3113: an unhandled exception raised between the claim and a successful
+    dispatch (here: `pr_lookup` blowing up) must still release the claim —
+    every OTHER "no review dispatched" path releases it via `_deny(...)` or
+    the candidate-exhaustion tail, but a raised exception used to propagate
+    straight past all of them, permanently stranding this work assignment's
+    review dispatch behind a claim nothing would ever clear (no review row
+    is ever created for a raised exception, so the terminal-status release
+    hook in `coord.issue_store._update_local_state` never fires either).
+    """
+    from coord import state
+
+    completed = _completed_assignment(machine="laptop")
+
+    def _boom(repo_github, **kw):
+        raise RuntimeError("gh pr lookup blew up")
+
+    with pytest.raises(RuntimeError, match="gh pr lookup blew up"):
+        dispatch_review(
+            completed, Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "unused"}),
+            pr_lookup=_boom,
+            claude_md_reader=lambda p: "",
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+        )
+
+    # The claim must be gone — a fresh claim attempt for the same completed
+    # assignment must succeed, proving the exception path released it.
+    assert state.claim_review_dispatch(completed.assignment_id) is True
+
+    # And a real retry (fresh board snapshot, no more exception) must succeed.
+    state.release_review_dispatch_claim(completed.assignment_id)
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 1, "url": "https://github.com/acme/api/pull/1", "existed": True}
+
+    retried = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-retry-3"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+    assert retried is not None
+
+
 # ── #1476: scoped re-review ──────────────────────────────────────────────────
 
 

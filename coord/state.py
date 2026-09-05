@@ -6439,6 +6439,17 @@ def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
 ISSUE_CONTEXT_MAX_ENTRIES = 12
 ISSUE_CONTEXT_MAX_CHARS = 2500
 
+# #3113: `source="review"` entries are exempt from the char cap below (a
+# reviewer's full `## Blocking findings` section must never be truncated
+# mid-word — that's the whole point of the exemption). Left fully open-ended,
+# that combines with `ISSUE_CONTEXT_MAX_ENTRIES` to allow up to 12 uncapped
+# multi-KB review sections in one briefing on a heavily-iterated issue. Cap
+# how many *review* entries get the uncapped treatment — the newest ones,
+# since those are the ones a fix worker is actually iterating against right
+# now; anything older falls back into the normal char-capped/droppable pool
+# alongside every other note source.
+ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES = 4
+
 
 def add_issue_context_entry(
     repo_name: str,
@@ -7517,7 +7528,15 @@ def render_issue_context_entries(
     (oldest-selected-first) to bring the rest of the block back toward
     *max_chars*. Order is otherwise unchanged from before this exemption
     existed (pinned first, then notes newest-first) whenever no truncation is
-    needed at all — the overwhelmingly common case.
+    needed at all — the overwhelmingly common case. When truncation DOES
+    trigger, the rebuilt block instead orders as protected-review-lines then
+    kept-other-lines, which can differ from the untruncated ordering above.
+
+    Only the newest ``ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES`` review
+    entries get this uncapped treatment — otherwise a heavily-iterated issue
+    could accumulate up to *max_entries* uncapped multi-KB review sections in
+    every future briefing. Older review entries beyond that fall back into
+    the normal char-capped/droppable pool alongside every other source.
     """
     if not entries:
         return ""
@@ -7551,9 +7570,22 @@ def render_issue_context_entries(
         return block
 
     # Char-cap truncation is needed. Split into review-sourced (protected,
-    # always kept whole) vs everything else (eligible to be trimmed).
-    review_lines = [line for e, line in selected if e.get("source") == "review"]
-    other_lines = [line for e, line in selected if e.get("source") != "review"]
+    # always kept whole) vs everything else (eligible to be trimmed). Only
+    # the newest ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES review entries are
+    # protected — older ones fall back into the trimmable pool so a
+    # heavily-iterated issue can't accumulate unbounded uncapped review text
+    # (see the docstring above).
+    review_entries_newest_first = sorted(
+        (e for e, _ in selected if e.get("source") == "review"),
+        key=lambda e: e.get("created_at") or 0,
+        reverse=True,
+    )
+    protected_ids = {
+        id(e)
+        for e in review_entries_newest_first[:ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES]
+    }
+    review_lines = [line for e, line in selected if id(e) in protected_ids]
+    other_lines = [line for e, line in selected if id(e) not in protected_ids]
     review_len = sum(len(x) + 1 for x in review_lines)  # +1 per joining newline
     budget = max(0, max_chars - review_len)
 

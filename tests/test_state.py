@@ -4097,6 +4097,37 @@ class TestRenderIssueContextReviewFindingsExemption:
         assert "an ordinary note" not in out
         assert "trimmed" in out
 
+    def test_review_entries_beyond_the_uncapped_limit_can_be_trimmed(self) -> None:
+        """A heavily-iterated issue with MORE than
+        `ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES` review entries must not be
+        allowed to balloon every future briefing with unbounded uncapped
+        review text — only the newest N stay protected; older ones fall back
+        into the normal char-capped/droppable pool."""
+        assert state.ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES == 4
+        num_reviews = state.ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES + 2
+        chunk = state.ISSUE_CONTEXT_MAX_CHARS  # each entry alone exceeds nothing,
+        # but together they blow well past the cap.
+        entries = [
+            {
+                "id": i,
+                "pinned": False,
+                "source": "review",
+                "body": f"## Blocking findings\n\nfinding-{i} " + ("y" * (chunk // 3)),
+                "created_at": float(i),
+            }
+            for i in range(1, num_reviews + 1)
+        ]
+        out = state.render_issue_context_entries(entries)
+        # The newest N (highest created_at / id) survive whole and uncapped.
+        newest_ids = range(num_reviews - state.ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES + 1, num_reviews + 1)
+        for i in newest_ids:
+            assert f"finding-{i} " in out
+        # At least one of the oldest entries beyond the uncapped budget is
+        # dropped/trimmed rather than rendered in full forever.
+        oldest_ids = range(1, num_reviews - state.ISSUE_CONTEXT_MAX_UNCAPPED_REVIEW_ENTRIES + 1)
+        assert any(f"finding-{i} " not in out for i in oldest_ids)
+        assert "trimmed" in out
+
     def test_no_review_entries_behaves_exactly_as_before(self) -> None:
         """Regression guard: with no `source="review"` entries, ordering and
         truncation behavior is unchanged from pre-#3113."""
