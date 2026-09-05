@@ -720,6 +720,46 @@ def test_pg_dump_command_leaves_a_passwordless_dsn_alone():
     assert "postgresql://db.internal/coord" in argv
 
 
+def test_pg_dump_command_moves_the_password_out_of_argv_for_keyword_value_dsn():
+    # libpq / psycopg / pg_dump --dbname all accept this form just as much as
+    # the URI form, per StoreConfig's docstring — a password here must be
+    # scrubbed exactly like a URI-embedded one.
+    argv, env = bk.pg_dump_command(
+        "host=db.internal port=5432 dbname=coord user=coord password=hunter2",
+        Path("/tmp/out.dump"),
+    )
+    joined = " ".join(argv)
+    assert "hunter2" not in joined, "argv is world-readable in /proc"
+    assert env["PGPASSWORD"] == "hunter2"
+    assert "host=db.internal" in joined
+    assert "dbname=coord" in joined
+    assert "user=coord" in joined
+    assert "--format=custom" in joined
+    assert "--file=/tmp/out.dump" in joined
+
+
+def test_pg_dump_command_leaves_a_passwordless_keyword_value_dsn_alone():
+    argv, env = bk.pg_dump_command(
+        "host=db.internal dbname=coord", Path("/tmp/o.dump")
+    )
+    assert env == {}
+    assert "host=db.internal dbname=coord" in argv
+
+
+def test_pg_dump_command_handles_a_quoted_keyword_value_password():
+    # libpq allows single-quoting a value that contains whitespace or a
+    # quote/backslash itself; the parser must still find and scrub it.
+    argv, env = bk.pg_dump_command(
+        "host=db.internal password='hunter two' dbname=coord",
+        Path("/tmp/out.dump"),
+    )
+    joined = " ".join(argv)
+    assert "hunter two" not in joined
+    assert env["PGPASSWORD"] == "hunter two"
+    assert "host=db.internal" in joined
+    assert "dbname=coord" in joined
+
+
 def test_snapshot_postgres_passes_the_password_only_in_the_environment(tmp_path):
     seen = {}
 

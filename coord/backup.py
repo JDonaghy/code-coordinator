@@ -343,6 +343,79 @@ def snapshot_sqlite(dest: Path, *, source: Path | None = None) -> Path:
     return dest
 
 
+def _is_uri_dsn(dsn: str) -> bool:
+    """True for libpq's URI form (`postgresql://...` / `postgres://...`).
+
+    Anything else is libpq's other valid form: space-separated
+    `keyword=value` pairs (e.g. ``"host=h port=5432 password=hunter2"``),
+    which is what ``store.dsn`` documents itself as accepting in
+    :class:`coord.config.StoreConfig` and what psycopg happily parses.
+    """
+    return dsn.startswith("postgresql://") or dsn.startswith("postgres://")
+
+
+def _parse_keyword_value_dsn(dsn: str) -> dict[str, str]:
+    """Parse libpq's `keyword=value` connection-string form.
+
+    Minimal hand-rolled parser (no hard dependency on psycopg, which is an
+    optional extra — see ``coord/sql.py``'s ``_import_psycopg``): values may
+    be single-quoted to hold whitespace, with ``\\'`` and ``\\\\`` as the only
+    escapes, matching
+    https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING.
+    """
+    params: dict[str, str] = {}
+    i, n = 0, len(dsn)
+    while i < n:
+        while i < n and dsn[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        key_start = i
+        while i < n and dsn[i] != "=" and not dsn[i].isspace():
+            i += 1
+        key = dsn[key_start:i]
+        while i < n and dsn[i].isspace():
+            i += 1
+        if i >= n or dsn[i] != "=":
+            break  # malformed tail; stop rather than loop forever
+        i += 1
+        while i < n and dsn[i].isspace():
+            i += 1
+        value_chars: list[str] = []
+        if i < n and dsn[i] == "'":
+            i += 1
+            while i < n:
+                c = dsn[i]
+                if c == "\\" and i + 1 < n:
+                    value_chars.append(dsn[i + 1])
+                    i += 2
+                    continue
+                if c == "'":
+                    i += 1
+                    break
+                value_chars.append(c)
+                i += 1
+        else:
+            while i < n and not dsn[i].isspace():
+                value_chars.append(dsn[i])
+                i += 1
+        if key:
+            params[key] = "".join(value_chars)
+    return params
+
+
+def _format_keyword_value_dsn(params: dict[str, str]) -> str:
+    """Inverse of :func:`_parse_keyword_value_dsn`, quoting where needed."""
+    parts = []
+    for key, value in params.items():
+        if value == "" or any(c.isspace() for c in value) or "'" in value or "\\" in value:
+            escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+            parts.append(f"{key}='{escaped}'")
+        else:
+            parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
 def pg_dump_command(dsn: str, dest: Path) -> tuple[list[str], dict[str, str]]:
     """`(argv, extra_env)` for `pg_dump -Fc` against *dsn*.
 
@@ -350,19 +423,33 @@ def pg_dump_command(dsn: str, dest: Path) -> tuple[list[str], dict[str, str]]:
     argv is world-readable in `/proc` and a DSN with an inline password on
     the command line is exactly the leak this lane is not allowed to have.
     Everything else about the DSN is passed through unchanged.
-    """
-    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
 
+    Handles both DSN forms libpq (and thus psycopg and ``pg_dump --dbname``)
+    accept: the URI form (`postgresql://user:pass@host/db`) and the
+    space-separated `keyword=value` form
+    (`host=h port=5432 dbname=coord user=u password=hunter2`) — see
+    :class:`coord.config.StoreConfig`'s docstring. Checking only the URI form
+    left a keyword/value password sailing straight into argv unchanged.
+    """
     extra_env: dict[str, str] = {}
     safe_dsn = dsn
-    parts = urlsplit(dsn)
-    if parts.password:
-        extra_env["PGPASSWORD"] = parts.password
-        host = parts.hostname or ""
-        if parts.port:
-            host = f"{host}:{parts.port}"
-        netloc = f"{parts.username}@{host}" if parts.username else host
-        safe_dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    if _is_uri_dsn(dsn):
+        from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+
+        parts = urlsplit(dsn)
+        if parts.password:
+            extra_env["PGPASSWORD"] = parts.password
+            host = parts.hostname or ""
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            netloc = f"{parts.username}@{host}" if parts.username else host
+            safe_dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    else:
+        params = _parse_keyword_value_dsn(dsn)
+        password = params.pop("password", None)
+        if password:
+            extra_env["PGPASSWORD"] = password
+            safe_dsn = _format_keyword_value_dsn(params)
     argv = ["pg_dump", "--format=custom", f"--file={dest}", "--dbname", safe_dsn]
     return argv, extra_env
 
