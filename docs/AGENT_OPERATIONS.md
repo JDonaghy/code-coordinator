@@ -374,6 +374,34 @@ scripts/verify-provision-noble.sh --skip-live --skip-units   # tier 1 only, ~3 m
 real dispatch landing on the agent are all out of its reach and still need a throwaway-VM run. The
 harness says exactly that in its own header, and prints which checks it skipped.
 
+#### The throwaway-VM run the harness cannot replace
+
+Everything above runs unprivileged, so a Claude Code worker session can (and does) run it. The
+remaining layer needs a hypervisor and a human at a browser, so it is an **operator** task —
+mechanical, about 20 minutes, and worth doing once before the first real rebuild:
+
+```bash
+multipass launch 24.04 --name coordvm --cpus 4 --memory 8G --disk 40G   # or any 24.04 VM
+multipass shell coordvm
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/JDonaghy/code-coordinator ~/src/code-coordinator
+export COORD_SETTINGS_DIR=~/scratch-settings    # do NOT register a throwaway in the real
+git clone <coord-settings> ~/scratch-settings   # coordinator.yml — use a scratch clone
+~/src/code-coordinator/scripts/provision-machine.sh --role thin-client --machine coordvm
+~/src/code-coordinator/scripts/provision-machine.sh --role worker      --machine coordvm
+~/src/code-coordinator/scripts/provision-machine.sh --role server      --machine coordvm
+~/src/code-coordinator/scripts/provision-machine.sh --role server      --machine coordvm  # no-op
+```
+
+Paste, for each role: the run's own final `PROVISION:` line (`changes=`, `dead_exec=`, `gate=`),
+`coord machine doctor coordvm --ssh -v` in full, `coord status`, and — for `worker`/`server` —
+`curl -s localhost:7433/health` and `curl -s localhost:7435/board | head -c 400`. What the three
+tiers above genuinely cannot tell you, and what this run is for: whether `systemctl --user enable
+--now` + linger survive a reboot, whether `tailscale up` / `gh auth login` / the Claude OAuth work
+end to end on a machine with no prior identity, whether the agent takes a real dispatch, and
+whether the fourth line above really reports `changes=0`. `multipass delete --purge coordvm`
+afterwards.
+
 Its first run paid for itself: it proved the browser capability was a **silent false green** on
 24.04. `apt-cache policy chromium` reports `Candidate: (none)` — the package does not exist in
 noble — and `chromium-browser` is a 50 KB transitional deb whose entire `/usr/bin/chromium-browser`
@@ -397,10 +425,38 @@ separately enabled; the timer pulls them. Second: the packaged `*.sh` helpers we
 files, but `coord-db-backup.service` says `ExecStart=%h/.local/bin/coord-db-backup.sh` — so a
 rebuilt daemon host's hourly `coord.db` snapshot would have `203/EXEC`'d every hour in silence.
 They now go to `~/.local/bin` (override: `$COORD_PROVISION_LOCAL_BIN`). The script now also
-**resolves every rendered `ExecStart` at provision time** and warns, naming the unit and the missing
-file, rather than arming something that can only fail — which is how it surfaces the one case no
-installer can fix: `coord-web-dist-build.sh` and `coord-failure-notify.sh` are in the repo's
-`deploy/` but are **not shipped in the wheel's `coord/deploy/`**, so nothing can install them.
+**resolves every rendered `ExecStart` at provision time**, rather than arming something that can
+only fail.
+
+That resolution is what surfaced the third case: the wheel deliberately ships almost none of the
+`*.sh` helpers the units `ExecStart` (`coord/deploy/README.md` says so, and
+`tests/test_packaged_deploy_units.py` pins that only `coord-db-backup.sh` is copied across), so
+`coord-web-dist-build.service` installs from a release with nothing to run. **The installer now
+falls back to the `deploy/` directory of the checkout it is being run from** for exactly those —
+never overriding a helper the release *does* package, so `packaged_unit_dir()` stays authoritative
+for every released artifact and this cannot reintroduce #1927's "installed from whatever the
+checkout held" drift. In practice a rebuild is driven from a checkout, so the fallback fires and
+the helper lands.
+
+When even that cannot resolve it (a release-only install, no checkout beside the script), the unit
+is **still installed and still enabled**, and the run prints `DEAD ExecStart: <unit> runs <path>`
+plus a `dead_exec=N` count in its final `PROVISION:` line. That is **advisory, not gating**, on
+purpose: what remains is a missing release artifact the operator cannot produce from that host, and
+refusing to finish `--role server` over it would block a rebuild on something outside their
+control. It is also the one failure class `coord machine doctor` genuinely cannot catch — the
+doctor grades units by `is-enabled`, which reads `enabled` for a unit that `203/EXEC`s on every
+fire — so **`dead_exec=` in the trailer is the only report you get**; treat a non-zero one as
+work to do even though the gate went green.
+
+One unit you will *not* see named there is `coord-failure-notify.service`, the last-resort pager
+several daemon units carry as `OnFailure=`. It is not in `ROLE_UNITS[daemon]` — nothing enables it,
+systemd starts it on another unit's failure — so the manifest walk above never renders it and never
+checks its `ExecStart`. A rebuilt daemon host therefore has no escalation unit at all until someone
+installs it (`deploy/coord-failure-notify.service` + `deploy/coord-failure-notify.sh` →
+`~/.config/systemd/user/` + `~/.local/bin/`, per the header comments in that unit). Teaching
+`provision-machine.sh` to install it unasked would make the installer a *second* answer to "which
+units does this host run", which is precisely the #2098 boundary `deploy_manifest.py` owns: if a
+daemon host should have it, it belongs in the manifest, and the installer will follow.
 
 Four more:
 

@@ -142,6 +142,10 @@ PHASE_TABLE=(
 
 CHANGES=0
 CURRENT_PHASE=""
+# Units installed with an ExecStart that resolves to nothing (phase
+# daemon-units). Advisory, never fatal — but reported in the final trailer,
+# because neither `is-enabled` nor `coord machine doctor` can see this class.
+DEAD_EXEC=0
 
 log()      { printf '\n=== %s ===\n' "$*"; }
 info()     { printf '    %s\n' "$*"; }
@@ -1061,8 +1065,18 @@ phase_daemon_units() {
     # the manifest, and install from the PACKAGED unit dir inside the
     # installed distribution — the released artifact, which cannot drift with
     # whatever this checkout happens to hold (#1927).
+    # The one thing the released artifact demonstrably does NOT carry is the
+    # `*.sh` helpers half the units ExecStart: `coord/deploy/README.md` says
+    # so in as many words and tests/test_packaged_deploy_units.py pins it
+    # (only `coord-db-backup.sh` is copied across). For those, the checkout
+    # this script is being run FROM is the only source there is — see the
+    # fallback in the plan below.
+    local helper_fallback=""
+    [[ -d "$REPO_ROOT/deploy" ]] && helper_fallback="$REPO_ROOT/deploy"
+
     local plan
-    plan="$("$py" - "$SYSTEMD_USER_DIR" "$MACHINE_NAME" "$AGENT_PORT" "$LOCAL_BIN_DIR" <<'PY'
+    plan="$("$py" - "$SYSTEMD_USER_DIR" "$MACHINE_NAME" "$AGENT_PORT" "$LOCAL_BIN_DIR" \
+            "$helper_fallback" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1072,6 +1086,7 @@ from coord.health.checks.unit_drift import packaged_unit_dir
 
 dest = Path(sys.argv[1]); machine, port = sys.argv[2], sys.argv[3]
 helper_dest = Path(sys.argv[4])
+fallback = Path(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else None
 ref = packaged_unit_dir()
 if ref is None:
     print("ERROR|this install ships no coord/deploy/ — upgrade the Python lane first")
@@ -1130,16 +1145,25 @@ for unit in manifest + companions:
 # snapshot silently never runs. Caught by tier 3 of
 # scripts/verify-provision-noble.sh, which resolves every rendered ExecStart.
 helper_dest.mkdir(parents=True, exist_ok=True)
-for helper in sorted(ref.glob("*.sh")):
-    target = helper_dest / helper.name
-    text = helper.read_text(encoding="utf-8")
+
+
+def stage_helper(src: Path, note: str) -> None:
+    """Copy one helper into place, idempotently, reporting what it did."""
+    target = helper_dest / src.name
+    text = src.read_text(encoding="utf-8")
     if target.exists() and target.read_text(encoding="utf-8") == text:
-        print(f"SAME|{helper.name}")
-        continue
-    action = "UPDATED" if target.exists() else "NEW"
+        print(f"HELPERSAME|{src.name}{note}")
+        return
+    action = "HELPERUPDATED" if target.exists() else "HELPERNEW"
     target.write_text(text, encoding="utf-8")
     target.chmod(0o755)
-    print(f"{action}|{helper.name}")
+    print(f"{action}|{src.name}{note}")
+
+
+packaged_helpers = set()
+for helper in sorted(ref.glob("*.sh")):
+    packaged_helpers.add(helper.name)
+    stage_helper(helper, "")
 
 # #2096, applied to systemd: a unit that installs and enables cleanly is not
 # a unit that runs. Resolve every rendered ExecStart NOW, while there is an
@@ -1154,8 +1178,27 @@ for unit_path in sorted(dest.glob("*.service")):
         if not parts:
             continue
         binary = Path(parts[0].replace("%h", home))
-        if not binary.exists():
-            print(f"DEADEXEC|{unit_path.name} runs {parts[0]}, which does not exist")
+        if binary.exists():
+            continue
+        # LAST RESORT, and only for a helper this release genuinely does not
+        # ship (`coord-web-dist-build.sh`, `coord-failure-notify.sh`): take it
+        # from the checkout this script is running out of. A packaged helper is
+        # NEVER overridden this way — the release stays authoritative for
+        # everything it actually carries, so this cannot reintroduce the #1927
+        # "installed from whatever the checkout happened to hold" drift. It is
+        # strictly better than the alternative, which is arming a unit that can
+        # only ever 203/EXEC.
+        src = fallback / binary.name if fallback is not None else None
+        if (
+            src is not None
+            and binary.name.endswith(".sh")
+            and binary.name not in packaged_helpers
+            and binary.parent.resolve() == helper_dest.resolve()
+            and src.is_file()
+        ):
+            stage_helper(src, f" (from {fallback}; this coord release does not ship it)")
+            continue
+        print(f"DEADEXEC|{unit_path.name} runs {parts[0]}, which does not exist")
 PY
 )"
 
@@ -1165,9 +1208,14 @@ PY
         action="${line%%|*}"; unit="${line#*|}"
         case "$action" in
             ERROR)   warn "unit install: $unit"; errors=$((errors + 1)) ;;
-            NEW)     changed "installed $unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
-            UPDATED) changed "refreshed $unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
-            SAME)    unchanged "$unit"; [[ "$unit" == *.sh ]] || wanted+=("$unit") ;;
+            NEW)     changed "installed $unit"; wanted+=("$unit") ;;
+            UPDATED) changed "refreshed $unit"; wanted+=("$unit") ;;
+            SAME)    unchanged "$unit"; wanted+=("$unit") ;;
+            # The *.sh helpers the units ExecStart. Never enabled — they are
+            # not units — so they are deliberately not in `wanted`.
+            HELPERNEW)     changed "staged helper $unit" ;;
+            HELPERUPDATED) changed "refreshed helper $unit" ;;
+            HELPERSAME)    unchanged "helper $unit" ;;
             # A timer's companion .service: installed so the timer has
             # something to run, never separately enabled (the timer pulls it).
             NEW-DEP)     changed "installed $unit (fired by its timer)" ;;
@@ -1175,11 +1223,20 @@ PY
             SAME-DEP)    unchanged "$unit (fired by its timer)" ;;
             MASKED)  warn "$unit is masked by an operator — left masked (#2812)" ;;
             DEADEXEC)
-                warn "$unit.
+                DEAD_EXEC=$((DEAD_EXEC + 1))
+                warn "DEAD ExecStart: $unit.
       systemd will enable and arm it happily and then fail every start with
-      203/EXEC, which 'is-enabled' cannot see. If the missing file is a *.sh
-      helper, it is not in this coord release's packaged coord/deploy/ — copy
-      it from the repo's deploy/ into $LOCAL_BIN_DIR by hand, or drop the unit."
+      203/EXEC, which 'is-enabled' cannot see, and which 'coord machine
+      doctor' cannot see either — so THIS WARNING, and the dead_exec= count
+      in the final PROVISION: line, are the only report you will get. It is
+      deliberately advisory and not fatal: the remaining cases are missing
+      release artifacts, and refusing to finish --role server over one would
+      block a rebuild on something the operator cannot fix from this host.
+      The file was not in this coord release's packaged coord/deploy/ AND not
+      in ${helper_fallback:-<no deploy/ dir beside this script>}, the checkout
+      this script is running from. Put it in $LOCAL_BIN_DIR by hand, or
+      'systemctl --user mask' the unit named above so it stops being an armed
+      unit that can only fail."
                 ;;
         esac
     done <<< "$plan"
@@ -1306,8 +1363,18 @@ done
 CURRENT_PHASE=""
 
 printf '\n'
-printf 'PROVISION: role=%s machine=%s phases=%d changes=%d gate=pass\n' \
-    "$ROLE" "$MACHINE_NAME" "$PHASES_RUN" "$CHANGES"
+printf 'PROVISION: role=%s machine=%s phases=%d changes=%d dead_exec=%d gate=pass\n' \
+    "$ROLE" "$MACHINE_NAME" "$PHASES_RUN" "$CHANGES" "$DEAD_EXEC"
 if [[ $CHANGES -eq 0 ]]; then
     printf 'Nothing changed — this machine was already provisioned for role %s.\n' "$ROLE"
+fi
+if [[ $DEAD_EXEC -gt 0 ]]; then
+    # The gate above is green and this is still true: `coord machine doctor`
+    # grades units by `is-enabled`, which reads `enabled` for a unit that
+    # 203/EXECs on every fire. So say it once more, after the trailer, where
+    # an operator who scrolled past the phase output still sees it.
+    printf '%d unit(s) are enabled with an ExecStart that resolves to nothing — they\n' \
+        "$DEAD_EXEC"
+    printf 'will fail 203/EXEC on every fire and the doctor cannot see it. Search this\n'
+    printf "run's output for 'DEAD ExecStart' for the unit names and what to do.\n"
 fi
