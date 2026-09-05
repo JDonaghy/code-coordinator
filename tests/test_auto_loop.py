@@ -2022,6 +2022,119 @@ def _stub_review_assignment(assignment_id: str = "re-review-1") -> Assignment:
     )
 
 
+class TestMultiReviewFixBriefing:
+    """#3113: two reviews can complete for the same work assignment — a
+    dispatch race (the vimcode#804 incident: two reviews 3 seconds apart,
+    both to the same machine, $4.41 combined) or a legacy duplicate. The fix
+    briefing must contain BOTH reviews' blocking findings, not just whichever
+    review's completion happened to trigger the fix dispatch."""
+
+    def test_fix_briefing_contains_both_reviews_findings_untruncated(
+        self, config: Config, tmp_path, coord_db,
+    ) -> None:
+        """Black-box: drive `process_review_completion` (the real entry
+        point `coord.notify` calls) for ONE of two completed reviews on the
+        same work row, and assert the fix worker's actual dispatched
+        briefing carries both reviews' full, untruncated findings."""
+        from coord.state import save_board, update_assignment_review_findings
+
+        work = _work_assignment(assignment_id="work-abc", review_iteration=0)
+        review1 = _review_assignment(assignment_id="review-1", review_of="work-abc")
+        review2 = _review_assignment(assignment_id="review-2", review_of="work-abc")
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[], active=[], completed=[work, review1, review2],
+        )
+        save_board(board)
+
+        # review1's findings arrive via a local log (the path that triggers
+        # this call) — the real perf-bug shape from the incident, sized like
+        # the real ~1.9KB blocking section so this also proves nothing
+        # upstream (briefing assembly) truncates it.
+        first_finding = (
+            "## Blocking findings\n\n- missing RED statement in the "
+            "acceptance test scaffold. " * 30
+        ).rstrip()
+        assert len(first_finding) > 900
+        log_file = tmp_path / "review1.log"
+        log_file.write_text(
+            f"REVIEW_VERDICT: request-changes\nREVIEW_BODY:\n{first_finding}\nEND_REVIEW\n"
+        )
+
+        # review2's findings are already cached on its own row (as they
+        # would be after notify parsed ITS completion) — the loser of the
+        # race in the real incident, whose findings used to be silently
+        # discarded.
+        second_finding = (
+            "## Blocking findings\n\n- split_insert_undo_group() on every "
+            "insert-mode arrow key makes finish_undo_group do an O(buffer) "
+            "full-text clone per keystroke. " * 30
+        ).rstrip()
+        assert len(second_finding) > 900
+        assert len(first_finding) + len(second_finding) > 2500  # > ISSUE_CONTEXT_MAX_CHARS
+        update_assignment_review_findings(
+            "review-2", verdict="request-changes", body=second_finding,
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-mrg-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review1, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert len(actions) == 1
+        assert actions[0].kind == "fix_dispatched"
+
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        briefing = sent_payload["briefing"]
+        assert first_finding in briefing, "review1's blocking finding is missing/truncated"
+        assert second_finding in briefing, (
+            "review2's blocking finding — the one #3113 fixes — is missing/truncated"
+        )
+        assert "## Reviewer findings to address" in briefing
+
+    def test_single_review_briefing_is_byte_identical_to_before(
+        self, config: Config, tmp_path, coord_db,
+    ) -> None:
+        """Regression guard: the overwhelmingly common single-review case
+        must render exactly as it did before #3113 — no extra wrapper text
+        around the one review's body."""
+        from coord.state import save_board
+
+        work = _work_assignment(assignment_id="work-solo", review_iteration=0)
+        review = _review_assignment(assignment_id="review-solo", review_of="work-solo")
+        board = _board_with(work, review)
+        save_board(board)
+
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "Missing tests for edge case X.\n"
+            "END_REVIEW\n"
+        )
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-solo-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        briefing = mock_http.post.call_args.kwargs["json"]["briefing"]
+        assert "Missing tests for edge case X." in briefing
+        assert "Additional blocking findings" not in briefing
+
+
 class TestRunForFixTransition:
     """run_for_fix_transition: auto-dispatch a fresh review when a fix worker completes."""
 

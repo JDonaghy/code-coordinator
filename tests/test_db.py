@@ -2369,7 +2369,13 @@ class TestUatStateAndReasonColumns:
 # #2786 bumped this to (6, 74): `assignments.num_turns`.
 # #2987 bumped this to (7, 76): `portal_sync_state.relayed_answer_
 # watermark_at` / `relayed_answer_watermark_rowid`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (9, 80)
+# #3114 bumped this to (9, 80): `merge_queue.ci_fix_detail_sha` /
+# `ci_fix_detail_json`.
+# #3113 bumped this to (10, 80): a new `review_claims` TABLE (not a column —
+# `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 80, so only the version
+# moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to run once
+# more on an existing database).
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (10, 80)
 
 
 class TestMigrateAddColumnsVersionGuard:

@@ -703,6 +703,92 @@ def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
     return model
 
 
+def _merge_blocking_review_findings(
+    work: Assignment,
+    primary_review: Assignment,
+    primary_findings: ReviewFindings,
+    board: Board,
+    config: Config,
+) -> ReviewFindings:
+    """Fold every OTHER completed review's blocking findings for *work* into
+    *primary_findings* (#3113).
+
+    Two reviews can complete for the same work assignment — a dispatch race
+    (the vimcode#804 incident: two reviews 3 seconds apart, both to the same
+    machine) or a legacy duplicate that predates the #3113 atomic claim.
+    `_dispatch_fix_for_review` used to build the fix briefing from whichever
+    review's completion happened to trigger this call, silently discarding
+    the other review's findings forever — the loser's real perf-bug finding
+    in vimcode#804 survived only in the issue-context digest, which then
+    truncated it mid-word (the ``ISSUE_CONTEXT_MAX_CHARS`` gap this same
+    issue also closes in ``render_issue_context_entries``).
+
+    Returns *primary_findings* unchanged when there is nothing else to add
+    (the overwhelmingly common single-review case — zero extra DB reads
+    beyond the board scan below). Otherwise returns a NEW ``ReviewFindings``
+    whose ``.body`` concatenates every DISTINCT blocking section, so
+    ``_build_fix_briefing`` (unchanged: it just embeds ``findings.body``
+    under one ``## Reviewer findings to address`` heading) tells the fix
+    worker to address every reviewer's findings, not just one.
+
+    Only ``request-changes`` reviews contribute (an ``approve`` review has
+    nothing to fix). Exact-duplicate bodies — a re-capture of the SAME
+    review, or two reviews that happen to agree word-for-word — are folded
+    into a single entry rather than listed twice.
+    """
+    repo_github = None
+    try:
+        repo_cfg = config.repo(work.repo_name)
+        repo_github = repo_cfg.github if repo_cfg is not None else None
+    except Exception:  # noqa: BLE001
+        repo_github = None
+
+    seen: set[str] = set()
+    sections: list[str] = []
+
+    def _add(body: str | None) -> None:
+        norm = (body or "").strip()
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        sections.append(norm)
+
+    _add(primary_findings.body)
+
+    others = [
+        a
+        for a in list(board.completed) + list(board.active)
+        if a.type == "review"
+        and a.review_of_assignment_id == work.assignment_id
+        and a.assignment_id != primary_review.assignment_id
+    ]
+    for other in others:
+        try:
+            other_findings = _load_review_findings(
+                other, None, None, repo_github=repo_github
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; never block the fix dispatch
+            log.debug(
+                "auto_loop: failed to load findings for sibling review %s: %s",
+                other.assignment_id, exc,
+            )
+            other_findings = None
+        if other_findings is None or other_findings.verdict != "request-changes":
+            continue
+        _add(other_findings.body)
+
+    if len(sections) <= 1:
+        return primary_findings
+
+    merged_body = sections[0]
+    for extra in sections[1:]:
+        merged_body += (
+            "\n\n---\n\n**Additional blocking findings from another review of "
+            "the same patch (#3113 — do not skip these):**\n\n" + extra
+        )
+    return ReviewFindings(verdict="request-changes", body=merged_body)
+
+
 def _dispatch_fix_for_review(
     review: Assignment,
     findings,
@@ -789,6 +875,13 @@ def _dispatch_fix_for_review(
             ),
         )]
 
+    # #3113: gather every OTHER completed review of THIS work assignment with
+    # its own blocking findings before building the briefing — a dispatch
+    # race (or a legacy duplicate) can leave two reviews on the same work
+    # row, and the fix worker must see every reviewer's findings, not just
+    # whichever review's completion happened to trigger this call.
+    merged_findings = _merge_blocking_review_findings(work, review, findings, board, config)
+
     # Build briefing and dispatch.  The fix worker escalates the model per
     # iteration (when pipeline.escalate_fix_model is enabled); compute it here
     # where the iteration is known and thread it into the dispatch.
@@ -799,7 +892,7 @@ def _dispatch_fix_for_review(
     from coord.state import issue_context_block  # noqa: PLC0415
 
     briefing = issue_context_block(work.repo_name, work.issue_number) + _build_fix_briefing(
-        work, findings, next_iteration, max_iter
+        work, merged_findings, next_iteration, max_iter
     )
     model = _fix_model_for_iteration(config, next_iteration)
     fix = _dispatch_fix(

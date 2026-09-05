@@ -2174,6 +2174,96 @@ def _mark_needs_attention_notified_local(assignment_id: str) -> None:
     _mark_notified_local(f"{assignment_id}:needs-attention", EVENT_NEEDS_ATTENTION)
 
 
+# ── Atomic review-dispatch claim (#3113) ─────────────────────────────────────
+
+
+def claim_review_dispatch(of_assignment_id: str) -> bool:
+    """Atomically claim the right to dispatch a review for *of_assignment_id*.
+
+    Returns ``True`` when THIS call wins the claim (no other in-flight claim
+    exists for the same completed work assignment), ``False`` when another
+    caller already holds it.
+
+    ``dispatch_review``'s previous dedupe (``coord.claim.has_active_followup``)
+    read an in-memory ``Board`` snapshot — two coordinator passes racing each
+    other each read "no review in flight" from their own stale snapshot and
+    both dispatched a metered review for the same completed assignment (the
+    vimcode#804 incident: two reviews 3 seconds apart, both to the same
+    machine, $4.41 combined, with the *loser's* blocking findings never
+    reaching the fix worker). This is the DB-level conditional insert that
+    closes the gap: a single ``INSERT ... OR IGNORE`` is atomic even across
+    two separate processes/machines, so exactly one caller ever sees
+    ``rowcount > 0`` for a given ``of_assignment_id``.
+
+    Routes to the daemon when ``board_service`` is configured (the claim
+    table lives on the shared canonical DB, same as ``assignments``), else
+    writes the local DB directly.
+
+    Released by :func:`release_review_dispatch_claim` — call sites are
+    ``dispatch_review`` itself (every deny path after a successful claim) and
+    ``coord.issue_store._update_local_state`` (the review assignment's own
+    terminal-status write), so a legitimate later re-review of the same work
+    assignment (the ``coord review <id>`` escape hatch) is never permanently
+    stranded by a claim nothing will ever release.
+    """
+    if not of_assignment_id:
+        return True
+    svc = _board_service()
+    resp = _route_write(svc, "/review-claim", {"of_assignment_id": of_assignment_id})
+    if resp is not None:
+        return bool(resp.get("claimed", False))
+    return _claim_review_dispatch_local(of_assignment_id)
+
+
+def _claim_review_dispatch_local(of_assignment_id: str) -> bool:
+    """Local-DB write for :func:`claim_review_dispatch`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP — mirrors every other ``_*_local`` write in this module.
+    """
+    conn = get_connection()
+    cur = sql.insert_ignore(
+        conn, "review_claims", ["of_assignment_id", "claimed_at"],
+        (of_assignment_id, time.time()),
+    )
+    conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+def release_review_dispatch_claim(of_assignment_id: str) -> None:
+    """Release a claim taken by :func:`claim_review_dispatch`.
+
+    Idempotent — deleting an absent row is a no-op. Routes to the daemon
+    exactly like :func:`claim_review_dispatch` does: a thin client that
+    claimed via the ``/review-claim`` POST above must release through the
+    same seam, or the claim it took on the daemon's canonical DB would never
+    actually clear (a purely-local delete on the thin client would touch a
+    different, likely-empty, DB and silently no-op).
+    """
+    if not of_assignment_id:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/review-claim-release", {"of_assignment_id": of_assignment_id}
+    )
+    if resp is not None:
+        return
+    _release_review_dispatch_claim_local(of_assignment_id)
+
+
+def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
+    """Local-DB write for :func:`release_review_dispatch_claim`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP, and by ``coord.issue_store._update_local_state`` (which always runs
+    against whatever DB is local to that process — the canonical one, when
+    that process is the daemon or a non-thin-client host).
+    """
+    conn = get_connection()
+    sql.execute(conn, "DELETE FROM review_claims WHERE of_assignment_id=?", (of_assignment_id,))
+    conn.commit()
+
+
 # ── Review-findings tracking ──────────────────────────────────────────────────
 
 def update_assignment_review_findings(
@@ -7413,6 +7503,21 @@ def render_issue_context_entries(
     non-pinned notes newest-first, total capped at *max_entries* and the whole
     block char-capped.  Returns "" when there are no entries (caller omits the
     section).  Shared by the briefing read-path and ``coord context show``.
+
+    #3113: the char cap used to slice the joined block at a raw character
+    offset, which cuts clean through whichever entry straddles the cutoff —
+    including a ``source="review"`` entry, which carries a reviewer's
+    ``## Blocking findings`` section verbatim (#2466) and is the fix worker's
+    one authoritative record of what to fix. Two reviews racing for the same
+    work assignment (#3113's root cause) each add their own ``source="review"``
+    entry, and two full blocking sections routinely exceed this cap on their
+    own — the old behavior silently truncated one mid-word. Entries whose
+    ``source`` is ``"review"`` are therefore exempt from the char cap: they
+    always render in full; only non-review lines are eligible to be dropped
+    (oldest-selected-first) to bring the rest of the block back toward
+    *max_chars*. Order is otherwise unchanged from before this exemption
+    existed (pinned first, then notes newest-first) whenever no truncation is
+    needed at all — the overwhelmingly common case.
     """
     if not entries:
         return ""
@@ -7431,17 +7536,43 @@ def render_issue_context_entries(
         src = f"  _[{e['source']}]_" if e.get("source") else ""
         return f"- {tag}{(e.get('body') or '').strip()}{src}"
 
-    lines = [_fmt(e) for e in pinned] + [_fmt(e) for e in notes[:note_slots]]
-    dropped = len(notes) - note_slots
-    if dropped > 0:
-        lines.append(f"- _… {dropped} older note(s) trimmed — `coord context show` for all_")
+    # (entry, formatted line), in display order — pinned first, then the
+    # newest notes up to the max_entries budget.
+    selected = [(e, _fmt(e)) for e in pinned] + [(e, _fmt(e)) for e in notes[:note_slots]]
+    entries_dropped = max(0, len(notes) - note_slots)
+
+    lines = [line for _, line in selected]
     block = "\n".join(lines)
-    if len(block) > max_chars:
-        block = (
-            block[:max_chars].rstrip()
-            + "\n- _… (truncated — `coord context show` for full context)_"
+    if entries_dropped > 0:
+        marker = f"- _… {entries_dropped} older note(s) trimmed — `coord context show` for all_"
+        block = f"{block}\n{marker}" if block else marker
+
+    if len(block) <= max_chars:
+        return block
+
+    # Char-cap truncation is needed. Split into review-sourced (protected,
+    # always kept whole) vs everything else (eligible to be trimmed).
+    review_lines = [line for e, line in selected if e.get("source") == "review"]
+    other_lines = [line for e, line in selected if e.get("source") != "review"]
+    review_len = sum(len(x) + 1 for x in review_lines)  # +1 per joining newline
+    budget = max(0, max_chars - review_len)
+
+    kept_other: list[str] = []
+    used = 0
+    for line in other_lines:
+        needed = len(line) + 1
+        if used + needed > budget:
+            break
+        kept_other.append(line)
+        used += needed
+
+    total_dropped = entries_dropped + (len(other_lines) - len(kept_other))
+    final_lines = review_lines + kept_other
+    if total_dropped > 0:
+        final_lines.append(
+            f"- _… {total_dropped} older note(s) trimmed — `coord context show` for all_"
         )
-    return block
+    return "\n".join(final_lines)
 
 
 def render_issue_context(

@@ -482,6 +482,119 @@ def test_post_review_posted_idempotent(
     assert r1.status_code == 200 and r2.status_code == 200
 
 
+# ── #3113: atomic review-dispatch claim — daemon routing + endpoints ────────
+
+
+def test_claim_review_dispatch_routes_to_daemon(monkeypatch, coord_db) -> None:
+    """When board_service is set, the claim POSTs to /review-claim NOT the
+    local DB (mirrors test_update_review_findings_routes_to_daemon above)."""
+    from coord.state import claim_review_dispatch
+
+    captured: dict = {}
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc,
+        "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True, "claimed": True},
+    )
+
+    won = claim_review_dispatch("work-905")
+
+    assert won is True
+    assert captured["path"] == "/review-claim"
+    assert captured["payload"]["of_assignment_id"] == "work-905"
+    # Local DB must NOT have been written (empty local DB, thin-client).
+    row = get_connection().execute(
+        "SELECT 1 FROM review_claims WHERE of_assignment_id='work-905'"
+    ).fetchone()
+    assert row is None
+
+
+def test_release_review_dispatch_claim_routes_to_daemon(monkeypatch, coord_db) -> None:
+    """Release must route through the SAME daemon seam as claim — a
+    purely-local release on a thin client would touch the wrong (empty) DB
+    and silently no-op, leaving the daemon-held claim stuck forever."""
+    from coord.state import release_review_dispatch_claim
+
+    captured: dict = {}
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc,
+        "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+
+    release_review_dispatch_claim("work-905")
+
+    assert captured["path"] == "/review-claim-release"
+    assert captured["payload"]["of_assignment_id"] == "work-905"
+
+
+def test_claim_review_dispatch_writes_local_when_no_service(coord_db) -> None:
+    """Daemon host (no board_service): the claim writes to the local SQLite."""
+    from coord.state import claim_review_dispatch
+
+    assert claim_review_dispatch("work-local") is True
+    row = get_connection().execute(
+        "SELECT 1 FROM review_claims WHERE of_assignment_id='work-local'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_post_review_claim_endpoint_second_call_loses(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """POST /review-claim: first call wins (claimed=True), a second call for
+    the same of_assignment_id loses (claimed=False) — the daemon-side half
+    of the atomic race fix."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r1 = cli.post("/review-claim", json={"of_assignment_id": "work-abc"})
+        r2 = cli.post("/review-claim", json={"of_assignment_id": "work-abc"})
+
+    assert r1.status_code == 200 and r1.json()["claimed"] is True
+    assert r2.status_code == 200 and r2.json()["claimed"] is False
+
+
+def test_post_review_claim_endpoint_missing_field_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/review-claim", json={})
+    assert resp.status_code == 400
+
+
+def test_post_review_claim_release_endpoint_allows_reclaim(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """POST /review-claim-release frees a claim so a later /review-claim for
+    the same of_assignment_id wins again."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        first = cli.post("/review-claim", json={"of_assignment_id": "work-def"})
+        assert first.json()["claimed"] is True
+
+        released = cli.post(
+            "/review-claim-release", json={"of_assignment_id": "work-def"}
+        )
+        assert released.status_code == 200
+
+        reclaimed = cli.post("/review-claim", json={"of_assignment_id": "work-def"})
+    assert reclaimed.json()["claimed"] is True
+
+
+def test_post_review_claim_release_endpoint_missing_field_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/review-claim-release", json={})
+    assert resp.status_code == 400
+
+
 # ── request-changes persists correctly ───────────────────────────────────────
 
 
