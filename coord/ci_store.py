@@ -74,12 +74,41 @@ class JobRun:
     (same name, fetched via ``gh api repos/{repo}/actions/runs/{id}/jobs``)
     with its steps. ``runner_name`` is empty when GitHub never assigned this
     job a runner at all — the "cancelled at the queue timeout" signature.
+
+    ``job_id`` (#3114) is the numeric Actions job id — distinct from both
+    the check's own id and the run id it belongs to — needed to fetch this
+    job's own log text (``gh api repos/{repo}/actions/jobs/{id}/logs``, see
+    :func:`coord.github_ops.get_job_log`). Defaults to ``""`` so every
+    pre-#3114 ``JobRun(...)`` construction (all keyword-based; see
+    :meth:`coord.ci_github.GitHubCi._fetch_jobs`) keeps working unchanged.
     """
 
     name: str
     conclusion: str | None
     runner_name: str
     steps: list[JobStep] = field(default_factory=list)
+    job_id: str = ""
+
+
+@dataclass
+class CIFailureDetail:
+    """Structured detail behind a CONFIRMED CI failure (#3114) — the failing
+    job/step/log-excerpt a ci-fix briefing can use in place of a bare
+    ``checks_summary`` one-liner.
+
+    Built by :func:`coord.ci_github.build_ci_failure_detail`, which is
+    best-effort throughout: any field below can come back empty when the
+    underlying data wasn't available (no job matched the check, the log
+    fetch failed/was throttled, ...) — a caller must treat an all-empty
+    instance the same as "no detail", not as evidence of anything.
+    """
+
+    check_name: str
+    job_name: str = ""
+    step_name: str = ""
+    log_excerpt: str = ""
+    run_url: str = ""
+    truncated: bool = False
 
 
 @dataclass

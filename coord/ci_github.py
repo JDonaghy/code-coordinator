@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
-from coord.ci_store import CheckRun, JobRun, JobStep, failed_checks
+from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep, failed_checks
 from coord.forge_availability import record_ci_check_fetch
 
 
@@ -66,6 +66,109 @@ _BUCKET_CONCLUSIONS: dict[str, str] = {
 # `coord/ci_store.py`), so fixing the extraction here has no back-compat
 # concern.
 _RUN_ID_RE = re.compile(r"/runs/(\d+)")
+
+
+# #3114: bound on the log excerpt threaded into a ci-fix briefing — "last
+# ~200 lines or ~8KB, whichever is smaller" per the issue's fix shape. A
+# fetched job log can run to many MB; a briefing is a chat message, not a
+# log viewer, and a worker that needs more than this can still read the
+# full log itself (see `build_ci_failure_detail`'s `run_url`).
+CI_FIX_LOG_MAX_LINES = 200
+CI_FIX_LOG_MAX_BYTES = 8192
+
+
+def _bound_log_excerpt(text: str) -> tuple[str, bool]:
+    """Truncate *text* to the last :data:`CI_FIX_LOG_MAX_LINES` lines AND
+    :data:`CI_FIX_LOG_MAX_BYTES` bytes, whichever is smaller (#3114).
+
+    Returns ``(excerpt, truncated)`` — *truncated* is ``True`` iff either
+    bound actually cut something, so the caller can make the cut visible in
+    the briefing text rather than silently handing over a partial log.
+    """
+    lines = text.splitlines()
+    truncated = False
+    if len(lines) > CI_FIX_LOG_MAX_LINES:
+        lines = lines[-CI_FIX_LOG_MAX_LINES:]
+        truncated = True
+    excerpt = "\n".join(lines)
+    encoded = excerpt.encode("utf-8", errors="replace")
+    if len(encoded) > CI_FIX_LOG_MAX_BYTES:
+        encoded = encoded[-CI_FIX_LOG_MAX_BYTES:]
+        excerpt = encoded.decode("utf-8", errors="replace")
+        truncated = True
+    return excerpt, truncated
+
+
+def _failing_step(job: JobRun) -> JobStep | None:
+    """First step of *job* whose conclusion isn't affirmatively benign —
+    mirrors :class:`coord.ci_store.CheckRun`'s own success/skipped/neutral
+    allow-list (#1525's fail-closed posture), one level down."""
+    return next(
+        (s for s in job.steps if s.conclusion not in (None, "success", "skipped", "neutral")),
+        None,
+    )
+
+
+def build_ci_failure_detail(
+    ci_store: object, repo: str, pr_number: int,
+) -> CIFailureDetail | None:
+    """Best-effort structured detail behind a CONFIRMED CI failure (#3114):
+    the failing job name, failing step name, a bounded log excerpt, and the
+    run URL — the detail a ci-fix briefing used to lack entirely (see the
+    issue's evidence: a worker had to spend 82 turns rediscovering a
+    one-line fix the coordinator already had ``list_jobs_for_run`` data for).
+
+    Only ever called once, at CI-fix dispatch time (``coord.commands.merge.
+    _dispatch_ci_fixes``) — never on the polling path, the same scoping
+    ``coord.merge_queue._ci_infra_reason`` already established for
+    :meth:`~coord.ci_store.CiStore.list_jobs_for_run`. *ci_store* is
+    duck-typed (not annotated as :class:`coord.ci_store.CiStore` to avoid an
+    import cycle) — anything exposing ``list_checks_for_pr``/
+    ``list_jobs_for_run`` works, matching how ``_ci_infra_reason`` treats it.
+
+    Fails soft throughout, same false-negative bias as
+    :func:`coord.merge_queue._ci_infra_reason`: returns ``None`` when there
+    is no completed failing check, no job matched the failing check, or ANY
+    read along the way raises (a throttled/rate-limited ``gh``, a malformed
+    job id, a missing method on a duck-typed stub, ...). The caller falls
+    back to the plain ``checks_summary`` text exactly as if this function
+    didn't exist — this is enrichment, never a dispatch precondition.
+    """
+    try:
+        checks = ci_store.list_checks_for_pr(repo, pr_number)
+        failed = failed_checks(checks)
+        if not failed:
+            return None
+        check = next((c for c in failed if c.run_id), failed[0])
+        job: JobRun | None = None
+        if check.run_id:
+            jobs = ci_store.list_jobs_for_run(repo, check.run_id) or []
+            job = next((j for j in jobs if j.name == check.name), None)
+            if job is None and len(jobs) == 1:
+                job = jobs[0]
+        step = _failing_step(job) if job is not None else None
+        log_excerpt = ""
+        truncated = False
+        if job is not None and job.job_id:
+            raw_log = github_ops.get_job_log(repo, job.job_id)
+            log_excerpt, truncated = _bound_log_excerpt(raw_log)
+        run_url = check.url or (
+            f"https://github.com/{repo}/actions/runs/{check.run_id}"
+            if check.run_id else ""
+        )
+        return CIFailureDetail(
+            check_name=check.name,
+            job_name=job.name if job is not None else "",
+            step_name=step.name if step is not None else "",
+            log_excerpt=log_excerpt,
+            run_url=run_url,
+            truncated=truncated,
+        )
+    except Exception:  # noqa: BLE001 — best-effort enrichment (#3114), same
+        # posture as `_ci_infra_reason`'s classification-only catch: a
+        # throttled/rate-limited/malformed read here must degrade to "no
+        # detail available", never block or delay the actual dispatch.
+        return None
 
 
 def _run_id_from_link(link: str) -> str:
@@ -376,6 +479,7 @@ class GitHubCi:
                     conclusion=entry.get("conclusion"),
                     runner_name=str(entry.get("runner_name") or ""),
                     steps=steps,
+                    job_id=str(entry.get("id", "") or ""),
                 )
             )
         return jobs
