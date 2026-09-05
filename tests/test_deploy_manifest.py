@@ -84,6 +84,23 @@ def test_doc_table_matches_manifest() -> None:
     assert doc_units == set(all_manifest_units())
 
 
+def test_dr_verify_timer_is_registered_on_the_daemon_host() -> None:
+    """#3119: the DR-verify lane is only worth building if a rebuilt daemon
+    host is *told* it exists.
+
+    The unit itself is the easy half; being in the manifest (and, through the
+    cross-checks above, in the doc table and `deploy/`) is what stops it from
+    becoming the folklore #2098 exists to kill — and what makes
+    `unit_enablement` WARN when it is installed but not enabled, which is the
+    exact state that hid the propagate timer.
+    """
+    assert "coord-dr-verify.timer" in units_for_role(ROLE_DAEMON)
+    assert "coord-dr-verify.timer" not in units_for_role(ROLE_WORKER)
+    # The timer, never the oneshot it fires: enabling the .service wires
+    # nothing into timers.target.wants/ (see deploy_manifest's docstring).
+    assert "coord-dr-verify.service" not in all_manifest_units()
+
+
 def test_doc_table_roles_match_manifest() -> None:
     doc_roles = _doc_table_units()
     for name, role_text in doc_roles.items():

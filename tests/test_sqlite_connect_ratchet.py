@@ -191,6 +191,25 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "test_deploy_coord_db_backup.py directly above, and filed A alongside "
         "it.",
     ),
+    "test_dr_verify.py": Classification(
+        3, (BUCKET_A,),
+        "#3119's DR-verify lane — the restore half of test_backup.py directly "
+        "above, and filed A for the same reason. All three sites build or "
+        "mutate a real on-disk SQLite *file* that is then snapshotted, "
+        "uploaded through a fake restic and restored: make_store() writes the "
+        "live schema to a path (the whole lane is about a file that leaves the "
+        "machine and comes back), and the other two hollow out `assignments` / "
+        "rewind `schema_version` in a copy to manufacture the two "
+        "restores-cleanly-but-is-not-a-recovery cases the acceptance criteria "
+        "name. The autouse coord_db fixture cannot serve any of them — there "
+        "is no file to restic — and scratch_database() is out for the usual "
+        "backend-following reason: under COORD_TEST_BACKEND=postgres these "
+        "would be asserting about a database with no integrity_check and no "
+        "`schema_version` file to rewind. The Postgres arm of this lane "
+        "(pg_restore --list, and the refusal to claim recovery it cannot "
+        "prove) is tested through a monkeypatched backend and adds no site "
+        "here.",
+    ),
     "test_test_orchestrator.py": Classification(
         2, (BUCKET_A,),
         "Judgement call: _migrate_add_columns idempotency + PRAGMA "

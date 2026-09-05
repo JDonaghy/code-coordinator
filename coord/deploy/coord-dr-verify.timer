@@ -1,0 +1,39 @@
+# Fires coord-dr-verify.service every 6 hours — the lane that proves the
+# OFF-SITE backup actually restores (#3119, rung D2 of #3117). See that unit's
+# header for the full rationale, the five checks, credential handling and the
+# alerting/failure-domain design.
+#
+# WHY 6h AND NOT HOURLY. coord-backup.timer is hourly because a push is a
+# ~megabyte incremental. A verify is the opposite shape: it downloads and
+# materialises the whole snapshot, then boots a daemon against it. Running it
+# on the backup's cadence would spend real bandwidth and real CPU on the
+# daemon host to re-answer a question whose answer changes rarely. 6h keeps
+# four independent proofs a day while sitting comfortably inside the 12h
+# staleness window ($COORD_DR_VERIFY_MAX_AGE_HOURS) — so a single missed fire
+# does not page, but a lane that has actually stopped does, within one window.
+#
+# OnBootSec is deliberately later than coord-backup.timer's 15min: on a cold
+# boot the push lane should get an off-site copy of the current state up
+# BEFORE the verify lane starts pulling one down, and staggering keeps a
+# restore's disk I/O off the same tick as a VACUUM INTO.
+#
+# Persistent=true: after an outage the gap is the riskiest window there is —
+# catch the missed verify up immediately rather than waiting up to 6h to find
+# out the backup taken during the incident does not restore.
+#
+# RandomizedDelaySec spreads it off the top of the hour so it does not contend
+# with coord-backup, coord-db-backup, coord-notify and coord-drive-queue all
+# firing on the same tick.
+
+[Unit]
+Description=Prove the off-site coordinator backup restores, every 6h (#3119)
+
+[Timer]
+OnBootSec=45min
+OnUnitActiveSec=6h
+AccuracySec=5min
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
