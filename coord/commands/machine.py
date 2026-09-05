@@ -49,6 +49,11 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.commands.repo import _guard_settings_fresh, _resolve_write_target
 from coord.fleet_config_health import TRACKED_CONFIG_REL, default_settings_dir
 
+# #3137: `--role`'s vocabulary is #3128's, routed through machine_onboard's
+# role->checks table so the flag can never offer a role the report cannot
+# actually grade against.
+from coord.machine_onboard import ROLE_IDENTITY_CHECKS
+
 
 @click.group(
     "machine",
@@ -396,8 +401,10 @@ def _print_add_residue(
     help=(
         "Probe all onboarding layers for a machine and report per-layer "
         "status: config, network (does `host:` reach THIS machine?), agent "
-        "(live /health), repo clones, graph, and runtime (the agent's venv "
-        "and whether it survives logout). Reads LIVE state, not config. "
+        "(live /health), repo clones, graph, runtime (the agent's venv and "
+        "whether it survives logout), toolchain (is each capability's tool "
+        "installed, current, and on the AGENT's PATH?) and identity (does it "
+        "hold the credentials its role needs?). Reads LIVE state, not config. "
         "Exits non-zero on any CRIT so it can gate."
     ),
 )
@@ -410,9 +417,21 @@ def _print_add_residue(
 @click.option(
     "--ssh/--no-ssh", "probe_ssh", default=False, show_default=True,
     help=(
-        "Also SSH in to check systemd linger — the one thing /health cannot "
-        "see, because an agent answering a probe only proves the user manager "
-        "is up right now."
+        "Also SSH in for everything /health structurally cannot see: systemd "
+        "linger, the worker-shaped PATH, the LOGIN shell's view of each tool "
+        "(the other half of the #1671 comparison), this host's own role "
+        "declaration, and the layer-8 identity probes. Without it those all "
+        "read UNKNOWN — never a pass."
+    ),
+)
+@click.option(
+    "--role", "role_override", default=None,
+    type=click.Choice(sorted(ROLE_IDENTITY_CHECKS)),
+    help=(
+        "Grade this machine against ROLE instead of the role it declares in "
+        "~/.coord/role (#3128). Answers 'what would this host be missing if it "
+        "were the daemon?' without touching the host. Default: the host's own "
+        "declaration, read over --ssh; absent that, #3128's `worker` default."
     ),
 )
 @click.option(
@@ -430,6 +449,7 @@ def machine_doctor(  # noqa: PLR0913 — one option per thing the command can do
     probe_ssh: bool,  # noqa: FBT001
     ssh_timeout: float,
     verbose: bool,  # noqa: FBT001
+    role_override: str | None,
 ) -> None:
     from coord import machine_onboard, network  # noqa: PLC0415
     from coord.network import check_all  # noqa: PLC0415
@@ -461,6 +481,7 @@ def machine_doctor(  # noqa: PLR0913 — one option per thing the command can do
         ts_map=network.tailscale_ip_map(timeout=timeout) or {},
         probe_ssh=probe_ssh,
         ssh_timeout=ssh_timeout,
+        role_override=role_override,
     )
     report = machine_onboard.evaluate(facts)
     for line in machine_onboard.format_report(report, verbose=verbose):
@@ -471,6 +492,13 @@ def machine_doctor(  # noqa: PLR0913 — one option per thing the command can do
             "  → systemd linger was NOT checked (/health cannot see it). "
             f"Re-run with --ssh, or `ssh {facts.host} 'loginctl show-user "
             "\"$USER\" --property=Linger'`."
+        )
+        click.echo(
+            "  → layers 7-8 are PARTIAL without --ssh: the login-shell PATH "
+            "(which is what tells the #1671 'installed but invisible to the "
+            "agent' trap apart from a genuinely missing tool), this host's own "
+            "role declaration, and every identity probe all need it. They read "
+            "UNKNOWN above, never a pass."
         )
     if not report.ok:
         sys.exit(1)
