@@ -965,6 +965,28 @@ def test_toolchain_is_unknown_not_ok_when_no_agent_answered():
     assert [f.severity for f in findings] == [UNKNOWN]
 
 
+def test_role_tool_missing_still_fires_when_the_agent_is_unreachable():
+    """The review-blocking regression: a daemon host straight off a fresh OS
+    install has SSH up but coord-agent not yet running (#3137's own
+    motivating scenario — "dellserver ... rebuilt from a fresh OS"). The
+    capability/version verdicts genuinely need /health and cannot be
+    produced without it, but the role-tool check (restic on a daemon) is
+    gathered entirely over SSH via `facts.shell_probed` /
+    `facts.login_path_tools` and has nothing to do with agent reachability.
+    Dropping it here would silently swallow the exact restic CRIT the whole
+    layer was written to surface."""
+    facts = _tc_facts(
+        reachable=False, role="daemon", role_source="file",
+        shell_probed=True, login_path_tools={"restic": None},
+    )
+    findings = machine_onboard.evaluate_toolchain(facts)
+    assert _find(findings, "toolchain.unprobed").severity == UNKNOWN
+    restic = _find(findings, "toolchain.role_tool_missing")
+    assert restic is not None
+    assert restic.severity == CRIT
+    assert restic.subject == "restic"
+
+
 # ── Acceptance 3: the forge token, and the role that decides its bar ───────
 
 
@@ -1308,6 +1330,32 @@ def test_the_shell_probe_script_runs_end_to_end_without_touching_a_credential(
     )
     assert "--show-token" not in joined_calls
     assert "sk-ant-oat01-x" not in out
+
+
+def test_probe_machine_shell_redacts_the_exception_branch_too(monkeypatch):
+    """The module's own stated invariant is that every free-form reason that
+    survives into a Finding goes through `redact` as a second, independent
+    line of defence — but the `except (OSError, subprocess.SubprocessError)`
+    branch in `probe_machine_shell` built its `ShellProbe(error=...)` straight
+    from `str(exc)`, unlike the non-zero-exit branch two lines below it. Not
+    exploitable today (these exceptions' string forms don't carry command
+    output), but it's a real gap in defense-in-depth the moment the except
+    clause is broadened or what's captured changes — so assert the redactor
+    runs here too, over an exception message that is deliberately
+    secret-shaped."""
+    import subprocess as _subprocess
+
+    def fake_run(*a, **k):
+        raise OSError(f"connect failed, cached key {SECRETS[0]}")
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    probe = machine_onboard.probe_machine_shell(
+        "dead-host", binaries=["cargo"], repo_slug=None, timeout=1.0,
+    )
+    assert probe.error is not None
+    assert SECRETS[0] not in probe.error
+    assert machine_onboard.REDACTED in probe.error
 
 
 def test_an_unparseable_probe_is_an_error_not_a_clean_bill():
