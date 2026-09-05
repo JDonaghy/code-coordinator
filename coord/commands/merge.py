@@ -33,7 +33,7 @@ def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
     return target.machine_name if target is not None else None
 
 
-def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
+def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool, skip_review: bool = False):
     """#1769: the ``--revalidate`` arm for the merge lane.
 
     Finds the entries in *items* blocked **solely** on a stale-but-``passed``
@@ -41,6 +41,14 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
     whole eligibility policy — review/CI/conflict/missing-verdict blocks are
     never touched), re-tests them against the current base, and lets
     :func:`coord.merge_queue.process` re-evaluate afterwards.
+
+    #3107: *skip_review* is forwarded to
+    :func:`coord.merge_queue.revalidation_candidates` unchanged, so an entry
+    this same run already waived the review gate for (``--skip-review``) is
+    evaluated as blocked *solely* on staleness rather than on the review
+    finding the waiver already disposed of. Without this, ``--skip-review
+    --revalidate`` together on one entry printed the waiver and then refused
+    to revalidate anyway — the predicate below never saw the waiver.
 
     Batch (#1715): candidates are grouped by ``(repo, target_branch)`` and each
     group is composed onto its current base and validated by ONE suite run —
@@ -63,7 +71,9 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
     from coord import merge_queue as _mq  # noqa: PLC0415
     from coord import revalidate as _rv  # noqa: PLC0415
 
-    candidates = _mq.revalidation_candidates(items, board, config, gh_ops)
+    candidates = _mq.revalidation_candidates(
+        items, board, config, gh_ops, skip_review=skip_review,
+    )
     if not candidates:
         click.echo(
             "  --revalidate: no entry is blocked solely on a stale test "
@@ -2237,6 +2247,7 @@ def merge(
         if revalidate and not skip_smoke:
             board_only = _apply_revalidation(
                 only_items, board_only, cfg_only, gh_ops, dry_run=dry_run,
+                skip_review=skip_review,
             )
         # #1851: CI staleness is a separate gate from the local smoke
         # verdict — always run under --revalidate, independent of
@@ -2685,7 +2696,9 @@ def merge(
     # asked for it — with no `--revalidate` this block does not run at all and
     # `coord merge` behaves byte-identically to before.
     if revalidate and not skip_smoke:
-        board = _apply_revalidation(pending, board, cfg, gh_ops, dry_run=dry_run)
+        board = _apply_revalidation(
+            pending, board, cfg, gh_ops, dry_run=dry_run, skip_review=skip_review,
+        )
     # #1851: CI staleness is a separate gate from the local smoke verdict —
     # always run under --revalidate, independent of --skip-smoke (which
     # waives the smoke gate specifically, not CI).
