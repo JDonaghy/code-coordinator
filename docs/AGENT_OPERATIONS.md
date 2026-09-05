@@ -342,6 +342,11 @@ failures.
 | the daemon units from `ROLE_UNITS[daemon]`, `backup.env`, restic, the SSD | | | ✓ |
 | **gate: `coord machine doctor --ssh -v --role <worker\|daemon>`** | ✓ | ✓ | ✓ |
 
+The store phase's SSD mount check defaults to `/media/crucial` — the same mountpoint
+`coord/deploy/coord-db-backup.sh` hardcodes and the backup table above documents — via
+`$COORD_PROVISION_BACKUP_MOUNT`. **Only override it if a given `--role server` host's SSD is
+genuinely mounted somewhere else**; the default is the real production path, not a placeholder.
+
 Four things about it are load-bearing:
 
 **The contract is the doctor, not the phase count.** The script ends by running `coord machine
@@ -372,8 +377,8 @@ gate clean. Registering it with nothing to run is what keeps the board from rout
 Ubuntu-only. On a Mac the seam is launchd rather than systemd
 ([`MAC_MINI.md`](MAC_MINI.md)); under WSL see [`WSL_WINDOWS_WORKER.md`](WSL_WINDOWS_WORKER.md).
 And rebuilding a daemon *host* is not restoring the daemon's *data*: `coord.db` comes back via
-[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md) / `coord dr promote`, which the script points at and
-deliberately does not duplicate.
+`docs/DISASTER_RECOVERY.md` (landing separately via #3117; not yet merged as of this section) and
+`coord dr promote` (#3129), which the script points at and deliberately does not duplicate.
 
 ## Install a new agent (first time)
 

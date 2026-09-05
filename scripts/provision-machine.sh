@@ -87,7 +87,12 @@ COORD_DIR="${COORD_PROVISION_COORD_DIR:-$HOME/.coord}"
 SETTINGS_DIR="${COORD_SETTINGS_DIR:-$HOME/src/coord-settings}"
 SRC_DIR="${COORD_PROVISION_SRC_DIR:-$HOME/src}"
 SYSTEMD_USER_DIR="${COORD_PROVISION_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
-BACKUP_MOUNT="${COORD_PROVISION_BACKUP_MOUNT:-/mnt/coord-ssd}"
+# The documented production mountpoint (docs/AGENT_OPERATIONS.md's backup
+# table, "target: /media/crucial/coord-backups/") is what
+# coord/deploy/coord-db-backup.sh (unchanged by this script) hardcodes, so
+# THAT is the default here too — not a placeholder path. Override only if a
+# given host's SSD is genuinely mounted somewhere else.
+BACKUP_MOUNT="${COORD_PROVISION_BACKUP_MOUNT:-/media/crucial}"
 
 # coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION — the same floor
 # scripts/azure-workers/provision-worker.sh enforces, for the same reason: a
@@ -166,17 +171,39 @@ usage: provision-machine.sh --role thin-client|worker|server [options]
 The script ends by running `coord machine doctor <machine> --ssh -v --role
 <worker|daemon>` and exits non-zero if it is not clean. That verdict is the
 whole contract; there is no flag to skip it.
+
+Environment overrides (only needed on a host whose layout differs from the
+documented production one):
+
+  COORD_PROVISION_BACKUP_MOUNT   --role server only. Where the daemon's
+                                 external backup SSD is mounted. Defaults to
+                                 /media/crucial, the mountpoint
+                                 coord/deploy/coord-db-backup.sh and
+                                 docs/AGENT_OPERATIONS.md already document —
+                                 override this ONLY if a given host's SSD is
+                                 genuinely mounted somewhere else, not as a
+                                 matter of course.
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --role)         ROLE="${2:-}"; shift 2 ;;
-        --machine)      MACHINE_NAME="${2:-}"; shift 2 ;;
-        --host)         HOST_NAME="${2:-}"; shift 2 ;;
-        --capabilities) CAPABILITIES="${2:-}"; shift 2 ;;
-        --repos)        REPOS="${2:-}"; shift 2 ;;
-        --port)         AGENT_PORT="${2:-}"; shift 2 ;;
+        # A value-taking flag with nothing after it (e.g. a bare trailing
+        # `--role`) must not reach `shift 2` with only one positional
+        # parameter left: bash's `shift` then fails outright and, under
+        # `set -e`, aborts with its own unhelpful message instead of the
+        # usage/die text below.
+        --role|--machine|--host|--capabilities|--repos|--port)
+            [[ $# -ge 2 ]] || { usage >&2; die "$1 requires a value"; }
+            ;;
+    esac
+    case "$1" in
+        --role)         ROLE="$2"; shift 2 ;;
+        --machine)      MACHINE_NAME="$2"; shift 2 ;;
+        --host)         HOST_NAME="$2"; shift 2 ;;
+        --capabilities) CAPABILITIES="$2"; shift 2 ;;
+        --repos)        REPOS="$2"; shift 2 ;;
+        --port)         AGENT_PORT="$2"; shift 2 ;;
         --yes|-y)       ASSUME_YES=1; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -243,6 +270,21 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Run once per invocation: `apt-get install` against a stale/empty package
+# index can fail with "unable to locate package" for reasons that have
+# nothing to do with the real problem, on a fresh image where every
+# BASE_REQUIREMENTS tool is already present (so phase_base_packages never ran
+# its own `apt-get update`) but the index itself was never refreshed. Every
+# later `apt-get install` in this script — restic, gh's own repo, gtk4, the
+# browser pair — goes through this instead of calling `apt-get update` (or
+# skipping it) on its own.
+APT_UPDATED=0
+apt_update_once() {
+    [[ $APT_UPDATED -eq 1 ]] && return 0
+    sudo apt-get update -qq
+    APT_UPDATED=1
+}
 
 # `coord` from the venv this script installs, never whatever is on PATH: on a
 # fresh box there is nothing on PATH, and after `install-agent.sh` the shim in
@@ -351,8 +393,10 @@ phase_base_packages() {
     if [[ ${#missing[@]} -eq 0 ]]; then
         unchanged "all base packages present"
     else
-        sudo apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends "${missing[@]}"
+        apt_update_once
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends "${missing[@]}" \
+            || die "apt-get install failed for: ${missing[*]} — check apt sources/network and re-run
+(this script is safe to re-run from the top)."
         changed "installed base packages: ${missing[*]}"
         # #2096: confirm AFTER the action. apt exiting 0 is not evidence the
         # tool resolves — a held package, a wrong suite, or a rename all exit
@@ -396,8 +440,14 @@ phase_cred_tools() {
         sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
         printf 'deb [arch=%s signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
             "$(dpkg --print-architecture)" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+        # A forced update, not apt_update_once: a source list just changed, so
+        # a prior update in this run (e.g. from phase_base_packages) does not
+        # cover the new repo's index.
         sudo apt-get update -qq
-        sudo apt-get install -y -qq gh
+        APT_UPDATED=1
+        sudo apt-get install -y -qq gh \
+            || die "apt-get install gh failed — check the github-cli apt source and network,
+then re-run (this script is safe to re-run from the top)."
         gh_ver="$(gh --version 2>/dev/null | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
         [[ -n "$gh_ver" ]] || die "gh install reported success but 'gh --version' produced nothing"
         [[ "$(printf '%s\n%s\n' "$GH_MIN_VERSION" "$gh_ver" | sort -V | head -1)" == "$GH_MIN_VERSION" ]] \
@@ -704,7 +754,10 @@ accepts work and fails on the first task."
         if have restic; then
             unchanged "restic $(restic version 2>/dev/null | head -1)"
         else
-            sudo apt-get install -y -qq restic
+            apt_update_once
+            sudo apt-get install -y -qq restic \
+                || die "apt-get install restic failed — check apt sources/network and re-run
+(this script is safe to re-run from the top)."
             have restic || die "restic install reported success but the binary is not on PATH.
 A daemon without it fails toolchain.role_tool_missing and the DR lane is dead."
             changed "installed restic"
@@ -860,7 +913,10 @@ Finding cargo without rustc is the exact false-green #1671 documents."
                 if pkg-config --exists gtk4 2>/dev/null; then
                     unchanged "gtk4 $(pkg-config --modversion gtk4)"
                 else
-                    sudo apt-get install -y -qq --no-install-recommends libgtk-4-dev
+                    apt_update_once
+                    sudo apt-get install -y -qq --no-install-recommends libgtk-4-dev \
+                        || die "apt-get install libgtk-4-dev failed — check apt sources/network
+and re-run (this script is safe to re-run from the top)."
                     pkg-config --exists gtk4 2>/dev/null \
                         || die "libgtk-4-dev installed but pkg-config cannot see gtk4"
                     changed "installed gtk4 $(pkg-config --modversion gtk4)"
@@ -869,8 +925,11 @@ Finding cargo without rustc is the exact false-green #1671 documents."
                 if have chromium || have chromium-browser || have google-chrome; then
                     unchanged "a browser is present"
                 else
+                    apt_update_once
                     sudo apt-get install -y -qq --no-install-recommends chromium-browser \
-                        || sudo apt-get install -y -qq --no-install-recommends chromium
+                        || sudo apt-get install -y -qq --no-install-recommends chromium \
+                        || die "apt-get install of both chromium-browser and chromium failed —
+check apt sources/network and re-run (this script is safe to re-run from the top)."
                     have chromium || have chromium-browser \
                         || die "browser install reported success but no chromium binary is on PATH.
 The 'browser' capability reading unmet is what makes webapp Test stages retry
@@ -1041,7 +1100,7 @@ phase_store() {
     cat <<EOF
 
     This host is now a daemon HOST. It is not yet the daemon's DATA.
-    Restoring coord.db is docs/DISASTER_RECOVERY.md + #3129
+    Restoring coord.db is docs/DISASTER_RECOVERY.md (landing via #3117) + #3129
     ('coord dr promote'), deliberately not duplicated here:
 
       coord dr status                 # is there a verified off-site snapshot?
