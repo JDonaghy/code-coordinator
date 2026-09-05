@@ -2428,6 +2428,125 @@ def test_dispatch_review_records_to_dispatched_ledger(
     assert records[0]["machine_name"] == "server"
 
 
+# ── #3113: atomic review-dispatch claim ──────────────────────────────────────
+
+
+def test_dispatch_review_second_racing_call_loses_the_claim(
+    two_machine_config: Config, coord_db,
+) -> None:
+    """Simulates two coordinator passes racing `dispatch_review` for the SAME
+    completed assignment, each holding its OWN board snapshot that has not
+    yet observed the other's dispatch — the vimcode#804 incident: two reviews
+    dispatched 3 seconds apart, both to the same machine, for $4.41 combined.
+
+    Before #3113, `has_active_followup` read the in-memory `board` argument
+    only, so two calls each passed an empty `Board()` (a stale snapshot
+    unaware of the other) would BOTH see "no review in flight" and BOTH
+    dispatch — reproducing the incident. The atomic DB-level claim now makes
+    the second call lose deterministically even though its own board
+    snapshot still looks empty.
+    """
+    completed = _completed_assignment(machine="laptop")
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 1, "url": "https://github.com/acme/api/pull/1", "existed": True}
+
+    first = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-race-1"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+    assert first is not None
+
+    # A second, independent call for the SAME completed assignment, racing
+    # the first with its own fresh (stale) board snapshot.
+    second = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-race-2"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+    assert second is None
+    assert "atomic dispatch-claim race" in (completed.review_dispatch_reason or "")
+
+
+def test_dispatch_review_releases_claim_when_all_candidates_rejected(
+    two_machine_config: Config, coord_db,
+) -> None:
+    """A denial AFTER the claim is taken (here: every reviewer candidate 400s)
+    must release it — otherwise a transient/config-drift failure would
+    permanently strand this work assignment's review dispatch behind a claim
+    nothing else will ever clear."""
+    completed = _completed_assignment(machine="laptop")
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 1, "url": "https://github.com/acme/api/pull/1", "existed": True}
+
+    denied = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_AllRejectingClient(),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=lambda host: None,
+    )
+    assert denied is None
+    assert completed.review_state == "no_eligible_reviewer"
+
+    # Retried (e.g. after an operator fixes the agent's repos list) with a
+    # fresh board snapshot — must succeed, proving the claim was released.
+    retried = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-retry-1"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+    assert retried is not None
+
+
+def test_dispatch_review_releases_claim_on_early_deny_path(
+    two_machine_config: Config, coord_db,
+) -> None:
+    """A denial from an early guard (here: the #1534 zero-commit gate) must
+    also release the claim — every `_deny(...)` path after the claim is taken
+    releases it, not just the candidate-exhaustion tail."""
+    completed = _completed_assignment(machine="laptop")
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 1, "url": "https://github.com/acme/api/pull/1", "existed": True}
+
+    denied = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "unused"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        commits_ahead_checker=lambda repo_github, base, branch: 0,
+    )
+    assert denied is None
+    assert completed.review_state == "zero_commits"
+
+    retried = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-retry-2"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        commits_ahead_checker=lambda repo_github, base, branch: 1,
+    )
+    assert retried is not None
+
+
 # ── #1476: scoped re-review ──────────────────────────────────────────────────
 
 

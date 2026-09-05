@@ -3998,3 +3998,114 @@ class TestListIssueNumbersWithAssignmentsOnRealPostgres:
         finally:
             monkeypatch.undo()
             session.close()
+
+
+# ── #3113: atomic review-dispatch claim ─────────────────────────────────────
+
+
+class TestReviewDispatchClaim:
+    """`claim_review_dispatch` / `release_review_dispatch_claim`: the
+    DB-level conditional insert that replaced `dispatch_review`'s old
+    board-snapshot dedupe (`coord.claim.has_active_followup`), which raced —
+    two coordinator passes each reading "no review in flight" from their own
+    stale snapshot both dispatched a metered review for the same completed
+    assignment (the vimcode#804 incident)."""
+
+    def test_second_claim_for_the_same_assignment_loses(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        # Same DB, same key — simulates a second, concurrent dispatch_review
+        # call racing the first: it must lose deterministically.
+        assert state.claim_review_dispatch("w1") is False
+
+    def test_claims_for_different_assignments_both_win(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        assert state.claim_review_dispatch("w2") is True
+
+    def test_release_then_reclaim_succeeds(self, coord_db) -> None:
+        """A legitimate later re-review of the same work assignment (the
+        `coord review <id>` escape hatch) must not be permanently stranded
+        once the first review concludes and releases its claim."""
+        assert state.claim_review_dispatch("w1") is True
+        state.release_review_dispatch_claim("w1")
+        assert state.claim_review_dispatch("w1") is True
+
+    def test_release_is_idempotent(self, coord_db) -> None:
+        state.release_review_dispatch_claim("never-claimed")  # must not raise
+        assert state.claim_review_dispatch("never-claimed") is True
+
+    def test_empty_assignment_id_always_wins(self, coord_db) -> None:
+        # Mirrors coord.claim.has_active_followup's own `of_assignment_id is
+        # None` short-circuit — nothing to key a claim on, so never block.
+        assert state.claim_review_dispatch("") is True
+        assert state.claim_review_dispatch("") is True
+
+
+# ── #3113: render_issue_context_entries exempts review findings from the
+#    block-level char cap ───────────────────────────────────────────────────
+
+
+class TestRenderIssueContextReviewFindingsExemption:
+    def test_two_full_size_review_sections_both_survive_uncut(self) -> None:
+        """#2466 widened `source="review"` context entries to carry a
+        reviewer's full `## Blocking findings` section verbatim, but left
+        `ISSUE_CONTEXT_MAX_CHARS` (2500) unaware of that — two racing
+        reviews' blocking sections (~1.8KB + ~1.9KB in the vimcode#804
+        incident) together exceeded the cap and the raw `block[:max_chars]`
+        slice cut the second one off mid-word. Both must now survive whole."""
+        first_finding = (
+            "## Blocking findings\n\n"
+            + "- missing RED statement in the acceptance test scaffold. " * 40
+        )
+        second_finding = (
+            "## Blocking findings\n\n"
+            + "- split_insert_undo_group() on every insert-mode arrow key "
+            "makes finish_undo_group do an O(buffer) full-text clone per "
+            "keystroke. " * 40
+        )
+        assert len(first_finding) > 1500
+        assert len(second_finding) > 1500
+        assert len(first_finding) + len(second_finding) > state.ISSUE_CONTEXT_MAX_CHARS
+
+        entries = [
+            {
+                "id": 1, "pinned": False, "source": "review",
+                "body": first_finding, "created_at": 1.0,
+            },
+            {
+                "id": 2, "pinned": False, "source": "review",
+                "body": second_finding, "created_at": 2.0,
+            },
+        ]
+        out = state.render_issue_context_entries(entries)
+        assert first_finding in out
+        assert second_finding in out
+        # Neither survived by accident from raising the cap globally — the
+        # rendered block genuinely exceeds the nominal cap.
+        assert len(out) > state.ISSUE_CONTEXT_MAX_CHARS
+        assert "(truncated" not in out
+
+    def test_non_review_entries_are_trimmed_to_protect_review_entries(self) -> None:
+        """A huge `source="review"` entry must not silently balloon the
+        briefing forever — ordinary (non-review) notes still yield first."""
+        big_review = "## Blocking findings\n\n" + ("x" * (state.ISSUE_CONTEXT_MAX_CHARS + 500))
+        entries = [
+            {"id": 1, "pinned": False, "source": "review", "body": big_review, "created_at": 2.0},
+            {"id": 2, "pinned": False, "source": "work", "body": "an ordinary note", "created_at": 1.0},
+        ]
+        out = state.render_issue_context_entries(entries)
+        assert big_review in out
+        assert "an ordinary note" not in out
+        assert "trimmed" in out
+
+    def test_no_review_entries_behaves_exactly_as_before(self) -> None:
+        """Regression guard: with no `source="review"` entries, ordering and
+        truncation behavior is unchanged from pre-#3113."""
+        entries = [
+            {"id": 1, "pinned": True, "source": "operator", "body": "PIN dep #99", "created_at": 1.0},
+            {"id": 2, "pinned": False, "source": "test", "body": "old note", "created_at": 2.0},
+            {"id": 3, "pinned": False, "source": "work", "body": "new note", "created_at": 3.0},
+        ]
+        out = state.render_issue_context_entries(entries)
+        lines = out.splitlines()
+        assert lines[0].startswith("- 📌 PIN dep #99")
+        assert "new note" in lines[1] and "old note" in lines[2]

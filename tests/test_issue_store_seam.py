@@ -1198,6 +1198,144 @@ class TestPostResult:
         _, body = cached
         assert body == "corrected findings"
 
+    # ── #3113: a distinct second review is not a re-capture ─────────────────
+
+    def test_distinct_second_review_of_same_patch_is_not_clobber_blocked(
+        self,
+    ) -> None:
+        """#3113 (vimcode#804): two reviews dispatched for the SAME
+        completed work assignment — the dispatch-race shape this issue's
+        atomic claim now prevents going forward, but which could already
+        exist on old rows — are two DIFFERENT `assignment_id`s, each with
+        its own row. This must land as two independent, successful writes,
+        NOT a clobber: the #650 guard exists to catch a re-capture of the
+        SAME review (see the tests above), never a second, distinct
+        review's own findings."""
+        from coord.state import load_assignment_review_findings
+
+        _seed_running_assignment("review-a", assignment_type="review", issue_number=804)
+        _seed_running_assignment("review-b", assignment_type="review", issue_number=804)
+
+        finding_a = "missing RED statement in the acceptance test scaffold"
+        finding_b = (
+            "split_insert_undo_group() on every insert-mode arrow key makes "
+            "finish_undo_group do an O(buffer) full-text clone per keystroke"
+        )
+        with patch("coord.github_ops.post_issue_comment"):
+            outcome_a = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="review-a",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=804,
+                    status="done",
+                    verdict="request-changes",
+                    summary="review a: missing RED statement",
+                    findings_body=finding_a,
+                )
+            )
+            outcome_b = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="review-b",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=804,
+                    status="done",
+                    verdict="request-changes",
+                    summary="review b: O(buffer) perf regression",
+                    findings_body=finding_b,
+                )
+            )
+
+        assert outcome_a.findings_written is True
+        assert outcome_b.findings_written is True
+
+        cached_a = load_assignment_review_findings("review-a")
+        cached_b = load_assignment_review_findings("review-b")
+        assert cached_a is not None and finding_a in cached_a[1]
+        assert cached_b is not None and finding_b in cached_b[1]
+
+    def test_recapture_of_the_same_review_id_is_still_clobber_blocked(self) -> None:
+        """#3113 regression guard: distinguishing a distinct second review
+        (above) from a same-review re-capture must not weaken the #650
+        guard itself — a second write to the SAME assignment_id with a
+        DIFFERENT body under the SAME verdict is still refused."""
+        _seed_running_assignment("review-a2", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            first = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="review-a2",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="first capture",
+                    findings_body="the original finding",
+                )
+            )
+            second = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="review-a2",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="re-capture",
+                    findings_body="a DIFFERENT finding — must not land",
+                )
+            )
+
+        assert first.findings_written is True
+        assert second.findings_written is False
+
+    def test_review_terminal_write_releases_dispatch_claim(self) -> None:
+        """#3113: `_update_local_state`'s terminal-status write for a
+        ``type="review"`` row must release its dispatch-time claim
+        (``coord.state.claim_review_dispatch``) so a legitimate later
+        re-review of the same work assignment (the ``coord review <id>``
+        escape hatch) is never permanently stranded behind a claim nothing
+        else will ever clear."""
+        from coord import sql
+        from coord.state import claim_review_dispatch, get_connection
+
+        _seed_running_assignment("review-release-1", assignment_type="review")
+        conn = get_connection()
+        sql.execute(
+            conn,
+            "UPDATE assignments SET review_of_assignment_id=? WHERE assignment_id=?",
+            ("work-xyz", "review-release-1"),
+        )
+        conn.commit()
+
+        # Simulate the claim `dispatch_review` took before dispatching this review.
+        assert claim_review_dispatch("work-xyz") is True
+        # A racing second dispatch attempt would lose it, as expected.
+        assert claim_review_dispatch("work-xyz") is False
+
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="review-release-1",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                )
+            )
+
+        # The review's terminal write must have released the claim — a
+        # legitimate later re-review of "work-xyz" can claim again.
+        assert claim_review_dispatch("work-xyz") is True
+
     def test_invalid_status_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid status"):
             issue_store.post_result(

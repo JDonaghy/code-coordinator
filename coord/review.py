@@ -2328,11 +2328,29 @@ def dispatch_review(
     # assignment itself (`review_dispatch_reason`, transient/in-memory —
     # see its docstring in models.py) and logs at info level, then returns
     # None so call sites can keep writing `return _deny(...)`.
+    #
+    # #3113: `_claim_held` is flipped True the moment the atomic
+    # `claim_review_dispatch` below succeeds. Every `_deny(...)` call from
+    # that point on is a path that will NOT produce a dispatched review, so
+    # the claim must be released here or a transient failure (agent
+    # unreachable, TOS gate, zero-commit gate, ...) would permanently
+    # strand this work assignment's review dispatch behind a claim nothing
+    # will ever clear. Denials BEFORE the claim is taken (reviews disabled,
+    # wrong type/status, no branch, already-in-flight) never held it, so
+    # this is a no-op for those.
+    _claim_held = False
+
     def _deny(reason: str) -> None:
+        nonlocal _claim_held
         completed.review_dispatch_reason = reason
         log.info(
             "[review] not dispatching for %s: %s", completed.assignment_id, reason
         )
+        if _claim_held:
+            from coord.state import release_review_dispatch_claim  # noqa: PLC0415
+
+            release_review_dispatch_claim(completed.assignment_id)
+            _claim_held = False
         return None
 
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
@@ -2362,7 +2380,13 @@ def dispatch_review(
         )
 
     # Dedupe: don't fire a second review if one's already in flight for this
-    # completed work assignment.
+    # completed work assignment. This in-memory check is a fast path only —
+    # `board` is a snapshot that can already be stale by the time we reach
+    # here, which is exactly how #3113 happened (two coordinator passes each
+    # read "no review in flight" from their own snapshot and both dispatched
+    # a metered review for the same completed assignment). The atomic claim
+    # right below is the AUTHORITATIVE guard; this is just cheap enough to
+    # skip a DB round-trip in the common case where the board already agrees.
     from coord.claim import has_active_followup, has_active_work_followup
 
     if has_active_followup(
@@ -2371,6 +2395,24 @@ def dispatch_review(
         return _deny(
             f"a review is already in flight for {completed.assignment_id}"
         )
+
+    # #3113: DB-level conditional insert — atomic even across two separate
+    # processes/machines racing this same function, unlike the board-snapshot
+    # check above. Exactly one caller ever wins this for a given
+    # `completed.assignment_id`; the loser denies here, before spending
+    # anything on a candidate machine. Released by every subsequent
+    # `_deny(...)` call in this function (see `_claim_held` above) and, once
+    # this call succeeds through to a real dispatch, by the review
+    # assignment's own terminal-status write (`coord.issue_store.
+    # _update_local_state`) — never left permanently held.
+    from coord.state import claim_review_dispatch  # noqa: PLC0415
+
+    if not claim_review_dispatch(completed.assignment_id):
+        return _deny(
+            f"a review is already in flight for {completed.assignment_id} "
+            "(lost the atomic dispatch-claim race — #3113)"
+        )
+    _claim_held = True
 
     # #459: skip review if a work or conflict-fix is actively rewriting the
     # branch for this issue (e.g. a coord-bounce fix iteration). Reviewing
@@ -2922,6 +2964,18 @@ def dispatch_review(
             f"all reviewer candidates unreachable for repo "
             f"{completed.repo_name!r} — transient, will retry automatically"
         )
+    # #3113: this tail doesn't go through `_deny` (it sets `review_state`
+    # directly, distinguishing the rejected/unreachable cases) but it is
+    # still a path that produced no dispatched review, so the claim taken
+    # above must be released the same way every `_deny(...)` call releases
+    # it — otherwise a transient "all candidates unreachable" pass would
+    # permanently strand this work assignment behind a claim nothing else
+    # will ever clear.
+    if _claim_held:
+        from coord.state import release_review_dispatch_claim  # noqa: PLC0415
+
+        release_review_dispatch_claim(completed.assignment_id)
+        _claim_held = False
     return None
 
 

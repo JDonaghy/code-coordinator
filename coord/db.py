@@ -798,7 +798,16 @@ def retry_on_locked(
 #
 # #3114 review fix: bumped 8 -> 9 for the two `merge_queue.ci_fix_detail_sha`/
 # `ci_fix_detail_json` columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 9
+#
+# #3113: bumped 9 -> 10 for the new `review_claims` TABLE above (not a column —
+# `_migrate_add_columns` below is unchanged; `CREATE TABLE IF NOT EXISTS` in
+# `_SCHEMA_SQL` is what actually creates it on an existing database, and that
+# only runs when `_ensure_schema` runs, which is gated on this version bump).
+# Rebase note: #3113 and #3114 both originally bumped 8 -> 9 in parallel; #3114
+# landed on main first, so this branch's bump stacks on top of it as 10 rather
+# than colliding at 9. Both bumps are still required — they create different
+# schema objects.
+_DB_SCHEMA_VERSION = 10
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1560,6 +1569,30 @@ _SCHEMA_SQL = """
             text          TEXT    NOT NULL DEFAULT '',
             actor         TEXT    NOT NULL DEFAULT '',
             recorded_at   REAL    NOT NULL
+        );
+
+        -- #3113: atomic review-dispatch claim. `dispatch_review`'s dedupe used
+        -- to be a read of an in-memory `Board` snapshot (`has_active_followup`)
+        -- followed, much later, by the actual dispatch — a classic
+        -- check-then-act gap. Two coordinator passes racing each other (the
+        -- vimcode#804 incident: two reviews dispatched 3 seconds apart, both
+        -- to the same machine, for $4.41 combined) each read "no review in
+        -- flight" from their own snapshot and both dispatched. One row per
+        -- `of_assignment_id` (the completed WORK assignment being reviewed) —
+        -- `coord.state.claim_review_dispatch` does a conditional
+        -- `INSERT ... OR IGNORE` and checks `rowcount` to learn atomically
+        -- whether THIS call is the one that gets to dispatch; the loser
+        -- refuses instead of also spending a metered review. Released
+        -- (`coord.state.release_review_dispatch_claim`) the moment the
+        -- review's own assignment row leaves the active state (done/failed/
+        -- advisory — see `coord.issue_store._update_local_state`), mirroring
+        -- exactly what made `has_active_followup` stop treating it as "in
+        -- flight" before this table existed, so a legitimate later re-review
+        -- of the same work assignment (the `coord review <id>` escape hatch)
+        -- is never permanently stranded.
+        CREATE TABLE IF NOT EXISTS review_claims (
+            of_assignment_id TEXT    PRIMARY KEY,
+            claimed_at       REAL    NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
