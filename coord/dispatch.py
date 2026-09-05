@@ -740,6 +740,24 @@ def dispatch(
             + briefing_text
         )
 
+        # #3112: append the reviewer's own repo-specific grading rules
+        # (`reviews.repo_overrides`) so the worker can read the exact
+        # criteria it will be reviewed against — before this, the override
+        # rules were read in coord/review.py alone, so a worker could be
+        # graded on (and request-changes'd for) a rule it was never shown.
+        # `repo_focus_lines` is the SAME builder `build_review_briefing`
+        # calls for the reviewer's copy, so the two can never drift.
+        from coord.review import repo_focus_lines  # noqa: PLC0415
+
+        focus_lines = repo_focus_lines(config.reviews, proposal.repo_name)
+        if focus_lines:
+            briefing_text = (
+                briefing_text
+                + "\n\n## What the reviewer will grade you against\n"
+                + "\n".join(focus_lines)
+                + "\n"
+            )
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,

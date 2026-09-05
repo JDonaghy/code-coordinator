@@ -33,6 +33,7 @@ from coord.review import (
     dispatch_scoped_reviews_for_queue,
     parse_review_from_log,
     pick_reviewer_machine,
+    repo_focus_lines,
 )
 
 
@@ -328,6 +329,125 @@ def test_briefing_includes_claude_md_and_checklist() -> None:
     assert "gh pr review" not in briefing
     # No same-machine warning when the reviewer is on a different machine.
     assert "running on the same machine as the worker" not in briefing
+
+
+# ── #3112: repo_focus_lines shared builder + worker's-own-claims section ────
+
+
+def test_repo_focus_lines_empty_when_no_overrides() -> None:
+    cfg = ReviewsConfig(repo_overrides={})
+    assert repo_focus_lines(cfg, "api") == []
+
+
+def test_repo_focus_lines_empty_for_repo_with_no_matching_override() -> None:
+    cfg = ReviewsConfig(repo_overrides={"other": ["Some rule."]})
+    assert repo_focus_lines(cfg, "api") == []
+
+
+def test_repo_focus_lines_renders_heading_and_bullets() -> None:
+    cfg = ReviewsConfig(repo_overrides={"api": ["Rule one.", "Rule two."]})
+    lines = repo_focus_lines(cfg, "api")
+    assert "### Repo-specific focus (api)" in lines
+    assert "- Rule one." in lines
+    assert "- Rule two." in lines
+
+
+def _briefing_kwargs(**overrides) -> dict:
+    base = dict(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="Login is broken on Firefox.",
+        branch="issue-7-fix-login",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(),
+        repo_claude_md=None,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_briefing_no_worker_claims_section_when_absent() -> None:
+    """Regression (#3112): no completion summary and no commit messages
+    produces no dangling/empty 'worker's own claims' section."""
+    briefing = build_review_briefing(**_briefing_kwargs())
+    assert "Worker's own claims" not in briefing
+
+
+def test_briefing_includes_worker_completion_summary() -> None:
+    briefing = build_review_briefing(
+        **_briefing_kwargs(
+            completion_summary="Added a regression test observed RED before the fix.",
+        )
+    )
+    assert "Worker's own claims" in briefing
+    assert "Added a regression test observed RED before the fix." in briefing
+
+
+def test_briefing_includes_worker_commit_messages() -> None:
+    briefing = build_review_briefing(
+        **_briefing_kwargs(
+            commit_messages=[
+                "Fix #804: guard ctrl-h backspace in insert mode\n\nObserved RED against unfixed develop.",
+                "Address review nit",
+            ],
+        )
+    )
+    assert "Worker's own claims" in briefing
+    assert "Fix #804: guard ctrl-h backspace in insert mode" in briefing
+    assert "Address review nit" in briefing
+
+
+def test_briefing_worker_claims_survive_whitespace_only_inputs() -> None:
+    """Regression (#3112): blank/whitespace-only summary and commit list
+    entries must not fake a non-empty section."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(completion_summary="   ", commit_messages=["  ", ""])
+    )
+    assert "Worker's own claims" not in briefing
+
+
+def test_briefing_carries_same_repo_override_text_worker_briefing_gets(
+    tmp_path,
+) -> None:
+    """Black-box pair test (#3112): dispatch a work briefing and a review
+    briefing for the same fixture repo/override and assert the rule string
+    appears in both, sourced from the one shared builder."""
+    from unittest.mock import MagicMock, patch
+
+    from coord.config import Config
+    from coord.dispatch import dispatch
+    from coord.models import Machine, Proposal
+
+    rule = "State that the new black-box test was observed RED against unfixed develop."
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(
+            name="laptop", host="laptop.tailnet", repos=["api"],
+            repo_paths={"api": str(tmp_path)},
+        )],
+        reviews=ReviewsConfig(repo_overrides={"api": [rule]}),
+    )
+    proposal = Proposal(
+        id=1, machine_name="laptop", repo_name="api", issue_number=10,
+        issue_title="Fix auth", rationale="best fit", briefing="Fix the auth module",
+    )
+    with patch("coord.dispatch.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, cfg)
+        worker_briefing = mock_post.call_args.kwargs["json"]["briefing"]
+
+    review_briefing = build_review_briefing(
+        **_briefing_kwargs(reviews_cfg=cfg.reviews)
+    )
+    assert rule in worker_briefing
+    assert rule in review_briefing
 
 
 def test_briefing_fetches_claude_md_by_sha_instead_of_embedding() -> None:
