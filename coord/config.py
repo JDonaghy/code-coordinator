@@ -2099,6 +2099,14 @@ class HealthConfig:
     pr_churn_window_hours: float = 24.0
     pr_churn_crit_count: int = 3
 
+    # ── off-box coordinator.yml drift (#3120, epic #3117 rung D1) ──────────
+    # The daemon host's `~/.coord/coordinator.yml` is a symlink into a
+    # private `coord-settings` checkout — the fleet's only off-box config
+    # copy, and it only works as a backup if it's pushed. An unpushed commit
+    # older than this is CRIT; any dirty tree or unpushed commit at all is
+    # WARN regardless of age. See `coord.health.checks.config_drift`.
+    config_drift_crit_hours: float = 24.0
+
 
 @dataclass
 class NotificationsConfig:
@@ -3650,6 +3658,7 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "webapp_build_heartbeat_warn_minutes": 0.0,
     "webapp_build_heartbeat_crit_minutes": 0.0,
     "pr_churn_window_hours": 0.0,
+    "config_drift_crit_hours": 0.0,
 }
 _HEALTH_INT_FIELDS: tuple[str, ...] = (
     "worktree_warn_count",
