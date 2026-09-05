@@ -13,6 +13,10 @@ in `docs/`.*
 
 - [`OPERATING_GOTCHAS.md`](OPERATING_GOTCHAS.md) — **READ BEFORE OPERATING.** Traps that each cost a real dispatch, real money, or real lost work, and are invisible from the code. The headline: **a merged fix is not a live fix.**
 - [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md) — releases, propagation, the deploy lanes, agent installs, and the **`~/.coord-venv` must-be-PyPI invariant**. **Read end-to-end before touching any agent install** — don't re-derive it.
+- [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md) — **the daemon host is gone; what to do in the
+  next hour.** Start at *Right now*. Covers machine loss (promote precision) vs. site loss
+  (Azure), where the off-site backup and its credentials live, and — honestly — which parts are
+  still manual. Epic #3117.
 - [`DRIVE_QUEUE.md`](DRIVE_QUEUE.md) — the durable, board-backed driver (`coord drive-queue`, #1750). **Read the top section before queuing more than ~2 issues on one repo.**
 
 ## Reference
