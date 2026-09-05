@@ -102,7 +102,19 @@ def _bound_log_excerpt(text: str) -> tuple[str, bool]:
 def _failing_step(job: JobRun) -> JobStep | None:
     """First step of *job* whose conclusion isn't affirmatively benign —
     mirrors :class:`coord.ci_store.CheckRun`'s own success/skipped/neutral
-    allow-list (#1525's fail-closed posture), one level down."""
+    allow-list (#1525's fail-closed posture), one level down.
+
+    Deliberately includes ``"neutral"`` in the benign set, unlike
+    :func:`coord.ci_store.is_verdictless_job`'s own allow-list
+    (``None``/``"success"``/``"skipped"`` — no ``"neutral"``). The two ask
+    different questions: ``is_verdictless_job`` decides whether a whole
+    JOB'S failure counts as infra noise that shouldn't cost a retry-budget
+    spend, whereas this decides which single STEP to point a human/worker
+    at as THE failing one — and GitHub itself doesn't treat a "neutral"
+    step conclusion as a failure, so it shouldn't be singled out as one
+    here even on a job that ``is_verdictless_job`` would still count as
+    verdicted. Kept separate on purpose; not a bug to reconcile.
+    """
     return next(
         (s for s in job.steps if s.conclusion not in (None, "success", "skipped", "neutral")),
         None,
@@ -118,10 +130,16 @@ def build_ci_failure_detail(
     issue's evidence: a worker had to spend 82 turns rediscovering a
     one-line fix the coordinator already had ``list_jobs_for_run`` data for).
 
-    Only ever called once, at CI-fix dispatch time (``coord.commands.merge.
-    _dispatch_ci_fixes``) — never on the polling path, the same scoping
-    ``coord.merge_queue._ci_infra_reason`` already established for
-    :meth:`~coord.ci_store.CiStore.list_jobs_for_run`. *ci_store* is
+    Only ever called at CI-fix dispatch time (``coord.commands.merge.
+    _dispatch_ci_fixes``) for an entry ``coord.ci_fix.dispatch_precheck``
+    has already confirmed is otherwise dispatch-eligible, and only once per
+    distinct ``branch_head_sha`` — never on the polling path, the same
+    scoping ``coord.merge_queue._ci_infra_reason`` already established for
+    :meth:`~coord.ci_store.CiStore.list_jobs_for_run`. A repeat ``coord
+    merge`` tick against the SAME still-failing SHA (dispatch declined for
+    a reason unrelated to CI — see ``dispatch_precheck``'s docstring) reuses
+    the cached result instead of calling this again — see
+    ``QueuedMerge.ci_fix_detail_sha``/``ci_fix_detail_json``. *ci_store* is
     duck-typed (not annotated as :class:`coord.ci_store.CiStore` to avoid an
     import cycle) — anything exposing ``list_checks_for_pr``/
     ``list_jobs_for_run`` works, matching how ``_ci_infra_reason`` treats it.
@@ -133,6 +151,17 @@ def build_ci_failure_detail(
     job id, a missing method on a duck-typed stub, ...). The caller falls
     back to the plain ``checks_summary`` text exactly as if this function
     didn't exist — this is enrichment, never a dispatch precondition.
+
+    Best-effort in a second sense too: when more than one check is
+    simultaneously failing, this describes only ONE of them (``next((c for
+    c in failed if c.run_id), failed[0])`` below — the first with a
+    readable run id, or else the first failing check period). The plain
+    ``checks_summary``/``ev.message`` one-liner the caller always falls
+    back to (``coord.merge_queue.process``'s ``", ".join(...)``) can name
+    several failing checks at once; this function's "## CI failure detail"
+    section may therefore describe a different job/step than the ones that
+    summary line enumerates. Not incorrect — just incomplete when the
+    failure isn't isolated to a single check.
     """
     try:
         checks = ci_store.list_checks_for_pr(repo, pr_number)

@@ -27,6 +27,8 @@ stub through ``ci_store=`` without touching subprocess at all.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -109,6 +111,46 @@ class CIFailureDetail:
     log_excerpt: str = ""
     run_url: str = ""
     truncated: bool = False
+
+
+def ci_failure_detail_to_json(detail: "CIFailureDetail | None") -> str:
+    """Serialize *detail* for :class:`coord.merge_queue.QueuedMerge`'s
+    ``ci_fix_detail_json`` cache column (#3114 review fix).
+
+    ``None`` (a fetch was attempted and genuinely found nothing — not to be
+    confused with "never attempted", which the column represents as SQL
+    NULL / Python ``None`` at the ``QueuedMerge`` level) encodes to the JSON
+    literal ``"null"`` so :func:`ci_failure_detail_from_json` can tell the
+    two apart: a stored ``"null"`` string means "fetched, no detail",
+    whereas the column itself being unset means "never fetched for this
+    SHA".
+    """
+    if detail is None:
+        return "null"
+    return json.dumps(dataclasses.asdict(detail))
+
+
+def ci_failure_detail_from_json(raw: str | None) -> "CIFailureDetail | None":
+    """Inverse of :func:`ci_failure_detail_to_json`. Fails soft: malformed or
+    unexpected JSON (a hand-edited DB row, a future/older schema) decodes to
+    ``None`` — "no cached detail" — rather than raising, matching
+    :func:`coord.ci_github.build_ci_failure_detail`'s own best-effort
+    posture.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return CIFailureDetail(**data)
+    except TypeError:
+        return None
 
 
 @dataclass

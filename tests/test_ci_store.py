@@ -20,11 +20,14 @@ from coord.ci_github import GitHubCi
 from coord.forge_availability import _flush_all_ok_aggregates
 from coord.ci_store import (
     CheckRun,
+    CIFailureDetail,
     JobRun,
     JobStep,
     NoOpCi,
     build_ci_store,
     checks_are_stale,
+    ci_failure_detail_from_json,
+    ci_failure_detail_to_json,
     failed_checks,
     in_flight_checks,
     is_verdictless_job,
@@ -1793,3 +1796,51 @@ class TestParseCiStore:
     def test_non_mapping_raises(self) -> None:
         with pytest.raises(ConfigError):
             _parse_ci_store(["github"])
+
+
+# ── CIFailureDetail (de)serialization (#3114 review fix) ────────────────────
+
+
+class TestCIFailureDetailJson:
+    """`coord.merge_queue.QueuedMerge.ci_fix_detail_json` caches a fetched
+    `CIFailureDetail` across `coord merge` ticks (each a fresh CLI process,
+    so nothing in-memory survives) so a dispatch declined for a reason
+    unrelated to CI doesn't re-fetch the same still-failing SHA's log every
+    tick. These two functions are the (de)serialization behind that cache."""
+
+    def test_roundtrips_a_populated_detail(self) -> None:
+        detail = CIFailureDetail(
+            check_name="Test (Linux, headless)",
+            job_name="Test (Linux, headless)",
+            step_name="Run tests",
+            log_excerpt="FAIL: test_x",
+            run_url="https://github.com/acme/api/actions/runs/999",
+            truncated=True,
+        )
+        raw = ci_failure_detail_to_json(detail)
+        assert ci_failure_detail_from_json(raw) == detail
+
+    def test_none_encodes_to_json_null_and_back(self) -> None:
+        # A fetch that ran and genuinely found nothing must be
+        # distinguishable, once decoded, from "never fetched" — the
+        # latter is represented at the QueuedMerge level by the *column*
+        # being unset (Python `None`), not by any string this function
+        # would produce (see `ci_fix_detail_json`'s own docstring).
+        raw = ci_failure_detail_to_json(None)
+        assert raw == "null"
+        assert ci_failure_detail_from_json(raw) is None
+
+    def test_column_unset_also_decodes_to_none(self) -> None:
+        # "never fetched for this SHA" (the column itself is NULL/None,
+        # never handed a string at all) must decode the same as the
+        # "null" sentinel above — both mean "no detail available".
+        assert ci_failure_detail_from_json(None) is None
+        assert ci_failure_detail_from_json("") is None
+
+    def test_malformed_json_fails_soft_to_none(self) -> None:
+        # A hand-edited DB row or a future/older schema must never raise —
+        # matching build_ci_failure_detail's own best-effort posture.
+        assert ci_failure_detail_from_json("{not json") is None
+        assert ci_failure_detail_from_json("[]") is None
+        assert ci_failure_detail_from_json('{"unexpected_field": 1}') is None
+        assert ci_failure_detail_from_json("42") is None

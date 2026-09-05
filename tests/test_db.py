@@ -2369,7 +2369,7 @@ class TestUatStateAndReasonColumns:
 # #2786 bumped this to (6, 74): `assignments.num_turns`.
 # #2987 bumped this to (7, 76): `portal_sync_state.relayed_answer_
 # watermark_at` / `relayed_answer_watermark_rowid`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (8, 78)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (9, 80)
 
 
 class TestMigrateAddColumnsVersionGuard:

@@ -775,7 +775,15 @@ class TestDispatchCiFixesWithCiStore:
         from coord.commands import merge as merge_cmd
         from coord.state import save_board
 
-        save_board(Board())
+        board = Board()
+        # #3114 review fix: `_dispatch_ci_fixes` now only fetches CI-failure
+        # detail once `coord.ci_fix.dispatch_precheck` confirms the entry is
+        # otherwise dispatch-eligible — which requires the originating work
+        # assignment to actually resolve on the board (see
+        # `dispatch_precheck`'s docstring). An empty board made every entry
+        # ineligible and this test's fetch assertion below would never fire.
+        board.completed.append(_work_assignment())
+        save_board(board)
         entry = _entry()
         events = [MergeEvent(entry, "checks_failed", entry.error or "")]
         check = _failed_check()
@@ -828,7 +836,13 @@ class TestDispatchCiFixesWithCiStore:
         from coord.commands import merge as merge_cmd
         from coord.state import save_board
 
-        save_board(Board())
+        # #3114 review fix: the entry must be otherwise dispatch-eligible
+        # (see `dispatch_precheck`) for `_dispatch_ci_fixes` to attempt the
+        # fetch at all — an empty board would skip the fetch (and this
+        # test's whole point) before the patched raising fetcher ever runs.
+        board = Board()
+        board.completed.append(_work_assignment())
+        save_board(board)
         entry = _entry()
         events = [MergeEvent(entry, "checks_failed", entry.error or "")]
         ci_store = _StubCiStoreForDetail(checks=[], jobs_by_run={})
@@ -843,3 +857,71 @@ class TestDispatchCiFixesWithCiStore:
 
         dispatch.assert_called_once()
         assert dispatch.call_args.kwargs["detail"] is None
+
+    def test_declined_dispatch_with_ci_store_caches_detail_across_ticks(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3114 review fix: a dispatch declined for a reason unrelated to
+        CI (budget remains, but the underlying `dispatch_ci_fix` call
+        itself returns None — no capable machine, agent unreachable, the
+        #2538 DB-lock-contention case) leaves the entry PENDING for the
+        next tick to retry. Before this fix, EVERY such retry re-fetched
+        the failing job's log from `gh` — exactly the per-tick GitHub
+        probing #2989/#2988 warn against. A second tick against the SAME
+        still-failing `branch_head_sha` must reuse the cached detail
+        instead of calling `build_ci_failure_detail` (and the `gh api
+        .../logs` fetch behind it) again."""
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        board.completed.append(_work_assignment())
+        save_board(board)
+
+        entry = _entry()
+        entry.branch_head_sha = "deadbeef"  # unchanged across both ticks
+        check = _failed_check()
+        job = JobRun(
+            name=check.name, conclusion="failure", runner_name="GitHub Actions 1",
+            steps=[
+                JobStep(name="Set up job", conclusion="success"),
+                JobStep(name="Run tests", conclusion="failure"),
+            ],
+            job_id="456",
+        )
+        ci_store = _StubCiStoreForDetail(checks=[check], jobs_by_run={"999": [job]})
+
+        with patch(
+            "coord.ci_github.github_ops.get_job_log",
+            return_value="line1\nAssertionError: boom\n",
+        ) as get_log, patch(
+            "coord.ci_fix.dispatch_ci_fix", return_value=None,
+        ) as dispatch:
+            # Tick 1: dispatch declines (budget remains — see the module's
+            # own `test_declined_dispatch_under_budget_leaves_entry_pending`
+            # for the un-enriched twin of this scenario), but the detail
+            # fetch runs because the entry is otherwise dispatch-eligible.
+            events = [MergeEvent(entry, "checks_failed", entry.error or "")]
+            merge_cmd._dispatch_ci_fixes(
+                events, two_machine_config, ci_store, dry_run=False,
+            )
+            assert entry.state == PENDING
+            assert get_log.call_count == 1
+            first_detail = dispatch.call_args.kwargs["detail"]
+            assert first_detail is not None
+            assert first_detail.step_name == "Run tests"
+            assert entry.ci_fix_detail_sha == "deadbeef"
+            assert entry.ci_fix_detail_json is not None
+
+            # Tick 2: same still-failing SHA, dispatch declines again — the
+            # fetch must NOT run a second time.
+            events = [MergeEvent(entry, "checks_failed", entry.error or "")]
+            merge_cmd._dispatch_ci_fixes(
+                events, two_machine_config, ci_store, dry_run=False,
+            )
+            assert get_log.call_count == 1, (
+                "a repeat tick against the same still-failing SHA must "
+                "reuse the cached detail, not re-fetch the log"
+            )
+            second_detail = dispatch.call_args.kwargs["detail"]
+            assert second_detail == first_detail

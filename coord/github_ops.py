@@ -2696,6 +2696,15 @@ def get_job_log(repo: str, job_id: str) -> str:
     :func:`coord.ci_github.build_ci_failure_detail`, treats any raise as "no
     log available" and degrades to the summary-only briefing — this is
     never called from the polling path, only once at CI-fix dispatch time.
+
+    No server-side tail: this downloads the job's ENTIRE log before
+    :func:`coord.ci_github._bound_log_excerpt` truncates it client-side. A
+    GitHub Actions job log can run to many MB, and this call shares
+    :func:`_gh`'s single subprocess timeout with every other ``gh``
+    invocation — so a very verbose job's log can time out this fetch
+    outright (fails soft to no detail, same as any other raise here, but
+    means the noisiest/most-verbose failures are the ones likeliest to get
+    no excerpt at all).
     """
     return _gh(
         "api", f"repos/{repo}/actions/jobs/{job_id}/logs",
