@@ -385,7 +385,24 @@ asking a candidate binary for its `--version`, never by asking `PATH` whether a 
 browser resolves under `/snap/bin`, `coord-agent`'s unit `PATH` must contain `/snap/bin` too or the
 capability stays unmet for the agent even though it works in your login shell.
 
-Four things about it are load-bearing:
+Five things about it are load-bearing:
+
+**An enabled unit is not a running unit, and `is-enabled` cannot tell you which you have.** Tier 3
+found two ways `--role server` produced units that install, enable, report `enabled` forever, and
+die on every fire in a journal nobody reads. First: `ROLE_UNITS[daemon]` names what to *enable*,
+which for a timer is the timer — the `.service` each timer actually fires (systemd's `Unit=`
+defaults to the same stem) is never in that list, so six of the ten daemon units would have armed
+with nothing to run. Those companions are now installed alongside, and deliberately **not**
+separately enabled; the timer pulls them. Second: the packaged `*.sh` helpers went next to the unit
+files, but `coord-db-backup.service` says `ExecStart=%h/.local/bin/coord-db-backup.sh` — so a
+rebuilt daemon host's hourly `coord.db` snapshot would have `203/EXEC`'d every hour in silence.
+They now go to `~/.local/bin` (override: `$COORD_PROVISION_LOCAL_BIN`). The script now also
+**resolves every rendered `ExecStart` at provision time** and warns, naming the unit and the missing
+file, rather than arming something that can only fail — which is how it surfaces the one case no
+installer can fix: `coord-web-dist-build.sh` and `coord-failure-notify.sh` are in the repo's
+`deploy/` but are **not shipped in the wheel's `coord/deploy/`**, so nothing can install them.
+
+Four more:
 
 **The contract is the doctor, not the phase count.** The script ends by running `coord machine
 doctor <machine> --ssh -v --role <worker|daemon>` and exits non-zero unless that report's own
