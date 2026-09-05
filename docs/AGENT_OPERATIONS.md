@@ -308,6 +308,73 @@ The agent is generally online and the restart simply didn't take. Check the runn
 version/PID first, then choose between a drift-fix and a plain
 `systemctl --user restart coord-agent`.
 
+## Build a whole machine from a fresh OS (`scripts/provision-machine.sh`, #3138)
+
+`install-agent.sh` below is **one layer** of a machine — the venv and the agent unit. Everything
+under it (base packages, python 3.12, tailscale, gh at the version floor, node + the Claude CLI)
+and everything above it (identity, registration, repo clones, the graph, and on a daemon host the
+ten units in the inventory further down) used to be reassembled by hand out of four documents that
+do not cross-reference each other. Onboarding `dell64` that way cost six separately hand-found
+failures.
+
+`scripts/provision-machine.sh` is that whole sequence, role-aware and idempotent:
+
+```bash
+# on the machine being built, as your own login user (it refuses to run as root)
+./scripts/provision-machine.sh --role thin-client --machine testbox
+./scripts/provision-machine.sh --role worker --machine testbox \
+    --capabilities rust,gtk --repos code-coordinator,coord-tui
+./scripts/provision-machine.sh --role server --machine dellserver --repos code-coordinator
+
+./scripts/provision-machine.sh --role server --dry-run   # just print the phase plan
+```
+
+| phase | thin-client | worker | server |
+|---|---|---|---|
+| base packages, python 3.12+ | ✓ | ✓ | ✓ |
+| tailscale, gh (version-floored), node + Claude CLI | ✓ | ✓ | ✓ |
+| `~/.coord-venv` + `coord-agent` (delegated to `install-agent.sh`) | ✓ | ✓ | ✓ |
+| `~/.coord/role` (#3128) | ✓ | ✓ | ✓ |
+| **identity** — tailscale up, gh, push key, inbound ssh, Claude OAuth, board token | ✓ | ✓ | ✓ |
+| register (`coord machine add`) + the `~/.coord/coordinator.yml` symlink | ✓ | ✓ | ✓ |
+| toolchains for the declared capabilities | | ✓ | ✓ |
+| repo clones + `coord repo doctor --fix` (graphify) | | ✓ | ✓ |
+| the daemon units from `ROLE_UNITS[daemon]`, `backup.env`, restic, the SSD | | | ✓ |
+| **gate: `coord machine doctor --ssh -v --role <worker\|daemon>`** | ✓ | ✓ | ✓ |
+
+Four things about it are load-bearing:
+
+**The contract is the doctor, not the phase count.** The script ends by running `coord machine
+doctor <machine> --ssh -v --role <worker|daemon>` and exits non-zero unless that report's own
+`MACHINE_DOCTOR:` trailer says `ok=true` — a *missing* trailer is a failure, not a pass. There is
+no flag to skip it. So when a phase dies three hours into a rebuild you fix the cause and **re-run
+the whole script**; every phase is idempotent and a second run on a finished machine reports
+`changes=0`.
+
+**Every prompt is in one block, before anything slow.** `tailscale up`, `gh auth login` and the
+Claude OAuth all need a human. They happen together, after the small prerequisites they each need
+and *before* the toolchain and clone phases, and the script prints the full list of what it is
+about to ask for first. Nothing already configured re-prompts. No credential is echoed, logged, or
+passed on a command line; each lands directly in a mode-0600 file.
+
+**It is not `scripts/azure-workers/provision-worker.sh`.** That one builds a golden *image*: root,
+a dedicated `coord` user (because `waagent -deprovision+user` deletes the provisioning user's
+home), and zero identity on purpose. This one builds a *machine*: it refuses to run as root, never
+creates an account, and installs the identity that is the entire point. Converging the two is M3.
+Nothing here requires Azure — where a credential can come from Key Vault the script says so and
+lets you paste it, but a machine must stay buildable with a laptop and a browser.
+
+**A thin client still gets `coord-agent`, and is registered with no capabilities and no repos.**
+`machine_onboard.evaluate_network` CRITs `network.agent_unreachable` for *any* machine with a
+`machines[]` entry and no agent answering `/health`, so a registered agent-less client could never
+gate clean. Registering it with nothing to run is what keeps the board from routing work to it.
+
+Ubuntu-only. On a Mac the seam is launchd rather than systemd
+([`MAC_MINI.md`](MAC_MINI.md)); under WSL see [`WSL_WINDOWS_WORKER.md`](WSL_WINDOWS_WORKER.md).
+And rebuilding a daemon *host* is not restoring the daemon's *data*: `coord.db` comes back via
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md) / `coord dr promote`, which the script points at and
+deliberately does not duplicate.
+
 ## Install a new agent (first time)
 
 On the target machine:
