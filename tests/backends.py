@@ -474,6 +474,21 @@ def upsert_issue(conn: Any, **columns: Any) -> None:
     as keyword columns by every caller. Column order is whatever *columns*
     was given in (a plain ``dict`` preserves insertion order), matching how
     each existing call site already named its own subset of columns.
+
+    #3101-review: this is NOT semantically identical to the ``INSERT OR
+    REPLACE`` it replaces in the general case -- ``INSERT OR REPLACE`` is a
+    DELETE+INSERT, so any column the caller omits resets to its schema
+    default on a conflicting key, whereas ``sql.upsert``'s ``ON CONFLICT ...
+    DO UPDATE`` leaves an omitted column holding whatever the existing row
+    already had. Audited at conversion time: every call site passes the
+    same fixed column set on every call it makes for a given
+    ``(repo_name, number)`` key (typically just re-asserting `state`
+    alongside the columns it always supplied), so there is no call site
+    that relies on an omitted column resetting. If a future caller seeds
+    the same key twice with two different column subsets and depends on
+    the second call resetting the columns it left out, this helper will
+    silently do the wrong thing -- pass the full column set on every call
+    for that key instead.
     """
     from coord import sql
 

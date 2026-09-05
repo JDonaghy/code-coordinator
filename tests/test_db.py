@@ -1787,11 +1787,14 @@ class TestMigrateGateOrder:
         )
         conn.commit()
 
-    def _set_board_meta(self, conn: sqlite3.Connection, value: str) -> None:
+    def _set_board_meta(self, conn: Any, value: str) -> None:
         # #3101: was a raw `INSERT OR REPLACE` -- invalid syntax on Postgres,
         # where `isolated_conn`/`coord_db` can be a real psycopg connection
         # (#2884's backend switch). `sql.upsert` is the portable idiom
-        # `coord.state`'s own writers use for this exact table.
+        # `coord.state`'s own writers use for this exact table. `conn` is
+        # typed `Any`, not `sqlite3.Connection`, precisely because it can be
+        # that real psycopg-backed `TranslatingConnection` under the
+        # Postgres lane.
         sql.upsert(conn, "board_meta", ["key", "value"], ("pipeline_default_gates", value), conflict_columns=["key"])
         conn.commit()
 

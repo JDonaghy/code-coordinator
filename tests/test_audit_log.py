@@ -171,6 +171,22 @@ class _FlakyConn:
     raising ``UnsupportedDialectError`` before the intended lock error ever
     fires — mirrors ``tests/test_state.py``'s ``_FlakyConn`` (#2726) and
     ``tests/test_serve.py``'s ``_AlwaysLockedConn`` (#2726).
+
+    #3101: ``__getattr__`` below forwards straight through to ``self._real``
+    -- the same shape as ``tests/test_state.py``'s ``_FlakyConnProxy`` --
+    so under ``COORD_TEST_BACKEND=postgres`` ``coord.sql.unwrap()``/
+    ``detect_dialect()`` see straight through this proxy to the real
+    ``TranslatingConnection`` underneath, and ``coord.sql.execute()``'s
+    outer call already translates qmark (``?``) to pyformat (``%s``) before
+    ever reaching this proxy's ``execute()``. Delegating the post-retry
+    success path to ``self._real.execute()`` (a ``TranslatingConnection``)
+    would translate that already-``%s`` statement a second time, doubling
+    every ``%`` into ``%%`` and leaving psycopg with zero real placeholders
+    against N bound parameters. Going through ``self._real.cursor()``
+    instead reaches the raw driver cursor directly, untranslated, so the
+    already-correctly-translated statement from the outer seam call reaches
+    the driver exactly once, on both lanes -- see ``_FlakyConnProxy`` in
+    ``tests/test_state.py`` for the fuller writeup of this exact defect.
     """
 
     __module__ = "sqlite3"
@@ -187,7 +203,7 @@ class _FlakyConn:
         self.calls += 1
         if self._fail_times is None or self.calls <= self._fail_times:
             raise sqlite3.OperationalError("database is locked")
-        return self._real.execute(*args, **kwargs)
+        return self._real.cursor().execute(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -202,6 +218,13 @@ class _TrimLockedConn:
     #2767: see ``_FlakyConn`` above — ``cursor()``/``__module__`` are needed
     for the same reason now that both the insert and the trim route through
     ``coord.sql.execute()``.
+
+    #3101: same retry-path double-translation hazard as ``_FlakyConn``
+    above -- ``__getattr__`` leaks through to the real
+    ``TranslatingConnection`` on the Postgres lane, so the non-``DELETE``
+    (``INSERT``) path below must reach the driver via
+    ``self._real.cursor().execute(...)`` rather than ``self._real.execute(...)``
+    to avoid re-translating an already-translated statement.
     """
 
     __module__ = "sqlite3"
@@ -215,7 +238,7 @@ class _TrimLockedConn:
     def execute(self, sql, *args, **kwargs):
         if sql.strip().upper().startswith("DELETE"):
             raise sqlite3.OperationalError("database is locked")
-        return self._real.execute(sql, *args, **kwargs)
+        return self._real.cursor().execute(sql, *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
