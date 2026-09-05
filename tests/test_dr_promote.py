@@ -701,6 +701,24 @@ def test_a_unit_systemd_does_not_know_about_blocks_the_run(standby):
     assert standby.started() == []
 
 
+def test_no_systemd_session_says_so_rather_than_naming_ten_forgotten_units(standby):
+    """Every unit missing usually means the query failed, not ten oversights."""
+    # No systemd user session: `systemctl show` answers nothing at all.
+    _write_shim(
+        standby.tmp / "bin" / "systemctl",
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('Failed to connect to user scope bus\\n')\n"
+        "sys.exit(1)\n",
+    )
+
+    result = run_promote("--force")
+
+    assert result.exit_code == 1
+    assert "no state for ANY of them" in result.output
+    assert not standby.live_db.exists()
+
+
 def test_a_unit_that_exits_zero_but_never_becomes_active_fails_the_run(standby):
     """Success derived from an observation after the action, never from exit 0."""
     state = standby.systemd()
