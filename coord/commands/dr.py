@@ -5,7 +5,7 @@ what order, what counts as a failure, what gets persisted) lives there so the
 systemd timer and a human at a terminal cannot take different paths — the same
 split ``coord backup`` uses over :mod:`coord.backup`.
 
-Two commands, deliberately separate:
+Three commands, deliberately separate:
 
 * ``coord dr verify`` — restore the latest off-site snapshot into a scratch
   location and prove it is usable. Runs on the daemon host, on a timer.
@@ -14,6 +14,10 @@ Two commands, deliberately separate:
   credentials and no daemon, so it is the command **another machine** runs
   against a mirrored record when the daemon host is the thing that died. A
   verify that stopped running is a failure, not an absence of news.
+* ``coord dr promote`` — the recovery itself (#3129, rung D3): restore onto a
+  tailnet standby and bring it up as the board. Same split as above: all of
+  the policy lives in :mod:`coord.dr_promote`, so the refusal an operator sees
+  at a terminal and the one a future automation would hit are the same code.
 """
 
 from __future__ import annotations
@@ -22,15 +26,17 @@ from pathlib import Path
 
 import click
 
-from coord import dr_verify
+from coord import dr_promote, dr_verify
 
 
 @click.group(
     "dr",
     help=(
-        "Disaster-recovery verification: prove the off-site backup actually "
-        "restores (#3119). `verify` does the restore; `status` reports whether "
-        "the last one is recent enough to be believed."
+        "Disaster recovery: prove the off-site backup restores (#3119), and "
+        "restore onto a standby when the daemon host is gone (#3129). "
+        "`verify` does a scratch restore; `status` reports whether the last "
+        "one is recent enough to be believed; `promote` brings a standby up "
+        "as the board."
     ),
 )
 def dr_group() -> None:
@@ -160,3 +166,103 @@ def dr_status_cmd(
     if not no_alert:
         dr_verify.alert("DR verify is not running", verdict.reason)
     raise SystemExit(1)
+
+
+@dr_group.command(
+    "promote",
+    help=(
+        "Restore the latest off-site backup onto THIS host and bring it up as "
+        "the board (#3129). Operator-initiated only: it refuses while the "
+        "incumbent board still answers /healthz, while the coord-settings "
+        "checkout is absent/dirty/behind, and while any credential the daemon "
+        "needs to be useful (not merely to boot) is missing. Run --dry-run "
+        "first: it does everything except mutate, and is the mode to rehearse "
+        "with."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Probe, resolve, check credentials, enumerate units and print the "
+    "ordered plan — mutating nothing. Exits zero even when it reports the "
+    "incumbent is alive: a rehearsal that says 'dellserver is still serving' "
+    "has succeeded at rehearsing.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Waive the two refusals that name it: a live incumbent, and a "
+    "non-empty local store. Never waives a missing credential or a stale "
+    "coord-settings checkout — forcing past those is how you get a board that "
+    "looks recovered and cannot merge.",
+)
+@click.option(
+    "--board-url",
+    default=None,
+    help="The incumbent board to probe (default: $COORD_SERVICE_URL, then "
+    "~/.coord/client.toml's board_service).",
+)
+@click.option(
+    "--snapshot",
+    "snapshot_id",
+    default=None,
+    help="Restore this snapshot instead of the newest one.",
+)
+@click.option(
+    "--no-network",
+    is_flag=True,
+    help="Skip the credential probes that need the network. Strictly weaker: "
+    "an unprobed credential reports `unknown`, which still blocks a real run.",
+)
+@click.option(
+    "--local-board-url",
+    default=None,
+    help="Where the PROMOTED daemon will be reachable for the final "
+    "verification (default: http://127.0.0.1:7435). Distinct from "
+    "--board-url, which names the incumbent this command refuses to race.",
+)
+@click.option(
+    "--verify-timeout",
+    default=None,
+    type=float,
+    help="Seconds to wait for the promoted daemon to serve GET /board "
+    "(default: 90).",
+)
+@click.option(
+    "--record",
+    "record_path",
+    default=None,
+    type=click.Path(),
+    help="Write a JSON record of the run (including the measured elapsed "
+    "time) to this path.",
+)
+def dr_promote_cmd(
+    dry_run: bool,
+    force: bool,
+    board_url: str | None,
+    snapshot_id: str | None,
+    no_network: bool,
+    local_board_url: str | None,
+    verify_timeout: float | None,
+    record_path: str | None,
+) -> None:
+    report = dr_promote.promote(
+        dry_run=dry_run,
+        force=force,
+        board_url=board_url,
+        network=not no_network,
+        snapshot_id=snapshot_id,
+        local_board_url=local_board_url,
+        **({"verify_timeout": verify_timeout} if verify_timeout else {}),
+    )
+    for line in dr_promote.render_plan(report.plan, dry_run=dry_run):
+        click.echo(line)
+    if record_path:
+        click.echo(f"record written to {dr_promote.write_record(report, Path(record_path))}")
+    if dry_run:
+        return
+    click.echo("")
+    for line in dr_promote.render_report(report):
+        click.echo(line, err=not report.ok)
+    if not report.ok:
+        raise SystemExit(1)
