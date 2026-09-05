@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from coord.models import Assignment, Board, Machine, Repo
+from coord.models import (
+    CLOSES_ISSUE_TYPES,
+    EPIC_DECOMPOSE_TYPE,
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Machine,
+    Repo,
+    trust_issue_closed_for,
+)
 
 
 def _board() -> Board:
@@ -262,3 +272,51 @@ def test_resolve_uat_preview_url_malformed_format_spec_falls_back_to_raw() -> No
     # can't intercept — never crash the merge gate over a coordinator.yml typo.
     repo = Repo(name="api", github="acme/api", uat_preview="https://example/{}/")
     assert repo.resolve_uat_preview_url(branch="b1") == "https://example/{}/"
+
+
+# ── #3132: epic-decompose type membership ────────────────────────────────────
+
+
+def test_epic_decompose_is_work_like() -> None:
+    """It must flow through the normal Work → Test → Review → Merge pipeline
+    like any other work-like type — the whole point of #3132 is that its
+    first-slice PR gets reviewed and merged normally."""
+    assert EPIC_DECOMPOSE_TYPE in WORK_LIKE_TYPES
+
+
+def test_epic_decompose_never_closes_its_issue() -> None:
+    """The entire point of the type: its `issue_number` IS the epic, and
+    merging its PR must never auto-close it (that's `CLOSES_ISSUE_TYPES`'
+    job, and epic-decompose must stay out of it — see #1077/#1314)."""
+    assert EPIC_DECOMPOSE_TYPE not in CLOSES_ISSUE_TYPES
+
+
+def test_epic_decompose_is_not_a_sealed_path_author() -> None:
+    """Unlike mock-author/test-author, epic-decompose writes ordinary code
+    (the epic's first slice) plus files new issues — it does NOT author
+    under `tests/acceptance/`, so the oracle-tamper inversion rule in
+    coord.review must not apply to it."""
+    assert EPIC_DECOMPOSE_TYPE not in SEALED_PATH_AUTHOR_TYPES
+
+
+@pytest.mark.parametrize(
+    ("assignment_type", "expected"),
+    [
+        ("work", True),
+        ("mock-author", False),
+        ("test-author", False),
+        (EPIC_DECOMPOSE_TYPE, False),
+        ("conflict-fix", True),
+        ("review", True),
+        ("smoke", True),
+        (None, True),
+    ],
+)
+def test_trust_issue_closed_for(assignment_type: str | None, expected: bool) -> None:
+    """#2639/#3132: only CLOSES_ISSUE_TYPES members get their `issue_number`
+    trusted as their own deliverable. `epic-decompose`'s `issue_number` is
+    the epic itself — never closed by its own merge — so it must read
+    exactly like mock-author/test-author here (False), even though it isn't
+    in SEALED_PATH_AUTHOR_TYPES. Every non-epic-decompose case pins down
+    pre-#3132 behaviour is unchanged."""
+    assert trust_issue_closed_for(assignment_type) is expected

@@ -356,6 +356,64 @@ class TestAssignDispatch:
         proposal = disp.call_args[0][0]
         assert proposal.briefing == "Focus on the auth module only"
 
+    def test_type_flag_overrides_default_work_type(self, config_file: Path, coord_dir: Path) -> None:
+        """#3132: `--type epic-decompose` must reach the dispatched Proposal
+        instead of the default 'work'."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "epic", "labels": [{"name": "epic"}]}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "e-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "7",
+                    "--config", str(config_file),
+                    "--type", "epic-decompose",
+                ],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.type == "epic-decompose"
+
+    def test_type_flag_rejects_unknown_value(self, config_file: Path, coord_dir: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "assign", "laptop", "api", "7",
+                "--config", str(config_file),
+                "--type", "mock-author",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "mock-author" in result.output
+
+    def test_type_flag_conflicts_with_interactive(self, config_file: Path, coord_dir: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "assign", "laptop", "api", "7",
+                "--config", str(config_file),
+                "--type", "epic-decompose", "--interactive",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--type" in result.output
+        assert "--interactive" in result.output
+
+    def test_type_flag_conflicts_with_plan_only(self, config_file: Path, coord_dir: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "assign", "laptop", "api", "7",
+                "--config", str(config_file),
+                "--type", "epic-decompose", "--plan-only",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--type" in result.output
+        assert "--plan-only" in result.output
+
     def test_claim_check_blocks_duplicate(self, config_file: Path, coord_dir: Path) -> None:
         """If issue is already claimed, assign should refuse."""
         from coord.claim import Claim

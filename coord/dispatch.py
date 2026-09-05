@@ -17,7 +17,7 @@ from coord.comments import (
     format_refused_policy,
 )
 from coord.config import Config
-from coord.models import Proposal, Repo, coordinator_owned_docs
+from coord.models import EPIC_DECOMPOSE_TYPE, Proposal, Repo, coordinator_owned_docs
 
 AGENT_PORT = 7433
 
@@ -120,25 +120,36 @@ def enforce_epic_dispatch_guard(
     label (:data:`coord.milestone_order.TRACKING_ISSUE_LABEL`).
 
     The #1077/#1142 ``CLOSES_ISSUE_TYPES`` split (see ``coord/models.py``)
-    already assumes only ``mock-author``/``test-author`` are ever dispatched
-    directly against a tracking issue's own number — a small correction to
-    an already-merged Gate-A contract, with no properly-typed tool for it
-    yet, falls back to a plain ``coord assign`` (``type="work"``) instead.
-    That silently breaks the same assumption a ``type="work"`` merge relies
-    on everywhere else: that ``issue_number`` is real, resolvable work, not
-    a milestone's tracking issue. Hit in practice against epic #1120's Gate
-    A contract (PR #1312) — this is the dispatch-time half of the fix;
-    ``coord/commands/plan_followup.py``'s ``pr()`` command independently
-    checks the same label so the PR body never carries the closing keyword
-    even for an already-dispatched assignment.
+    already assumes only ``mock-author``/``test-author``/``epic-decompose``
+    (#3132) are ever dispatched directly against a tracking issue's own
+    number — a small correction to an already-merged Gate-A contract, with
+    no properly-typed tool for it yet, falls back to a plain ``coord
+    assign`` (``type="work"``) instead. That silently breaks the same
+    assumption a ``type="work"`` merge relies on everywhere else: that
+    ``issue_number`` is real, resolvable work, not a milestone's tracking
+    issue. Hit in practice against epic #1120's Gate A contract (PR #1312)
+    — this is the dispatch-time half of the fix; ``coord/commands/
+    plan_followup.py``'s ``pr()`` command independently checks the same
+    label so the PR body never carries the closing keyword even for an
+    already-dispatched assignment.
+
+    This function's own scope is narrow — it only ever raises for
+    *proposal_type* in :data:`coord.models.CLOSES_ISSUE_TYPES` (``"work"``).
+    A ``type="epic-decompose"`` dispatch against the SAME epic is a no-op
+    here (never enters the ``CLOSES_ISSUE_TYPES`` check at all) — that is
+    the whole point of #3132: the properly-typed dispatch this docstring
+    used to say didn't exist yet. See
+    :data:`coord.models.EPIC_DECOMPOSE_TYPE` /
+    :func:`epic_decompose_briefing` for what that dispatch actually briefs.
 
     Override: label the issue ``oracle:exempt`` (the existing "I know what
     I'm doing, let this bypass oracle-loop-specific gating" signal — see
-    :func:`enforce_oracle_readiness`) to dispatch anyway. Raises
-    :class:`DispatchRefused` on refusal (#1844) — same deterministic-refusal
-    reasoning as :func:`enforce_oracle_readiness`, and still a
-    :class:`ValueError` under the hood, so callers get "refuse cleanly" for
-    free via their existing ``except ValueError`` handling.
+    :func:`enforce_oracle_readiness`) to dispatch anyway — or, preferably
+    since #3132, use ``type="epic-decompose"`` instead, which needs no
+    override at all. Raises :class:`DispatchRefused` on refusal (#1844) —
+    same deterministic-refusal reasoning as :func:`enforce_oracle_readiness`,
+    and still a :class:`ValueError` under the hood, so callers get "refuse
+    cleanly" for free via their existing ``except ValueError`` handling.
 
     Fails OPEN (proceeds) if the issue can't be fetched or *repo* is
     ``None`` — mirrors :func:`enforce_oracle_readiness`'s posture; a
@@ -184,7 +195,71 @@ def enforce_epic_dispatch_guard(
         "contract correction), label the issue 'oracle:exempt' to override, "
         "or use a properly-typed dispatch instead — e.g. `coord acceptance "
         "mock <repo> <tracking_issue> --amend '<correction>'` for a "
-        "targeted fix to an already-merged Gate-A contract (#1315)."
+        "targeted fix to an already-merged Gate-A contract (#1315), or "
+        "`coord assign <machine> <repo> <tracking_issue> --type "
+        "epic-decompose` to hand the epic to a worker for in-pickup "
+        "decomposition (#3132) — that type never trips this guard."
+    )
+
+
+# #3132: the addendum appended to a ``type="epic-decompose"`` dispatch's
+# briefing — see ``epic_decompose_briefing`` below. Kept as a module-level
+# constant (not inlined in the function) so a test can assert against the
+# exact contract text without re-deriving it, the same way
+# ``coord.acceptance``'s oracle-loop contract block is a named, testable
+# piece of text rather than an inline f-string.
+EPIC_DECOMPOSE_CONTRACT = """\
+## Epic decomposition contract (#3132)
+
+This issue is an epic/tracking issue, dispatched with `type="epic-decompose"` \
+specifically so it does NOT auto-close when your PR merges — the epic is the \
+tracker; it closes when its own checklist is complete, not when this PR does. \
+Decomposition happens now, with the checkout in hand, so you can re-verify \
+any `file:line` citations in the epic body against the current code rather \
+than trusting them as written.
+
+Your job, in order:
+
+1. **Decompose fully.** Read the epic's own decomposition/handoff \
+instructions (if it carries them, follow those verbatim) and file every \
+child issue this epic implies. Register each one against this epic with \
+`coord milestone add-child <repo> <this epic's issue number> --child <new \
+issue number>` so the epic's checklist and this epic's tracking stay in \
+sync — never hand-edit the checklist directly.
+2. **Queue the first batch.** At most 6 of the newly-filed children, \
+chained serially so they land one at a time: `coord drive-queue add <repo> \
+<child 1>`, then `coord drive-queue add <repo> <child 2> --after <repo>#\
+<child 1>`, and so on.
+3. **Re-queue this epic behind that batch** — `coord drive-queue add <repo> \
+<this epic's issue number> --after <repo>#<child N>` (the last one queued) \
+— so decomposition continues once the first batch lands, if more children \
+remain.
+4. **Implement only the first slice in this pickup.** Do not attempt the \
+whole epic in one PR — that defeats the point of decomposing it.
+5. **Leave this epic open.** Do not close it yourself and do not word your \
+PR body as "Closes #N" — the coordinator already opens this PR with `Refs \
+#N`, non-closing, for exactly this reason. The epic closes only when its \
+checklist is complete.
+"""
+
+
+def epic_decompose_briefing(issue_number: int) -> str:
+    """The full ``type="epic-decompose"`` briefing addendum for *issue_number*
+    (#3132) — the contract described in :data:`EPIC_DECOMPOSE_CONTRACT`,
+    naming the epic's own issue number so the worker doesn't have to infer
+    which issue the ``add-child``/``drive-queue add`` commands below refer
+    to.
+
+    Appended (not prepended) to the proposal's own briefing by
+    :func:`dispatch` — the epic's own issue body already carries whatever
+    decomposition instructions its author wrote (per #3132's motivating
+    issue, several epics wrote this out by hand); this is the coordinator's
+    OWN durable restatement of the same contract, so a worker never has to
+    rely solely on prose an operator might have gotten slightly wrong.
+    """
+    return (
+        f"{EPIC_DECOMPOSE_CONTRACT}\n"
+        f"(This epic's own issue number, for the commands above: #{issue_number}.)\n"
     )
 
 
@@ -757,6 +832,13 @@ def dispatch(
                 + "\n".join(focus_lines)
                 + "\n"
             )
+    elif proposal.type == EPIC_DECOMPOSE_TYPE and proposal.issue_number:
+        # #3132: append (not prepend — unlike the #603/#945 work-stage
+        # blocks above, there is no per-issue context digest or oracle-loop
+        # contract to lead with here) the decompose-and-queue contract so a
+        # worker sees it durably from the coordinator itself, not only from
+        # whatever the epic's own body happens to say.
+        briefing_text = briefing_text + "\n\n" + epic_decompose_briefing(proposal.issue_number)
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
