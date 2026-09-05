@@ -48,7 +48,8 @@ def _set_last_status(submission_id: str, status: str, *, now: float) -> None:
 
 class TestIsPulledStatus:
     @pytest.mark.parametrize(
-        "status", ["planned", "in-progress", "quality-check", "shipped"]
+        "status",
+        ["planned", "in-progress", "quality-check", "shipped", "post-shipped"],
     )
     def test_true_for_every_pulled_status(self, status: str) -> None:
         assert is_pulled_status(status) is True

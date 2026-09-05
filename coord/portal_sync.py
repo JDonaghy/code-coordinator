@@ -44,11 +44,11 @@ One pass, in this order:
    as a normal client-authored answer, which is exactly "lands as a normal
    answer that supersedes it, both remain visible". See
    :func:`_consume_relayed_answer_confirmations`.
-5. **Fold status** (#2588) — every linked milestone (``coord portal link``,
-   #2507/PDR-1) has its issues folded into one customer status
-   (:func:`fold_submission_status`: planned / in-progress / shipped) and,
-   if it changed since the last push, enqueued — the automatic caller
-   `enqueue_status` never had before this issue. See
+5. **Fold status** (#2588, widened by #3106) — every linked milestone
+   (``coord portal link``, #2507/PDR-1) has its issues folded into one
+   customer status (:func:`fold_submission_status`: planned / in-progress /
+   shipped / post-shipped) and, if it changed since the last push, enqueued
+   — the automatic caller `enqueue_status` never had before this issue. See
    :func:`sync_submission_statuses`.
 6. **Push** — coord-authored facts from the outbox (design rounds · status ·
    open questions · relayed answers), one row at a time, in per-submission
@@ -778,11 +778,27 @@ def enqueue_relayed_answer(
 # pipeline state is per ISSUE, the portal's status is per SUBMISSION, and a
 # submission that decomposed into five issues has no single stage. This
 # section is the fold that answers that — deliberately narrow, covering only
-# the three statuses coord can derive with no human judgment call:
+# the four statuses coord can derive with no human judgment call:
 #
-#   STATUS_PLANNED      — every linked issue exists, none has started
-#   STATUS_IN_PROGRESS  — at least one linked issue has started, not all done
-#   STATUS_SHIPPED       — every linked issue is closed
+#   STATUS_PLANNED       — every linked issue exists, none has started
+#   STATUS_IN_PROGRESS   — at least one linked issue has started, not all done
+#   STATUS_SHIPPED        — every linked issue is closed
+#   STATUS_POST_SHIPPED   — NOT every linked issue is closed, but this
+#                           submission has been through STATUS_SHIPPED
+#                           before (#3106)
+#
+# STATUS_POST_SHIPPED is deliberately un-graded: once a submission has ever
+# been notified `shipped`, a fold that would otherwise read
+# `planned`/`in-progress` (new post-release work exists and is not yet all
+# closed) collapses to `post-shipped` instead — post-release maintenance
+# does not get its own planned/in-progress granularity, it is one ongoing
+# state the client hears about. All-closed still reads plain `shipped`
+# regardless of history (see `fold_submission_status`'s own docstring for
+# why: it is what keeps a submission with nothing new since shipping
+# folding to the SAME value tick after tick, which the #2588 churn guard
+# needs to stay quiet). A full new release cycle re-entering
+# `planned`/`in-progress`/`shipped` from scratch is a separate, still
+# out-of-scope, design question (#3106's own issue body).
 #
 # Every other portal status is either driven by a different, already-wired
 # mechanism (`awaiting-signoff`/`quality-check` via the design-round/preview
@@ -809,12 +825,19 @@ def enqueue_relayed_answer(
 # result was 322 outbox rows alternating in-progress/shipped and 100+ mails
 # to a real customer over seven days.
 
-#: The three automatically-derived customer statuses (#2588). Every other
-#: entry in `coord.portal_bridge.SUBMISSION_STATUSES` is out of this fold's
-#: scope — see the module-section docstring above.
+#: The four automatically-derived customer statuses (#2588, widened by
+#: #3106). Every other entry in `coord.portal_bridge.SUBMISSION_STATUSES` is
+#: out of this fold's scope — see the module-section docstring above.
 STATUS_PLANNED = "planned"
 STATUS_IN_PROGRESS = "in-progress"
 STATUS_SHIPPED = "shipped"
+#: #3106: ongoing maintenance (bug fixes, small cosmetic enhancements)
+#: against a release that has already shipped — distinct from a full new
+#: release cycle. See the module-section docstring above and
+#: `fold_submission_status` for how it is derived, and
+#: `_reentry_block_reason` for why it is the one status in this vocabulary
+#: that is both reachable only after `shipped` AND itself repeatable.
+STATUS_POST_SHIPPED = "post-shipped"
 
 
 def _is_closed_issue(issue: dict[str, Any]) -> bool:
@@ -822,7 +845,10 @@ def _is_closed_issue(issue: dict[str, Any]) -> bool:
 
 
 def fold_submission_status(
-    issues: list[dict[str, Any]], started_issue_numbers: Any
+    issues: list[dict[str, Any]],
+    started_issue_numbers: Any,
+    *,
+    already_shipped: bool = False,
 ) -> str:
     """Fold every issue under one linked milestone into a single customer
     status (#2588). Pure — no I/O, so this is the part unit tests hit hardest.
@@ -843,10 +869,39 @@ def fold_submission_status(
 
     All-closed wins over "started" so a submission's last issue closing always
     reads ``shipped``, never a stale ``in-progress`` from an assignment that
-    started before it finished.
+    started before it finished. All-closed also wins over ``already_shipped``
+    below, for the same reason: it is what keeps a submission that is still
+    fully shipped, with nothing new since, folding to the same ``shipped``
+    value on every tick rather than drifting to a different one — the #2588
+    churn guard (:func:`_fold_status_for_link`'s ``_last_queued_status``
+    check) depends on repeated no-op ticks producing an *identical* status,
+    not merely an equivalent one.
+
+    ``already_shipped`` (#3106) is ``True`` once this submission has ever
+    been notified :data:`STATUS_SHIPPED` before — this function stays pure,
+    so the caller (:func:`_fold_status_for_link`) is the one that derives it
+    from the outbox history. It only changes the answer when the issue set
+    is NOT all-closed: a milestone-less follow-up issue newly linked and
+    still open (or not yet started) now reads :data:`STATUS_POST_SHIPPED`
+    instead of :data:`STATUS_PLANNED`/:data:`STATUS_IN_PROGRESS` — those two
+    buckets are pre-release granularity only, and post-release maintenance
+    does not get its own planned-vs-in-progress distinction, just the one
+    "there is post-release work happening" signal. This is the case that
+    used to leave a client stuck reading a stale ``shipped`` forever while
+    bug fixes and small enhancements kept landing behind it and the
+    automatic fold kept trying (and being refused) to re-derive
+    ``planned``/``in-progress`` (#3106's own reproduction, SUB-1EA1D3's
+    twelve post-release issues). A submission cannot go back to
+    ``planned``/``in-progress`` once it has shipped, and re-closing back to
+    all-closed reads plain ``shipped`` again rather than a distinct
+    "post-release work finished" value — a genuine new release cycle is a
+    separate, still out-of-scope, design question this fold does not
+    attempt to model.
     """
     if all(_is_closed_issue(i) for i in issues):
         return STATUS_SHIPPED
+    if already_shipped:
+        return STATUS_POST_SHIPPED
     if any(i.get("number") in started_issue_numbers for i in issues):
         return STATUS_IN_PROGRESS
     return STATUS_PLANNED
@@ -1069,24 +1124,45 @@ def _authoritative_link_block_reason(link: "portal_store.PortalLink") -> str | N
     )
 
 
+def _notified_statuses(submission_id: str) -> frozenset[str]:
+    """Every distinct status ever queued for *submission_id*, across every
+    outbox state (pending, draft, applied, rejected, held) — the "has the
+    customer already been told X" set shared by :func:`_reentry_block_reason`
+    and, via ``already_shipped``, :func:`fold_submission_status` (#3106).
+    """
+    return frozenset(
+        s for s in (r.fields.get("status") for r in _queued_status_rows(submission_id))
+        if s
+    )
+
+
 def _reentry_block_reason(submission_id: str, status: str) -> str | None:
     """Why folding *submission_id* into *status* would be a RE-ENTRY rather
     than a lifecycle step, or ``None`` if it is a genuine forward move
-    (#3096).
+    (#3096, amended by #3106).
 
-    The customer vocabulary is a lifecycle, not a state machine that
-    revisits, and ``shipped`` is the terminal one (coord-portal's
-    ``src/notifications.ts``). Two rules follow:
+    The customer vocabulary is a lifecycle, not a state machine that freely
+    revisits, and ``shipped`` is terminal for the pre-release half of it
+    (coord-portal's ``src/notifications.ts``). Three rules follow:
 
+    * :data:`STATUS_POST_SHIPPED` is the one deliberate exception (#3106): it
+      is reachable only AFTER ``shipped`` (a release has to exist before
+      post-release maintenance can be announced), but once reachable it may
+      be re-entered any number of times — a submission legitimately keeps
+      taking bug fixes and small enhancements for a long time after release,
+      and the client has to be able to hear about that more than once. This
+      is checked first and returns before either rule below can fire for it.
     * once ``shipped`` has been queued, the automatic fold pushes nothing
-      further — a submission cannot un-ship;
-    * a status this submission has already been notified into is never
-      pushed a second time.
+      further EXCEPT :data:`STATUS_POST_SHIPPED` — a submission cannot
+      un-ship back to ``planned``/``in-progress``, and re-``shipped`` is
+      caught by the next rule instead of this one.
+    * any other status this submission has already been notified into is
+      never pushed a second time.
 
-    Rule two is what the #2588 churn guard could not do: it compared against
-    the LAST queued status only, so `A -> B -> A` slipped through every time.
-    This compares against every status ever queued, which is the difference
-    between suppressing a repeat and suppressing an alternation.
+    Rule three is what the #2588 churn guard could not do: it compared
+    against the LAST queued status only, so `A -> B -> A` slipped through
+    every time. This compares against every status ever queued, which is the
+    difference between suppressing a repeat and suppressing an alternation.
 
     Scoped to the automatic fold on purpose. A human running `coord portal
     enqueue-status`, and the question/relayed-answer consumers that nudge a
@@ -1095,16 +1171,25 @@ def _reentry_block_reason(submission_id: str, status: str) -> str | None:
     behind them, not a loop.
 
     The cost, stated plainly: a submission whose fold legitimately wants to
-    re-enter a status (work re-opened under a shipped milestone) stops being
-    auto-notified and reports the refusal on every tick until an operator
-    resolves it. That is the trade #3096 asks for — a stuck status an
-    operator can see beats an unbounded mail flood nobody can.
+    re-enter a PRE-release status (work re-opened under a shipped milestone
+    as though it were a new release, rather than post-release maintenance)
+    stops being auto-notified and reports the refusal on every tick until an
+    operator resolves it. That is the trade #3096 asks for — a stuck status
+    an operator can see beats an unbounded mail flood nobody can. #3106 does
+    not relax this for anything other than :data:`STATUS_POST_SHIPPED`: a
+    genuine new release cycle is still a design question for a future issue.
     """
-    seen = {
-        s for s in (r.fields.get("status") for r in _queued_status_rows(submission_id))
-        if s
-    }
+    seen = _notified_statuses(submission_id)
     if not seen:
+        return None
+    if status == STATUS_POST_SHIPPED:
+        if STATUS_SHIPPED not in seen:
+            return (
+                f"{submission_id} has never been notified {STATUS_SHIPPED!r} — "
+                f"refusing to notify it {STATUS_POST_SHIPPED!r} before a release "
+                "has shipped (#3106: post-release maintenance implies a release "
+                "happened first)"
+            )
         return None
     if STATUS_SHIPPED in seen and status != STATUS_SHIPPED:
         return (
@@ -1328,7 +1413,8 @@ def _fold_status_for_link(
         return StatusFoldResult(link.submission_id, None, empty_reason)
 
     started = _started_issue_numbers(board, repo_name)
-    status = fold_submission_status(issues, started)
+    already_shipped = STATUS_SHIPPED in _notified_statuses(link.submission_id)
+    status = fold_submission_status(issues, started, already_shipped=already_shipped)
 
     if _last_queued_status(link.submission_id) == status:
         return StatusFoldResult(

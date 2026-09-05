@@ -1544,6 +1544,44 @@ class TestFoldSubmissionStatus:
             == "shipped"
         )
 
+    def test_already_shipped_collapses_new_open_work_to_post_shipped(self):
+        """#3106: a newly-linked, still-open post-release issue must not
+        fold to `planned`/`in-progress` once the submission has shipped —
+        those buckets are pre-release granularity only."""
+        issues = [_issue(1, "CLOSED"), _issue(2, "OPEN")]
+        assert (
+            portal_sync.fold_submission_status(
+                issues, frozenset(), already_shipped=True,
+            )
+            == "post-shipped"
+        )
+
+    def test_already_shipped_started_work_also_reads_post_shipped(self):
+        """Same as above when the new post-release issue has actually
+        started — `already_shipped` collapses both pre-release buckets
+        (`planned` and `in-progress`), not just `planned`."""
+        issues = [_issue(1, "CLOSED"), _issue(2, "OPEN")]
+        assert (
+            portal_sync.fold_submission_status(
+                issues, frozenset({2}), already_shipped=True,
+            )
+            == "post-shipped"
+        )
+
+    def test_already_shipped_all_closed_still_reads_plain_shipped(self):
+        """All-closed wins over `already_shipped`, deliberately: a
+        submission with nothing new since it shipped must keep folding to
+        the SAME `shipped` value on every tick (what lets the #2588 churn
+        guard recognise "nothing changed" and stay quiet), not drift to
+        `post-shipped` on its own with no new issue behind it."""
+        issues = [_issue(1, "CLOSED"), _issue(2, "CLOSED")]
+        assert (
+            portal_sync.fold_submission_status(
+                issues, frozenset({1, 2}), already_shipped=True,
+            )
+            == "shipped"
+        )
+
 
 class TestStartedIssueNumbers:
     def test_none_board_is_the_empty_set(self):
@@ -2059,14 +2097,23 @@ class TestStatusReentryGuard:
         return FakeConfig({"acme-portal": FakeRepoCfg()})
 
     def test_alternating_fold_is_refused_after_one_round_trip(self, monkeypatch):
+        """A pre-release `A -> B -> A` oscillation is still refused — this
+        no longer routes through `shipped` (#3106 made the specific
+        `in-progress -> shipped -> in-progress` shape this test used to use
+        legitimate: it now folds to `shipped -> post-shipped`, not a refused
+        re-entry into `in-progress` — see
+        `test_shipped_moves_forward_into_post_shipped_when_new_work_lands`
+        below for that case). The board here toggles whether issue 1 has
+        started, oscillating in-progress/planned without ever reaching
+        all-closed, to keep exercising the ordinary rule."""
         config = self._linked_config()
-        board = _board_with_started("acme-portal", {1, 2})
-        open_then_closed = [
-            [_issue(1, "OPEN"), _issue(2, "CLOSED")],   # in-progress
-            [_issue(1, "CLOSED"), _issue(2, "CLOSED")],  # shipped
-            [_issue(1, "OPEN"), _issue(2, "CLOSED")],   # in-progress again
+        started_board = _board_with_started("acme-portal", {1})
+        stages = [
+            (started_board, [_issue(1, "OPEN")]),  # in-progress
+            (None, [_issue(1, "OPEN")]),  # planned
+            (started_board, [_issue(1, "OPEN")]),  # in-progress again
         ]
-        for issues in open_then_closed:
+        for board, issues in stages:
             monkeypatch.setattr(portal_sync, "_milestone_issues", lambda *a, _i=issues: _i)
             result = portal_sync.fold_status_for_milestone(
                 config, "acme-portal", 5, board=board,
@@ -2077,11 +2124,32 @@ class TestStatusReentryGuard:
         assert result.status == "in-progress"
         assert result.row is None
         assert result.failed is True
-        assert _status_values() == ["in-progress", "shipped"]
+        assert _status_values() == ["in-progress", "planned"]
 
-    def test_shipped_is_terminal(self, monkeypatch):
-        """`shipped` is the terminal one (coord-portal `src/notifications.ts`)
-        — a submission cannot un-ship, whatever the fold computes."""
+    def test_shipped_no_longer_blocks_planned_or_in_progress_reentry_at_the_guard(
+        self,
+    ):
+        """`shipped` is still terminal for the PRE-release buckets — the
+        guard-level check that used to be exercised by the fold before
+        #3106 (the fold itself can no longer reach `planned`/`in-progress`
+        once shipped; see `fold_submission_status`'s `already_shipped`)."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        enqueue_status(SUB, "shipped")
+
+        reason = portal_sync._reentry_block_reason(SUB, "planned")
+
+        assert reason is not None
+        assert "terminal" in reason
+
+    def test_shipped_moves_forward_into_post_shipped_when_new_work_lands(
+        self, monkeypatch,
+    ):
+        """#3106: `shipped` no longer strands a submission — new post-release
+        work (a bug fix, a small enhancement) folds into `post-shipped`
+        instead of the fold getting silently stuck re-computing `planned`/
+        `in-progress` and being refused as an "un-ship"."""
         config = self._linked_config()
         monkeypatch.setattr(
             portal_sync, "_milestone_issues", lambda *a: [_issue(1, "CLOSED")]
@@ -2089,18 +2157,39 @@ class TestStatusReentryGuard:
         first = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
         assert first.status == "shipped"
 
-        # A brand-new issue lands under the shipped milestone.
+        # A brand-new issue lands under the shipped milestone — exactly
+        # #3106's own reproduction (SUB-1EA1D3 took twelve of these).
         monkeypatch.setattr(
             portal_sync, "_milestone_issues",
             lambda *a: [_issue(1, "CLOSED"), _issue(2, "OPEN")],
         )
         result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
 
-        assert result.status == "planned"
-        assert result.row is None
-        assert result.failed is True
-        assert "terminal" in result.reason
-        assert _status_values() == ["shipped"]
+        assert result.status == "post-shipped"
+        assert result.row is not None
+        assert result.failed is False
+        assert _status_values() == ["shipped", "post-shipped"]
+
+    def test_post_shipped_is_refused_before_any_shipped_notification(self):
+        """#3106: post-release maintenance implies a release happened first
+        — `post-shipped` cannot be entered on a submission that has never
+        been notified `shipped`, even if it has seen other statuses."""
+        enqueue_status(SUB, "in-progress")
+
+        reason = portal_sync._reentry_block_reason(SUB, "post-shipped")
+
+        assert reason is not None
+        assert "shipped" in reason
+
+    def test_post_shipped_can_be_re_entered_after_shipped(self):
+        """#3106: unlike every other status, `post-shipped` is not one-shot
+        — a submission legitimately takes many post-release fixes over a
+        long time, and the guard must not treat a second `post-shipped`
+        notification as an oscillation."""
+        enqueue_status(SUB, "shipped")
+        enqueue_status(SUB, "post-shipped")
+
+        assert portal_sync._reentry_block_reason(SUB, "post-shipped") is None
 
     def test_re_shipping_after_shipped_stays_the_quiet_unchanged_no_op(
         self, monkeypatch,
