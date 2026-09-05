@@ -456,14 +456,17 @@ PY
                             # A helper the units reference but this coord
                             # release does not package (the repo's own
                             # deploy/ has several coord/deploy/ does not).
-                            # No installer can conjure it, so this is a
-                            # release-packaging gap, not an installer bug —
-                            # and provision-machine.sh now WARNS about it by
-                            # name at run time rather than arming a unit that
-                            # can only 203/EXEC.
+                            # This tier grades the RELEASE, from a rootfs with
+                            # no checkout in it, so it is the honest picture
+                            # of a wheel-only install. On a real rebuild
+                            # provision-machine.sh stages this file from the
+                            # deploy/ of the checkout it is run from, and only
+                            # warns by name (DEADEXEC, counted in its final
+                            # dead_exec= trailer) when even that is absent —
+                            # a release-packaging gap, not an installer bug.
                             note "$(basename "$f"): ExecStart '$(basename "$bin")' is not"
                             note "        packaged in this coord release — provision-machine.sh"
-                            note "        warns about this unit at run time (DEADEXEC)" ;;
+                            note "        stages it from the checkout's deploy/, else DEADEXEC" ;;
                         *)
                             bad "$(basename "$f"): ExecStart '$bin' is not executable in the rootfs"
                             missing_exec=$((missing_exec + 1)) ;;

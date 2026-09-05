@@ -551,10 +551,12 @@ def test_every_installed_unit_has_something_to_run(box: Box):
             checked += 1
             if resolved.exists():
                 continue
-            # It may be genuinely unresolvable — `coord-web-dist-build.sh` is
-            # in the repo's deploy/ but NOT in the wheel's coord/deploy/, so
-            # no amount of correct installing produces it. What must never
-            # happen is that going unsaid: the run has to name the unit.
+            # It may still be unresolvable: `coord-web-dist-build.sh` is in
+            # the repo's deploy/ but NOT in the wheel's coord/deploy/, so a
+            # release-only install (no checkout to fall back to — see
+            # test_a_dead_execstart_is_advisory_counted_and_never_fatal)
+            # cannot produce it. What must never happen is that going unsaid:
+            # the run has to name the unit.
             assert f"{service.name} runs {command}" in out, (
                 f"{service.name}: ExecStart={command} resolves to {resolved}, "
                 f"which this run never created (203/EXEC on every start) — and "
@@ -562,6 +564,97 @@ def test_every_installed_unit_has_something_to_run(box: Box):
             )
             assert "203/EXEC" in out, "the warning must say what the symptom looks like"
     assert checked >= len(list(unit_dir.glob("*.service"))), "no ExecStart was checked"
+
+
+def test_a_helper_the_release_does_not_ship_is_staged_from_this_checkout(box: Box):
+    """`coord/deploy/README.md` says the `*.sh` helpers "are not copied here"
+    and tests/test_packaged_deploy_units.py pins that only
+    ``coord-db-backup.sh`` is — so a daemon host installed purely from the
+    wheel has `coord-web-dist-build.service` armed with an `ExecStart=` that
+    resolves to nothing. The checkout this script is being run out of is the
+    only place that file exists, so it is the fallback.
+    """
+    out = _ok(box.run("--role", "server", *WORKER_ARGS)).stdout
+    local_bin = box.home / ".local" / "bin"
+
+    source = REPO_ROOT / "deploy" / "coord-web-dist-build.sh"
+    assert source.is_file(), "the premise moved: deploy/coord-web-dist-build.sh is gone"
+    staged = local_bin / source.name
+    assert staged.is_file(), (
+        "coord-web-dist-build.service's ExecStart names "
+        f"%h/.local/bin/{source.name} and nothing put it there"
+    )
+    assert staged.read_text() == source.read_text()
+    assert staged.stat().st_mode & 0o111, "a helper systemd ExecStarts must be executable"
+    # and it says WHERE it came from — a checkout-sourced file is not a
+    # released artifact and the operator has to be able to tell.
+    assert f"{source.name} (from {REPO_ROOT / 'deploy'}" in out
+    assert "does not ship it" in out
+
+
+def test_a_helper_the_release_does_ship_is_never_overridden_by_the_checkout(box: Box):
+    """The fallback is last-resort only. If the release packages a helper,
+    the release wins — otherwise this would quietly reintroduce exactly the
+    #1927 "installed from whatever the checkout happened to hold" drift that
+    installing from `packaged_unit_dir()` exists to prevent.
+    """
+    from coord.health.checks.unit_drift import packaged_unit_dir
+
+    packaged = packaged_unit_dir() / "coord-db-backup.sh"
+    assert packaged.is_file(), "the premise moved: the wheel no longer ships this helper"
+
+    out = _ok(box.run("--role", "server", *WORKER_ARGS)).stdout
+    staged = box.home / ".local" / "bin" / packaged.name
+    assert staged.read_text() == packaged.read_text()
+    for line in out.splitlines():
+        if packaged.name in line:
+            assert "does not ship it" not in line, (
+                f"{packaged.name} IS packaged in this release; it must not be "
+                f"taken from the checkout: {line}"
+            )
+
+
+def test_a_dead_execstart_is_advisory_counted_and_never_fatal(tmp_path: Path, box: Box):
+    """Run the script from a directory with no `deploy/` beside it — i.e. the
+    release-only case the fallback above cannot rescue.
+
+    The unresolvable unit is still installed and still enabled, deliberately:
+    the missing file is a release-packaging gap the operator cannot fix from
+    this host, and refusing to finish `--role server` over it would block a
+    rebuild on something outside their control. So it is advisory — but it
+    must be *loud* and *counted*, because this is the one failure class that
+    `is-enabled` and `coord machine doctor` both read as healthy.
+    """
+    detached = tmp_path / "detached" / "scripts"
+    detached.mkdir(parents=True)
+    script = detached / "provision-machine.sh"
+    script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    assert not (tmp_path / "detached" / "deploy").exists()
+
+    result = subprocess.run(  # noqa: S603
+        ["bash", str(script), "--role", "server", *WORKER_ARGS],
+        capture_output=True, text=True, env=box.env, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout + result.stderr
+
+    assert "DEAD ExecStart: coord-web-dist-build.service" in out
+    assert "203/EXEC" in out
+    assert re.search(r"PROVISION: .*dead_exec=[1-9]", out), (
+        "a dead ExecStart must reach the machine-readable trailer, not just "
+        f"scroll past in the phase output:\n{out}"
+    )
+    assert "the doctor cannot see it" in out
+    # ...and the unit really was enabled anyway — that is the tradeoff being
+    # asserted, not an accident.
+    assert "coord-web-dist-build.timer" in {p.name for p in (box.state / "units").glob("*")}
+
+
+def test_a_clean_run_reports_no_dead_execstarts(box: Box):
+    """The counter must be able to read zero, or it grades nothing."""
+    out = _ok(box.run("--role", "server", *WORKER_ARGS)).stdout
+    assert "dead_exec=0" in out
+    assert "DEAD ExecStart" not in out
 
 
 def test_the_script_names_no_units_of_its_own(box: Box):
@@ -1191,3 +1284,26 @@ def test_agent_operations_documents_the_installer():
     doc = (REPO_ROOT / "docs" / "AGENT_OPERATIONS.md").read_text(encoding="utf-8")
     assert "provision-machine.sh" in doc
     assert "--role thin-client" in doc
+
+
+def test_agent_operations_hands_the_operator_the_run_no_harness_can_do():
+    """The three verification tiers all run unprivileged, which is exactly why
+    it is tempting to stop there. The one layer that needs a hypervisor and a
+    human at a browser has to be written down as a runnable checklist, not
+    left as "someone should do a VM run": what to launch, what to run, and
+    which output to paste back.
+    """
+    doc = (REPO_ROOT / "docs" / "AGENT_OPERATIONS.md").read_text(encoding="utf-8")
+    for needed in (
+        "multipass launch 24.04",          # how to get the VM
+        "COORD_SETTINGS_DIR=~/scratch-settings",  # don't register a throwaway for real
+        "coord machine doctor coordvm --ssh -v",  # what proves the gate
+        "localhost:7435/board",           # the server role's own evidence
+        "multipass delete --purge",       # and put it away afterwards
+    ):
+        assert needed in doc, f"the VM checklist must say: {needed}"
+    for role in ("thin-client", "worker", "server"):
+        assert f"--role {role}      --machine coordvm" in doc or \
+               f"--role {role} --machine coordvm" in doc, (
+            f"the checklist must run --role {role} on the throwaway VM"
+        )
