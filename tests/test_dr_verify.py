@@ -24,6 +24,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -393,10 +394,10 @@ def test_parity_boots_a_real_coord_serve_and_reads_a_well_formed_board(lane):
     expected = dr_verify.table_counts(restored)["assignments"]
     assert expected > 0, "the fixture store must carry assignments to prove anything"
 
-    step = dr_verify.check_parity(restored, expected_assignments=expected)
+    step = dr_verify.check_parity(restored, live_assignments=expected)
 
     assert step.ok and step.name == "parity"
-    assert "GET /board" in step.detail
+    assert "/board (restored)" in step.detail
     assert f"{expected} assignment(s)" in step.detail
 
 
@@ -410,7 +411,7 @@ def test_parity_fails_when_the_board_does_not_match_the_restored_store(lane):
     )
 
     with pytest.raises(dr_verify.DRVerifyError, match="parity check failed"):
-        dr_verify.check_parity(restored, expected_assignments=9999)
+        dr_verify.check_parity(restored, live_assignments=9999)
 
 
 def test_parity_argv_carries_no_credential_and_the_token_travels_in_the_env(tmp_path):
@@ -424,6 +425,144 @@ def test_parity_argv_carries_no_credential_and_the_token_travels_in_the_env(tmp_
     assert env["COORD_SERVE_TOKEN"] == "tok3n-abcdef"
     assert env["COORD_DIR"] == str(tmp_path / "scratch")
     assert "PYTEST_CURRENT_TEST" not in env
+
+
+# ==========================================================================
+# Acceptance: parity compares /board to /board, never /board to a raw
+# table count (#3135)
+# ==========================================================================
+
+
+def add_ancient_terminal_assignments(path: Path, count: int, *, start: int = 90000) -> None:
+    """Insert *count* old, terminal, unreferenced assignment rows straight
+    into *path*'s `assignments` table.
+
+    This is the shape a real fleet board has after months of churn: far more
+    `done` rows than #762's retention cap keeps on `/board` (they are neither
+    active, nor recent, nor queued for merge, nor the latest assignment of a
+    still-open issue — none of `compute_board_keep_ids`'s keep conditions
+    apply). That gap between the raw table and what `/board` serves is
+    exactly what #3135's parity check compared against itself and always
+    failed on.
+    """
+    ancient = time.time() - 400 * 86400.0
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executemany(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "repo_github, issue_number, issue_title, status, type, "
+            "dispatched_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    f"work-ancient-{i}",
+                    "precision",
+                    "claude-coordinator",
+                    "JDonaghy/claude-coordinator",
+                    start + i,
+                    f"ancient issue {i}",
+                    "done",
+                    "work",
+                    ancient,
+                    ancient,
+                )
+                for i in range(count)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_verify_passes_on_a_production_shaped_store_where_the_table_outnumbers_board(lane):
+    """The regression #3135 is about: a board with real history has a raw
+    `assignments` table far bigger than what `/board` serves, and the parity
+    check must compare `/board` to `/board` — not the raw table to `/board`,
+    which fails on every healthy production restore, forever.
+    """
+    pytest.importorskip("uvicorn")
+    live_path = lane.home / "coord.db"
+    add_ancient_terminal_assignments(live_path, 500)
+    push_backup()
+
+    raw_count = dr_verify.table_counts(live_path)["assignments"]
+    served_count = dr_verify.live_board_assignment_count(live_path)
+    assert raw_count > served_count, (
+        "the fixture must actually diverge — otherwise this test cannot tell "
+        "the fix apart from the bug it regression-tests"
+    )
+
+    result = run_cli(lane)
+    assert result.exit_code == 0, result.output
+
+    record = json.loads(lane.record.read_text())
+    assert record["outcome"] == "ok"
+    steps = {s["name"]: s for s in record["steps"]}
+    assert steps["parity"]["ok"], steps["parity"]["detail"]
+    assert lane.alerts == []
+
+
+def test_parity_fails_hard_when_restored_board_serves_zero_but_live_serves_some(
+    sqlite_config, tmp_path
+):
+    """A restored store whose daemon serves 0 assignments while live serves
+    any at all is the daemon-cannot-read-it failure this step exists to
+    catch — and must fail even though a live count this small (5) is well
+    within the generic tolerance budget (max(50, ceil(5*0.10)) == 50), which
+    would otherwise wave a shortfall of 5 through. Tolerance must not be able
+    to launder a total loss.
+    """
+    pytest.importorskip("uvicorn")
+    restored_dir = tmp_path / "zero-restore"
+    restored_dir.mkdir()
+    restored = make_store(restored_dir / "coord.db")
+    conn = sqlite3.connect(str(restored))
+    conn.execute("DELETE FROM assignments")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(dr_verify.DRVerifyError, match="parity check failed") as excinfo:
+        dr_verify.check_parity(restored, live_assignments=5)
+
+    assert "served 0 assignment" in str(excinfo.value)
+
+
+def test_parity_fails_when_restored_serves_materially_fewer_than_live_beyond_tolerance(lane):
+    """A restore that comes up and serves *something*, but far less than live
+    and past the same lag tolerance `check_content` applies, is still a
+    broken restore — not every shortfall is a total loss like the zero case
+    above, so this needs its own named failure path.
+    """
+    pytest.importorskip("uvicorn")
+    pushed = push_backup()
+    restored = lane.scratch_root / "coord.db"
+    dr_verify.fetch_snapshot(
+        pushed.snapshot_id, restored, config=bk.BackupConfig.from_env()
+    )
+
+    with pytest.raises(dr_verify.DRVerifyError, match="parity check failed") as excinfo:
+        dr_verify.check_parity(restored, live_assignments=10_000)
+
+    assert "short by" in str(excinfo.value)
+
+
+def test_parity_failure_names_both_board_comparands_not_a_table_count(lane):
+    """The message must name what each side actually is (`/board` vs
+    `/board`), so the next reader is not left guessing which side is
+    filtered — the ambiguity that let #3135 ship in the first place.
+    """
+    pytest.importorskip("uvicorn")
+    pushed = push_backup()
+    restored = lane.scratch_root / "coord.db"
+    dr_verify.fetch_snapshot(
+        pushed.snapshot_id, restored, config=bk.BackupConfig.from_env()
+    )
+
+    with pytest.raises(dr_verify.DRVerifyError) as excinfo:
+        dr_verify.check_parity(restored, live_assignments=10_000)
+
+    message = str(excinfo.value)
+    assert "/board (restored)" in message
+    assert "/board (live)" in message
 
 
 # ==========================================================================

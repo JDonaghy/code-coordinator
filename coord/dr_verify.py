@@ -28,7 +28,10 @@ end:
    expects. A backup that restores cleanly but is three migrations behind is a
    recovery that fails at daemon start.
 5. **Parity check** — boot a throwaway ``coord serve`` against the scratch DB
-   on an ephemeral port and ``GET /board``. This is the check that proves
+   on an ephemeral port and ``GET /board``, then compare its served assignment
+   count against what ``/board`` serves for the *live* store — never against
+   the live store's raw table count, which #762's retention cap always makes
+   larger once a board has any history (#3135). This is the check that proves
    *recoverability* rather than merely *restorability*.
 6. **Clean up** the scratch copy on every exit path, including a mid-restore
    failure and a ``KeyboardInterrupt``.
@@ -680,17 +683,22 @@ def serve_env(scratch_dir: Path, token: str) -> dict[str, str]:
     guard refuses to open "the" database under pytest — and under this
     module's own tests, "the" database is the scratch copy, which is precisely
     what we want opened.
+
+    #3135: deliberately does **not** force ``COORD_BOARD_RETENTION_DAYS``.
+    #762 caps `/board`'s assignments to active + pipeline-referenced + the
+    last ``COORD_BOARD_RETENTION_DAYS`` of terminal rows, so a real fleet
+    board's `/board` count is *always* smaller than its raw `assignments`
+    table once it has any history. A parity check that disabled the cap here
+    and then compared against the raw table count (the pre-#3135 shape of
+    this function) was comparing a filtered view to an unfiltered one and
+    failed permanently on production. The throwaway daemon now inherits
+    whatever retention window the parent process has — the same one the
+    *live* board applies (see :func:`live_board_assignment_count`) — so both
+    sides of the parity comparison are `/board` answers, filtered identically.
     """
     env = dict(os.environ)
     env["COORD_DIR"] = str(scratch_dir)
     env["COORD_SERVE_TOKEN"] = token
-    # #762 caps `/board`'s assignments to active + pipeline-referenced + the
-    # last COORD_BOARD_RETENTION_DAYS of terminal rows. That cap is right for
-    # a live TUI and wrong here: it would make "the board served fewer rows
-    # than the store holds" ambiguous between a healthy cap and a broken
-    # restore. `0` disables it (coord/dao.py::_board_retention_cutoff), so the
-    # parity step can assert an exact count against the restored store.
-    env["COORD_BOARD_RETENTION_DAYS"] = "0"
     env.pop("PYTEST_CURRENT_TEST", None)
     # A stray client.toml/COORD_SERVICE_URL must not make the throwaway
     # daemon proxy someone else's board (#2824's failure, in miniature).
@@ -698,11 +706,46 @@ def serve_env(scratch_dir: Path, token: str) -> dict[str, str]:
     return env
 
 
+def live_board_assignment_count(live_db_path: Path) -> int:
+    """How many assignments the **live** `/board` serves, right now.
+
+    #3135: the comparand the restored side's `/board` count must be checked
+    against is another `/board` count — never the live store's raw table
+    count, which is always larger once a board has any history (#762's
+    retention cap). There is no need to *boot* a second daemon to answer this:
+    the live daemon (if one is even running) is not what is being tested here
+    — only "what would `/board` report for this file" is needed, and that is
+    exactly :meth:`coord.dao.SqliteStore.board_projection`, the same function
+    `coord/serve_app.py`'s `/board` route calls. Calling it directly, read-only,
+    against the live file is the "one question, one answer" version of asking
+    a second daemon to boot just to answer a question the daemon already
+    knows how to answer without booting.
+    """
+    from coord.dao import SqliteStore  # noqa: PLC0415
+
+    try:
+        payload = SqliteStore(live_db_path).board_projection()
+    except sql.driver_errors() as exc:
+        raise DRVerifyError(
+            f"parity check failed: could not read the live board's /board "
+            f"count from {live_db_path}: {exc}"
+        ) from None
+    rows = payload.get("assignments")
+    if not isinstance(rows, list):
+        raise DRVerifyError(
+            "parity check failed: the live store's /board projection carried "
+            "no `assignments` list — cannot establish what /board (live) serves"
+        )
+    return len(rows)
+
+
 def check_parity(
     db_path: Path,
     *,
     config_path: Path | None = None,
-    expected_assignments: int | None = None,
+    live_assignments: int | None = None,
+    tolerance_fraction: float = DEFAULT_TOLERANCE_FRACTION,
+    tolerance_rows: int = DEFAULT_TOLERANCE_ROWS,
     timeout: float = PARITY_BOOT_TIMEOUT,
 ) -> StepResult:
     """Boot a real ``coord serve`` against the scratch DB and ``GET /board``.
@@ -712,6 +755,14 @@ def check_parity(
     fail to come up as a board (a schema the daemon's projections do not
     understand, a JSON column that no longer decodes). Nothing short of
     booting the daemon finds that.
+
+    *live_assignments* is what `/board` (live) serves right now — see
+    :func:`live_board_assignment_count` — **not** a raw table count (#3135).
+    Compared with the same lag tolerance :func:`check_content` applies, plus a
+    hard zero-check tolerance cannot waive: a restore that serves 0 while live
+    serves any is a broken restore no matter how small live's count is (the
+    generic tolerance formula's absolute floor would otherwise wave through
+    "0 of 10" as within budget).
     """
     from coord.config import resolve_config_path  # noqa: PLC0415
 
@@ -754,19 +805,38 @@ def check_parity(
             "restored store did not project as a board"
         )
     served = len(rows)
-    if expected_assignments is not None and served != expected_assignments:
-        # Exact, not "close enough": the retention cap that would otherwise
-        # make this fuzzy is disabled in the child (see `serve_env`), so any
-        # divergence here is the restored store failing to project as a board.
-        raise DRVerifyError(
-            f"parity check failed: /board served {served} assignment(s) from a "
-            f"restored store holding {expected_assignments} — the restore does "
-            "not come up as the board it was taken from"
+    if live_assignments is not None:
+        # Hard zero-check, ahead of tolerance: a restore that serves nothing
+        # while live serves plenty is the daemon-can't-read-it failure this
+        # step exists to catch, and must fail even when live's count is small
+        # enough that the tolerance budget below would otherwise wave a
+        # shortfall of exactly `live_assignments` through.
+        if live_assignments > 0 and served == 0:
+            raise DRVerifyError(
+                f"parity check failed: /board (restored) served 0 assignment(s) "
+                f"while /board (live) serves {live_assignments} — the restore "
+                "does not come up as the board it was taken from"
+            )
+        shortfall = live_assignments - served
+        budget = allowed_shortfall(
+            live_assignments, fraction=tolerance_fraction, absolute=tolerance_rows
         )
+        if shortfall > budget:
+            raise DRVerifyError(
+                f"parity check failed: /board (restored) served {served} "
+                f"assignment(s), /board (live) serves {live_assignments} "
+                f"(short by {shortfall}, tolerance {budget}) — the restore "
+                "does not come up as the board it was taken from"
+            )
     return StepResult(
         "parity",
         True,
-        f"a real coord serve answered GET /board with {served} assignment(s)",
+        f"/board (restored) served {served} assignment(s)"
+        + (
+            f", /board (live) serves {live_assignments}"
+            if live_assignments is not None
+            else ""
+        ),
     )
 
 
@@ -931,7 +1001,9 @@ def verify(
                     check_parity(
                         restored,
                         config_path=config_path,
-                        expected_assignments=restored_counts.get("assignments"),
+                        live_assignments=live_board_assignment_count(live_path),
+                        tolerance_fraction=tolerance_fraction,
+                        tolerance_rows=tolerance_rows,
                         timeout=parity_timeout,
                     )
                 )
