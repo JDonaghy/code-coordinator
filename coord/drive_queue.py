@@ -436,7 +436,25 @@ RETRY_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 300.0, 1200.0)
 # produces. Widening the spacing buys a transient condition real time to
 # clear while still letting the existing `max_attempts` ceiling catch a
 # genuinely-broken entry and escalate it, same as any other death.
-DISPATCH_FAILURE_MIN_BACKOFF_SECONDS = 300.0
+#
+# #3145 raised this from 300.0: `DEFAULT_MAX_ATTEMPTS` is 2, so this single
+# gap is the ENTIRE budget between a died launch's first and last chance —
+# and on 2026-09-05 both of vimcode#821's fix-dispatch attempts (a bare
+# `httpx` timeout, `assign()` never reached, so `_dispatch_produced_nothing`
+# is true) landed inside ONE dellserver agent stall and burned the whole
+# budget, landing the row in `blocked` with no code-side evidence at all —
+# recoverable only by a manual `drive-queue remove` + `add`. 300s was
+# narrower than `coord/agent.py::_run_pre_stash_build`'s own 600s
+# `subprocess.run` timeout, the single best-documented cause of a
+# same-agent stall, so a same-spacing retry could (and did) land inside the
+# very stall it was retrying. 660.0 clears that 600s worst case with a 60s
+# margin: a dispatch-only death's next attempt is now guaranteed to fire
+# only after any single such stall has already ended, so it either
+# succeeds or fails for a genuinely different reason — never "recurs within
+# one agent-stall window" (this constant cannot see OTHER stall causes —
+# e.g. the shared `asyncio.to_thread` pool saturating, or a wedged agent —
+# so it bounds the known worst case, not every possible one).
+DISPATCH_FAILURE_MIN_BACKOFF_SECONDS = 660.0
 
 # ── the per-repo ceiling (#1972) ─────────────────────────────────────────────
 #
@@ -3220,11 +3238,12 @@ def _retry_backoff_reason(
     `_dispatch_produced_nothing` alone — which, like the note before #2424,
     cannot tell a genuine pre-`coord assign` crash from a merge-only relaunch
     that dispatches no new assignment by design. Once `own_reason` already
-    names a merge-gate block (`_is_merge_gate_block_reason`), the 300s floor
-    would be pure mispacing: the rationale for widening it ("a transient
-    dispatch failure cannot spend the whole retry budget inside one tick
-    cadence") does not apply once the cause is known to be a merge-gate
-    block, not a dispatch failure. ``None`` (the default) degrades to the
+    names a merge-gate block (`_is_merge_gate_block_reason`), the widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` floor would be pure mispacing:
+    the rationale for widening it ("a transient dispatch failure cannot
+    spend the whole retry budget inside one tick cadence") does not apply
+    once the cause is known to be a merge-gate block, not a dispatch
+    failure. ``None`` (the default) degrades to the
     pre-#2424-follow-up behaviour exactly, for callers that have not been
     updated to pass it.
     """
