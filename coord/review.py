@@ -9,8 +9,14 @@ Public entry points:
 
 - `pick_reviewer_machine(...)`  — choose an idle machine different from the
   worker, with a single-machine fallback.
+- `repo_focus_lines(...)`       — #3112: the `### Repo-specific focus` block
+  for a repo's `reviews.repo_overrides`. Shared with `coord.dispatch.dispatch`
+  so the worker's briefing and the reviewer's briefing are graded/shown the
+  exact same rule text, and can never drift apart.
 - `build_review_briefing(...)`  — assemble the reviewer's prompt from the
-  repo's CLAUDE.md, the generic checklist, and any repo-specific overrides.
+  repo's CLAUDE.md, the generic checklist, any repo-specific overrides
+  (`repo_focus_lines`), and the worker's own claims (completion summary +
+  commit messages, #3112).
 - `dispatch_review(...)`        — full path: find/open PR, pick reviewer,
   build briefing, send to agent server, add a review `Assignment` to the
   board. Called from reconcile when a work assignment transitions to done.
@@ -1539,6 +1545,34 @@ def diff_missing_test_coverage(diff_text: str | None) -> bool:
     return not any(_is_test_path(p) for p in paths)
 
 
+def repo_focus_lines(reviews_cfg: ReviewsConfig, repo_name: str) -> list[str]:
+    """Return the ``### Repo-specific focus`` block for *repo_name*, or ``[]``
+    if the repo has no ``reviews.repo_overrides`` configured (#3112).
+
+    Shared by :func:`build_review_briefing` (the reviewer's copy) and
+    :func:`coord.dispatch.dispatch`'s work-briefing chokepoint (the worker's
+    copy) so the two can never drift. Before #3112, ``repo_overrides`` was
+    read in exactly one module (``coord/review.py``) — workers were graded
+    against rules they were never shown, and vimcode's most-failed rule
+    (state that a black-box test was observed RED against unfixed develop)
+    pointed at a PR body workers structurally cannot write. A worker that
+    can read the exact rubric it is graded against can satisfy it in the
+    surface it actually owns (its own commits/summary) instead.
+
+    Returns a list starting with a blank line (matching every other
+    optional-section append pattern in :func:`build_review_briefing`) so a
+    caller can simply ``lines.extend(...)`` — and ``[]`` (no dangling blank
+    line or empty heading) when there is nothing to say.
+    """
+    overrides = reviews_cfg.repo_overrides.get(repo_name, [])
+    if not overrides:
+        return []
+    lines = ["", f"### Repo-specific focus ({repo_name})"]
+    for item in overrides:
+        lines.append(f"- {item}")
+    return lines
+
+
 def build_review_briefing(
     *,
     pr_number: int | None,
@@ -1563,6 +1597,8 @@ def build_review_briefing(
     assignment_type: str = "work",
     provider_same_as_worker: bool = False,
     review_provider: str | None = None,
+    completion_summary: str | None = None,
+    commit_messages: list[str] | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -1646,6 +1682,18 @@ def build_review_briefing(
     ever editing the repo's own rulebook, so any diff that touches one of
     these paths is mandatory ``request-changes`` regardless of
     *assignment_type*.
+
+    *completion_summary* and *commit_messages* (#3112) are the worker's own
+    claims about its work — the prose extracted from its "### Summary" block
+    (:data:`coord.models.Assignment.completion_summary`) and the PR's commit
+    messages (:func:`coord.github_ops.get_pr_commit_messages`). Before #3112
+    the reviewer had access to nothing the worker *said*, only the diff —
+    so a repo-override rule that requires a specific claim (e.g. vimcode's
+    "state that the new test was observed RED against unfixed develop")
+    was unverifiable by the reviewer even when the worker made the claim
+    somewhere, because nothing carried it into this briefing. Both are
+    optional and rendered only when non-empty; when both are empty this adds
+    no section at all (mirrors every other optional block here).
     """
 
     lines: list[str] = []
@@ -1721,17 +1769,43 @@ def build_review_briefing(
         lines.append("- Did the worker stay within the assigned file scope?")
         lines.append("- Any security issues (injection, auth bypass, credential exposure)?")
 
-    overrides = reviews_cfg.repo_overrides.get(repo_name, [])
-    if overrides:
-        lines.append("")
-        lines.append(f"### Repo-specific focus ({repo_name})")
-        for item in overrides:
-            lines.append(f"- {item}")
+    lines.extend(repo_focus_lines(reviews_cfg, repo_name))
 
     if reviews_cfg.reviewer_prompt.strip():
         lines.append("")
         lines.append("## Additional instructions")
         lines.append(reviews_cfg.reviewer_prompt.strip())
+
+    _summary = (completion_summary or "").strip()
+    _commits = [m.strip() for m in (commit_messages or []) if m and m.strip()]
+    if _summary or _commits:
+        # #3112: the worker's own claims about its work — unverified prose,
+        # not evidence, but a place a repo-override rule (e.g. vimcode's
+        # "state the test was observed RED") can actually be satisfied and
+        # checked, instead of pointing at a PR body the worker cannot write.
+        lines.append("")
+        lines.append("## Worker's own claims (unverified — cross-check against the diff)")
+        lines.append("")
+        lines.append(
+            "The worker cannot edit the PR description or post GitHub "
+            "comments directly, so this is everything it said about its own "
+            "work. Treat it as a claim to verify, not as evidence on its own "
+            "— but a repo-specific rule that requires the worker to *state* "
+            "something (e.g. that a new test was observed failing against "
+            "unfixed code) is satisfied or violated here, not in the PR body."
+        )
+        if _summary:
+            lines.append("")
+            lines.append("### Completion summary")
+            lines.append("")
+            lines.append(_summary)
+        if _commits:
+            lines.append("")
+            lines.append("### Commit messages")
+            lines.append("")
+            for msg in _commits:
+                headline = msg.splitlines()[0] if msg.splitlines() else msg
+                lines.append(f"- {headline}")
 
     if diff_text and diff_text.strip():
         # #612: embed the merge-base (three-dot) diff verbatim so the reviewer
@@ -2287,6 +2361,7 @@ def dispatch_review(
     patch_id_computer=None,
     diff_fetcher=None,
     commits_ahead_checker=None,
+    commit_messages_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -2318,6 +2393,14 @@ def dispatch_review(
     below. Defaults to :func:`coord.github_ops.branch_commits_ahead` (a real
     ``gh api compare`` call); inject a stub in tests so the gate is exercised
     without network.
+
+    *commit_messages_fetcher* is an optional ``(repo_github: str, pr_number:
+    int) -> list[str]`` callable (#3112) that fetches the PR's own commit
+    messages for the reviewer briefing's "worker's own claims" section.
+    Defaults to :func:`coord.github_ops.get_pr_commit_messages` (a real
+    ``gh pr view --json commits`` call); inject a stub in tests so dispatch
+    never shells out to a live ``gh``. Fail-open: an exception here yields an
+    empty list, never a blocked dispatch.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -2641,6 +2724,20 @@ def dispatch_review(
         fetch_body = issue_body_fetcher or _fetch_issue_body
         issue_body = fetch_body(repo.github, completed.issue_number)
 
+        # #3112: the worker's own commit messages — one half of the "worker's
+        # own claims" section (the other half is completed.completion_summary,
+        # already on the Assignment). Fail-open like every other best-effort
+        # GitHub read in this function: a fetch failure just means the review
+        # briefing has fewer worker-said claims to cross-check, never a
+        # blocked dispatch.
+        _fetch_commits = commit_messages_fetcher or github_ops.get_pr_commit_messages
+        commit_messages: list[str] = []
+        if pr:
+            try:
+                commit_messages = _fetch_commits(repo.github, pr["number"])
+            except Exception:  # noqa: BLE001 — fail-open, see docstring
+                commit_messages = []
+
         # #2192: free pre-review nudge (see diff_missing_test_coverage docstring).
         # Logged only, ahead of the paid reviewer dispatch below — never gates,
         # never denies, never mutates `completed`. A false positive here must
@@ -2808,6 +2905,8 @@ def dispatch_review(
                 sealed_entrypoints=sealed_entrypoints,
                 coordinator_doc_paths=coordinator_doc_paths,
                 assignment_type=completed.type,
+                completion_summary=completed.completion_summary,
+                commit_messages=commit_messages,
             )
 
             payload = {

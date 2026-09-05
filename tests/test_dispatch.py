@@ -15,6 +15,7 @@ from coord.config import (
     ModelsConfig,
     ProviderDef,
     ProvidersConfig,
+    ReviewsConfig,
 )
 from coord.dispatch import (
     DispatchRefused,
@@ -27,6 +28,7 @@ from coord.dispatch import (
     resolve_dispatch_model_alias,
 )
 from coord.models import Machine, Proposal, Repo
+from coord.review import repo_focus_lines
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +138,68 @@ class TestDispatch:
         mock_post.return_value = mock_resp
         dispatch(proposal, config)
         assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_includes_repo_specific_review_focus(
+        self, mock_post: MagicMock, proposal: Proposal, coord_db,
+    ) -> None:
+        """#3112: a work briefing for a repo with `reviews.repo_overrides`
+        must carry the exact same rule text the reviewer's briefing gets —
+        before this, `repo_overrides` was read in coord/review.py alone, so
+        a worker could be reviewed against (and request-changes'd for) a
+        rule it was never shown.
+        """
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            reviews=ReviewsConfig(
+                repo_overrides={
+                    "api": [
+                        "State that the new black-box test was observed "
+                        "RED against unfixed develop.",
+                    ],
+                },
+            ),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "observed RED against unfixed develop" in briefing
+        assert "Fix the auth module" in briefing  # original briefing preserved
+        # Shared-builder assertion (acceptance criterion #1): the exact same
+        # lines `build_review_briefing` renders for the reviewer.
+        for line in repo_focus_lines(cfg.reviews, "api"):
+            assert line in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_no_repo_focus_section_when_no_overrides_for_repo(
+        self, mock_post: MagicMock, proposal: Proposal, coord_db,
+    ) -> None:
+        """Regression (#3112): a repo with reviews configured but no override
+        entry for *this* repo gets no dangling/empty focus section."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            reviews=ReviewsConfig(repo_overrides={"other-repo": ["Some rule."]}),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert briefing == "Fix the auth module"
+        assert "What the reviewer will grade you against" not in briefing
+        assert "Repo-specific focus" not in briefing
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_carries_default_branch(
