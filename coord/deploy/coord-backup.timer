@@ -1,0 +1,35 @@
+# Fires coord-backup.service hourly — the OFF-SITE lane (#3118, closes
+# #1822). See that unit's header for the full rationale, credential handling,
+# install steps and safety guarantees, and for why this is independent of
+# coord-db-backup.timer rather than a replacement for it.
+#
+# Hourly is the RPO this rung buys: up to an hour of coordinator state can be
+# lost in a total-loss scenario. Continuous WAL shipping (Litestream) stays
+# the deliberate escalation if that proves insufficient AND sqlite is still
+# the store — recorded as a decision in #3118, not drifted into.
+#
+# OnBootSec is deliberately later than coord-db-backup.timer's 5min: on a
+# cold boot the local SSD snapshot is the cheap one and should go first, and
+# staggering keeps two `VACUUM INTO`s off the same busy database at once.
+#
+# Persistent=true: if the daemon host was down/rebooted when a fire was
+# missed, the next boot catches it up immediately rather than waiting up to
+# an hour — the whole point of an off-site lane is that the gap after an
+# outage is the riskiest window there is.
+#
+# RandomizedDelaySec spreads the upload off the top of the hour so it does
+# not contend with coord-db-backup, coord-notify and coord-drive-queue all
+# firing on the same tick.
+
+[Unit]
+Description=Hourly off-site verified backup of the coordinator store (#3118)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=5min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

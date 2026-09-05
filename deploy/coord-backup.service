@@ -1,0 +1,116 @@
+# coord-backup — hourly OFF-SITE, verified backup of the coordinator store
+# to a restic repository in Azure Blob (#3118, closes #1822). Paired with
+# coord-backup.timer.
+#
+# This is NOT a replacement for coord-db-backup.{service,timer}, and it does
+# not touch /media/crucial. The two lanes are deliberately independent:
+#   - coord-db-backup  : hourly VACUUM INTO onto a USB SSD in this chassis.
+#                        Protects against db corruption, a bad migration,
+#                        accidental deletion, OS-disk failure. Fast to
+#                        restore from. Useless if the machine is lost.
+#   - coord-backup     : hourly verified snapshot pushed OFF the machine.
+#                        The one that survives the box being lost, stolen or
+#                        burned. `~/.coord/coord.db` is 720 MB and, before
+#                        this unit, had no off-box copy at all.
+# Losing the store is not recoverable from GitHub: reconcile() rebuilds
+# in-flight assignment state and nothing else — not test verdicts, not review
+# verdicts, not merge-queue ordering, not the audit log.
+#
+# A systemd *user* unit (mirrors coord-serve/coord-web/coord-notify/
+# coord-drive-queue/coord-db-backup), Type=oneshot, timer-fired. Runs
+# `coord backup push` (coord/backup.py), which, in this order:
+#   - asks `coord.db.resolve_store_backend()` — the same seam `coord
+#     store-backend` and coord-db-backup.sh use (#3084/#3085) — which storage
+#     engine is actually configured, and refuses outright, BEFORE writing
+#     anything, when it is not one this lane knows how to snapshot. There is
+#     no fall-back-to-sqlite path: after a Postgres cutover (#829) the old
+#     coord.db file, if still present, is a dead frozen snapshot of
+#     pre-cutover state, and a lane that assumed sqlite would cheerfully
+#     back it up and offer to roll the fleet back to it,
+#   - takes a consistent snapshot for THAT backend: `VACUUM INTO` for sqlite
+#     (WAL-safe against a live coord-serve, and it compacts), `pg_dump -Fc`
+#     for postgres,
+#   - verifies it before it counts — integrity check AND a sanity check that
+#     the `assignments` table is present and non-empty. A snapshot that fails
+#     either is kept on disk as `~/.coord/backup-rejected/*.REJECTED` (never
+#     silently deleted, never left under a name indistinguishable from a good
+#     backup) and is NEVER uploaded, so it can never age out a good one,
+#   - only then uploads, via restic, to $COORD_BACKUP_REPOSITORY,
+#   - only then prunes: hourly 48h / daily 30d / weekly 8w, always with a
+#     `--keep-last 1` floor so retention cannot leave the repository empty.
+#
+# Content-chunked dedup is the entire premise: an hourly push of a ~720 MB
+# database transfers roughly the delta (target: single-digit MB), not the
+# database. `coord backup push` prints the transferred byte count on every
+# run — if that number is ever ~700 MB, the dedup is not working and this
+# unit is costing far more than it should.
+#
+# CREDENTIALS COME FROM THE ENVIRONMENT OR A MANAGED IDENTITY ONLY. Never
+# from coordinator.yml (coord/backup.py does not read it), and never from
+# argv — argv is world-readable in /proc. EnvironmentFile below must be mode
+# 0600. Expected contents:
+#
+#   COORD_BACKUP_REPOSITORY=azure:coord-backups:/dellserver
+#   RESTIC_PASSWORD=<repository encryption password>
+#   AZURE_ACCOUNT_NAME=<storage account>
+#   AZURE_ACCOUNT_KEY=<key>        # or omit entirely and use a managed identity
+#
+# The EnvironmentFile is marked optional (leading `-`) on purpose: a missing
+# file then produces coord's own curated "no backup repository configured:
+# set $COORD_BACKUP_REPOSITORY ..." refusal in the journal rather than a bare
+# systemd load error. Provisioning the storage account and container is
+# operator work; this lane consumes an already-configured target and fails
+# clearly when it is absent.
+#
+# restic is a binary no `coord` release upgrades — the same "fifth deploy
+# surface" objection #1822 raised against Litestream, and it is real. It is
+# mitigated, not ignored: this timer is registered in
+# coord/deploy_manifest.py's ROLE_UNITS and in docs/AGENT_OPERATIONS.md's
+# daemon-host unit inventory (tests/test_deploy_manifest.py cross-checks the
+# two), so a rebuilt daemon host is told this unit exists instead of it being
+# folklore.
+#
+# Install ONLY on the daemon host — the box that owns the store (dellserver
+# in production).
+#
+# Install:
+#   sudo apt install restic     # or the distro equivalent; see the docs
+#   mkdir -p ~/.config/systemd/user
+#   install -m 0600 /dev/null ~/.coord/backup.env && $EDITOR ~/.coord/backup.env
+#   cp deploy/coord-backup.service deploy/coord-backup.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   coord backup init                       # one-time, creates the restic repo
+#   systemctl --user enable --now coord-backup.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-backup.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# See docs/AGENT_OPERATIONS.md → "Daemon-host unit inventory".
+
+[Unit]
+Description=Off-site verified backup of the coordinator store (#3118)
+Documentation=https://github.com/JDonaghy/code-coordinator/issues/3118
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/coord backup push
+# A systemd *user* unit's default PATH does NOT include ~/.local/bin (where
+# the `coord` shim lives), ~/.coord-venv/bin, or wherever restic was
+# installed — the #1831/#2561/#2569 gap already fixed on coord-serve.service,
+# coord-notify.service, coord-drive-queue.service and coord-db-backup.service
+# in this directory. Byte-identical to coord-db-backup.service's line (same
+# host, same role family); `restic` is expected on /usr/bin or /usr/local/bin,
+# both of which are present below.
+Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# Optional on purpose — see the header. Must be mode 0600; it holds the
+# repository password and (unless a managed identity is used) the storage
+# account key.
+EnvironmentFile=-%h/.coord/backup.env
+# A push is snapshot + verify + upload + prune over a link that can be slow
+# or flaky. Generous relative to a normal incremental run (single-digit MB),
+# but well below the timer's hourly cadence so a genuinely wedged run cannot
+# run into the next fire indefinitely — same pattern as every other oneshot
+# unit in this directory (see coord-db-backup.service, coord-drive-queue.service).
+TimeoutStartSec=2700

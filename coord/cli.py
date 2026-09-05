@@ -31,6 +31,7 @@ from coord.dist_name import pkg_spec as _dist_pkg_spec
 
 from coord.commands.acceptance import acceptance_group
 from coord.commands.audit import audit
+from coord.commands.backup import backup_group
 from coord.commands.gate_a import gate_a
 from coord.commands.report import report_group
 from coord.commands.scorecard import scorecard
@@ -404,6 +405,7 @@ def main() -> None:
 main.add_command(version)
 main.add_command(config_cmd)
 main.add_command(store_backend_cmd)
+main.add_command(backup_group)
 main.add_command(init)
 main.add_command(agent)
 main.add_command(status)

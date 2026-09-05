@@ -1148,8 +1148,20 @@ two in sync; `tests/test_deploy_manifest.py` cross-checks it.
 | `coord-drive-queue.timer` | daemon host | see "Periodic `coord drive-queue tick`" above |
 | `coord-release-propagate.timer` | daemon host | **below** |
 | `coord-db-backup.timer` | daemon host | **below** |
+| `coord-backup.timer` | daemon host | `deploy/coord-backup.service` header (#3118) |
 
 Workers (precision, elitebook) run `coord-agent` **only**.
+
+**`coord-db-backup.timer` and `coord-backup.timer` are two different lanes,
+not a duplicate.** The first snapshots `coord.db` onto the USB SSD in
+dellserver's own chassis — fast to restore from, useless if the machine is
+lost. The second (#3118, closing #1822) pushes a *verified* snapshot **off the
+machine** into Azure Blob via restic, with content-chunked dedup so an hourly
+push of the 720 MB database transfers the delta rather than the database.
+Keep both. `coord-backup` additionally needs `restic` installed and a
+mode-0600 `~/.coord/backup.env` holding `COORD_BACKUP_REPOSITORY` and the
+repository password — credentials never live in `coordinator.yml` and are
+never passed on the command line.
 
 **Checkable, not just prose (#2098).** `coord doctor` / `coord health` run
 `unit_enablement` (`coord/health/checks/unit_enablement.py`) on every
