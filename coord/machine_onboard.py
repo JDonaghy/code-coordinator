@@ -385,6 +385,10 @@ class MachineFacts:
     #: into ``daemon``, but which is still a fault worth naming.
     role_valid: bool = True
     role_raw: str | None = None
+    #: Why the host's own declaration could not be read, when the rest of the
+    #: probe succeeded — e.g. an agent venv predating #3128. Distinct from
+    #: :attr:`shell_probe_error`: the role is unknown, everything else is not.
+    role_error: str | None = None
 
     # ── Layer 7: toolchain ───────────────────────────────────────────────
     #: ``{tool: ToolProbe}`` exactly as the AGENT's own process resolved them
@@ -801,7 +805,15 @@ _SHELL_PROBE_MARKER = "COORD_MACHINE_PROBE="
 class ShellProbe:
     """Everything :func:`probe_machine_shell` learned, already sanitized."""
 
+    #: The probe as a whole produced no payload — nothing below is usable.
     error: str | None = None
+    #: The payload arrived but #3128's resolver could not be reached on that
+    #: host (typically an agent venv predating it). A SEPARATE field from
+    #: :attr:`error` on purpose, found by running this against precision on
+    #: 2026-09-05: collapsing the two threw away a perfectly good login-PATH
+    #: and identity payload over one unavailable import, which is the same
+    #: "one probe failed, so report nothing" shape #3137 exists to end.
+    role_error: str | None = None
     login_path_tools: dict[str, str | None] = field(default_factory=dict)
     login_path: str | None = None
     agent_path: str | None = None
@@ -914,7 +926,7 @@ def parse_shell_probe(stdout: str) -> ShellProbe:
         backup_env_present=_tri("backup_env_present"),
     )
     return ShellProbe(
-        error=redact(str(role_error)) if role_error else None,
+        role_error=redact(str(role_error)) if role_error else None,
         login_path_tools=tools,
         login_path=str(payload["login_path"]) if payload.get("login_path") else None,
         agent_path=str(payload["agent_path"]) if payload.get("agent_path") else None,
@@ -1103,7 +1115,7 @@ def gather_facts(
             repo_slug=slug,
             timeout=max(ssh_timeout, 60.0),
         )
-        if role_override is None and probe.error is None:
+        if role_override is None and probe.error is None and probe.role_error is None:
             facts.role = probe.role
             facts.role_source = probe.role_source
             facts.role_valid = probe.role_valid
@@ -1121,6 +1133,7 @@ def gather_facts(
 
         facts.shell_probed = probe.error is None
         facts.shell_probe_error = probe.error
+        facts.role_error = probe.role_error
         facts.login_path_tools = probe.login_path_tools
         facts.login_path = probe.login_path
         facts.agent_path = probe.agent_path
@@ -2295,13 +2308,18 @@ def _role_finding(facts: MachineFacts) -> Finding:
             ),
         )
     if facts.role_source == "unprobed":
+        why = (
+            f"could not be read ({facts.role_error})"
+            if facts.role_error
+            else "was not read (needs --ssh)"
+        )
         return Finding(
             layer="identity", check="identity.role_undeclared", severity=UNKNOWN,
             summary=(
-                f"this host's own role declaration was not read (needs --ssh), so "
-                f"the {facts.role!r} bar was applied — #3128's default. A daemon "
-                "host graded as a worker is not asked for merge rights or the DR "
-                "lane"
+                f"this host's own role declaration {why}, so the {facts.role!r} bar "
+                "was applied — #3128's default. A daemon host graded as a worker is "
+                "not asked for merge rights or the DR lane; pass --role to grade it "
+                "against one explicitly"
             ),
             subject=facts.name,
         )

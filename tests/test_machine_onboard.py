@@ -1333,3 +1333,43 @@ def test_the_cheap_second_pass_reads_as_unprobed_not_as_missing_credentials():
     assert probe.identity.probed is False
     assert probe.identity.board_token_accepted is None
     assert probe.login_path_tools == {"restic": "/usr/bin/restic"}
+
+
+def test_a_host_whose_agent_predates_3128_still_reports_its_identity():
+    """Found by running this against precision on 2026-09-05, before it was
+    a test: the fleet's pinned agent venv predated #3128, `resolve_role` did
+    not import, and the WHOLE probe was discarded — login PATH and all four
+    identity verdicts, over one unavailable import. A probe that reports
+    nothing because one of its questions could not be asked is the same
+    failure #3137 exists to end, so the role error is a SEPARATE field from
+    "the probe produced no payload"."""
+    import json as _json
+
+    payload = {
+        "login_path_tools": {"cargo": "/usr/bin/cargo"},
+        "login_path": "/usr/bin",
+        "agent_path": "/usr/bin",
+        "role": {"error": "ImportError: cannot import name 'resolve_role'"},
+        "identity": {"forge_repo_read": True, "board_token_accepted": True},
+    }
+    probe = machine_onboard.parse_shell_probe(
+        "COORD_MACHINE_PROBE=" + _json.dumps(payload)
+    )
+    assert probe.error is None          # the payload arrived...
+    assert probe.role_error             # ... only the role question failed
+    assert probe.identity.probed is True
+    assert probe.identity.board_token_accepted is True
+
+    facts = _tc_facts(
+        shell_probed=True, role_error=probe.role_error, role_source="unprobed",
+        login_path_tools=probe.login_path_tools, identity=probe.identity,
+    )
+    findings = machine_onboard.evaluate_identity(facts)
+    # The identity verdicts survive...
+    assert _find(findings, "identity.forge_read").severity == OK
+    assert _find(findings, "identity.board_token").severity == OK
+    # ... and the role is honestly reported as unreadable, naming why.
+    role = _find(findings, "identity.role_undeclared")
+    assert role.severity == UNKNOWN
+    assert "ImportError" in role.summary
+    assert "--role" in role.summary
