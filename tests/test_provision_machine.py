@@ -11,10 +11,17 @@ That is deliberate. #3138's acceptance criteria are all statements about
 observable behaviour — "the second run changes nothing", "the prompts come
 before the slow phases", "no credential reaches a log or a non-0600 file",
 "it exits non-zero and names the failing layer" — and none of them survive
-being restated as a unit test against an extracted helper. The one thing
-these cannot cover is the throwaway-VM verification the issue also asks for
-(real apt, real tailscale login, a real agent taking a dispatch); that is in
-the PR's SMOKE_TESTS block, not here.
+being restated as a unit test against an extracted helper.
+
+What a stub fleet structurally cannot answer is "do these package names
+resolve on the OS this targets?" — a stubbed ``apt-get`` says yes to
+everything. ``scripts/verify-provision-noble.sh`` answers that half against a
+real Ubuntu 24.04 root filesystem with no stubs at all (and found the #1678
+browser false green that ``test_a_chromium_browser_that_is_only_a_name_on_path
+_is_not_a_browser`` below now pins). What neither can reach is systemd, a real
+``tailscale up``/``gh auth login``, and a live agent taking a dispatch: that is
+still the throwaway-VM run the issue asks for, and it is in the PR's
+SMOKE_TESTS block, not here.
 
 The daemon-unit phase is the exception that proves the rule: it runs the
 **real** ``coord.deploy_manifest`` / ``coord.deploy_units`` /
@@ -26,11 +33,12 @@ fails if ``ROLE_UNITS[daemon]`` and the packaged unit set ever disagree.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -782,6 +790,162 @@ def test_a_role_file_the_resolver_disagrees_with_stops_the_run(box: Box):
     combined = result.stdout + result.stderr
     assert "resolver reads" in combined
     assert "silently grade this host as a worker" in combined
+
+
+# ── The backup mount: one path, two scripts, no drift ────────────────────────
+
+
+def _script_default(name: str) -> str:
+    """The literal default of ``NAME="${OVERRIDE:-default}"`` in the script."""
+    m = re.search(rf'^{name}="\$\{{[A-Z_]+:-([^}}]*)\}}"', SCRIPT.read_text(encoding="utf-8"),
+                  re.MULTILINE)
+    assert m, f"could not find a {name}= default in {SCRIPT}"
+    return m.group(1)
+
+
+def test_the_backup_mount_default_is_the_path_coord_db_backup_sh_actually_checks():
+    """The unmodified default, pinned — every other test in this file overrides
+    ``COORD_PROVISION_BACKUP_MOUNT`` to a tmp dir, so none of them would notice
+    a revert to a path that exists nowhere else in the fleet (it was
+    ``/mnt/coord-ssd`` once). The assertion is not against a literal typed here
+    but against the sibling unit's own default, so the two cannot drift: this
+    is the mount ``coord-db-backup.sh`` refuses to write without."""
+    backup_sh = (REPO_ROOT / "coord" / "deploy" / "coord-db-backup.sh").read_text(encoding="utf-8")
+    m = re.search(r'^DEST_DIR="\$\{COORD_BACKUP_DIR:-([^}]*)\}"', backup_sh, re.MULTILINE)
+    assert m, "coord-db-backup.sh no longer declares a default COORD_BACKUP_DIR"
+    # coord-db-backup.sh checks `mountpoint -q "$(dirname "$DEST_DIR")"`.
+    expected_mount = str(PurePosixPath(m.group(1)).parent)
+
+    assert _script_default("BACKUP_MOUNT") == expected_mount, (
+        "provision-machine.sh's BACKUP_MOUNT default and coord-db-backup.sh's own "
+        "mount check disagree — --role server would grade a path the backup lane "
+        "never writes to"
+    )
+    assert expected_mount == "/media/crucial", (
+        "both moved together, which is fine, but docs/AGENT_OPERATIONS.md's backup "
+        "table still says /media/crucial — update it in the same commit"
+    )
+
+
+def test_the_unoverridden_default_mount_is_what_the_server_role_reports_on(box: Box):
+    """End to end, with the override REMOVED: the warning a real operator sees
+    on a daemon host names the real backup target."""
+    # An unmounted SSD is the case the warning exists for, and the case where
+    # naming the wrong path is most expensive.
+    (box.bin / "mountpoint").write_text(
+        f"#!/usr/bin/env bash\n{_LOGGER}exit 1\n", encoding="utf-8")
+    (box.bin / "mountpoint").chmod(0o755)
+    env = {k: v for k, v in box.env.items() if k != "COORD_PROVISION_BACKUP_MOUNT"}
+    result = subprocess.run(  # noqa: S603
+        ["bash", str(SCRIPT), "--role", "server", *WORKER_ARGS],
+        capture_output=True, text=True, input="", env=env, timeout=180,
+    )
+    _ok(result)
+    combined = result.stdout + result.stderr
+    assert "/media/crucial is not a mount point" in combined, combined
+    assert "/mnt/coord-ssd" not in combined
+    assert "mountpoint -q /media/crucial" in box.invocations, box.invocations
+
+
+# ── The browser capability: a name on PATH is not a browser (#1678) ──────────
+
+# Ubuntu 24.04's real `chromium-browser`, byte-for-byte in behaviour: the deb
+# is a 50 KB transitional package whose /usr/bin/chromium-browser refuses to do
+# anything without the snap. Verified against the real deb by
+# scripts/verify-provision-noble.sh.
+NOBLE_CHROMIUM_STUB = """
+echo "Command '$0' requires the chromium snap to be installed." >&2
+exit 1
+"""
+
+
+def _browser_box(box: Box, *, stub: bool, snap: str | None) -> Box:
+    """Reshape the stub fleet for the browser capability. The default fleet has
+    a working `chromium`, which is the case that never needed fixing."""
+    (box.bin / "chromium").unlink()
+    if stub:
+        path = box.bin / "chromium-browser"
+        path.write_text(f"#!/usr/bin/env bash\n{_LOGGER}{NOBLE_CHROMIUM_STUB}", encoding="utf-8")
+        path.chmod(0o755)
+    if snap is not None:
+        path = box.bin / "snap"
+        path.write_text(f"#!/usr/bin/env bash\n{_LOGGER}{snap}", encoding="utf-8")
+        path.chmod(0o755)
+    return box
+
+
+BROWSER_ARGS = ("--machine", "testbox", "--host", "testbox.tail.ts.net",
+                "--repos", "api", "--capabilities", "browser")
+
+
+def test_a_chromium_browser_that_is_only_a_name_on_path_is_not_a_browser(box: Box):
+    """The #1678 false green, as a test. On noble `apt-get install
+    chromium-browser` exits 0 and puts a binary on PATH that can never launch;
+    the old presence check reported a browser and the machine then advertised a
+    capability it could not honour. Nothing must accept that."""
+    # The installer reports success and produces nothing runnable — which is
+    # what apt genuinely does on noble, and what snapd does on a box where the
+    # snap is confined out of existence. Either way the stub is all that is on
+    # PATH afterwards, and that must not be mistaken for a browser.
+    _browser_box(box, stub=True, snap="exit 0\n")
+    result = box.run("--role", "worker", *BROWSER_ARGS)
+    assert result.returncode != 0, result.stdout
+    combined = result.stdout + result.stderr
+    assert "no browser answers --version" in combined, combined
+    assert "#1678" in combined
+    assert "NOCHANGE: [toolchains] browser" not in combined
+    assert "installed a browser" not in combined
+
+
+def test_the_browser_capability_installs_the_snap_rather_than_the_apt_stub(box: Box):
+    """On noble the snap is the only packaging that yields a runnable chromium
+    (`apt-cache policy chromium` -> Candidate: (none)), so a host with snap
+    must not be sent down the apt path at all."""
+    working = box.bin / "chromium"
+    snap_stub = (
+        'if [ "$1" = install ]; then\n'
+        f'  printf "#!/bin/sh\\nexit 0\\n" > "{working}"\n'
+        f'  chmod 0755 "{working}"\n'
+        "fi\nexit 0\n"
+    )
+    _browser_box(box, stub=True, snap=snap_stub)
+    out = _ok(box.run("--role", "worker", *BROWSER_ARGS)).stdout
+    assert "installed a browser" in out, out
+    log = box.invocations
+    assert "snap install chromium" in log, log
+    assert "apt-get install" not in log or "chromium" not in log.split("apt-get install")[-1]
+
+
+def test_a_working_browser_is_left_alone_and_the_stub_never_shadows_it(box: Box):
+    """Both names present, only one runnable: the runnable one must win, and
+    the phase must change nothing."""
+    _browser_box(box, stub=True, snap=None)
+    working = box.bin / "chromium"
+    working.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    working.chmod(0o755)
+    out = _ok(box.run("--role", "worker", *BROWSER_ARGS)).stdout
+    assert "NOCHANGE: [toolchains] browser: chromium" in out, out
+    assert "snap" not in box.invocations
+
+
+# ── The real-surface harness (scripts/verify-provision-noble.sh) ─────────────
+
+
+def test_the_noble_harness_derives_its_inventory_from_the_script_not_a_copy():
+    """The harness answers the one question the stub fleet above cannot — "do
+    these package names resolve on the OS this targets?" — so it must read the
+    package list and the gh floor OUT of provision-machine.sh. A second, hand-
+    maintained copy would drift and quietly stop verifying the real thing."""
+    harness = REPO_ROOT / "scripts" / "verify-provision-noble.sh"
+    assert harness.exists() and os.access(harness, os.X_OK)
+    text = harness.read_text(encoding="utf-8")
+    assert "BASE_REQUIREMENTS" in text and "GH_MIN_VERSION" in text
+    assert "provision-machine.sh" in text
+    # #2096: a machine-readable verdict, and an honest statement of the gap it
+    # does not close, so nobody reads a green here as the VM run.
+    assert "NOBLE_VERIFY: ok=" in text
+    for uncovered in ("systemd", "tailscale up", "gh auth login", "/health", "/board"):
+        assert uncovered in text, f"the harness must say it cannot cover {uncovered}"
 
 
 # ── Documentation seam ───────────────────────────────────────────────────────
