@@ -23,10 +23,22 @@ Two things decide whether this is useful or noise, both load-bearing:
   ``coordinator.yml`` on mtime change and swallows a malformed one (keeps the
   last-good copy, logs a warning), so an automatic push of a half-finished
   edit on the daemon host is a worse failure mode than the drift itself. This
-  probe runs exactly four read-only git subcommands
-  (``rev-parse --is-inside-work-tree``, ``status --porcelain``,
+  probe runs at most five read-only git invocations, across four distinct
+  subcommands (``rev-parse --is-inside-work-tree``, ``status --porcelain``,
   ``rev-parse ... @{u}``, ``rev-list --count``, ``log --format=%ct``) and
   nothing else.
+
+* **A failed git call is never silently "nothing to report."** ``status
+  --porcelain`` failing (an ``index.lock`` held by a concurrent commit,
+  a timed-out or corrupted repo) must not read as "clean" — that would be
+  the worst possible failure mode for a check whose whole job is being the
+  last line of defense on the fleet's only off-box config backup. It reports
+  ``UNKNOWN`` instead, same convention as its close neighbour
+  ``repo_state.probe_repo_dirty``. A failed ``rev-list``/``log`` call
+  (age/count of unpushed commits) is lower stakes — it can't flip the
+  verdict to OK, since dirty/no-upstream/unpushed-count-known cases are
+  already covered — but still surfaces as ``UNKNOWN`` rather than silently
+  under-reporting a commit count or age as zero.
 
 Deliberately ``scope="machine"``, like ``repo_branch``/``repo_dirty`` in
 :mod:`coord.health.checks.repo_state`: it answers a question about *this*
@@ -83,6 +95,14 @@ def _resolve_config_path(ctx: HealthContext) -> Path:
     daemon-host service has no meaningful "current directory", and the
     fixture this check exists for is specifically the canonical
     ``~/.coord/`` home.
+
+    This is a second, independent answer to "where does coordinator.yml
+    live" alongside ``coord.config.resolve_config_path`` — if that
+    function's resolution rules ever change, check here too. Health probes
+    read only ``HealthContext`` and never reach into ``coord.config`` /
+    ``Path.home()`` directly (see this package's ``context.py`` module
+    docstring), so the duplication is this package's established
+    convention, not an oversight.
     """
     env = os.environ.get("COORD_CONFIG")
     if env:
@@ -141,7 +161,23 @@ def probe_config_drift(ctx: HealthContext) -> CheckResult:
 
     # --porcelain is the stable machine format; unstripped, same caveat as
     # repo_state's probe_repo_dirty (the first two columns carry meaning).
+    #
+    # A failed `git status` here (index.lock held by a concurrent commit, a
+    # timed-out or corrupted repo, ...) must never fall through and read as
+    # "clean" — that is the single worst-case failure mode for a check whose
+    # whole job is being the last line of defense on the fleet's only
+    # off-box config backup. Bail out to UNKNOWN immediately, same
+    # convention as repo_state.probe_repo_dirty.
     code, status_out = _git(repo_dir, "status", "--porcelain")
+    if code != 0:
+        return CheckResult(
+            check_id="config_drift",
+            scope="machine",
+            severity=Severity.UNKNOWN,
+            headroom="could not read git status",
+            error=status_out,
+            values={"path": str(config_path), "real_path": str(real_path)},
+        )
     dirty_lines = [line for line in status_out.splitlines() if line.strip()]
     dirty_count = len(dirty_lines)
 
@@ -150,18 +186,27 @@ def probe_config_drift(ctx: HealthContext) -> CheckResult:
     )
     has_upstream = code == 0
 
-    unpushed_count = 0
+    # `unpushed_count`/`oldest_unpushed_seconds` stay `None` — rather than
+    # silently defaulting to 0 — when the git call that would determine them
+    # fails, so a hung/corrupted repo shows up as UNKNOWN instead of quietly
+    # under-reporting the commit count or age as zero.
+    unpushed_count: int | None = 0
     oldest_unpushed_seconds: float | None = None
+    age_unknown = False
     if has_upstream:
         code, count_out = _git(repo_dir, "rev-list", "--count", "@{u}..HEAD")
-        if code == 0:
+        if code != 0:
+            unpushed_count = None
+        else:
             try:
                 unpushed_count = int(count_out.strip() or "0")
             except ValueError:
-                unpushed_count = 0
+                unpushed_count = None
         if unpushed_count:
             code, log_out = _git(repo_dir, "log", "--format=%ct", "@{u}..HEAD")
-            if code == 0:
+            if code != 0:
+                age_unknown = True
+            else:
                 timestamps = [
                     int(tok)
                     for tok in log_out.split()
@@ -169,6 +214,8 @@ def probe_config_drift(ctx: HealthContext) -> CheckResult:
                 ]
                 if timestamps:
                     oldest_unpushed_seconds = ctx.now - min(timestamps)
+                else:
+                    age_unknown = True
 
     severities: list[Severity] = []
     messages: list[str] = []
@@ -185,22 +232,32 @@ def probe_config_drift(ctx: HealthContext) -> CheckResult:
     if not has_upstream:
         severities.append(Severity.WARN)
         messages.append("no upstream configured — pushes go nowhere")
+    elif unpushed_count is None:
+        severities.append(Severity.UNKNOWN)
+        messages.append("could not determine unpushed commit count")
     elif unpushed_count:
         plural = "s" if unpushed_count != 1 else ""
-        age_hours = (
-            oldest_unpushed_seconds / 3600.0
-            if oldest_unpushed_seconds is not None
-            else 0.0
-        )
-        if oldest_unpushed_seconds is not None and age_hours > crit_hours:
-            severities.append(Severity.CRIT)
+        if age_unknown:
+            severities.append(Severity.UNKNOWN)
             messages.append(
-                f"{unpushed_count} unpushed commit{plural}, oldest "
-                f"{human_hours(oldest_unpushed_seconds)} old"
+                f"{unpushed_count} unpushed commit{plural} "
+                "(could not determine age)"
             )
         else:
-            severities.append(Severity.WARN)
-            messages.append(f"{unpushed_count} unpushed commit{plural}")
+            age_hours = (
+                oldest_unpushed_seconds / 3600.0
+                if oldest_unpushed_seconds is not None
+                else 0.0
+            )
+            if oldest_unpushed_seconds is not None and age_hours > crit_hours:
+                severities.append(Severity.CRIT)
+                messages.append(
+                    f"{unpushed_count} unpushed commit{plural}, oldest "
+                    f"{human_hours(oldest_unpushed_seconds)} old"
+                )
+            else:
+                severities.append(Severity.WARN)
+                messages.append(f"{unpushed_count} unpushed commit{plural}")
 
     severity = worst(severities) if severities else Severity.OK
     headroom = "; ".join(messages) if messages else "clean, fully pushed"

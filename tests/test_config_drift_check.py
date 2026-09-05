@@ -273,3 +273,67 @@ def test_missing_config_file_is_unknown(tmp_path, monkeypatch) -> None:
     ctx = make_ctx(tmp_path)  # nothing written under coord_dir
     result = config_drift.probe_config_drift(ctx)
     assert result.severity is Severity.UNKNOWN
+
+
+# ── failed git calls never read as clean ────────────────────────────────────
+
+
+def test_failed_git_status_is_unknown_not_clean(tmp_path, monkeypatch) -> None:
+    """A `git status` failure (lock contention, timeout, ...) must not be
+    silently treated as "nothing dirty" — that would report a false OK on
+    exactly the failure modes (lock contention, disk pressure) most likely
+    to coincide with real drift on a busy daemon host."""
+    _write_config(tmp_path)
+    _fake_git(
+        monkeypatch,
+        {
+            **_WORK_TREE,
+            ("status", "--porcelain"): (128, "fatal: Unable to create '.git/index.lock'"),
+        },
+    )
+    result = config_drift.probe_config_drift(make_ctx(tmp_path))
+    assert result.severity is Severity.UNKNOWN
+    assert result.severity is not Severity.OK
+    assert "git status" in result.headroom
+    assert result.error
+
+
+def test_failed_rev_list_is_unknown_not_silently_zero(tmp_path, monkeypatch) -> None:
+    """If `rev-list --count` fails, the unpushed count must not silently
+    default to 0 (which would combine with a clean tree to report OK)."""
+    _write_config(tmp_path)
+    _fake_git(
+        monkeypatch,
+        {
+            **_WORK_TREE,
+            **_CLEAN,
+            **_UPSTREAM_OK,
+            ("rev-list", "--count", "@{u}..HEAD"): (1, "fatal: ambiguous argument"),
+        },
+    )
+    result = config_drift.probe_config_drift(make_ctx(tmp_path))
+    assert result.severity is Severity.UNKNOWN
+    assert result.values["unpushed_count"] is None
+    assert "could not determine unpushed commit count" in result.headroom
+
+
+def test_failed_log_reports_unknown_age_not_zero(tmp_path, monkeypatch) -> None:
+    """If `log --format=%ct` fails after a nonzero unpushed count is known,
+    the commit must not be silently graded as 0h old (WARN instead of the
+    CRIT it might actually deserve)."""
+    _write_config(tmp_path)
+    _fake_git(
+        monkeypatch,
+        {
+            **_WORK_TREE,
+            **_CLEAN,
+            **_UPSTREAM_OK,
+            ("rev-list", "--count", "@{u}..HEAD"): (0, "1\n"),
+            ("log", "--format=%ct", "@{u}..HEAD"): (1, "fatal: bad revision"),
+        },
+    )
+    result = config_drift.probe_config_drift(make_ctx(tmp_path))
+    assert result.severity is Severity.UNKNOWN
+    assert result.values["unpushed_count"] == 1
+    assert result.values["oldest_unpushed_age_hours"] is None
+    assert "could not determine age" in result.headroom
