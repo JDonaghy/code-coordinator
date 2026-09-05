@@ -35,6 +35,7 @@ from coord.health.fleet_snapshot import (
 from coord.models import Board, Machine
 from coord.serve_app import build_app
 from coord import state
+from tests.backends import set_board_meta
 
 
 def _machine(name: str, host: str = "x.tailnet") -> Machine:
@@ -137,9 +138,7 @@ def detail_db(tmp_path: Path) -> Path:
     conn = sqlite3.connect(str(p))
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '0')"
-    )
+    set_board_meta(conn, "round_number", "0")
     conn.commit()
     conn.close()
     return p

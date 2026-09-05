@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from click.testing import CliRunner
 
+from coord import sql
 from coord.models import Assignment, Board, Machine, Repo
 from coord.state import (
     save_board,
@@ -132,9 +133,9 @@ class TestBoardPersistence:
         # directly, simulating the transient/corrupt write this issue is
         # about — save_plan itself always writes valid JSON.
         conn = get_connection()
-        conn.execute(
-            "INSERT OR REPLACE INTO plans (assignment_id, plan_data) VALUES (?, ?)",
-            ("bad-1", "{not valid json"),
+        sql.upsert(
+            conn, "plans", ["assignment_id", "plan_data"],
+            ("bad-1", "{not valid json"), conflict_columns=["assignment_id"],
         )
         conn.commit()
 

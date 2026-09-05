@@ -25,6 +25,7 @@ from starlette.testclient import TestClient
 
 from coord.cli import main
 from coord import state as state_mod
+from tests.backends import set_board_meta
 
 
 # ── shared config ─────────────────────────────────────────────────────────────
@@ -276,12 +277,8 @@ def _make_file_db(path: Path) -> None:
     conn = _sqlite3.connect(str(path))
     conn.row_factory = _sqlite3.Row
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')"
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(conn, "round_number", "1")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 

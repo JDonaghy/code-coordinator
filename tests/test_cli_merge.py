@@ -15,6 +15,7 @@ from coord import merge_queue as mq
 from coord import state as state_mod
 from coord.cli import main
 from coord.db import LockContentionExhaustedError
+from tests import backends
 
 
 # #1525: these fixtures never exercise the CI gate (that's covered by
@@ -1197,10 +1198,8 @@ class TestMergeAutoEnqueue:
         save_board(Board(active=[], completed=[a]))
 
     def _seed_issue_state(self, coord_db, *, number: int, state: str) -> None:
-        coord_db.execute(
-            "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
-            "VALUES ('api', ?, ?, ?)",
-            (number, f"#{number}", state),
+        backends.upsert_issue(
+            coord_db, repo_name="api", number=number, title=f"#{number}", state=state,
         )
         coord_db.commit()
 

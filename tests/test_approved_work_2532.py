@@ -46,6 +46,7 @@ from coord.config import (
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 from coord.serve_app import build_app
+from tests.backends import set_board_meta
 
 CONFIG_YAML = """\
 repos:
@@ -258,9 +259,7 @@ def detail_db(tmp_path: Path) -> Path:
     conn = sqlite3.connect(str(p))
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '0')"
-    )
+    set_board_meta(conn, "round_number", "0")
     conn.commit()
     conn.close()
     return p

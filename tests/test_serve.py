@@ -23,6 +23,7 @@ from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 from coord.serve_app import _reload_config_if_stale, build_app
+from tests.backends import set_board_meta
 
 
 def _make_file_db(path: Path) -> None:
@@ -54,12 +55,9 @@ def _make_file_db(path: Path) -> None:
         "INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
         ("laptop", "laptop.tailnet", '["python"]', '["api"]'),
     )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '7')")
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-        "('pipeline_default_gates', '[\"review\", \"test\", \"merge\"]')"
-    )
+    set_board_meta(conn, "round_number", "7")
+    set_board_meta(conn, "board_initialized", "1")
+    set_board_meta(conn, "pipeline_default_gates", '["review", "test", "merge"]')
     conn.commit()
     conn.close()
 
@@ -1089,7 +1087,7 @@ def _make_work_order_db(path: Path) -> None:
             "VALUES (?, ?, ?, '', 'open', '[]', 0)",
             ("api", num, title),
         )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -1283,7 +1281,7 @@ def _make_sub_issues_db(path: Path) -> None:
         "VALUES (?, ?, ?, ?, 'open', ?, 0)",
         ("api", 500, "Milestone tracking", _SUB_ISSUES_BODY, '["epic", "coord"]'),
     )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -1363,7 +1361,7 @@ def _make_sub_issues_db_with_malformed_epic(path: Path) -> None:
         "VALUES (?, ?, ?, ?, 'open', ?, 0)",
         ("api", 600, "Malformed milestone tracking", _MALFORMED_SUB_ISSUES_BODY, '["epic", "coord"]'),
     )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -1423,7 +1421,7 @@ def _make_work_order_only_db(path: Path) -> None:
         "VALUES (?, ?, ?, ?, 'open', ?, 0)",
         ("api", 500, "Milestone tracking", _WORK_ORDER_ONLY_TRACKING_BODY, '["epic", "coord"]'),
     )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -1499,7 +1497,7 @@ def _make_plan_roster_db(path: Path) -> None:
         "VALUES (?, ?, ?, '', 'open', '[]', ?, ?, 0)",
         ("api", 200, "Bare follow-up issue", 6, "Follow-up"),
     )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -1806,7 +1804,7 @@ Tracking issue for the milestone.
             "VALUES (?, ?, ?, '', 'closed', '[]', ?, ?, 0)",
             ("api", num, title, 7, "Wrapped up"),
         )
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 
@@ -5068,8 +5066,8 @@ def _seed_approved_done_work(conn, *, aid: str = "work99", branch: str = "issue-
     The DB must already have ``board_initialized`` set (coord_db autouse fixture
     sets this via ``_ensure_schema``; for ``rw_db`` we set it explicitly).
     """
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(conn, "board_initialized", "1")
+    set_board_meta(conn, "round_number", "1")
     conn.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
@@ -5213,12 +5211,8 @@ def _seed_done_work_with_branch(
     issue_number: int = 42,
 ) -> None:
     """Seed a done work assignment that has a branch (eligible for merge reconcile)."""
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')"
-    )
+    set_board_meta(conn, "board_initialized", "1")
+    set_board_meta(conn, "round_number", "1")
     conn.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
@@ -5318,9 +5312,7 @@ def test_sync_issues_tick_marks_issues_closed(
     from coord.serve_app import _sync_issues_tick
 
     # Seed an open issue in the DB.
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.execute(
         "INSERT INTO issues (repo_name, number, title, state, body, labels) "
         "VALUES (?,?,?,?,?,?)",
@@ -5362,9 +5354,7 @@ def test_sync_issues_tick_records_status_per_repo(
     from coord import github_ops, issues_sync_status
     from coord.serve_app import _sync_issues_tick
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
 
     def fake_get_open_issues(repo, **kwargs):
@@ -5406,9 +5396,7 @@ def test_sync_issues_tick_forces_through_backoff_when_starved(
     from coord import github_ops, issues_sync_status
     from coord.serve_app import _sync_issues_tick
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
 
     now = time.time()
@@ -5457,9 +5445,7 @@ def test_sync_issues_tick_completes_despite_continuously_rearmed_latch(
     from coord import github_throttle, issues_sync_status
     from coord.serve_app import _sync_issues_tick
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
 
     now = time.time()
@@ -5505,9 +5491,7 @@ def test_sync_issues_tick_skips_dormant_repo(
     from coord import github_ops, repo_dormancy
     from coord.serve_app import _sync_issues_tick
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
 
     # 'shared' has no assignment and no drive-queue entry -- dormant. Give it
@@ -5538,9 +5522,7 @@ def test_sync_issues_tick_wakes_dormant_repo_when_work_is_queued(
     from coord import github_ops, repo_dormancy
     from coord.serve_app import _sync_issues_tick
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
 
     now = time.time()
@@ -5593,9 +5575,7 @@ def test_reconcile_and_issues_ticks_back_to_back_do_not_starve_issues_sync(
 
     monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
 
-    rw_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(rw_db, "board_initialized", "1")
     rw_db.commit()
     # No assignments seeded at all -- both 'api' and 'shared' are fully
     # dormant (no open assignment, no drive-queue entry, no open PR).
@@ -5848,8 +5828,8 @@ def test_board_merge_plan_contains_correct_fields(
     # Seed a pending merge-queue entry with a known enqueued_at.
     import time as _time
     ts = _time.time() - 30.0
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(rw_db, "board_initialized", "1")
+    set_board_meta(rw_db, "round_number", "1")
     rw_db.execute(
         "INSERT INTO merge_queue "
         "(assignment_id, repo_name, repo_github, branch, target_branch, "
@@ -5934,8 +5914,8 @@ def test_board_issue_stage_projection_contains_correct_fields(
     from coord.dao import SqliteStore
     from coord.serve_app import build_app
 
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(rw_db, "board_initialized", "1")
+    set_board_meta(rw_db, "round_number", "1")
     rw_db.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, issue_number, issue_title, "
@@ -5994,8 +5974,8 @@ def test_board_issue_stage_projection_agrees_with_merge_plan_on_superseded_appro
     from coord.dao import SqliteStore
     from coord.serve_app import build_app
 
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(rw_db, "board_initialized", "1")
+    set_board_meta(rw_db, "round_number", "1")
     rw_db.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
@@ -6107,8 +6087,8 @@ def _seed_queued_ready_entry(
       marks the entry ``PLAN_READY`` (all gates pass).
     - ``_auto_drain_tick`` should pick it up and call ``process()``.
     """
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(conn, "board_initialized", "1")
+    set_board_meta(conn, "round_number", "1")
     conn.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
@@ -6148,8 +6128,8 @@ def _seed_queued_blocked_entry(
     ``plan()`` marks this entry ``PLAN_BLOCKED`` (review not approved), so
     ``_auto_drain_tick`` must skip it.
     """
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(conn, "board_initialized", "1")
+    set_board_meta(conn, "round_number", "1")
     conn.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
@@ -6401,8 +6381,8 @@ def test_auto_drain_never_triggers_ci_rerun_for_stale_ci(
     from coord.serve_app import _auto_drain_tick
 
     aid, branch, issue_number = "work-cistale1", "issue-57-impl", 57
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
-    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    set_board_meta(rw_db, "board_initialized", "1")
+    set_board_meta(rw_db, "round_number", "1")
     rw_db.execute(
         "INSERT INTO assignments "
         "(assignment_id, machine_name, repo_name, repo_github, issue_number, "

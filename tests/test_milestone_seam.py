@@ -21,6 +21,7 @@ from coord.cli import main
 from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.serve_app import build_app
+from tests.backends import set_board_meta
 
 
 CONFIG_YAML = """\
@@ -182,10 +183,8 @@ def _make_file_db(path: Path) -> None:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
-    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
-    )
+    set_board_meta(conn, "round_number", "1")
+    set_board_meta(conn, "board_initialized", "1")
     conn.commit()
     conn.close()
 

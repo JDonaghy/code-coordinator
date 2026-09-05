@@ -66,6 +66,7 @@ from coord.drive_queue import (
     plan_tick,
 )
 from coord.models import Machine, Repo
+from tests import backends
 
 REPO = "claude-coordinator"
 NOW = 1_800_000_000.0
@@ -130,10 +131,9 @@ def seed(coord_db):
         assignments: list[dict[str, Any]] | None = None,
     ) -> None:
         for number, issue_state in (issues or {}).items():
-            coord_db.execute(
-                "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
-                "VALUES (?, ?, ?, ?)",
-                (REPO, number, f"issue {number}", issue_state),
+            backends.upsert_issue(
+                coord_db, repo_name=REPO, number=number, title=f"issue {number}",
+                state=issue_state,
             )
         for index, row in enumerate(assignments or []):
             coord_db.execute(

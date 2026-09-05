@@ -25,6 +25,7 @@ from coord.models import Machine, Repo
 from coord.openapi import declared_routes, spec_routes, validate_json_schema
 from coord.serve_app import build_app as build_serve_app
 from scripts.gen_board_fixture import fixture_json_text
+from tests.backends import set_board_meta
 
 
 # ── agent ─────────────────────────────────────────────────────────────────
@@ -112,9 +113,7 @@ def _serve_db(path: Path) -> None:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')"
-    )
+    set_board_meta(conn, "round_number", "1")
     conn.commit()
     conn.close()
 

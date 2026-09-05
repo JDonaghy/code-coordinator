@@ -2951,7 +2951,35 @@ class _FlakyConnProxy:
     the same counting/raising behavior. ``__module__`` is pinned to
     ``"sqlite3"`` so ``coord.sql.detect_dialect`` (keyed off
     ``type(conn).__module__``) recognizes this fake as SQLite instead of
-    raising ``UnsupportedDialectError``.
+    raising ``UnsupportedDialectError`` -- this only matters on the SQLite
+    lane, since ``__getattr__`` below means ``coord.sql.unwrap()`` sees
+    straight through this proxy to the real driver connection anyway (its
+    ``getattr(conn, "_coord_seam_conn", None)`` probe forwards here and
+    lands on the wrapped connection), so on the Postgres lane
+    ``detect_dialect`` already resolves correctly off the real psycopg
+    connection underneath.
+
+    #3101: that "sees straight through" property is exactly why the retry
+    delegation below must NOT go back through ``self._real.execute()``.
+    Under ``COORD_TEST_BACKEND=postgres`` ``self._real`` is a
+    ``coord.sql.TranslatingConnection`` (``tests/backends.py``'s
+    ``_open_postgres``), and its own ``.execute()`` translates qmark
+    (``?``) to pyformat (``%s``) again. Because ``detect_dialect`` already
+    saw through to Postgres, ``coord.sql.execute()`` -- the seam the write
+    under test calls -- had ALREADY translated the statement once before
+    ever reaching this proxy. Delegating to ``self._real.execute()``
+    therefore translated an already-``%s`` statement a second time,
+    doubling every ``%`` into ``%%`` (``_qmark_to_pyformat``'s own
+    percent-escaping rule, meant for a literal ``%`` already in the SQL,
+    firing on a placeholder it had just created) and leaving psycopg with
+    zero real placeholders against N bound parameters -- ``the query has 0
+    placeholders but N parameters were passed``, the exact signature this
+    class's tests were failing with. Going through ``self._real.cursor()``
+    instead reaches the same raw driver cursor ``TranslatingConnection``
+    itself would hand to a caller that didn't route through its
+    ``.execute()`` -- untranslating, so the already-correctly-translated
+    statement from the outer seam call reaches the driver exactly once, on
+    both lanes.
     """
 
     __module__ = "sqlite3"
@@ -2965,7 +2993,7 @@ class _FlakyConnProxy:
         self.calls += 1
         if self.calls <= self._fail_times:
             raise sqlite3.OperationalError("database is locked")
-        return self._real.execute(*args, **kwargs)
+        return self._real.cursor().execute(*args, **kwargs)
 
     def cursor(self):
         return _FlakyCursorProxy(self)

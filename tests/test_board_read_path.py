@@ -27,6 +27,7 @@ from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 from coord.serve_app import build_app
+from tests.backends import set_board_meta
 
 
 def _make_db(path: Path) -> None:
@@ -51,9 +52,7 @@ def _make_db(path: Path) -> None:
         "synced_at) VALUES (?,?,?,?,?,?,?)",
         ("api", 42, "A work issue", "B" * 9000, "open", '["bug"]', 0.0),
     )
-    conn.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '3')"
-    )
+    set_board_meta(conn, "round_number", "3")
     conn.commit()
     conn.close()
 
