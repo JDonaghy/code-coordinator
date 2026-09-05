@@ -787,3 +787,549 @@ def test_coord_doctor_stays_quiet_for_a_healthy_machine(config_path, cfg, monkey
         config_path, monkeypatch, [_status(cfg.machines[0], health=health)]
     )
     assert "onboarding:" not in result.output
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #3137 — layer 7 (toolchain), layer 8 (identity), and the role dimension
+#
+# Six layers passed `precision` with `crit=0 ... ok=true` while it had no
+# restic, no ~/.coord/backup.env and no daemon units. These tests are the
+# gate that failure could not reach: one named finding per gap, each one
+# reachable from seeded facts with no network, no SSH and no live agent.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _probe(tool, *, found=True, version=None, min_version=None, meets_floor=None,
+           capability=None):
+    from coord.prereqs import ToolProbe
+
+    return ToolProbe(
+        tool=tool, capability=capability, found=found, version=version,
+        min_version=min_version, meets_floor=meets_floor, what_breaks="",
+    )
+
+
+def _tc_facts(**kw):
+    """A reachable, otherwise-clean machine, with layer 7/8 facts seeded."""
+    base = dict(
+        name="laptop", configured=True, host="laptop.tail1234.ts.net",
+        declared_capabilities=["rust"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        host_matches_tailnet=True, reachable=True, version="0.9.0",
+        published_capabilities=["rust"], published_repos=["api"],
+    )
+    base.update(kw)
+    return MachineFacts(**base)
+
+
+def _find(findings, check):
+    return next((f for f in findings if f.check == check), None)
+
+
+# ── Acceptance 1: the #1671 regression ─────────────────────────────────────
+
+
+def test_tool_on_login_path_but_not_the_agents_path_crits_naming_both_paths():
+    """THE finding this layer exists for. On 2026-08-01 `cargo` was installed,
+    invisible to the agent, the `rust` probe read "not found", dispatch_smoke
+    refused to route, and the Test stage retried every 30s with no
+    board-visible reason. `/health` structurally cannot report this: its
+    probes run inside the agent's own process, so "absent" and "present but
+    off my PATH" are the same answer there. Only the login-shell comparison
+    tells them apart — and the CRIT must name BOTH paths, because the fix
+    (edit the agent's unit) is not the fix a reader would otherwise guess
+    (edit their own shell rc)."""
+    facts = _tc_facts(
+        tool_probes={"cargo": _probe("cargo", found=False, capability="rust")},
+        shell_probed=True,
+        login_path_tools={"cargo": "/home/john/.cargo/bin/cargo"},
+        login_path="/home/john/.cargo/bin:/usr/bin",
+        agent_path="/home/john/.coord-venv/bin:/usr/bin",
+    )
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.tool_off_agent_path")
+    assert finding is not None
+    assert finding.severity == CRIT
+    # Both paths, named.
+    assert "/home/john/.cargo/bin/cargo" in finding.summary
+    assert "/home/john/.coord-venv/bin:/usr/bin" in finding.summary
+    # And the fix must point at the AGENT's unit, not the operator's shell.
+    assert "coord-agent" in (finding.fix or "")
+
+
+def test_a_genuinely_absent_tool_is_not_reported_as_the_path_trap():
+    """The counterweight: if the login shell cannot find it either, this is an
+    ordinary missing tool and must not be dressed up as a PATH problem —
+    otherwise the #1671 finding stops meaning anything."""
+    facts = _tc_facts(
+        tool_probes={"cargo": _probe("cargo", found=False, capability="rust")},
+        shell_probed=True, login_path_tools={"cargo": None},
+    )
+    checks = {f.check for f in machine_onboard.evaluate_toolchain(facts)}
+    assert "toolchain.tool_missing" in checks
+    assert "toolchain.tool_off_agent_path" not in checks
+
+
+def test_missing_tool_without_ssh_says_it_could_not_tell_the_trap_apart():
+    """Absence of evidence, stated out loud: with no login-shell probe the
+    layer still CRITs (the tool really is unusable) but must say it cannot
+    distinguish the #1671 trap, rather than implying it ruled it out."""
+    facts = _tc_facts(
+        tool_probes={"cargo": _probe("cargo", found=False, capability="rust")},
+    )
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.tool_missing")
+    assert finding.severity == CRIT
+    assert "--ssh" in finding.summary
+
+
+def test_probe_binaries_excludes_the_pkg_config_backed_gtk4_prereq():
+    """`gtk4`'s binary is `pkg-config` and its probe is a MODULE lookup, so a
+    login shell finding pkg-config says nothing about GTK4 dev libs — feeding
+    it into the comparison would manufacture a #1671 CRIT out of a machine
+    that simply has no GTK. The exclusion is structural (`tool == binary`),
+    not a hardcoded skip list."""
+    binaries = machine_onboard.probe_binaries(["gtk", "rust"], "worker")
+    assert "cargo" in binaries
+    assert "pkg-config" not in binaries
+
+
+# ── Acceptance 2: a tool below a known floor ───────────────────────────────
+
+
+def test_tool_below_its_version_floor_crits_naming_floor_and_found_version():
+    """`gh` is the floor that already exists (GH_PR_CHECKS_JSON_MIN_VERSION):
+    a daemon on a too-old gh cannot read CI status, so every production merge
+    gate silently degrades. The CRIT must carry both numbers — "upgrade gh" is
+    not actionable without knowing to what, or from what."""
+    from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
+
+    facts = _tc_facts(
+        declared_capabilities=[],
+        tool_probes={
+            "gh": _probe("gh", version="2.0.0",
+                         min_version=GH_PR_CHECKS_JSON_MIN_VERSION, meets_floor=False),
+        },
+    )
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.tool_below_floor")
+    assert finding.severity == CRIT
+    assert "2.0.0" in finding.summary
+    assert GH_PR_CHECKS_JSON_MIN_VERSION in finding.summary
+    assert GH_PR_CHECKS_JSON_MIN_VERSION in (finding.fix or "")
+
+
+def test_the_floor_is_coord_prereqs_own_not_a_second_copy():
+    """One question, one answer (#2085): this layer must not re-derive whether
+    a version passes. It reads `ToolProbe.ok`, the same predicate
+    `prereqs.unmet_capabilities` applies for layer 3 — so a probe the shared
+    predicate calls fine can never CRIT here."""
+    from coord.prereqs import unmet_capabilities
+
+    probe = _probe("cargo", version="1.0.0", min_version="0.9",
+                   meets_floor=True, capability="rust")
+    assert probe.ok
+    assert unmet_capabilities(["rust"], {"cargo": probe}) == {}
+    facts = _tc_facts(tool_probes={"cargo": probe})
+    assert not [f for f in machine_onboard.evaluate_toolchain(facts) if f.severity == CRIT]
+
+
+def test_layer_7_and_layer_3_cannot_disagree_about_an_unmet_capability():
+    """The split-brain guard. Layer 3 reports the CAPABILITY roll-up and layer
+    7 the TOOL detail, from the same /health probes through the same
+    predicate. If layer 7 CRITs on a tool, layer 3 must be reporting its
+    capability unmet — two surfaces answering the same question must agree by
+    construction, not by coincidence."""
+    from coord.prereqs import unmet_capabilities
+
+    probes = {"cargo": _probe("cargo", found=False, capability="rust")}
+    facts = _tc_facts(
+        tool_probes=probes,
+        unmet_capabilities=unmet_capabilities(["rust"], probes),
+    )
+    report = machine_onboard.evaluate(facts)
+    tool_crits = [f for f in report.for_layer("toolchain") if f.severity == CRIT]
+    cap_crits = [f for f in report.for_layer("agent") if f.check == "agent.capability_unmet"]
+    assert tool_crits and cap_crits
+    assert {f.subject for f in cap_crits} == {"rust"}
+
+
+def test_a_capability_no_prereq_backs_warns_rather_than_passing_silently():
+    facts = _tc_facts(declared_capabilities=["teleportation"], tool_probes={"git": _probe("git")})
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.capability_unmapped")
+    assert finding.severity == WARN
+    assert finding.subject == "teleportation"
+
+
+def test_toolchain_is_unknown_not_ok_when_no_agent_answered():
+    """A gate that reads a dead agent as clean is not a gate."""
+    facts = _tc_facts(reachable=False)
+    findings = machine_onboard.evaluate_toolchain(facts)
+    assert [f.severity for f in findings] == [UNKNOWN]
+
+
+# ── Acceptance 3: the forge token, and the role that decides its bar ───────
+
+
+def _identity(**kw):
+    return machine_onboard.IdentityFacts(probed=True, **kw)
+
+
+def test_a_machine_with_no_forge_token_crits():
+    facts = _tc_facts(
+        shell_probed=True,
+        identity=_identity(forge_token_present=False, forge_repo_read=False,
+                           forge_repo="acme/api", forge_reason="gh: not authenticated"),
+    )
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.forge_read_missing")
+    assert finding.severity == CRIT
+    assert "acme/api" in finding.summary
+    assert "gh auth login" in (finding.fix or "")
+
+
+def test_a_token_that_cannot_merge_crits_on_a_daemon():
+    """Presence is not capability — the #3129 distinction. `coord merge`
+    re-invokes itself on the daemon, so it is the DAEMON's token that decides
+    every production merge; one that reads fine and cannot push is a merge
+    queue that wedges with no explanation."""
+    facts = _tc_facts(
+        role="daemon", role_source="file", shell_probed=True,
+        identity=_identity(forge_token_present=True, forge_repo_read=True,
+                           forge_can_merge=False, forge_repo="acme/api"),
+    )
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.forge_merge_missing")
+    assert finding.severity == CRIT
+    assert "acme/api" in finding.summary
+
+
+def test_a_token_that_cannot_merge_is_silent_on_a_thin_client():
+    """The role dimension's whole point. #3128 spells exactly two roles, and
+    its `worker` default IS #3137's "thin client" column — a machine that
+    never merges is not a degraded daemon, and warning it about merge rights
+    is how a report stops being read. Silence here must be TOTAL: not a WARN,
+    not an UNKNOWN, no finding at all."""
+    facts = _tc_facts(
+        role="worker", role_source="file", shell_probed=True,
+        identity=_identity(forge_token_present=True, forge_repo_read=True,
+                           forge_can_merge=False, forge_repo="acme/api"),
+    )
+    checks = {f.check for f in machine_onboard.evaluate_identity(facts)}
+    assert not any(c.startswith("identity.forge_merge") for c in checks)
+    # ... while the read check, which DOES apply to every role, still fires.
+    assert "identity.forge_read" in checks
+
+
+def test_daemon_role_demands_the_dr_lane_and_a_worker_is_not_asked_for_it():
+    """Run against precision (a worker) today this must stay quiet about
+    restic and backup.env, and report both the moment it is declared a
+    daemon — that difference is the role-awareness proof."""
+    kw = dict(
+        shell_probed=True, login_path_tools={"restic": None},
+        identity=_identity(backup_env_present=False),
+    )
+    worker = machine_onboard.evaluate(_tc_facts(role="worker", role_source="file", **kw))
+    daemon = machine_onboard.evaluate(_tc_facts(role="daemon", role_source="file", **kw))
+
+    worker_checks = {f.check for f in worker.findings}
+    assert "toolchain.role_tool_missing" not in worker_checks
+    assert not any(c.startswith("identity.backup_env") for c in worker_checks)
+
+    restic = _find(daemon.findings, "toolchain.role_tool_missing")
+    assert restic.severity == CRIT and restic.subject == "restic"
+    assert _find(daemon.findings, "identity.backup_env_missing").severity == CRIT
+    assert not daemon.ok
+
+
+def test_board_token_verdict_is_the_daemons_answer_not_the_files_existence():
+    """#2096: a reported outcome that only proves a file parses is not
+    evidence. The verdict is whether the DAEMON accepted the token."""
+    facts = _tc_facts(
+        shell_probed=True,
+        identity=_identity(board_token_present=True, board_token_accepted=False,
+                           board_reason="HTTPStatusError: 401 unauthorized"),
+    )
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.board_token_missing")
+    assert finding.severity == CRIT
+    assert "401" in finding.summary
+
+
+def test_identity_without_the_ssh_probe_is_unknown_never_a_pass():
+    facts = _tc_facts()
+    findings = machine_onboard.evaluate_identity(facts)
+    for check in ("forge_read", "git_push", "claude_oauth", "board_token"):
+        assert _find(findings, f"identity.{check}_unknown").severity == UNKNOWN
+    assert not [f for f in findings if f.severity in (CRIT, WARN)]
+
+
+def test_identity_tailnet_defers_to_layer_2_rather_than_double_counting():
+    """The same #2912 fact, read once. Layer 2 owns the CRIT of record; layer
+    8 naming it again at CRIT would count one defect twice in one exit code."""
+    facts = _tc_facts(host_matches_tailnet=False)
+    report = machine_onboard.evaluate(facts)
+    assert _find(report.findings, "network.host_resolves_offtailnet").severity == CRIT
+    mirrored = _find(report.findings, "identity.tailnet_node_mismatch")
+    assert mirrored.severity == WARN
+    assert "network.host_resolves_offtailnet" in mirrored.summary
+
+
+# ── Acceptance 4: no credential value, anywhere ────────────────────────────
+
+
+SECRETS = (
+    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+    "github_pat_11ABCDEFG0abcdefghijklmnop",
+    "sk-ant-oat01-SUPERSECRETVALUE-abcdef",
+    "b0ardT0kenb0ardT0kenb0ardT0kenb0ardT0ken",
+)
+
+
+def test_no_credential_value_reaches_any_finding_log_line_or_summary():
+    """This layer touches every secret the fleet has. The probe is written
+    never to emit one — but a free-form error string from `gh`, `ssh` or an
+    HTTP client is attacker-adjacent text pasted straight into a report, so
+    the parse boundary redacts as an independent second line of defence.
+    Asserted on CAPTURED OUTPUT, over a payload that maliciously carries a
+    token in every reason field."""
+    import json as _json
+
+    payload = {
+        "login_path_tools": {"cargo": "/usr/bin/cargo"},
+        "login_path": "/usr/bin", "agent_path": "/usr/bin",
+        "role": {"role": "daemon", "source": "file", "valid": True, "raw": "daemon"},
+        "identity": {
+            "forge_token_present": True, "forge_repo_read": False,
+            "forge_repo": "acme/api",
+            "forge_reason": f"gh: bad credentials for {SECRETS[0]}",
+            "git_push_ok": False,
+            "git_push_reason": f"key rejected: {SECRETS[1]}",
+            "claude_oauth_present": False,
+            "claude_oauth_reason": f"stale creds {SECRETS[2]}",
+            "board_token_present": True, "board_token_accepted": False,
+            "board_reason": f"401 for Bearer {SECRETS[3]}",
+            "backup_env_present": False,
+        },
+    }
+    probe = machine_onboard.parse_shell_probe(
+        "COORD_MACHINE_PROBE=" + _json.dumps(payload)
+    )
+    facts = _tc_facts(
+        role=probe.role, role_source=probe.role_source, shell_probed=True,
+        login_path_tools=probe.login_path_tools, login_path=probe.login_path,
+        agent_path=probe.agent_path, identity=probe.identity,
+    )
+    rendered = "\n".join(
+        machine_onboard.format_report(machine_onboard.evaluate(facts), verbose=True)
+    )
+    # The report is genuinely populated — otherwise this passes vacuously.
+    assert "identity.forge_read_missing" in rendered
+    assert "identity.board_token_missing" in rendered
+    for secret in SECRETS:
+        assert secret not in rendered, secret
+        assert secret not in repr(facts.identity), secret
+
+
+def test_redaction_leaves_diagnostics_readable():
+    """A redactor that eats the PATH it is supposed to print is useless: the
+    finding still has to say WHERE the tool was found."""
+    assert machine_onboard.redact("gh: HTTP 401 Bad credentials") == (
+        "gh: HTTP 401 Bad credentials"
+    )
+    facts = _tc_facts(
+        tool_probes={"cargo": _probe("cargo", found=False, capability="rust")},
+        shell_probed=True, login_path_tools={"cargo": "/home/john/.cargo/bin/cargo"},
+        agent_path="/home/john/.coord-venv/bin:/usr/bin",
+    )
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.tool_off_agent_path")
+    assert "/home/john/.cargo/bin/cargo" in finding.summary
+
+
+# ── Acceptance 5: the role comes from #3128, and defaults exactly as it does ─
+
+
+def test_absent_role_declaration_behaves_as_worker_and_adds_no_new_findings():
+    """#3128's first acceptance criterion, inherited: a host that never opts
+    in must be graded byte-for-byte as it is today. `worker` explicitly
+    declared and `worker` by default must produce identical findings — and
+    neither may produce a single new CRIT or WARN on an otherwise-clean
+    machine."""
+    default_role = machine_onboard.evaluate(_tc_facts(
+        tool_probes={"cargo": _probe("cargo", version="1.80.0", capability="rust")},
+    ))
+    declared = machine_onboard.evaluate(_tc_facts(
+        role="worker", role_source="file",
+        tool_probes={"cargo": _probe("cargo", version="1.80.0", capability="rust")},
+    ))
+    # The only permitted difference is the line that NAMES the role and where
+    # it came from — the grading itself must be identical.
+    role_lines = {"identity.role", "identity.role_undeclared"}
+
+    def _graded(report):
+        return [(f.check, f.severity) for f in report.findings if f.check not in role_lines]
+
+    assert _graded(default_role) == _graded(declared)
+    assert default_role.crits == []
+    assert default_role.warns == []
+    assert default_role.ok
+
+
+def test_the_role_is_read_through_3128s_resolver_only():
+    """No second reader and no second default: the SSH probe CALLS
+    `deploy_manifest.resolve_role` on the host that owns the declaration, and
+    this module only ever consumes the RoleDeclaration it returns."""
+    from coord import deploy_manifest
+
+    script = machine_onboard._SHELL_PROBE_SCRIPT
+    assert "resolve_role" in script
+    # Neither source #3128 owns may be read here directly — not the file...
+    assert "~/.coord/role" not in script
+    # ... and not the env var, whose NAME must appear nowhere but #3128.
+    assert deploy_manifest.ROLE_ENV_VAR not in script
+    # And the vocabulary is #3128's, not a copy.
+    assert set(machine_onboard.ROLE_IDENTITY_CHECKS) <= set(deploy_manifest.ROLE_UNITS)
+    assert MachineFacts(name="x").role == deploy_manifest.ROLE_WORKER
+
+
+def test_a_role_declaration_that_is_not_a_role_warns_rather_than_being_swallowed():
+    facts = _tc_facts(role="worker", role_source="file", role_raw="deamon", role_valid=False)
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.role_invalid")
+    assert finding.severity == WARN
+    assert "deamon" in finding.summary
+
+
+# ── Acceptance 6: the exit code still gates ────────────────────────────────
+
+
+def test_doctor_exits_nonzero_on_a_toolchain_crit(config_path, cfg):
+    """M2 is going to be built against this exit code, so a layer-7 CRIT has
+    to reach it — a finding that renders but cannot fail the gate is
+    decoration."""
+    health = _health(tool_versions={
+        "python3": {"capability": "python", "found": False, "version": None},
+    })
+    with patch("coord.network.check_all",
+               return_value=[_status(cfg.machines[0], health=health)]), \
+         patch("coord.network.tailscale_ip_map", return_value={}):
+        result = CliRunner().invoke(
+            machine_doctor, ["laptop", "--config", str(config_path)]
+        )
+    assert result.exit_code == 1
+    assert "toolchain.tool_missing" in result.output
+    assert "layers 7-8 are PARTIAL without --ssh" in result.output
+
+
+def test_doctor_role_flag_grades_a_worker_against_the_daemon_bar(config_path, cfg):
+    """`--role daemon` answers "what would precision be missing if it were the
+    daemon host?" without touching the host's own declaration."""
+    with patch("coord.network.check_all",
+               return_value=[_status(cfg.machines[0], health=_health())]), \
+         patch("coord.network.tailscale_ip_map", return_value={}):
+        plain = CliRunner().invoke(
+            machine_doctor, ["laptop", "--config", str(config_path), "-v"]
+        )
+        as_daemon = CliRunner().invoke(
+            machine_doctor,
+            ["laptop", "--config", str(config_path), "-v", "--role", "daemon"],
+        )
+    assert "identity.forge_merge" not in plain.output
+    assert "identity.forge_merge" in as_daemon.output
+    assert "identity.backup_env" in as_daemon.output
+    assert "role 'daemon' (source: flag)" in as_daemon.output
+
+
+# ── The probe itself: control flow, output shape, and no credential in it ──
+
+
+def test_the_shell_probe_script_runs_end_to_end_without_touching_a_credential(
+    tmp_path, monkeypatch, capsys
+):
+    """Executes the REAL embedded script against a stubbed `subprocess.run`
+    and a stubbed HOME, so the thing that ships is what is exercised — a
+    syntax check on a string proves nothing about its control flow. Asserts
+    the emitted payload is booleans and paths only."""
+    import json as _json
+    import subprocess as _subprocess
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "role").write_text("daemon\n")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "sk-ant-oat01-x"}')
+    (tmp_path / ".claude.json").write_text("{}")
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        joined = " ".join(argv) if isinstance(argv, list) else str(argv)
+        if "command -v -- restic" in joined:
+            return _subprocess.CompletedProcess(argv, 1, "", "")
+        if "command -v" in joined:
+            return _subprocess.CompletedProcess(argv, 0, "/usr/bin/cargo\n", "")
+        if "$PATH" in joined:
+            return _subprocess.CompletedProcess(argv, 0, "/usr/bin:/bin", "")
+        if "MainPID" in joined:
+            return _subprocess.CompletedProcess(argv, 0, "0\n", "")
+        if "gh api" in joined:
+            return _subprocess.CompletedProcess(argv, 0, "true\n", "")
+        if "git@github.com" in joined:
+            return _subprocess.CompletedProcess(
+                argv, 1, "", "Hi john! You've successfully authenticated"
+            )
+        return _subprocess.CompletedProcess(argv, 1, "", "unexpected")
+
+    from coord import client as client_mod
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(client_mod, "resolve_board_service",
+                        lambda *a, **k: client_mod.ServiceConfig(url="http://d:7435", token="t"))
+    monkeypatch.setattr(client_mod, "fetch_board_payload", lambda *a, **k: {"ok": True})
+
+    params = _json.dumps({"binaries": ["cargo", "restic"], "repo_slug": "acme/api"})
+    script = machine_onboard._SHELL_PROBE_SCRIPT.replace("__PARAMS__", repr(params))
+    exec(compile(script, "<probe>", "exec"), {"__name__": "__probe__"})  # noqa: S102
+
+    out = capsys.readouterr().out
+    probe = machine_onboard.parse_shell_probe(out)
+
+    # It really did ask #3128's resolver, on the host, and got the file's answer.
+    assert probe.role == "daemon"
+    assert probe.role_source == "file"
+    # Capability, not just presence.
+    assert probe.identity.forge_repo_read is True
+    assert probe.identity.forge_can_merge is True
+    assert probe.identity.git_push_ok is True
+    assert probe.identity.claude_oauth_present is True
+    assert probe.identity.board_token_accepted is True
+    assert probe.identity.backup_env_present is False
+    assert probe.login_path_tools == {"cargo": "/usr/bin/cargo", "restic": None}
+
+    # `gh auth status --show-token` must never appear, and no credential file
+    # content may reach the payload — the Claude creds above contain a token.
+    joined_calls = " ".join(
+        " ".join(c) if isinstance(c, list) else str(c) for c in calls
+    )
+    assert "--show-token" not in joined_calls
+    assert "sk-ant-oat01-x" not in out
+
+
+def test_an_unparseable_probe_is_an_error_not_a_clean_bill():
+    probe = machine_onboard.parse_shell_probe("login banner only\n")
+    assert probe.error
+    assert probe.identity.probed is False
+    facts = _tc_facts(shell_probed=False, shell_probe_error=probe.error,
+                      identity=machine_onboard.IdentityFacts(probed=False, error=probe.error))
+    findings = machine_onboard.evaluate_identity(facts)
+    assert _find(findings, "identity.board_token_unknown").severity == UNKNOWN
+
+
+def test_the_cheap_second_pass_reads_as_unprobed_not_as_missing_credentials():
+    """`gather_facts` re-probes ONLY when the host's own role turns out to
+    want a binary the first pass never looked up, and that pass skips every
+    credential check to avoid a second `gh api` + `ssh -T`. A skipped check
+    must read UNKNOWN — a cheap pass that rendered as "this machine holds no
+    credentials" would be the worst possible false CRIT in this layer."""
+    probe = machine_onboard.parse_shell_probe(
+        'COORD_MACHINE_PROBE={"login_path_tools": {"restic": "/usr/bin/restic"}, '
+        '"identity": null}'
+    )
+    assert probe.identity.probed is False
+    assert probe.identity.board_token_accepted is None
+    assert probe.login_path_tools == {"restic": "/usr/bin/restic"}
