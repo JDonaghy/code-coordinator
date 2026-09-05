@@ -30,8 +30,10 @@ import pytest
 from click.testing import CliRunner
 
 from coord import backup as bk
+from coord import config as cfgmod
 from coord import dr_verify
 from coord.cli import main
+from coord.config import NotificationsConfig
 from coord.db import _DB_SCHEMA_VERSION, _ensure_schema
 from coord.gen_board_fixture import build_fixture_db
 from coord.notifier.transport import MemoryTransport
@@ -596,6 +598,42 @@ def test_alert_goes_through_the_notifier_and_never_raises(lane, monkeypatch):
     assert dr_verify.alert("t", "b", transport=Exploding()) is False
     # An unconfigured transport is reported loudly rather than counted as sent.
     assert dr_verify.alert("t", "b", transport=NullTransport()) is False
+
+
+def test_default_transport_honors_the_notifications_master_switch(monkeypatch):
+    """#1632's invariant, applied to this rung's alert path: every other
+    caller of this exact machinery (coord/notifier/service.py,
+    drive_queue.py's self-cordon escalation) skips sending when
+    ``notifications.enabled`` is False, even with ntfy_url/ntfy_topic
+    populated — an operator pausing notifications, or a host mid-setup. The
+    one alert path in dr_verify must not be the exception."""
+    from coord.notifier.transport import NullTransport
+
+    class FakeCfg:
+        def __init__(self, notifications):
+            self.notifications = notifications
+
+    populated_but_disabled = NotificationsConfig(
+        enabled=False, ntfy_url="http://dellserver:7440", ntfy_topic="dr-verify"
+    )
+    monkeypatch.setattr(cfgmod, "load", lambda path: FakeCfg(populated_but_disabled))
+    transport = dr_verify._default_transport()
+    assert isinstance(transport, NullTransport), (
+        "enabled=False must yield a NullTransport regardless of populated "
+        "ntfy_url/ntfy_topic — the master switch, not field presence, decides"
+    )
+
+    # No notifications: block at all (cfg.notifications is None) — same result.
+    monkeypatch.setattr(cfgmod, "load", lambda path: FakeCfg(None))
+    assert isinstance(dr_verify._default_transport(), NullTransport)
+
+    # enabled=True with a real (ntfy) transport configured actually builds one.
+    enabled = NotificationsConfig(
+        enabled=True, ntfy_url="http://dellserver:7440", ntfy_topic="dr-verify"
+    )
+    monkeypatch.setattr(cfgmod, "load", lambda path: FakeCfg(enabled))
+    built = dr_verify._default_transport()
+    assert not isinstance(built, NullTransport)
 
 
 def test_an_unsnapshottable_backend_refuses_rather_than_reporting_green(
