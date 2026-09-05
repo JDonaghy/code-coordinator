@@ -41,6 +41,8 @@ from coord.drive_queue import (
     STATE_RUNNING,
     QueueEntry,
 )
+from tests import backends
+from tests.backends import set_board_meta
 
 #: The genuine `coord.state.apply_issue_labels`, captured at import time —
 #: before `_default_pipeline_labels` (autouse) replaces the module attribute
@@ -103,10 +105,9 @@ def seed(coord_db):
         repo: str = REPO,
     ) -> None:
         for number, issue_state in (issues or {}).items():
-            coord_db.execute(
-                "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
-                "VALUES (?, ?, ?, ?)",
-                (repo, number, f"issue {number}", issue_state),
+            backends.upsert_issue(
+                coord_db, repo_name=repo, number=number, title=f"issue {number}",
+                state=issue_state,
             )
         for index, row in enumerate(assignments or []):
             coord_db.execute(
@@ -486,10 +487,9 @@ def declare(coord_db):
 
     def _declare(number: int, *files: str, repo: str = REPO) -> None:
         body = "## Files\n" + "".join(f"- `{f}`\n" for f in files)
-        coord_db.execute(
-            "INSERT OR REPLACE INTO issues (repo_name, number, title, body, state) "
-            "VALUES (?, ?, ?, ?, 'open')",
-            (repo, number, f"issue {number}", body),
+        backends.upsert_issue(
+            coord_db, repo_name=repo, number=number, title=f"issue {number}",
+            body=body, state="open",
         )
         coord_db.commit()
 
@@ -2837,10 +2837,7 @@ def _seed_merge_only_evidence(coord_db, issue: int, work_aid: str) -> None:
     matching `coord.merge_queue.has_passed_test`/`has_approved_review`'s own
     read shape.
     """
-    coord_db.execute(
-        "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
-        "('board_initialized', '1')"
-    )
+    set_board_meta(coord_db, "board_initialized", "1")
     coord_db.execute(
         "INSERT INTO assignments "
         "(assignment_id, repo_name, issue_number, issue_title, machine_name, "

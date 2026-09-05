@@ -7673,11 +7673,15 @@ class TestPlan:
         """Milestone title is pulled from the issues table when present."""
         from coord.db import get_connection
         conn = get_connection()
-        conn.execute(
-            "INSERT OR REPLACE INTO issues "
-            "(repo_name, number, title, body, state, labels, milestone_title) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("api", 1, "t", "", "open", "[]", "v1.0"),
+        backends.upsert_issue(
+            conn,
+            repo_name="api",
+            number=1,
+            title="t",
+            body="",
+            state="open",
+            labels="[]",
+            milestone_title="v1.0",
         )
         conn.commit()
 

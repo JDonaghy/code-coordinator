@@ -26,6 +26,7 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
+from tests import backends
 
 REPO = "claude-coordinator"
 
@@ -77,10 +78,9 @@ def seed(coord_db):
         repo: str = REPO,
     ) -> None:
         for number, issue_state in (issues or {}).items():
-            coord_db.execute(
-                "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
-                "VALUES (?, ?, ?, ?)",
-                (repo, number, f"issue {number}", issue_state),
+            backends.upsert_issue(
+                coord_db, repo_name=repo, number=number, title=f"issue {number}",
+                state=issue_state,
             )
         for index, row in enumerate(assignments or []):
             coord_db.execute(

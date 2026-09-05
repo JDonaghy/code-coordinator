@@ -426,3 +426,61 @@ def scratch_database(tmp_path: Path, name: str = "scratch.db") -> Iterator[Any]:
         yield session.conn
     finally:
         session.close()
+
+
+# ── portable seed helpers (#3101) ─────────────────────────────────────────
+#
+# `coord/**`'s own writers all went through `coord.sql.upsert()`/
+# `insert_ignore()` back in #2726/#2721 -- but ~60 test bodies across the
+# suite seed the same handful of tables by writing sqlite-only `INSERT OR
+# REPLACE INTO ...` directly against whatever connection `coord_db`/
+# `get_connection()` handed them. On SQLite that is correct, idiomatic SQL.
+# On Postgres it is not a paramstyle problem `TranslatingConnection` can
+# paper over (that seam only rewrites `?`/`:name` -> `%s`/`%(name)s`, never
+# SQL syntax) -- `INSERT OR REPLACE`/`INSERT OR IGNORE` is invalid Postgres
+# grammar outright, so every one of those call sites fails the Postgres lane
+# with `psycopg.errors.SyntaxError: syntax error at or near "OR"`, the same
+# way #3083's own module docstring already flags for `coord/**`. These
+# helpers are the portable replacement: same `sql.upsert()`/`insert_ignore()`
+# idiom `coord/state.py` uses for the same tables, so a test seeding
+# `board_meta`/`issues`/`plans` reaches the driver exactly like production
+# code does, on both backends, without every call site re-deriving the
+# right `conflict_columns`.
+
+
+def set_board_meta(conn: Any, key: str, value: str) -> None:
+    """Portable replacement for ``conn.execute("INSERT OR REPLACE INTO
+    board_meta (key, value) VALUES (...)")`` (#3101).
+
+    Mirrors ``coord.state``'s own writers (see e.g. ``save_board``'s #2726
+    note): ``board_meta`` is exactly ``(key TEXT PRIMARY KEY, value TEXT)``
+    and both columns are always supplied, so DELETE+INSERT
+    (``INSERT OR REPLACE``) and upsert (``ON CONFLICT ... DO UPDATE``) are
+    behaviourally identical here -- no unmentioned column, no FK. Does not
+    commit -- same as the raw ``execute()`` calls this replaces, callers
+    keep control of when the transaction lands.
+    """
+    from coord import sql
+
+    sql.upsert(conn, "board_meta", ["key", "value"], (key, value), conflict_columns=["key"])
+
+
+def upsert_issue(conn: Any, **columns: Any) -> None:
+    """Portable replacement for ``conn.execute("INSERT OR REPLACE INTO
+    issues (...) VALUES (...)")`` (#3101).
+
+    Mirrors ``coord.state._upsert_open_issues_local``'s own upsert: the
+    ``issues`` table's natural key is ``(repo_name, number)``, both supplied
+    as keyword columns by every caller. Column order is whatever *columns*
+    was given in (a plain ``dict`` preserves insertion order), matching how
+    each existing call site already named its own subset of columns.
+    """
+    from coord import sql
+
+    sql.upsert(
+        conn,
+        "issues",
+        list(columns),
+        tuple(columns.values()),
+        conflict_columns=["repo_name", "number"],
+    )

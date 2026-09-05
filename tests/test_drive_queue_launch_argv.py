@@ -26,6 +26,7 @@ from click.testing import CliRunner
 from coord import state
 from coord.cli import main
 from coord.drive_queue import DEFAULT_TICK_MAX_FIX_ROUNDS
+from tests import backends
 
 REPO = "claude-coordinator"
 
@@ -79,10 +80,9 @@ def seed(coord_db):
     """Write an `issues` row the tick will actually read back as launchable."""
 
     def _seed(number: int, issue_state: str = "open") -> None:
-        coord_db.execute(
-            "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
-            "VALUES (?, ?, ?, ?)",
-            (REPO, number, f"issue {number}", issue_state),
+        backends.upsert_issue(
+            coord_db, repo_name=REPO, number=number, title=f"issue {number}",
+            state=issue_state,
         )
         coord_db.commit()
 

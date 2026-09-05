@@ -72,6 +72,7 @@ from coord.reports import (
     run_trend,
 )
 from coord.serve_app import build_app
+from tests.backends import set_board_meta
 
 # A stable window: 2026-08-02 20:16Z → 2026-08-03 09:16Z, the known-good 13h
 # window from the issue. Expressed as bare epoch floats so nothing here needs
@@ -2332,9 +2333,7 @@ class TestDaemonEndpoints:
             "VALUES (?,?,?,?,?,?,?,?)",
             ("work1", "laptop", "api", "acme/api", 1629, "t", "done", "work"),
         )
-        rw_db.execute(
-            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('updated', '123.5')"
-        )
+        set_board_meta(rw_db, "updated", "123.5")
         rw_db.commit()
 
         def _snapshot() -> tuple:
