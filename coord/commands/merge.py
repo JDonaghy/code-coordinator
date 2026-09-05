@@ -545,7 +545,7 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
         save_board(fix_board)
 
 
-def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
+def _dispatch_ci_fixes(events, config, ci_store=None, *, dry_run: bool) -> None:
     """#2510: classify any CONFIRMED ``checks_failed`` events and dispatch a
     bounded CI-fix worker for the eligible ones, escalating to
     ``HUMAN_REQUIRED`` once the retry cap (``coord.ci_fix.
@@ -592,6 +592,15 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
     would otherwise read as a noop). While a fix is still active, the entry
     is left untouched — no refund, no streak bump, no new dispatch — for
     the next tick to re-check.
+
+    *ci_store* (#3114): the same ``CiStore`` the caller already built to run
+    ``mq.process()`` this pass — threaded through so a fresh dispatch can
+    fetch the failing job/step/log-excerpt detail via
+    ``coord.ci_github.build_ci_failure_detail`` instead of handing the
+    worker a bare one-line ``checks_summary``. Optional (defaults to
+    ``None``) purely so every pre-#3114 caller/test keeps working
+    unmodified; a ``None`` store just means no detail is fetched, same as
+    today's behavior.
     """
     ci_events = [ev for ev in events if ev.kind == "checks_failed"]
     if not ci_events or dry_run:
@@ -692,7 +701,25 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
                     },
                 )
             continue
-        fix = dispatch_ci_fix(entry, fix_board, config, checks_summary=ev.message)
+        detail = None
+        if ci_store is not None and entry.pr_number is not None:
+            try:
+                from coord.ci_github import (  # noqa: PLC0415
+                    build_ci_failure_detail,
+                )
+                detail = build_ci_failure_detail(
+                    ci_store, entry.repo_github, entry.pr_number,
+                )
+            except Exception:  # noqa: BLE001 — best-effort enrichment
+                # (#3114): a throttled/rate-limited/malformed detail fetch
+                # must never block a dispatch that would otherwise succeed.
+                # `build_ci_failure_detail` already fails soft internally;
+                # this is defense-in-depth for anything that escapes it
+                # (e.g. a duck-typed `ci_store` missing a method entirely).
+                detail = None
+        fix = dispatch_ci_fix(
+            entry, fix_board, config, checks_summary=ev.message, detail=detail,
+        )
         if fix is not None:
             click.echo(
                 f"  {entry.repo_name} #{entry.issue_number}: "
@@ -2199,7 +2226,7 @@ def merge(
         # #2510: same reasoning, for a CONFIRMED checks_failed event — dispatch
         # a bounded ci-fix worker or escalate to HUMAN_REQUIRED before the
         # save below, so the mutation on only_entry.state is persisted too.
-        _dispatch_ci_fixes(events_only, cfg_only, dry_run=dry_run)
+        _dispatch_ci_fixes(events_only, cfg_only, ci_store_only, dry_run=dry_run)
         # #2246: `--only` merges one entry, but the branch it just moved is
         # shared — every OTHER queued PR based on it may have become
         # CONFLICTING a second ago. This is the drive-queue's path (`coord
@@ -2648,7 +2675,7 @@ def merge(
     # #2510: classify any CONFIRMED checks_failed events and dispatch a
     # bounded ci-fix worker for the eligible ones, escalating to
     # HUMAN_REQUIRED once the retry cap is spent.
-    _dispatch_ci_fixes(events, cfg, dry_run=dry_run)
+    _dispatch_ci_fixes(events, cfg, ci_store, dry_run=dry_run)
 
     # #2246: whatever just landed may have invalidated its siblings — ask
     # GitHub now, while the merge that caused it is still the obvious

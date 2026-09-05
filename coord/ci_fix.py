@@ -37,6 +37,7 @@ import logging
 
 import httpx
 
+from coord.ci_store import CIFailureDetail
 from coord.config import Config
 from coord.merge_queue import QueuedMerge, _chain_work_ids
 from coord.models import Assignment, Board
@@ -69,13 +70,54 @@ MAX_CI_FIX_NOOP_STREAK = 2
 CI_FIX_TITLE_PREFIX = "[ci-fix]"
 
 
+def _format_ci_failure_detail(detail: CIFailureDetail) -> list[str]:
+    """Render *detail* into briefing lines (#3114).
+
+    ``checks_summary`` alone is a one-line rollup (e.g. "checks failed:
+    Test (Linux, headless) (failure)") — no job name, no failing test, no
+    log. This is the section that fills that gap with what
+    ``list_jobs_for_run``/the failing step's log already told the
+    coordinator, so a ci-fix worker doesn't have to spend a whole session
+    rediscovering it from scratch (see the issue's evidence: 82 turns/$2.55
+    to re-find a one-line fix this data already pointed at).
+    """
+    lines: list[str] = ["## CI failure detail", ""]
+    if detail.job_name:
+        lines.append(f"Failing job: {detail.job_name}")
+    if detail.step_name:
+        lines.append(f"Failing step: {detail.step_name}")
+    if detail.run_url:
+        lines.append(f"Run: {detail.run_url}")
+    if detail.log_excerpt:
+        lines.append("")
+        # #3114 acceptance: truncation must be visible in the text itself,
+        # never a silent cut.
+        lines.append(
+            "Log excerpt (truncated — showing the tail only):"
+            if detail.truncated else "Log excerpt:"
+        )
+        lines.append("```")
+        lines.append(detail.log_excerpt)
+        lines.append("```")
+    lines.append("")
+    return lines
+
+
 def build_ci_fix_briefing(
     *,
     entry: QueuedMerge,
     checks_summary: str,
     attempt: int,
+    detail: CIFailureDetail | None = None,
 ) -> str:
-    """Assemble the CI-fix worker's briefing. Pure function — testable."""
+    """Assemble the CI-fix worker's briefing. Pure function — testable.
+
+    *detail* (#3114) is the structured failing-job/step/log-excerpt data
+    :func:`coord.ci_github.build_ci_failure_detail` fetches at dispatch
+    time — optional and additive: when it's ``None`` (the fetch failed,
+    was throttled, or found nothing beyond the check name), the briefing is
+    byte-identical to before #3114, still carrying ``checks_summary``.
+    """
     lines: list[str] = [
         f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
         "",
@@ -87,6 +129,10 @@ def build_ci_fix_briefing(
         "",
         f"    {checks_summary}",
         "",
+    ]
+    if detail is not None:
+        lines.extend(_format_ci_failure_detail(detail))
+    lines += [
         f"This is fix attempt {attempt}/{MAX_CI_FIX_DISPATCHES} for this "
         "failure streak — the coordinator will escalate to a human if this "
         "many attempts don't produce a green run.",
@@ -182,9 +228,16 @@ def dispatch_ci_fix(
     config: Config,
     *,
     checks_summary: str | None = None,
+    detail: CIFailureDetail | None = None,
     http_client: httpx.Client | None = None,
 ) -> Assignment | None:
     """Dispatch a fix worker for *entry*'s confirmed CI failure.
+
+    *detail* (#3114): structured failing-job/step/log-excerpt data the
+    caller (``coord.commands.merge._dispatch_ci_fixes``) fetched via
+    ``coord.ci_github.build_ci_failure_detail`` — threaded straight into
+    :func:`build_ci_fix_briefing`. Optional; ``None`` produces the same
+    briefing this function always has.
 
     Returns the new ``Assignment``, or ``None`` when dispatch couldn't
     proceed: the retry cap (:data:`MAX_CI_FIX_DISPATCHES`) is already spent,
@@ -226,6 +279,7 @@ def dispatch_ci_fix(
     summary = checks_summary or entry.error or "CI checks failed"
     briefing = build_ci_fix_briefing(
         entry=entry, checks_summary=summary, attempt=entry.ci_fix_dispatches + 1,
+        detail=detail,
     )
 
     from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
@@ -287,6 +341,8 @@ def dispatch_ci_fix(
             "merge_entry_id": entry.assignment_id,
             "ci_fix_dispatches": entry.ci_fix_dispatches,
             "checks_summary": summary,
+            "ci_fix_job": detail.job_name if detail else None,
+            "ci_fix_step": detail.step_name if detail else None,
         },
     )
 
