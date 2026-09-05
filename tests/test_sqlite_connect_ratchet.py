@@ -192,16 +192,26 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "it.",
     ),
     "test_dr_verify.py": Classification(
-        3, (BUCKET_A,),
+        4, (BUCKET_A,),
         "#3119's DR-verify lane — the restore half of test_backup.py directly "
-        "above, and filed A for the same reason. All three sites build or "
+        "above, and filed A for the same reason. All four sites build or "
         "mutate a real on-disk SQLite *file* that is then snapshotted, "
         "uploaded through a fake restic and restored: make_store() writes the "
         "live schema to a path (the whole lane is about a file that leaves the "
-        "machine and comes back), and the other two hollow out `assignments` / "
-        "rewind `schema_version` in a copy to manufacture the two "
+        "machine and comes back), and hollow_out_assignments() / the "
+        "`schema_version` rewind mutate a copy to manufacture the two "
         "restores-cleanly-but-is-not-a-recovery cases the acceptance criteria "
-        "name. The autouse coord_db fixture cannot serve any of them — there "
+        "name. +1 for #3135's add_ancient_terminal_assignments(), which bulk-"
+        "inserts old terminal rows into the live store *file* so that #762's "
+        "board retention cap makes `/board` serve materially fewer assignments "
+        "than the raw table holds — the production shape whose absence let the "
+        "parity step compare a filtered `/board` count against an unfiltered "
+        "table count and stay permanently red. It has to be that same on-disk "
+        "file, because the very next thing the test does is restic it and "
+        "restore it. (The zero-assignments parity case reuses "
+        "hollow_out_assignments() rather than opening its own connection, so "
+        "#3135 added one site, not two.) "
+        "The autouse coord_db fixture cannot serve any of them — there "
         "is no file to restic — and scratch_database() is out for the usual "
         "backend-following reason: under COORD_TEST_BACKEND=postgres these "
         "would be asserting about a database with no integrity_check and no "
