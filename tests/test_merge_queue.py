@@ -194,6 +194,26 @@ class TestPersistence:
         again = {x.assignment_id: x.ci_unreadable_reruns for x in load_queue()}
         assert again == {"a": 2, "b": 0}
 
+    def test_roundtrip_preserves_ci_fix_detail_cache(self, coord_db) -> None:
+        # #3114 review fix: the cached CI-failure-detail fetch (keyed by the
+        # branch_head_sha it was fetched for) must survive a save/load
+        # cycle — this is the whole point of caching it on the persisted
+        # queue row rather than in-process: `coord merge` is a fresh CLI
+        # invocation each tick, so an in-memory-only cache would never
+        # actually avoid the repeat `gh api .../logs` fetch across ticks.
+        a = _q("a")
+        a.ci_fix_detail_sha = "deadbeef"
+        a.ci_fix_detail_json = '{"check_name": "Test", "job_name": "Test"}'
+        save_queue([a, _q("b")])
+        again = {
+            x.assignment_id: (x.ci_fix_detail_sha, x.ci_fix_detail_json)
+            for x in load_queue()
+        }
+        assert again == {
+            "a": ("deadbeef", '{"check_name": "Test", "job_name": "Test"}'),
+            "b": ("", None),
+        }
+
 
 class TestSaveQueueLockContention:
     """#2802: `save_queue`'s DELETE+re-INSERT rewrite must ride out

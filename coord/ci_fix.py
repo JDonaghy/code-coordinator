@@ -70,6 +70,25 @@ MAX_CI_FIX_NOOP_STREAK = 2
 CI_FIX_TITLE_PREFIX = "[ci-fix]"
 
 
+def _detail_has_content(detail: CIFailureDetail) -> bool:
+    """True when *detail* carries anything :func:`_format_ci_failure_detail`
+    would actually render (#3114 review nit).
+
+    ``build_ci_failure_detail`` can return a non-``None`` ``CIFailureDetail``
+    with only ``check_name`` populated — e.g. a failed check whose ``run_id``
+    was empty, or whose job name never matched any job on the run (see
+    ``test_no_matching_job_leaves_job_and_step_empty``). ``check_name`` alone
+    isn't rendered by ``_format_ci_failure_detail`` (the plain
+    ``checks_summary`` line right above it already names the check), so
+    without this check the briefing would grow a "## CI failure detail"
+    section containing nothing but its own header — harmless, but pointless
+    noise. Treated identically to ``detail is None``.
+    """
+    return bool(
+        detail.job_name or detail.step_name or detail.run_url or detail.log_excerpt
+    )
+
+
 def _format_ci_failure_detail(detail: CIFailureDetail) -> list[str]:
     """Render *detail* into briefing lines (#3114).
 
@@ -114,9 +133,10 @@ def build_ci_fix_briefing(
 
     *detail* (#3114) is the structured failing-job/step/log-excerpt data
     :func:`coord.ci_github.build_ci_failure_detail` fetches at dispatch
-    time — optional and additive: when it's ``None`` (the fetch failed,
-    was throttled, or found nothing beyond the check name), the briefing is
-    byte-identical to before #3114, still carrying ``checks_summary``.
+    time — optional and additive: when it's ``None``, or non-``None`` but
+    empty of anything beyond the check name (see :func:`_detail_has_content`),
+    the briefing is byte-identical to before #3114, still carrying
+    ``checks_summary``.
     """
     lines: list[str] = [
         f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
@@ -130,7 +150,7 @@ def build_ci_fix_briefing(
         f"    {checks_summary}",
         "",
     ]
-    if detail is not None:
+    if detail is not None and _detail_has_content(detail):
         lines.extend(_format_ci_failure_detail(detail))
     lines += [
         f"This is fix attempt {attempt}/{MAX_CI_FIX_DISPATCHES} for this "
@@ -222,6 +242,51 @@ def refund_noop_ci_fix(entry: QueuedMerge) -> None:
     entry.ci_fix_head_sha = ""
 
 
+def dispatch_precheck(
+    entry: QueuedMerge, board: Board, *, log: bool = True,
+) -> Assignment | None:
+    """Return the originating work :class:`Assignment` when *entry* is
+    otherwise eligible for a fresh ci-fix dispatch — ``None`` when the retry
+    cap is already spent, a fix for this chain is already in flight, or the
+    original work assignment can't be found on *board*.
+
+    Extracted out of :func:`dispatch_ci_fix` (#3114 review fix) so a caller
+    that wants to fetch expensive CI-failure detail (:func:`coord.ci_github.
+    build_ci_failure_detail` — a network call, `gh api .../actions/jobs/{id}
+    /logs`) can check these conditions FIRST and skip the fetch entirely for
+    an entry that is going to be declined for one of these reasons anyway —
+    without duplicating this logic. Does not cover every way
+    :func:`dispatch_ci_fix` can still return ``None`` afterward (the
+    underlying ``_dispatch_fix`` HTTP dispatch itself can still decline: no
+    capable machine, agent unreachable, the #2538 DB-lock-contention case)
+    — those aren't knowable without actually attempting the dispatch, so a
+    ``True``-ish return here is necessary, not sufficient, for a dispatch to
+    succeed.
+
+    *log* controls whether a "work assignment not found" outcome is logged
+    — the caller doing the up-front eligibility check should pass ``False``
+    to avoid double-logging the same warning that :func:`dispatch_ci_fix`
+    itself will also emit when it re-derives the same ``None`` a moment
+    later.
+    """
+    if entry.ci_fix_dispatches >= MAX_CI_FIX_DISPATCHES:
+        return None
+    if _has_active_fix(board, entry):
+        return None
+    if entry.assignment_id is None:
+        return None
+    work = board.find_by_id(entry.assignment_id)
+    if work is None:
+        if log:
+            _log.warning(
+                "ci_fix: cannot find original work assignment %s for %s#%d — "
+                "no fix dispatched",
+                entry.assignment_id, entry.repo_name, entry.issue_number,
+            )
+        return None
+    return work
+
+
 def dispatch_ci_fix(
     entry: QueuedMerge,
     board: Board,
@@ -261,19 +326,8 @@ def dispatch_ci_fix(
     BEFORE calling this function again for the same entry, so a worker
     that pushed nothing doesn't silently spend a second real attempt.
     """
-    if entry.ci_fix_dispatches >= MAX_CI_FIX_DISPATCHES:
-        return None
-    if _has_active_fix(board, entry):
-        return None
-    if entry.assignment_id is None:
-        return None
-    work = board.find_by_id(entry.assignment_id)
+    work = dispatch_precheck(entry, board)
     if work is None:
-        _log.warning(
-            "ci_fix: cannot find original work assignment %s for %s#%d — "
-            "no fix dispatched",
-            entry.assignment_id, entry.repo_name, entry.issue_number,
-        )
         return None
 
     summary = checks_summary or entry.error or "CI checks failed"

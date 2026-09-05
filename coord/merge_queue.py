@@ -3447,6 +3447,32 @@ class QueuedMerge:
     # attempt, not a no-op) — see `dispatch_ci_fix`. 0 for every row
     # predating this column.
     ci_fix_noop_streak: int = 0
+    # #3114 review fix: the `branch_head_sha` (see the field above) that
+    # `coord.ci_github.build_ci_failure_detail` was last invoked for on
+    # this entry, together with its JSON-serialized result in
+    # `ci_fix_detail_json` (`coord.ci_store.ci_failure_detail_to_json`/
+    # `_from_json`). Exists because a dispatch declined for a reason
+    # UNRELATED to the CI detail itself (no capable machine, agent
+    # unreachable, the #2538 DB-lock-contention case) leaves the entry
+    # `PENDING` "for the next tick to retry" — without this cache, every
+    # subsequent `coord merge`/`coord merge --only` pass over the SAME
+    # still-failing SHA would re-issue the `gh api .../actions/jobs/{id}/
+    # logs` fetch behind `build_ci_failure_detail`, exactly the per-tick
+    # GitHub probing #2989/#2988 warn against. '' means "no fetch cached
+    # for any SHA yet" — matching `ci_fix_head_sha`'s own empty-string
+    # sentinel convention above — for every entry that has never had a
+    # detail fetch attempted, and for rows predating this column.
+    ci_fix_detail_sha: str = ""
+    # #3114 review fix: paired with `ci_fix_detail_sha` above. `None` means
+    # "no fetch cached for the SHA in `ci_fix_detail_sha`" (including every
+    # row predating this column); once a fetch has been attempted for a
+    # given SHA this holds `coord.ci_store.ci_failure_detail_to_json`'s
+    # output — the JSON literal `"null"` when the fetch ran but genuinely
+    # found no detail, or the serialized `CIFailureDetail` otherwise. Only
+    # ever trusted by a reader when `ci_fix_detail_sha` matches the
+    # CURRENT `branch_head_sha` — a stale cache entry from a since-moved
+    # SHA is simply refetched, never served.
+    ci_fix_detail_json: str | None = None
 
 
 class GhOps(Protocol):
@@ -3823,6 +3849,12 @@ def load_queue() -> list[QueuedMerge]:
             # rows predating these migrations.
             ci_fix_head_sha=row["ci_fix_head_sha"] or "",
             ci_fix_noop_streak=row["ci_fix_noop_streak"] or 0,
+            # #3114 review fix: column added via migration; NULL/'' (rows
+            # predating this migration, or an entry that has never had a
+            # detail fetch attempted) decodes to the same "no cache" shape
+            # as a fresh entry's own defaults.
+            ci_fix_detail_sha=row["ci_fix_detail_sha"] or "",
+            ci_fix_detail_json=row["ci_fix_detail_json"],
         )
         for row in rows
     ]
@@ -3845,8 +3877,9 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         assignment_type, required_gates, ci_infra_reruns,
                         ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
                         ci_unreadable_reruns, ci_fix_dispatches,
-                        ci_fix_head_sha, ci_fix_noop_streak
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ci_fix_head_sha, ci_fix_noop_streak,
+                        ci_fix_detail_sha, ci_fix_detail_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         item.assignment_id, item.repo_name, item.repo_github,
                         item.branch, item.target_branch, item.issue_number,
@@ -3857,6 +3890,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         item.ci_flaky_reruns, item.ci_flaky_pending,
                         item.ci_unreadable_reruns, item.ci_fix_dispatches,
                         item.ci_fix_head_sha, item.ci_fix_noop_streak,
+                        item.ci_fix_detail_sha, item.ci_fix_detail_json,
                     ),
                 )
 

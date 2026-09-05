@@ -795,7 +795,10 @@ def retry_on_locked(
 #
 # #3011: bumped 7 -> 8 for the two `merge_queue.ci_fix_head_sha`/
 # `ci_fix_noop_streak` columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 8
+#
+# #3114 review fix: bumped 8 -> 9 for the two `merge_queue.ci_fix_detail_sha`/
+# `ci_fix_detail_json` columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 9
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1011,7 +1014,9 @@ _SCHEMA_SQL = """
             ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0,
             ci_fix_dispatches INTEGER NOT NULL DEFAULT 0,
             ci_fix_head_sha TEXT NOT NULL DEFAULT '',
-            ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0
+            ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0,
+            ci_fix_detail_sha TEXT NOT NULL DEFAULT '',
+            ci_fix_detail_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -2021,6 +2026,23 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # row predating this migration reads as 0, not NULL, so `coord usage`
     # can sum it without a None-check.
     "ALTER TABLE assignments ADD COLUMN num_turns INTEGER DEFAULT 0",
+    # #3114 review fix: caches the `branch_head_sha` that
+    # `coord.ci_github.build_ci_failure_detail` was last invoked for on this
+    # merge-queue entry — see `QueuedMerge.ci_fix_detail_sha`'s docstring.
+    # Without this, a ci-fix dispatch declined for a reason unrelated to the
+    # CI detail (no capable machine, agent unreachable, #2538 DB-lock
+    # contention) left the entry PENDING and re-fetched the SAME
+    # still-failing SHA's log on every subsequent `coord merge` tick — the
+    # exact per-tick GitHub probing #2989/#2988 warn against. '' for every
+    # row predating this migration and for an entry with no cached fetch.
+    "ALTER TABLE merge_queue ADD COLUMN ci_fix_detail_sha TEXT NOT NULL DEFAULT ''",
+    # #3114 review fix: paired with ci_fix_detail_sha above — the
+    # JSON-serialized `CIFailureDetail` (`coord.ci_store.
+    # ci_failure_detail_to_json`), or the JSON literal "null" when a fetch
+    # was attempted but found nothing. NULL for every row predating this
+    # migration and for an entry with no cached fetch, read identically by
+    # `coord.ci_store.ci_failure_detail_from_json`.
+    "ALTER TABLE merge_queue ADD COLUMN ci_fix_detail_json TEXT",
 ]
 
 
