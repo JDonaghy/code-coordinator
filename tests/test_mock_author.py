@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from coord.agent import (
     MOCK_AUTHOR_DENY_COMMANDS,
+    MOCK_AUTHOR_INTERACTIVE_CARVEOUT,
     MOCK_AUTHOR_SYSTEM_PROMPT,
     WRITE_CAPABLE_SPEC_TYPES,
     AssignmentSpec,
@@ -257,10 +258,22 @@ def test_mock_author_system_prompt_carves_out_target_walkthroughs():
     """#3131: the "one file per screen state" rule above would directly
     contradict a CSS-only `:target` walkthrough, which needs every screen
     it covers sharing ONE document/stylesheet to toggle visibility — so the
-    system prompt must name the exception rather than silently fight the
-    seed briefing's own instruction once #3131's flag is enabled."""
-    assert "#3131" in MOCK_AUTHOR_SYSTEM_PROMPT
-    assert ":target" in MOCK_AUTHOR_SYSTEM_PROMPT
+    carve-out text names the exception rather than silently fighting the
+    seed briefing's own instruction once #3131's flag is enabled.
+
+    #3131 review: the raw MOCK_AUTHOR_SYSTEM_PROMPT constant itself no
+    longer names the exception unconditionally — it holds a
+    ‹INTERACTIVE_CARVEOUT› sentinel that `default_worker_command`
+    (coord/agent.py) only fills with real text when
+    `mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED` is true (see
+    test_agent.py's `test_mock_author_system_prompt_*_interactive_carveout*`
+    for that gating). This test now checks the two pieces that make up the
+    old assertion: the sentinel is present in the constant, and the text
+    that gets spliced in for it does name the exception.
+    """
+    assert "‹INTERACTIVE_CARVEOUT›" in MOCK_AUTHOR_SYSTEM_PROMPT
+    assert "#3131" in MOCK_AUTHOR_INTERACTIVE_CARVEOUT
+    assert ":target" in MOCK_AUTHOR_INTERACTIVE_CARVEOUT
 
 
 # ── dispatch_acceptance_mock ─────────────────────────────────────────────────
@@ -708,9 +721,20 @@ def test_default_worker_command_mock_author_uses_full_tools():
 
 
 def test_default_worker_command_mock_author_uses_mock_author_prompt():
+    """#3131 review: the built prompt is MOCK_AUTHOR_SYSTEM_PROMPT with its
+    ‹INTERACTIVE_CARVEOUT› sentinel resolved (see
+    test_agent.py's interactive-carveout-gating tests), so it can no longer
+    contain the raw constant verbatim as a substring — compare with the
+    sentinel resolved the same way `default_worker_command` resolves it
+    while the flag is off."""
     argv = default_worker_command(_spec())
     idx = argv.index("--system-prompt")
-    assert MOCK_AUTHOR_SYSTEM_PROMPT in argv[idx + 1]
+    from coord.agent import MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED
+
+    expected_base = MOCK_AUTHOR_SYSTEM_PROMPT.replace(
+        "‹INTERACTIVE_CARVEOUT›", MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED
+    )
+    assert expected_base in argv[idx + 1]
 
 
 def test_default_worker_command_mock_author_has_deny_list():

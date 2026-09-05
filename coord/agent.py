@@ -4401,11 +4401,8 @@ being built.
 declared medium, under `tests/acceptance/ms-NN/mocks/` — something the \
 operator can look at and react to, not a text description. For a \
 `web-playwright` driver: one hand-authored, self-contained `.html` file \
-PER SCREEN STATE (not one giant multi-state file) — UNLESS the seed \
-briefing explicitly calls for a CSS-only `:target` interactive walkthrough \
-(#3131), in which case the screens it covers belong TOGETHER in that one \
-file by design: `:target` needs them sharing a single document and \
-stylesheet to switch which one is visible. Each file must OPEN IN A \
+PER SCREEN STATE (not one giant multi-state file)‹INTERACTIVE_CARVEOUT› \
+Each file must OPEN IN A \
 BROWSER AND LOOK LIKE THE SCREEN — inline `<style>` CSS is expected and \
 encouraged, since the mock is the visual contract as well as the \
 structural one. Do not ship a bare DOM skeleton with no styling and call \
@@ -4445,6 +4442,33 @@ manually verify in the rendered mock.
   - [scenario] — [how to trigger] — [what to look for]
   END_SMOKE_TESTS
 """
+
+# #3131 review: the CSS-only `:target` interactive-walkthrough carve-out is
+# spliced into MOCK_AUTHOR_SYSTEM_PROMPT (replacing the ‹INTERACTIVE_CARVEOUT›
+# sentinel below, at dispatch time — see the `mock-author` branch further
+# down) ONLY when `coord.mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED`
+# is true. Before this, the sentence was unconditional prose in the constant
+# itself: every mock-author session — including one dispatched via an
+# operator's own free-text `coord acceptance mock ... --amend "make this a
+# :target interactive walkthrough"` — was told the technique was permitted,
+# regardless of the flag. That's the exact pre-coord-portal#314 CSP degrade
+# the flag exists to prevent (`style-src` falls back to `default-src
+# 'self'`, so the mock's own inline `<style>` is dropped: every `.screen`
+# renders stacked at once with the nav inert). Gating the sentinel closes
+# that path without needing `dispatch_acceptance_mock` to pattern-match
+# amend text for the technique's name — a worker that is never told the
+# exception exists has no instruction to act on even if asked.
+MOCK_AUTHOR_INTERACTIVE_CARVEOUT = (
+    " — UNLESS the seed briefing explicitly calls for a CSS-only `:target` "
+    "interactive walkthrough (#3131), in which case the screens it covers "
+    "belong TOGETHER in that one file by design: `:target` needs them "
+    "sharing a single document and stylesheet to switch which one is "
+    "visible."
+)
+
+#: Spliced in when the flag above is false — closes the sentence the
+#: sentinel sits inside without mentioning the exception at all.
+MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED = "."
 
 # Deny list applied to mock-author workers.  Unlike milestone-chat this type
 # DOES commit/push (it's authoring real files under tests/acceptance/), so
@@ -5019,7 +5043,25 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # Needs Edit/Write (create the mock/contract files) + Bash (commit,
         # push) like a normal worker, but with its own scoped system prompt
         # and deny list instead of the generic WORKER_SYSTEM_PROMPT.
-        system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
+        if spec.system_prompt:
+            system_prompt = spec.system_prompt
+        else:
+            from coord import mock_author  # noqa: PLC0415
+
+            # #3131 review: only mention the `:target` interactive-walkthrough
+            # exception to a mock-author session when the flag that gates
+            # the technique itself is on — see
+            # MOCK_AUTHOR_INTERACTIVE_CARVEOUT's docstring above for why an
+            # unconditional mention here is the one artifact that would ship
+            # the pre-#314 CSP degrade even while the flag stays off.
+            carveout = (
+                MOCK_AUTHOR_INTERACTIVE_CARVEOUT
+                if mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED
+                else MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED
+            )
+            system_prompt = MOCK_AUTHOR_SYSTEM_PROMPT.replace(
+                "‹INTERACTIVE_CARVEOUT›", carveout
+            )
         system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
         # `--setting-sources user` (below) drops CLAUDE.md auto-discovery —
         # see _claude_md_system_prompt_suffix.

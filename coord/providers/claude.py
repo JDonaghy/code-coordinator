@@ -109,6 +109,8 @@ class ClaudeProvider(Provider):
             MILESTONE_CHAT_DENY_COMMANDS,
             MILESTONE_CHAT_SYSTEM_PROMPT,
             MOCK_AUTHOR_DENY_COMMANDS,
+            MOCK_AUTHOR_INTERACTIVE_CARVEOUT,
+            MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED,
             MOCK_AUTHOR_SYSTEM_PROMPT,
             NEW_ISSUE_CHAT_DENY_COMMANDS,
             NEW_ISSUE_CHAT_SYSTEM_PROMPT,
@@ -177,7 +179,29 @@ class ClaudeProvider(Provider):
                 _sp += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
                 _at = "Read,Bash"
             elif spec.type == "mock-author":
-                _sp = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
+                if spec.system_prompt:
+                    _sp = spec.system_prompt
+                else:
+                    # #3131 review: keep in sync with default_worker_command's
+                    # identical branch — the ‹INTERACTIVE_CARVEOUT› sentinel
+                    # in MOCK_AUTHOR_SYSTEM_PROMPT must only resolve to real
+                    # text naming the `:target` walkthrough exception while
+                    # `coord.mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED`
+                    # is true — see MOCK_AUTHOR_INTERACTIVE_CARVEOUT's
+                    # docstring in coord/agent.py. Diverging here would both
+                    # leak the unresolved sentinel into this provider's
+                    # prompt and break the parity this module's own
+                    # docstring promises (tests/test_providers.py).
+                    from coord import mock_author  # noqa: PLC0415
+
+                    _carveout = (
+                        MOCK_AUTHOR_INTERACTIVE_CARVEOUT
+                        if mock_author.INTERACTIVE_MOCK_WALKTHROUGHS_ENABLED
+                        else MOCK_AUTHOR_INTERACTIVE_CARVEOUT_DISABLED
+                    )
+                    _sp = MOCK_AUTHOR_SYSTEM_PROMPT.replace(
+                        "‹INTERACTIVE_CARVEOUT›", _carveout
+                    )
                 _sp += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
                 # Keep in sync with default_worker_command — `--setting-
                 # sources user` drops CLAUDE.md auto-discovery.
