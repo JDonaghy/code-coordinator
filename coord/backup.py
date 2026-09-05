@@ -57,7 +57,6 @@ import json
 import logging
 import os
 import shutil
-import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -331,13 +330,13 @@ def snapshot_sqlite(dest: Path, *, source: Path | None = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
-    conn = sqlite3.connect(str(src))
+    conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=src)
     try:
         # Bound parameter, not an f-string: the destination is a path we
         # control, but quoting a path into SQL by hand is a habit worth not
         # having. SQLite evaluates VACUUM INTO's argument as an expression.
-        conn.execute("VACUUM INTO ?", (str(dest),))
-    except sqlite3.Error as exc:
+        sql.execute(conn, "VACUUM INTO ?", (str(dest),))
+    except sql.driver_errors() as exc:
         raise BackupError(f"VACUUM INTO failed: {exc}") from None
     finally:
         conn.close()
@@ -431,22 +430,21 @@ def verify_sqlite_snapshot(path: Path) -> int:
     if not path.exists() or path.stat().st_size == 0:
         raise VerifyFailure("snapshot is missing or zero-length")
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
+        conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=path, read_only=True)
+    except sql.driver_errors() as exc:
         raise VerifyFailure(f"cannot open snapshot: {exc}") from None
     try:
         try:
-            rows = conn.execute("PRAGMA integrity_check;").fetchall()
-        except sqlite3.DatabaseError as exc:
+            result = sql.sqlite_integrity_check(conn)
+        except sql.driver_errors() as exc:
             raise VerifyFailure(f"integrity_check failed: {exc}") from None
-        result = rows[0][0] if rows else "<no output>"
         if result != "ok":
             raise VerifyFailure(f"integrity_check on snapshot: {result}")
         # Prove it is a coord db and not an empty file that passed
         # integrity_check — the local lane's second gate, kept.
         try:
-            count = int(conn.execute("SELECT COUNT(*) FROM assignments;").fetchone()[0])
-        except sqlite3.DatabaseError as exc:
+            count = int(sql.execute(conn, "SELECT COUNT(*) FROM assignments;").fetchone()[0])
+        except sql.driver_errors() as exc:
             raise VerifyFailure(f"snapshot has no usable assignments table: {exc}") from None
         if count == 0:
             raise VerifyFailure(
@@ -858,18 +856,19 @@ def table_fingerprint(path: Path) -> dict[str, list[tuple]]:
     acceptance criterion, and the only check that would have caught a
     snapshot method that silently dropped a table.
     """
-    conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+    conn = sql.connect(backend=sql.DIALECT_SQLITE, sqlite_path=Path(path), read_only=True)
     try:
         names = [
             row[0]
-            for row in conn.execute(
+            for row in sql.execute(
+                conn,
                 "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name",
             )
         ]
         out: dict[str, list[tuple]] = {}
         for name in names:
-            rows = conn.execute(f'SELECT * FROM "{name}"').fetchall()
+            rows = sql.execute(conn, f'SELECT * FROM "{name}"').fetchall()
             out[name] = sorted(rows, key=repr)
         return out
     finally:

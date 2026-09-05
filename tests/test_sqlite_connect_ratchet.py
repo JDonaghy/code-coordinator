@@ -170,6 +170,27 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "unit under test is a filesystem operation on a SQLite database file. "
         "Postgres has no analogue to back up this way.",
     ),
+    "test_backup.py": Classification(
+        9, (BUCKET_A,),
+        "#3118's off-site backup lane. Every site builds or re-opens a real "
+        "on-disk SQLite *file* whose SQLite-ness is the subject: make_source_db "
+        "sets `PRAGMA journal_mode=WAL` so the `VACUUM INTO`-over-`cp` test can "
+        "hold a `BEGIN IMMEDIATE` write transaction open across a snapshot (the "
+        "second site) and prove the uncommitted row is excluded; the rest "
+        "re-open a snapshot or a restored file to assert `PRAGMA "
+        "integrity_check` says `ok`, or mutate the live db between two pushes "
+        "to prove restic's chunked dedup only ships the delta. The autouse "
+        "coord_db fixture cannot serve any of them — `VACUUM INTO`, "
+        "`journal_mode`, and a torn-file-under-concurrent-writes scenario all "
+        "need a path on disk, not a connection — and scratch_database() is out "
+        "for the usual backend-following reason: under "
+        "COORD_TEST_BACKEND=postgres these would be asserting on a database "
+        "that has no VACUUM INTO and no integrity_check. The Postgres arm of "
+        "the same lane (pg_dump/pg_restore) is tested separately, through a "
+        "fake `runner`, and adds no site here. Same subject as "
+        "test_deploy_coord_db_backup.py directly above, and filed A alongside "
+        "it.",
+    ),
     "test_test_orchestrator.py": Classification(
         2, (BUCKET_A,),
         "Judgement call: _migrate_add_columns idempotency + PRAGMA "
