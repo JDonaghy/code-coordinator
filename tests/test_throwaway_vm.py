@@ -72,7 +72,13 @@ if "network nsg rule create" in joined:
 if "vm list" in joined:
     print(os.environ.get("STUB_EXISTING_VM_NAME", "throwaway")); sys.exit(0)
 if "group delete" in joined:
-    sys.exit(0)
+    rc = int(os.environ.get("STUB_GROUP_DELETE_RC", "0"))
+    if rc != 0:
+        sys.stderr.write(os.environ.get(
+            "STUB_GROUP_DELETE_STDERR",
+            "ERROR: (ResourceGroupBeingDeleted) a lock is present\n",
+        ))
+    sys.exit(rc)
 sys.exit(0)
 """
 
@@ -344,6 +350,115 @@ def test_teardown_fires_on_interrupt(stubs: dict) -> None:
     assert proc.returncode != 0, stdout
     calls = _az_calls(stubs)
     assert any(c.startswith("group delete") for c in calls), (stdout, calls)
+
+
+def test_success_message_says_submitted_not_accepted(stubs: dict) -> None:
+    """#3154: '--no-wait' means 'submitted' is the strongest claim the script
+    can make at that moment -- not 'accepted', which implies more than a
+    fire-and-forget async call proves."""
+    result = _run(stubs, "--role", "worker", "--rg", "rg-msg")
+    assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "delete submitted" in combined
+    assert "accepted" not in combined.lower()
+
+
+def test_keep_flag_short_circuits_teardown_unchanged(stubs: dict) -> None:
+    """Regression pin for the one branch #3154 must NOT touch: --keep still
+    leaves the resource group standing and never calls 'az group delete'."""
+    result = _run(stubs, "--role", "worker", "--rg", "rg-keep-explicit", "--keep")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any(c.startswith("group delete") for c in _az_calls(stubs))
+    assert "leaving rg-keep-explicit standing" in (result.stdout + result.stderr)
+
+
+def test_failed_group_delete_warns_loudly_with_manual_command_and_flips_exit_status(stubs: dict) -> None:
+    """#3154: a submission failure must not look identical to success. It
+    must (a) print a WARNING: naming the RG and a copy-pasteable manual
+    delete command, (b) surface az's own stderr instead of swallowing it,
+    and (c) flip an otherwise-clean run's exit status to non-zero."""
+    result = _run(
+        stubs,
+        "--role",
+        "worker",
+        "--rg",
+        "rg-teardown-fail",
+        env_overrides={
+            "STUB_GROUP_DELETE_RC": "1",
+            "STUB_GROUP_DELETE_STDERR": "ERROR: lock 'do-not-delete' blocks this operation\n",
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "WARNING" in result.stderr
+    assert "rg-teardown-fail" in result.stderr
+    assert "az group delete -n rg-teardown-fail --yes" in result.stderr
+    # az's own stderr reached the operator instead of going to /dev/null.
+    assert "ERROR: lock 'do-not-delete' blocks this operation" in result.stderr
+
+
+def test_failed_group_delete_does_not_mask_an_earlier_failure_exit_code(stubs: dict) -> None:
+    """A teardown-submission failure piled onto an already-failed run must
+    still warn, but must not be needed to make the run non-zero -- the
+    earlier failure's own exit status is not clobbered."""
+    result = _run(
+        stubs,
+        "--role",
+        "worker",
+        "--rg",
+        "rg-teardown-fail-2",
+        env_overrides={
+            "STUB_PROVISION_OUTPUT": "PROVISION: role=worker machine=m phases=8 changes=3 dead_exec=0 gate=pass",
+            "STUB_GROUP_DELETE_RC": "1",
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "WARNING" in result.stderr
+    assert "MACHINE_DOCTOR" in (result.stdout + result.stderr)
+
+
+def test_wait_teardown_confirms_deletion(stubs: dict) -> None:
+    """--wait-teardown polls 'az group show' after the delete and reports a
+    confirmed deletion once it 404s (the default stub state: no
+    STUB_GROUP_EXISTS means the group is already gone)."""
+    result = _run(
+        stubs,
+        "--role",
+        "worker",
+        "--rg",
+        "rg-wait-ok",
+        "--wait-teardown",
+        env_overrides={
+            "THROWAWAY_VM_TEARDOWN_WAIT_ATTEMPTS": "3",
+            "THROWAWAY_VM_TEARDOWN_WAIT_SLEEP": "0",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "confirmed" in combined.lower()
+    assert "rg-wait-ok" in combined
+
+
+def test_wait_teardown_timeout_warns_loudly_and_fails(stubs: dict) -> None:
+    """If the resource group never 404s within the bounded timeout,
+    --wait-teardown must warn loudly and make the run non-zero -- a timeout
+    is not silently swallowed either."""
+    result = _run(
+        stubs,
+        "--role",
+        "worker",
+        "--rg",
+        "rg-wait-timeout",
+        "--wait-teardown",
+        env_overrides={
+            "STUB_GROUP_EXISTS": "1",
+            "THROWAWAY_VM_TEARDOWN_WAIT_ATTEMPTS": "2",
+            "THROWAWAY_VM_TEARDOWN_WAIT_SLEEP": "0",
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "WARNING" in result.stderr
+    assert "timed out" in result.stderr.lower()
+    assert "rg-wait-timeout" in result.stderr
 
 
 # ===========================================================================
