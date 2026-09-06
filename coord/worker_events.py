@@ -172,12 +172,31 @@ class WorkerSummary:
     # for `update_summary`'s fold; deliberately excluded from `to_dict`.
     pending_graphify: dict[str, int] = field(default_factory=dict, repr=False)
     duration_ms: int | None = None
-    # Token counts from the result event (may be zero if the log predates
-    # token reporting or the worker didn't emit usage data).
+    # Token counts. Authoritative source is the terminal `result` event's
+    # cumulative `usage` (set by the `result` branch below, which always
+    # OVERWRITES rather than accumulates). #3156: a log with NO `result`
+    # event at all — a leg SIGKILLed by the reap ceiling before the CLI ever
+    # emitted one — used to leave these at zero forever, which every cost
+    # report then read as "genuinely $0" rather than "unmeasured". The
+    # `assistant` branch below now accumulates each turn's own `message.
+    # usage` as a fallback (deduped by `message.id` — see
+    # `_seen_usage_message_ids`), so a full parse (`tail_bytes=0`) of a
+    # truncated log still yields real, non-inflated totals; a `result` event,
+    # when present, still wins outright since its overwrite runs later in
+    # event order.
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # #3156: `message.id`s already folded into the token totals above.
+    # `claude -p --output-format stream-json` emits one `assistant` *event*
+    # per content block of a single API turn (a `thinking` block and a
+    # `tool_use` block from the same response land as two lines), and every
+    # one of them repeats the SAME `message.usage` — measured in
+    # `coord.spend_ceiling.LiveCostMeter` (which this dedup mirrors) at ~45%
+    # inflation without it. Internal bookkeeping only, excluded from
+    # `to_dict()` like `pending_graphify` above.
+    _seen_usage_message_ids: set[str] = field(default_factory=set, repr=False)
     # #1584: `is_error` off the LAST `result` event seen (update_summary
     # overwrites these on every `result` line it processes, in log order —
     # never OR'd together), so a worker that hit a transient API error,
@@ -737,6 +756,31 @@ def _tool_result_output(block: dict, raw: dict) -> str | None:
     return text
 
 
+def _extract_usage_tokens(usage_obj: dict, raw: dict) -> tuple[int, int, int, int]:
+    """``(input, output, cache_creation, cache_read)`` from one usage block.
+
+    Shared by the `assistant`-event fallback accumulation and the terminal
+    `result` event's authoritative overwrite (#3156) so both read the exact
+    same key variants — claude reports them under a nested ``usage`` object
+    or at the top level (of *raw*), and cache fields go by either the API's
+    own ``*_input_tokens`` names or the shorter aliases some providers use.
+    """
+
+    def _tok(key: str, *alt_keys: str) -> int:
+        for k in (key, *alt_keys):
+            v = usage_obj.get(k) or raw.get(k)
+            if isinstance(v, int) and v > 0:
+                return v
+        return 0
+
+    return (
+        _tok("input_tokens"),
+        _tok("output_tokens"),
+        _tok("cache_creation_input_tokens", "cache_creation_tokens"),
+        _tok("cache_read_input_tokens", "cache_read_tokens"),
+    )
+
+
 def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
     """Fold *event* into *summary* in-place."""
     raw = event.raw
@@ -756,6 +800,29 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
         model = message.get("model") or raw.get("model")
         if isinstance(model, str):
             summary.model_used = model
+        # #3156: fold this turn's own `message.usage` into the running
+        # totals — the only usage data available for a log killed before any
+        # `result` event. Deduped by `message.id` (see the field docstring
+        # above) since the same message can appear across several
+        # `assistant` events, each repeating identical usage. A `result`
+        # event later in the same log unconditionally overwrites these
+        # (see below), so a normal, non-truncated run is unaffected.
+        usage_obj = message.get("usage")
+        if isinstance(usage_obj, dict):
+            message_id = message.get("id")
+            already_counted = (
+                isinstance(message_id, str)
+                and message_id
+                and message_id in summary._seen_usage_message_ids
+            )
+            if isinstance(message_id, str) and message_id:
+                summary._seen_usage_message_ids.add(message_id)
+            if not already_counted:
+                inp, out, cache_creation, cache_read = _extract_usage_tokens(usage_obj, {})
+                summary.input_tokens += inp
+                summary.output_tokens += out
+                summary.cache_creation_tokens += cache_creation
+                summary.cache_read_tokens += cache_read
         # Tool uses can be nested in the assistant message content.
         for block in _iter_content_blocks(message):
             if block.get("type") == "tool_use":
@@ -869,27 +936,21 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
                     )
                     summary.permission_denials.append(str(label))
         # Extract token counts. Claude may report them under a nested
-        # ``usage`` object or at the top level — try both forms.
+        # ``usage`` object or at the top level — try both forms. This is the
+        # AUTHORITATIVE cumulative total for the whole session — it always
+        # overwrites whatever the `assistant` branch above accumulated as a
+        # fallback, since a `result` event only ever appears once, at the
+        # very end of a normal (non-truncated) log.
         usage_obj = raw.get("usage") or {}
         if not isinstance(usage_obj, dict):
             usage_obj = {}
 
-        def _tok(key: str, *alt_keys: str) -> int:
-            """Return first non-zero int found across key variants."""
-            for k in (key, *alt_keys):
-                v = usage_obj.get(k) or raw.get(k)
-                if isinstance(v, int) and v > 0:
-                    return v
-            return 0
-
-        summary.input_tokens = _tok("input_tokens")
-        summary.output_tokens = _tok("output_tokens")
-        summary.cache_creation_tokens = _tok(
-            "cache_creation_input_tokens", "cache_creation_tokens"
-        )
-        summary.cache_read_tokens = _tok(
-            "cache_read_input_tokens", "cache_read_tokens"
-        )
+        (
+            summary.input_tokens,
+            summary.output_tokens,
+            summary.cache_creation_tokens,
+            summary.cache_read_tokens,
+        ) = _extract_usage_tokens(usage_obj, raw)
         return
 
 

@@ -5637,6 +5637,88 @@ class TestListAssignmentsTokens:
         assert entry.get("cache_creation_tokens") == 89
         assert entry.get("cache_read_tokens") == 321
 
+    def test_token_counts_recovered_for_reap_truncated_log_no_result_event(
+        self, tmp_path: Path
+    ) -> None:
+        """#3156: a leg SIGKILLed by the reap ceiling (exit 137) never gets a
+        terminal `result` line — the CLI is killed mid-turn. Before the fix,
+        `update_summary` only ever read usage off a `result` event, so this
+        completed entry carried all-zero token fields (and, one level down
+        in `coord/reconcile.py`, that all-zero shape is exactly what made
+        `_capture_tokens_best_effort` skip the DB write entirely, leaving
+        `cost_usd`/`num_turns`/every token column permanently NULL/0).
+        `list_assignments()` does a full (`tail_bytes=0`) parse for any
+        terminal assignment regardless of exit code, so the completed entry
+        must now recover real, non-zero totals from the `assistant` events'
+        own `message.usage` blocks that DID make it into the log before the
+        kill."""
+        import json as _json
+
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        log_path = tmp_path / "reaped.log"
+        lines = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "working..."}],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_creation_input_tokens": 50,
+                        "cache_read_input_tokens": 500,
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_2",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "still working..."}],
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 40,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 1000,
+                    },
+                },
+            },
+            # No terminating `result` line — the SIGKILL landed here.
+        ]
+        log_path.write_text(
+            "\n".join(_json.dumps(ln) for ln in lines) + "\n", encoding="utf-8"
+        )
+
+        a = AgentAssignment(
+            id="reap1",
+            spec=spec,
+            status=FAILED,
+            finished_at=1.0,
+            exit_code=137,
+            log_path=str(log_path),
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        completed = listing["completed"]
+        assert len(completed) == 1
+        entry = completed[0]
+        assert entry.get("input_tokens") == 300
+        assert entry.get("output_tokens") == 60
+        assert entry.get("cache_creation_tokens") == 50
+        assert entry.get("cache_read_tokens") == 1500
+        assert entry.get("num_turns") == 2
+        # Cost genuinely cannot be recovered here (no result line ever
+        # carried a total_cost_usd) — that's a real "uncaptured", not a
+        # regression, and downstream `coord.usage_rollup.leg_cost` estimates
+        # from the now-populated tokens instead of pricing it at $0.
+        assert entry.get("total_cost_usd") in (0.0, None)
+
     def test_no_tokens_when_log_absent(self, tmp_path: Path) -> None:
         """When the log path is absent, completed entry has no token fields
         (the coordinator handles missing keys gracefully)."""
