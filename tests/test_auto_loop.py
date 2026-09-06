@@ -2164,6 +2164,69 @@ class TestRunForFixTransition:
         assert found is not None
         assert found.review_state == "dispatched"
 
+    def test_run_for_fix_transition_prefers_scoped_review(
+        self, config: Config, coord_db
+    ) -> None:
+        """#3161: tries the SCOPED path first — when it succeeds, the
+        unconditional full ``dispatch_review`` this call site used to always
+        reach for must NOT run (the other of the two callers that used to
+        win the race against `dispatch_scoped_reviews_for_queue`)."""
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment()
+        board = Board(completed=[fix])
+        save_board(board)
+
+        scoped_review = _stub_review_assignment("scoped-rev-1")
+
+        with (
+            patch(
+                "coord.auto_loop.maybe_scoped_review_for_completed_fix",
+                return_value=scoped_review,
+            ) as mock_scoped,
+            patch("coord.auto_loop.dispatch_review") as mock_full,
+        ):
+            actions = run_for_fix_transition("fix-1", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "review_dispatched"
+        mock_scoped.assert_called_once()
+        mock_full.assert_not_called()
+
+        loaded = load_board()
+        found = loaded.find_by_id("fix-1")
+        assert found.review_state == "dispatched"
+
+    def test_run_for_fix_transition_falls_back_when_scoped_declines(
+        self, config: Config, coord_db
+    ) -> None:
+        """The scoped attempt returning None falls back to the ordinary
+        full review — pre-#3161 behaviour, unchanged."""
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment()
+        board = Board(completed=[fix])
+        save_board(board)
+
+        stub_review = _stub_review_assignment()
+
+        with (
+            patch(
+                "coord.auto_loop.maybe_scoped_review_for_completed_fix",
+                return_value=None,
+            ),
+            patch("coord.auto_loop.dispatch_review", return_value=stub_review) as mock_full,
+        ):
+            actions = run_for_fix_transition("fix-1", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "review_dispatched"
+        mock_full.assert_called_once()
+
+        loaded = load_board()
+        found = loaded.find_by_id("fix-1")
+        assert found.review_state == "dispatched"
+
     def test_run_for_fix_transition_iteration_cap_hit(
         self, config: Config, coord_db
     ) -> None:

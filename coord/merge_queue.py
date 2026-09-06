@@ -818,6 +818,80 @@ def only_conflict_fix_since_review(entry: "QueuedMerge", board, review: Assignme
     return False
 
 
+def only_bounded_fix_since_review(entry: "QueuedMerge", board, review: Assignment) -> bool:
+    """True when everything that changed *entry*'s branch since *review*
+    approved it is accounted for by DONE, chain-linked BOUNDED legs (#3161):
+    a conflict-fix rebase (#1476's original scope — see
+    :func:`only_conflict_fix_since_review`, kept byte-for-byte for ``coord
+    review-reaffirm``'s deliberately stricter human-attended gate, which is
+    NOT widened by this function), a CI-triggered fix
+    (:mod:`coord.ci_fix`), or an ordinary review-bounce fix round
+    (:func:`coord.auto_loop._dispatch_fix`) — the two leg shapes #3161
+    measured as actually dominating re-review volume, alongside the
+    conflict-fix rebase #1476 already covered.
+
+    This is the trigger :func:`coord.review.dispatch_scoped_reviews_for_queue`
+    uses; :func:`only_conflict_fix_since_review` remains untouched and is
+    still what ``coord review-reaffirm`` pairs with
+    :func:`intervening_work_since_review` for its own, separately-reasoned,
+    no-override guardrail.
+
+    False (⇒ caller falls back to a full review) when:
+
+    - No coord-tracked leg explains the delta at all — nothing dispatched
+      after *review* on either the conflict-fix or
+      :data:`~coord.models.WORK_LIKE_TYPES` side. Unattributable, never
+      guessed at (same fail-closed posture as
+      :func:`only_conflict_fix_since_review`).
+    - Any :data:`~coord.models.WORK_LIKE_TYPES` assignment dispatched after
+      *review* in the chain (per :func:`intervening_work_since_review`) is
+      NOT a completed (``status="done"``) fix/bounce leg — i.e. it hasn't
+      finished yet (still running, or failed), its ``type`` isn't one
+      :data:`coord.auto_loop.FIX_DISPATCH_TYPES` can emit, or it carries no
+      ``review_of_assignment_id`` linking it back into this chain. Any one
+      of those shapes means either the outcome is unknown or the delta is
+      genuinely new logic *review* never saw — exactly what this guardrail
+      must not wave through.
+
+    A conflict-fix and one or more bounded fix legs may both be present —
+    this is a superset of :func:`only_conflict_fix_since_review`, not a
+    replacement path alongside it.
+    """
+    from coord.auto_loop import FIX_DISPATCH_TYPES  # noqa: PLC0415
+
+    intervening = intervening_work_since_review(entry, board, review)
+    found_any = False
+    for a in intervening:
+        found_any = True
+        if getattr(a, "status", None) != "done":
+            return False
+        if getattr(a, "type", None) not in FIX_DISPATCH_TYPES:
+            return False
+        if getattr(a, "review_of_assignment_id", None) is None:
+            return False
+
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    review_dispatched_at = getattr(review, "dispatched_at", None)
+
+    for a in pool:
+        if getattr(a, "type", None) != "conflict-fix":
+            continue
+        if getattr(a, "review_of_assignment_id", None) != entry.assignment_id:
+            continue
+        if getattr(a, "status", None) != "done":
+            continue
+        a_dispatched_at = getattr(a, "dispatched_at", None)
+        if (
+            review_dispatched_at is not None
+            and a_dispatched_at is not None
+            and a_dispatched_at < review_dispatched_at
+        ):
+            continue  # a conflict-fix from BEFORE this review isn't relevant
+        found_any = True
+
+    return found_any
+
+
 # ── Smoke gate (#465) ──────────────────────────────────────────────────────
 
 def requires_smoke(entry: "QueuedMerge", config) -> bool:

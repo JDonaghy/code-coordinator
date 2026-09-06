@@ -31,6 +31,7 @@ from coord.review import (
     dispatch_review,
     dispatch_scoped_review,
     dispatch_scoped_reviews_for_queue,
+    maybe_scoped_review_for_completed_fix,
     parse_review_from_log,
     pick_reviewer_machine,
     repo_focus_lines,
@@ -2901,6 +2902,63 @@ def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
     assert "kept-from-before" in payload["briefing"]
 
 
+def test_dispatch_scoped_review_check_test_coverage_logs_nudge(
+    two_machine_config: Config, caplog,
+) -> None:
+    """#3161: ``check_test_coverage=True`` (set by the caller when a ci-fix/
+    fix-round leg — not just a conflict-fix — contributed to the delta) runs
+    the #2192 nudge against the branch's current diff."""
+    import logging
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+
+    def _source_only_diff(repo: str, base: str, ref: str) -> str:
+        if ref == "oldsha":
+            return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+old2\n"
+        return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+new_logic\n"
+
+    with caplog.at_level(logging.WARNING, logger="coord.review"):
+        result = dispatch_scoped_review(
+            entry, prior, board, two_machine_config,
+            http_client=_FakeHTTPClient({"id": "scoped-nudge"}),
+            diff_fetcher=_source_only_diff,
+            check_test_coverage=True,
+        )
+
+    assert result is not None
+    assert any("missing test only" in rec.message for rec in caplog.records)
+
+
+def test_dispatch_scoped_review_check_test_coverage_off_by_default(
+    two_machine_config: Config, caplog,
+) -> None:
+    """The default (``check_test_coverage=False``, what a pure conflict-fix
+    scope passes) never runs the nudge — #1476's original behaviour,
+    unchanged."""
+    import logging
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+
+    def _source_only_diff(repo: str, base: str, ref: str) -> str:
+        if ref == "oldsha":
+            return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+old2\n"
+        return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+new_logic\n"
+
+    with caplog.at_level(logging.WARNING, logger="coord.review"):
+        result = dispatch_scoped_review(
+            entry, prior, board, two_machine_config,
+            http_client=_FakeHTTPClient({"id": "scoped-no-nudge"}),
+            diff_fetcher=_source_only_diff,
+        )
+
+    assert result is not None
+    assert not any("missing test only" in rec.message for rec in caplog.records)
+
+
 def test_dispatch_scoped_review_returns_none_when_delta_unavailable(
     two_machine_config: Config,
 ) -> None:
@@ -2978,11 +3036,13 @@ def test_dispatch_scoped_reviews_for_queue_dispatches_when_eligible(
     assert dispatched[0].review_of_assignment_id == "w1"
 
 
-def test_dispatch_scoped_reviews_for_queue_falls_back_when_fix_round_intervened(
+def test_dispatch_scoped_reviews_for_queue_dispatches_when_fix_round_intervened(
     two_machine_config: Config,
 ) -> None:
-    """Guardrail: a work/fix commit (not just a conflict-fix) intervened
-    since the approval — this path must not fire; a full review is needed."""
+    """#3161: a DONE, chain-linked fix-round leg (a review bounce, or a
+    conflict-fix, or both) after the approval is a BOUNDED change — widens
+    #1476's original conflict-fix-only scope, so this now dispatches a
+    scoped review instead of falling back to a full one."""
     from coord import merge_queue as mq
 
     work = Assignment(
@@ -3011,7 +3071,166 @@ def test_dispatch_scoped_reviews_for_queue_falls_back_when_fix_round_intervened(
         http_client=_FakeHTTPClient({"id": "scoped-3"}),
         diff_fetcher=_scoped_diff_fetcher,
     )
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_scope_base_sha == prior.review_head_sha
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_after_ci_fix(
+    two_machine_config: Config,
+) -> None:
+    """Acceptance #1: a ci-fix leg (#2510's ``[ci-fix]``-titled, ``type=
+    "work"`` fix worker) completing after an APPROVING review dispatches a
+    scoped re-review with ``review_scope_base_sha`` anchored to that
+    approval's ``review_head_sha`` — #3161's primary motivating case."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-ci"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_scope_base_sha == prior.review_head_sha
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_after_fix_round(
+    two_machine_config: Config,
+) -> None:
+    """Acceptance #2: an ordinary review-bounce fix round (``[fix-N]``)
+    completing after an APPROVING review — same shape as ci-fix, different
+    leg — also dispatches scoped."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    fix_round = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, fix_round])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-fr"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_scope_base_sha == prior.review_head_sha
+
+
+def test_dispatch_scoped_reviews_for_queue_falls_back_when_fix_still_running(
+    two_machine_config: Config,
+) -> None:
+    """Guardrail (#3161): the gate can still say no — a fix leg dispatched
+    after the approval that hasn't FINISHED yet (``status="running"``) is
+    an unknown outcome, not a bounded one, so this must still fall back to
+    a full review rather than scoping around it."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    fix_running = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", type="work",
+        status="running", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior], active=[fix_running])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-running"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
     assert dispatched == []
+
+
+def _bulk_diff_fetcher(repo: str, base: str, ref: str) -> str:
+    """A diff with a large UNCHANGED bulk far from the one line the
+    fix-round leg actually touched — #3161 acceptance #6's fixture.
+    ``difflib.unified_diff``'s default 3-line context means the delta
+    should carry only a couple of lines near the tail, never the bulk."""
+    bulk = "".join(f"UNCHANGED_BULK_LINE_{i}\n" for i in range(1, 40))
+    if ref == "oldsha":
+        return f"diff --git a/f.py b/f.py\n{bulk}-old-tail\n"
+    return f"diff --git a/f.py b/f.py\n{bulk}+new-tail-from-fix-round\n"
+
+
+def test_dispatch_scoped_reviews_for_queue_briefing_contains_delta_not_bulk(
+    two_machine_config: Config,
+) -> None:
+    """Acceptance #6 (black-box): drive a fix-round leg through the review
+    dispatch path and assert the briefing the reviewer actually receives
+    (the HTTP payload's ``briefing`` field) contains the delta — and NOT
+    the untouched bulk of the diff untouched by the fix round."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    fix_round = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, fix_round])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    client = _FakeHTTPClient({"id": "scoped-bb"})
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=client,
+        diff_fetcher=_bulk_diff_fetcher,
+    )
+
+    assert len(dispatched) == 1
+    assert len(client.calls) == 1
+    briefing = client.calls[0][1]["briefing"]
+    assert "new-tail-from-fix-round" in briefing
+    assert "UNCHANGED_BULK_LINE_1\n" not in briefing
+    assert "UNCHANGED_BULK_LINE_20\n" not in briefing
 
 
 def test_dispatch_scoped_reviews_for_queue_skips_when_already_approved(
@@ -3322,6 +3541,137 @@ def test_dispatch_scoped_reviews_for_queue_respects_per_pass_cap(
         diff_fetcher=_scoped_diff_fetcher,
     )
     assert len(dispatched) == 1
+
+
+# ── maybe_scoped_review_for_completed_fix (#3161) ───────────────────────────
+# The bridge that makes the widened trigger actually reachable: a completed
+# ci-fix/fix-round leg gets a review dispatched against it directly by
+# `dispatch_pending_reviews`'s bulk scan and `coord.auto_loop.
+# run_for_fix_transition`, both BEFORE `dispatch_scoped_reviews_for_queue`'s
+# merge-queue sweep would otherwise get a turn — see this function's own
+# docstring for why. These tests exercise it directly, independent of either
+# caller.
+
+def test_maybe_scoped_review_dispatches_when_queue_entry_eligible(
+    two_machine_config: Config,
+) -> None:
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])  # the already-existing queue row
+
+    client = _FakeHTTPClient({"id": "scoped-mb"})
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        http_client=client,
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+
+    assert result is not None
+    assert result.review_scoped is True
+    assert result.review_scope_base_sha == prior.review_head_sha
+
+
+def test_maybe_scoped_review_returns_none_without_branch(
+    two_machine_config: Config,
+) -> None:
+    completed = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch=None, review_of_assignment_id="w1",
+    )
+    assert maybe_scoped_review_for_completed_fix(
+        completed, Board(), two_machine_config,
+    ) is None
+
+
+def test_maybe_scoped_review_returns_none_when_no_queue_entry(
+    two_machine_config: Config,
+) -> None:
+    """No matching merge-queue row for this branch — never enqueued (or
+    already cleared) — nothing to scope against; must not attempt any
+    live fetch."""
+    completed = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not fetch live state with no queue entry")
+
+    result = maybe_scoped_review_for_completed_fix(
+        completed, Board(), two_machine_config,
+        branch_sha_fetcher=_boom, branch_patch_id_fetcher=_boom, diff_fetcher=_boom,
+    )
+    assert result is None
+
+
+def test_maybe_scoped_review_returns_none_when_head_sha_unresolvable(
+    two_machine_config: Config,
+) -> None:
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        branch_sha_fetcher=lambda repo, branch: None,  # gh probe failed
+    )
+    assert result is None
+
+
+def test_maybe_scoped_review_returns_none_when_no_scoped_candidate(
+    two_machine_config: Config,
+) -> None:
+    """The completed fix leg is real and the queue entry exists, but there's
+    no prior approved review to scope against — falls through cleanly."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, ci_fix])  # no prior review at all
+    mq.save_queue([_scoped_entry()])
+
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+    assert result is None
 
 
 # ── #916: composed regression for the full rebase-bounce handoff ───────────
@@ -5072,6 +5422,105 @@ def test_dispatch_pending_reviews_enforces_max_review_iterations(fake_dispatch) 
     assert len(out) == 1
     assert under_cap.review_state == "dispatched"
     assert capped.review_state == "cap_hit"  # not left "pending" forever
+
+
+def test_dispatch_pending_reviews_prefers_scoped_for_completed_fix_leg(
+    fake_dispatch, monkeypatch,
+) -> None:
+    """#3161: a completed row that is itself a fix leg
+    (``review_of_assignment_id`` set) tries the SCOPED path first — if it
+    succeeds, the unconditional full ``dispatch_review`` this bulk loop used
+    to always call must NOT run (the whole point: `dispatch_pending_reviews`
+    is one of the two callers that used to win the race against
+    `dispatch_scoped_reviews_for_queue` with a full review every time)."""
+    scoped_calls: list[str] = []
+    scoped_result = Assignment(
+        machine_name="server", repo_name="api", issue_number=1,
+        issue_title="[scoped-review] t", assignment_id="scoped-rev-1",
+        status="running", type="review", review_of_assignment_id="w1",
+        review_scoped=True, dispatched_at=0.0,
+    )
+
+    def _fake_scoped(completed, board, config, **kw):
+        scoped_calls.append(completed.assignment_id)
+        board.active.append(scoped_result)
+        return scoped_result
+
+    monkeypatch.setattr(
+        "coord.review.maybe_scoped_review_for_completed_fix", _fake_scoped
+    )
+
+    fix_leg = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", status="done",
+        branch="issue-1-fix", type="work", review_state=None,
+        review_of_assignment_id="w1", dispatched_at=0.0, finished_at=1.0,
+    )
+    board = Board(completed=[fix_leg])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert scoped_calls == ["cifix1"]
+    assert fake_dispatch == []  # full dispatch_review never called
+    assert out == [scoped_result]
+    assert fix_leg.review_state == "dispatched"
+
+
+def test_dispatch_pending_reviews_falls_back_to_full_when_scoped_declines(
+    fake_dispatch, monkeypatch,
+) -> None:
+    """The scoped attempt returning None (no eligible merge-queue entry,
+    guardrail declined, ...) must still fall back to the ordinary full
+    review — the pre-#3161 behaviour, unchanged."""
+    monkeypatch.setattr(
+        "coord.review.maybe_scoped_review_for_completed_fix",
+        lambda completed, board, config, **kw: None,
+    )
+
+    fix_leg = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", status="done",
+        branch="issue-1-fix", type="work", review_state=None,
+        review_of_assignment_id="w1", dispatched_at=0.0, finished_at=1.0,
+    )
+    board = Board(completed=[fix_leg])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert fake_dispatch == ["fix1"]
+    assert len(out) == 1
+    assert fix_leg.review_state == "dispatched"
+
+
+def test_dispatch_pending_reviews_skips_scoped_check_for_first_time_completion(
+    fake_dispatch, monkeypatch,
+) -> None:
+    """A first-time work completion (no ``review_of_assignment_id`` — it has
+    never been reviewed, so nothing could possibly be scoped against it)
+    must never even attempt the scoped path — asserts by making the scoped
+    hook explode if it's called at all."""
+    def _boom(completed, board, config, **kw):
+        raise AssertionError("scoped path must not be attempted for a first-time completion")
+
+    monkeypatch.setattr(
+        "coord.review.maybe_scoped_review_for_completed_fix", _boom
+    )
+
+    fresh_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="t", assignment_id="w1", status="done",
+        branch="issue-1-fix", type="work", review_state=None,
+        dispatched_at=0.0, finished_at=1.0,
+    )
+    board = Board(completed=[fresh_work])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert fake_dispatch == ["w1"]
+    assert len(out) == 1
 
 
 def test_flood_guard_caps_per_pass(fake_dispatch) -> None:
