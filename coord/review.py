@@ -3382,9 +3382,22 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     for completed in eligible:
         if cap and len(dispatched) >= cap:
             break
-        review = dispatch_review(
-            completed, board, config, now=now, terminal_cache=terminal_cache
-        )
+        # #3161: `completed` may itself be a just-finished ci-fix/fix-round
+        # leg (`review_of_assignment_id` set — a fresh first-time work
+        # completion never has one) — try the SCOPED path first so this
+        # bulk loop doesn't win the race against `dispatch_scoped_reviews_
+        # for_queue` with an unconditional full review every time. See
+        # `maybe_scoped_review_for_completed_fix`'s docstring for why the
+        # race exists at all.
+        review = None
+        if completed.review_of_assignment_id is not None:
+            review = maybe_scoped_review_for_completed_fix(
+                completed, board, config, now=now, terminal_cache=terminal_cache,
+            )
+        if review is None:
+            review = dispatch_review(
+                completed, board, config, now=now, terminal_cache=terminal_cache
+            )
         if review is not None:
             completed.review_state = "dispatched"
             dispatched.append(review)
@@ -3404,22 +3417,29 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     return dispatched
 
 
-# ── Scoped re-review (#1476) ─────────────────────────────────────────────────
+# ── Scoped re-review (#1476, widened by #3161) ────────────────────────────────
 #
-# When a conflict-fix rebase changes content under an already-`approve`d
-# review (the branch's patch-id no longer matches the one the review covered
-# — see #1475), `has_approved_review` correctly voids the stale approval, but
-# the only way to get an approval back today is a FULL re-review of the whole
-# PR — even when the conflict-fix resolution touched a handful of lines. The
-# functions below dispatch a review scoped to just that resolution delta
-# instead: the reviewer is told the PR was already approved, handed a diff
-# *of diffs* showing exactly what the rebase changed, and asked to rule on
-# that alone. `coord.merge_queue.find_scoped_review_candidate` /
-# `only_conflict_fix_since_review` gate when this path is eligible; a
-# request-changes verdict here is a completely ordinary `type="review"`
-# assignment (same `review_of_assignment_id` chain, same REVIEW_VERDICT
-# parsing), so the existing fix/re-review auto-loop drives it identically to
-# a full review — nothing downstream needs to know the review was scoped.
+# When a conflict-fix rebase, a CI-triggered fix (#2510), or an ordinary
+# review-bounce fix round changes content under an already-`approve`d review
+# (the branch's patch-id no longer matches the one the review covered — see
+# #1475), `has_approved_review` correctly voids the stale approval, but the
+# only way to get an approval back used to be a FULL re-review of the whole
+# PR — even when the resolution touched a handful of lines. #3161 measured
+# this: re-reviews after a ci-fix or fix-round leg (not just a conflict-fix)
+# dominate re-review volume, and `dispatch_scoped_review` already had
+# everything needed except a trigger that fired for them. The functions below
+# dispatch a review scoped to just that delta instead: the reviewer is told
+# the PR was already approved, handed a diff *of diffs* showing exactly what
+# changed since, and asked to rule on that alone.
+# `coord.merge_queue.find_scoped_review_candidate` /
+# `only_bounded_fix_since_review` gate when this path is eligible (see the
+# latter for how it widens #1476's original conflict-fix-only scope — and why
+# `only_conflict_fix_since_review` stays unwidened for `coord
+# review-reaffirm`'s stricter human gate); a request-changes verdict here is a
+# completely ordinary `type="review"` assignment (same
+# `review_of_assignment_id` chain, same REVIEW_VERDICT parsing), so the
+# existing fix/re-review auto-loop drives it identically to a full review —
+# nothing downstream needs to know the review was scoped.
 
 
 def compute_resolution_delta(old_diff_text: str | None, new_diff_text: str | None) -> str | None:
@@ -3466,11 +3486,12 @@ def build_scoped_review_briefing(
     resolution_delta: str,
     default_branch: str = "main",
 ) -> str:
-    """Assemble a SCOPED re-review briefing (#1476). Pure function — testable.
+    """Assemble a SCOPED re-review briefing (#1476, widened by #3161).
+    Pure function — testable.
 
-    Dispatched when a conflict-fix rebase changed content under an
-    already-approved review with no other intervening work/fix commit
-    (``coord.merge_queue.only_conflict_fix_since_review``). The reviewer is
+    Dispatched when a conflict-fix rebase, ci-fix, or fix-round leg changed
+    content under an already-approved review with nothing else intervening
+    (``coord.merge_queue.only_bounded_fix_since_review``). The reviewer is
     told the PR was already approved — it must not re-derive a verdict
     already reached — and is handed ONLY the resolution delta
     (:func:`compute_resolution_delta`) to rule on. This is the whole point:
@@ -3589,13 +3610,15 @@ def dispatch_scoped_review(
     branch_sha_fetcher=None,
     patch_id_computer=None,
     terminal_cache: dict | None = None,
+    check_test_coverage: bool = False,
 ) -> Assignment | None:
-    """Dispatch a SCOPED re-review (#1476) for a merge entry whose approval
-    was voided ONLY by a content-changing conflict-fix rebase.
+    """Dispatch a SCOPED re-review (#1476, widened by #3161) for a merge
+    entry whose approval was voided ONLY by a content-changing conflict-fix
+    rebase, CI-triggered fix, or review-bounce fix round.
 
     Caller contract: only call this after
     :func:`coord.merge_queue.find_scoped_review_candidate` (its result is
-    *prior_review*) and :func:`coord.merge_queue.only_conflict_fix_since_review`
+    *prior_review*) and :func:`coord.merge_queue.only_bounded_fix_since_review`
     (the guardrail) have both confirmed this path applies — mirrors how
     :func:`dispatch_review` trusts :func:`dispatch_pending_reviews`'s
     eligibility filter rather than re-deriving it. *entry* is a
@@ -3627,12 +3650,18 @@ def dispatch_scoped_review(
     code it's judging, mirroring :func:`dispatch_review`'s
     ``completed.machine_name`` contract.
 
-    Does NOT run the #2192 "missing test coverage" nudge that
-    :func:`dispatch_review` does ahead of its dispatch — intentional, not an
-    oversight: this path only fires after a conflict-fix rebase where a full
-    review (nudge included) already happened against the whole PR, and the
-    delta reviewed here is scoped to just the rebase's own resolution, not
-    the PR's original feature diff.
+    *check_test_coverage* (#3161): runs the #2192 "missing test coverage"
+    nudge (:func:`diff_missing_test_coverage`, log-only — never gates, never
+    denies) against the branch's current full diff when True. The caller
+    (:func:`dispatch_scoped_reviews_for_queue`) decides this per entry: a
+    pure conflict-fix rebase is content-preserving — its full-PR review
+    already ran the nudge once, so it stays off (``check_test_coverage=
+    False`` is the default, preserving the original #1476 behaviour
+    byte-for-byte). A ci-fix or fix-round leg, by contrast, CAN add real
+    logic the original review never saw, so
+    :func:`dispatch_scoped_reviews_for_queue` passes ``True`` whenever
+    :func:`coord.merge_queue.intervening_work_since_review` found one
+    contributing to this delta.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -3705,6 +3734,21 @@ def dispatch_scoped_review(
             entry.assignment_id,
         )
         return None
+
+    # #3161: same free, log-only #2192 nudge `dispatch_review` runs — see
+    # `check_test_coverage`'s docstring for why this only fires for a
+    # ci-fix/fix-round-sourced delta, never a pure conflict-fix rebase.
+    # Checked against the branch's current FULL diff (not the diff-of-diffs
+    # `delta`, which isn't a real unified diff `diff_file_paths` can parse) —
+    # cheap and free either way, so scoping it down buys nothing.
+    if check_test_coverage and diff_missing_test_coverage(new_diff):
+        log.warning(
+            "[review] scoped review for merge entry %s: diff touches "
+            "user-visible source with zero test files changed — matches "
+            "#2132's 'missing test only' pattern (free static check, "
+            "non-blocking; dispatching scoped review as normal)",
+            entry.assignment_id,
+        )
 
     # #1476 fix: rank candidates against the machine that authored the code
     # under review — the WORK assignment behind *entry* — not the prior
@@ -3852,9 +3896,10 @@ def dispatch_scoped_reviews_for_queue(
     patch_id_computer=None,
 ) -> list[Assignment]:
     """Scan the merge queue for entries eligible for a #1476 SCOPED
-    re-review and dispatch one for each, instead of leaving them blocked on
-    "review required but not approved" until a human notices and manually
-    forces a full re-review.
+    re-review (widened by #3161 to also cover ci-fix/fix-round legs, not
+    just a conflict-fix rebase) and dispatch one for each, instead of
+    leaving them blocked on "review required but not approved" until a
+    human notices and manually forces a full re-review.
 
     Mirrors :func:`dispatch_pending_reviews`'s "bounded pass, caller
     persists the board" shape so it slots into the same
@@ -3865,8 +3910,8 @@ def dispatch_scoped_reviews_for_queue(
     It also mirrors that function's two review-flood-incident (2026-06-08)
     safety mechanisms — the ``reviews.flood_threshold`` surge gate and the
     ``reviews.max_auto_dispatch_per_pass`` per-pass cap — so a batch of
-    conflict-fix rebases completing together can't fire an unbounded burst
-    of metered ``claude -p`` reviews in a single pass.
+    conflict-fix/ci-fix/fix-round legs completing together can't fire an
+    unbounded burst of metered ``claude -p`` reviews in a single pass.
 
     An entry is eligible when: it's ``PENDING`` and review-gated
     (:func:`coord.merge_queue.requires_review`); it does NOT already have an
@@ -3875,12 +3920,21 @@ def dispatch_scoped_reviews_for_queue(
     nothing further);
     :func:`coord.merge_queue.find_scoped_review_candidate` finds a prior
     `approve`d review voided ONLY by a content-changing rebase; and
-    :func:`coord.merge_queue.only_conflict_fix_since_review` confirms no
-    other work/fix commit intervened. Entries failing any of these are left
-    untouched for the existing full-review paths to handle. A dedupe check
-    skips entries where a review dispatched after the prior approval is
-    already in flight or completed, so a slow reconcile loop can't fire two
-    scoped reviews for the same voided approval.
+    :func:`coord.merge_queue.only_bounded_fix_since_review` confirms
+    everything that changed since is a DONE conflict-fix, ci-fix, and/or
+    fix-round leg — no other, unattributable/unfinished work intervened.
+    Entries failing any of these are left untouched for the existing
+    full-review paths to handle. A dedupe check skips entries where a
+    review dispatched after the prior approval is already in flight or
+    completed, so a slow reconcile loop can't fire two scoped reviews for
+    the same voided approval.
+
+    #3161: for each dispatched entry, runs the #2192 test-coverage nudge
+    (via :func:`dispatch_scoped_review`'s ``check_test_coverage``) exactly
+    when :func:`coord.merge_queue.intervening_work_since_review` found a
+    ci-fix/fix-round leg contributing to the delta — a pure conflict-fix
+    rebase (content-preserving; its full-PR review already ran the nudge
+    once) keeps the nudge off, matching #1476's original behaviour.
 
     Returns the dispatched review Assignments (already on ``board.active``).
     """
@@ -3895,7 +3949,7 @@ def dispatch_scoped_reviews_for_queue(
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
     _get_branch_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
 
-    eligible: list[tuple] = []  # (entry, prior_review)
+    eligible: list[tuple] = []  # (entry, prior_review, run_test_coverage_nudge)
     mutated = False
     for entry in items:
         if entry.state != mq.PENDING:
@@ -3925,7 +3979,7 @@ def dispatch_scoped_reviews_for_queue(
         if prior_review is None:
             continue  # no scoped candidate — needs a full review, not this path
 
-        if not mq.only_conflict_fix_since_review(entry, board, prior_review):
+        if not mq.only_bounded_fix_since_review(entry, board, prior_review):
             continue  # guardrail: another commit intervened — full review required
 
         pool = list(board.active) + list(board.completed)
@@ -3939,7 +3993,14 @@ def dispatch_scoped_reviews_for_queue(
         if already_handled:
             continue
 
-        eligible.append((entry, prior_review))
+        # #3161: run the #2192 nudge only when a ci-fix/fix-round leg (not
+        # just a conflict-fix) contributed to this delta — see
+        # `dispatch_scoped_review`'s `check_test_coverage` docstring.
+        run_test_coverage_nudge = bool(
+            mq.intervening_work_since_review(entry, board, prior_review)
+        )
+
+        eligible.append((entry, prior_review, run_test_coverage_nudge))
 
     def _persist() -> None:
         if mutated and queue_items is None:
@@ -3976,7 +4037,7 @@ def dispatch_scoped_reviews_for_queue(
     # one gh lookup per issue, not one per entry revisited.
     terminal_cache: dict = {}
     dispatched: list[Assignment] = []
-    for entry, prior_review in eligible:
+    for entry, prior_review, run_test_coverage_nudge in eligible:
         if cap and len(dispatched) >= cap:
             break
         review = dispatch_scoped_review(
@@ -3987,12 +4048,128 @@ def dispatch_scoped_reviews_for_queue(
             branch_sha_fetcher=branch_sha_fetcher,
             patch_id_computer=patch_id_computer,
             terminal_cache=terminal_cache,
+            check_test_coverage=run_test_coverage_nudge,
         )
         if review is not None:
             dispatched.append(review)
 
     _persist()
     return dispatched
+
+
+def maybe_scoped_review_for_completed_fix(
+    completed: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    http_client: httpx.Client | None = None,
+    now: float | None = None,
+    diff_fetcher=None,
+    branch_sha_fetcher=None,
+    branch_patch_id_fetcher=None,
+    patch_id_computer=None,
+    terminal_cache: dict | None = None,
+) -> Assignment | None:
+    """#3161: before *completed* (a just-finished ci-fix or ordinary
+    review-bounce fix round) gets a FULL re-review, check whether it's
+    eligible for the #1476 SCOPED path instead.
+
+    Why this has to live here, not just in
+    :func:`dispatch_scoped_reviews_for_queue`: that function sweeps the
+    merge queue on its own schedule, but a completed fix leg gets a review
+    dispatched against it directly and immediately by two OTHER callers —
+    :func:`dispatch_pending_reviews`'s bulk scan (keyed on
+    ``completed.review_state``, which is unset on any freshly-completed
+    row) and :func:`coord.auto_loop.run_for_fix_transition` (fired the
+    moment a ``"[fix-"``-titled fix worker completes). Both call
+    :func:`dispatch_review` unconditionally today; :func:`dispatch_review`
+    itself atomically claims the dispatch (``claim_review_dispatch``), so
+    whichever of the two runs first wins the race and the merge queue's
+    scoped sweep never gets a turn — the trigger widened in
+    :func:`coord.merge_queue.only_bounded_fix_since_review` would otherwise
+    be dead code for exactly the two leg shapes #3161 measured as
+    dominating re-review volume. Both callers now try this function FIRST
+    and only fall back to :func:`dispatch_review` when it returns ``None``.
+
+    Looks up the ALREADY-EXISTING merge-queue entry for ``completed``'s
+    branch (:func:`coord.merge_queue.load_queue`) — never synthesizes one;
+    an automated bulk/transition pass must not create queue state as a side
+    effect, unlike ``coord review-reaffirm``'s explicit human invocation.
+    Refetches the branch's live head SHA/patch-id (never trusts a stale
+    queued value) and then reuses exactly
+    :func:`dispatch_scoped_reviews_for_queue`'s own eligibility chain:
+    :func:`~coord.merge_queue.has_approved_review`,
+    :func:`~coord.merge_queue.find_scoped_review_candidate`,
+    :func:`~coord.merge_queue.only_bounded_fix_since_review`, and the same
+    #2192 nudge decision (:func:`~coord.merge_queue.
+    intervening_work_since_review` non-empty ⇒ a ci-fix/fix-round leg
+    contributed ⇒ run the nudge).
+
+    Returns ``None`` (caller falls back to a full review) whenever: no
+    branch is recorded, no repo config, no matching queue entry, the
+    branch's current SHA/patch-id can't be resolved, an approved review
+    already covers the current head, no scoped candidate exists, or the
+    eligibility chain declines — the same fail-closed posture as every
+    other guard in this module.
+    """
+    if not completed.branch:
+        return None
+    repo = config.repo(completed.repo_name)
+    if repo is None:
+        return None
+
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    items = mq.load_queue()
+    entry = next(
+        (
+            e for e in items
+            if e.repo_github == repo.github and e.branch == completed.branch
+        ),
+        None,
+    )
+    if entry is None:
+        return None  # never enqueued (or already cleared) — nothing to scope against
+
+    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+    _get_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
+    try:
+        entry.branch_head_sha = _get_sha(entry.repo_github, entry.branch)
+    except Exception:  # noqa: BLE001 — fail-safe: unresolvable head → no scope
+        return None
+    if entry.branch_head_sha is None:
+        return None
+    try:
+        entry.branch_patch_id = _get_patch_id(
+            entry.repo_github, entry.target_branch, entry.branch
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if entry.branch_patch_id is None:
+        return None
+
+    if mq.has_approved_review(entry, board):
+        return None  # nothing stale to scope a review around
+
+    prior_review = mq.find_scoped_review_candidate(entry, board)
+    if prior_review is None:
+        return None
+    if not mq.only_bounded_fix_since_review(entry, board, prior_review):
+        return None
+
+    run_test_coverage_nudge = bool(
+        mq.intervening_work_since_review(entry, board, prior_review)
+    )
+    return dispatch_scoped_review(
+        entry, prior_review, board, config,
+        http_client=http_client,
+        now=now,
+        diff_fetcher=diff_fetcher,
+        branch_sha_fetcher=branch_sha_fetcher,
+        patch_id_computer=patch_id_computer,
+        terminal_cache=terminal_cache,
+        check_test_coverage=run_test_coverage_nudge,
+    )
 
 
 def _fetch_issue_body(repo_github: str, issue_number: int) -> str:

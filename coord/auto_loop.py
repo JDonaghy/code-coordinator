@@ -51,6 +51,7 @@ from coord.review import (
     blocking_findings_confirmed_absent,
     dispatch_review,
     estimate_review_counts,
+    maybe_scoped_review_for_completed_fix,
     parse_review_from_agent,
     parse_review_from_log,
 )
@@ -1561,7 +1562,17 @@ def run_for_fix_transition(
             ),
         )]
 
-    review = dispatch_review(fix, board, config)
+    # #3161: `fix` just completed with `review_of_assignment_id` set (this
+    # function's own docstring contract) — try the SCOPED re-review path
+    # first, exactly like `dispatch_pending_reviews`'s bulk loop, so this
+    # unconditional-full-review call site doesn't win the race against
+    # `dispatch_scoped_reviews_for_queue`'s merge-queue sweep. See
+    # `coord.review.maybe_scoped_review_for_completed_fix`'s docstring for
+    # why the race exists (both callers dispatch the moment `fix`
+    # completes) and its own fail-closed fallback conditions.
+    review = maybe_scoped_review_for_completed_fix(fix, board, config)
+    if review is None:
+        review = dispatch_review(fix, board, config)
 
     if review is None:
         log.warning(
