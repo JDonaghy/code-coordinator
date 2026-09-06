@@ -110,17 +110,23 @@ where 'unshare -r true' works, or do the throwaway-VM run instead"
 CHROOT="$(command -v chroot || echo /usr/sbin/chroot)"
 [[ -x "$CHROOT" ]] || fail "no chroot(8) binary"
 
-# The package/probe inventory is DERIVED from provision-machine.sh, not
-# retyped, so a package rename there cannot silently stop being verified here.
+# The package/probe inventory is DERIVED, not retyped, so a package rename
+# cannot silently stop being verified here. Since #3139 it lives in the SHARED
+# provisioning core, which both lanes source — so this verifies what the image
+# lane installs too, not only what the bare-metal lane probes. Sourced rather
+# than sed'd: the core is a pure declaration block plus functions, so reading
+# it the way its callers do is the real value, not a guess at it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION="$SCRIPT_DIR/provision-machine.sh"
 [[ -f "$PROVISION" ]] || fail "cannot find $PROVISION"
-GH_MIN="$(sed -n 's/^GH_MIN_VERSION="\([0-9.]*\)".*/\1/p' "$PROVISION" | head -1)"
-[[ -n "$GH_MIN" ]] || fail "could not read GH_MIN_VERSION out of $PROVISION"
-mapfile -t BASE_ENTRIES < <(
-    sed -n '/^BASE_REQUIREMENTS=(/,/^)/p' "$PROVISION" | sed -n 's/^ *"\(.*\)"$/\1/p'
-)
-[[ ${#BASE_ENTRIES[@]} -gt 0 ]] || fail "could not read BASE_REQUIREMENTS out of $PROVISION"
+CORE="$SCRIPT_DIR/lib/provision-core.sh"
+[[ -f "$CORE" ]] || fail "cannot find the shared provisioning core at $CORE"
+# shellcheck source=lib/provision-core.sh
+. "$CORE"
+GH_MIN="$COORD_GH_MIN_VERSION"
+[[ -n "$GH_MIN" ]] || fail "the shared core defines no COORD_GH_MIN_VERSION"
+BASE_ENTRIES=("${COORD_BASE_REQUIREMENTS[@]}")
+[[ ${#BASE_ENTRIES[@]} -gt 0 ]] || fail "the shared core defines no COORD_BASE_REQUIREMENTS"
 
 if [[ ! -s "$CACHE" ]]; then
     echo "fetching $TARBALL_URL"

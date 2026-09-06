@@ -643,6 +643,16 @@ def test_a_dead_execstart_is_advisory_counted_and_never_fatal(tmp_path: Path, bo
     detached.mkdir(parents=True)
     script = detached / "provision-machine.sh"
     script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    # #3139: the script sources the shared provisioning core from `lib/` beside
+    # it, and hard-fails without it (an image or a host built from half a
+    # toolchain list is exactly the drift the core exists to stop). Copy it
+    # along — what this test detaches from is the repo-root `deploy/`, not the
+    # core.
+    core_src = SCRIPT.parent / "lib" / "provision-core.sh"
+    (detached / "lib").mkdir()
+    (detached / "lib" / "provision-core.sh").write_text(
+        core_src.read_text(encoding="utf-8"), encoding="utf-8"
+    )
     assert not (tmp_path / "detached" / "deploy").exists()
 
     result = subprocess.run(  # noqa: S603

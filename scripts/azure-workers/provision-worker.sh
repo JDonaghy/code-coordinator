@@ -16,18 +16,41 @@
 #   separately-created user leaves /home/coord untouched by the deprovision.
 set -euo pipefail
 
+# The shared provisioning core (#3139). Every value this script used to
+# restate -- the gh floor, the node major, the opencode pin, the rust
+# location, the base package list, the repo clone list -- now lives THERE, in
+# exactly one place across both lanes, and tests/test_provision_core.py fails
+# the build if a second copy reappears here. What stays below is what is
+# genuinely specific to a golden IMAGE: root throughout, a dedicated `coord`
+# user, and zero identity.
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+COORD_CORE_SUDO=""            # this script is root throughout (checked below)
+_core="$(
+    if [[ -n "${COORD_PROVISION_CORE:-}" ]]; then printf '%s\n' "$COORD_PROVISION_CORE"
+    elif [[ -f "$HERE/../lib/provision-core.sh" ]]; then printf '%s\n' "$HERE/../lib/provision-core.sh"
+    elif [[ -f "$HERE/lib/provision-core.sh" ]]; then printf '%s\n' "$HERE/lib/provision-core.sh"
+    fi
+)"
+# build-worker-image.sh scp's this script to a throwaway builder; it copies the
+# core alongside it (into ./lib/ next to the script). A missing core is fatal,
+# never a fallback to inlined values -- an image built from half a toolchain
+# list is exactly the silent drift this file stopped restating in order to
+# avoid.
+[[ -n "$_core" && -f "$_core" ]] || {
+    echo "cannot find lib/provision-core.sh (looked beside and above $HERE)." >&2
+    echo "It must be copied to the builder alongside this script." >&2
+    exit 1
+}
+# shellcheck source=../lib/provision-core.sh
+. "$_core"
+
 COORD_USER="${COORD_USER:-coord}"
-GH_MIN_VERSION="2.86.0"       # coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION
-NODE_MAJOR="22"
-OPENCODE_VERSION="1.18.11"    # pinned to match the standing fleet -- see #1777
-RUST_HOME="/opt/rust"
 CARGO_TARGET_SEED="/opt/cargo-target-seed"
 # #2899: coord-tui joins the clone list as its own repo. `~/src/coord-tui` is
 # what `coordinator.yml`'s `repo_paths.coord-tui` names on every machine that
 # carries it, and what `resolve_coord_tui_checkout` discovers for the
-# tui_binary health lane.
-REPOS=(code-coordinator coord-tui quadraui vimcode)
-GITHUB_ORG="JDonaghy"
+# tui_binary health lane. The list itself is $COORD_FLEET_REPOS, in the core.
+read -r -a REPOS <<< "$COORD_FLEET_REPOS"
 
 WITH_GTK=0; WITH_BROWSER=0; SEED_CARGO_TARGET=0
 while [[ $# -gt 0 ]]; do
@@ -47,15 +70,20 @@ as_coord() { sudo -u "$COORD_USER" -H bash -lc "$*"; }
 log "1/9  base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# $COORD_BASE_REQUIREMENTS (the core) is the shared list -- the same one the
+# bare-metal lane probes -- and covers tmux, which coord/interactive.py,
+# drive.py, terminal and reattach all shell out to: a worker without it fails
+# at dispatch, not at build. The extras below are genuinely image-only:
+# libssl-dev/ca-certificates/gnupg for building crates and verifying the apt
+# keyrings this script adds, python3-pip because the venv is built offline of
+# an operator.
+mapfile -t _base_pkgs < <(coord_core_base_packages)
 apt-get install -y -qq --no-install-recommends \
-    build-essential pkg-config libssl-dev ca-certificates curl gnupg unzip \
-    git jq tmux ripgrep rsync \
-    python3 python3-venv python3-pip
-# coord/interactive.py, drive.py, terminal, reattach all shell out to tmux --
-# a worker without it fails at dispatch, not at build.
+    "${_base_pkgs[@]}" \
+    libssl-dev ca-certificates gnupg python3-pip
 
-python3 --version | grep -qE '3\.(1[2-9]|[2-9][0-9])' \
-    || { echo "Python 3.12+ required (install-agent.sh enforces this)" >&2; exit 1; }
+coord_core_python_meets_floor \
+    || { echo "Python ${COORD_PYTHON_MIN_VERSION}+ required (install-agent.sh enforces this)" >&2; exit 1; }
 
 if [[ $WITH_GTK -eq 1 ]]; then
     apt-get install -y -qq --no-install-recommends libgtk-4-dev
@@ -66,44 +94,34 @@ if [[ $WITH_BROWSER -eq 1 ]]; then
 fi
 
 # --------------------------------------------------------------------------
-log "2/9  gh (official repo -- Ubuntu's own gh is far below the ${GH_MIN_VERSION} floor)"
-install -d -m 0755 /usr/share/keyrings
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
-chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list
-apt-get update -qq
-apt-get install -y -qq gh
+log "2/9  gh (official repo -- Ubuntu's own gh is far below the ${COORD_GH_MIN_VERSION} floor)"
+coord_core_install_gh \
+    || { echo "installing gh from the official GitHub CLI apt source failed" >&2; exit 1; }
 
-# Hard-fail now rather than at the CI merge gate (coord.github_ops.GhTooOldForJsonChecks).
-gh_ver="$(gh --version | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
-if [[ "$(printf '%s\n%s\n' "$GH_MIN_VERSION" "$gh_ver" | sort -V | head -1)" != "$GH_MIN_VERSION" ]]; then
-    echo "gh $gh_ver is below the required $GH_MIN_VERSION floor" >&2; exit 1
+# HARD-FAIL now rather than at the CI merge gate
+# (coord.github_ops.GhTooOldForJsonChecks). `coord_core_gh_meets_floor` is
+# false for a missing gh and for a gh whose --version says nothing, so this
+# check is reachable in the failing direction -- it is not an absence
+# defaulting to the permissive branch.
+gh_ver="$(coord_core_gh_version)"
+if ! coord_core_gh_meets_floor; then
+    echo "gh ${gh_ver:-<absent>} is below the required $COORD_GH_MIN_VERSION floor" >&2; exit 1
 fi
-echo "gh $gh_ver OK (floor $GH_MIN_VERSION)"
+echo "gh $gh_ver OK (floor $COORD_GH_MIN_VERSION)"
 
 # --------------------------------------------------------------------------
-log "3/9  rust toolchain, system-wide"
-# MUST be system-wide. install-agent.sh pins the agent unit's PATH to
-#   $VENV/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
-# -- note the absence of ~/.cargo/bin. Workers inherit that PATH, so a
-# per-user rustup install leaves `cargo` invisible to every dispatched task.
-export RUSTUP_HOME="$RUST_HOME" CARGO_HOME="$RUST_HOME"
-curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
-    --default-toolchain stable
-for bin in "$RUST_HOME"/bin/*; do ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"; done
-chmod -R a+rX "$RUST_HOME"
-cat > /etc/profile.d/rust.sh <<EOF
-export RUSTUP_HOME=$RUST_HOME
-export CARGO_HOME=\$HOME/.cargo
-EOF
+log "3/9  rust toolchain, system-wide at $COORD_RUST_HOME"
+# MUST be system-wide -- see coord_core_install_rust_system_wide for #1671's
+# root cause. The location and the install both live in the core; only the
+# hard-fail wording is ours.
+coord_core_install_rust_system_wide \
+    || { echo "system-wide rust install did not yield a working cargo+rustc on /usr/local/bin" >&2; exit 1; }
 cargo --version
 
 # --------------------------------------------------------------------------
-log "4/9  node ${NODE_MAJOR}.x + Claude Code CLI"
-curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
-apt-get install -y -qq nodejs
+log "4/9  node ${COORD_NODE_MAJOR}.x + Claude Code CLI"
+coord_core_install_node_system_wide \
+    || { echo "node ${COORD_NODE_MAJOR}.x install did not put node on PATH" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
 log "5/9  tailscale (installed, NOT authenticated)"
@@ -129,23 +147,13 @@ as_coord "npm install -g @anthropic-ai/claude-code"
 as_coord "claude --version"
 
 # --------------------------------------------------------------------------
-log "7/9  opencode CLI ${OPENCODE_VERSION}, pinned to the standing fleet (#1777)"
-# The official installer always drops the binary at ~/.opencode/bin -- there
-# is no env var or flag that redirects it (verified against install.sh
-# source, 2026-08-03: `INSTALL_DIR=$HOME/.opencode/bin` is unconditional,
-# --binary only changes the SOURCE, not the destination). Rather than fight
-# that, symlink into ~/.local/bin, which the coord-agent unit's PATH already
-# includes (see deploy/coord-agent.service). That is what makes this land on
-# the *agent process's* PATH without a coord-agent.service.d PATH drop-in --
-# the standing fleet needed one (20-opencode-path.conf) precisely because
-# nothing else put ~/.opencode/bin on that PATH.
-#
-# Do NOT authenticate here (no `opencode auth login`, no auth.json). A golden
-# image must contain zero identity, same rule as the tailscale step above --
-# the credential arrives at boot from Key Vault (see bootstrap-shared.sh /
-# docs/OPENCODE_VERIFICATION.md for the verified non-interactive path).
-as_coord "curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION} --no-modify-path"
-as_coord "ln -sf ~/.opencode/bin/opencode ~/.local/bin/opencode"
+log "7/9  opencode CLI ${COORD_OPENCODE_VERSION}, pinned to the standing fleet (#1777)"
+# The pin, the ~/.opencode/bin PATH problem and the "never authenticate here"
+# rule all live in the core (coord_core_opencode_install_cmd). What is
+# image-specific -- and stays here -- is WHO runs it: the dedicated `coord`
+# user whose home survives `waagent -deprovision+user`.
+as_coord "$(coord_core_opencode_install_cmd)"
+as_coord "$(coord_core_opencode_link_cmd)"
 as_coord "opencode --version"
 
 # --------------------------------------------------------------------------
@@ -162,7 +170,7 @@ as_coord "~/.coord-venv/bin/coord version"
 
 as_coord "mkdir -p ~/src"
 for repo in "${REPOS[@]}"; do
-    as_coord "git clone --filter=blob:none https://github.com/${GITHUB_ORG}/${repo}.git ~/src/${repo}"
+    as_coord "git clone --filter=blob:none https://github.com/${COORD_GITHUB_ORG}/${repo}.git ~/src/${repo}"
 done
 # ~/src/<repo> is the worker WORKTREE BASE -- `git worktree add` runs from it.
 # Never delete it to fix drift (CLAUDE.md); fix the install instead.
@@ -193,23 +201,16 @@ fi
 
 # --------------------------------------------------------------------------
 log "9/9  verify prereqs (mirrors coord/prereqs.py)"
+# The baseline list and the per-tool check are $COORD_PREREQ_CHECKS /
+# coord_core_check_tool in the core, cross-checked against the real
+# coord.prereqs.BASELINE_PREREQS by tests/test_provision_core.py. Only the
+# image-lane extras -- the optional stacks this build was asked for, and the
+# two tools that must resolve as the `coord` user rather than as root -- are
+# below.
 fail=0
-check() { # name binary args... -- prints version or marks failure
-    local name="$1"; shift
-    if command -v "$1" >/dev/null 2>&1; then
-        printf '  %-10s %s\n' "$name" "$("$@" 2>&1 | head -1)"
-    else
-        printf '  %-10s MISSING\n' "$name"; fail=1
-    fi
-}
-check git    git --version
-check gh     gh --version
-check cargo  cargo --version
-check python3 python3 --version
-check tmux   tmux -V
-check node   node --version
-[[ $WITH_GTK     -eq 1 ]] && check gtk4    pkg-config --modversion gtk4
-[[ $WITH_BROWSER -eq 1 ]] && check browser chromium --version
+coord_core_verify_baseline_prereqs || fail=1
+[[ $WITH_GTK     -eq 1 ]] && { coord_core_check_tool gtk4    pkg-config --modversion gtk4 || fail=1; }
+[[ $WITH_BROWSER -eq 1 ]] && { coord_core_check_tool browser chromium --version          || fail=1; }
 as_coord "command -v claude >/dev/null" \
     && printf '  %-10s %s\n' claude "$(as_coord 'claude --version' 2>&1 | head -1)" \
     || { printf '  %-10s MISSING\n' claude; fail=1; }
@@ -221,10 +222,11 @@ as_coord "command -v claude >/dev/null" \
 # process can find it," not just "the binary exists somewhere on disk."
 if as_coord "command -v opencode >/dev/null"; then
     oc_ver="$(as_coord 'opencode --version' 2>&1 | tail -1)"
-    if [[ "$oc_ver" == "$OPENCODE_VERSION" ]]; then
+    if coord_core_opencode_version_matches "$oc_ver"; then
         printf '  %-10s %s\n' opencode "$oc_ver"
     else
-        printf '  %-10s VERSION MISMATCH (got %s, want %s)\n' opencode "$oc_ver" "$OPENCODE_VERSION"
+        printf '  %-10s VERSION MISMATCH (got %s, want %s)\n' \
+            opencode "${oc_ver:-<nothing>}" "$COORD_OPENCODE_VERSION"
         fail=1
     fi
 else

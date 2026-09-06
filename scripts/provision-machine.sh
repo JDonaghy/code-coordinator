@@ -70,6 +70,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
+# The shared provisioning core (#3139) — the ONE place the gh floor, the node
+# major, the opencode pin, the rust location, the base package list and the
+# repo clone list exist across both lanes. This script must never restate one
+# of them; tests/test_provision_core.py greps both lanes and fails on a second
+# literal. The core assumes nothing about privilege or user: what stays here
+# is this lane's substrate (the operator's own account, sudo for packages
+# only, identity front-loaded and interactive).
+COORD_CORE_SUDO="sudo"
+COORD_PROVISION_CORE="${COORD_PROVISION_CORE:-$SCRIPT_DIR/lib/provision-core.sh}"
+[[ -f "$COORD_PROVISION_CORE" ]] || {
+    printf 'provision-machine: cannot find the shared core at %s\n' "$COORD_PROVISION_CORE" >&2
+    exit 1
+}
+# shellcheck source=lib/provision-core.sh
+. "$COORD_PROVISION_CORE"
+
 ROLE=""
 MACHINE_NAME=""
 HOST_NAME=""
@@ -99,12 +115,11 @@ LOCAL_BIN_DIR="${COORD_PROVISION_LOCAL_BIN:-$HOME/.local/bin}"
 # given host's SSD is genuinely mounted somewhere else.
 BACKUP_MOUNT="${COORD_PROVISION_BACKUP_MOUNT:-/media/crucial}"
 
-# coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION — the same floor
-# scripts/azure-workers/provision-worker.sh enforces, for the same reason: a
-# `gh` below it fails at the CI merge gate, not at install time.
-GH_MIN_VERSION="2.86.0"
-GITHUB_ORG="${COORD_PROVISION_GITHUB_ORG:-JDonaghy}"
-DEFAULT_REPOS="code-coordinator,coord-tui,quadraui,vimcode"
+# The gh floor, the forge account and the repo list all come from the core —
+# see the sourcing block above. Named here only so the phases below read the
+# same as they did, and so $COORD_PROVISION_GITHUB_ORG still overrides.
+GITHUB_ORG="${COORD_PROVISION_GITHUB_ORG:-$COORD_GITHUB_ORG}"
+DEFAULT_REPOS="$(coord_core_repos_csv)"
 
 # ── The phase table ──────────────────────────────────────────────────────────
 #
@@ -161,7 +176,10 @@ die()      { printf '\nprovision-machine: %s\n' "$*" >&2; exit 1; }
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 usage() {
-    cat <<'USAGE'
+    # Unquoted heredoc: the repo default is $DEFAULT_REPOS, from the shared
+    # core (#3139), so the help text cannot say something the script does not
+    # do. There is nothing else to interpolate in here — keep it that way.
+    cat <<USAGE
 usage: provision-machine.sh --role thin-client|worker|server [options]
 
   --role ROLE            required; thin-client | worker | server
@@ -171,7 +189,7 @@ usage: provision-machine.sh --role thin-client|worker|server [options]
   --capabilities CSV     capabilities to register + install toolchains for
                          (worker/server only; e.g. rust,gtk,browser)
   --repos CSV            repos to clone and register (worker/server only;
-                         default: code-coordinator,coord-tui,quadraui,vimcode)
+                         default: $DEFAULT_REPOS)
   --port N               agent port (default 7433)
   --yes                  do not pause for confirmation before the prompt block
   --dry-run              print the phase plan for this role and exit
@@ -336,8 +354,8 @@ docs/WSL_WINDOWS_WORKER.md. Neither is handled here (#3138, out of scope)."
     fi
 
     if have python3; then
-        python3 --version 2>&1 | grep -qE '3\.(1[2-9]|[2-9][0-9])' \
-            || warn "python3 is below 3.12 — the base-packages phase will try to fix it"
+        coord_core_python_meets_floor \
+            || warn "python3 is below $COORD_PYTHON_MIN_VERSION — the base-packages phase will try to fix it"
     fi
 
     if [[ -x "$INSTALL_AGENT" ]]; then
@@ -355,27 +373,11 @@ or set \$COORD_PROVISION_INSTALL_AGENT."
 
 # ── Phase 2: base packages ───────────────────────────────────────────────────
 
-# probe|apt-package. The probe is what the fleet actually needs to WORK, not
-# what dpkg happens to have recorded — `python3 -m ensurepip` in particular is
-# the #2911 trap in its original form: Ubuntu 24.04 ships a python3 whose venv
-# module cannot bootstrap pip, and install-agent.sh then dies naming pip
-# rather than the missing package.
-BASE_REQUIREMENTS=(
-    "git|git"
-    "curl|curl"
-    "jq|jq"
-    "tmux|tmux"
-    "rsync|rsync"
-    "unzip|unzip"
-    "gcc|build-essential"
-    "pkg-config|pkg-config"
-    "rg|ripgrep"
-    "python3|python3"
-    "python3 -m venv --help|python3-venv"
-    "python3 -m ensurepip --version|python3-venv"
-    "ssh|openssh-client"
-    "ssh-keygen|openssh-client"
-)
+# probe|apt-package, from the core ($COORD_BASE_REQUIREMENTS) — the same list
+# the image lane installs from, so a package this fleet needs cannot be added
+# to one lane and forgotten in the other. See the core for why the PROBE and
+# not dpkg is the signal (#2911).
+BASE_REQUIREMENTS=("${COORD_BASE_REQUIREMENTS[@]}")
 
 _probe_ok() {
     local probe="$1"
@@ -417,9 +419,9 @@ Fix the package source and re-run — this script is safe to re-run from the top
         done
     fi
 
-    python3 --version 2>&1 | grep -qE '3\.(1[2-9]|[2-9][0-9])' \
-        || die "python3 is below 3.12; install-agent.sh enforces that floor and
-will refuse. Install a 3.12+ interpreter and re-run."
+    coord_core_python_meets_floor \
+        || die "python3 is below $COORD_PYTHON_MIN_VERSION; install-agent.sh enforces that floor
+and will refuse. Install a $COORD_PYTHON_MIN_VERSION+ interpreter and re-run."
 }
 
 # ── Phase 3: the tools the credential prompts need ───────────────────────────
@@ -435,32 +437,28 @@ phase_cred_tools() {
         changed "installed tailscale"
     fi
 
-    # gh — version-floored, mirroring provision-worker.sh step 2.
+    # gh — the official repo and the floor both come from the core, which is
+    # the same code provision-worker.sh step 2 runs. Only the wording of the
+    # failure and the CHANGE/NOCHANGE bookkeeping are this lane's.
     local gh_ver=""
-    if have gh; then gh_ver="$(gh --version 2>/dev/null | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"; fi
-    if [[ -n "$gh_ver" ]] \
-        && [[ "$(printf '%s\n%s\n' "$GH_MIN_VERSION" "$gh_ver" | sort -V | head -1)" == "$GH_MIN_VERSION" ]]; then
-        unchanged "gh $gh_ver (floor $GH_MIN_VERSION)"
+    gh_ver="$(coord_core_gh_version)"
+    if coord_core_gh_meets_floor; then
+        unchanged "gh $gh_ver (floor $COORD_GH_MIN_VERSION)"
     else
-        info "installing gh from the official repo — Ubuntu's own gh is far below the $GH_MIN_VERSION floor"
-        sudo install -d -m 0755 /usr/share/keyrings
-        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
-        sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-        printf 'deb [arch=%s signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
-            "$(dpkg --print-architecture)" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-        # A forced update, not apt_update_once: a source list just changed, so
-        # a prior update in this run (e.g. from phase_base_packages) does not
-        # cover the new repo's index.
-        sudo apt-get update -qq
-        APT_UPDATED=1
-        sudo apt-get install -y -qq gh \
+        info "installing gh from the official repo — Ubuntu's own gh is far below the $COORD_GH_MIN_VERSION floor"
+        coord_core_install_gh \
             || die "apt-get install gh failed — check the github-cli apt source and network,
 then re-run (this script is safe to re-run from the top)."
-        gh_ver="$(gh --version 2>/dev/null | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
+        # coord_core_install_gh runs its own `apt-get update` (a source list
+        # just changed, so any earlier update in this run does not cover the
+        # new repo's index) — record that so apt_update_once does not repeat it.
+        APT_UPDATED=1
+        # #2096: apt exiting 0 is not the verdict — re-probe, and treat a gh
+        # that says nothing as a failure rather than as an unmeasured pass.
+        gh_ver="$(coord_core_gh_version)"
         [[ -n "$gh_ver" ]] || die "gh install reported success but 'gh --version' produced nothing"
-        [[ "$(printf '%s\n%s\n' "$GH_MIN_VERSION" "$gh_ver" | sort -V | head -1)" == "$GH_MIN_VERSION" ]] \
-            || die "gh $gh_ver is still below the required $GH_MIN_VERSION floor"
+        coord_core_gh_meets_floor \
+            || die "gh $gh_ver is still below the required $COORD_GH_MIN_VERSION floor"
         changed "installed gh $gh_ver"
     fi
 
@@ -468,6 +466,8 @@ then re-run (this script is safe to re-run from the top)."
     # shims (#1678) resolve an nvm install at RUN time, so a later `nvm
     # install` is a no-op for the agent's PATH. A root nodesource install
     # (what the golden image does) would work too but is not re-resolvable.
+    # The MAJOR is $COORD_NODE_MAJOR either way — different installers,
+    # substrate-forced; same node, because that is not substrate.
     if have node; then
         unchanged "node $(node --version 2>/dev/null || echo '?')"
     else
@@ -475,7 +475,7 @@ then re-run (this script is safe to re-run from the top)."
         [[ -s "$NVM_DIR/nvm.sh" ]] || curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
         # shellcheck disable=SC1091
         . "$NVM_DIR/nvm.sh"
-        nvm install --lts
+        nvm install "$COORD_NODE_MAJOR"
         have node || die "nvm reported success but node is not on PATH"
         changed "installed node $(node --version)"
     fi
@@ -947,10 +947,13 @@ phase_toolchains() {
                 else
                     # #1671: the agent unit's PATH includes ~/.cargo/bin, so a
                     # per-user rustup install IS visible to workers here —
-                    # unlike the golden image, whose unit PATH predates that.
-                    curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
-                    export PATH="$HOME/.cargo/bin:$PATH"
-                    have cargo && have rustc \
+                    # unlike the golden image, whose unit PATH predates that
+                    # and therefore needs the core's system-wide
+                    # $COORD_RUST_HOME variant. Same toolchain and profile,
+                    # different destination *because the substrate differs*:
+                    # both spellings live side by side in the core so the
+                    # divergence is one file's decision, not two scripts'.
+                    coord_core_install_rust_per_user \
                         || die "rustup reported success but cargo/rustc are not both resolvable.
 Finding cargo without rustc is the exact false-green #1671 documents."
                     changed "installed rust $(rustc --version)"
