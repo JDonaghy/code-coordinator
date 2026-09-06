@@ -1941,6 +1941,7 @@ def _mark_notified_local(
         EVENT_NEEDS_ATTENTION,
         EVENT_PLAN,
         EVENT_REFUSED_POLICY,
+        EVENT_REFUSED_PREMISE,
         EVENT_STALLED,
         EVENT_STUCK,
     )
@@ -1995,6 +1996,16 @@ def _mark_notified_local(
         # #2234's own headline defect one layer further down the stack.
         sql.execute(conn,
             "UPDATE assignments SET status='refused_policy', finished_at=? WHERE assignment_id=?",
+            (now, assignment_id),
+        )
+    elif event == EVENT_REFUSED_PREMISE:
+        # #3164: mirrors the EVENT_REFUSED_POLICY branch immediately above,
+        # for the same reason — without this, the just-posted "Refused —
+        # Issue Premise False Or Unmet" GitHub comment would be followed by
+        # this same call falling into the bare `else` below and overwriting
+        # the classification back to `status='failed'`.
+        sql.execute(conn,
+            "UPDATE assignments SET status='refused_premise', finished_at=? WHERE assignment_id=?",
             (now, assignment_id),
         )
     else:
@@ -3351,6 +3362,30 @@ def mark_refused_policy_settled(assignment_id: str) -> None:
     sql.execute(conn,
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='refused_policy'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
+def mark_refused_premise_settled(assignment_id: str) -> None:
+    """#3164: flip a refused_premise row to 'merged' when its issue is terminal.
+
+    Same shape as `mark_refused_policy_settled` above, for the same reason: a
+    `refused_premise` row (a worker's 0-commit clean exit reporting an
+    investigated, refuted issue premise — `coord.agent.REFUSED_PREMISE`) is
+    never touched by the #609 sweep (which only looks at status='done' work
+    rows), so it would otherwise linger on the board forever even after the
+    issue is re-scoped/closed and lands.
+
+    Idempotent: only transitions rows still carrying status='refused_premise'.
+    Silently no-ops when the row doesn't exist or is already settled.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    sql.execute(conn,
+        "UPDATE assignments SET status='merged' WHERE assignment_id=? "
+        "AND status='refused_premise'",
         (assignment_id,),
     )
     conn.commit()

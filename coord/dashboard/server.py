@@ -586,6 +586,12 @@ ASSIGNMENT_ADVISORY = "assignment_advisory"
 # ASSIGNMENT_FAILED — reproducing, on this surface, the exact "worker that
 # refused reads as a worker that failed" defect #2234 exists to fix.
 ASSIGNMENT_REFUSED_POLICY = "assignment_refused_policy"
+# #3164: sibling of ASSIGNMENT_REFUSED_POLICY above for a `refused_premise`
+# terminal status (`coord.agent.REFUSED_PREMISE`) — a 0-commit clean exit
+# whose worker investigated the issue and found its premise false or its
+# prerequisite unmet, rather than citing a repo-rule prohibition. Same
+# "distinct event, not the `else` catch-all" reasoning.
+ASSIGNMENT_REFUSED_PREMISE = "assignment_refused_premise"
 # #846: an assignment running past its wall-clock threshold, or thrashing
 # through fix/review rounds without converging (coord.notify.attention_signal
 # — same detection core as the coordinator's GitHub-comment backstop).
@@ -745,6 +751,9 @@ async def _poll_once(
             elif status == "refused_policy":
                 payload["policy_refusal_reason"] = entry.get("policy_refusal_reason")
                 event_source.publish(ASSIGNMENT_REFUSED_POLICY, payload)
+            elif status == "refused_premise":
+                payload["premise_refusal_reason"] = entry.get("premise_refusal_reason")
+                event_source.publish(ASSIGNMENT_REFUSED_PREMISE, payload)
             else:  # "failed" and any other unexpected terminal status
                 payload["exit_code"] = entry.get("exit_code")
                 event_source.publish(ASSIGNMENT_FAILED, payload)

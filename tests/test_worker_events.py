@@ -11,6 +11,7 @@ from coord.worker_events import (
     USAGE_LIMIT_REASON_PREFIX,
     WorkerEvent,
     WorkerSummary,
+    classify_zero_commit_refusal,
     detect_anomalies,
     detect_usage_limit_kill,
     detect_usage_limit_kill_in_log,
@@ -23,6 +24,8 @@ from coord.worker_events import (
     iter_events,
     latest_assistant_turn_text,
     latest_assistant_turn_text_from_text,
+    looks_like_policy_refusal,
+    looks_like_premise_refusal,
     parse_event,
     parse_log,
     render_event,
@@ -1448,3 +1451,135 @@ class TestGraphifyResultCount:
 
     def test_uncountable_output_stays_none(self) -> None:
         assert graphify_result_count("Rebuilding graph...\ndone.") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3164: `classify_zero_commit_refusal` — distinguishing a POLICY refusal
+# (worker declines because CLAUDE.md forbids the deliverable) from a PREMISE
+# refusal (worker investigated and found the issue's premise false or its
+# prerequisite unmet). Canonical home for both marker lists — `coord.agent`
+# delegates its `_looks_like_policy_refusal` here rather than keeping a
+# second copy (epic #2096: one question, one answer).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# The quadraui#812 case #3164 was filed for: NativeSurface Phase 3, worked
+# 2026-09-06, $1.77 / 33 turns / 4 minutes / zero commits. The worker
+# verified both halves of the issue's premise and found each one false —
+# reconstructed from the issue's own description of the assignment's final
+# message (the real transcript lives in the fleet DB, not this repo).
+_QUADRAUI_812_FINAL_MESSAGE = (
+    "STATUS: investigated NativeSurface Phase 3's stated dependency and its "
+    "rule-7 claim → both are false → confidence: high\n\n"
+    "Phase 3's blanket `impl<S: NativeSurface> Backend for Raster<S>` would "
+    "need to supply 73 draw_*/*_layout methods; I found exactly 6 "
+    "primitives with a shared paint plan. The issue's own stated dependency "
+    "(\"depends on Phase 1 and all Phase 2 slices\") is only about 8% met, "
+    "so the issue's premise is false — there is nothing correct to build "
+    "yet.\n\n"
+    "The issue's second clause (\"the four empty {} defaults are rule-7 "
+    "violations\") is also wrong on count (I found 9, not 4) and wrong on "
+    "scope (rule 7 governs primitives, not configuration setters). This "
+    "claim is already superseded by quadraui#492's ACCEPTED_DEFAULTS "
+    "conformance test, which I ran green to confirm.\n\n"
+    "Writing nothing and pushing nothing — the issue's premise does not "
+    "hold up."
+)
+
+# The #2195 shape #2234 was filed for: a doc-only deliverable CLAUDE.md
+# tells every worker to refuse.
+_CLAUDE_2195_FINAL_MESSAGE = (
+    "Confirmed: the rule exists verbatim at CLAUDE.md line 156, and the "
+    "issue itself explicitly says this. Only the coordinator writes docs, "
+    "so I am stopping rather than editing the doc."
+)
+
+
+class TestLooksLikePolicyRefusal:
+    """#2234 regression guard, now anchored in the canonical home."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Confirmed: the rule exists verbatim at CLAUDE.md line 156.",
+            "This is coordinator work per files_forbidden in the briefing.",
+            "Only the coordinator writes docs — stopping here.",
+            "This issue should never have been dispatched to a worker.",
+            _CLAUDE_2195_FINAL_MESSAGE,
+        ],
+    )
+    def test_matches_rule_citations(self, text: str) -> None:
+        assert looks_like_policy_refusal(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            None,
+            "",
+            "STUCK: could not find the relevant module after two approaches.",
+            "Implemented the feature and pushed the branch.",
+        ],
+    )
+    def test_does_not_match_ordinary_text(self, text) -> None:
+        assert looks_like_policy_refusal(text) is False
+
+
+class TestLooksLikePremiseRefusal:
+    def test_matches_the_quadraui_812_shape(self) -> None:
+        assert looks_like_premise_refusal(_QUADRAUI_812_FINAL_MESSAGE) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            None,
+            "",
+            "STUCK: could not find the relevant module after two approaches.",
+            "Implemented the feature and pushed the branch.",
+            _CLAUDE_2195_FINAL_MESSAGE,
+        ],
+    )
+    def test_does_not_match_non_premise_text(self, text) -> None:
+        assert looks_like_premise_refusal(text) is False
+
+
+class TestClassifyZeroCommitRefusal:
+    """#3164 acceptance criteria 1, 2, 5."""
+
+    def test_a_standing_policy_refusal_classifies_as_policy(self) -> None:
+        """AC1: the #2234 regression guard — a worker declining on a
+        standing repo-rule prohibition, with no premise-refutation language
+        at all, still classifies as policy."""
+        assert classify_zero_commit_refusal(_CLAUDE_2195_FINAL_MESSAGE) == "policy"
+
+    def test_the_quadraui_812_fixture_classifies_as_premise(self) -> None:
+        """AC5: quadraui#812's reconstructed final message — an
+        investigated, refuted premise, no prohibition involved."""
+        assert classify_zero_commit_refusal(_QUADRAUI_812_FINAL_MESSAGE) == "premise"
+
+    def test_a_message_citing_both_shapes_resolves_to_premise(self) -> None:
+        """The overlap #3164 exists to fix: a premise report that ALSO
+        quotes the rule it's disproving a violation of must not fall back
+        to POLICY just because it mentions CLAUDE.md — describing why a rule
+        does not apply is the stronger, more specific signal."""
+        text = (
+            "Per CLAUDE.md rule 7, I checked whether the four cited "
+            "defaults are violations — they are not: the issue's premise "
+            "is false, since rule 7 governs primitives, not configuration "
+            "setters."
+        )
+        assert looks_like_policy_refusal(text) is True  # mentions the rule
+        assert classify_zero_commit_refusal(text) == "premise"  # but wins here
+
+    def test_a_stuck_worker_with_neither_marker_classifies_as_none(self) -> None:
+        """The #448 ADVISORY fallback: no premise or policy language at
+        all — `coord.agent._reap` leaves this exactly as ADVISORY as
+        before."""
+        text = (
+            "STUCK: could not locate the relevant module after two "
+            "approaches (grep for the symbol, then a graphify query); ran "
+            "out of turns before finding it."
+        )
+        assert classify_zero_commit_refusal(text) is None
+
+    @pytest.mark.parametrize("text", [None, ""])
+    def test_empty_input_classifies_as_none(self, text) -> None:
+        assert classify_zero_commit_refusal(text) is None

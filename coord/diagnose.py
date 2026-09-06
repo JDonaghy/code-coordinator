@@ -1059,6 +1059,27 @@ def _recover_work_like(
             "coordinator-only"
         )
         res.recovered = False
+    elif latest.type in ("work", "plan") and latest.status == "refused_premise":
+        # #3164: a REFUSED_PREMISE row is TERMINAL exactly like
+        # refused_policy above — same false-healthy read this diagnose call
+        # exists to close, just for a different underlying cause: the
+        # worker investigated and found the issue's premise false or its
+        # prerequisite unmet, not a repo-rule prohibition. The remedy is
+        # correspondingly different — no title rewrite fixes a missing
+        # prerequisite, so this must NOT repeat refused_policy's "re-scope
+        # the issue so its deliverable isn't coordinator-only" wording,
+        # which doesn't apply here.
+        stage_label = "work" if latest.type == "work" else "plan"
+        res.findings.append(
+            f"{stage_label} stage is 'refused_premise' — the worker "
+            "investigated and found the issue's premise false or its "
+            "prerequisite unmet; `coord retry` refuses to touch it on "
+            "purpose (retrying reproduces the identical refusal, since "
+            "nothing about the premise has changed) — needs the "
+            "coordinator: re-scope or close the issue and audit the "
+            "`after=` edges of anything queued behind it (#3164)"
+        )
+        res.recovered = False
     else:
         res.findings.append("stage looks healthy")
         res.recovered = True

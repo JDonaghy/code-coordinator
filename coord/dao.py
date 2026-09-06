@@ -106,10 +106,13 @@ MIN_SCHEMA_VERSION = 1
 
 # #762: terminal assignment statuses.  Anything NOT in this set (running /
 # pending) is "in-flight" and always kept on the board projection.
-# #2234: "refused_policy" is terminal exactly like "advisory" — see
-# coord.agent.REFUSED_POLICY.
+# #2234/#3164: "refused_policy"/"refused_premise" are terminal exactly like
+# "advisory" — see coord.agent.REFUSED_POLICY / REFUSED_PREMISE.
 TERMINAL_STATUSES = frozenset(
-    {"done", "merged", "failed", "cancelled", "advisory", "refused_policy"}
+    {
+        "done", "merged", "failed", "cancelled", "advisory",
+        "refused_policy", "refused_premise",
+    }
 )
 
 # #762: how many days of *terminal* assignment history the /board projection

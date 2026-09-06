@@ -119,6 +119,24 @@ ADVISORY = "advisory"
 # a terminal `blocked` rediscovering a rule that was never going to change.
 REFUSED_POLICY = "refused_policy"
 
+# #3164: a SIBLING shape to REFUSED_POLICY, for the same #448 zero-commit
+# clean exit — but the worker's own final message shows it stopped because it
+# investigated and found the ISSUE'S PREMISE false or its prerequisite unmet,
+# not because a standing rule forbids the deliverable (see `coord.
+# worker_events.classify_zero_commit_refusal`, checked FIRST for "premise"
+# ahead of "policy" — the quadraui#812 case: 73 methods needed, 6 had a
+# shared paint plan; the issue's "depends on all Phase 2 slices" was ~8% met).
+# Distinct from REFUSED_POLICY because the operator remedy is different in
+# kind: a policy refusal is fixed by retargeting the issue (a title rewrite
+# makes a fresh dispatch land); a premise refusal has no title that fixes it
+# — the prerequisite genuinely does not exist yet — so the right remedy is to
+# re-scope or close the issue and audit its dependents' `after=` edges, not
+# to reword it and relaunch. Every other property mirrors REFUSED_POLICY
+# exactly: terminal, no-attempt-spent park, no auto-retry — see
+# `coord.models.PREMISE_REFUSAL_MARKER`/`is_premise_refusal_reason` and
+# `coord/drive_queue.py`'s park branch for the messaging difference.
+REFUSED_PREMISE = "refused_premise"
+
 # #448: spec types that are expected to push commits, so a clean exit with
 # zero commits is interesting (advisory).  Review/smoke workers commit
 # nothing by design and must NOT be flagged advisory.
@@ -215,34 +233,15 @@ _COMPLETED_HISTORY_CAP = 25
 # within an operator's normal polling cadence.
 _ADVISORY_TERMINAL_CHECK_COOLDOWN_S = 300.0
 
-# #2234: markers that show up when a worker's OWN final message explains
-# that it stopped because of a STANDING repo rule — not because it got stuck
-# or ran out of turns. Matched only against the worker's own account (see
-# `_looks_like_policy_refusal`), never against the briefing or issue body,
-# which quote the same rules on every single dispatch and would false-
-# positive on every assignment if matched directly. `claude.md` is the one
-# filename standing worker-facing rules live in across this repo (see
-# CLAUDE.md's own "Rules for workers" section, "Only the coordinator writes
-# docs"); the rest are lifted verbatim from that same rule's text, which is
-# the shape that triggered this issue (claude-coordinator#2195: an issue
-# whose entire deliverable was a doc edit, dispatched to a worker that
-# correctly refused and stopped). Deliberately permissive rather than
-# requiring an exact quote — a weak/cheap model's terse refusal ("Confirmed:
-# the rule exists verbatim at CLAUDE.md line 156...", the actual #2195
-# transcript) may cite the rule without repeating "must not"/"forbidden"
-# verbatim.
-_POLICY_REFUSAL_MARKERS = (
-    "claude.md",
-    "files_forbidden",
-    "repo rule",
-    "repo's rule",
-    "coordinator work",
-    "only the coordinator",
-    "coordinator-only",
-    "should never have been dispatched",
-)
-
-
+# #2234: `_looks_like_policy_refusal` used to keep its own copy of the
+# marker list here. #3164 needed a SECOND classifier (premise vs. policy)
+# that had to share the exact same "is this a policy refusal" answer this one
+# gives — two independent marker lists that happen to agree today are a
+# split-brain waiting to happen (epic #2096) — so both now live in
+# `coord.worker_events` (mirrors that module's `GRAPHIFY_INVOCATION_RE`
+# precedent: canonical home for logic more than one caller needs, import-
+# light, no DB). This stays a thin wrapper only because `tests/
+# test_agent_zero_commit.py` imports the name directly.
 def _looks_like_policy_refusal(text: str | None) -> bool:
     """#2234: does *text* — the worker's own final message — read as a
     refusal grounded in a STANDING repo-rule prohibition, rather than a
@@ -253,15 +252,15 @@ def _looks_like_policy_refusal(text: str | None) -> bool:
     below): a worker that pushed real commits never reaches this check, so a
     successful run that happens to mention `CLAUDE.md` in passing (e.g.
     "per CLAUDE.md I ran the build before committing") carries no risk of
-    being reclassified. Within that already-narrow shape, an ordinary
-    `STUCK:`-style report (out of turns, couldn't find the code, a flaky
-    test) mentions none of :data:`_POLICY_REFUSAL_MARKERS`, so it is left
-    exactly as ADVISORY as it always was.
+    being reclassified.
+
+    Delegates to `coord.worker_events.looks_like_policy_refusal` — see that
+    function's docstring for the marker list and the #3164 PREMISE/POLICY
+    disambiguation `_reap` actually drives off of (`classify_zero_commit_
+    refusal`, checked in preference to this bare boolean).
     """
-    if not text:
-        return False
-    lowered = text.lower()
-    return any(marker in lowered for marker in _POLICY_REFUSAL_MARKERS)
+    from coord.worker_events import looks_like_policy_refusal  # noqa: PLC0415
+    return looks_like_policy_refusal(text)
 
 
 # #2316: `WorkerSummary.stop_reason` values that mean the model was CUT OFF
@@ -3557,6 +3556,17 @@ class AgentAssignment:
     # one of `analysis_deliverable`/`zero_commit_reason`/this field is ever
     # set for a given assignment).
     policy_refusal_reason: str | None = None
+    # #3164: the worker's own final message when `_reap` classifies a clean
+    # (exit_code==0), 0-commit exit as a PREMISE refusal (`status ==
+    # REFUSED_PREMISE`) rather than a POLICY refusal or the #448 ADVISORY
+    # default — see `coord.worker_events.classify_zero_commit_refusal`.
+    # Mirrors `policy_refusal_reason` exactly, as its own field rather than a
+    # shared one, so a caller can always tell which of the two shapes it's
+    # looking at from the field name alone. `None` on every other outcome,
+    # mutually exclusive with `policy_refusal_reason`/`zero_commit_reason`/
+    # `analysis_deliverable` for the same reason those four are mutually
+    # exclusive with each other.
+    premise_refusal_reason: str | None = None
     # #2316: set when `_reap` classifies a clean (exit_code==0), 0-commit
     # exit as a TRUNCATION — the worker's last `result`/`step_finish` event
     # carries a `stop_reason` in `_TRUNCATION_STOP_REASONS` (opencode's
@@ -3568,8 +3578,9 @@ class AgentAssignment:
     # commits run (no truncation marker matched) and a truncated run that DID
     # push commits (`_ahead != 0` never reaches this check at all). Mutually
     # exclusive with `zero_commit_reason`/`analysis_deliverable`/
-    # `policy_refusal_reason`: all four are decided in the SAME `_ahead == 0`
-    # branch of `_reap`, and this one is checked first — see that method.
+    # `policy_refusal_reason`/`premise_refusal_reason`: all five are decided
+    # in the SAME `_ahead == 0` branch of `_reap`, and this one is checked
+    # first — see that method.
     truncation_reason: str | None = None
 
     def to_dict(self) -> dict:
@@ -5967,7 +5978,9 @@ class AgentServer:
             completed = sum(
                 1
                 for a in self._assignments.values()
-                if a.status in (DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY)
+                if a.status in (
+                    DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY, REFUSED_PREMISE,
+                )
             )
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
@@ -8142,7 +8155,8 @@ class AgentServer:
         the refused_policy GitHub comment and `coord status` render for that
         status, so a dirty worktree left behind by an otherwise-correct
         policy refusal needs the same visibility, on the field that surface
-        actually reads.
+        actually reads. #3164 mirrors it a second time for REFUSED_PREMISE /
+        ``premise_refusal_reason``.
         """
         with self._lock:
             live = self._assignments.get(assignment.id, assignment)
@@ -8151,6 +8165,8 @@ class AgentServer:
                 live.zero_commit_reason = reason
             elif live.status == REFUSED_POLICY:
                 live.policy_refusal_reason = reason
+            elif live.status == REFUSED_PREMISE:
+                live.premise_refusal_reason = reason
             # Keep the caller's object in sync when it isn't the live one, so
             # a caller holding a detached copy still sees the outcome.
             assignment.dirty_worktree_reason = reason
@@ -8158,6 +8174,8 @@ class AgentServer:
                 assignment.zero_commit_reason = reason
             elif assignment.status == REFUSED_POLICY:
                 assignment.policy_refusal_reason = reason
+            elif assignment.status == REFUSED_PREMISE:
+                assignment.premise_refusal_reason = reason
         self._persist()
 
     def _rescue_uncommitted_work(
@@ -9661,12 +9679,20 @@ class AgentServer:
         # readings of "0 commits" can never disagree about which one applies
         # to this assignment.
         _policy_refusal_reason: str | None = None
+        # #3164: the PREMISE sibling of `_policy_refusal_reason` — see
+        # `coord.worker_events.classify_zero_commit_refusal` and
+        # `REFUSED_PREMISE`'s module-level docstring. Mutually exclusive with
+        # it by construction (the classifier returns exactly one of
+        # "premise"/"policy"/`None`), decided in the same `_ahead == 0`
+        # branch below.
+        _premise_refusal_reason: str | None = None
         # #2316: checked FIRST in the `_ahead == 0` branch below, ahead of
-        # `_analysis_deliverable`/`_policy_refusal_reason`/`_zero_commit_
-        # reason` — a truncated run's `result_text` is whatever the model
-        # managed to emit before the ceiling cut it off, not a considered
-        # final message, so it must not be read as a positive "deliverable"
-        # or "policy refusal" signal just because it happens to match one.
+        # `_analysis_deliverable`/`_policy_refusal_reason`/
+        # `_premise_refusal_reason`/`_zero_commit_reason` — a truncated run's
+        # `result_text` is whatever the model managed to emit before the
+        # ceiling cut it off, not a considered final message, so it must not
+        # be read as a positive "deliverable" or "refusal" signal just
+        # because it happens to match one.
         _truncation_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
@@ -9676,6 +9702,18 @@ class AgentServer:
                 _base = assignment.spec.branch or "main"
                 _ahead = self._commits_ahead(_wt_advisory, _base)
                 if _ahead == 0:
+                    # #3164: computed ONCE, unconditionally, so both the
+                    # "premise" and "policy" branches below can read it
+                    # without re-parsing `result_text` or risking a
+                    # short-circuited walrus leaving it unbound in the
+                    # `_worker_summary is None` case.
+                    from coord.worker_events import (  # noqa: PLC0415
+                        classify_zero_commit_refusal,
+                    )
+                    _refusal_kind = (
+                        classify_zero_commit_refusal(_worker_summary.result_text)
+                        if _worker_summary is not None else None
+                    )
                     if (_worker_summary is not None
                             and _worker_summary.stop_reason in _TRUNCATION_STOP_REASONS):
                         # #2316: the model was guillotined by its own
@@ -9709,9 +9747,33 @@ class AgentServer:
                                 )
                         except OSError:
                             pass
-                    elif _worker_summary is not None and _looks_like_policy_refusal(
-                        _worker_summary.result_text
-                    ):
+                    elif _refusal_kind == "premise":
+                        # #3164: the worker investigated and found the
+                        # ISSUE'S OWN PREMISE false or its stated prerequisite
+                        # unmet — no rule was involved, there is simply
+                        # nothing correct to build (yet). Distinct from
+                        # REFUSED_POLICY below: the operator remedy differs
+                        # in kind (re-scope/close + audit dependents' after=
+                        # edges, not a title retarget) — see REFUSED_PREMISE's
+                        # module-level docstring. Like a policy refusal,
+                        # retrying reproduces the identical, correct outcome,
+                        # so it must not consume the queue's attempt budget.
+                        _premise_refusal_reason = _worker_summary.result_text or (
+                            "worker investigated and found the issue's "
+                            "premise false or its prerequisite unmet"
+                        )
+                        try:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
+                                reopen.write(
+                                    "# reap: refused_premise — 0 commits ahead "
+                                    f"of {_base}; worker's final message "
+                                    "reports an investigated, refuted issue "
+                                    "premise, status set to refused_premise "
+                                    "(#3164)\n"
+                                )
+                        except OSError:
+                            pass
+                    elif _refusal_kind == "policy":
                         # #2234: the worker's own final message cites a
                         # standing repo-rule prohibition as the reason it
                         # stopped — the #2195 shape. Distinct from the
@@ -9809,19 +9871,34 @@ class AgentServer:
                     elif _truncation_reason is not None:
                         # #2316: the worker's own output-token ceiling cut it
                         # off before it committed anything — checked BEFORE
-                        # `_policy_refusal_reason`/`_zero_commit_reason` (the
-                        # `_reap` computation above already guarantees the
-                        # four are mutually exclusive; kept parallel here for
-                        # readability). FAILED, not ADVISORY: exit_code==0 is
-                        # not evidence of a clean finish for a truncated run,
-                        # and nobody re-drives an advisory. `error` is set
-                        # too (not just `truncation_reason`) so the existing
-                        # generic `entry.get("error")` fallback in
-                        # `coord.notify`'s FAILED comment arms carries this
-                        # text without needing its own dedicated wiring.
+                        # `_policy_refusal_reason`/`_premise_refusal_reason`/
+                        # `_zero_commit_reason` (the `_reap` computation above
+                        # already guarantees the five are mutually exclusive;
+                        # kept parallel here for readability). FAILED, not
+                        # ADVISORY: exit_code==0 is not evidence of a clean
+                        # finish for a truncated run, and nobody re-drives an
+                        # advisory. `error` is set too (not just
+                        # `truncation_reason`) so the existing generic
+                        # `entry.get("error")` fallback in `coord.notify`'s
+                        # FAILED comment arms carries this text without
+                        # needing its own dedicated wiring.
                         assignment.status = FAILED
                         assignment.truncation_reason = _truncation_reason
                         assignment.error = _truncation_reason
+                    elif _premise_refusal_reason is not None:
+                        # #3164: clean exit, no commits, and the worker's own
+                        # final message reports an investigated, refuted
+                        # issue premise — a distinct, permanent shape of "0
+                        # commits" from REFUSED_POLICY below (see
+                        # REFUSED_PREMISE's module docstring for why the
+                        # operator remedy differs). Checked BEFORE
+                        # `_policy_refusal_reason`/`_zero_commit_reason` (all
+                        # three are mutually exclusive by construction — see
+                        # the `_reap` computation above — so the order is
+                        # never actually load-bearing, kept parallel for
+                        # readability).
+                        assignment.status = REFUSED_PREMISE
+                        assignment.premise_refusal_reason = _premise_refusal_reason
                     elif _policy_refusal_reason is not None:
                         # #2234: clean exit, no commits, and the worker's own
                         # final message cites a standing repo-rule
@@ -10026,21 +10103,22 @@ class AgentServer:
         # worktree into a WIP commit and pushed it (`_rescue_uncommitted_
         # work`) — AFTER the "0 commits ahead" status decision earlier in
         # this method already ran. That decision (ADVISORY's `zero_commit_
-        # reason`, or REFUSED_POLICY's `policy_refusal_reason`) was computed
-        # from a branch that was genuinely empty at the moment of judgement;
-        # a rescue that landed a real, pushed commit on it makes the verdict
+        # reason`, REFUSED_POLICY's `policy_refusal_reason`, or #3164's
+        # REFUSED_PREMISE `premise_refusal_reason`) was computed from a
+        # branch that was genuinely empty at the moment of judgement; a
+        # rescue that landed a real, pushed commit on it makes the verdict
         # stale by construction — reporting "nothing was authored" about a
         # branch that, four log lines later, carries the worker's actual
         # output. Recompute from `repo_path` (not the worktree, which may
         # already be gone) whether the rescue's push actually reached
         # origin, and correct the status when it did. Only ADVISORY/
-        # REFUSED_POLICY are ever reachable here (both are set exclusively
-        # in the `_ahead == 0` branch above, itself gated on `spec.type in
-        # _ZERO_COMMIT_TYPES`) — DONE, FAILED-for-other-reasons, CANCELLED
-        # etc. are untouched.
+        # REFUSED_POLICY/REFUSED_PREMISE are ever reachable here (all three
+        # are set exclusively in the `_ahead == 0` branch above, itself gated
+        # on `spec.type in _ZERO_COMMIT_TYPES`) — DONE, FAILED-for-other-
+        # reasons, CANCELLED etc. are untouched.
         if (
             assignment is not None
-            and assignment.status in (ADVISORY, REFUSED_POLICY)
+            and assignment.status in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE)
             and assignment.dirty_worktree_reason is not None
         ):
             _rescue_branch = assignment.branch or assignment.spec.target_branch
@@ -10148,16 +10226,16 @@ class AgentServer:
             ):
                 return
             self._last_advisory_terminal_check = now
-            # #2234: REFUSED_POLICY joins ADVISORY here for the same reason
-            # — both are terminal, zero-commit statuses the agent would
-            # otherwise keep serving indefinitely from its own `/status`
-            # feed once GitHub confirms the work is done, forcing every
-            # downstream consumer (dashboard, TUI, any future client) to
-            # reimplement the same GitHub-terminality filter this method
-            # exists to spare them.
+            # #2234/#3164: REFUSED_POLICY/REFUSED_PREMISE join ADVISORY here
+            # for the same reason — all three are terminal, zero-commit
+            # statuses the agent would otherwise keep serving indefinitely
+            # from its own `/status` feed once GitHub confirms the work is
+            # done, forcing every downstream consumer (dashboard, TUI, any
+            # future client) to reimplement the same GitHub-terminality
+            # filter this method exists to spare them.
             candidates = [
                 a for a in self._assignments.values()
-                if a.status in (ADVISORY, REFUSED_POLICY)
+                if a.status in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE)
             ]
         if not candidates:
             return
@@ -10237,14 +10315,15 @@ class AgentServer:
             ordered = list(self._assignments.values())
             superseded_ids: list[str] = []
             for i, a in enumerate(ordered):
-                # #2234: REFUSED_POLICY joins ADVISORY here too — a refusal
-                # for issue X can be superseded the same way an advisory can
-                # (e.g. the coordinator re-scopes the issue so a later
-                # dispatch's deliverable is no longer coordinator-only, and
-                # that later attempt reaches DONE). Same in-memory
+                # #2234/#3164: REFUSED_POLICY/REFUSED_PREMISE join ADVISORY
+                # here too — a refusal for issue X can be superseded the same
+                # way an advisory can (e.g. the coordinator re-scopes the
+                # issue so a later dispatch's deliverable is no longer
+                # coordinator-only, or a later dispatch lands once the
+                # premise it refuted has since become true). Same in-memory
                 # comparison, same root cause as `_prune_terminal_advisory`
                 # above.
-                if a.status not in (ADVISORY, REFUSED_POLICY):
+                if a.status not in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE):
                     continue
                 key = (a.spec.repo_name, a.spec.issue_number)
                 for later in ordered[i + 1 :]:

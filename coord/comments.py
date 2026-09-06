@@ -30,6 +30,16 @@ EVENT_ADVISORY = "advisory"
 # this into EVENT_ADVISORY) keeps the two legible on GitHub the same way
 # `coord.agent.REFUSED_POLICY` keeps them distinct on the board.
 EVENT_REFUSED_POLICY = "refused_policy"
+# #3164: a SIBLING event to EVENT_REFUSED_POLICY above — a worker exited
+# cleanly (exit_code 0), pushed 0 commits, AND its own final message showed
+# it investigated the issue and found its stated premise false or its
+# prerequisite unmet (the quadraui#812 shape), rather than citing a repo-rule
+# prohibition. Kept as its own event (not folded into EVENT_REFUSED_POLICY)
+# for the same reason that one is kept distinct from EVENT_ADVISORY: the
+# operator remedy differs — re-scope/close the issue and audit dependents'
+# `after=` edges, never a title retarget — and folding it in would print the
+# wrong advice on GitHub, exactly the failure #3164 was filed to fix.
+EVENT_REFUSED_PREMISE = "refused_premise"
 # #846: an assignment running past its wall-clock threshold, or thrashing
 # through fix/review rounds without converging. Distinct from EVENT_STUCK
 # (a worker self-reported STATUS/STUCK line) — this fires from time/round
@@ -825,6 +835,58 @@ def format_refused_policy(
         "refusal, since the rule it cited isn't going anywhere. Needs the "
         "coordinator: do the work directly, or re-scope the issue so its "
         "deliverable isn't coordinator-only."
+    )
+    if reason.strip():
+        lines.append("")
+        lines.append("### Worker note")
+        lines.append(reason.strip())
+    return "\n".join(lines)
+
+
+def format_refused_premise(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> str:
+    """Format a comment for a #3164 premise refusal — a 0-commit clean exit
+    whose worker investigated the issue and found its stated premise false
+    or its prerequisite unmet.
+
+    Mirrors `format_refused_policy` exactly except for the remedy: no title
+    rewrite fixes a missing prerequisite, so this names re-scoping/closing
+    the issue and auditing its dependents' `after=` edges instead.
+    """
+    marker = _marker(
+        EVENT_REFUSED_PREMISE,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    lines = [
+        "## Coordinator: Refused — Issue Premise False Or Unmet",
+        marker,
+        f"**Machine:** {machine_name}",
+        "**Status:** refused_premise",
+        f"**Duration:** {_fmt_duration(duration_seconds)}",
+    ]
+    if log_path:
+        lines.append(f"**Log:** `{log_path}`")
+    lines.append("")
+    lines.append(
+        "The worker exited cleanly (exit code 0) and pushed **no commits** "
+        "because it investigated the issue and found its stated premise "
+        "false or its prerequisite unmet — no repo rule was involved, there "
+        "is simply nothing correct to build yet. This is not a failure — "
+        "retrying will reproduce the same refusal, since nothing about the "
+        "premise has changed. Needs the coordinator: re-scope or close the "
+        "issue (no title rewrite fixes this), and audit the `after=` edges "
+        "of anything queued behind it."
     )
     if reason.strip():
         lines.append("")

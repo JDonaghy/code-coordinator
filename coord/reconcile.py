@@ -61,8 +61,9 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
 # Terminal statuses an agent reports in its /status `completed` history,
 # mapped to the board terminal status we persist. (#625)
 #
-# #2234: "refused_policy" (coord.agent.REFUSED_POLICY) joins "advisory" as
-# its own pass-through entry — WITHOUT this, `reconcile_completed_
+# #2234/#3164: "refused_policy" (coord.agent.REFUSED_POLICY) and
+# "refused_premise" (coord.agent.REFUSED_PREMISE) join "advisory" as their
+# own pass-through entries — WITHOUT this, `reconcile_completed_
 # assignments` below (the daemon's passive tick, the primary production
 # path a completion is first observed on) reads `terminal = _AGENT_TERMINAL_
 # STATUS.get(...)` as `None` for an unrecognised status and just
@@ -75,6 +76,7 @@ _AGENT_TERMINAL_STATUS = {
     "done": "done",
     "advisory": "advisory",
     "refused_policy": "refused_policy",
+    "refused_premise": "refused_premise",
     "failed": "failed",
     "cancelled": "failed",
 }
@@ -143,7 +145,9 @@ _LATE_REPORT_CORRECTION_WINDOW_SECONDS = 6 * 3600.0
 # passive correction pass has no business doing. A row whose real status
 # turns out to be `done` is left on its (safe, conservative) `failed`/
 # `advisory` guess — a human or `coord notify` can still promote it.
-_LATE_REPORT_SAFE_TARGETS = frozenset({"failed", "advisory", "refused_policy"})
+_LATE_REPORT_SAFE_TARGETS = frozenset(
+    {"failed", "advisory", "refused_policy", "refused_premise"}
+)
 
 
 def is_attended_session(a: object) -> bool:
@@ -2221,6 +2225,30 @@ def reconcile(board: Board, config: Config) -> list[str]:
             # NOTE: do NOT add to newly_failed — a policy refusal is never a
             # candidate for auto_reassign; retrying it reproduces the
             # identical, correct refusal every time.
+        elif agent_status == "refused_premise":
+            # #3164: worker exited cleanly, pushed 0 commits, and its own
+            # final message reported an investigated, refuted issue premise
+            # — no repo rule involved. Mirrors the "refused_policy" branch
+            # immediately above exactly (move to completed, skip review,
+            # never a candidate for auto_reassign) — the two differ only in
+            # the OPERATOR remedy (`coord/drive.py` / `coord/drive_queue.py`
+            # print a re-scope/close-and-audit-dependents note here instead
+            # of a title-retarget one), never in this control flow.
+            done = board.mark_done_by_id(
+                a.assignment_id,
+                finished_at=entry.get("finished_at"),
+                branch=branch,
+            )
+            if done is not None:
+                # mark_done_by_id sets status="done"; correct it.
+                done.status = "refused_premise"
+                if done.type in WORK_LIKE_TYPES:
+                    # No code pushed → nothing to review.
+                    done.review_state = "advisory"
+                _record_usage_limit_reason(a.assignment_id, entry)
+            # NOTE: do NOT add to newly_failed — a premise refusal is never a
+            # candidate for auto_reassign; retrying it reproduces the
+            # identical, correct refusal every time.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
             # the agent reports cancelled (e.g. after POST /cancel cleanup
@@ -3350,11 +3378,13 @@ def reconcile_board_merges(
                 and a.review_state == "pending"
             )
             or a.status == "advisory"
-            # #2234: a refused_policy row is the same "ghost sibling" shape
-            # as advisory above — a terminal, zero-commit no-op that should
-            # auto-settle to `merged` once GitHub confirms the issue went
-            # terminal, rather than sitting on `refused_policy` forever.
+            # #2234/#3164: a refused_policy/refused_premise row is the same
+            # "ghost sibling" shape as advisory above — a terminal,
+            # zero-commit no-op that should auto-settle to `merged` once
+            # GitHub confirms the issue went terminal, rather than sitting on
+            # `refused_policy`/`refused_premise` forever.
             or a.status == "refused_policy"
+            or a.status == "refused_premise"
             or (
                 a.type == "work"
                 and a.status == "merged"
@@ -3413,6 +3443,19 @@ def reconcile_board_merges(
             if not dry_run:
                 a.status = "merged"
                 state.mark_refused_policy_settled(a.assignment_id or "")
+        elif a.status == "refused_premise":
+            # #3164: same settling as refused_policy above — once GitHub
+            # confirms the issue went terminal, a refused_premise row
+            # auto-settles to 'merged' rather than sitting on the board
+            # forever.
+            actions.append(
+                f"settle refused_premise {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.status = "merged"
+                state.mark_refused_premise_settled(a.assignment_id or "")
         elif a.type == "work":
             # #951: type=work, status=merged, review_state=pending — a row
             # that already fell out of sweep (b)'s status=='done' candidates

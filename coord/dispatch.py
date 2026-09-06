@@ -15,6 +15,7 @@ from coord.comments import (
     format_completion,
     format_failure,
     format_refused_policy,
+    format_refused_premise,
 )
 from coord.config import Config
 from coord.models import EPIC_DECOMPOSE_TYPE, Proposal, Repo, coordinator_owned_docs
@@ -1211,6 +1212,30 @@ def post_refused_policy(
     reason: str = "",
 ) -> None:
     body = format_refused_policy(
+        assignment_id=assignment_id,
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        duration_seconds=duration_seconds,
+        log_path=log_path,
+        reason=reason,
+    )
+    github_ops.post_issue_comment(repo_github, issue_number, body)
+
+
+def post_refused_premise(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_github: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> None:
+    """#3164: sibling of `post_refused_policy` for a premise refusal."""
+    body = format_refused_premise(
         assignment_id=assignment_id,
         machine_name=machine_name,
         repo_name=repo_name,

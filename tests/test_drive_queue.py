@@ -59,7 +59,7 @@ from coord.drive_queue import (
     unreachable_wait_alert,
     validate_enqueue,
 )
-from coord.models import EPIC_DECOMPOSE_TYPE, MERGE_LANDED_MARKER
+from coord.models import EPIC_DECOMPOSE_TYPE, MERGE_LANDED_MARKER, PREMISE_REFUSAL_MARKER
 
 REPO = "claude-coordinator"
 
@@ -3007,6 +3007,152 @@ def test_a_policy_refusal_still_reconciles_to_done_if_it_lands_by_hand():
     reconcile = plan.reconciles[0]
     assert reconcile.outcome == "done"
     assert reconcile.updates["state"] == STATE_DONE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3164: a premise refusal — a worker that reaped `coord.agent.
+# REFUSED_PREMISE` (clean exit, 0 commits, its own final message reports an
+# investigated, refuted issue premise rather than a repo-rule prohibition) —
+# parks exactly like a policy refusal (#2234) above: same no-attempt-spent
+# accounting, same "never auto-resumes" posture. The ONLY thing that differs
+# is the remediation TEXT — it must not suggest a title retarget, since
+# rewriting a title cannot make a missing prerequisite exist. This is a
+# classification and messaging change, not a control-flow change (per the
+# issue's own framing), so most of these tests are the #2234 suite above
+# with the reason swapped — the point is proving the control flow really did
+# come along unchanged.
+# ═══════════════════════════════════════════════════════════════════════════
+
+PREMISE_REFUSAL_REASON = (
+    "drive exited for quadraui#812 (exit_code=1): work 721861c90bf3 refused "
+    "on the issue's own false premise rather than doing the dispatched "
+    "work — the worker did the CORRECT thing (#3164). "
+    f"{PREMISE_REFUSAL_MARKER}"
+)
+
+
+def test_a_premise_refusal_parks_without_spending_an_attempt():
+    """AC3: the same #2234-style acceptance criterion, asserted the same
+    way — on the attempt counter AND the terminal bucket, not just the verb."""
+    entries = [entry(812, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 812): PREMISE_REFUSAL_REASON},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()  # NOT terminal `blocked`
+    assert plan.launch is None
+    assert PREMISE_REFUSAL_REASON in reconcile.reason
+    assert PREMISE_REFUSAL_REASON in reconcile.updates["last_reason"]
+
+
+def test_a_premise_refusal_park_reason_does_not_suggest_a_retarget():
+    """AC2: the #3164 headline fix. A policy refusal's park reason correctly
+    tells the operator to retarget the issue's title — but that advice is
+    actively wrong for a premise refusal (no title fixes a missing
+    prerequisite), so the reason text must say something ELSE entirely."""
+    entries = [entry(812, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 812): PREMISE_REFUSAL_REASON},
+    )
+    reason = plan.reconciles[0].reason
+    assert "retarget" not in reason
+    assert "rewrite its title" not in reason
+    assert "Re-scope or close the issue" in reason
+    assert "after=" in reason
+
+
+def test_a_premise_refusal_parks_even_on_a_fresh_entrys_first_tick():
+    entries = [entry(812, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 812): PREMISE_REFUSAL_REASON},
+    )
+    assert plan.reconciles[0].outcome == "parked"
+    assert plan.blocked == ()
+    assert plan.launch is None
+
+
+def test_a_premise_refusal_deep_into_the_attempt_budget_still_spends_none():
+    entries = [
+        entry(812, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 812): PREMISE_REFUSAL_REASON},
+    )
+    assert plan.reconciles[0].outcome == "parked"  # not "exhausted"
+    assert plan.blocked == ()
+
+
+def test_a_parked_premise_refusal_does_not_auto_resume_next_tick():
+    """Mirrors the #2234 policy-park regression guard: a parked entry with
+    no `merge_ci_pending` reads exactly like a CI park whose gate has
+    cleared, and without the #3164 pre-pass check this would flip straight
+    back to `waiting` and relaunch into the identical refusal forever."""
+    entries = [
+        entry(812, position=3, state="parked", attempts=0,
+              last_reason=PREMISE_REFUSAL_REASON)
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()  # left alone — still parked
+    assert plan.launch is None
+
+
+def test_a_parked_premise_refusal_stays_parked_through_the_2158_ceiling():
+    """Unlike a CI park, this never ages out — the missing prerequisite it
+    names does not start existing on a timer, so #2158's staleness ceiling
+    must not apply to it either."""
+    entries = [
+        entry(
+            812, position=3, state="parked", attempts=0,
+            last_reason=PREMISE_REFUSAL_REASON,
+            reason_at=NOW - PARK_STALE_SECONDS - 60,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_premise_refusal_still_reconciles_to_done_if_it_lands_by_hand():
+    """AC4 (round-trip): the #2055 landed-check still applies on top of
+    #3164 — a human re-scoping the issue and merging it out of band must
+    not leave the entry parked forever."""
+    entries = [entry(812, position=3, state="parked", attempts=0,
+                      last_reason=PREMISE_REFUSAL_REASON)]
+    plan = plan_tick(entries, board(merged=(812,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_premise_refusal_and_a_policy_refusal_are_never_conflated():
+    """AC4: both verdicts round-trip through the SAME queue-row mechanism
+    (parked state + last_reason text) but must stay texually distinguishable
+    from each other — an operator (or `coord drive-queue list`) reading
+    `last_reason` must be able to tell which one this is."""
+    entries = [
+        entry(812, position=1, state=STATE_RUNNING, attempts=0),
+        entry(2195, position=2, state=STATE_RUNNING, attempts=0),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        exit_reasons={
+            entry_key(REPO, 812): PREMISE_REFUSAL_REASON,
+            entry_key(REPO, 2195): POLICY_REFUSAL_REASON,
+        },
+    )
+    by_key = {r.key: r for r in plan.reconciles}
+    premise_reason = by_key[entry_key(REPO, 812)].reason
+    policy_reason = by_key[entry_key(REPO, 2195)].reason
+    assert premise_reason != policy_reason
+    assert "retarget" not in premise_reason
+    assert "retarget" in policy_reason
 
 
 # ═══════════════════════════════════════════════════════════════════════════

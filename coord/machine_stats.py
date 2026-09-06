@@ -34,9 +34,9 @@ below is copied verbatim from the handler this replaces:
   GitHub confirms the merge), not a distinct outcome — mirrors
   ``coord.scorecard``'s own ``status == "merged"`` success check.
 - ``counts.failed`` — ``status == "failed"``; ``advisory``/``cancelled``/
-  ``refused_policy`` deliberately count toward neither bucket (#448/#2234's
-  "advisory is a third state" distinction) — they still appear in
-  ``job_history`` but bucket into nothing.
+  ``refused_policy``/``refused_premise`` deliberately count toward neither
+  bucket (#448/#2234/#3164's "advisory is a third state" distinction) — they
+  still appear in ``job_history`` but bucket into nothing.
 - ``job_history`` — the most recent 20 of ``board.completed`` per machine,
   newest first by ``finished_at`` (falling back to ``dispatched_at`` for a
   row that somehow has no ``finished_at``). ``counts`` are NOT capped the

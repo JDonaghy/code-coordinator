@@ -538,6 +538,23 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     done.status = "refused_policy"
                     if done.type == "work":
                         done.review_state = "advisory"
+            elif agent_status == "refused_premise":
+                # #3164: worker exited cleanly, pushed 0 commits, and its own
+                # final message reported an investigated, refuted issue
+                # premise — no repo rule involved. Mirrors the
+                # "refused_policy" branch immediately above exactly, for the
+                # same reason (falling to `else` below would record FAILED
+                # and feed `auto_reassign` on a condition retrying can never
+                # fix).
+                done = board.mark_done_by_id(
+                    a.assignment_id,
+                    finished_at=entry.get("finished_at"),
+                    branch=branch,
+                )
+                if done is not None:
+                    done.status = "refused_premise"
+                    if done.type == "work":
+                        done.review_state = "advisory"
             else:
                 board.mark_failed_by_id(
                     a.assignment_id,
@@ -644,6 +661,32 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         for e in policy_refusal_entries:
             spec = e.get("spec", {})
             reason = e.get("policy_refusal_reason") or "cited a repo-rule prohibition"
+            click.echo(
+                f"  #{spec.get('issue_number', '?')}: "
+                f"{spec.get('issue_title', '?')} "
+                f"[{spec.get('repo_name', '?')}]  — {reason}"
+            )
+
+    # #3164: a premise refusal gets its OWN section too — same #1472 "still
+    # live on GitHub" filter as policy refusal above, but distinct wording:
+    # no rule was involved, the issue's own premise didn't hold up, so the
+    # remedy is re-scope/close, never a title retarget.
+    premise_refusal_entries = _live_advisory_entries(
+        [
+            e for e in agent_completed.values()
+            if e.get("status") == "refused_premise" and not e.get("usage_limit_reason")
+        ],
+        cfg,
+    )
+    if premise_refusal_entries:
+        click.echo("")
+        click.echo(
+            "🚫 Needs the coordinator (worker found the issue's premise "
+            "false or its prerequisite unmet):"
+        )
+        for e in premise_refusal_entries:
+            spec = e.get("spec", {})
+            reason = e.get("premise_refusal_reason") or "premise false or prerequisite unmet"
             click.echo(
                 f"  #{spec.get('issue_number', '?')}: "
                 f"{spec.get('issue_title', '?')} "

@@ -1861,6 +1861,30 @@ def test_refused_policy_on_a_plan_row_is_not_reported_healthy(
     assert res.recovered is False
 
 
+# ── #3164: REFUSED_PREMISE work row must never report "stage looks healthy" ─
+
+
+def test_refused_premise_is_not_reported_healthy(monkeypatch, config) -> None:
+    """Sibling of the REFUSED_POLICY test above for a REFUSED_PREMISE row —
+    same false-healthy read this diagnose call exists to close, but the
+    remedy must name re-scoping/closing the issue, never the refused_policy
+    'deliverable isn't coordinator-only' wording, which doesn't apply here."""
+    _stub(monkeypatch, session="dead")
+
+    a = _assign(
+        aid="w-refused-premise", status="refused_premise", issue=812,
+        branch="issue-812-empty",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 812, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("refused_premise" in f for f in res.findings), res.findings
+    assert any("coordinator" in f for f in res.findings), res.findings
+    assert not any("coordinator-only" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
 # ── #618: _prune_orphan_for_failed integration ──────────────────────────────
 
 

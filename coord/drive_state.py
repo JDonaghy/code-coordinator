@@ -49,12 +49,16 @@ from coord.models import WORK_LIKE_TYPES, test_mode_from_labels
 # exactly a hardcoded copy of this set going stale).
 WORK_LIKE: frozenset[str] = WORK_LIKE_TYPES
 
-# #2234: "refused_policy" joins "advisory" here for the same reason —
-# `active_count` (below) must not count either as still running, or
-# `decide()`'s `active_count > 0` guard would wait on a row that already
-# reaped and never actually change state (see `coord.agent.REFUSED_POLICY`).
+# #2234/#3164: "refused_policy"/"refused_premise" join "advisory" here for
+# the same reason — `active_count` (below) must not count any of them as
+# still running, or `decide()`'s `active_count > 0` guard would wait on a row
+# that already reaped and never actually change state (see
+# `coord.agent.REFUSED_POLICY`/`REFUSED_PREMISE`).
 TERMINAL_STATUSES = frozenset(
-    {"done", "failed", "cancelled", "merged", "advisory", "refused_policy"}
+    {
+        "done", "failed", "cancelled", "merged", "advisory",
+        "refused_policy", "refused_premise",
+    }
 )
 
 
