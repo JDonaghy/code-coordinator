@@ -99,6 +99,46 @@ pool member and `coord plan` can route any work in its repos to it. Use
 live interactive tmux sessions, deregisters, and deletes the resource group.
 `--force` skips the drain — unpushed work on the VM is lost.
 
+## Verifying `scripts/provision-machine.sh` on a real, fresh VM
+
+This lane's own machinery (`epic-up.sh`/`epic-down.sh`, `build-worker-image.sh`)
+is **not** how `scripts/provision-machine.sh` (#3138, the bare-metal /
+Ubuntu-24.04 fleet-onboarding script — see its own header) gets verified.
+[`scripts/azure-workers/throwaway-vm.sh`](../scripts/azure-workers/throwaway-vm.sh)
+(#3151) is a **separate, disposable** tool for exactly that:
+
+```bash
+./throwaway-vm.sh --role thin-client|worker|server [--rg NAME] [--keep] [--out FILE]
+```
+
+It creates a **stock** `Canonical:ubuntu-24_04-lts:server:latest` VM (never
+the golden gallery image this lane builds — proving `provision-machine.sh`
+against an image that already has every prerequisite installed would prove
+nothing about the fresh-OS path), stages `provision-machine.sh` onto it,
+hands the operator a real interactive SSH session for the one phase that
+needs a human (`tailscale up`, `gh auth login`, the Claude Code OAuth login),
+captures the `PROVISION:`/`MACHINE_DOCTOR:` trailers plus `coord status` and
+`/health`/`/board`, and deletes the resource group on a trap — success,
+failure, or Ctrl-C alike.
+
+**It deliberately does not touch `~/.coord/epic.env`.** That file is this
+lane's shared, one-time infrastructure (Key Vault, the managed identity, the
+private DNS zone, the image pin); a disposable verification VM needs none of
+it, and coupling to it would make the check depend on this lane's setup
+having already run on the operator's machine. The two scripts share only a
+shape (`build-worker-image.sh` steps 0-2: per-run resource group, an NSG rule
+scoped to the operator's own IP, a wait-for-SSH loop, `scp` + `ssh`), not any
+state.
+
+Pass the same `--rg` twice (with `--keep` on the first run) to point a second
+invocation at an already-provisioned VM — that is the idempotency half of
+`provision-machine.sh`'s own contract, exercised for real rather than
+asserted about. `scripts/verify-provision-noble.sh` is the third leg: real
+package installs and a real live agent/board pair, but inside a chroot in a
+user namespace, which is real coverage but still not a machine — the
+throwaway-VM run is what that script's own header says is still needed
+beyond it.
+
 ## Gotchas
 
 These each cost real time or money and are invisible from the code.
