@@ -3923,6 +3923,25 @@ class TestBackfillReviewCost:
         assert result.exit_code == 0, result.output
         assert "No review assignments with missing cost/tokens found." in result.output
 
+    def test_unmeasured_row_is_not_a_candidate(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """#3158: a review row already stamped cost_capture_state='unmeasured'
+        by a previous backfill run (its log genuinely has no cost) must not
+        be re-selected on every subsequent run forever — the same trap
+        `load_terminal_assignments_missing_cost` was built to avoid, for the
+        one population (type='review') the older sibling command targets."""
+        self._record_review("bf4")
+        from coord.state import mark_cost_unmeasured
+
+        mark_cost_unmeasured("bf4")
+
+        result = CliRunner().invoke(
+            main, ["backfill-review-cost", "--config", str(config_file)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No review assignments with missing cost/tokens found." in result.output
+
 
 class TestBackfillCost:
     """#3158: `coord backfill-cost` — the fleet-wide, all-types repair for
