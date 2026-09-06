@@ -705,6 +705,17 @@ RUST_FIELD_OVERRIDES: dict[str, dict[str, RustField]] = {
                 "`None` for in-flight workers and for pre-#208 rows.",
             ),
         ),
+        "cost_capture_state": _f(
+            "cost_capture_state", "Option<String>",
+            doc=(
+                "#3158: tri-states cost_usd's own NULL so \"un-measured\" (a terminal",
+                "row whose log conclusively has no cost) stays distinguishable from",
+                '"uncaptured" (a backfill candidate the daemon has not examined yet).',
+                'None (never examined) | "captured" (cost_usd set) | "unmeasured"',
+                "(log confirmed to carry no cost — excluded from future backfill",
+                "candidate queries so it is not re-fetched forever).",
+            ),
+        ),
         "smoke_tests": _f(
             "smoke_tests", "Option<Vec<String>>",
             doc=(

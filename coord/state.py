@@ -3061,10 +3061,20 @@ def _mark_cost_unmeasured_local(assignment_id: str) -> None:
     """Write ``cost_capture_state='unmeasured'`` directly to the local DB.
 
     Called by the daemon endpoint. Guarded to only fire when ``cost_usd IS
-    NULL`` (never downgrade a real captured cost) and ``cost_capture_state
-    IS NULL`` (never clobber an already-recorded state, 'captured' or
-    otherwise) — a caller that already parsed a positive cost calls
-    :func:`update_assignment_cost` instead, never both.
+    NULL OR cost_usd = 0`` (never downgrade a real, positive captured cost)
+    and ``cost_capture_state IS NULL`` (never clobber an already-recorded
+    state, 'captured' or otherwise) — a caller that already parsed a
+    positive cost calls :func:`update_assignment_cost` instead, never both.
+
+    The ``cost_usd = 0`` half of the guard matters for legacy rows that
+    predate the ``cost > 0`` write guard (#1763) and have a literal stored
+    zero rather than NULL: the candidate queries
+    (:func:`load_review_assignments_missing_cost`,
+    :func:`load_terminal_assignments_missing_cost`) treat ``cost_usd = 0``
+    the same as NULL, so without this half the UPDATE below would silently
+    affect 0 rows for such a row, ``cost_capture_state`` would never get
+    set, and it would be re-selected and re-fetched forever — the exact
+    trap the tri-state exists to close (#3158).
     """
     if not assignment_id:
         return
@@ -3073,7 +3083,7 @@ def _mark_cost_unmeasured_local(assignment_id: str) -> None:
     def _write() -> None:
         sql.execute(conn,
             "UPDATE assignments SET cost_capture_state='unmeasured' "
-            "WHERE assignment_id=? AND cost_usd IS NULL "
+            "WHERE assignment_id=? AND (cost_usd IS NULL OR cost_usd = 0) "
             "AND cost_capture_state IS NULL",
             (assignment_id,),
         )
@@ -3929,6 +3939,12 @@ def load_review_assignments_missing_cost(repo_name: str | None = None) -> list[d
     the same shape as :func:`load_done_reviews_needing_post` (including
     ``provider_name`` for :func:`coord.notify.capture_cost_and_tokens_for_assignment`).
 
+    Also excludes rows already marked ``cost_capture_state='unmeasured'``
+    (#3158) — a row a previous backfill run already examined and confirmed
+    has NO cost in its log is not re-fetched and re-parsed on every
+    subsequent run forever. See :func:`load_terminal_assignments_missing_cost`,
+    whose otherwise-identical query added this filter first.
+
     **Daemon-aware:** mirrors :func:`load_done_reviews_needing_post` — reads
     the ``GET /board`` payload when a ``board_service`` is configured so a
     thin client sees the real candidates instead of an empty local table.
@@ -3945,6 +3961,7 @@ def load_review_assignments_missing_cost(repo_name: str | None = None) -> list[d
                     a.get("type") == "review"
                     and a.get("status") not in ("running", "pending", "finalizing")
                     and not (a.get("cost_usd") or 0)
+                    and a.get("cost_capture_state") is None
                     and (repo_name is None or a.get("repo_name") == repo_name)
                 ):
                     results.append({
@@ -3968,7 +3985,7 @@ def _load_review_assignments_missing_cost_local(repo_name: str | None = None) ->
     conn = get_connection()
     where = (
         "type='review' AND status NOT IN ('running', 'pending', 'finalizing') "
-        "AND (cost_usd IS NULL OR cost_usd = 0)"
+        "AND (cost_usd IS NULL OR cost_usd = 0) AND cost_capture_state IS NULL"
     )
     if repo_name:
         rows = sql.execute(conn,
