@@ -169,3 +169,25 @@ class TestRetryAcceptsZeroCommitAdvisory:
         assert "refused_policy" in out
         assert "coordinator" in out
         assert "not 'failed' or 'advisory'" not in out
+
+    def test_refused_premise_status_gets_a_bespoke_message(
+        self, valid_config_path: Path
+    ) -> None:
+        """#3164: sibling of `test_refused_policy_status_gets_a_bespoke_
+        message` above — `coord retry` on a `refused_premise` row must name
+        the reason rather than reusing the generic "not 'failed' or
+        'advisory'" refusal, and must steer the operator toward re-scoping
+        or closing the issue rather than the refused_policy message's
+        (inapplicable here) framing."""
+        a = _advisory()
+        a.status = "refused_premise"
+        board = Board(completed=[a])
+        with patch("coord.board_service.read_board", return_value=board):
+            result = CliRunner().invoke(
+                main, ["retry", "0256c844edfb", "--config", str(valid_config_path)],
+            )
+        out = output_and_stderr(result)
+        assert result.exit_code == 1
+        assert "refused_premise" in out
+        assert "coordinator" in out
+        assert "not 'failed' or 'advisory'" not in out

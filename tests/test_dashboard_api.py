@@ -917,9 +917,10 @@ class TestMachinesStatsAPI:
         assert history_by_id["merged1"]["status"] == "merged"
 
     def test_advisory_and_cancelled_appear_in_history_but_not_in_counts(self) -> None:
-        """#448/#2234: advisory/cancelled/refused_policy are neither a clean
-        success nor a failure -- they still show up in job_history (it is a
-        raw recent-activity feed) but must not inflate either count."""
+        """#448/#2234/#3164: advisory/cancelled/refused_policy/refused_premise
+        are neither a clean success nor a failure -- they still show up in
+        job_history (it is a raw recent-activity feed) but must not inflate
+        either count."""
         now = time.time()
         board = Board(completed=[
             Assignment(
@@ -934,6 +935,18 @@ class TestMachinesStatsAPI:
                 assignment_id="cancel1", status="cancelled",
                 dispatched_at=now - 20, finished_at=now - 15,
             ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=22, issue_title="Refused by policy",
+                assignment_id="refused1", status="refused_policy",
+                dispatched_at=now - 30, finished_at=now - 25,
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=23, issue_title="Refused on a false premise",
+                assignment_id="refused2", status="refused_premise",
+                dispatched_at=now - 40, finished_at=now - 35,
+            ),
         ])
         machines = [Machine(name="laptop", host="laptop.tailnet", repos=["api"])]
         client = self._client(machines)
@@ -942,7 +955,9 @@ class TestMachinesStatsAPI:
 
         m = r.json()[0]
         assert m["counts"] == {"completed": 0, "failed": 0}
-        assert {j["assignment_id"] for j in m["job_history"]} == {"adv1", "cancel1"}
+        assert {j["assignment_id"] for j in m["job_history"]} == {
+            "adv1", "cancel1", "refused1", "refused2",
+        }
 
     def test_job_history_capped_at_most_recent_20(self) -> None:
         now = time.time()

@@ -186,6 +186,26 @@ def test_refused_policy_is_persisted_not_downgraded_to_failed() -> None:
     assert by == {"w1": "refused_policy"}
 
 
+def test_refused_premise_is_persisted_not_downgraded_to_failed() -> None:
+    """#3164: same regression guard as
+    ``test_refused_policy_is_persisted_not_downgraded_to_failed`` above, for
+    the sibling ``refused_premise`` verdict — without ``_AGENT_TERMINAL_
+    STATUS``'s ``refused_premise`` entry, this row would fall through the
+    same "unrecognised status" hole and be `continue`d past, leaving it on
+    `status="running"` forever."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "w1", "status": "refused_premise"},
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    by = {c["assignment_id"]: c["terminal_status"] for c in rec.calls}
+    assert by == {"w1": "refused_premise"}
+
+
 def test_usage_limit_reason_propagated_from_agent_entry() -> None:
     """#1461: a usage-limit kill is carried on the agent's completed entry
     (AgentServer._reap stamps ``usage_limit_reason``) and must be forwarded

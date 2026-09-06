@@ -100,9 +100,9 @@ def test_merged_status_counts_as_completed() -> None:
 
 
 def test_advisory_and_cancelled_appear_in_history_but_not_in_counts() -> None:
-    """#448/#2234: advisory/cancelled/refused_policy are neither a clean
-    success nor a failure -- they still show up in job_history but must not
-    inflate either count."""
+    """#448/#2234/#3164: advisory/cancelled/refused_policy/refused_premise
+    are neither a clean success nor a failure -- they still show up in
+    job_history but must not inflate either count."""
     now = time.time()
     board = Board(completed=[
         Assignment(
@@ -123,12 +123,18 @@ def test_advisory_and_cancelled_appear_in_history_but_not_in_counts() -> None:
             assignment_id="refused1", status="refused_policy",
             dispatched_at=now - 30, finished_at=now - 25,
         ),
+        Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=23, issue_title="Refused on a false premise",
+            assignment_id="refused2", status="refused_premise",
+            dispatched_at=now - 40, finished_at=now - 35,
+        ),
     ])
     machines = [Machine(name="laptop", host="laptop.tailnet", repos=["api"])]
     row = build_machine_stats(board, _config(machines))[0]
     assert row["counts"] == {"completed": 0, "failed": 0}
     assert {j["assignment_id"] for j in row["job_history"]} == {
-        "adv1", "cancel1", "refused1",
+        "adv1", "cancel1", "refused1", "refused2",
     }
 
 
