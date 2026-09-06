@@ -4103,6 +4103,15 @@ def openapi_spec() -> dict:
                                 "properties": {
                                     "assignment_id": {"type": "string"},
                                     "cost_usd": {"type": "number", "nullable": True},
+                                    "cost_capture_state": {
+                                        "type": "string",
+                                        "nullable": True,
+                                        "description": (
+                                            "#3158: only 'unmeasured' is ever "
+                                            "sent — a captured cost is "
+                                            "implied by cost_usd."
+                                        ),
+                                    },
                                     "input_tokens": {"type": "integer"},
                                     "output_tokens": {"type": "integer"},
                                     "cache_creation_tokens": {"type": "integer"},
@@ -7802,6 +7811,12 @@ def build_app(
         try:
             if "cost_usd" in body and body["cost_usd"] is not None:
                 state._update_assignment_cost_local(aid, body["cost_usd"])
+            if body.get("cost_capture_state") == "unmeasured":
+                # #3158: the other half of the tri-state — see
+                # coord.state.mark_cost_unmeasured's docstring. Never sent
+                # alongside cost_usd by any caller; update_assignment_cost
+                # stamps 'captured' itself, in the same UPDATE, above.
+                state._mark_cost_unmeasured_local(aid)
             if any(
                 k in body
                 for k in (
@@ -9215,6 +9230,12 @@ def build_app(
             if body.get("cost_usd") is not None:
                 state._update_assignment_cost_local(aid, body["cost_usd"])
                 applied.append("cost_usd")
+            if body.get("cost_capture_state") == "unmeasured":
+                # #3158: same predicate as post_assignment_usage above —
+                # kept in lockstep for the same reason the header comment
+                # names.
+                state._mark_cost_unmeasured_local(aid)
+                applied.append("cost_capture_state")
             if any(k in body for k in rest_schema.USAGE_TOKEN_FIELDS):
                 state._update_assignment_tokens_local(
                     aid,

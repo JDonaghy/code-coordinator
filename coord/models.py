@@ -867,6 +867,16 @@ class Assignment:
     # workers whose log lacked usage data).  Set on completion by
     # notify.py / reconcile via coord.usage.parse_usage_from_log.
     cost_usd: float | None = None
+    # #3158: distinguishes "genuinely un-measured" (a full re-parse of the
+    # log found no `total_cost_usd` at all) from "uncaptured" (cost_usd IS
+    # NULL and this is ALSO None — nobody has looked yet) — both used to
+    # collapse to the same NULL, which is exactly the "silently priced at
+    # $0" trap #1763 warns about. Set to ``"captured"`` alongside cost_usd
+    # by `coord.state.update_assignment_cost`, or to ``"unmeasured"`` by
+    # `coord.state.mark_cost_unmeasured` when a full-log parse conclusively
+    # finds nothing. None for every row predating this column and for any
+    # terminal row not yet (re-)examined.
+    cost_capture_state: str | None = None
     # #252: worker-emitted smoke-test list parsed from the SMOKE_TESTS
     # block.  None = no block emitted (graceful TUI placeholder); [] =
     # explicit "(none — change is internal)"; non-empty list = bullets.

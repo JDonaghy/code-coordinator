@@ -1047,13 +1047,28 @@ def _capture_cost_from_entry_best_effort(assignment_id: str, entry: dict) -> Non
     serves terminal entries) with ``cost_so_far`` as a fallback.  Either is
     used only when present and > 0 so an un-measured session isn't written as 0.
 
+    #3158: this is only ONE of the two places a terminal row's cost can be
+    captured — the daemon's passive reconcile tick, and only for a row it
+    catches transitioning to terminal *while the agent still serves the
+    ``completed`` entry this function is handed*. A missed tick (agent
+    restart, retention, a slow tick) means this function is never even
+    called for that row, and ``cost_usd`` stays NULL forever — the #3158
+    root cause. ``coord backfill-cost`` (coord/commands/merge.py) is the
+    fleet-wide repair for that population, going through each agent's
+    ``/logs/<id>`` directly instead of depending on this opportunistic path.
+    When THIS function IS reached and finds no cost, it still records that
+    fact (see below) so a later backfill run doesn't have to re-parse a log
+    that already told us there's nothing in it.
+
     Token counts are captured separately by ``_capture_tokens_best_effort``
     (#667 Gap B), which is called at the same call site.
     """
     try:
-        from coord.state import update_assignment_cost  # noqa: PLC0415
+        from coord.state import mark_cost_unmeasured, update_assignment_cost  # noqa: PLC0415
 
-        raw_cost = entry.get("total_cost_usd") or entry.get("cost_so_far")
+        raw_cost = entry.get("total_cost_usd")
+        if raw_cost is None:
+            raw_cost = entry.get("cost_so_far")
         if raw_cost is not None:
             try:
                 cost = float(raw_cost)
@@ -1062,6 +1077,18 @@ def _capture_cost_from_entry_best_effort(assignment_id: str, entry: dict) -> Non
             else:
                 if cost > 0:
                     update_assignment_cost(assignment_id, cost)
+                elif "total_cost_usd" in entry:
+                    # #3158: `"total_cost_usd" in entry` (as opposed to just
+                    # `raw_cost is not None`) is the signal that
+                    # `coord.agent.AgentServer.list_assignments` actually
+                    # ran a FULL re-parse of this assignment's log and
+                    # found nothing — as opposed to the key being absent
+                    # because the log wasn't stream-json or the parse
+                    # itself raised. Only that positive case is safe to
+                    # record as "un-measured" rather than silently leaving
+                    # both columns NULL (indistinguishable from "never
+                    # examined") per #1763's "never silently priced at $0".
+                    mark_cost_unmeasured(assignment_id)
     except Exception:  # noqa: BLE001 — never let cost capture break the reconcile
         pass
 

@@ -1224,7 +1224,7 @@ def post_pending_reviews(config_path: Path, repo_name: str | None) -> None:
 @_CONFIG_OPTION
 @click.option("--repo", "repo_name", default=None, help="Only process assignments for this repo.")
 def backfill_review_cost(config_path: Path, repo_name: str | None) -> None:
-    from coord.notify import _capture_cost_and_tokens_for_review
+    from coord.notify import capture_cost_and_tokens_for_assignment
     from coord.state import load_review_assignments_missing_cost
     from coord.usage import LOGS_DIR
 
@@ -1253,10 +1253,10 @@ def backfill_review_cost(config_path: Path, repo_name: str | None) -> None:
         # correctly whenever this command runs on the same box that hosted
         # the review (the common case for a per-machine repair run), and is
         # a harmless miss otherwise (falls straight through to the *host*
-        # fetch below, same as `_capture_cost_and_tokens_for_review` already
+        # fetch below, same as `capture_cost_and_tokens_for_assignment` already
         # does for every other caller).
         log_path = str(LOGS_DIR / f"{aid}.log")
-        wrote = _capture_cost_and_tokens_for_review(
+        wrote = capture_cost_and_tokens_for_assignment(
             aid, log_path=log_path, host=host,
             provider_name=row.get("provider_name"),
         )
@@ -1279,6 +1279,93 @@ def backfill_review_cost(config_path: Path, repo_name: str | None) -> None:
     click.echo(
         f"\nSummary: {len(recovered)} recovered, {len(still_missing)} still missing "
         f"of {len(candidates)} total."
+    )
+
+
+@click.command(
+    "backfill-cost",
+    help=(
+        "One-shot repair for #3158: capture cost/tokens for ANY terminal "
+        "assignment (not just reviews — see coord backfill-review-cost, "
+        "#2476) left at cost_usd IS NULL by the daemon's opportunistic "
+        "reconcile-tick capture missing its window (agent restart, "
+        "retention, or a tick that simply ran too slowly).\n\n"
+        "Walks every terminal row (any type, excluding running/pending/"
+        "finalizing) with cost_usd IS NULL/0 and cost_capture_state IS "
+        "NULL, tries the local log first, then the assignment's agent "
+        "/logs/<id> endpoint, parses, and persists via the same "
+        "update_assignment_cost/update_assignment_tokens writers the live "
+        "capture path uses — no new write mechanism. A log that parses "
+        "cleanly but genuinely carries no cost (e.g. a reap-truncated run "
+        "with no terminal result event, #3156) is stamped "
+        "cost_capture_state='unmeasured' so it isn't re-fetched forever on "
+        "every future run (#1763: 'unmeasured' must stay distinguishable "
+        "from simply never having been looked at). Run once per machine "
+        "that hosts logs; a row whose log is truly gone (no local file, "
+        "agent unreachable) is reported as still-missing rather than "
+        "silently dropped, and stays a candidate for the next run."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--repo", "repo_name", default=None, help="Only process assignments for this repo.")
+def backfill_cost(config_path: Path, repo_name: str | None) -> None:
+    from coord.notify import capture_cost_and_tokens_for_assignment
+    from coord.state import load_terminal_assignments_missing_cost
+    from coord.usage import LOGS_DIR
+
+    cfg = _load_config(config_path)
+    machines_by_name = {m.name: m for m in cfg.machines}
+
+    candidates = load_terminal_assignments_missing_cost(repo_name=repo_name)
+    if not candidates:
+        click.echo("No assignments with missing cost/tokens found.")
+        return
+
+    click.echo(f"Found {len(candidates)} assignment(s) with missing cost/tokens:")
+    for row in candidates:
+        click.echo(
+            f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']} "
+            f"({row.get('type', 'work')}, machine: {row['machine_name']})"
+        )
+
+    recovered: list[dict] = []
+    still_missing: list[dict] = []
+    for row in candidates:
+        aid = row["assignment_id"]
+        machine = machines_by_name.get(row["machine_name"])
+        host = machine.host if machine is not None else None
+        # #3158: always offer the conventional local path first — resolves
+        # correctly whenever this command runs on the same box that hosted
+        # the leg (the common case for a per-machine repair run), and is a
+        # harmless miss otherwise (falls straight through to the *host*
+        # fetch below, same as `capture_cost_and_tokens_for_assignment`
+        # already does for every other caller).
+        log_path = str(LOGS_DIR / f"{aid}.log")
+        wrote = capture_cost_and_tokens_for_assignment(
+            aid, log_path=log_path, host=host,
+            provider_name=row.get("provider_name"),
+        )
+        (recovered if wrote else still_missing).append(row)
+
+    click.echo(f"\nRecovered cost/tokens for {len(recovered)} assignment(s):")
+    for row in recovered:
+        click.echo(f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']}")
+
+    if still_missing:
+        click.echo(
+            f"\n{len(still_missing)} assignment(s) still missing or confirmed "
+            "un-measured (log gone/unreachable, or a full parse found no "
+            "cost to capture — either way, see cost_capture_state on the "
+            "row for which):"
+        )
+        for row in still_missing:
+            click.echo(
+                f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']} "
+                f"(machine: {row['machine_name']})"
+            )
+    click.echo(
+        f"\nSummary: {len(recovered)} recovered, {len(still_missing)} still "
+        f"missing/unmeasured of {len(candidates)} total."
     )
 
 

@@ -98,6 +98,7 @@ from coord.notifier.cli import notifier_group
 # the same tables.
 from coord.commands.portal import journal, portal_group
 from coord.commands.merge import (
+    backfill_cost,
     backfill_review_cost,
     bounce,
     merge,
@@ -463,6 +464,7 @@ main.add_command(set_test_mode)
 main.add_command(notify)
 main.add_command(post_pending_reviews)
 main.add_command(backfill_review_cost)
+main.add_command(backfill_cost)
 main.add_command(merge)
 main.add_command(resume)
 main.add_command(test)
