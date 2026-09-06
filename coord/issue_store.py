@@ -1468,6 +1468,31 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
                     )
         except Exception:  # noqa: BLE001 — best-effort
             pass
+    # #3148: an `approve` is the durable counterpart of the request-changes
+    # write above — until now the carry-forward ledger was write-only for
+    # request-changes, so an approve left NO trace in it. A re-review
+    # triggered later (e.g. by a ci-fix leg pushed after the approval) then
+    # re-read the same "blocking findings" entries this approve had already
+    # waived — including a worker-unfixable AC — and was mechanically forced
+    # to re-block on it forever (coord.review's own re-review instruction:
+    # block only for "a previously-requested change that was not
+    # addressed"). Mark every still-unresolved `source="review"` entry on
+    # this issue resolved-in-place (never deleted — the audit trail of
+    # "raised, then waived, by whom and when" is the point). Scoped to
+    # findings_written for the same #650 reason as the request-changes path:
+    # a duplicate capture of an already-recorded review must not re-process.
+    if record.verdict == VERDICT_APPROVE and findings_written:
+        try:
+            from coord.state import resolve_issue_context_by_source  # noqa: PLC0415
+
+            resolve_issue_context_by_source(
+                record.repo_name,
+                record.issue_number,
+                "review",
+                note=f"approved in review {record.assignment_id}",
+            )
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
     return StoreOutcome(
         status="done",
         event=EVENT_COMPLETION,

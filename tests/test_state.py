@@ -4168,3 +4168,100 @@ class TestRenderIssueContextReviewFindingsExemption:
         lines = out.splitlines()
         assert lines[0].startswith("- 📌 PIN dep #99")
         assert "new note" in lines[1] and "old note" in lines[2]
+
+
+# ── #3148: an approve resolves carried-forward blocking findings ────────────
+
+
+class TestResolveIssueContextBySource:
+    """`resolve_issue_context_by_source` is the non-destructive peer of
+    `clear_issue_context_by_source` — it marks matching entries resolved IN
+    PLACE (never deletes them) so the audit trail of "raised, then waived, by
+    whom and when" survives, while the rendered digest shows the finding as
+    settled rather than still outstanding."""
+
+    def test_resolves_matching_unresolved_entries_only(self, coord_db) -> None:
+        state.add_issue_context_entry(
+            "api", 1, "Review requested changes — blocking findings:\nfoo",
+            source="review",
+        )
+        state.add_issue_context_entry(
+            "api", 1, "an unrelated non-review note", source="work",
+        )
+
+        resolved = state.resolve_issue_context_by_source(
+            "api", 1, "review", note="approved in review aid-99"
+        )
+        assert resolved == 1
+
+        entries = state.list_issue_context("api", 1)
+        review_entry = next(e for e in entries if e["source"] == "review")
+        other_entry = next(e for e in entries if e["source"] == "work")
+        assert review_entry["resolved_at"] is not None
+        assert review_entry["resolved_note"] == "approved in review aid-99"
+        # A non-matching source is left completely untouched.
+        assert other_entry["resolved_at"] is None
+        assert other_entry["resolved_note"] is None
+
+    def test_is_idempotent_and_does_not_overwrite_an_earlier_resolution(
+        self, coord_db
+    ) -> None:
+        state.add_issue_context_entry(
+            "api", 1, "blocking finding", source="review",
+        )
+        first = state.resolve_issue_context_by_source(
+            "api", 1, "review", note="approved in review aid-1"
+        )
+        assert first == 1
+        # A second resolve call (e.g. a duplicate approve capture) must not
+        # re-count or clobber the original resolution note.
+        second = state.resolve_issue_context_by_source(
+            "api", 1, "review", note="approved in review aid-2"
+        )
+        assert second == 0
+        entry = state.list_issue_context("api", 1)[0]
+        assert entry["resolved_note"] == "approved in review aid-1"
+
+    def test_no_matching_entries_is_a_harmless_no_op(self, coord_db) -> None:
+        resolved = state.resolve_issue_context_by_source(
+            "api", 1, "review", note="approved in review aid-1"
+        )
+        assert resolved == 0
+
+
+class TestRenderIssueContextResolvedMarker:
+    def test_resolved_entry_renders_with_resolved_marker(self) -> None:
+        entries = [
+            {
+                "id": 1, "pinned": False, "source": "review",
+                "body": "Review requested changes — blocking findings:\nfoo",
+                "created_at": 1.0,
+                "resolved_at": time.time(),
+                "resolved_note": "approved in review aid-5",
+            },
+        ]
+        out = state.render_issue_context_entries(entries)
+        assert "✅ **RESOLVED**" in out
+        assert "aid-5" in out
+
+    def test_unresolved_entry_renders_without_resolved_marker(self) -> None:
+        entries = [
+            {
+                "id": 1, "pinned": False, "source": "review",
+                "body": "still outstanding", "created_at": 1.0,
+                "resolved_at": None, "resolved_note": None,
+            },
+        ]
+        out = state.render_issue_context_entries(entries)
+        assert "RESOLVED" not in out
+
+    def test_entries_missing_resolved_keys_render_unchanged(self) -> None:
+        """Backward compatibility: entries from a pre-#3148 code path (or a
+        daemon that hasn't upgraded yet) carry no resolved_at/resolved_note
+        keys at all — must not KeyError."""
+        entries = [
+            {"id": 1, "pinned": False, "source": "review", "body": "x", "created_at": 1.0},
+        ]
+        out = state.render_issue_context_entries(entries)
+        assert "RESOLVED" not in out
+        assert "- x" in out

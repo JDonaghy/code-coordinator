@@ -3226,6 +3226,39 @@ def test_serve_issue_context_add_get_pin_clear(file_db: Path, valid_config_path:
     ).fetchone()["c"] == 0
 
 
+def test_serve_issue_context_resolve(file_db: Path, valid_config_path: Path, rw_db):
+    """#3148: the daemon-side counterpart of `resolve_issue_context_by_source`
+    — the non-destructive peer of "clear". Marks matching entries resolved
+    in place (never deletes) so a thin client's approve can waive carried-
+    forward blocking findings without losing the audit trail."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        cli.post("/issue-context", json={
+            "action": "add", "repo_name": "api", "issue_number": 7,
+            "body": "blocking finding", "source": "review",
+        })
+        cli.post("/issue-context", json={
+            "action": "add", "repo_name": "api", "issue_number": 7,
+            "body": "an unrelated note", "source": "work",
+        })
+        r = cli.post("/issue-context", json={
+            "action": "resolve", "repo_name": "api", "issue_number": 7,
+            "source": "review", "note": "approved in review aid-99",
+        })
+        assert r.status_code == 200
+        assert r.json()["resolved"] == 1
+
+        g = cli.get("/issue-context", params={"repo_name": "api", "issue_number": 7})
+        entries = {e["source"]: e for e in g.json()["entries"]}
+        assert entries["review"]["resolved_at"] is not None
+        assert entries["review"]["resolved_note"] == "approved in review aid-99"
+        # The unrelated entry is left completely untouched — resolved, not cleared.
+        assert entries["work"]["resolved_at"] is None
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM issue_context WHERE repo_name='api' AND issue_number=7"
+    ).fetchone()["c"] == 2
+
+
 def test_serve_issue_context_unknown_action_400(file_db: Path, valid_config_path: Path, rw_db):
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
     with TestClient(app) as cli:

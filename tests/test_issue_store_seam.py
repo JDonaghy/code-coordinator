@@ -1157,6 +1157,110 @@ class TestPostResult:
         assert "SplitTree on every drag" not in stored
         assert "trailing whitespace" not in stored
 
+    # ── #3148: an approve resolves carried-forward blocking findings ────────
+
+    def test_approve_resolves_prior_request_changes_context_entry(self) -> None:
+        """#3148 real incident (claude-coordinator#3138): the carry-forward
+        ledger was write-only for request-changes — an approve left zero
+        trace, so a re-review triggered later (e.g. a ci-fix leg) re-read the
+        same "blocking findings" entry an earlier approve had already waived
+        and was mechanically forced to re-block on it forever.
+
+        A round-1 request-changes must land an unresolved `source='review'`
+        digest entry; a later round's approve must mark it resolved IN PLACE
+        (never deleted — the audit trail is the point) so the rendered
+        digest shows it settled, not still outstanding."""
+        from coord.state import get_connection, issue_context_block
+
+        _seed_running_assignment("aid-3148-rc", assignment_type="review")
+        blocking = (
+            "## Blocking findings\n\n"
+            "- machine.sh's `--role` AC needs a real throwaway Ubuntu VM — "
+            "structurally unfixable from inside a headless worker\n"
+        )
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-3148-rc",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="one blocking finding",
+                    findings_body=blocking,
+                )
+            )
+
+        row = get_connection().execute(
+            "SELECT resolved_at, resolved_note FROM issue_context "
+            "WHERE repo_name=? AND issue_number=? AND source='review'",
+            ("api", 7),
+        ).fetchone()
+        assert row is not None
+        assert row["resolved_at"] is None, "unresolved right after request-changes"
+        digest_before = issue_context_block("api", 7)
+        # The header legend explains what the ✅ marker means (always present
+        # once there's any digest), but no entry is actually tagged resolved.
+        assert "✅ **RESOLVED**" not in digest_before
+
+        # A later round (a fresh review assignment, e.g. after a ci-fix leg)
+        # approves — this must resolve the still-outstanding entry above.
+        _seed_running_assignment("aid-3148-approve", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-3148-approve",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="approved — VM AC demoted to non-blocking",
+                )
+            )
+
+        row = get_connection().execute(
+            "SELECT resolved_at, resolved_note FROM issue_context "
+            "WHERE repo_name=? AND issue_number=? AND source='review'",
+            ("api", 7),
+        ).fetchone()
+        assert row is not None
+        assert row["resolved_at"] is not None
+        assert "aid-3148-approve" in row["resolved_note"]
+
+        digest_after = issue_context_block("api", 7)
+        assert "✅ **RESOLVED**" in digest_after
+        assert "aid-3148-approve" in digest_after
+
+    def test_approve_with_no_prior_findings_is_a_harmless_no_op(self) -> None:
+        """An approve on an issue with no carried-forward review findings must
+        not raise or fabricate a context entry — nothing to resolve."""
+        from coord.state import get_connection
+
+        _seed_running_assignment("aid-3148-clean-approve", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            outcome = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-3148-clean-approve",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                )
+            )
+        assert outcome.status == "done"
+        rows = get_connection().execute(
+            "SELECT COUNT(*) AS n FROM issue_context WHERE repo_name=? AND issue_number=?",
+            ("api", 7),
+        ).fetchone()
+        assert rows["n"] == 0
+
     def test_second_capture_with_allow_overwrite_replaces_findings(self) -> None:
         """#650: `allow_overwrite_findings=True` (the `--force` CLI flag) is the
         explicit-confirmation escape hatch — the write lands."""
