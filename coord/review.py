@@ -4098,6 +4098,7 @@ def maybe_scoped_review_for_completed_fix(
     Refetches the branch's live head SHA/patch-id (never trusts a stale
     queued value) and then reuses exactly
     :func:`dispatch_scoped_reviews_for_queue`'s own eligibility chain:
+    the ``entry.state == mq.PENDING`` check,
     :func:`~coord.merge_queue.has_approved_review`,
     :func:`~coord.merge_queue.find_scoped_review_candidate`,
     :func:`~coord.merge_queue.only_bounded_fix_since_review`, and the same
@@ -4105,12 +4106,65 @@ def maybe_scoped_review_for_completed_fix(
     intervening_work_since_review` non-empty ⇒ a ci-fix/fix-round leg
     contributed ⇒ run the nudge).
 
+    **Dedupe/anti-double-dispatch (review follow-up on #3161).** Unlike
+    every other review-dispatch entry point in this module, this function
+    originally had none of the three mechanisms the others carry
+    (:func:`dispatch_review`'s atomic ``claim_review_dispatch`` +
+    ``has_active_followup``, :func:`dispatch_scoped_reviews_for_queue`'s
+    ``already_handled`` board scan) — it re-derived eligibility purely from
+    ``has_approved_review``/``find_scoped_review_candidate``, both of which
+    only see reviews with ``review_verdict == "approve"``, so a review
+    dispatched moments ago (verdict still ``None``) was invisible to it.
+    Within a single ``coord notify`` pass this was a real, not hypothetical,
+    race: :func:`dispatch_pending_reviews`'s bulk scan and
+    :func:`coord.auto_loop.run_for_fix_transition` can both reach this
+    function for the identical ``completed.assignment_id`` before either has
+    a terminal-verdict review to show for it. Two defenses now close that:
+
+    1. **In-flight scan.** Right before dispatching, scans ``board`` (active
+       + completed) for a ``type="review"`` row that already shares the
+       *same* ``review_of_assignment_id`` this call is about to reuse
+       (``prior_review.review_of_assignment_id`` — what
+       :func:`dispatch_scoped_review` sets on its output, so this is the
+       identical delta) and was dispatched more recently than
+       *prior_review* itself — mirroring :func:`dispatch_scoped_reviews_
+       for_queue`'s own ``already_handled`` check. A hit means the other
+       caller already dispatched a scoped review for this exact voided
+       approval this pass; back off instead of dispatching a second one.
+    2. **Atomic claim.** Takes :func:`coord.state.claim_review_dispatch`
+       (after the cheap :func:`coord.claim.has_active_followup` fast path),
+       keyed on ``completed.assignment_id`` — the SAME key
+       :func:`dispatch_review` claims for the same ``completed``, so this
+       function and a concurrent ``dispatch_review(completed, ...)``
+       fallback call serialize against each other. Unlike
+       :func:`dispatch_review`'s claim, which stays held until the
+       dispatched review's own terminal-status write releases it, this one
+       is released on every exit from this function — including a
+       successful dispatch. It has to be: the scoped review this function
+       dispatches carries ``prior_review.review_of_assignment_id``, not
+       ``completed.assignment_id``, as its own ``review_of_assignment_id``,
+       so the terminal-status release hook (keyed on that field) would never
+       find a match and the claim would be stranded forever if left held.
+       This claim's job is therefore narrower than ``dispatch_review``'s —
+       it only closes the split-second TOCTOU window between reading
+       ``board`` and persisting the dispatch (the #3113 scenario), not the
+       whole in-flight lifetime. Covering that gap is
+       ``completed.review_state``: every caller sets it to ``"dispatched"``
+       immediately after either this function or ``dispatch_review`` returns
+       non-``None``, and both callers now check it — via
+       :func:`dispatch_pending_reviews`'s own ``eligible`` filter, and via
+       :func:`coord.auto_loop.run_for_fix_transition`'s explicit
+       ``fix.review_state`` guard (added alongside this) — before ever
+       reaching this function again for the same completed fix leg.
+
     Returns ``None`` (caller falls back to a full review) whenever: no
-    branch is recorded, no repo config, no matching queue entry, the
-    branch's current SHA/patch-id can't be resolved, an approved review
-    already covers the current head, no scoped candidate exists, or the
-    eligibility chain declines — the same fail-closed posture as every
-    other guard in this module.
+    branch is recorded, no repo config, a review dispatch is already
+    claimed/in flight for ``completed``, no matching queue entry, the queue
+    entry isn't ``PENDING``, the branch's current SHA/patch-id can't be
+    resolved, an approved review already covers the current head, no scoped
+    candidate exists, the eligibility chain declines, or an equivalent
+    scoped review is already in flight for the same delta — the same
+    fail-closed posture as every other guard in this module.
     """
     if not completed.branch:
         return None
@@ -4119,57 +4173,106 @@ def maybe_scoped_review_for_completed_fix(
         return None
 
     from coord import merge_queue as mq  # noqa: PLC0415
-
-    items = mq.load_queue()
-    entry = next(
-        (
-            e for e in items
-            if e.repo_github == repo.github and e.branch == completed.branch
-        ),
-        None,
+    from coord.claim import has_active_followup  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        claim_review_dispatch,
+        release_review_dispatch_claim,
     )
-    if entry is None:
-        return None  # never enqueued (or already cleared) — nothing to scope against
 
-    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
-    _get_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
-    try:
-        entry.branch_head_sha = _get_sha(entry.repo_github, entry.branch)
-    except Exception:  # noqa: BLE001 — fail-safe: unresolvable head → no scope
+    # #3161 review follow-up (dedupe mechanism 2 — see docstring). Same claim
+    # key `dispatch_review` uses for `completed`, taken before any of the
+    # eligibility chain below runs.
+    if has_active_followup(
+        board, of_assignment_id=completed.assignment_id, assignment_type="review"
+    ):
         return None
-    if entry.branch_head_sha is None:
+    if not claim_review_dispatch(completed.assignment_id):
         return None
+    _claim_held = True
+
+    def _release_claim() -> None:
+        nonlocal _claim_held
+        if _claim_held:
+            release_review_dispatch_claim(completed.assignment_id)
+            _claim_held = False
+
     try:
-        entry.branch_patch_id = _get_patch_id(
-            entry.repo_github, entry.target_branch, entry.branch
+        items = mq.load_queue()
+        entry = next(
+            (
+                e for e in items
+                if e.repo_github == repo.github and e.branch == completed.branch
+            ),
+            None,
         )
-    except Exception:  # noqa: BLE001
-        return None
-    if entry.branch_patch_id is None:
-        return None
+        if entry is None:
+            return None  # never enqueued (or already cleared) — nothing to scope against
 
-    if mq.has_approved_review(entry, board):
-        return None  # nothing stale to scope a review around
+        # #3161 review follow-up (non-blocking finding): parity with
+        # `dispatch_scoped_reviews_for_queue`'s own eligibility loop, which
+        # requires `entry.state == mq.PENDING` before considering an entry
+        # at all. A queue entry sitting in CONFLICT/MERGING/HUMAN_REQUIRED
+        # at the moment a same-branch fix leg completes elsewhere isn't safe
+        # to scope a review dispatch around.
+        if entry.state != mq.PENDING:
+            return None
 
-    prior_review = mq.find_scoped_review_candidate(entry, board)
-    if prior_review is None:
-        return None
-    if not mq.only_bounded_fix_since_review(entry, board, prior_review):
-        return None
+        _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+        _get_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
+        try:
+            entry.branch_head_sha = _get_sha(entry.repo_github, entry.branch)
+        except Exception:  # noqa: BLE001 — fail-safe: unresolvable head → no scope
+            return None
+        if entry.branch_head_sha is None:
+            return None
+        try:
+            entry.branch_patch_id = _get_patch_id(
+                entry.repo_github, entry.target_branch, entry.branch
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if entry.branch_patch_id is None:
+            return None
 
-    run_test_coverage_nudge = bool(
-        mq.intervening_work_since_review(entry, board, prior_review)
-    )
-    return dispatch_scoped_review(
-        entry, prior_review, board, config,
-        http_client=http_client,
-        now=now,
-        diff_fetcher=diff_fetcher,
-        branch_sha_fetcher=branch_sha_fetcher,
-        patch_id_computer=patch_id_computer,
-        terminal_cache=terminal_cache,
-        check_test_coverage=run_test_coverage_nudge,
-    )
+        if mq.has_approved_review(entry, board):
+            return None  # nothing stale to scope a review around
+
+        prior_review = mq.find_scoped_review_candidate(entry, board)
+        if prior_review is None:
+            return None
+        if not mq.only_bounded_fix_since_review(entry, board, prior_review):
+            return None
+
+        # #3161 review follow-up (dedupe mechanism 1 — see docstring):
+        # mirrors `dispatch_scoped_reviews_for_queue`'s own `already_handled`
+        # scan — a review for this exact voided approval may already have
+        # been dispatched by the OTHER caller earlier in this same pass.
+        pool = list(board.active) + list(board.completed)
+        already_handled = any(
+            a.type == "review"
+            and a.review_of_assignment_id == prior_review.review_of_assignment_id
+            and a.assignment_id != prior_review.assignment_id
+            and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
+            for a in pool
+        )
+        if already_handled:
+            return None
+
+        run_test_coverage_nudge = bool(
+            mq.intervening_work_since_review(entry, board, prior_review)
+        )
+        return dispatch_scoped_review(
+            entry, prior_review, board, config,
+            http_client=http_client,
+            now=now,
+            diff_fetcher=diff_fetcher,
+            branch_sha_fetcher=branch_sha_fetcher,
+            patch_id_computer=patch_id_computer,
+            terminal_cache=terminal_cache,
+            check_test_coverage=run_test_coverage_nudge,
+        )
+    finally:
+        _release_claim()
 
 
 def _fetch_issue_body(repo_github: str, issue_number: int) -> str:

@@ -1443,9 +1443,13 @@ def run_for_fix_transition(
     list[LoopAction]
         ``[LoopAction(kind="review_dispatched", ...)]`` on success,
         ``[LoopAction(kind="iteration_cap_hit", ...)]`` when the cap is hit,
-        ``[LoopAction(kind="disabled", ...)]`` when auto_loop is off, or
-        ``[]`` when the assignment is not found on the board or
-        ``dispatch_review`` cannot find a capable machine.
+        ``[LoopAction(kind="disabled", ...)]`` when auto_loop is off,
+        ``[LoopAction(kind="already_dispatched", ...)]`` when ``fix.
+        review_state`` already reflects a prior dispatch/outcome (#3161
+        review follow-up — closes the same-pass double-dispatch race with
+        ``dispatch_pending_reviews``), or ``[]`` when the assignment is not
+        found on the board or ``dispatch_review`` cannot find a capable
+        machine.
     """
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=assignment_id)]
@@ -1462,6 +1466,41 @@ def run_for_fix_transition(
             assignment_id,
         )
         return []
+
+    # #3161 review follow-up: `dispatch_pending_reviews`'s bulk loop filters
+    # its `eligible` list on `c.review_state in (None, "pending")` before it
+    # ever calls `maybe_scoped_review_for_completed_fix`/`dispatch_review` —
+    # so a row it already dispatched a review for (scoped or full;
+    # `review_state` is set to `"dispatched"` by BOTH paths) is invisible to
+    # a second pass. This function had no equivalent gate: within one
+    # `coord notify` pass, `_dispatch_board_pending_reviews()` runs (and can
+    # dispatch a review for `fix`, persisting `review_state="dispatched"`)
+    # BEFORE the `fix_completions` loop reaches this function with a freshly
+    # `read_board()`-loaded `fix` — but without this check the freshly-read
+    # `review_state` was never consulted, so this function dispatched a
+    # SECOND, fully independent review for the exact same delta every time.
+    # `maybe_scoped_review_for_completed_fix`'s own in-flight check (below)
+    # only catches a duplicate SCOPED dispatch; it can't stop the fallback
+    # to `dispatch_review` from firing a redundant FULL review, because that
+    # fallback's own dedup keys on `fix.assignment_id`, not the scoped
+    # review's `review_of_assignment_id` chain — this gate is what actually
+    # closes the race, by never letting either dispatch attempt happen a
+    # second time for the same completed fix leg.
+    if fix.review_state not in (None, "pending"):
+        log.info(
+            "auto_loop: NOT dispatching re-review for %s — review_state=%r "
+            "already reflects a prior dispatch/outcome this pass (or an "
+            "earlier one) handled",
+            assignment_id, fix.review_state,
+        )
+        return [LoopAction(
+            kind="already_dispatched",
+            assignment_id=assignment_id,
+            detail=(
+                f"review_state={fix.review_state!r} — a review for this fix "
+                "was already dispatched or resolved; not dispatching another"
+            ),
+        )]
 
     # #555: an *interactive* fix (provider_name="claude-pty") gets its re-review
     # from the human-attended TUI flow (leg 3 #517), never a headless metered

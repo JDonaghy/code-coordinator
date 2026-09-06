@@ -3674,6 +3674,180 @@ def test_maybe_scoped_review_returns_none_when_no_scoped_candidate(
     assert result is None
 
 
+def test_maybe_scoped_review_returns_none_when_queue_entry_not_pending(
+    two_machine_config: Config,
+) -> None:
+    """#3161 review follow-up (non-blocking finding): parity with
+    `dispatch_scoped_reviews_for_queue`'s own `entry.state == mq.PENDING`
+    gate — a queue entry sitting in CONFLICT/MERGING/HUMAN_REQUIRED at the
+    moment a same-branch fix leg completes elsewhere must not get a scoped
+    review dispatched around it."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry(state=mq.HUMAN_REQUIRED)])
+
+    def _boom(*a, **k):
+        raise AssertionError("must not fetch live state for a non-PENDING entry")
+
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        branch_sha_fetcher=_boom, branch_patch_id_fetcher=_boom, diff_fetcher=_boom,
+    )
+    assert result is None
+
+
+def test_maybe_scoped_review_declines_when_equivalent_review_already_in_flight(
+    two_machine_config: Config,
+) -> None:
+    """#3161 review follow-up (blocking finding): the "not hypothetical"
+    race — `dispatch_pending_reviews`'s bulk scan and `coord.auto_loop.
+    run_for_fix_transition` can both reach this function for the same
+    completed fix leg within one `coord notify` pass, before either has a
+    terminal-verdict review to show for it (`has_approved_review`/
+    `find_scoped_review_candidate` only see `review_verdict == "approve"`,
+    so an in-flight review with `review_verdict=None` is invisible to them).
+    A review already dispatched for the identical delta (same
+    `review_of_assignment_id` as *prior_review*, dispatched after it) must
+    make this call back off instead of dispatching a second one."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    # Already dispatched moments ago by the OTHER caller, in the same pass —
+    # verdict still unset, so `find_scoped_review_candidate` doesn't see it
+    # as a candidate, but it DOES cover the identical delta.
+    in_flight_scoped_review = Assignment(
+        machine_name="desktop", repo_name="api", issue_number=1,
+        issue_title="[scoped-review] Fix the thing", assignment_id="scoped-inflight",
+        type="review", status="running",
+        review_of_assignment_id="w1",  # == prior.review_of_assignment_id
+        dispatched_at=250.0,  # after prior_review's dispatched_at=100.0
+        review_scoped=True,
+    )
+    board = Board(
+        completed=[work, prior, ci_fix], active=[in_flight_scoped_review],
+    )
+    mq.save_queue([_scoped_entry()])
+
+    def _boom(*a, **k):
+        raise AssertionError(
+            "must not fetch a diff/dispatch when an equivalent review is "
+            "already in flight"
+        )
+
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+        diff_fetcher=_boom,
+    )
+    assert result is None
+
+
+def test_maybe_scoped_review_declines_when_claim_already_held(
+    two_machine_config: Config,
+) -> None:
+    """#3161 review follow-up (blocking finding), dedupe mechanism 2: the
+    atomic `claim_review_dispatch` this function now takes (keyed on
+    `completed.assignment_id`, the same key `dispatch_review` claims for the
+    same completed fix leg) serializes it against a concurrent
+    `dispatch_review(completed, ...)` fallback attempt for the identical
+    assignment — a held claim must short-circuit before any queue/board
+    lookup runs."""
+    from coord import merge_queue as mq
+    from coord.state import claim_review_dispatch, release_review_dispatch_claim
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    assert claim_review_dispatch("cifix1") is True
+    try:
+        def _boom(*a, **k):
+            raise AssertionError("must not touch the queue when the claim is held")
+
+        result = maybe_scoped_review_for_completed_fix(
+            ci_fix, board, two_machine_config,
+            branch_sha_fetcher=_boom, branch_patch_id_fetcher=_boom, diff_fetcher=_boom,
+        )
+        assert result is None
+    finally:
+        release_review_dispatch_claim("cifix1")
+
+
+def test_maybe_scoped_review_releases_claim_after_successful_dispatch(
+    two_machine_config: Config,
+) -> None:
+    """The claim taken for the duration of this call must not be left held
+    after a successful dispatch — it can't rely on the terminal-status
+    release hook (the scoped review's own `review_of_assignment_id` is
+    `prior_review`'s, not `completed.assignment_id`), so a subsequent
+    legitimate claim attempt for the same completed assignment must succeed
+    once this call has returned."""
+    from coord import merge_queue as mq
+    from coord.state import claim_review_dispatch, release_review_dispatch_claim
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    client = _FakeHTTPClient({"id": "scoped-mb"})
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        http_client=client,
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+    assert result is not None
+
+    # Claim was released — a fresh claim for the same completed assignment
+    # succeeds rather than finding it permanently stranded.
+    assert claim_review_dispatch("cifix1") is True
+    release_review_dispatch_claim("cifix1")
+
+
 # ── #916: composed regression for the full rebase-bounce handoff ───────────
 #
 # Each piece below (has_approved_review/scan_approved_reviews's patch-id

@@ -2197,6 +2197,41 @@ class TestRunForFixTransition:
         found = loaded.find_by_id("fix-1")
         assert found.review_state == "dispatched"
 
+    def test_run_for_fix_transition_skips_when_review_already_dispatched(
+        self, config: Config, coord_db
+    ) -> None:
+        """#3161 review follow-up: within one ``coord notify`` pass,
+        ``_dispatch_board_pending_reviews()`` can dispatch (and persist
+        ``review_state="dispatched"`` for) a review against this exact fix
+        leg BEFORE the ``fix_completions`` loop reaches
+        ``run_for_fix_transition`` for the same assignment. Neither
+        ``maybe_scoped_review_for_completed_fix`` nor ``dispatch_review``
+        must be tried again — the freshly-read ``fix.review_state`` alone is
+        enough to tell this call there is nothing left to do.
+        """
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment()
+        fix.review_state = "dispatched"  # set by the earlier bulk-scan call
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with (
+            patch("coord.auto_loop.maybe_scoped_review_for_completed_fix") as mock_scoped,
+            patch("coord.auto_loop.dispatch_review") as mock_full,
+        ):
+            actions = run_for_fix_transition("fix-1", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "already_dispatched"
+        mock_scoped.assert_not_called()
+        mock_full.assert_not_called()
+
+        # review_state is left exactly as found — this call didn't touch it.
+        loaded = load_board()
+        found = loaded.find_by_id("fix-1")
+        assert found.review_state == "dispatched"
+
     def test_run_for_fix_transition_falls_back_when_scoped_declines(
         self, config: Config, coord_db
     ) -> None:
