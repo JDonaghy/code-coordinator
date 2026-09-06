@@ -196,6 +196,9 @@ class FixtureServer:
     machine_metrics_raw: dict = field(default_factory=dict)
     sessions_raw: list = field(default_factory=list)
     drive_queue_raw: list = field(default_factory=list)
+    #: #3160: seeded issue titles backing `GET /api/drive-queue`'s `titles`
+    #: sibling field, keyed `"repo_name#N"` — see `issue_titles()`.
+    issue_titles_raw: dict = field(default_factory=dict)
     #: #2492 RPT-1: `GET /api/report`'s catalogue. `None` (the default) falls
     #: back to the real `coord.reports.catalogue()` — see `report_catalogue()`.
     report_catalogue_raw: dict | None = None
@@ -291,6 +294,18 @@ class FixtureServer:
             for a in (*board.active, *board.completed)
         )
         return compute_leg_counts(rows)
+
+    def issue_titles(self) -> dict[str, str]:
+        """The seeded issue-title map (#3160), keyed ``"repo_name#N"``.
+
+        No live-DB equivalent to reconstruct this from (a fixture has no
+        seeded ``issues`` table the way ``board()`` stands in for
+        ``assignments``), so unlike ``leg_counts()`` this is its own seeded
+        field rather than derived from ``board_payload``. Callers scope the
+        result to the drive-queue rows actually being returned — see
+        ``coord.dashboard.server``'s ``_read_issue_titles``.
+        """
+        return copy.deepcopy(self.issue_titles_raw)
 
     def report_catalogue(self) -> dict[str, Any]:
         """The seeded ``GET /api/report`` catalogue (#2492 RPT-1).

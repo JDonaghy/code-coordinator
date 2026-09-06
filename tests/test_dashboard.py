@@ -465,6 +465,7 @@ class TestDriveQueueAPI:
                 "held": 0,
                 "fleet_held": 0,
             },
+            "titles": {},
             "leg_counts": {},
         }
 

@@ -57,7 +57,7 @@ from coord.drive_queue import (
 from coord.models import Assignment
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 from coord.pipeline import PipelineView
-from coord.state import leg_counts, list_drive_queue, load_proposals
+from coord.state import get_issue_titles, leg_counts, list_drive_queue, load_proposals
 
 if TYPE_CHECKING:  # #3072: annotations only — keep module import cost flat
     from coord.gate_a import GateADecision
@@ -916,11 +916,27 @@ def openapi_spec() -> dict:
             "drive-queue relaunch (#2972) — see coord.state.leg_counts()."
         ),
     }
+    # #3160: `titles` — a FOURTH sibling, resolved from the `issues` table
+    # (not `drive_queue`) and scoped to `entries`' own `?repo=` filter, unlike
+    # `summary`/`leg_counts` which stay fleet-wide — see `api_drive_queue`'s
+    # docstring. Keyed `"repo_name#N"`; an entry whose issue isn't synced yet
+    # is simply absent, so this is an open map, not a fixed-shape object.
+    titles_schema = {
+        "type": "object",
+        "additionalProperties": {"type": "string"},
+        "description": (
+            "\"repo_name#issue_number\" -> issue title, covering the entries "
+            "actually returned (respects `?repo=`). An entry whose issue "
+            "isn't in the `issues` table yet is simply absent — no "
+            "placeholder, no error."
+        ),
+    }
     drive_queue_response = {
         "type": "object",
         "properties": {
             "entries": {"type": "array", "items": drive_queue_entry_ref},
             "summary": drive_queue_summary_ref,
+            "titles": titles_schema,
             "leg_counts": leg_counts_schema,
         },
     }
@@ -1472,8 +1488,9 @@ def openapi_spec() -> dict:
                 "summary": (
                     "The `coord drive` work queue in run order, plus a "
                     "server-computed pending/running/waiting/eligible/"
-                    "blocked/held summary (#2428 DQW-1) and all-time "
-                    "per-issue assignment leg counts by type (#3060)"
+                    "blocked/held summary (#2428 DQW-1), issue titles for "
+                    "the returned entries (#3160), and all-time per-issue "
+                    "assignment leg counts by type (#3060)"
                 ),
                 "parameters": [
                     {
@@ -1490,7 +1507,9 @@ def openapi_spec() -> dict:
                             "could misreport it as clear. `leg_counts` is "
                             "likewise always computed over the FULL history "
                             "(#3060) — it is keyed `\"repo#issue\"` so a client "
-                            "can still look up counts for the narrowed `entries`."
+                            "can still look up counts for the narrowed `entries`. "
+                            "`titles` (#3160), by contrast, DOES follow `repo` — "
+                            "it is resolved for `entries` only, not the full queue."
                         ),
                     }
                 ],
@@ -2298,6 +2317,35 @@ def build_app(
             return _fixture.leg_counts()
         return leg_counts()
 
+    def _read_issue_titles(rows: list[dict]) -> dict[str, str]:
+        """Issue titles for exactly *rows* (#3160) — backs ``GET
+        /api/drive-queue``'s ``titles`` sibling field.
+
+        Unlike ``summary``/``leg_counts`` (deliberately fleet-wide, see
+        ``api_drive_queue``'s docstring), this is scoped to the rows actually
+        being returned: callers pass the already ``?repo=``-filtered
+        ``entries`` list, not the full queue, so ``GET
+        /api/drive-queue?repo=quadraui`` resolves titles for the quadraui
+        rows only.
+
+        Same fixture-vs-live indirection as ``_read_drive_queue()``. Live
+        mode routes through :func:`coord.state.get_issue_titles`, which
+        itself resolves daemon-vs-local (thin client vs. local DB) exactly
+        like ``list_drive_queue`` — a bare local ``issues`` read here would
+        silently come back empty on a thin client. Fixture mode reads the
+        seeded map and intersects it with *rows*' own keys, so a stray
+        seeded title never leaks past the same filter the live path applies.
+        """
+        keys = {(r["repo_name"], int(r["issue_number"])) for r in rows}
+        if _fixture is not None:
+            seeded = _fixture.issue_titles()
+            return {
+                key: seeded[key]
+                for repo, number in keys
+                if (key := f"{repo}#{number}") in seeded
+            }
+        return get_issue_titles(keys)
+
     def _drive_queue_write(action: str, **fields) -> dict:
         """POST /drive-queue's ``{action, ...fields}`` shape (#2429 DQW-2).
 
@@ -2974,6 +3022,18 @@ def build_app(
         `drive_queue` projection, and `project_row` silently drops any field
         the row doesn't carry, so a computed field placed there would vanish
         on `/board` for every consumer instead of erroring loudly.
+
+        ``titles`` (#3160, :func:`coord.state.get_issue_titles` /
+        :meth:`coord.dashboard.fixture.FixtureServer.issue_titles`) is a
+        FOURTH sibling, resolved from the `issues` table rather than
+        `drive_queue` — same reasoning as ``leg_counts`` for why it lives on
+        the envelope and not on ``BoardDriveQueueEntry``. Unlike ``summary``/
+        ``leg_counts`` it follows ``entries``' own ``?repo=`` filter, not the
+        full queue: a title is a lookup keyed off the *visible* rows, with no
+        cross-repo aggregate question at stake the way the queue-health
+        summary has. An entry whose issue is absent from the `issues` table
+        (not yet synced) is simply missing from ``titles`` — no placeholder,
+        no error.
         """
         from dataclasses import asdict
 
@@ -2984,6 +3044,7 @@ def build_app(
         return JSONResponse({
             "entries": entries,
             "summary": asdict(summary),
+            "titles": _read_issue_titles(entries),
             "leg_counts": _read_leg_counts(),
         })
 
