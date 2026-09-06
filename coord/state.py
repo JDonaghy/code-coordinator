@@ -2579,6 +2579,60 @@ def clear_issue_context_by_source(
     return cur.rowcount
 
 
+def resolve_issue_context_by_source(
+    repo_name: str, issue_number: int, source: str, *, note: str
+) -> int:
+    """Mark #603 context entries with a given *source* (e.g. ``'review'``) as
+    resolved — the non-destructive peer of :func:`clear_issue_context_by_source`
+    (#3148).
+
+    Routes to the daemon when ``board_service`` is set, else writes the local
+    DB.  Returns the number of rows newly marked resolved.
+
+    #3148: an ``approve`` verdict used to leave zero trace in the carry-forward
+    ledger, so a re-review triggered later (e.g. by a ci-fix leg) re-read the
+    same "blocking findings" entries an earlier approve had already waived and
+    was mechanically forced to re-block on a worker-unfixable AC forever.
+    This marks matching entries **resolved in place** rather than deleting
+    them — the audit value of "this was raised and then waived, by whom and
+    when" is the point; a blunt delete would lose it. Idempotent: only rows
+    that are not already resolved are touched, so calling this twice (e.g. a
+    duplicate report-result capture) is a no-op the second time.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-context",
+        {
+            "action": "resolve",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "source": source,
+            "note": note,
+        },
+    )
+    if resp is not None:
+        return int(resp.get("resolved") or 0)
+    return _resolve_issue_context_by_source_local(
+        repo_name, issue_number, source, note=note
+    )
+
+
+def _resolve_issue_context_by_source_local(
+    repo_name: str, issue_number: int, source: str, *, note: str
+) -> int:
+    conn = get_connection()
+    cur = sql.execute(
+        conn,
+        "UPDATE issue_context SET resolved_at = ?, resolved_note = ? "
+        "WHERE repo_name = ? AND issue_number = ? AND source = ? "
+        "AND resolved_at IS NULL",
+        (time.time(), note, repo_name, issue_number, source),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def _parse_review_findings_blob(raw: object) -> tuple[str, str] | None:
     """Parse a stored ``review_findings`` blob into ``(verdict, body)``.
 
@@ -6609,11 +6663,16 @@ def _replace_issue_context_local(
             continue
         sql.execute(conn,
             "INSERT INTO issue_context "
-            "(repo_name, issue_number, pinned, source, body, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(repo_name, issue_number, pinned, source, body, created_at, "
+            " resolved_at, resolved_note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             # +i·µs keeps the supplied order stable under the created_at sort.
+            # #3148: carry resolved_at/resolved_note through a curate
+            # round-trip — a `coord context show --json | edit | replace`
+            # cycle must not silently un-resolve an already-waived finding.
             (repo_name, issue_number, 1 if e.get("pinned") else 0,
-             e.get("source"), body, now + i * 1e-6),
+             e.get("source"), body, now + i * 1e-6,
+             e.get("resolved_at"), e.get("resolved_note")),
         )
     conn.commit()
 
@@ -7487,7 +7546,8 @@ def run_report(report_id: str, params: dict[str, str] | None = None) -> dict:
 def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
     conn = get_connection()
     rows = sql.execute(conn,
-        "SELECT id, pinned, source, body, created_at FROM issue_context "
+        "SELECT id, pinned, source, body, created_at, resolved_at, resolved_note "
+        "FROM issue_context "
         "WHERE repo_name = ? AND issue_number = ? ORDER BY created_at",
         (repo_name, issue_number),
     ).fetchall()
@@ -7498,6 +7558,10 @@ def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
             "source": r["source"],
             "body": r["body"],
             "created_at": r["created_at"],
+            # #3148: NULL until a later review explicitly resolves/waives
+            # this entry (e.g. an approve carrying it forward as settled).
+            "resolved_at": r["resolved_at"],
+            "resolved_note": r["resolved_note"],
         }
         for r in rows
     ]
@@ -7553,7 +7617,16 @@ def render_issue_context_entries(
     def _fmt(e: dict) -> str:
         tag = "📌 " if e.get("pinned") else ""
         src = f"  _[{e['source']}]_" if e.get("source") else ""
-        return f"- {tag}{(e.get('body') or '').strip()}{src}"
+        # #3148: a resolved entry (e.g. a blocking finding an approve
+        # explicitly waived) stays in the digest — deleting it would lose the
+        # audit trail of "raised, then waived, by whom" — but must render as
+        # visibly settled so a later re-review doesn't read it as still
+        # outstanding and mechanically re-block on it.
+        resolved_note = (e.get("resolved_note") or "").strip()
+        resolved = (
+            f"  ✅ **RESOLVED** — {resolved_note}" if resolved_note else ""
+        )
+        return f"- {tag}{(e.get('body') or '').strip()}{src}{resolved}"
 
     # (entry, formatted line), in display order — pinned first, then the
     # newest notes up to the max_entries budget.
@@ -7645,7 +7718,9 @@ def issue_context_block(repo_name: str, issue_number: int) -> str:
         "Findings carried forward from earlier work on this issue (cross-repo "
         "dependencies, approaches already tried, hard constraints). Treat these "
         "as authoritative — do **not** rediscover or contradict them; build on "
-        "them. 📌 = pinned critical.\n\n"
+        "them. 📌 = pinned critical. ✅ RESOLVED = a prior finding a later "
+        "review explicitly waived/resolved (e.g. an approve) — settled, not "
+        "still outstanding.\n\n"
         f"{digest}\n\n"
         "---\n\n"
     )

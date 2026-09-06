@@ -2032,6 +2032,15 @@ def build_review_briefing(
             "the coordinator will not dispatch another fix round for "
             "non-blocking findings."
         )
+        lines.append(
+            "4. **A finding in the issue-context digest above marked "
+            "`✅ RESOLVED` is settled, not outstanding** — a previous review "
+            "round approved the issue with that item explicitly carried "
+            "forward and waived (e.g. a worker-unfixable AC). It is no longer "
+            "\"a previously-requested change that was not addressed\"; do "
+            "not re-raise it as blocking unless you have independently found "
+            "it broken again in the current diff."
+        )
     elif pr_number is not None:
         if diff_text and diff_text.strip():
             lines.append(

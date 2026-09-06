@@ -690,6 +690,25 @@ def test_briefing_re_review_is_incremental_and_nit_suppressing() -> None:
     assert "git log --oneline origin/main...origin/my-branch" in briefing
 
 
+def test_briefing_re_review_tells_reviewer_resolved_findings_are_settled() -> None:
+    """#3148: a re-review's own "block ONLY for ... a previously-requested
+    change that was not addressed" instruction used to be a trap — a
+    worker-unfixable AC an earlier round explicitly approved-and-waived still
+    read as an unresolved "previously-requested change" verbatim, forcing a
+    mechanical re-block forever. The re-review instructions must now tell the
+    reviewer that a `✅ RESOLVED` entry in the issue-context digest is
+    settled, not still outstanding."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        default_branch="main", review_iteration=5,
+    )
+    assert "RESOLVED" in briefing
+    assert "settled" in briefing.lower()
+
+
 def test_briefing_embeds_diff_text_when_supplied() -> None:
     """#612: a supplied merge-base diff is embedded verbatim and the reviewer
     is told NOT to compute its own diff (a stale-base diff false-flags

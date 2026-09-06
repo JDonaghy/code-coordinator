@@ -807,7 +807,10 @@ def retry_on_locked(
 # landed on main first, so this branch's bump stacks on top of it as 10 rather
 # than colliding at 9. Both bumps are still required — they create different
 # schema objects.
-_DB_SCHEMA_VERSION = 10
+#
+# #3148: bumped 10 -> 11 for the two `issue_context.resolved_at`/
+# `resolved_note` columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 11
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1078,7 +1081,15 @@ _SCHEMA_SQL = """
             pinned       INTEGER NOT NULL DEFAULT 0,
             source       TEXT,
             body         TEXT    NOT NULL,
-            created_at   REAL    NOT NULL
+            created_at   REAL    NOT NULL,
+            -- #3148: NULL until a later review explicitly resolves/waives this
+            -- entry (e.g. an approve carrying a worker-unfixable blocking
+            -- finding forward as settled rather than re-blocking on it
+            -- forever). Marked, never deleted — the audit value of "raised,
+            -- then waived, by whom and when" is the point. See
+            -- coord.state.resolve_issue_context_by_source.
+            resolved_at   REAL,
+            resolved_note TEXT
         );
 
         -- #1036: durable, append-only audit trail.  One row per real
@@ -2076,6 +2087,14 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # migration and for an entry with no cached fetch, read identically by
     # `coord.ci_store.ci_failure_detail_from_json`.
     "ALTER TABLE merge_queue ADD COLUMN ci_fix_detail_json TEXT",
+    # #3148: see the CREATE TABLE comment above — resolve-in-place marker for
+    # a #603 issue-context entry (e.g. a blocking finding an `approve`
+    # explicitly waives), so the carry-forward ledger stops being write-only
+    # for `request-changes`. NULL for every row predating this migration and
+    # for any entry never explicitly resolved — read identically to "still
+    # outstanding" by coord.state.render_issue_context_entries.
+    "ALTER TABLE issue_context ADD COLUMN resolved_at REAL",
+    "ALTER TABLE issue_context ADD COLUMN resolved_note TEXT",
 ]
 
 

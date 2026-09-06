@@ -8415,6 +8415,18 @@ def build_app(
                     body["repo_name"], body["issue_number"]
                 )
                 return JSONResponse({"deleted": deleted})
+            if action == "resolve":
+                # #3148: mark existing entries of a given source (e.g.
+                # 'review') resolved in place — the non-destructive daemon-side
+                # counterpart of "clear", so an approve can waive carried-
+                # forward blocking findings without losing the audit trail.
+                resolved = state._resolve_issue_context_by_source_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    body["source"],
+                    note=body.get("note") or "",
+                )
+                return JSONResponse({"resolved": resolved})
             if action == "replace":
                 state._replace_issue_context_local(
                     body["repo_name"], body["issue_number"], body.get("entries") or []

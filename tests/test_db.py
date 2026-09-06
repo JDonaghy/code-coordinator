@@ -2379,7 +2379,9 @@ class TestUatStateAndReasonColumns:
 # `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 80, so only the version
 # moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to run once
 # more on an existing database).
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (10, 80)
+# #3148 bumped this to (11, 82): `issue_context.resolved_at` /
+# `resolved_note`.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (11, 82)
 
 
 class TestMigrateAddColumnsVersionGuard:
