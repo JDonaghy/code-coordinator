@@ -81,7 +81,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 
 log()  { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
-warn() { printf '    ! %s\n' "$*" >&2; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf '\nthrowaway-vm: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -108,6 +108,12 @@ usage: throwaway-vm.sh --role thin-client|worker|server [options]
   --keep                  do NOT delete the resource group on exit. Use this
                           for the first half of an idempotency check; you are
                           responsible for deleting it afterwards.
+  --wait-teardown         after the delete is submitted, poll 'az group show'
+                          until the resource group actually 404s (bounded
+                          timeout) and report confirmed deletion. Without
+                          this, '--no-wait' means the script only knows the
+                          delete was SUBMITTED, not that it finished --
+                          #3152's repeated runs should pass this.
   -h, --help              this
 
 The credentials phase is interactive by design (tailscale up, gh auth login,
@@ -126,6 +132,7 @@ ADMIN_USER="azureuser"
 OUT_FILE=""
 PROVISION_ARGS=""
 KEEP=0
+WAIT_TEARDOWN=0
 VM_NAME="throwaway"
 
 # Overridable only so the test suite can drive the reachability loop in
@@ -133,6 +140,10 @@ VM_NAME="throwaway"
 # build-worker-image.sh's own wait loop (30 x 10s).
 SSH_WAIT_ATTEMPTS="${THROWAWAY_VM_SSH_WAIT_ATTEMPTS:-30}"
 SSH_WAIT_SLEEP="${THROWAWAY_VM_SSH_WAIT_SLEEP:-10}"
+
+# Same pattern, for --wait-teardown's post-delete confirmation poll.
+TEARDOWN_WAIT_ATTEMPTS="${THROWAWAY_VM_TEARDOWN_WAIT_ATTEMPTS:-30}"
+TEARDOWN_WAIT_SLEEP="${THROWAWAY_VM_TEARDOWN_WAIT_SLEEP:-10}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -150,6 +161,7 @@ while [[ $# -gt 0 ]]; do
         --out)             OUT_FILE="$2"; shift 2 ;;
         --provision-args)  PROVISION_ARGS="$2"; shift 2 ;;
         --keep)            KEEP=1; shift ;;
+        --wait-teardown)   WAIT_TEARDOWN=1; shift ;;
         -h|--help)         usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -188,6 +200,12 @@ info "resource group: $RG   role: $ROLE   machine: $MACHINE_NAME   evidence: $OU
 
 CLEANED_UP=0
 cleanup() {
+    # #2096: the exit status that was ALREADY PENDING when this trap fired —
+    # captured before anything else touches $? — is what a teardown failure
+    # gets compared against below, so a failure discovered here can flip a
+    # would-be-clean run to non-zero without clobbering an existing failure's
+    # own exit code.
+    local trigger_status=$?
     [[ $CLEANED_UP -eq 1 ]] && return
     CLEANED_UP=1
     if [[ $KEEP -eq 1 ]]; then
@@ -196,8 +214,44 @@ cleanup() {
         return
     fi
     log "teardown: deleting resource group $RG"
-    az group delete -n "$RG" --yes --no-wait -o none 2>/dev/null || true
-    info "delete accepted (async) — 'az group show -n $RG' will 404 once it finishes"
+    local delete_stderr delete_rc=0
+    delete_stderr="$(mktemp)"
+    # Keep az's own stderr instead of discarding it — it is the one message
+    # that would explain a submission failure.
+    az group delete -n "$RG" --yes --no-wait -o none 2>"$delete_stderr" || delete_rc=$?
+    if [[ $delete_rc -ne 0 ]]; then
+        warn "'az group delete -n $RG --yes --no-wait' failed to submit (exit $delete_rc) — $RG may still exist and still be billing."
+        if [[ -s "$delete_stderr" ]]; then
+            warn "az said:"
+            while IFS= read -r line; do warn "  $line"; done < "$delete_stderr"
+        fi
+        warn "delete it by hand:  az group delete -n $RG --yes"
+        rm -f "$delete_stderr"
+        # A teardown that failed to even submit must not be reported as a
+        # clean run — but don't paper over an existing non-zero exit either.
+        [[ $trigger_status -eq 0 ]] && exit 1
+        return
+    fi
+    rm -f "$delete_stderr"
+    # --no-wait means "submitted" is the strongest claim available right
+    # now — NOT "accepted" or "deleted". The delete could still fail after
+    # this (a resource lock, a stuck child resource).
+    info "delete submitted (async, --no-wait) — 'az group show -n $RG' will 404 once it finishes"
+
+    [[ $WAIT_TEARDOWN -eq 1 ]] || return
+    log "--wait-teardown: polling until $RG actually disappears"
+    local attempt=0
+    while [[ $attempt -lt $TEARDOWN_WAIT_ATTEMPTS ]]; do
+        if ! az group show -n "$RG" -o none >/dev/null 2>&1; then
+            info "confirmed: resource group $RG is gone"
+            return
+        fi
+        attempt=$((attempt + 1))
+        sleep "$TEARDOWN_WAIT_SLEEP"
+    done
+    warn "timed out after $TEARDOWN_WAIT_ATTEMPTS attempt(s) waiting for $RG to disappear — it may still exist."
+    warn "verify by hand:  az group show -n $RG"
+    [[ $trigger_status -eq 0 ]] && exit 1
 }
 trap cleanup EXIT
 # Bash also runs the EXIT trap on an otherwise-fatal untrapped signal, but an
