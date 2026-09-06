@@ -7564,6 +7564,48 @@ def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
     return [_decode_drive_queue_row(r) for r in rows]
 
 
+def get_issue_titles(keys: Iterable[tuple[str, int]]) -> dict[str, str]:
+    """Best-effort issue titles for ``(repo_name, issue_number)`` pairs, keyed
+    ``"repo_name#N"`` — backs ``GET /api/drive-queue``'s ``titles`` sibling
+    field (#3160).
+
+    Routes to the daemon when ``board_service`` is set — one ``GET
+    /issue/{repo}/{n}`` per unique key via :func:`coord.client.fetch_issue`,
+    the same routed single-issue read ``coord.reconcile`` already relies on —
+    else reads the local ``issues`` table directly. This split matters: a
+    thin client (``coord web`` pointed at a remote daemon) has no local
+    ``issues`` table, so a bare local SELECT here would silently return an
+    empty map and reintroduce the exact bug this function exists to fix.
+
+    Best-effort like ``coord.reports._lookup_titles``: an issue absent from
+    the ``issues`` table (not yet synced) is simply missing from the returned
+    map — never an empty string, never a raised error.
+    """
+    unique = sorted({(repo, int(number)) for repo, number in keys})
+    if not unique:
+        return {}
+    out: dict[str, str] = {}
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_issue  # noqa: PLC0415
+
+        for repo, number in unique:
+            row = fetch_issue(svc, repo, number)
+            if row is not None and row.get("title"):
+                out[f"{repo}#{number}"] = row["title"]
+        return out
+    conn = get_connection()
+    for repo, number in unique:
+        row = sql.execute(
+            conn,
+            "SELECT title FROM issues WHERE repo_name = ? AND number = ?",
+            (repo, number),
+        ).fetchone()
+        if row is not None and row["title"]:
+            out[f"{repo}#{number}"] = row["title"]
+    return out
+
+
 def leg_counts() -> dict[str, dict[str, int]]:
     """All-time per-issue assignment leg counts by type, keyed ``"repo#N"``
     (#3060) — backs ``GET /api/drive-queue``'s ``leg_counts`` sibling field.

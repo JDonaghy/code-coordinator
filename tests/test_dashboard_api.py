@@ -2547,3 +2547,131 @@ class TestJournalAPI:
         ]["content"]["application/json"]["schema"]
         errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
         assert errors == [], errors
+
+
+class TestDriveQueueTitles:
+    """GET /api/drive-queue's `titles` sibling field (#3160).
+
+    `entries` alone carries no issue title — `BoardDriveQueueEntry` is a
+    literal `drive_queue` row projection that also doubles as `/board`'s wire
+    shape, so a title (sourced from the separate `issues` table) deliberately
+    isn't added there (see `api_drive_queue`'s docstring). `titles` resolves
+    it as a sibling map on the envelope instead, scoped to the entries
+    actually returned — unlike `summary`/`leg_counts`, which stay fleet-wide
+    regardless of `?repo=`.
+    """
+
+    def test_local_db_resolves_titles_for_every_returned_entry(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local, _upsert_issue_local
+
+        _upsert_issue_local("api", {"number": 1, "title": "Fix the thing"})
+        _upsert_issue_local("api", {"number": 2, "title": "Another issue"})
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("api", 2)
+
+        client = _client()
+        r = client.get("/api/drive-queue")
+        assert r.status_code == 200
+        assert r.json()["titles"] == {
+            "api#1": "Fix the thing",
+            "api#2": "Another issue",
+        }
+
+    def test_issue_missing_from_the_issues_table_is_simply_absent(
+        self, rw_db
+    ) -> None:
+        """Not yet synced -> missing key, never an empty string or an error."""
+        from coord.state import _enqueue_drive_queue_local, _upsert_issue_local
+
+        _upsert_issue_local("api", {"number": 1, "title": "Synced issue"})
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("api", 2)  # never synced — no issues row
+
+        client = _client()
+        titles = client.get("/api/drive-queue").json()["titles"]
+        assert titles == {"api#1": "Synced issue"}
+        assert "api#2" not in titles
+
+    def test_repo_filter_scopes_titles_to_the_filtered_entries(self, rw_db) -> None:
+        """`titles` follows `entries`' own `?repo=` filter — unlike `summary`/
+        `leg_counts`, which the sibling tests in test_dashboard.py pin as
+        deliberately fleet-wide."""
+        from coord.state import _enqueue_drive_queue_local, _upsert_issue_local
+
+        _upsert_issue_local("api", {"number": 1, "title": "API issue"})
+        _upsert_issue_local("web", {"number": 9, "title": "Web issue"})
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("web", 9)
+
+        client = _client()
+        data = client.get("/api/drive-queue", params={"repo": "api"}).json()
+        assert data["titles"] == {"api#1": "API issue"}
+
+    def test_thin_client_routes_title_lookup_to_the_daemon(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """A `coord web` thin client has no local `issues` table — resolving
+        `titles` off a bare local SELECT would silently come back empty and
+        reintroduce #3160. The lookup must route through the daemon's own
+        `GET /issue/{repo}/{n}` (`coord.client.fetch_issue`), exactly like
+        `coord.state.get_issue_titles` does when `board_service` is set."""
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        class _Resp:
+            def __init__(self, payload):
+                self.status_code = 200
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kw):
+            if url == "http://daemon:7435/drive-queue":
+                return _Resp({
+                    "entries": [
+                        {"repo_name": "api", "issue_number": 1, "state": "waiting"},
+                    ]
+                })
+            if url == "http://daemon:7435/leg-counts":
+                return _Resp({})
+            if url == "http://daemon:7435/issue/api/1":
+                return _Resp({
+                    "repo_name": "api", "number": 1, "title": "Remote title",
+                })
+            raise AssertionError(f"unexpected GET {url}")
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/drive-queue")
+        assert r.status_code == 200
+        data = r.json()
+        # Proves the queue itself came from the (mocked) daemon too, not this
+        # thin client's own empty local DB.
+        assert [e["repo_name"] for e in data["entries"]] == ["api"]
+        assert data["titles"] == {"api#1": "Remote title"}
+
+    def test_response_matches_its_openapi_schema(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local, _upsert_issue_local
+
+        _upsert_issue_local("api", {"number": 1, "title": "Fix the thing"})
+        _enqueue_drive_queue_local("api", 1)
+
+        client = _client()
+        r = client.get("/api/drive-queue")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/drive-queue"]["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
