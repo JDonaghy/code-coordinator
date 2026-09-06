@@ -1949,6 +1949,23 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
             err=True,
         )
         sys.exit(1)
+    if assignment.status == "refused_premise":
+        # #3164: same shape as refused_policy above — the worker did the
+        # right thing (investigated and found the issue's premise false or
+        # its prerequisite unmet), and retrying reproduces the identical,
+        # correct refusal since nothing about that has changed. The
+        # remedy differs from refused_policy's: no title rewrite fixes a
+        # missing prerequisite.
+        click.echo(
+            f"error: assignment {assignment_id} is 'refused_premise' — the "
+            "worker investigated and found the issue's premise false or its "
+            "prerequisite unmet. Retrying cannot change that verdict. Needs "
+            "the coordinator: re-scope or close the issue (no title rewrite "
+            "fixes this) and audit the `after=` edges of anything queued "
+            "behind it, then `coord drive-queue remove` once handled (#3164).",
+            err=True,
+        )
+        sys.exit(1)
     if assignment.status not in ("failed", "advisory"):
         click.echo(
             f"error: assignment {assignment_id} is {assignment.status!r}, not "

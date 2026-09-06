@@ -109,7 +109,7 @@ from coord.drive_queue import entry_key
 # terminal (the tick's question is "is this issue still being worked"), and
 # ``done`` is precisely the state a finished-but-unmerged PR sits in.
 LANDED_STATUSES = frozenset(
-    {"merged", "cancelled", "advisory", "refused_policy", "failed"}
+    {"merged", "cancelled", "advisory", "refused_policy", "refused_premise", "failed"}
 )
 
 # Where one side's file list came from. Recorded on every overlap so a later
@@ -574,7 +574,8 @@ def inflight_assignments(
     can no longer collide with anything:
 
     * ``merged`` — it IS the base now;
-    * ``cancelled`` / ``advisory`` / ``refused_policy`` — never produced work;
+    * ``cancelled`` / ``advisory`` / ``refused_policy`` / ``refused_premise``
+      — never produced work;
     * ``failed`` — a dead branch. Excluded deliberately: a failed attempt can
       sit on the board indefinitely, and ordering live work behind a corpse
       would be a permanent latency cost with no collision to prevent. A retry

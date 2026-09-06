@@ -121,6 +121,7 @@ from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
     MERGE_LANDED_MARKER,
     POLICY_REFUSAL_MARKER,
+    PREMISE_REFUSAL_MARKER,
 )
 from coord.self_health import self_freshness
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
@@ -2243,6 +2244,42 @@ def decide(
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}\n"
             f"   {POLICY_REFUSAL_MARKER}"
+        )
+    elif state.work_status == "refused_premise":
+        # #3164: the worker exited cleanly, pushed 0 commits, and its own
+        # final message shows it investigated the issue and found its stated
+        # premise false or its prerequisite unmet (`coord.agent.
+        # REFUSED_PREMISE` — the quadraui#812 shape: a "depends on Phase 1
+        # and all Phase 2 slices" claim that was ~8% met). Unlike
+        # REFUSED_POLICY there is no #2871 staleness/retarget bypass here —
+        # rewriting the issue's TITLE cannot make a missing prerequisite
+        # exist, so a fresh `coord drive` launch on the same row would just
+        # reproduce the identical, correct refusal. `_die()` exactly like
+        # every other terminal branch here, WITHOUT the staleness check
+        # REFUSED_POLICY runs above.
+        age_seconds = (
+            time.time() - state.work_finished_at
+            if state.work_finished_at is not None
+            else None
+        )
+        age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
+        remedy = (
+            "Needs the coordinator: re-scope or close the issue — no title "
+            "rewrite fixes this, the prerequisite the worker checked for "
+            "genuinely does not exist yet — and audit the `after=` edges of "
+            "anything queued behind it (`coord drive-queue list`), since "
+            "whatever they were waiting on is not landing on the timescale "
+            "they assumed."
+        )
+        return _die(
+            f"pre-dispatch refusal on assignment {state.work_aid} "
+            f"(refused_premise, {age} old) — the worker investigated and "
+            "found the issue's premise false or its prerequisite unmet, "
+            f"rather than doing the dispatched work; the worker did the "
+            f"CORRECT thing (#3164). {remedy}\n"
+            f"   inspect: coord log {state.work_aid} --machine "
+            f"{state.work_machine or machine}\n"
+            f"   {PREMISE_REFUSAL_MARKER}"
         )
     elif state.work_status == "cancelled":
         return _die(

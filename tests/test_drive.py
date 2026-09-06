@@ -69,7 +69,7 @@ from coord.drive import (
 )
 from coord.drive_state import IssueState
 from coord.failure_class import environmental_backoff_secs
-from coord.models import POLICY_REFUSAL_MARKER, Machine, Repo
+from coord.models import POLICY_REFUSAL_MARKER, PREMISE_REFUSAL_MARKER, Machine, Repo
 from coord.usage_limits import PlanLimits
 
 
@@ -1968,6 +1968,71 @@ def test_refused_policy_still_blocking_distinguishes_uncertain_from_confident():
     assert confident.is_exit
     assert "could not confirm" not in confident.message.lower()
     assert "the next `coord drive` detects the retarget" in confident.message
+
+
+# ── refused_premise: #3164's distinct terminal shape ────────────────────────
+
+
+def test_refused_premise_work_is_terminal_and_carries_the_3164_marker():
+    """`coord.agent.REFUSED_PREMISE` reaches here as `work_status ==
+    "refused_premise"` and must exit — never wait, never treat it like a
+    bounded-retry failure. The message embeds `PREMISE_REFUSAL_MARKER` so
+    `coord/drive_queue.py`'s `_reconcile_running` can recognise it out of
+    this run's own `drive_exited` audit summary and park the queue entry
+    (STATE_PARKED) instead of spending an attempt or landing in `blocked`
+    — see tests/test_drive_queue.py's #3164 section for that half."""
+    action = step(state(work_aid="w1", work_status="refused_premise"))
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert PREMISE_REFUSAL_MARKER in action.message
+    assert "needs the coordinator" in action.message.lower()
+
+
+def test_refused_premise_still_blocking_names_the_assignment_and_age():
+    """Mirrors refused_policy's #2871 naming guarantee: the message names
+    the pre-dispatch assignment it refused on and the row's age."""
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="refused_premise",
+            work_finished_at=1000.0,
+        )
+    )
+    assert action.is_exit
+    assert "pre-dispatch refusal on assignment w1" in action.message
+    assert "refused_premise" in action.message
+    assert PREMISE_REFUSAL_MARKER in action.message
+
+
+def test_refused_premise_remedy_never_mentions_a_retarget():
+    """#3164's headline fix: unlike refused_policy, a premise refusal's
+    remedy must never suggest rewriting the issue's title — a retarget
+    cannot make a missing prerequisite exist. Also unlike refused_policy,
+    there is no staleness bypass: a retargeted title still dies here, since
+    #2871's title-vs-branch bypass is deliberately NOT wired for this
+    status (see the `decide()` branch's own comment)."""
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "A completely different retargeted deliverable"
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="refused_premise",
+            work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+            issue_title=title,
+            work_finished_at=1000.0,
+        )
+    )
+    assert action.is_exit, (
+        "a refused_premise row must still die even when the title was "
+        "rewritten to match the branch — no #2871-style bypass applies here"
+    )
+    assert action.audit_event is None
+    message_lower = action.message.lower()
+    assert "retarget" not in message_lower
+    assert "rewrite its title" not in message_lower
+    assert "re-scope or close the issue" in message_lower
+    assert "after=" in action.message
 
 
 def test_an_unknown_terminal_status_refuses_to_guess():

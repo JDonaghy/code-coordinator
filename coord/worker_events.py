@@ -466,6 +466,116 @@ def format_api_error_reason(
     return "api_error"
 
 
+# ── Zero-commit refusal classification (#2234 / #3164) ──────────────────────
+#
+# A worker that exits cleanly (exit_code==0) having pushed no commits is
+# either genuinely stuck (the #448 ADVISORY default) or correctly declining
+# to do the dispatched work at all. Two distinct shapes of "correctly
+# declining" exist, and confusing them hands the operator a remediation aimed
+# at the wrong problem (#3164, the issue this module section was added for):
+#
+# * POLICY (#2234) — the DELIVERABLE itself is something CLAUDE.md forbids a
+#   worker from ever doing (docs-only work, a sealed path, coordinator-owned
+#   files). The rule is a standing, permanent property of who may do the
+#   work — nothing about the issue's CONTENT is wrong.
+# * PREMISE (#3164) — the worker investigated and found the issue's stated
+#   premise false, or its stated prerequisite unmet. No prohibition is
+#   involved; there is simply nothing correct to build yet.
+#
+# Both kinds of message routinely cite CLAUDE.md or a numbered repo rule — a
+# PREMISE report often quotes the exact rule it is showing does NOT apply, or
+# runs a conformance test to prove a claimed violation doesn't hold — so a
+# marker list keyed only on "mentions a rule" cannot tell them apart. That is
+# exactly the quadraui#812 case #3164 exists to fix: the worker's own final
+# message cited "rule 7" while explaining why the issue's rule-7 claim was
+# wrong on both count and scope, and the old POLICY-only marker list matched
+# it anyway. `classify_zero_commit_refusal` below checks PREMISE markers
+# FIRST and lets them win on overlap: describing why a rule does or doesn't
+# apply — with a count, a re-run test, a "the issue's own stated X was Y"
+# comparison — is a strictly more specific signal than merely naming the
+# rule while declining on it.
+#
+# This is a best-effort prose heuristic, not a guarantee — see
+# `_looks_like_policy_refusal`'s own precedent for the same tradeoff. A
+# worker final message that reads as neither shape is left exactly as
+# ADVISORY as it always was; see `classify_zero_commit_refusal`'s docstring.
+_POLICY_REFUSAL_MARKERS = (
+    "claude.md",
+    "files_forbidden",
+    "repo rule",
+    "repo's rule",
+    "coordinator work",
+    "only the coordinator",
+    "coordinator-only",
+    "should never have been dispatched",
+)
+
+_PREMISE_REFUSAL_MARKERS = (
+    "premise is false",
+    "premise is wrong",
+    "premise is inaccurate",
+    "premise is unmet",
+    "premise is not",
+    "false premise",
+    "unmet premise",
+    "issue's premise",
+    "issue's own stated",
+    "issue's own claim",
+    "the issue's stated dependency",
+    "already superseded by",
+    "nothing correct to build",
+    "no correct work to dispatch",
+    "prerequisite does not exist",
+    "prerequisite is unmet",
+    "wrong on count",
+    "wrong on scope",
+)
+
+
+def looks_like_policy_refusal(text: str | None) -> bool:
+    """#2234: does *text* — a worker's own final message on a clean, 0-commit
+    exit — read as a refusal grounded in a STANDING repo-rule prohibition,
+    rather than a stuck/incomplete session?
+
+    Canonical home for the marker list `coord.agent._looks_like_policy_
+    refusal` delegates to (mirrors this module's `GRAPHIFY_INVOCATION_RE`
+    precedent) — `coord/agent.py` imports this rather than keeping its own
+    copy, so the two can never disagree about what counts as a policy
+    refusal (epic #2096: one question, one answer).
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _POLICY_REFUSAL_MARKERS)
+
+
+def looks_like_premise_refusal(text: str | None) -> bool:
+    """#3164: does *text* read as a worker reporting an investigated,
+    refuted issue premise (a false or unmet prerequisite), rather than a
+    standing-rule refusal or a stuck session?
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PREMISE_REFUSAL_MARKERS)
+
+
+def classify_zero_commit_refusal(text: str | None) -> str | None:
+    """Classify a worker's own final message on a clean, 0-commit exit.
+
+    Returns ``"premise"``, ``"policy"``, or ``None`` — neither shape matched,
+    so the #448 ADVISORY default applies. PREMISE is checked first: see the
+    module comment above for why an overlap (both marker sets present, e.g.
+    a premise report that also quotes the rule it's disproving a violation
+    of) must resolve toward PREMISE rather than POLICY.
+    """
+    if looks_like_premise_refusal(text):
+        return "premise"
+    if looks_like_policy_refusal(text):
+        return "policy"
+    return None
+
+
 # ── Field extraction helpers ────────────────────────────────────────────────
 
 

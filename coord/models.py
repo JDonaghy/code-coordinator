@@ -642,6 +642,47 @@ def is_policy_refusal_reason(text: str | None) -> bool:
     return bool(text) and POLICY_REFUSAL_MARKER in text
 
 
+# #3164: the machine-readable tag `coord.drive.decide` embeds in its
+# `_die()` message when a work row reaps as `coord.agent.REFUSED_PREMISE` —
+# the SIBLING shape to `POLICY_REFUSAL_MARKER` immediately above, for a
+# worker that exited cleanly (exit_code==0), pushed 0 commits, and whose OWN
+# final message shows it investigated the issue and found its stated premise
+# false or its prerequisite unmet (`coord.worker_events.
+# classify_zero_commit_refusal`; the quadraui#812 shape: an issue claiming a
+# dependency was met when the worker's own count showed it was ~8% met). No
+# repo rule was involved — nothing about WHO may do the work is wrong, only
+# WHETHER there is anything correct to build yet — so the correct operator
+# remedy is different in kind from a policy refusal's: retargeting the
+# issue's title cannot make a missing prerequisite exist, so #2871's
+# "rewrite the title, the next drive dispatches fresh work" story does not
+# apply here. The right fix is to re-scope or close the issue and audit its
+# dependents' `after=` edges, since whatever they were waiting on is not
+# landing on the timescale they assumed.
+#
+# Text-marker matching (not a dedicated exit code), same rationale as
+# `POLICY_REFUSAL_MARKER`: `coord/drive_queue.py`'s `_reconcile_running`
+# recognises this straight out of the drive's own `drive_exited` audit
+# summary (`own_reason`) and routes it to `STATE_PARKED` — no attempt spent
+# rediscovering a premise that hasn't changed — with remediation text that
+# does NOT mention a title retarget.
+PREMISE_REFUSAL_MARKER = "[refused-by-premise #3164]"
+
+
+def is_premise_refusal_reason(text: str | None) -> bool:
+    """Whether *text* is a #3164 premise-refusal park reason.
+
+    Like a policy refusal (`is_policy_refusal_reason`), a premise refusal has
+    no external verdict that can arrive and clear it on its own — the
+    prerequisite it names does not exist yet, and nothing on the board
+    signals when that changes — so nothing auto-resumes an entry parked for
+    this reason. An operator clears it by re-scoping or closing the issue
+    (never by retargeting the title alone — see the module comment above)
+    and auditing its dependents' `after=` edges, then `coord drive-queue
+    remove`.
+    """
+    return bool(text) and PREMISE_REFUSAL_MARKER in text
+
+
 # #2850: the machine-readable tag `coord.drive.decide` embeds in its
 # `_succeed()` message when the "terminal: merged" branch's own LIVE check
 # (`MergeVerifier.verify_merged`) confirms the issue has genuinely landed —
@@ -677,7 +718,7 @@ class Assignment:
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
     assignment_id: str | None = None
-    status: str = "pending"  # pending | running | done | failed | advisory | refused_policy
+    status: str = "pending"  # pending | running | done | failed | advisory | refused_policy | refused_premise
     branch: str | None = None
     pr_url: str | None = None
     dispatched_at: float | None = None

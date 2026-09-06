@@ -22,6 +22,7 @@ from coord.agent import (
     DONE,
     FAILED,
     REFUSED_POLICY,
+    REFUSED_PREMISE,
     AgentServer,
     AssignmentSpec,
     _looks_like_policy_refusal,
@@ -830,6 +831,135 @@ def test_health_counts_refused_policy_as_completed(
     h = server.health()
     assert h["active"] == 0, "REFUSED_POLICY must not count as active"
     assert h["completed"] >= 1, "REFUSED_POLICY must count as completed"
+    server.shutdown()
+
+
+# ── a premise refusal is its own status too, distinct from POLICY (#3164) ───
+#
+# #2234's REFUSED_POLICY only ever fires when the worker's own final message
+# cites a STANDING repo-rule prohibition. #3164 is a structurally different
+# outcome the same reap classifier used to mis-file into REFUSED_POLICY: the
+# worker investigated the issue and found its stated premise false or its
+# prerequisite unmet — no rule was involved, there is simply nothing correct
+# to build (the quadraui#812 case: 73 methods needed, 6 had a shared paint
+# plan; the issue's "depends on all Phase 2 slices" claim was ~8% met).
+
+_PREMISE_REFUSAL_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "Investigated the stated dependency and the rule-7 claim: '
+    "both are false. The issue's own stated dependency is only about 8% "
+    'met, so the premise is false -- there is nothing correct to build '
+    "yet. The rule-7 claim is wrong on count and wrong on scope, and is "
+    'already superseded by a conformance test that ran green."}'
+)
+
+
+def test_premise_refusal_zero_commit_is_refused_premise_not_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#3164's core regression guard: 0 commits + clean exit + a final
+    message reporting an investigated, refuted premise → REFUSED_PREMISE,
+    not ADVISORY and not REFUSED_POLICY."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_PREMISE_REFUSAL_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=812,
+        issue_title="NativeSurface Phase 3",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_PREMISE, (
+        f"expected REFUSED_PREMISE for a premise-refutation 0-commit exit, "
+        f"got {final.status!r}"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None, (
+        "must not ALSO carry the #448 advisory reason — mutually exclusive"
+    )
+    assert final.policy_refusal_reason is None, (
+        "must not ALSO carry the #2234 policy-refusal reason — mutually "
+        "exclusive"
+    )
+    assert final.premise_refusal_reason is not None
+    assert "premise is false" in final.premise_refusal_reason
+    server.shutdown()
+
+
+def test_premise_refusal_reason_appears_in_log(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The premise-refusal diagnosis is written to the assignment log,
+    mirroring the existing policy-refusal log guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_PREMISE_REFUSAL_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=813,
+        issue_title="a premise-refuted issue",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_PREMISE
+    assert final.log_path is not None
+    log_text = Path(final.log_path).read_text()
+    assert "refused_premise" in log_text.lower(), (
+        f"expected 'refused_premise' in log, got:\n{log_text}"
+    )
+    server.shutdown()
+
+
+def test_health_counts_refused_premise_as_completed(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """health() must count REFUSED_PREMISE assignments as completed, not
+    active — mirrors the existing REFUSED_POLICY/ADVISORY guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_PREMISE_REFUSAL_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=814,
+        issue_title="another premise-refuted issue",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == REFUSED_PREMISE
+
+    h = server.health()
+    assert h["active"] == 0, "REFUSED_PREMISE must not count as active"
+    assert h["completed"] >= 1, "REFUSED_PREMISE must count as completed"
     server.shutdown()
 
 

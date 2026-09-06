@@ -36,6 +36,7 @@ from coord.comments import (
     EVENT_NEEDS_ATTENTION,
     EVENT_PLAN,
     EVENT_REFUSED_POLICY,
+    EVENT_REFUSED_PREMISE,
     EVENT_STALLED,
     EVENT_STUCK,
     format_liveness_stall,
@@ -52,6 +53,7 @@ from coord.dispatch import (
     post_completion,
     post_failure,
     post_refused_policy,
+    post_refused_premise,
 )
 from coord.progress import parse_progress
 
@@ -1696,6 +1698,15 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
                 # review of an undecided outcome; the worker already found
                 # the answer.
                 event = EVENT_REFUSED_POLICY
+            elif entry_status == "refused_premise":
+                # #3164: sibling of the refused_policy arm above — the
+                # worker exited cleanly, pushed 0 commits, and its own final
+                # message reported an investigated, refuted issue premise
+                # (`coord.agent.REFUSED_PREMISE`) rather than a repo-rule
+                # citation. Same "post so GitHub-only readers see it"
+                # reasoning, distinct event so the comment prints the
+                # re-scope/close remedy rather than the title-retarget one.
+                event = EVENT_REFUSED_PREMISE
             else:
                 continue
             transitions.append(
@@ -3525,6 +3536,21 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # exactly the "no comment at all" regression #2234's review caught.
         post_refused_policy(
             reason=entry.get("policy_refusal_reason") or "",
+            **common,
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_REFUSED_PREMISE:
+        # #3164: sibling of the refused_policy arm above — 0-commit clean
+        # exit whose worker investigated the issue and found its premise
+        # false or its prerequisite unmet, rather than citing a repo-rule
+        # prohibition. Same reasoning for why this needs its own arm (the
+        # catch-all `else` below would silently drop it).
+        post_refused_premise(
+            reason=entry.get("premise_refusal_reason") or "",
             **common,
         )
         mark_notified(

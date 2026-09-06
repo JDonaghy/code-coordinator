@@ -104,7 +104,12 @@ from coord.merge_queue import (
     is_stale_smoke_reason,
 )
 from coord.milestone_order import TRACKING_ISSUE_LABEL
-from coord.models import EPIC_DECOMPOSE_TYPE, is_merge_landed_reason, is_policy_refusal_reason
+from coord.models import (
+    EPIC_DECOMPOSE_TYPE,
+    is_merge_landed_reason,
+    is_policy_refusal_reason,
+    is_premise_refusal_reason,
+)
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
 #
@@ -3663,6 +3668,46 @@ def _reconcile_running(
             None,
         )
 
+    # #3164 rides the SAME evidence as `refused_policy` immediately above —
+    # the drive's own `drive_exited` reason — but names a DIFFERENT permanent
+    # shape: `coord.drive.decide` marks a `refused_premise` work row with
+    # `PREMISE_REFUSAL_MARKER` (coord.models) when the worker's own final
+    # message shows it investigated the issue and found its stated premise
+    # false or its prerequisite unmet, rather than citing a repo-rule
+    # prohibition. Parks (#2234's same "no attempt spent" semantics) — but,
+    # unlike the `refused_policy` branch above, the remediation text does
+    # NOT suggest a title retarget: a retarget lets a fresh `coord drive`
+    # dispatch a DIFFERENT deliverable past a coordinator-only restriction,
+    # but rewriting a title cannot make a missing prerequisite exist. #3164
+    # was filed precisely because that retarget advice, printed for THIS
+    # shape (the quadraui#812 case), sent an operator down the wrong path —
+    # so the fix here is a distinct remedy, not a reworded one.
+    if own_reason and is_premise_refusal_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt (#3164); "
+            "needs the coordinator, not a relaunch — the worker's own "
+            "investigation found the issue's premise false or its "
+            "prerequisite unmet, and no title rewrite changes that. "
+            "Re-scope or close the issue, and audit the `after=` edges of "
+            "anything queued behind it (`coord drive-queue list`) — "
+            "whatever they were waiting on is not landing on the timescale "
+            "they assumed."
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     # #2977: `coord assign` exited because `_gh`'s pre-call guard found a
     # shared GitHub rate-limit backoff already active and skipped the call
     # entirely (`GhRateLimitError(from_cache=True)`) — no `gh` call was ever
@@ -5281,6 +5326,14 @@ def plan_tick(
         # bounce this check exists to prevent. Stays parked until a human
         # clears it (`coord drive-queue remove`, same as `blocked`).
         if is_policy_refusal_reason(entry.last_reason):
+            continue
+        # #3164: a premise-refusal park has the SAME "no external verdict to
+        # poll for" shape as the policy-refusal check just above — the
+        # prerequisite the worker found missing does not start existing on a
+        # timer, so this never resumes itself either. Stays parked until a
+        # human re-scopes/closes the issue and clears it by hand (`coord
+        # drive-queue remove`).
+        if is_premise_refusal_reason(entry.last_reason):
             continue
         # #2977: a throttle-skip park (`github_ops.is_throttle_skip_reason`)
         # carries its OWN known wall-clock expiry (`until=<epoch>`, embedded
