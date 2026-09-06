@@ -27,6 +27,33 @@ HTTP API (`coord/agent_app.py`) has **no authentication** — anything on the
 tailnet can `POST /assign` to any agent. The ACL is what stops a compromised
 worker reaching your machines.
 
+**The toolchain list is shared with the bare-metal lane, not copied from it
+(#3139).** [`scripts/lib/provision-core.sh`](../scripts/lib/provision-core.sh)
+owns *what a fleet machine needs* — the `gh` version floor, the Node major, the
+pinned opencode version, the system-wide Rust location, the base package list,
+the repo clone list and the prereq verification that mirrors `coord/prereqs.py`.
+Both `scripts/azure-workers/provision-worker.sh` (this lane) and
+[`scripts/provision-machine.sh`](../scripts/provision-machine.sh) (bare metal,
+#3138) source it; each keeps only the constraints of its own substrate:
+
+| | Azure image | bare metal |
+|---|---|---|
+| user | a dedicated `coord` user — `waagent -deprovision+user` deletes the *provisioning* user and its home | the operator's own account |
+| identity | **none by design** — credentials arrive per-boot from Key Vault | the whole point; interactive, front-loaded |
+| tailscale | installed, never `up` | `tailscale up`, interactive |
+| privilege | root throughout | `sudo` for packages only |
+| rust | system-wide at `/opt/rust` (the agent unit's PATH has no `~/.cargo/bin` — #1671) | per-user rustup; that lane's unit PATH *does* |
+| finish | `scrub-and-generalize.sh` | `coord machine doctor` |
+
+Every pinned value below has already drifted once and cost something, so the
+rule is enforced rather than documented: `tests/test_provision_core.py` greps
+both lanes and **fails on a second literal**, and separately fails when the
+shell-side `gh` floor and `coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION`
+disagree. `build-worker-image.sh` copies the core to the builder alongside
+`provision-worker.sh` and the script **hard-fails** if it is absent — never
+falls back to inlined defaults, because an image built from half a toolchain
+list is exactly the silent drift the core exists to prevent.
+
 ## One-time setup
 
 1. **Tailnet ACL** — apply [`scripts/azure-workers/tailnet-acl.hujson`](../scripts/azure-workers/tailnet-acl.hujson).
@@ -75,6 +102,18 @@ live interactive tmux sessions, deregisters, and deletes the resource group.
 ## Gotchas
 
 These each cost real time or money and are invisible from the code.
+
+Two of them are now **named tests** in `tests/test_provision_core.py`, driven to
+their *failing* verdict against a stub `az`/`gh` so they cannot quietly be
+weakened into warnings during a refactor:
+`test_the_build_hard_fails_on_an_image_definition_without_nvme` (the
+`DiskControllerTypes` declaration, both at create time and when reusing an old
+definition) and `test_the_gh_floor_hard_fails_on_an_old_or_silent_gh`. The
+"build as a non-provisioning user" and "zero identity" gotchas are pinned by
+`test_the_image_lane_still_builds_as_a_dedicated_non_provisioning_user` and
+`test_the_image_lane_still_installs_zero_identity`. The remaining ones —
+Key Vault DNS at boot, `XDG_RUNTIME_DIR`, the user-unit/system-unit ordering —
+live outside this repo's reach (cloud-init and `easy-azure`) and stay prose.
 
 **A stale tailnet node silently costs you 15 minutes.** If a node already holds
 the hostname, Tailscale names the new VM `<name>-1` and `epic-up` polls the

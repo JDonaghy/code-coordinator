@@ -58,6 +58,36 @@ update_epic_env() {
     echo "  (previous contents backed up to ${EPIC_ENV}.bak)"
 }
 
+# HARD-FAIL if the image definition being reused does not declare NVMe.
+#
+# `DiskControllerTypes` is IMMUTABLE after creation: it cannot be added later,
+# and a version cannot be copied into a definition whose features differ.
+# Omitting NVMe yields a SCSI-only image that v6/v7 SKUs (Dasv7 included)
+# refuse to boot from, with a confusing "cannot boot with OS image or disk"
+# error at DEPLOY time -- half an hour after the build reported success, on a
+# VM you are paying for. This is the first gotcha in docs/EPHEMERAL_WORKERS.md
+# and it is an `exit 1`, never a warning.
+#
+# A standalone function, like update_epic_env above, so
+# tests/test_provision_core.py can drive both verdicts for real against a stub
+# `az` -- a guard whose failing branch is never executed is not a guard.
+require_nvme_declared() {
+    local rg="$1" gallery="$2" image_def="$3" feat
+    feat="$(az sig image-definition show -g "$rg" --gallery-name "$gallery" \
+             --gallery-image-definition "$image_def" \
+             --query "features[?name=='DiskControllerTypes'].value | [0]" -o tsv 2>/dev/null)"
+    # An EMPTY answer is a failure, not a pass: `az` erroring out, or a
+    # definition with no features at all, must not fall through to "fine".
+    if [[ "$feat" != *NVMe* ]]; then
+        echo "ERROR: image definition '$image_def' declares DiskControllerTypes='${feat:-none}'." >&2
+        echo "  Features are immutable. Delete the definition and its versions, then re-run:" >&2
+        echo "    az sig image-version delete -g $rg --gallery-name $gallery --gallery-image-definition $image_def --gallery-image-version <ver>" >&2
+        echo "    az sig image-definition delete -g $rg --gallery-name $gallery --gallery-image-definition $image_def" >&2
+        return 1
+    fi
+    return 0
+}
+
 main() {
 RG=""; GALLERY=""; LOCATION="eastus"; IMAGE_DEF="coord-worker"
 VM_SIZE="Standard_D8as_v7"; OS_DISK_GB=128; ADMIN_USER="azureuser"
@@ -140,16 +170,7 @@ az sig image-definition create \
 
 # Fail loudly if an OLD definition without NVMe is being reused -- otherwise the
 # build succeeds and only the first epic-up discovers the image is unusable.
-_feat="$(az sig image-definition show -g "$RG" --gallery-name "$GALLERY" \
-         --gallery-image-definition "$IMAGE_DEF" \
-         --query "features[?name=='DiskControllerTypes'].value | [0]" -o tsv 2>/dev/null)"
-if [[ "$_feat" != *NVMe* ]]; then
-    echo "ERROR: image definition '$IMAGE_DEF' declares DiskControllerTypes='${_feat:-none}'." >&2
-    echo "  Features are immutable. Delete the definition and its versions, then re-run:" >&2
-    echo "    az sig image-version delete -g $RG --gallery-name $GALLERY --gallery-image-definition $IMAGE_DEF --gallery-image-version <ver>" >&2
-    echo "    az sig image-definition delete -g $RG --gallery-name $GALLERY --gallery-image-definition $IMAGE_DEF" >&2
-    exit 1
-fi
+require_nvme_declared "$RG" "$GALLERY" "$IMAGE_DEF" || exit 1
 
 # --------------------------------------------------------------------------
 log "1/6  create builder ($VM_SIZE, ${OS_DISK_GB}GB)"
@@ -180,8 +201,20 @@ $SSH true || { echo "builder never became reachable" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
 log "2/6  provision (10-20 min)"
+# #3139: provision-worker.sh sources the SHARED provisioning core, so the
+# builder needs it too. It goes to /tmp/lib/ — one of the two layouts
+# provision-worker.sh looks in — and the script hard-fails rather than falling
+# back to inlined values if it is missing, so a copy that silently did not
+# happen cannot produce a half-provisioned image that reports success.
+CORE_SRC="$HERE/../lib/provision-core.sh"
+[[ -f "$CORE_SRC" ]] || { echo "cannot find $CORE_SRC — the shared provisioning core (#3139)" >&2; exit 1; }
+$SSH "mkdir -p /tmp/lib"
 scp -o StrictHostKeyChecking=accept-new \
     "$HERE/provision-worker.sh" "$HERE/scrub-and-generalize.sh" "${ADMIN_USER}@${IP}:/tmp/"
+scp -o StrictHostKeyChecking=accept-new \
+    "$CORE_SRC" "${ADMIN_USER}@${IP}:/tmp/lib/"
+$SSH "test -f /tmp/lib/provision-core.sh" \
+    || { echo "provision-core.sh did not land on the builder" >&2; exit 1; }
 $SSH "chmod +x /tmp/provision-worker.sh /tmp/scrub-and-generalize.sh"
 $SSH "sudo /tmp/provision-worker.sh${PROVISION_ARGS}"
 
