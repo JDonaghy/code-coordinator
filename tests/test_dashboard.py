@@ -1848,6 +1848,60 @@ class TestPollOnce:
             "CLAUDE.md line 156: only the coordinator writes docs"
         )
 
+    def test_running_to_refused_premise_fires_assignment_refused_premise(self) -> None:
+        """#3164 regression: refused_premise must fire
+        ASSIGNMENT_REFUSED_PREMISE, not FAILED — sibling of
+        ``test_running_to_refused_policy_fires_assignment_refused_policy``
+        above.
+
+        Before this fix, refused_premise matched none of the named branches
+        ("done"/"cancelled"/"advisory"/"refused_policy") and fell into the
+        `else` arm — explicitly commented "'failed' and any other
+        unexpected terminal status" — publishing ASSIGNMENT_FAILED for a
+        worker that correctly refused on a refuted issue premise.
+        """
+        from coord.dashboard.server import (
+            ASSIGNMENT_REFUSED_PREMISE,
+            _poll_once,
+        )
+        from coord.events import ASSIGNMENT_FAILED, EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("rpr1")
+
+        agent_resp = {
+            "active": [],
+            "completed": [{
+                "id": "rpr1",
+                "status": "refused_premise",
+                "premise_refusal_reason": (
+                    "Phase 2 is ~8% complete; the dependency this issue "
+                    "assumes doesn't exist yet"
+                ),
+            }],
+        }
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=agent_resp,
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        event = es._history[0]
+        assert event.type == ASSIGNMENT_REFUSED_PREMISE, (
+            f"expected {ASSIGNMENT_REFUSED_PREMISE}, got {event.type!r} — "
+            "refused_premise must not be routed to ASSIGNMENT_FAILED"
+        )
+        assert event.type != ASSIGNMENT_FAILED
+        # premise_refusal_reason should be carried through to the client.
+        assert event.data.get("premise_refusal_reason") == (
+            "Phase 2 is ~8% complete; the dependency this issue assumes "
+            "doesn't exist yet"
+        )
+
     def test_absent_over_threshold_appears_in_possibly_stuck(self) -> None:
         """An assignment absent from agent data past the threshold is stuck."""
         from coord.dashboard.server import _poll_once

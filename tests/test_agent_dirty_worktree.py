@@ -34,6 +34,7 @@ from coord.agent import (
     ADVISORY,
     DONE,
     REFUSED_POLICY,
+    REFUSED_PREMISE,
     WORKER_SYSTEM_PROMPT,
     AgentAssignment,
     AgentServer,
@@ -258,6 +259,33 @@ def test_dirty_refused_policy_is_recorded_on_policy_refusal_reason(tmp_path: Pat
     # The stale, now-superseded refusal-only line must not be what the
     # operator sees once there's an unrecorded dirty worktree to explain.
     assert "only the coordinator writes docs" not in a.policy_refusal_reason
+
+
+def test_dirty_refused_premise_is_recorded_on_premise_refusal_reason(tmp_path: Path) -> None:
+    """#3164: sibling of
+    `test_dirty_refused_policy_is_recorded_on_policy_refusal_reason` above
+    for the REFUSED_PREMISE verdict — its equivalent surfaced field is
+    `premise_refusal_reason`, and a dirty worktree left behind by an
+    otherwise-correct premise refusal must be visible there, on the field
+    `coord status` / the GitHub refused_premise comment actually read."""
+    repo = _init_local_repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-b", "issue-1394-rpr", str(wt), "HEAD")
+    (wt / "fix.py").write_text("real work\n")
+
+    server = _server(tmp_path, repo)
+    a = _make_assignment(repo, wt, status=REFUSED_PREMISE, branch="issue-1394-rpr")
+    # What the reap writes for a worker that correctly refused per #3164.
+    a.premise_refusal_reason = "Phase 2 is ~8% complete; the dependency doesn't exist yet"
+    server._assignments[a.id] = a
+
+    server._cleanup_worktree(a)
+
+    assert a.dirty_worktree_reason is not None
+    assert a.premise_refusal_reason == a.dirty_worktree_reason
+    # The stale, now-superseded refusal-only line must not be what the
+    # operator sees once there's an unrecorded dirty worktree to explain.
+    assert "the dependency doesn't exist yet" not in a.premise_refusal_reason
 
 
 def test_wip_rescue_is_pushed_when_a_remote_exists(

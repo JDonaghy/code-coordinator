@@ -97,6 +97,11 @@ def _patch_probes(
         state, "mark_refused_policy_settled",
         lambda aid: writes.append(("refused_policy_settled", aid)),
     )
+    # #3164: stub the refused_premise sibling-settling function the same way.
+    monkeypatch.setattr(
+        state, "mark_refused_premise_settled",
+        lambda aid: writes.append(("refused_premise_settled", aid)),
+    )
     # #951: stub the type=work review_state settle so sweep (b) never touches
     # the DB in these tests.
     monkeypatch.setattr(
@@ -1322,6 +1327,43 @@ def test_refused_policy_row_not_settled_when_issue_not_terminal(
 
     assert refused.status == "refused_policy"  # untouched
     assert ("refused_policy_settled", "rp-live") not in writes
+
+
+def test_settles_refused_premise_row_when_issue_terminal(monkeypatch, config) -> None:
+    """#3164: a status=refused_premise row must be flipped to merged when
+    work_is_terminal — same shape as the refused_policy settle above."""
+    work = _done_work(assignment_id="work-5", issue_number=42, branch="issue-42-fix")
+    refused = _ghost_sibling(
+        assignment_id="rpr-1", sibling_type="work",
+        status="refused_premise", review_state=None,
+    )
+    board = Board(completed=[work, refused])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert refused.status == "merged"
+    assert ("refused_premise_settled", "rpr-1") in writes
+    assert any("settle refused_premise" in s and "rpr-1" in s for s in actions)
+
+
+def test_refused_premise_row_not_settled_when_issue_not_terminal(
+    monkeypatch, config
+) -> None:
+    """#3164: a refused_premise row for a still-open/unmerged issue is left
+    untouched, mirroring the refused_policy case."""
+    work = _done_work(assignment_id="w-live3", issue_number=9, branch="issue-9-fix")
+    refused = _ghost_sibling(
+        assignment_id="rpr-live", sibling_type="work",
+        issue_number=9, status="refused_premise", review_state=None,
+    )
+    board = Board(completed=[work, refused])
+    writes = _patch_probes(monkeypatch, terminal=False)  # issue NOT terminal
+
+    reconcile_board_merges(board, config)
+
+    assert refused.status == "refused_premise"  # untouched
+    assert ("refused_premise_settled", "rpr-live") not in writes
 
 
 def test_settles_all_ghost_types_in_one_pass(monkeypatch, config) -> None:

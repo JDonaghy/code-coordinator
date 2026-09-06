@@ -642,6 +642,163 @@ class TestRefusedPolicyNotify:
         )
 
 
+# ── #3164: refused_premise (0-commit clean exit refuting the issue's own
+# premise) notify — sibling of TestRefusedPolicyNotify above ────────────────
+
+
+class TestRefusedPremiseNotify:
+    """A premise refusal must post a distinctive GitHub comment, not be
+    dropped and not be conflated with a policy refusal.
+
+    Before this fix, `refused_premise` matched none of the `entry_status`
+    branches in `_collect_transitions`'s loop and fell into the final
+    `else: continue` — no comment was ever posted, unlike every other
+    terminal status (including the `refused_policy` case this status is
+    modeled on).
+    """
+
+    def test_refused_premise_posts_comment(self, coord_dir: Path, config: Config) -> None:
+        _record("rpr-run1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run1", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
+        assert len(posted) == 1, "refused_premise transition must appear in posted list"
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Refused" in body, "comment must be clearly labelled as a refusal"
+        assert "premise" in body.lower()
+
+    def test_refused_premise_not_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """The refused_premise comment must NOT say 'Assignment Failed' or use ❌."""
+        _record("rpr-run2")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run2", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Assignment Failed" not in body
+        assert "❌" not in body
+
+    def test_refused_premise_not_retarget_advice(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#3164's whole point: unlike refused_policy, this comment must NOT
+        advise a title retarget — no title rewrite fixes a missing
+        prerequisite or a false premise."""
+        _record("rpr-run7")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run7", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "retarget" not in body.lower()
+        assert "rewrite its title" not in body.lower()
+
+    def test_refused_premise_marked_notified(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("rpr-run3")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run3", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        assert "rpr-run3" in state_mod.load_notified()
+
+    def test_refused_premise_persists_status_column(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """The `assignments.status` column must end up `refused_premise`,
+        not `failed`.
+
+        Before this fix, `_mark_notified_local` had no `EVENT_REFUSED_
+        PREMISE` branch, so this write fell into the bare `else` (meant for
+        `EVENT_FAILURE` and anything unrecognized) and stamped
+        `status='failed'` right after `post_transition` posted the
+        "Refused" comment — silently reverting the correct classification
+        one layer below the notified ledger checked by
+        `test_refused_premise_marked_notified` above.
+        """
+        _record("rpr-run6")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run6", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("rpr-run6",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert row["status"] == "refused_premise"
+
+    def test_refused_premise_idempotent(self, coord_dir: Path, config: Config) -> None:
+        _record("rpr-run4")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rpr-run4", "refused_premise", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
+        assert mock_post.call_count == 1, "refused_premise comment must post exactly once"
+        assert posted_again == []
+
+    def test_refused_premise_includes_premise_refusal_reason(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """When premise_refusal_reason is set, it appears in the comment."""
+        _record("rpr-run5")
+        reason = "Phase 2 is ~8% complete; the dependency this issue assumes doesn't exist yet"
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "rpr-run5",
+                    "refused_premise",
+                    exit_code=0,
+                    premise_refusal_reason=reason,
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert reason in body, (
+            "premise_refusal_reason must appear in the refused_premise comment"
+        )
+
+
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
         _record("abc")
@@ -2039,6 +2196,42 @@ class TestNoIssueSentinelNotifySuppression:
         mock_post_refused_policy.assert_not_called()
         mock_mark_notified.assert_called_once_with(
             "dc-5", EVENT_REFUSED_POLICY, branch=None, failure_reason=None, exit_code=0,
+        )
+
+    def test_decomposition_chat_refused_premise_skips_post_refused_premise(
+        self,
+    ) -> None:
+        """#3164: same guard, EVENT_REFUSED_PREMISE leg."""
+        from coord.notify import post_transition, Transition, EVENT_REFUSED_PREMISE
+
+        transition = Transition(
+            assignment_id="dc-6",
+            machine_name="laptop",
+            repo_name="grocery-list",
+            issue_number=0,
+            event=EVENT_REFUSED_PREMISE,
+            exit_code=0,
+        )
+        record = {"repo_github": "acme/grocery-list", "type": "decomposition-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_refused_premise") as mock_post_refused_premise,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_refused_premise.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "dc-6", EVENT_REFUSED_PREMISE, branch=None, failure_reason=None, exit_code=0,
         )
 
 
