@@ -952,6 +952,140 @@ class TestWorkerSummary:
         assert s.model_used == "claude-sonnet-4-6"
 
 
+# ── #3156: token/turn recovery for a log with no terminal `result` event ────
+#
+# A leg SIGKILLed by the reap ceiling (coord/agent.py's _REAP_MAX_WAIT) is
+# truncated before claude ever emits its terminal `result` line — the only
+# event `update_summary` used to read usage from. Every `assistant` event
+# already carries that turn's own `message.usage`; the fix folds it into the
+# running totals as a fallback so a full parse (`tail_bytes=0`) of a
+# truncated log still recovers real, non-zero tokens instead of leaving the
+# leg silently priced at $0.
+
+
+def _assistant_usage_event(
+    *,
+    msg_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+    model: str = "claude-sonnet-4-6",
+    content_type: str = "text",
+) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "id": msg_id,
+            "model": model,
+            "content": [{"type": content_type, "text": "hi"}],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation,
+                "cache_read_input_tokens": cache_read,
+            },
+        },
+    }
+
+
+class TestReapTruncatedLogTokenRecovery:
+    def test_no_result_event_still_recovers_tokens_from_assistant_turns(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact reap shape: turns with usage, then SIGKILL — no
+        `result` line ever lands. Full parse must still see real tokens."""
+        log = tmp_path / "reaped.log"
+        events = [
+            _init_event(),
+            _assistant_usage_event(
+                msg_id="msg_1", input_tokens=100, output_tokens=20,
+                cache_creation=50, cache_read=500,
+            ),
+            _assistant_usage_event(
+                msg_id="msg_2", input_tokens=200, output_tokens=40,
+                cache_creation=0, cache_read=1000,
+            ),
+        ]
+        log.write_text(_ndjson(events))
+
+        summary = parse_log(log, tail_bytes=0)
+
+        assert summary.input_tokens == 300
+        assert summary.output_tokens == 60
+        assert summary.cache_creation_tokens == 50
+        assert summary.cache_read_tokens == 1500
+        assert summary.num_turns == 2
+        # No `result` event was ever seen — cost genuinely cannot be
+        # recovered here, only tokens (usage_rollup.leg_cost estimates cost
+        # from these tokens downstream; this module never guesses a dollar
+        # figure on its own).
+        assert summary.total_cost_usd == 0.0
+
+    def test_repeated_message_id_across_content_blocks_not_double_counted(
+        self, tmp_path: Path
+    ) -> None:
+        """claude -p's stream-json emits one `assistant` *event* per content
+        block of a single API turn (a `thinking` block and a `tool_use`
+        block from the same response land as two lines), and every one of
+        them repeats the SAME `message.usage` — see
+        `coord.spend_ceiling.LiveCostMeter._fold`, which measured ~45%
+        inflation on a real transcript without this exact dedup."""
+        log = tmp_path / "reaped.log"
+        events = [
+            _init_event(),
+            _assistant_usage_event(
+                msg_id="msg_1", input_tokens=100, output_tokens=20,
+                cache_creation=50, cache_read=500, content_type="thinking",
+            ),
+            _assistant_usage_event(
+                msg_id="msg_1", input_tokens=100, output_tokens=20,
+                cache_creation=50, cache_read=500, content_type="tool_use",
+            ),
+        ]
+        log.write_text(_ndjson(events))
+
+        summary = parse_log(log, tail_bytes=0)
+
+        # Counted once, not twice, despite two lines sharing msg_1.
+        assert summary.input_tokens == 100
+        assert summary.output_tokens == 20
+        assert summary.cache_creation_tokens == 50
+        assert summary.cache_read_tokens == 500
+
+    def test_terminal_result_event_still_wins_over_accumulated_turns(
+        self, tmp_path: Path
+    ) -> None:
+        """A normal, non-truncated run must be byte-for-byte unaffected: the
+        terminal `result` event's cumulative usage overwrites whatever the
+        `assistant` branch accumulated along the way."""
+        log = tmp_path / "done.log"
+        events = [
+            _init_event(),
+            _assistant_usage_event(msg_id="msg_1", input_tokens=100, output_tokens=20),
+            _assistant_usage_event(msg_id="msg_2", input_tokens=200, output_tokens=40),
+            _result_event(
+                total_cost_usd=0.99,
+                num_turns=2,
+                usage={
+                    "input_tokens": 9999,
+                    "output_tokens": 8888,
+                    "cache_creation_input_tokens": 7777,
+                    "cache_read_input_tokens": 6666,
+                },
+            ),
+        ]
+        log.write_text(_ndjson(events))
+
+        summary = parse_log(log, tail_bytes=0)
+
+        assert summary.total_cost_usd == 0.99
+        assert summary.input_tokens == 9999
+        assert summary.output_tokens == 8888
+        assert summary.cache_creation_tokens == 7777
+        assert summary.cache_read_tokens == 6666
+
+
 # ── Usage-limit kill detection (#1461) ──────────────────────────────────────
 
 

@@ -561,6 +561,58 @@ def test_num_turns_absent_from_entry_defaults_to_zero(monkeypatch) -> None:
     assert captured_tokens[0]["num_turns"] == 0
 
 
+def test_reap_shaped_entry_captures_tokens_but_not_cost(monkeypatch) -> None:
+    """#3156: a leg reaped by `_REAP_MAX_WAIT` (SIGKILL, exit 137) never gets
+    a terminal `result` line, so its `/status` completed entry — as produced
+    by `AgentServer.list_assignments()`'s full log re-parse — carries real
+    token counts (recovered from the `assistant` events' own `message.usage`
+    blocks, see `coord/worker_events.py::update_summary`) but NO cost field
+    at all, since claude never reported an authoritative `total_cost_usd`
+    for the truncated run. Tokens must still land in the DB (the bug this
+    issue reports: they used to stay zero and the write was skipped
+    entirely); cost must stay uncaptured rather than being written as a
+    fabricated $0 — `coord.usage_rollup.leg_cost` estimates from the tokens
+    at read time instead."""
+    captured_tokens: list[dict] = []
+    recorded_costs: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_tokens",
+        lambda assignment_id, **kw: captured_tokens.append({"assignment_id": assignment_id, **kw}),
+    )
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: recorded_costs.append((aid, cost)),
+    )
+
+    entry = {
+        "id": "w1",
+        "status": "failed",
+        "exit_code": 137,
+        "input_tokens": 300,
+        "output_tokens": 60,
+        "cache_creation_tokens": 50,
+        "cache_read_tokens": 1500,
+        "num_turns": 2,
+        # No total_cost_usd / cost_so_far — exactly what a reap-truncated
+        # log's full parse produces (no `result` event was ever emitted).
+    }
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [entry]},
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+
+    assert len(captured_tokens) == 1
+    t = captured_tokens[0]
+    assert t["input_tokens"] == 300
+    assert t["output_tokens"] == 60
+    assert t["cache_creation_tokens"] == 50
+    assert t["cache_read_tokens"] == 1500
+    assert t["num_turns"] == 2
+    assert recorded_costs == []  # no cost data available → no fabricated $0
+
+
 def test_token_capture_zero_skipped(monkeypatch) -> None:
     """#667: when the entry has no token fields the update is skipped (not
     called with zeros)."""
