@@ -831,8 +831,12 @@ def only_bounded_fix_since_review(entry: "QueuedMerge", board, review: Assignmen
     conflict-fix rebase #1476 already covered.
 
     This is the trigger :func:`coord.review.dispatch_scoped_reviews_for_queue`
-    uses; :func:`only_conflict_fix_since_review` remains untouched and is
-    still what ``coord review-reaffirm`` pairs with
+    uses — and, via the same eligibility chain, what
+    :func:`coord.review.maybe_scoped_review_for_completed_fix` relies on too
+    (the entry point a just-finished ci-fix/fix-round leg hits directly, and
+    the one this whole #3161 widening was actually motivated by).
+    :func:`only_conflict_fix_since_review` remains untouched and is still
+    what ``coord review-reaffirm`` pairs with
     :func:`intervening_work_since_review` for its own, separately-reasoned,
     no-override guardrail.
 
