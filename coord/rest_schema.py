@@ -173,6 +173,10 @@ class AssignmentPatch:
     """
 
     cost_usd: float | None = None
+    #: #3158: ``"unmeasured"`` only — a captured cost sets this implicitly
+    #: (see ``cost_usd`` above), so the wire never needs to send
+    #: ``"captured"`` explicitly.
+    cost_capture_state: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_creation_tokens: int | None = None

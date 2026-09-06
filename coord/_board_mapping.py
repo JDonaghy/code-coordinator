@@ -126,6 +126,8 @@ def row_to_assignment(row: object) -> Assignment:
         review_scoped=bool(d.get("review_scoped") or False),
         review_scope_base_sha=d.get("review_scope_base_sha"),
         cost_usd=d.get("cost_usd"),
+        # #3158: "captured"/"unmeasured"/None — see the field's own docstring.
+        cost_capture_state=d.get("cost_capture_state"),
         # #252: stored as JSON; absent column → None (not parsed yet).
         smoke_tests=decode_smoke_tests(d.get("smoke_tests")),
         # #324: resolved provider name; None for rows predating this feature.

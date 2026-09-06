@@ -2933,6 +2933,162 @@ class TestLoadReviewAssignmentsMissingCost:
         assert [r["assignment_id"] for r in rows] == ["api1"]
 
 
+class TestCostCaptureState:
+    """#3158: the tri-state ``cost_capture_state`` column — "captured" (set
+    alongside a real ``cost_usd``), "unmeasured" (a full-log parse found
+    nothing), and NULL ("uncaptured" — nobody has looked yet) must stay
+    distinguishable, per #1763's "never silently priced at $0"."""
+
+    def _assignment(self, aid: str) -> None:
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        record_dispatched_assignment(
+            assignment=Assignment(
+                assignment_id=aid, machine_name="laptop", repo_name="api",
+                issue_number=1, issue_title="x", type="work", status="running",
+                dispatched_at=1.0,
+            ),
+            repo_github="acme/api",
+        )
+
+    def test_update_assignment_cost_stamps_captured(self, coord_db) -> None:
+        from coord.state import get_connection, update_assignment_cost
+
+        self._assignment("c1")
+        update_assignment_cost("c1", 2.5)
+
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='c1'"
+        ).fetchone()
+        assert row["cost_usd"] == 2.5
+        assert row["cost_capture_state"] == "captured"
+
+    def test_mark_cost_unmeasured_sets_state_when_cost_still_null(
+        self, coord_db,
+    ) -> None:
+        from coord.state import get_connection, mark_cost_unmeasured
+
+        self._assignment("c2")
+        mark_cost_unmeasured("c2")
+
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='c2'"
+        ).fetchone()
+        assert row["cost_usd"] is None
+        assert row["cost_capture_state"] == "unmeasured"
+
+    def test_mark_cost_unmeasured_never_downgrades_a_captured_cost(
+        self, coord_db,
+    ) -> None:
+        """A real captured cost must never be clobbered back to
+        'unmeasured' — the guard is `cost_usd IS NULL`, checked at write
+        time, not just "call update_assignment_cost first"."""
+        from coord.state import (
+            get_connection,
+            mark_cost_unmeasured,
+            update_assignment_cost,
+        )
+
+        self._assignment("c3")
+        update_assignment_cost("c3", 4.0)
+        mark_cost_unmeasured("c3")
+
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='c3'"
+        ).fetchone()
+        assert row["cost_usd"] == 4.0
+        assert row["cost_capture_state"] == "captured"
+
+
+class TestLoadTerminalAssignmentsMissingCost:
+    """#3158: coord.state.load_terminal_assignments_missing_cost — the
+    fleet-wide, all-types generalization of #2476's review-only query,
+    feeding `coord backfill-cost`."""
+
+    def _row(
+        self, aid: str, *, status: str = "done", type_: str = "work",
+        cost_usd: float | None = None, repo_name: str = "api",
+    ):
+        from coord.models import Assignment
+
+        return Assignment(
+            machine_name="laptop", repo_name=repo_name, issue_number=1,
+            issue_title="x", assignment_id=aid, type=type_,
+            status=status, dispatched_at=1.0, finished_at=2.0,
+            cost_usd=cost_usd,
+        )
+
+    def test_finds_terminal_work_row_with_null_cost(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_terminal_assignments_missing_cost, save_board
+
+        save_board(Board(active=[], completed=[
+            self._row("w1", status="merged", type_="work"),
+        ]))
+
+        rows = load_terminal_assignments_missing_cost()
+        assert [r["assignment_id"] for r in rows] == ["w1"]
+
+    def test_includes_every_type_not_just_review(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_terminal_assignments_missing_cost, save_board
+
+        save_board(Board(active=[], completed=[
+            self._row("w2", type_="work", status="merged"),
+            self._row("s2", type_="smoke", status="failed"),
+            self._row("r2", type_="review", status="done"),
+            self._row("d2", type_="decomposition-chat", status="done"),
+        ]))
+
+        rows = {r["assignment_id"] for r in load_terminal_assignments_missing_cost()}
+        assert rows == {"w2", "s2", "r2", "d2"}
+
+    def test_excludes_row_marked_unmeasured(self, coord_db) -> None:
+        """A row a previous backfill run already confirmed has nothing to
+        give must not be re-fetched and re-parsed on every subsequent run."""
+        from coord.models import Board
+        from coord.state import (
+            load_terminal_assignments_missing_cost,
+            mark_cost_unmeasured,
+            save_board,
+        )
+
+        save_board(Board(active=[], completed=[self._row("u1", status="failed")]))
+        mark_cost_unmeasured("u1")
+
+        rows = load_terminal_assignments_missing_cost()
+        assert rows == []
+
+    def test_excludes_running_pending_and_finalizing(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_terminal_assignments_missing_cost, save_board
+
+        save_board(Board(active=[
+            self._row("running1", status="running"),
+            self._row("pending1", status="pending"),
+            self._row("finalizing1", status="finalizing", type_="review"),
+        ], completed=[]))
+
+        rows = load_terminal_assignments_missing_cost()
+        assert rows == []
+
+    def test_filters_by_repo(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_terminal_assignments_missing_cost, save_board
+
+        save_board(Board(active=[], completed=[
+            self._row("api1", repo_name="api", status="merged"),
+            self._row("other1", repo_name="other", status="merged"),
+        ]))
+
+        rows = load_terminal_assignments_missing_cost(repo_name="api")
+        assert [r["assignment_id"] for r in rows] == ["api1"]
+
+
 # ── #2597: cost/token capture rides out transient lock contention ──────────
 
 

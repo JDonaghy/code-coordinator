@@ -106,6 +106,9 @@ class BoardAssignment:
     uat_state: str | None = None
     uat_reason: str | None = None
     cost_usd: float | None = None
+    # #3158: "captured"/"unmeasured"/None — see coord.models.Assignment's
+    # field docstring.
+    cost_capture_state: str | None = None
     smoke_tests: list[str] | None = None
     review_findings: str | None = None
     test_plan: dict | None = None

@@ -810,7 +810,10 @@ def retry_on_locked(
 #
 # #3148: bumped 10 -> 11 for the two `issue_context.resolved_at`/
 # `resolved_note` columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 11
+#
+# #3158: bumped 11 -> 12 for the new `assignments.cost_capture_state` column
+# appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 12
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2095,6 +2098,19 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # outstanding" by coord.state.render_issue_context_entries.
     "ALTER TABLE issue_context ADD COLUMN resolved_at REAL",
     "ALTER TABLE issue_context ADD COLUMN resolved_note TEXT",
+    # #3158: a third state alongside `cost_usd`, so "genuinely un-measured"
+    # (a full-log parse found no `total_cost_usd` at all — e.g. the reap-
+    # truncated #3156 population, or a provider that never reports cost) is
+    # distinguishable from "uncaptured" (cost_usd IS NULL AND this column is
+    # ALSO NULL — nobody has yet re-parsed the log to know either way).
+    # Written only by `coord.state.update_assignment_cost` ('captured', in
+    # the SAME UPDATE as cost_usd) and `coord.state.mark_cost_unmeasured`
+    # ('unmeasured') — see both docstrings. NULL for every row predating
+    # this migration and for any terminal row nobody has re-examined yet;
+    # per #1763 ("never silently priced at $0") this is what lets a backfill
+    # tell a row worth re-trying apart from one already confirmed to have
+    # nothing to give.
+    "ALTER TABLE assignments ADD COLUMN cost_capture_state TEXT",
 ]
 
 

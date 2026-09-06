@@ -3922,3 +3922,164 @@ class TestBackfillReviewCost:
         )
         assert result.exit_code == 0, result.output
         assert "No review assignments with missing cost/tokens found." in result.output
+
+
+class TestBackfillCost:
+    """#3158: `coord backfill-cost` — the fleet-wide, all-types repair for
+    the SAME capture gap #2476 fixed only for reviews. The dominant
+    population in the reference investigation was merged `type='work'`
+    rows, so that's the shape exercised here."""
+
+    def _record(
+        self, assignment_id: str, *, status: str = "merged", type_: str = "work",
+    ) -> None:
+        from coord.models import Assignment
+        from coord.state import get_connection, record_dispatched_assignment
+
+        assignment = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Fix the thing",
+            briefing="work briefing",
+            type=type_,
+            dispatched_at=1000.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/api")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status=?, finished_at=1234.0 "
+            "WHERE assignment_id=?",
+            (status, assignment_id),
+        )
+        conn.commit()
+
+    def test_recovers_cost_from_local_log_for_a_merged_work_row(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The dominant #3158 population: a merged work row whose log has a
+        perfectly good total_cost_usd the daemon's opportunistic tick never
+        caught."""
+        import json
+
+        self._record("bf1", status="merged", type_="work")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        monkeypatch.setattr("coord.usage.LOGS_DIR", logs_dir)
+        (logs_dir / "bf1.log").write_text(
+            json.dumps({
+                "type": "result", "subtype": "success", "result": "done",
+                "total_cost_usd": 2.71, "num_turns": 109, "duration_ms": 9999,
+                "session_id": "s", "input_tokens": 212, "output_tokens": 36538,
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            main, ["backfill-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 1 assignment(s)" in result.output
+
+        from coord.state import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='bf1'"
+        ).fetchone()
+        assert row["cost_usd"] == 2.71
+        assert row["cost_capture_state"] == "captured"
+
+    def test_covers_non_work_types_too(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Not scoped to type='work' — a failed smoke leg is just as
+        recoverable."""
+        import json
+
+        self._record("bf2", status="failed", type_="smoke")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        monkeypatch.setattr("coord.usage.LOGS_DIR", logs_dir)
+        (logs_dir / "bf2.log").write_text(
+            json.dumps({
+                "type": "result", "subtype": "success", "result": "done",
+                "total_cost_usd": 0.85, "num_turns": 3, "duration_ms": 500,
+                "session_id": "s",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            main, ["backfill-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 1 assignment(s)" in result.output
+
+    def test_zero_cost_log_is_marked_unmeasured_and_reported_separately(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A log that parses cleanly but genuinely has no result event (the
+        #3156 reap-truncated shape) must not be treated the same as a
+        recovered cost, and must not be re-fetched by a later run."""
+        import json
+
+        self._record("bf3", status="failed", type_="work")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        monkeypatch.setattr("coord.usage.LOGS_DIR", logs_dir)
+        (logs_dir / "bf3.log").write_text(
+            json.dumps({"type": "assistant", "message": {"id": "m1"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            main, ["backfill-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 0 assignment(s)" in result.output
+        assert "1 assignment(s) still missing or confirmed" in result.output
+
+        from coord.state import get_connection, load_terminal_assignments_missing_cost
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='bf3'"
+        ).fetchone()
+        assert row["cost_usd"] is None
+        assert row["cost_capture_state"] == "unmeasured"
+        # And a second run finds nothing left to do — not re-fetched forever.
+        assert load_terminal_assignments_missing_cost() == []
+
+    def test_reports_still_missing_when_log_unavailable(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        self._record("bf4", status="merged", type_="work")
+        monkeypatch.setattr("coord.usage.LOGS_DIR", tmp_path / "no-such-logs-dir")
+
+        result = CliRunner().invoke(
+            main, ["backfill-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 0 assignment(s)" in result.output
+        assert "bf4" in result.output
+
+        from coord.state import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd, cost_capture_state FROM assignments "
+            "WHERE assignment_id='bf4'"
+        ).fetchone()
+        assert row["cost_usd"] is None
+        assert row["cost_capture_state"] is None
+
+    def test_no_candidates_message(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        result = CliRunner().invoke(
+            main, ["backfill-cost", "--config", str(config_file)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No assignments with missing cost/tokens found." in result.output

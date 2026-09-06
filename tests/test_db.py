@@ -2381,7 +2381,7 @@ class TestUatStateAndReasonColumns:
 # more on an existing database).
 # #3148 bumped this to (11, 82): `issue_context.resolved_at` /
 # `resolved_note`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (11, 82)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (12, 83)
 
 
 class TestMigrateAddColumnsVersionGuard:

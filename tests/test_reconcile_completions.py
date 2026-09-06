@@ -738,6 +738,60 @@ def test_no_cost_write_when_entry_has_no_cost(monkeypatch) -> None:
     assert recorded_costs == []  # no cost data → no write
 
 
+def test_zero_total_cost_usd_marks_unmeasured_not_captured(monkeypatch) -> None:
+    """#3158: `total_cost_usd` present but zero means the agent DID run a
+    full re-parse of the log and found nothing — as opposed to the key
+    being absent entirely (the previous test), which means the log was
+    never even examined. Only the former is safe to stamp 'unmeasured'."""
+    recorded_costs: list[tuple[str, float]] = []
+    marked_unmeasured: list[str] = []
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: recorded_costs.append((aid, cost)),
+    )
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "coord.state.mark_cost_unmeasured",
+        lambda aid: marked_unmeasured.append(aid),
+    )
+
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done", "total_cost_usd": 0.0}]
+        },
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert recorded_costs == []
+    assert marked_unmeasured == ["w1"]
+
+
+def test_absent_total_cost_usd_key_never_marks_unmeasured(monkeypatch) -> None:
+    """The key being absent (no full-log parse happened for this entry —
+    e.g. the log wasn't stream-json) must NOT be conflated with a full
+    parse that genuinely found $0 — that would wrongly mark a row
+    'unmeasured' that a later tick (or the fleet-wide backfill) could still
+    resolve."""
+    marked_unmeasured: list[str] = []
+
+    monkeypatch.setattr("coord.state.update_assignment_cost", lambda *a, **kw: None)
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "coord.state.mark_cost_unmeasured",
+        lambda aid: marked_unmeasured.append(aid),
+    )
+
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done"}]
+        },
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert marked_unmeasured == []
+
+
 def test_cost_capture_failure_does_not_break_status_write(monkeypatch) -> None:
     """An exception in cost capture must not prevent the terminal-status write."""
     rec = _Recorder()
