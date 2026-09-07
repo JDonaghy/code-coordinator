@@ -341,6 +341,52 @@ class MilestoneDetail:
     warnings: list[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class PipelineLegWire:
+    """One board row — one dispatched assignment "leg" — for a (repo, issue)
+    pipeline, the served counterpart to ``coord gates <repo> <issue>`` (#3184).
+
+    ``stage`` is the assignment's own ``type`` (work/review/test-author/
+    mock-author/smoke/conflict-fix/...) — the same value ``coord gates``
+    brackets as ``[type]`` (see ``format_gate_report``) — deliberately not
+    the coarser ``coord.pipeline.PipelineStage`` gate-box vocabulary
+    (coding/review/merge/...): a leg is one dispatched assignment, not a gate
+    box, and #100's whole point is naming who ran THIS leg, not which gate
+    box it maps to. ``status`` is the raw ``Assignment.status`` (pending |
+    running | done | failed | advisory | refused_policy | refused_premise),
+    unmodified — this must never diverge from what ``coord gates``/``coord
+    status`` print for the same row (#2096: one question, one answer). An
+    in-flight leg has ``dispatched_at`` set and ``finished_at`` ``None`` —
+    deliberately still a row, never omitted, so the client can render an
+    elapsed timer on it (#3184's ask).
+    """
+
+    assignment_id: str | None
+    stage: str
+    status: str | None
+    machine_name: str | None
+    dispatched_at: float | None
+    finished_at: float | None
+
+
+@dataclasses.dataclass(frozen=True)
+class PipelineLegsResponse:
+    """``GET /api/pipeline/{repo}/{issue}/legs`` — every assignment leg for
+    one ``(repo, issue)``, newest-dispatch-first (#3184).
+
+    Built directly on :func:`coord.gates.assignments_for_issue` — the exact
+    row selection (raw ``issue_number`` OR #1553's effective issue) ``coord
+    gates`` reports on — so this endpoint and the CLI can never disagree
+    about which rows belong to an issue. ``legs`` is empty (never a 404) for
+    an issue with no board rows yet; that is a fact about the board, not an
+    error.
+    """
+
+    repo_name: str
+    issue_number: int
+    legs: list[PipelineLegWire]
+
+
 def gate_a_decision_for_milestone(
     config: Config, repo_cfg: "Repo", milestone_number: int
 ) -> "tuple[GateADecision, str | None]":
@@ -894,6 +940,10 @@ def openapi_spec() -> dict:
     components: dict = {}
     assignment_ref = dataclass_schema(Assignment, components)
     pipeline_view_ref = dataclass_schema(PipelineView, components)
+    # #3184: GET /api/pipeline/{repo}/{issue}/legs — same plain
+    # `dataclass_schema` walk as the milestone/journal endpoints below; the
+    # handler returns a literal `dataclasses.asdict(PipelineLegsResponse)`.
+    pipeline_legs_response_ref = dataclass_schema(PipelineLegsResponse, components)
     # #2428 DQW-1 / #1849: the drive-queue entry schema comes from the same
     # explicit DTO the daemon publishes as `BoardDriveQueueEntry` on `/board`
     # (`coord/board_schema.py`) — not from a hand-maintained field list, and
@@ -1764,6 +1814,40 @@ def openapi_spec() -> dict:
                             }
                         },
                     }
+                },
+            }
+        },
+        "/api/pipeline/{repo}/{issue}/legs": {
+            "get": {
+                "summary": (
+                    "#3184: every dispatched assignment leg for one "
+                    "(repo, issue) — the machine and timing PER LEG that "
+                    "GET /api/pipeline collapses into one row"
+                ),
+                "description": (
+                    "Built on coord.gates.assignments_for_issue — the exact "
+                    "row selection `coord gates <repo> <issue>` reports on "
+                    "(raw issue_number OR #1553's effective issue) — so this "
+                    "and the CLI can never disagree about which rows belong "
+                    "to an issue. Newest-dispatch-first. An unknown repo is "
+                    "a 404; an issue with no board rows yet is a 200 with "
+                    "an empty `legs` array, not an error. An in-flight leg "
+                    "carries `dispatched_at` with `finished_at: null` — "
+                    "never an omitted row — so the client can render an "
+                    "elapsed timer on it."
+                ),
+                "parameters": [
+                    _dashboard_path_param("repo", "repo name (coordinator.yml)"),
+                    _dashboard_path_param("issue", "GitHub issue number"),
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": pipeline_legs_response_ref}
+                        },
+                    },
+                    "404": {"description": "Unknown repo, or a non-integer issue"},
                 },
             }
         },
@@ -3623,6 +3707,77 @@ def build_app(
 
         return JSONResponse([asdict(pv) for pv in pipelines])
 
+    async def api_pipeline_legs(request: Request) -> JSONResponse:
+        """GET /api/pipeline/{repo}/{issue}/legs — every dispatched
+        assignment leg for one (repo, issue), newest-first (#3184).
+
+        coord-web#100's own reviewer found that ``GET /api/pipeline``
+        collapses a whole work item onto one ``machine_name``/``finished_at``
+        pair plus a 5-entry ``stages[]`` of ``{name, status, is_current}`` —
+        no per-leg machine, no per-leg timing, no assignment history. That
+        makes the reviewer's independence (a fresh session, on a different
+        machine, with zero shared context with the worker) invisible on
+        every web surface. This route exposes the row-per-leg data that
+        already exists server-side — :func:`coord.gates.assignments_for_issue`,
+        the same selection ``coord gates <repo> <issue>`` reports on — rather
+        than a second, driftable derivation (#2096: one question, one
+        answer).
+
+        Deliberately built on ``assignments_for_issue`` (cheap, board-only),
+        not :func:`coord.gates.build_gate_report` (which additionally wants a
+        ``gh_ops`` seam for LIVE branch/base SHA comparisons to answer "would
+        the merge gate refuse right now") — this route answers a narrower
+        question ("what ran, on what machine, when") that needs none of
+        that, so it costs no per-request GitHub API fan-out.
+
+        An unknown repo is a 404, matching ``GET /api/milestones/{repo}/
+        {number}``'s convention. An issue with no board rows yet is a 200
+        with an empty ``legs`` array — a fact about the board, not an error,
+        matching ``GET /api/journal/{submission_id}``'s convention. Every
+        row is kept regardless of status — including an in-flight leg, which
+        carries ``dispatched_at`` with ``finished_at: null`` rather than
+        being omitted, so the client can show a leg count per stage box and
+        run an elapsed timer on whatever is currently in flight.
+        """
+        from coord.gates import assignments_for_issue  # noqa: PLC0415
+
+        repo_name = request.path_params["repo"]
+        try:
+            issue_number = int(request.path_params["issue"])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "issue number must be an integer"}, status_code=404
+            )
+
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            return JSONResponse(
+                {"error": f"unknown repo {repo_name!r}"}, status_code=404
+            )
+
+        board = _read_board()
+        rows = assignments_for_issue(board, repo_cfg.name, issue_number)
+        # `assignments_for_issue` is oldest-dispatch-first (the order `coord
+        # gates` prints it in); this route promises newest-first (#3184) so
+        # the client never has to sort.
+        rows = sorted(rows, key=lambda a: a.dispatched_at or 0.0, reverse=True)
+
+        legs = [
+            PipelineLegWire(
+                assignment_id=a.assignment_id,
+                stage=a.type or "work",
+                status=a.status,
+                machine_name=a.machine_name,
+                dispatched_at=a.dispatched_at,
+                finished_at=a.finished_at,
+            )
+            for a in rows
+        ]
+        response = PipelineLegsResponse(
+            repo_name=repo_cfg.name, issue_number=issue_number, legs=legs,
+        )
+        return JSONResponse(dataclasses.asdict(response))
+
     # Actions whose live handler returns a fixed-shape success envelope. The
     # fixture branch below reproduces that envelope exactly (`ok: true` plus
     # whatever fields the client reads) so a seeded acceptance run exercises
@@ -4852,6 +5007,9 @@ def build_app(
         Route("/api/diff/{id}", api_diff, methods=["GET"]),
         Route("/api/chat", api_chat, methods=["POST"]),
         Route("/api/pipeline", api_pipeline, methods=["GET"]),
+        Route(
+            "/api/pipeline/{repo}/{issue}/legs", api_pipeline_legs, methods=["GET"]
+        ),
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         Route("/api/portal/needs-input", api_portal_needs_input, methods=["GET"]),
         Route("/api/portal/answer", api_portal_answer, methods=["POST"]),

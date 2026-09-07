@@ -89,7 +89,13 @@ handler, so seeding a realistic spread of completed/failed/running
 assignments per machine in ``board.assignments`` is all a fixture needs to
 exercise it. ``GET /api/drive-queue``'s ``leg_counts`` field (#3060) is the
 same story: no dedicated key, derived from ``board.assignments``' ``type``
-field via ``FixtureServer.leg_counts()``.
+field via ``FixtureServer.leg_counts()``. ``GET /api/pipeline/{repo}/
+{issue}/legs`` (#3184) is a fourth: it reads ``board()`` + the resolved
+``config`` exactly like the live handler (``coord.gates.
+assignments_for_issue`` over the reconstructed board), so seeding the
+relevant ``(repo_name, issue_number)`` rows — including one with
+``finished_at`` unset, for the in-flight-leg case — in ``board.assignments``
+is all a fixture needs to exercise every leg the route can return.
 """
 
 from __future__ import annotations
