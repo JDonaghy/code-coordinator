@@ -2107,6 +2107,271 @@ def test_dispatch_review_flags_coordinator_owned_docs_without_config(
     assert "CLAUDE.md" in payload["briefing"]
 
 
+# ── #3180: mechanical short-circuit — record request-changes directly,      ─
+# never dispatch a review leg for a violation the coordinator already knows ─
+# about at prompt-assembly time. ─────────────────────────────────────────────
+
+
+def test_dispatch_review_mechanical_short_circuit_for_coordinator_doc(
+    two_machine_config: Config,
+) -> None:
+    """#3180 acceptance: a diff touching CLAUDE.md (a coordinator-owned doc,
+    on by default per COORDINATOR_OWNED_DOC_DEFAULTS) must record
+    request-changes WITHOUT a review leg ever being dispatched — not just a
+    briefing that says so (that's the whole point of this issue: the old
+    behavior already computed this and then paid a full review leg to be
+    told what it just computed)."""
+    from coord.issue_store import _read_verdict_source_local  # noqa: PLC0415
+    from coord.state import load_assignment_review_verdict  # noqa: PLC0415
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/CLAUDE.md b/CLAUDE.md\n"
+        "--- a/CLAUDE.md\n"
+        "+++ b/CLAUDE.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+A new coordinator rule the worker added itself.\n"
+    )
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    # The real dispatch path: no HTTP POST to any agent at all. A string
+    # assertion on a prompt nobody ever sent proves nothing — this is the
+    # actual proof no review leg was spent.
+    assert client.calls == []
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.status == "done"
+    assert result.review_verdict == "request-changes"
+    assert result.verdict_source == "mechanical"
+    assert "CLAUDE.md" in (result.verdict_source_reason or "")
+    assert "COORDINATOR-OWNED DOC EDITED" in result.briefing
+
+    # The verdict is durably recorded, not just returned in-memory — read it
+    # back from the DB the same way `coord gates` would.
+    review_state, review_verdict = load_assignment_review_verdict(result.assignment_id)
+    assert review_verdict == "request-changes"
+    source, reason = _read_verdict_source_local(result.assignment_id)
+    assert source == "mechanical"
+    assert reason and "CLAUDE.md" in reason
+
+    # And it was propagated onto the parent work row, exactly like a real
+    # reviewer's request-changes would be.
+    assert completed.review_state == "done"
+    assert completed.review_verdict == "request-changes"
+
+
+def test_dispatch_review_mechanical_short_circuit_for_sealed_path(
+    two_machine_config: Config,
+) -> None:
+    """#3180 acceptance: same short-circuit for a sealed-path tamper hit,
+    for a plain type="work" diff (no SEALED_PATH_AUTHOR_TYPES carve-out
+    applies to it)."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+cheated = True\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 43, "url": "https://github.com/acme/api/pull/43", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert client.calls == []
+    assert result is not None
+    assert result.review_verdict == "request-changes"
+    assert result.verdict_source == "mechanical"
+    assert "tests/acceptance/" in (result.verdict_source_reason or "")
+    assert "SEALED ORACLE TAMPER DETECTED" in result.briefing
+    assert completed.review_state == "done"
+    assert completed.review_verdict == "request-changes"
+
+
+def test_dispatch_review_mechanical_short_circuit_respects_sealed_author_carveout(
+    two_machine_config: Config,
+) -> None:
+    """#3180 acceptance: the sealed-path mechanical check must respect the
+    existing SEALED_PATH_AUTHOR_TYPES carve-out — a test-author diff
+    confined to the sealed tree is its JOB, not tamper, so it must NOT
+    short-circuit and must get a normal review exactly as before."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+    )
+    board = Board()
+    completed = replace(
+        _completed_assignment(machine="laptop"),
+        type="test-author",
+        assignment_id="ta-42",
+        branch="ms-01-test-author",
+    )
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-ta"})
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+new_slice = True\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 44, "url": "https://github.com/acme/api/pull/44", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    # A real review leg WAS dispatched — the confined-to-sealed-tree diff is
+    # expected for this assignment type, never a mechanical request-changes.
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+
+
+def test_dispatch_review_mechanical_short_circuit_fires_for_author_scope_violation(
+    two_machine_config: Config,
+) -> None:
+    """#3180: the OTHER mandatory sealed-path shape — a test-author diff
+    that touches something OUTSIDE the sealed tree — must also
+    short-circuit (the #1175 'SCOPE VIOLATION' banner)."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+    )
+    board = Board()
+    completed = replace(
+        _completed_assignment(machine="laptop"),
+        type="test-author",
+        assignment_id="ta-43",
+        branch="ms-01-test-author",
+    )
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+new_slice = True\n"
+        "diff --git a/coord/agent.py b/coord/agent.py\n"
+        "--- a/coord/agent.py\n"
+        "+++ b/coord/agent.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+sneaky_edit = True\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 45, "url": "https://github.com/acme/api/pull/45", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert client.calls == []
+    assert result is not None
+    assert result.review_verdict == "request-changes"
+    assert result.verdict_source == "mechanical"
+    assert "coord/agent.py" in (result.verdict_source_reason or "")
+    assert "SEALED ORACLE SCOPE VIOLATION" in result.briefing
+
+
+def test_dispatch_review_unaffected_when_no_mechanical_violation(
+    two_machine_config: Config,
+) -> None:
+    """#3180 acceptance: a diff touching neither a coordinator-owned doc nor
+    a sealed path is unaffected — a normal review is still dispatched."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-normal"})
+    diff = (
+        "diff --git a/coord/agent.py b/coord/agent.py\n"
+        "--- a/coord/agent.py\n"
+        "+++ b/coord/agent.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+ordinary_change = True\n"
+    )
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 46, "url": "https://github.com/acme/api/pull/46", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+    assert completed.review_state != "done"
+
+
 def test_dispatch_review_threads_assignment_type_for_test_author_exemption(
     two_machine_config: Config,
 ) -> None:

@@ -851,7 +851,7 @@ class Assignment:
     # --verdict` posted by an operator, not parsed from the reviewer's own
     # log) is otherwise indistinguishable from one the reviewer agent
     # produced itself — every downstream reader (merge gate, `coord gates`,
-    # the TUI) sees a plain "approve" either way. Three values:
+    # the TUI) sees a plain "approve" either way. Four values:
     #   "agent"      — parsed from the reviewer's own transcript (the
     #                  overwhelming common case; also the default when this
     #                  column is NULL, for every row predating this feature).
@@ -867,6 +867,15 @@ class Assignment:
     #                  when the override happened automatically (#476); a
     #                  manual override may have no prior agent verdict at
     #                  all (e.g. an interactive review that never finished).
+    #   "mechanical" — (#3180) request-changes recorded WITHOUT ever
+    #                  dispatching a reviewer session at all: the diff trips
+    #                  a rule (coordinator-owned doc / sealed path) that
+    #                  `coord.review.build_review_briefing` already computes,
+    #                  unconditionally, at prompt-assembly time — spending a
+    #                  review leg to have an LLM read the same banner and
+    #                  agree with it added no information. There is no
+    #                  reviewer transcript behind this verdict at all, unlike
+    #                  every other source above.
     # `verdict_source_reason` is a required, human-readable justification for
     # anything that isn't "agent" — see issue_store._validate_result.
     verdict_source: str | None = None
