@@ -407,17 +407,24 @@ def push_design_round_bundle(
     Three steps, each able to fail independently — callers keep whatever
     try/except shape they already had around the calls this replaces:
 
-    1. :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` — raises
+    1. :func:`coord.mock_author.flatten_bundle_for_upload` — reshapes
+       *files* out of the ``mocks/``-prefixed layout
+       :func:`coord.mock_author.collect_mock_bundle_files` and its
+       local-checkout counterpart both return, into the bundle-ROOT layout
+       coord-portal's upload route requires (#3166). Pure; cannot raise.
+    2. :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` — raises
        :class:`coord.portal_bridge.PortalBridgeError` on a transport/4xx/5xx
-       failure.
-    2. :func:`coord.mock_author.build_design_round` — reshapes the bundle
+       failure. *round_number* is threaded straight into this call (#3166):
+       the portal addresses a bundle by ``(reference, round)`` in the URL
+       itself, not just in the D1 metadata payload built in step 3.
+    3. :func:`coord.mock_author.build_design_round` — reshapes the bundle
        key + tracking-issue text into the D1 metadata payload; does not
        raise (a malformed ``## Work order`` degrades to an empty
        decomposition, per that function's own docstring).
-    3. :func:`enqueue_design_round` — raises :class:`PortalSyncError` for a
+    4. :func:`enqueue_design_round` — raises :class:`PortalSyncError` for a
        payload it refuses to queue.
 
-    Returns ``(bundle_key, row)`` — the R2 object key the portal assigned
+    Returns ``(bundle_key, row)`` — the R2 key prefix the portal assigned
     the bundle, and the outbox row now queued for it.
 
     #3071: also appends the ``design_round_published`` ledger row for this
@@ -429,9 +436,11 @@ def push_design_round_bundle(
     and queued by this point, and losing the timeline entry must not turn a
     successful publish into a raised error in a merge hook.
     """
-    from coord.mock_author import build_design_round  # noqa: PLC0415
+    from coord.mock_author import build_design_round, flatten_bundle_for_upload  # noqa: PLC0415
 
-    bundle_key = client.upload_bundle(submission_id, files)
+    bundle_key = client.upload_bundle(
+        submission_id, flatten_bundle_for_upload(files), round_number=round_number
+    )
     design_round = build_design_round(
         milestone_title=milestone_title,
         tracking_issue_title=tracking_issue_title,

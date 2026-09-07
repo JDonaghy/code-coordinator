@@ -845,6 +845,53 @@ def test_collect_mock_bundle_files_uses_the_repos_own_driver_glob(monkeypatch):
     }
 
 
+# ── flatten_bundle_for_upload (#3166) ────────────────────────────────────
+
+
+def test_flatten_bundle_for_upload_strips_the_mocks_prefix():
+    files = {
+        "contract.md": "# contract",
+        "mocks/index.html": "<html>index</html>",
+        "mocks/detail.html": "<html>detail</html>",
+    }
+
+    assert mock_author.flatten_bundle_for_upload(files) == {
+        "contract.md": "# contract",
+        "index.html": "<html>index</html>",
+        "detail.html": "<html>detail</html>",
+    }
+
+
+def test_flatten_bundle_for_upload_leaves_root_files_alone():
+    files = {"contract.md": "# contract"}
+    assert mock_author.flatten_bundle_for_upload(files) == files
+
+
+def test_flatten_bundle_for_upload_does_not_mutate_collect_mock_bundle_files_output(
+    monkeypatch,
+):
+    """#3166: the flatten is a separate reshape, not a change to
+    `collect_mock_bundle_files`'s own contract — `coord.dashboard.server`
+    still needs the `mocks/`-prefixed keys that function returns."""
+    monkeypatch.setattr(
+        github_ops, "repo_file_exists",
+        lambda repo, path, branch: path.endswith("contract.md"),
+    )
+    monkeypatch.setattr(
+        github_ops, "list_repo_dir", lambda repo, path, branch: ["index.html"],
+    )
+    monkeypatch.setattr(
+        github_ops, "get_repo_file", lambda repo, path, branch: f"content of {path}",
+    )
+
+    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main", "*.html")
+    flattened = mock_author.flatten_bundle_for_upload(files)
+
+    assert "mocks/index.html" in files
+    assert "mocks/index.html" not in flattened
+    assert "index.html" in flattened
+
+
 # ── resolve_viewable_mock_glob (#3068) ───────────────────────────────────
 
 

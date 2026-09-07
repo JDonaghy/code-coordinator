@@ -255,42 +255,79 @@ def test_pull_sends_cursor_and_limit_as_query_params(monkeypatch):
     assert data == {"events": [], "cursor": "abc", "has_more": False}
 
 
-# ── upload_bundle (PDR-3, #2508) ────────────────────────────────────────
+# ── upload_bundle (PDR-3, #2508; route contract fixed in #3166) ─────────
 
 
-def test_upload_bundle_sends_files_and_returns_bundle_key(monkeypatch):
+def test_upload_bundle_posts_multipart_to_the_reference_round_path(monkeypatch):
+    """#3166: the real route is `POST /api/bridge/mocks/:reference/:round`
+    (coord-portal's `matchMockUploadPath`/`uploadMockBundle`), a multipart
+    body with one part per file keyed by its bundle-root-relative path — not
+    the JSON `/api/bridge/upload` this client used to send, which coord-portal
+    has never served."""
     seen = {}
 
-    def _post(url, json=None, headers=None, timeout=None):
+    def _post(url, files=None, headers=None, timeout=None):
         seen["url"] = url
-        seen["json"] = json
-        return _Response(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+        seen["files"] = files
+        seen["headers"] = headers
+        return _Response(200, {"key": "rounds/sub_1/1", "files": ["contract.md", "index.html"]})
 
     monkeypatch.setattr("httpx.post", _post)
     client = _client()
     key = client.upload_bundle(
-        "sub_1", {"contract.md": "# contract", "mocks/index.html": "<html></html>"}
+        "sub_1", {"contract.md": "# contract", "index.html": "<html></html>"}, round_number=1
     )
 
-    assert seen["url"] == "https://intake.heurontech.com/api/bridge/upload"
-    assert seen["json"] == {
-        "submission_id": "sub_1",
-        "files": {"contract.md": "# contract", "mocks/index.html": "<html></html>"},
-    }
-    assert key == "bundles/sub_1/r1.tar"
+    assert seen["url"] == "https://intake.heurontech.com/api/bridge/mocks/sub_1/1"
+    # One multipart part per file, field name == bundle-root-relative path.
+    assert set(seen["files"]) == {"contract.md", "index.html"}
+    assert seen["files"]["contract.md"][1] == b"# contract"
+    assert seen["files"]["index.html"][1] == b"<html></html>"
+    # No JSON Content-Type forced onto a multipart body — httpx needs to set
+    # its own `multipart/form-data; boundary=...` header.
+    assert "Content-Type" not in seen["headers"]
+    assert seen["headers"]["CF-Access-Client-Id"] == "id-123"
+    assert key == "rounds/sub_1/1"
+
+
+def test_upload_bundle_puts_the_round_number_in_the_url_not_the_body(monkeypatch):
+    seen = {}
+
+    def _post(url, files=None, headers=None, timeout=None):
+        seen["url"] = url
+        return _Response(200, {"key": "rounds/sub_1/3"})
+
+    monkeypatch.setattr("httpx.post", _post)
+    client = _client()
+    client.upload_bundle("sub_1", {"index.html": "<html></html>"}, round_number=3)
+
+    assert seen["url"].endswith("/api/bridge/mocks/sub_1/3")
 
 
 def test_upload_bundle_rejects_empty_files():
     client = _client()
     with pytest.raises(PortalBridgeError, match="empty files"):
-        client.upload_bundle("sub_1", {})
+        client.upload_bundle("sub_1", {}, round_number=1)
 
 
-def test_upload_bundle_raises_when_response_has_no_bundle_key(monkeypatch):
+def test_upload_bundle_raises_when_response_has_no_key(monkeypatch):
     monkeypatch.setattr("httpx.post", lambda *a, **k: _Response(200, {}))
     client = _client()
-    with pytest.raises(PortalBridgeError, match="bundle_key"):
-        client.upload_bundle("sub_1", {"contract.md": "# contract"})
+    with pytest.raises(PortalBridgeError, match="'key'"):
+        client.upload_bundle("sub_1", {"index.html": "<html></html>"}, round_number=1)
+
+
+def test_upload_bundle_surfaces_a_missing_index_html_refusal(monkeypatch):
+    """The portal's `missing_index_html` refusal (400) arrives as an
+    ordinary 4xx — this client does not need to special-case it, the shared
+    4xx handling in `_send` already raises with the body attached."""
+    monkeypatch.setattr(
+        "httpx.post",
+        lambda *a, **k: _Response(400, text='{"error": "missing_index_html"}'),
+    )
+    client = _client()
+    with pytest.raises(PortalBridgeError, match="missing_index_html"):
+        client.upload_bundle("sub_1", {"contract.md": "# contract"}, round_number=1)
 
 
 # ── client_from_config ──────────────────────────────────────────────────

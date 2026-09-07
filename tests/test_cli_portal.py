@@ -1121,7 +1121,8 @@ def test_remirror_is_idempotent_once_clean():
 
 
 class _UploadResponse:
-    """Minimal `httpx.Response` stand-in for `/api/bridge/upload` — mirrors
+    """Minimal `httpx.Response` stand-in for the mock-bundle upload route
+    (`POST /api/bridge/mocks/:reference/:round`, #3166) — mirrors
     `test_merge_queue.py`'s `_StubResponse`, needed here too since
     `publish-mocks` drives a real `PortalBridgeClient` over `httpx.post`."""
 
@@ -1272,9 +1273,9 @@ def test_publish_mocks_uploads_and_enqueues_for_an_issue_scoped_link(
 
     seen_upload: dict = {}
 
-    def _post(url, json=None, headers=None, timeout=None):
-        seen_upload["files"] = (json or {}).get("files")
-        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+    def _post(url, files=None, headers=None, timeout=None):
+        seen_upload["files"] = files
+        return _UploadResponse(200, {"key": "rounds/sub_1/1"})
 
     monkeypatch.setattr("httpx.post", _post)
 
@@ -1283,8 +1284,10 @@ def test_publish_mocks_uploads_and_enqueues_for_an_issue_scoped_link(
     assert "published" in result.output
     assert "issue #3" in result.output
     assert "sub_1" in result.output
+    # #3166: the wire body is flattened bundle-root-relative — no `mocks/`
+    # prefix — even though the local collector groups them under `mocks/`.
     assert set(seen_upload["files"]) == {
-        "contract.md", "mocks/screen.html", "mocks/index.html",
+        "contract.md", "screen.html", "index.html",
     }
 
     rows = portal_store.outbox_for_submission("sub_1")
@@ -1433,10 +1436,10 @@ def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
 
     seen_upload: dict = {}
 
-    def _post(url, json=None, headers=None, timeout=None):
+    def _post(url, files=None, headers=None, timeout=None):
         seen_upload["url"] = url
-        seen_upload["files"] = (json or {}).get("files")
-        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+        seen_upload["files"] = files
+        return _UploadResponse(200, {"key": "rounds/sub_1/1"})
 
     monkeypatch.setattr("httpx.post", _post)
 
@@ -1444,15 +1447,18 @@ def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "published" in result.output
     assert "sub_1" in result.output
-    assert seen_upload["url"] == "https://intake.heurontech.com/api/bridge/upload"
+    # #3166: `POST /api/bridge/mocks/:reference/:round` — the route
+    # coord-portal actually serves — not the never-wired-up
+    # `/api/bridge/upload`, and the bundle is flattened to bundle-root paths.
+    assert seen_upload["url"] == "https://intake.heurontech.com/api/bridge/mocks/sub_1/1"
     assert set(seen_upload["files"]) == {
-        "contract.md", "mocks/screen.html", "mocks/index.html",
+        "contract.md", "screen.html", "index.html",
     }
 
     rows = portal_store.outbox_for_submission("sub_1")
     assert len(rows) == 1
     assert rows[0].kind == "design_round"
-    assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
+    assert rows[0].fields["design_round"]["bundle_key"] == "rounds/sub_1/1"
 
 
 def test_publish_mocks_includes_uppercase_html_suffix(tmp_path, monkeypatch):
@@ -1478,15 +1484,15 @@ def test_publish_mocks_includes_uppercase_html_suffix(tmp_path, monkeypatch):
 
     seen_upload: dict = {}
 
-    def _post(url, json=None, headers=None, timeout=None):
-        seen_upload["files"] = (json or {}).get("files")
-        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+    def _post(url, files=None, headers=None, timeout=None):
+        seen_upload["files"] = files
+        return _UploadResponse(200, {"key": "rounds/sub_1/1"})
 
     monkeypatch.setattr("httpx.post", _post)
 
     result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
     assert result.exit_code == 0, result.output
-    assert set(seen_upload["files"]) == {"mocks/SCREEN.HTML"}
+    assert set(seen_upload["files"]) == {"SCREEN.HTML"}
 
 
 def test_publish_mocks_reports_upload_failure(tmp_path, monkeypatch):
