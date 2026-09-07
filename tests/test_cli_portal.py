@@ -1458,7 +1458,9 @@ def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
     rows = portal_store.outbox_for_submission("sub_1")
     assert len(rows) == 1
     assert rows[0].kind == "design_round"
-    assert rows[0].fields["design_round"]["bundle_key"] == "rounds/sub_1/1"
+    # #3173: the wire key is `mock_bundle` — one of coord-portal's
+    # accepted aliases; `bundle_key` (the previous name) is not.
+    assert rows[0].fields["design_round"]["mock_bundle"] == "rounds/sub_1/1"
 
 
 def test_publish_mocks_includes_uppercase_html_suffix(tmp_path, monkeypatch):

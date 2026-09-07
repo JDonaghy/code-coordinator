@@ -1984,7 +1984,9 @@ class TestDesignRoundPushOnMerge:
         rows = portal_store.outbox_for_submission("sub_1")
         assert len(rows) == 1
         assert rows[0].kind == "design_round"
-        assert rows[0].fields["design_round"]["bundle_key"] == "rounds/sub_1/1"
+        # #3173: the wire key is `mock_bundle` — one of coord-portal's
+        # accepted aliases; `bundle_key` (the previous name) is not.
+        assert rows[0].fields["design_round"]["mock_bundle"] == "rounds/sub_1/1"
         assert "Ship the thing." in rows[0].fields["design_round"]["outcome_definition"]
         assert rows[0].state == portal_store.STATE_DRAFT
         assert portal_store.pending_outbox() == []

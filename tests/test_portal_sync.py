@@ -1456,7 +1456,20 @@ def test_push_design_round_bundle_uploads_then_enqueues():
     assert row.kind == portal_sync.KIND_DESIGN_ROUND
     stored = portal_store.outbox_for_submission(SUB)
     assert len(stored) == 1
-    assert stored[0].fields["design_round"]["bundle_key"] == "bundles/sub-001/r7.tar"
+    # #3173: the queued design_round must carry the bundle reference under a
+    # key coord-portal's `src/rounds.ts` actually reads — not just a key
+    # coord itself intends to send. Assert against the mirrored accepted-name
+    # list rather than restating "mock_bundle" as a second opinion of it.
+    from coord.mock_author import PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS  # noqa: PLC0415
+
+    queued_design_round = stored[0].fields["design_round"]
+    bundle_fields = set(queued_design_round) & set(PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS)
+    assert bundle_fields, (
+        f"queued design_round has no portal-accepted bundle key; got "
+        f"{sorted(queued_design_round)}"
+    )
+    (bundle_field,) = bundle_fields
+    assert queued_design_round[bundle_field] == "bundles/sub-001/r7.tar"
     assert "Ship it." in stored[0].fields["design_round"]["outcome_definition"]
 
 
