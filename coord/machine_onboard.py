@@ -50,7 +50,8 @@ are anything layers 1-6 look at. Two gaps, both structural:
    with no board-visible reason.
 8. ``identity`` — there was no layer at all. A rebuild must restore
    ``~/.config/gh/hosts.yml``, an SSH push key, ``~/.coord/client.toml`` and
-   ``~/.claude/.credentials.json``; a machine missing any of them looks
+   Claude's OAuth credentials (``~/.claude/.credentials.json`` on linux; the
+   login **Keychain** on darwin, #3170); a machine missing any of them looks
    perfectly healthy and cannot do a single unit of work.
 
 Both are **role-aware**: a daemon host is held to the daemon's bar (merge
@@ -262,6 +263,13 @@ class IdentityFacts:
 
     claude_oauth_present: bool | None = None
     claude_oauth_reason: str | None = None
+    #: WHERE the verdict above came from — ``"file"``
+    #: (``~/.claude/.credentials.json``, linux) or ``"keychain"`` (the login
+    #: Keychain, which is the only place Claude Code stores OAuth on darwin,
+    #: #3170). Not cosmetic: an operator who reads "credentials absent" on a
+    #: mac needs to know the probe looked in the right place before going and
+    #: creating a file that will never be used.
+    claude_oauth_source: str | None = None
 
     board_token_present: bool | None = None
     board_token_accepted: bool | None = None
@@ -283,6 +291,7 @@ class IdentityFacts:
             git_push_reason=redact(self.git_push_reason),
             claude_oauth_present=self.claude_oauth_present,
             claude_oauth_reason=redact(self.claude_oauth_reason),
+            claude_oauth_source=self.claude_oauth_source,
             board_token_present=self.board_token_present,
             board_token_accepted=self.board_token_accepted,
             board_reason=redact(self.board_reason),
@@ -519,6 +528,116 @@ def probe_linger(host: str, *, timeout: float = 20.0) -> tuple[bool | None, str 
     return None, "`loginctl` did not report a Linger property (not systemd?)"
 
 
+# ── "what PATH does the agent itself run with?" — ONE implementation ────────
+#
+# #3170: two probes need this answer and they must not disagree, so it lives
+# here as a single snippet spliced into both remote scripts
+# (`_COORD_ON_WORKER_PATH_PROBE_SCRIPT` and `_SHELL_PROBE_SCRIPT`) rather than
+# being hand-rolled twice.
+#
+# It matters because a WORKER's PATH is *derived from the agent's* (#402/#2569
+# strip `~/.coord-venv/bin` out of it) — so a probe that answers from the SSH
+# session's PATH is answering a different question entirely. On Debian/Ubuntu
+# that mistake is invisible: the stock `~/.profile` puts `~/.local/bin` on an
+# ssh session's PATH, so the Linux fleet passed by coincidence. macOS's
+# non-interactive ssh PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, so the very
+# same, correctly-installed `~/.local/bin/coord` shim read as MISSING and a
+# healthy mac reported a CRIT it could never clear.
+#
+# Two sources, matching the two ways the fleet actually supervises the agent:
+#   * systemd `--user` (`coord-agent.service`) — the live process's own
+#     `/proc/<pid>/environ`, i.e. the PATH it is running with *right now*,
+#     not what a unit file says it should be.
+#   * launchd (`~/Library/LaunchAgents/*coord-agent*.plist`, docs/MAC_MINI.md)
+#     — `launchctl print` for the loaded job's live environment, falling back
+#     to the plist's declared `EnvironmentVariables/PATH` when the job is
+#     written but not bootstrapped.
+#
+# Deliberately NOT a hardcoded `~/.local/bin` (or any other guess): #2937
+# exists precisely because "coord is probably over there" is not evidence.
+# When neither source answers, this returns None and the caller reports
+# UNKNOWN — never a fabricated verdict off the wrong PATH.
+_AGENT_PATH_DISCOVERY = """\
+import os as _os
+import subprocess as _sp
+from pathlib import Path as _Path
+
+
+def _agent_path_from_systemd():
+    try:
+        proc = _sp.run(
+            ["systemctl", "--user", "show", "coord-agent.service",
+             "--property=MainPID", "--value"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return None
+    pid = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not pid.isdigit() or pid == "0":
+        return None
+    try:
+        blob = _Path("/proc/%s/environ" % pid).read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for entry in blob.split("\\0"):
+        if entry.startswith("PATH="):
+            return entry[5:] or None
+    return None
+
+
+def _agent_path_from_launchd():
+    # A per-USER LaunchAgent by construction (it needs this user's HOME,
+    # login keychain and GUI session), so only ~/Library is searched.
+    try:
+        import plistlib
+        plists = sorted((_Path.home() / "Library" / "LaunchAgents").glob("*coord-agent*.plist"))
+    except Exception:
+        return None
+    declared = None
+    for plist in plists:
+        try:
+            data = plistlib.loads(plist.read_bytes())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if declared is None:
+            value = (data.get("EnvironmentVariables") or {}).get("PATH")
+            declared = value if isinstance(value, str) and value else None
+        label = data.get("Label") or plist.stem
+        try:
+            proc = _sp.run(
+                ["launchctl", "print", "gui/%d/%s" % (_os.getuid(), label)],
+                capture_output=True, text=True, timeout=20,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("PATH =>"):
+                live = stripped.split("=>", 1)[1].strip()
+                if live:
+                    return live
+    return declared
+
+
+def discover_agent_path():
+    \"\"\"The PATH the coord agent process on THIS host runs with, or None.\"\"\"
+    for finder in (_agent_path_from_systemd, _agent_path_from_launchd):
+        try:
+            found = finder()
+        except Exception:
+            found = None
+        if found:
+            return found
+    return None
+
+
+"""
+
+
 # #2937 review: this probe must answer "can a worker resolve `coord`?" using
 # the exact same algorithm the agent itself uses to spawn a worker — not a
 # second, hand-rolled PATH-stripping implementation that can silently
@@ -535,21 +654,37 @@ def probe_linger(host: str, *, timeout: float = 20.0) -> tuple[bool | None, str 
 # implementations that happen to agree today. The script is sent over
 # stdin (`python3 -`) rather than embedded as a `-c` argument so no
 # shell-quoting layer stands between it and the interpreter.
-_COORD_ON_WORKER_PATH_PROBE_SCRIPT = """\
+#
+# #3170: it is invoked with an explicit *base_env* carrying the AGENT's own
+# PATH (:data:`_AGENT_PATH_DISCOVERY`), not left to default to `os.environ` —
+# which here is the SSH SESSION's environment, a PATH no worker is ever
+# spawned with. Without that, this script asked the canonical function the
+# right question about the wrong machine state.
+_COORD_ON_WORKER_PATH_PROBE_SCRIPT = _AGENT_PATH_DISCOVERY + """\
+import os
 import subprocess
 from coord.agent import worker_coord_reachable, _worker_subprocess_env
 
-ok, _msg = worker_coord_reachable()
+agent_path = discover_agent_path()
+base_env = None
+if agent_path:
+    base_env = dict(os.environ)
+    base_env["PATH"] = agent_path
+
+ok = False
 version = ""
-if ok:
-    env = _worker_subprocess_env()
-    try:
-        result = subprocess.run(
-            ["coord", "--version"], env=env, capture_output=True, text=True, timeout=10
-        )
-        version = (result.stdout or result.stderr or "").strip()
-    except Exception:
-        version = ""
+if base_env is not None:
+    ok, _msg = worker_coord_reachable(base_env)
+    if ok:
+        env = _worker_subprocess_env(base_env)
+        try:
+            result = subprocess.run(
+                ["coord", "--version"], env=env, capture_output=True, text=True, timeout=10
+            )
+            version = (result.stdout or result.stderr or "").strip()
+        except Exception:
+            version = ""
+print("AGENT_PATH_FOUND=" + ("1" if base_env is not None else "0"))
 print("COORD_ON_WORKER_PATH_OK=" + ("1" if ok else "0"))
 print("VERSION=" + version.replace("\\n", " "))
 """
@@ -580,14 +715,29 @@ def probe_coord_on_worker_path(
     (``worker_coord_reachable`` logged at ``AgentServer`` init) can never
     silently disagree.
 
+    **#3170: "where it matters" is the agent's environment, not the SSH
+    session's.** The right function was being called against the wrong PATH:
+    with ``base_env=None`` it resolved against the *SSH session's*
+    ``os.environ``. Debian/Ubuntu's stock ``~/.profile`` puts
+    ``~/.local/bin`` on that PATH, so the Linux fleet agreed with the agent
+    by coincidence; macOS's non-interactive ssh PATH is
+    ``/usr/bin:/bin:/usr/sbin:/sbin``, so a correctly-installed shim read as
+    missing and a healthy mac carried a permanent CRIT. The script now
+    discovers the agent's own PATH on *host* (:data:`_AGENT_PATH_DISCOVERY`)
+    and passes it as ``base_env``.
+
     Returns ``(found, error, version)``. Fail-soft, same discipline as
     :func:`probe_linger`: this needs SSH, which ``/health`` structurally
     cannot substitute for (the agent process answering a probe still has its
     own venv on PATH — proving nothing about a worker's shell) — so an SSH
     failure, or the pinned interpreter itself being unreachable/absent,
     reports ``(None, reason, None)``, UNKNOWN, never a fabricated CRIT.
-    ``found=False`` — the actual defect this check exists to catch — is the
-    one outcome that must never collapse into UNKNOWN.
+    A host whose agent PATH cannot be discovered at all (no systemd ``--user``
+    unit, no launchd plist) joins that same UNKNOWN class: the *premise* of
+    the question is missing, which is a different thing from the defect — and
+    guessing off the ssh session's PATH is exactly the bug above. ``found=False``
+    — the actual defect this check exists to catch — is the one outcome that
+    must never collapse into UNKNOWN.
     """
     import subprocess  # noqa: PLC0415
 
@@ -610,6 +760,15 @@ def probe_coord_on_worker_path(
         return None, f"ssh probe failed: {detail[0] if detail else 'no output'}", None
 
     text = (result.stdout or "").strip()
+    if "AGENT_PATH_FOUND=0" in text:
+        return (
+            None,
+            "could not determine the agent's own PATH on that host (no running "
+            "systemd --user coord-agent.service, no ~/Library/LaunchAgents "
+            "coord-agent plist). A worker's PATH is DERIVED from the agent's, so "
+            "answering from the ssh session's PATH would be a guess (#3170)",
+            None,
+        )
     if "COORD_ON_WORKER_PATH_OK=1" in text:
         version = None
         for line in text.splitlines():
@@ -649,8 +808,8 @@ def probe_coord_on_worker_path(
 #     that parses proves only that a file exists).
 # The script therefore emits booleans and short reasons; `parse_shell_probe`
 # then runs every reason through `redact` anyway.
-_SHELL_PROBE_SCRIPT = """\
-import json, os, subprocess
+_SHELL_PROBE_SCRIPT = _AGENT_PATH_DISCOVERY + """\
+import json, os, subprocess, sys
 from pathlib import Path
 
 PARAMS = json.loads(__PARAMS__)
@@ -693,21 +852,11 @@ rc, so, _se = _run('printf "%s" "$PATH"', login=True, timeout=20)
 OUT["login_path"] = so.strip() or None
 
 # ── the AGENT's own resolved PATH, straight off the running unit ───────
-agent_path = None
-rc, so, _se = _run(
-    ["systemctl", "--user", "show", "coord-agent.service",
-     "--property=MainPID", "--value"], timeout=20
-)
-pid = (so or "").strip()
-if rc == 0 and pid.isdigit() and pid != "0":
-    try:
-        blob = Path("/proc/%s/environ" % pid).read_bytes().decode("utf-8", "replace")
-        for entry in blob.split("\\0"):
-            if entry.startswith("PATH="):
-                agent_path = entry[5:]
-    except OSError:
-        agent_path = None
-OUT["agent_path"] = agent_path
+# #3170: shared with the worker-PATH probe (`_AGENT_PATH_DISCOVERY`) so the
+# two can never disagree about what the agent's PATH is — and so this half
+# of the #1671 comparison works on a launchd host too, instead of silently
+# reporting None on every mac.
+OUT["agent_path"] = discover_agent_path()
 
 # ── role: #3128's resolver, on the host that owns the declaration ──────
 try:
@@ -765,14 +914,53 @@ else:
     ident["git_push_ok"] = False
     ident["git_push_reason"] = _tail(se, so)
 
+# Claude OAuth lives in a FILE on linux and in the login KEYCHAIN on darwin
+# (#3170). Checking only the file made every working mac report a CRIT it
+# could never clear, because that file does not exist there and never will.
+# `security find-generic-password` WITHOUT `-w` returns metadata only: it
+# needs no keychain unlock, prompts for nothing, and cannot yield the secret
+# — so presence of the item is the same strength of evidence as a non-empty
+# file, obtained the same way as every other probe here (a plain
+# non-interactive ssh). The secret itself is never read; doing so WOULD
+# prompt, and is not needed.
 creds = _size("~/.claude/.credentials.json")
-ident["claude_oauth_present"] = bool(creds > 0)
-if creds < 0:
-    ident["claude_oauth_reason"] = "~/.claude/.credentials.json does not exist"
-elif creds == 0:
-    ident["claude_oauth_reason"] = "~/.claude/.credentials.json is EMPTY"
-elif _size("~/.claude.json") <= 0:
-    ident["claude_oauth_reason"] = "credentials present but ~/.claude.json is missing/empty"
+if creds > 0:
+    ident["claude_oauth_present"] = True
+    ident["claude_oauth_source"] = "file"
+    if _size("~/.claude.json") <= 0:
+        ident["claude_oauth_reason"] = "credentials present but ~/.claude.json is missing/empty"
+elif sys.platform == "darwin":
+    ident["claude_oauth_source"] = "keychain"
+    rc, so, se = _run(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+        timeout=20,
+    )
+    if rc == 0:
+        ident["claude_oauth_present"] = True
+        if _size("~/.claude.json") <= 0:
+            ident["claude_oauth_reason"] = (
+                "credentials present but ~/.claude.json is missing/empty"
+            )
+    else:
+        # A genuinely logged-OUT mac must still CRIT — a false green here is
+        # strictly worse than the false red this replaces. `security` itself
+        # failing to run (rc is None) is reported verbatim rather than being
+        # laundered into "logged in".
+        ident["claude_oauth_present"] = False
+        ident["claude_oauth_reason"] = (
+            "no 'Claude Code-credentials' item in the login Keychain, where "
+            "Claude Code on macOS stores OAuth (there is no "
+            "~/.claude/.credentials.json on darwin)"
+        )
+        if rc is None:
+            ident["claude_oauth_reason"] += ": " + (_tail(se, so) or "security did not run")
+else:
+    ident["claude_oauth_present"] = False
+    ident["claude_oauth_source"] = "file"
+    ident["claude_oauth_reason"] = (
+        "~/.claude/.credentials.json is EMPTY" if creds == 0
+        else "~/.claude/.credentials.json does not exist"
+    )
 
 try:
     from coord import client
@@ -933,6 +1121,11 @@ def parse_shell_probe(stdout: str) -> ShellProbe:
         git_push_reason=_reason("git_push_reason"),
         claude_oauth_present=_tri("claude_oauth_present"),
         claude_oauth_reason=_reason("claude_oauth_reason"),
+        claude_oauth_source=(
+            str(ident_block["claude_oauth_source"])
+            if ident_block.get("claude_oauth_source") in ("file", "keychain")
+            else None
+        ),
         board_token_present=_tri("board_token_present"),
         board_token_accepted=_tri("board_token_accepted"),
         board_reason=_reason("board_reason"),
@@ -2221,9 +2414,16 @@ def evaluate_identity(facts: MachineFacts) -> list[Finding]:
             ),
         )
     if "claude_oauth" in required:
+        # #3170: name WHERE we looked. On darwin that is the login Keychain,
+        # not ~/.claude/.credentials.json — an operator told "credentials
+        # absent" with no location will go create a file macOS never reads.
+        where = {
+            "file": " (~/.claude/.credentials.json)",
+            "keychain": " (the login Keychain, where macOS stores them)",
+        }.get(ident.claude_oauth_source or "", "")
         _tri(
             "claude_oauth", ident.claude_oauth_present,
-            ok="Claude OAuth credentials present",
+            ok=f"Claude OAuth credentials present{where}",
             bad=(
                 "Claude OAuth credentials are absent or empty"
                 f"{f' ({ident.claude_oauth_reason})' if ident.claude_oauth_reason else ''}"
