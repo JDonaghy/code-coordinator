@@ -40,6 +40,7 @@ from coord.agent import (
     _worker_subprocess_env,
     default_worker_command,
     is_runtime_ceiling_reason,
+    worker_coord_reachable,
 )
 
 from .conftest import noop_default_worker_command
@@ -184,6 +185,75 @@ def test_worker_env_no_assignment_id_leaves_var_unset() -> None:
         base_prefix="/usr",
     )
     assert "COORD_ASSIGNMENT_ID" not in env
+
+
+def test_worker_coord_reachable_via_shim_symlinked_into_the_stripped_venv_dir(
+    tmp_path: Path,
+) -> None:
+    """#3176: on macOS, `coord` is never a literal file on a worker's PATH —
+    it is `~/.local/bin/coord`, a symlink whose TARGET (`~/.coord-venv/bin/coord`,
+    the symlink NAME per setup-macmini.sh, never a resolved `.blue`/`.green`
+    path) lives INSIDE the exact directory #402/#2569 strip out. #3176's own
+    (unconfirmed) theory for a false CRIT on a healthy mac was a resolution
+    step that CANONICALISES that shim before deciding, concluding "this
+    lives inside ~/.coord-venv/bin, which the worker strips" and reporting
+    it missing — even though PATH is irrelevant once `execve` starts, because
+    the real console-script's shebang names its interpreter ABSOLUTELY.
+
+    Per #3170's own lesson, a string assertion about the probe's source
+    proves nothing about control flow — this calls the REAL, shipped
+    `worker_coord_reachable`/`_worker_subprocess_env` (no mocking of
+    `shutil.which` or the filesystem) against a real on-disk symlink chain,
+    and then actually EXECUTES the resolved shim, so the reachability
+    verdict and "can a worker literally run this" are proven together.
+    """
+    home = tmp_path / "home"
+    real_slot = home / ".coord-venv.green"  # the blue/green REAL venv slot
+    (real_slot / "bin").mkdir(parents=True)
+    coord_bin = real_slot / "bin" / "coord"
+    coord_bin.write_text(f"#!{sys.executable}\nprint('coord, version 9.9.9')\n")
+    coord_bin.chmod(0o755)
+
+    venv_link = home / ".coord-venv"  # the blue/green symlink itself
+    venv_link.symlink_to(real_slot)
+
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    # Points at the SYMLINK NAME, never a resolved .blue/.green path — a
+    # symlink into a symlink, exactly as `setup-macmini.sh` creates it.
+    (local_bin / "coord").symlink_to(venv_link / "bin" / "coord")
+
+    agent_path = os.pathsep.join([
+        str(venv_link / "bin"),        # what #402/#2569 must strip
+        str(home / ".cargo" / "bin"),
+        str(local_bin),                # the shim, must survive the strip
+        "/usr/bin",
+        "/bin",
+    ])
+    base_env = {**os.environ, "HOME": str(home), "PATH": agent_path}
+
+    ok, msg = worker_coord_reachable(base_env)
+    assert ok, msg
+    assert str(local_bin / "coord") in msg
+
+    # The strip removed the venv's own bin dir specifically — not the shim's,
+    # which is a real, unrelated directory that just happens to hold a
+    # symlink pointing INTO the stripped one.
+    worker_path = _worker_subprocess_env(base_env)["PATH"].split(os.pathsep)
+    assert str(venv_link / "bin") not in worker_path
+    assert str(local_bin) in worker_path
+
+    # And it isn't merely "found" — it actually runs, because the shebang is
+    # absolute and never depended on PATH in the first place.
+    result = subprocess.run(
+        ["coord", "--version"],
+        env=_worker_subprocess_env(base_env),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert "9.9.9" in (result.stdout or result.stderr)
 
 
 def test_health_reports_machine(tmp_path: Path) -> None:
