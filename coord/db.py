@@ -813,7 +813,11 @@ def retry_on_locked(
 #
 # #3158: bumped 11 -> 12 for the new `assignments.cost_capture_state` column
 # appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 12
+#
+# #3188: bumped 12 -> 13 for `assignments.uat_actor`, `assignments.
+# uat_prior`, and the two `portal_sync_state.preview_verdict_watermark_*`
+# columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 13
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -961,6 +965,21 @@ _SCHEMA_SQL = """
             test_reason TEXT,
             uat_state TEXT,
             uat_reason TEXT,
+            -- #3188: WHO recorded uat_state/uat_reason -- "customer" (a
+            -- portal preview sign-off, coord.portal_sync.
+            -- _consume_preview_verdicts) or "operator" (`coord uat <id>
+            -- --passed|--failed`). NULL for rows predating this column,
+            -- treated identically to "operator" (the only source that
+            -- existed before). See coord.models.Assignment.uat_actor.
+            uat_actor TEXT,
+            -- #3188: the ONE verdict this row's uat_state/uat_reason/
+            -- uat_actor just replaced, JSON-encoded ({"state", "reason",
+            -- "actor"}) -- see coord.state._record_uat_verdict_local. NULL
+            -- until the first override; not a full history (the audit log
+            -- is), just enough for the board to show a customer's verdict
+            -- was not silently dropped when an operator's call landed on
+            -- top of it (or vice versa).
+            uat_prior TEXT,
             cost_usd REAL,
             smoke_tests TEXT,
             review_findings TEXT,
@@ -1492,7 +1511,17 @@ _SCHEMA_SQL = """
             -- event newer than it). See
             -- `coord.portal_sync._consume_relayed_answer_confirmations`.
             relayed_answer_watermark_at    REAL,
-            relayed_answer_watermark_rowid TEXT
+            relayed_answer_watermark_rowid TEXT,
+            -- #3188: the preview-verdict consumer's own read position into
+            -- `portal_events` -- same reason and same shape as
+            -- `question_watermark_at`/`question_watermark_rowid` above (a
+            -- private watermark, independent of `handled_at`, so the
+            -- never-marked backlog every OTHER event kind leaves behind
+            -- cannot starve this consumer of a `preview.approved`/
+            -- `preview.changes_requested` event newer than it). See
+            -- `coord.portal_sync._consume_preview_verdicts`.
+            preview_verdict_watermark_at    REAL,
+            preview_verdict_watermark_rowid TEXT
         );
 
         -- #2749 (IL-3, epic #2746): the running-context ledger — the record
@@ -2111,6 +2140,29 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # tell a row worth re-trying apart from one already confirmed to have
     # nothing to give.
     "ALTER TABLE assignments ADD COLUMN cost_capture_state TEXT",
+    # #3188: WHO recorded uat_state/uat_reason -- see the CREATE TABLE
+    # comment above and coord.models.Assignment.uat_actor. NULL for every
+    # row predating this column, treated identically to "operator" (the
+    # only source that existed before the portal's preview sign-off started
+    # feeding this gate too).
+    "ALTER TABLE assignments ADD COLUMN uat_actor TEXT",
+    # #3188: see the CREATE TABLE comment above -- the one verdict an
+    # override just replaced. NULL for every row predating this column and
+    # for any row that has never had its verdict overridden.
+    "ALTER TABLE assignments ADD COLUMN uat_prior TEXT",
+    # #3188: the preview-verdict consumer's own read position into
+    # `portal_events` -- same reason and same shape as
+    # `question_watermark_at`/`question_watermark_rowid` above. NULL (read
+    # as `(0.0, "")`, before every real event) for every database predating
+    # this migration, which replays the full existing inbox exactly once on
+    # upgrade -- safe for the same reason replaying it is safe for the
+    # other verdict consumers: recording a UAT verdict is a plain UPDATE,
+    # not an append, so a re-observed `preview.approved`/`preview.
+    # changes_requested` event is idempotent (same verdict written again),
+    # never a duplicate. See
+    # `coord.portal_sync._consume_preview_verdicts`.
+    "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_at REAL",
+    "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_rowid TEXT",
 ]
 
 

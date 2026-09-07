@@ -2732,6 +2732,112 @@ class TestRecordUatVerdict:
         row = next(a for a in board.active if a.assignment_id == "aid-1")
         assert row.uat_state == "passed"
 
+    def test_actor_defaults_to_operator(self, coord_db) -> None:
+        # #3188: `coord uat` (and every pre-#3188 caller) never passes
+        # `actor` -- must still read as "operator" on the board.
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed")
+
+        row = coord_db.execute(
+            "SELECT uat_actor FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_actor"] == "operator"
+
+    def test_customer_verdict_is_attributed(self, coord_db) -> None:
+        # #3188: a portal preview sign-off records "customer" so the board
+        # says who approved.
+        self._seed_assignment(coord_db)
+        record_uat_verdict(
+            assignment_id="aid-1", uat_state="failed",
+            uat_reason="wrong logo", actor="customer",
+        )
+
+        row = coord_db.execute(
+            "SELECT uat_state, uat_reason, uat_actor FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "failed"
+        assert row["uat_actor"] == "customer"
+
+        digest_rows = coord_db.execute(
+            "SELECT body FROM issue_context WHERE repo_name='api' AND issue_number=1"
+        ).fetchall()
+        assert any(
+            "UAT FAILED (customer): wrong logo" in r["body"] for r in digest_rows
+        )
+
+    def test_operator_override_of_a_customer_verdict_preserves_the_prior_one(
+        self, coord_db,
+    ) -> None:
+        # #3188: "do not silently widen the gate" -- an operator's
+        # `--passed` must still work even after a customer's
+        # `changes_requested`, but the customer's verdict must not vanish
+        # with no trace: it is folded into `uat_prior` rather than dropped.
+        self._seed_assignment(coord_db)
+        record_uat_verdict(
+            assignment_id="aid-1", uat_state="failed",
+            uat_reason="wrong logo", actor="customer",
+        )
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed", actor="operator")
+
+        row = coord_db.execute(
+            "SELECT uat_state, uat_actor, uat_prior FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "passed"
+        assert row["uat_actor"] == "operator"
+        prior = json.loads(row["uat_prior"])
+        assert prior == {
+            "state": "failed", "reason": "wrong logo", "actor": "customer",
+        }
+
+    def test_repeating_the_same_verdict_and_actor_does_not_touch_prior(
+        self, coord_db,
+    ) -> None:
+        self._seed_assignment(coord_db)
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed", actor="operator")
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed", actor="operator")
+
+        row = coord_db.execute(
+            "SELECT uat_prior FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_prior"] is None
+
+    def test_uat_actor_and_uat_prior_excluded_from_whole_board_upsert(
+        self, coord_db,
+    ) -> None:
+        """Same #1482 exclusion as `test_uat_state_excluded_from_whole_board_
+        upsert` above, for the two #3188 columns: a stale `save_board()`
+        snapshot (every `Assignment` defaults `uat_actor`/`uat_prior` to
+        `None`) must never clobber a verdict already recorded through the
+        dedicated seam writer."""
+        from coord.models import Assignment, Board
+        from coord.state import build_board, save_board
+
+        self._seed_assignment(coord_db)
+        record_uat_verdict(
+            assignment_id="aid-1", uat_state="failed",
+            uat_reason="wrong logo", actor="customer",
+        )
+        record_uat_verdict(assignment_id="aid-1", uat_state="passed", actor="operator")
+
+        stale_snapshot = Board(active=[
+            Assignment(
+                machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+                assignment_id="aid-1", branch="worker/aid-1",
+                uat_state=None, uat_actor=None, uat_prior=None,
+            ),
+        ])
+        save_board(stale_snapshot)
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == "aid-1")
+        assert row.uat_state == "passed"
+        assert row.uat_actor == "operator"
+        assert json.loads(row.uat_prior) == {
+            "state": "failed", "reason": "wrong logo", "actor": "customer",
+        }
+
     def test_uat_state_excluded_from_whole_board_upsert(self, coord_db) -> None:
         """Mirrors test_state's #1482 exclusion: a stale in-memory
         `save_board()` snapshot (no `uat_state` known to it — every

@@ -1396,6 +1396,268 @@ def test_changes_requested_verdict_with_a_space_separator_is_recognized(monkeypa
     assert calls == ["space separated"]
 
 
+# ── consuming portal PREVIEW verdicts (#3188) ───────────────────────────────
+
+
+def _seed_work_assignment(
+    coord_db, *, assignment_id="aid-1", repo_name="acme-portal", issue_number=77,
+):
+    coord_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, branch, type, dispatched_at) "
+        "VALUES (?, 'm1', ?, ?, 't', ?, 'work', 100.0)",
+        (assignment_id, repo_name, issue_number, f"worker/{assignment_id}"),
+    )
+    coord_db.commit()
+
+
+def _preview_event(kind: str, submission_id: str = SUB, comments: str | None = "looks great") -> dict:
+    data: dict = {}
+    if comments is not None:
+        data["comments"] = comments
+    return {"id": "e1", "submission_id": submission_id, "type": kind, "data": data}
+
+
+class TestConsumePreviewVerdicts:
+    """#3188: a customer's portal preview sign-off (`preview.approved`/
+    `preview.changes_requested`, coord-portal's `src/previewReviews.ts`) must
+    record the same pre-merge UAT-gate verdict `coord uat --passed|--failed`
+    does — sibling to `TestSignoffVerdict`'s design-round consumer above.
+
+    Exercises `_consume_preview_verdicts` directly (not through `sync_tick`):
+    a real `coord portal link` also makes the unrelated automatic status-fold
+    phase (`sync_submission_statuses`) reach for a live `gh` call, which the
+    test suite forbids — see the other consumer tests' own `sync_tick`
+    integration test below for the one place that wiring is still checked
+    end to end.
+    """
+
+    def test_approved_records_a_passed_uat_verdict_attributed_to_the_customer(
+        self, coord_db,
+    ):
+        from coord.state import build_board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        _seed_work_assignment(coord_db)
+        board = build_board()
+        portal_store.record_events([_preview_event("preview.approved", comments=None)])
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, board)
+
+        assert consumed == 1
+        assert errors == []
+        row = coord_db.execute(
+            "SELECT uat_state, uat_reason, uat_actor FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "passed"
+        assert row["uat_actor"] == "customer"
+        assert portal_store.unhandled_events() == []
+
+    def test_changes_requested_records_a_failed_uat_verdict_with_the_comment(
+        self, coord_db,
+    ):
+        from coord.state import build_board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        _seed_work_assignment(coord_db)
+        board = build_board()
+        portal_store.record_events(
+            [_preview_event("preview.changes_requested", comments="logo is cropped")]
+        )
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, board)
+
+        assert consumed == 1
+        assert errors == []
+        row = coord_db.execute(
+            "SELECT uat_state, uat_reason, uat_actor FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "failed"
+        assert row["uat_reason"] == "logo is cropped"
+        assert row["uat_actor"] == "customer"
+
+        # #2687: a failed UAT verdict reads as actionable feedback in the
+        # issue's context digest, the same way a failed Test verdict does —
+        # and #3188 tags it as the customer's own words.
+        digest_rows = coord_db.execute(
+            "SELECT body, source FROM issue_context WHERE repo_name='acme-portal' "
+            "AND issue_number=77"
+        ).fetchall()
+        assert any(
+            r["source"] == "uat" and "logo is cropped" in r["body"]
+            and "customer" in r["body"].lower()
+            for r in digest_rows
+        )
+
+    def test_missing_comment_falls_back_to_a_placeholder_reason(self, coord_db):
+        from coord.state import build_board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        _seed_work_assignment(coord_db)
+        board = build_board()
+        portal_store.record_events(
+            [_preview_event("preview.changes_requested", comments=None)]
+        )
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, board)
+
+        assert consumed == 1
+        assert errors == []
+        row = coord_db.execute(
+            "SELECT uat_reason FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert SUB in row["uat_reason"]
+
+    def test_no_link_recorded_stays_unhandled_and_errors(self, coord_db):
+        portal_store.record_events([_preview_event("preview.approved")])
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, None)
+
+        assert consumed == 0
+        assert any("no milestone/issue is linked" in e for e in errors)
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+    def test_milestone_scoped_link_is_rejected_not_guessed(self, coord_db):
+        """A preview is one PR's deployment, never a whole milestone's
+        (#2665) — a milestone-scoped link must not be silently guessed at."""
+        portal_store.link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id=SUB
+        )
+        portal_store.record_events([_preview_event("preview.approved")])
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, None)
+
+        assert consumed == 0
+        assert any("milestone-scoped link" in e for e in errors)
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+    def test_no_matching_work_assignment_stays_unhandled_and_errors(self, coord_db):
+        """A board with nothing dispatched for this issue yet — retry next
+        tick rather than guess an assignment id."""
+        from coord.models import Board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        portal_store.record_events([_preview_event("preview.approved")])
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(
+            config, Board(active=[])
+        )
+
+        assert consumed == 0
+        assert any("no work assignment found" in e for e in errors)
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+    def test_with_no_config_the_phase_is_a_no_op_not_a_crash(self, coord_db):
+        portal_store.record_events([_preview_event("preview.approved")])
+
+        consumed, errors = portal_sync._consume_preview_verdicts(None, None)
+
+        assert consumed == 0
+        assert errors == []
+        assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+    def test_non_preview_event_is_left_alone(self, coord_db):
+        """A `created`/`signoff.*`/whatever-else event must not be mistaken
+        for a preview verdict — `_preview_verdict` returns `None` and the
+        event is walked past, not consumed."""
+        portal_store.record_events([{"id": "e1", "submission_id": SUB, "type": "created"}])
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, None)
+
+        assert consumed == 0
+        assert errors == []
+
+    def test_sync_tick_reports_preview_verdicts_consumed(self, coord_db):
+        """The `sync_tick` wiring end to end — pull a `preview.approved`
+        event through a `FakeClient`, resolve it against a real board, and
+        confirm the tick's own result counter reflects it. Uses an
+        issue-scoped link with no milestone (#2665), so the unrelated
+        automatic status fold has nothing to reach `gh` for."""
+        from coord.state import build_board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id=SUB
+        )
+        _seed_work_assignment(coord_db)
+        board = build_board()
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        client = FakeClient(
+            pages=[
+                {
+                    "events": [_preview_event("preview.approved", comments=None)],
+                    "cursor": "c1",
+                    "has_more": False,
+                }
+            ]
+        )
+
+        result = sync_tick(config=config, client=client, board=board)
+
+        assert result.preview_verdicts_consumed == 1
+        row = coord_db.execute(
+            "SELECT uat_state FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["uat_state"] == "passed"
+
+    def test_a_failure_freezes_the_watermark_but_not_later_independent_events(
+        self, coord_db,
+    ):
+        """Mirrors `test_a_dispatch_failure_freezes_the_watermark_but_not_
+        later_independent_events` for `_consume_verdicts`: a still-broken
+        event must stay retryable, but a later, unrelated preview verdict in
+        the same page still gets recorded (per-event isolation)."""
+        from coord.state import build_board
+
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=77, submission_id="sub-bad"
+        )
+        portal_store.link_issue(
+            repo_name="acme-portal", issue_number=78, submission_id="sub-good"
+        )
+        _seed_work_assignment(coord_db, assignment_id="aid-2", issue_number=78)
+        board = build_board()
+
+        portal_store.record_events(
+            [
+                {
+                    "id": "bad-1", "submission_id": "sub-bad", "type": "preview.approved",
+                },
+                {
+                    "id": "good-1", "submission_id": "sub-good", "type": "preview.approved",
+                },
+            ]
+        )
+
+        config = FakeConfig({"acme-portal": FakeRepoCfg()})
+        consumed, errors = portal_sync._consume_preview_verdicts(config, board)
+
+        assert consumed == 1
+        assert any("no work assignment found" in e for e in errors)
+        unhandled_ids = {e.event_id for e in portal_store.unhandled_events()}
+        assert unhandled_ids == {"bad-1"}
+        row = coord_db.execute(
+            "SELECT uat_state FROM assignments WHERE assignment_id='aid-2'"
+        ).fetchone()
+        assert row["uat_state"] == "passed"
+
+
 class TestSignoffVerdict:
     def _event(self, kind: str, payload: dict | None = None):
         return portal_store.PortalEvent(

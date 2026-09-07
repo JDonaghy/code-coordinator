@@ -4914,7 +4914,7 @@ class TestUatGate:
     @staticmethod
     def _work(
         aid: str = "w1", *, uat_state: str | None = None, uat_reason: str | None = None,
-        dispatched_at: float | None = None,
+        dispatched_at: float | None = None, uat_actor: str | None = None,
     ) -> Assignment:
         return Assignment(
             machine_name="m1",
@@ -4928,6 +4928,7 @@ class TestUatGate:
             uat_state=uat_state,
             uat_reason=uat_reason,
             dispatched_at=dispatched_at,
+            uat_actor=uat_actor,
         )
 
     # ── requires_uat ──
@@ -5010,6 +5011,27 @@ class TestUatGate:
         ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
         assert ok is False
         assert "uat verdict FAILED: logo is cropped" in message
+
+    def test_evaluate_uat_verdict_ignores_who_recorded_it(self) -> None:
+        """#3188: `evaluate_uat_verdict` reads only `uat_state`/`uat_reason` —
+        never `uat_actor` — so a customer's portal preview sign-off
+        (`coord.portal_sync._consume_preview_verdicts`, ``actor="customer"``)
+        gates identically to an operator's `coord uat --passed|--failed`
+        (#2096: one question, one answer; a second source of truth for "is
+        UAT ok" would be exactly the split-brain that principle forbids)."""
+        cfg = self._config()
+
+        passed = self._work("w1", uat_state="passed", uat_actor="customer")
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), self._board(completed=[passed]), cfg)
+        assert ok is True
+        assert message == ""
+
+        failed = self._work(
+            "w1", uat_state="failed", uat_reason="wrong logo", uat_actor="customer",
+        )
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), self._board(completed=[failed]), cfg)
+        assert ok is False
+        assert "uat verdict FAILED: wrong logo" in message
 
     def test_evaluate_uat_verdict_fails_closed_with_no_work_assignment(self) -> None:
         # Unlike evaluate_smoke_verdict (fails open), an unidentifiable work
