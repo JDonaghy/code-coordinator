@@ -277,6 +277,12 @@ Without auto-login the agent does not come back after a reboot, and nothing dist
 from the machine being switched off. `loginctl enable-linger` has no macOS equivalent; the linger
 probe correctly reports UNKNOWN rather than a defect.
 
+> Verify this rather than assuming it. On the first mac, the agent *did* come back after an OS
+> update — but auto-login was off the whole time and someone had simply logged in. The tell:
+> `defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser` reports the key "does
+> not exist" while the domain itself reads fine, and `/etc/kcpassword` is absent. A reboot that
+> works because a human was standing there is not a machine that survives reboots.
+
 **6. Remote Login is off by default and `systemsetup -setremotelogin on` needs Full Disk Access**
 for the calling terminal, so it fails silently from a plain shell. Enable it in
 System Settings → General → Sharing. Until it is on, `coord machine doctor --ssh`, remote session
@@ -289,6 +295,32 @@ agent), so ssh is precisely the channel you need when propagation is what strand
 push, destroying the session's work) and `identity.claude_oauth_missing` (no
 `~/.claude/.credentials.json`, so `claude -p` cannot start and the machine fails every dispatch it
 accepts). Neither is visible from `/health`. Clear both before routing work.
+
+**9. Idle sleep will kill a running worker, and nothing in the failure says "power".** A mini
+provisioned without `--with-sudo` kept macOS's default sleep behaviour, went to idle sleep
+mid-dispatch, and dropped off the tailnet:
+
+```
+21:51:02  Entering Sleep state due to 'Idle Sleep': TCPKeepAlive=active  Using AC
+22:02:03  DarkWake ... 22:02:10 Wake
+```
+
+The work leg failed; the fleet redispatched it to another machine and it completed there, and the
+branch survived only because the worker had already pushed. From the board this looks like an
+ordinary worker failure — there is no signal pointing at power management, and the machine is
+back online and healthy by the time you look.
+
+`sleep 0` alone is not sufficient: `disksleep` and `powernap` produce the same symptom from the
+fleet's side. Set all of them, and `autorestart` so a power cut does not leave the box dark:
+
+```bash
+sudo pmset -a sleep 0 disablesleep 1 disksleep 0 powernap 0 womp 1 autorestart 1
+```
+
+`scripts/setup-macmini.sh` applies these under `--with-sudo`, and — because reading power state
+needs no privileges — **reports them even without it**, naming `sleep` explicitly in its residue
+rather than a generic "step skipped". That gap is what let this happen: the original script said
+only "Remote Login is off" and never mentioned sleep at all.
 
 **8. Cosmetic, but it will make you look twice:** `hostname -s` is `Johns-Mac-mini`, not the
 machine name — always pass `--machine` explicitly rather than relying on the Linux installer's
