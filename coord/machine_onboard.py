@@ -551,7 +551,9 @@ def probe_linger(host: str, *, timeout: float = 20.0) -> tuple[bool | None, str 
 #   * launchd (`~/Library/LaunchAgents/*coord-agent*.plist`, docs/MAC_MINI.md)
 #     — `launchctl print` for the loaded job's live environment, falling back
 #     to the plist's declared `EnvironmentVariables/PATH` when the job is
-#     written but not bootstrapped.
+#     written but not bootstrapped, OR when `print` can describe a job that
+#     is not actually `state = running` (#3176: registered is not the same
+#     as alive — see `_agent_path_from_launchd`).
 #
 # Deliberately NOT a hardcoded `~/.local/bin` (or any other guess): #2937
 # exists precisely because "coord is probably over there" is not evidence.
@@ -585,9 +587,22 @@ def _agent_path_from_systemd():
     return None
 
 
+# #3176: set by `_agent_path_from_launchd` as a side effect, so a caller that
+# cares (the worker-PATH probe script) can report a LIVE/DECLARED divergence
+# instead of a bare PATH nobody can cross-check. Not returned from the
+# function itself because `discover_agent_path()` — used by two different
+# scripts (see the module comment above) — must keep returning a single
+# string; most callers never look at these.
+_LAUNCHD_LIVE_PATH = None
+_LAUNCHD_DECLARED_PATH = None
+
+
 def _agent_path_from_launchd():
     # A per-USER LaunchAgent by construction (it needs this user's HOME,
     # login keychain and GUI session), so only ~/Library is searched.
+    global _LAUNCHD_LIVE_PATH, _LAUNCHD_DECLARED_PATH
+    _LAUNCHD_LIVE_PATH = None
+    _LAUNCHD_DECLARED_PATH = None
     try:
         import plistlib
         plists = sorted((_Path.home() / "Library" / "LaunchAgents").glob("*coord-agent*.plist"))
@@ -614,12 +629,30 @@ def _agent_path_from_launchd():
             continue
         if proc.returncode != 0:
             continue
-        for line in (proc.stdout or "").splitlines():
+        lines = (proc.stdout or "").splitlines()
+        # #3176: `launchctl print` succeeding only proves the job is
+        # REGISTERED with launchd, never that it is the process actually
+        # answering requests right now. setup-macmini.sh's own plist writes
+        # a comment warning about exactly this ("KeepAlive... a genuinely
+        # broken binary retries forever instead of landing in `failed`... a
+        # crash loop here is quiet"), and docs/MAC_MINI.md's trap #4 says to
+        # read the state/exit-code lines rather than infer liveness from
+        # `print` succeeding. A job `print` can describe but that is not
+        # `state = running` may be reporting an environment frozen at an
+        # earlier bootstrap (launchd does not hot-reload a running job when
+        # its plist changes on disk) — or simply be an abandoned leftover —
+        # so it must not be trusted over `declared` here.
+        if not any(ln.strip().startswith("state = running") for ln in lines):
+            continue
+        for line in lines:
             stripped = line.strip()
             if stripped.startswith("PATH =>"):
                 live = stripped.split("=>", 1)[1].strip()
                 if live:
+                    _LAUNCHD_LIVE_PATH = live
+                    _LAUNCHD_DECLARED_PATH = declared
                     return live
+    _LAUNCHD_DECLARED_PATH = declared
     return declared
 
 
@@ -679,10 +712,10 @@ if base_env is not None:
     # PATH it searched rather than a bare boolean nobody can interrogate
     # after the fact — the whole reason the #3170 theory took hand-rolling a
     # reproduction script on the box to even investigate.
-    worker_path = _worker_subprocess_env(base_env).get("PATH", "")
+    env = _worker_subprocess_env(base_env)
+    worker_path = env.get("PATH", "")
     ok, _msg = worker_coord_reachable(base_env)
     if ok:
-        env = _worker_subprocess_env(base_env)
         try:
             result = subprocess.run(
                 ["coord", "--version"], env=env, capture_output=True, text=True, timeout=10
@@ -694,6 +727,16 @@ print("AGENT_PATH_FOUND=" + ("1" if base_env is not None else "0"))
 print("WORKER_PATH=" + worker_path)
 print("COORD_ON_WORKER_PATH_OK=" + ("1" if ok else "0"))
 print("VERSION=" + version.replace("\\n", " "))
+# #3176: this agent PATH may have come from a launchd job whose LIVE
+# environment (what it is actually running with right now) differs from
+# what its plist currently declares on disk. launchd does not hot-reload a
+# loaded job when its plist changes, so that shape is a genuinely stale
+# agent process, not a probe defect — surfacing it turns "is this CRIT
+# real" from a hand-rolled ssh reproduction into a fact already sitting in
+# this output.
+if _LAUNCHD_LIVE_PATH and _LAUNCHD_DECLARED_PATH and _LAUNCHD_LIVE_PATH != _LAUNCHD_DECLARED_PATH:
+    print("LAUNCHD_PATH_STALE=1")
+    print("LAUNCHD_DECLARED_PATH=" + _LAUNCHD_DECLARED_PATH)
 """
 
 
@@ -749,11 +792,33 @@ def probe_coord_on_worker_path(
     **#3176: a bare ``found=False`` named no evidence.** Confirming (or
     refuting) the CRIT it produces meant hand-rolling this exact probe again
     by hand over ssh — which is how #3176 itself got investigated, and
-    exactly the kind of unconfirmed verdict #2096 exists to catch. ``error``
-    now also carries the post-strip worker PATH that ``worker_coord_reachable``
-    actually searched when ``found=False`` (``"searched PATH: ..."``) — an
-    observation taken from the same probe run that produced the verdict, not
-    a re-guess after the fact.
+    exactly the kind of unconfirmed verdict #2096 exists to catch.
+    ``error`` on the ``found=False`` branch now carries two independent
+    pieces of evidence taken from the same probe run that produced the
+    verdict (see the inline comments in
+    :data:`_COORD_ON_WORKER_PATH_PROBE_SCRIPT` and the parsing below for the
+    mechanics of each):
+
+    1. The post-strip worker PATH ``worker_coord_reachable`` actually
+       searched (``"searched PATH: ..."``).
+    2. When the agent's PATH was discovered via a launchd job: whether that
+       job's *live* environment (what it is actually running with right
+       now) disagrees with what its plist *currently* declares on disk.
+       launchd does not hot-reload a plist edit into an already-loaded job,
+       so a mismatch here can mean the CRIT is real but the agent process
+       itself is stale — an operational problem (restart the job), not a
+       probe defect — and the note names the restart command rather than
+       leaving that theory for the next reader to re-derive by hand.
+       ``_agent_path_from_launchd`` was also hardened to stop trusting a
+       launchd job's reported environment unless that job is actually
+       ``state = running`` — a job `launchctl print` can merely describe
+       (loaded, crashed, or an abandoned leftover) is not evidence of what
+       the real agent process has (docs/MAC_MINI.md trap #4: "a crash loop
+       here is quiet").
+
+    Neither of these confirms *why* any specific host currently CRITs —
+    that still needs a live ``coord machine doctor <host> --ssh`` run to
+    read whichever of the two the output actually names.
     """
     import subprocess  # noqa: PLC0415
 
@@ -792,16 +857,29 @@ def probe_coord_on_worker_path(
                 version = line[len("VERSION="):].strip() or None
         return True, None, version
     if "COORD_ON_WORKER_PATH_OK=0" in text:
-        # #3176: a bare False told nobody what PATH was actually searched, so
-        # confirming (or refuting) a CRIT meant hand-rolling this exact probe
-        # over ssh a second time. WORKER_PATH is the post-strip PATH
-        # worker_coord_reachable() searched, straight off the same run that
-        # produced the verdict — an observation, not a re-guess.
+        # #3176: see the docstring above for what each of these two fields
+        # is evidence of and why.
         worker_path = None
+        declared_path = None
+        stale = False
         for line in text.splitlines():
             if line.startswith("WORKER_PATH="):
                 worker_path = line[len("WORKER_PATH="):].strip() or None
+            elif line.startswith("LAUNCHD_PATH_STALE="):
+                stale = line[len("LAUNCHD_PATH_STALE="):].strip() == "1"
+            elif line.startswith("LAUNCHD_DECLARED_PATH="):
+                declared_path = line[len("LAUNCHD_DECLARED_PATH="):].strip() or None
         detail = f"searched PATH: {worker_path!r}" if worker_path else None
+        if stale and declared_path:
+            note = (
+                f"the loaded launchd job's live PATH differs from what its "
+                f"plist currently declares ({declared_path!r}) — the job may "
+                "be running with a stale environment from an earlier "
+                "bootstrap; try `launchctl kickstart -k "
+                "gui/$(id -u)/com.jdonaghy.coord-agent` to restart it "
+                "against the current config, then re-run this check"
+            )
+            detail = f"{detail} — NOTE: {note}" if detail else note
         return False, detail, None
     return None, "worker-PATH probe produced no parseable output", None
 
