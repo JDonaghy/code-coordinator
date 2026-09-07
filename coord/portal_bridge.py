@@ -70,6 +70,12 @@ CLIENT_SECRET_HEADER = "CF-Access-Client-Secret"
 # generic 400 from the other side of the internet.
 MAX_PUSH_UPDATES = 50
 
+# #3178: mirrors coord-portal's MAX_OUTBOUND_DRAFTS_PUSH
+# (src/coordOutboundDrafts.ts) the same way MAX_PUSH_UPDATES above mirrors
+# MAX_PUSH_UPDATES — a Worker-imposed ceiling made visible here, not a
+# contract term of its own.
+MAX_OUTBOUND_DRAFTS_PUSH = 50
+
 #: The pinned customer status vocabulary the portal accepts (Gate-A contract).
 #: Keep in step with ``docs/CUSTOMER_PORTAL.md`` (§ Status vocabulary) and
 #: coord-portal's ``src/submissions.ts`` ``SUBMISSION_STATUS_TEXT`` — a value
@@ -174,6 +180,68 @@ class PushResult:
         fleet's intent is now reflected on the portal (updates.ts's own
         framing of `already_applied` as "a success, not a no-op")."""
         return self.outcome in ("applied", "already_applied")
+
+
+@dataclass(frozen=True)
+class OutboundDraftUpdate:
+    """One coord-drafted, still-``draft`` outbox row, as coord-portal's
+    ``POST /api/bridge/outbound-drafts`` (#3178, coord-portal#318) expects it.
+
+    ``id`` is coord's own ``portal_outbox`` row id, stringified — the wire
+    identity coord-portal's ``coord_outbound_drafts`` table keys off
+    (``migrations/0027_coord_outbound_drafts.sql``: "coord's own
+    ``portal_outbox`` row id ... never minted here"). ``fields`` is the FLAT
+    string map coord-portal's ``parseFields``/``isPlainObject`` checks expect
+    — never the row's own nested ``fields_json`` shape — see
+    :func:`coord.portal_sync._draft_wire_fields` for the flattening.
+    """
+
+    id: str
+    submission_id: str
+    kind: str
+    fields: dict[str, str]
+    queued_at: str
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.id.strip():
+            raise PortalBridgeError("OutboundDraftUpdate.id must be non-empty")
+        if not self.submission_id or not self.submission_id.strip():
+            raise PortalBridgeError(
+                "OutboundDraftUpdate.submission_id must be non-empty"
+            )
+        if not self.kind or not self.kind.strip():
+            raise PortalBridgeError("OutboundDraftUpdate.kind must be non-empty")
+        if not self.queued_at or not self.queued_at.strip():
+            raise PortalBridgeError(
+                "OutboundDraftUpdate.queued_at must be non-empty"
+            )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "submission_id": self.submission_id,
+            "kind": self.kind,
+            "fields": self.fields,
+            "queued_at": self.queued_at,
+        }
+
+
+@dataclass(frozen=True)
+class OutboundDraftPushResult:
+    """One entry of ``POST /api/bridge/outbound-drafts``'s per-item ``results``.
+
+    Only two outcomes on this route (``applyOutboundDraftsPush`` in
+    coord-portal's ``src/coordOutboundDrafts.ts``) — unlike :class:`PushResult`
+    there is no ``already_applied``: a re-assertion of a draft the operator
+    already decided is reported ``applied`` too (the whole point of the
+    upsert's own ``WHERE state = 'pending'`` guard is that re-asserting a
+    decided row is a safe no-op, not a distinct outcome coord needs to tell
+    apart from a fresh insert).
+    """
+
+    id: str
+    outcome: str  # "applied" | "rejected"
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +391,49 @@ class PortalBridgeClient:
             [BridgeUpdate(submission_id=submission_id, revision=revision, fields={"status": status})]
         )
         return results[0]
+
+    def push_outbound_drafts(
+        self, drafts: list[OutboundDraftUpdate]
+    ) -> list[OutboundDraftPushResult]:
+        """``POST /api/bridge/outbound-drafts`` — assert coord's current
+        ``draft``-state outbox rows (#3178, coord-portal#318).
+
+        A re-assertion of coord's *current* pending set, not an append-only
+        log (coord-portal's ``bridgeOutboundDraftsPush`` doc comment) — call
+        this every tick with whatever :func:`coord.portal_store.draft_outbox`
+        returns right now; there is nothing to diff against locally. A
+        per-item ``rejected`` (a malformed row, a ``kind`` this deploy does
+        not recognise) is a real answer, not a transport failure, same
+        posture as :meth:`push`. Only a transport failure, a 401, or a
+        malformed response raises :class:`PortalBridgeError`.
+        """
+        if not drafts:
+            return []
+        if len(drafts) > MAX_OUTBOUND_DRAFTS_PUSH:
+            raise PortalBridgeError(
+                f"push_outbound_drafts() got {len(drafts)} drafts; the portal "
+                f"caps a batch at {MAX_OUTBOUND_DRAFTS_PUSH} "
+                f"(src/coordOutboundDrafts.ts MAX_OUTBOUND_DRAFTS_PUSH) — "
+                f"split it into multiple calls"
+            )
+        data = self._post(
+            "/api/bridge/outbound-drafts",
+            {"drafts": [d.to_wire() for d in drafts]},
+        )
+        raw_results = data.get("results")
+        if not isinstance(raw_results, list):
+            raise PortalBridgeError(
+                f"POST /api/bridge/outbound-drafts: response had no 'results' "
+                f"list: {data!r}"
+            )
+        return [
+            OutboundDraftPushResult(
+                id=str(r.get("id", "")),
+                outcome=str(r.get("outcome", "rejected")),
+                reason=r.get("reason"),
+            )
+            for r in raw_results
+        ]
 
     def heartbeat(self, at: str | None = None) -> bool:
         """``POST /api/bridge/heartbeat`` — say the daemon is alive.

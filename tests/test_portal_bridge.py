@@ -7,7 +7,10 @@ import pytest
 
 from coord.config import PortalConfig
 from coord.portal_bridge import (
+    MAX_OUTBOUND_DRAFTS_PUSH,
     BridgeUpdate,
+    OutboundDraftPushResult,
+    OutboundDraftUpdate,
     PortalBridgeClient,
     PortalBridgeError,
     SUBMISSION_STATUSES,
@@ -384,3 +387,143 @@ def test_relayed_answer_is_a_coord_owned_field():
     from coord.portal_bridge import COORD_OWNED_FIELDS
 
     assert "relayed_answer" in COORD_OWNED_FIELDS
+
+
+# ── outbound drafts (#3178, coord-portal#318's companion) ───────────────────
+
+
+def test_push_outbound_drafts_sends_the_documented_wire_shape(monkeypatch):
+    """coord-portal's `POST /api/bridge/outbound-drafts`
+    (`bridgeOutboundDraftsPush`, `src/routes/bridge.ts`) expects a `drafts`
+    array of `{id, submission_id, kind, fields, queued_at}` — the exact shape
+    `applyOneDraftPush` (`src/coordOutboundDrafts.ts`) parses. `id` must be a
+    string (coord's own `portal_outbox` row id, stringified) and `fields` a
+    flat string map."""
+    seen = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        return _Response(200, {"results": [{"id": "1", "outcome": "applied"}]})
+
+    monkeypatch.setattr("httpx.post", _post)
+    client = _client()
+    results = client.push_outbound_drafts(
+        [
+            OutboundDraftUpdate(
+                id="1",
+                submission_id="sub_1",
+                kind="question",
+                fields={"question": "which blue?"},
+                queued_at="2026-09-07T00:00:00.000Z",
+            )
+        ]
+    )
+
+    assert seen["url"] == "https://intake.heurontech.com/api/bridge/outbound-drafts"
+    assert seen["json"] == {
+        "drafts": [
+            {
+                "id": "1",
+                "submission_id": "sub_1",
+                "kind": "question",
+                "fields": {"question": "which blue?"},
+                "queued_at": "2026-09-07T00:00:00.000Z",
+            }
+        ]
+    }
+    assert results == [OutboundDraftPushResult(id="1", outcome="applied", reason=None)]
+
+
+def test_push_outbound_drafts_empty_list_is_a_noop_no_request_sent(monkeypatch):
+    def _post(*a, **k):
+        raise AssertionError("push_outbound_drafts([]) must not make a request")
+
+    monkeypatch.setattr("httpx.post", _post)
+    assert _client().push_outbound_drafts([]) == []
+
+
+def test_push_outbound_drafts_over_the_batch_cap_is_refused_locally(monkeypatch):
+    def _post(*a, **k):
+        raise AssertionError("an oversized batch must be refused before any request")
+
+    monkeypatch.setattr("httpx.post", _post)
+    drafts = [
+        OutboundDraftUpdate(
+            id=str(i),
+            submission_id=f"sub_{i}",
+            kind="question",
+            fields={"question": "?"},
+            queued_at="2026-09-07T00:00:00.000Z",
+        )
+        for i in range(MAX_OUTBOUND_DRAFTS_PUSH + 1)
+    ]
+    with pytest.raises(PortalBridgeError, match="caps a batch at 50"):
+        _client().push_outbound_drafts(drafts)
+
+
+def test_push_outbound_drafts_rejected_outcome_is_not_an_exception(monkeypatch):
+    """A per-item `rejected` (a `kind` this deploy does not recognise, per
+    `isCoordOutboundDraftKind`) is a real answer, not a transport failure —
+    same posture as `push`'s own per-item outcomes."""
+
+    def _post(url, json=None, headers=None, timeout=None):
+        return _Response(
+            200, {"results": [{"id": "1", "outcome": "rejected", "reason": "unknown_kind"}]}
+        )
+
+    monkeypatch.setattr("httpx.post", _post)
+    results = _client().push_outbound_drafts(
+        [
+            OutboundDraftUpdate(
+                id="1",
+                submission_id="sub_1",
+                kind="question",
+                fields={"question": "?"},
+                queued_at="2026-09-07T00:00:00.000Z",
+            )
+        ]
+    )
+    assert results[0].outcome == "rejected"
+    assert results[0].reason == "unknown_kind"
+
+
+def test_push_outbound_drafts_raises_when_response_has_no_results_list(monkeypatch):
+    def _post(url, json=None, headers=None, timeout=None):
+        return _Response(200, {"ok": True})
+
+    monkeypatch.setattr("httpx.post", _post)
+    with pytest.raises(PortalBridgeError, match="no 'results' list"):
+        _client().push_outbound_drafts(
+            [
+                OutboundDraftUpdate(
+                    id="1",
+                    submission_id="sub_1",
+                    kind="question",
+                    fields={"question": "?"},
+                    queued_at="2026-09-07T00:00:00.000Z",
+                )
+            ]
+        )
+
+
+def test_outbound_draft_update_rejects_empty_id():
+    with pytest.raises(PortalBridgeError, match="id"):
+        OutboundDraftUpdate(
+            id="",
+            submission_id="sub_1",
+            kind="question",
+            fields={"question": "?"},
+            queued_at="2026-09-07T00:00:00.000Z",
+        )
+
+
+def test_outbound_draft_update_rejects_empty_queued_at():
+    with pytest.raises(PortalBridgeError, match="queued_at"):
+        OutboundDraftUpdate(
+            id="1",
+            submission_id="sub_1",
+            kind="question",
+            fields={"question": "?"},
+            queued_at="",
+        )
