@@ -102,6 +102,14 @@ def row_to_assignment(row: object) -> Assignment:
         # column or a repo that hasn't opted in via Repo.uat_preview.
         uat_state=d.get("uat_state"),
         uat_reason=d.get("uat_reason"),
+        # #3188: who recorded the verdict above -- "customer" (a portal
+        # preview sign-off) or "operator" (`coord uat`); None for rows
+        # predating this column or written before #3188, read identically
+        # to "operator" everywhere it's displayed.
+        uat_actor=d.get("uat_actor"),
+        # #3188: the verdict `uat_state` just overrode, when it did; None
+        # otherwise. See coord.models.Assignment.uat_prior.
+        uat_prior=d.get("uat_prior"),
         # #1479: Test-gate staleness anchor; None for pre-1479 rows or where
         # it couldn't be captured — the merge-queue gate treats that as "SHA
         # tracking unavailable" and skips the staleness check (fail open).

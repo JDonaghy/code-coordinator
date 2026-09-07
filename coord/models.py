@@ -802,6 +802,28 @@ class Assignment:
     # there's nothing to mechanically re-verify against a moved SHA.
     uat_state: str | None = None
     uat_reason: str | None = None
+    # #3188: WHO recorded uat_state/uat_reason -- "customer" (the portal's
+    # preview sign-off, `preview.approved`/`preview.changes_requested` via
+    # `coord.portal_sync._consume_preview_verdicts`) or "operator" (`coord
+    # uat <id> --passed|--failed`, the only source before #3188 and still
+    # the default an operator call records). None for rows predating this
+    # column, treated identically to "operator" everywhere it's read.
+    # Attribution only -- `coord.merge_queue.evaluate_uat_verdict` does not
+    # read this field and does not need to: it is the exact same uat_state/
+    # uat_reason `coord uat --passed` already wrote, so there remains
+    # exactly one function answering "is UAT ok" regardless of who supplied
+    # the verdict (#2096, "one question, one answer").
+    uat_actor: str | None = None
+    # #3188: the ONE verdict `uat_state`/`uat_reason`/`uat_actor` just
+    # replaced, JSON-encoded (``{"state", "reason", "actor"}``) — set only
+    # when `coord.state.record_uat_verdict` actually overrides a prior,
+    # different verdict (a customer's `changes_requested` overwritten by a
+    # later operator `--passed`, or the reverse). None when no override has
+    # happened. Not a full history — the audit log is — just enough for a
+    # caller displaying the current verdict to also show the one it
+    # replaced, so an override can never read as if the earlier verdict
+    # never existed.
+    uat_prior: str | None = None
     # #1479: staleness anchor for a terminal (passed/skipped) Test-gate
     # verdict — captured once, best-effort, when the verdict is recorded
     # (``coord.state._record_test_verdict_local``). Mirrors the review gate's

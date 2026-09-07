@@ -2381,7 +2381,10 @@ class TestUatStateAndReasonColumns:
 # more on an existing database).
 # #3148 bumped this to (11, 82): `issue_context.resolved_at` /
 # `resolved_note`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (12, 83)
+# #3188 bumped this to (13, 87): `assignments.uat_actor`,
+# `assignments.uat_prior`, and the two
+# `portal_sync_state.preview_verdict_watermark_*` columns.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (13, 87)
 
 
 class TestMigrateAddColumnsVersionGuard:

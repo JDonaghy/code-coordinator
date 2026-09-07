@@ -1588,6 +1588,66 @@ def events_after_relayed_answer_watermark(
     return [(r["event_id"], _event_from_row(r)) for r in rows]
 
 
+def get_preview_verdict_watermark() -> tuple[float, str]:
+    """The preview-verdict consumer's own read position (#3188) — ``(0.0,
+    "")`` if never set. A private watermark, independent of
+    ``verdict_watermark_*``/``question_watermark_*``/
+    ``relayed_answer_watermark_*`` above, for the same reason those are
+    independent of each other and of :func:`unhandled_events`: this
+    consumer walks the same ``portal_events`` inbox at its own pace for
+    ``preview.approved``/``preview.changes_requested`` events, and every
+    OTHER event kind it ignores must not pile up ahead of the next one of
+    those forever — see :func:`get_verdict_watermark`'s docstring for the
+    full "why not ``handled_at IS NULL``" rationale, which applies here
+    unchanged. See :func:`coord.portal_sync._consume_preview_verdicts`.
+    """
+    row = sql.execute(
+        _conn(),
+        "SELECT preview_verdict_watermark_at, preview_verdict_watermark_rowid "
+        "FROM portal_sync_state WHERE id = 1",
+    ).fetchone()
+    if row is None or row["preview_verdict_watermark_at"] is None:
+        return (0.0, "")
+    return (
+        row["preview_verdict_watermark_at"],
+        row["preview_verdict_watermark_rowid"] or "",
+    )
+
+
+def set_preview_verdict_watermark(received_at: float, event_id: str) -> None:
+    """Advance the preview-verdict consumer's read position past
+    ``(received_at, event_id)`` — called after a scan has looked at that
+    row, whatever kind it turned out to be, same reasoning as
+    :func:`set_verdict_watermark`.
+    """
+    _update_sync_state(
+        preview_verdict_watermark_at=received_at,
+        preview_verdict_watermark_rowid=event_id,
+    )
+
+
+def events_after_preview_verdict_watermark(
+    received_at: float, after_event_id: str, *, limit: int = 100
+) -> list[tuple[str, "PortalEvent"]]:
+    """The preview-verdict consumer's own paginated scan — identical query
+    to :func:`events_after_verdict_watermark`, against this consumer's own
+    watermark instead. See
+    :func:`coord.portal_sync._consume_preview_verdicts`.
+    """
+    rows = sql.execute(
+        _conn(),
+        """
+        SELECT * FROM portal_events
+         WHERE received_at > ?
+            OR (received_at = ? AND event_id > ?)
+         ORDER BY received_at ASC, event_id ASC
+         LIMIT ?
+        """,
+        (received_at, received_at, after_event_id, limit),
+    ).fetchall()
+    return [(r["event_id"], _event_from_row(r)) for r in rows]
+
+
 def note_push(*, now: float | None = None) -> None:
     _update_sync_state(last_push_at=time.time() if now is None else now)
 

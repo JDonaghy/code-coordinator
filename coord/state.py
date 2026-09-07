@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from coord.liveness_auditor import AuditState
@@ -148,6 +148,10 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         # _UPSERT_SQL comment for why these are absent from ON CONFLICT.
         a.uat_state,
         a.uat_reason,
+        # #3188: same seam-writer-owned exclusion as uat_state/uat_reason
+        # above — record_uat_verdict is the single-row writer for these too.
+        a.uat_actor,
+        a.uat_prior,
         a.review_verdict,
         # #1456: audit trail when the coordinator overrode the reviewer.
         a.review_verdict_original,
@@ -177,7 +181,8 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, uat_state, uat_reason, review_verdict,
+        review_posted_at, test_state, test_reason, uat_state, uat_reason,
+        uat_actor, uat_prior, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
         review_patch_id, review_scoped, review_scope_base_sha,
         cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason
@@ -187,7 +192,8 @@ _UPSERT_SQL = """
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?, ?
@@ -1520,6 +1526,7 @@ def record_uat_verdict(
     assignment_id: str,
     uat_state: str | None,
     uat_reason: str | None = None,
+    actor: str = "operator",
 ) -> None:
     """Record a UAT-gate verdict on one assignment — routes to the daemon when set.
 
@@ -1534,6 +1541,24 @@ def record_uat_verdict(
     ``uat_state=None`` clears the verdict back to ``NULL``, mirroring
     ``record_test_verdict``'s reset case — used to un-stick a merge queue
     entry rather than force a fresh ``--passed``/``--failed``.
+
+    *actor* (#3188) records WHO supplied this verdict: ``"operator"`` (the
+    default — a human ran ``coord uat`` themselves) or ``"customer"`` (a
+    portal preview sign-off, via
+    :func:`coord.portal_sync._consume_preview_verdicts`) — so the board can
+    say who approved, the same way :func:`coord.merge_queue.
+    evaluate_uat_verdict`'s message already names the assignment. This
+    function has exactly two callers (``coord uat`` and that portal
+    consumer) and no automatic fold ever reaches it, so a call here is
+    always a deliberate act by a human or an event the customer themselves
+    triggered — never something else quietly re-deriving a verdict. When a
+    call here actually *changes* a previously-recorded verdict (a different
+    state, or the same state re-attributed to a different actor), the prior
+    one is preserved rather than silently replaced — see
+    :func:`_record_uat_verdict_local`'s ``uat_prior`` handling — so an
+    operator's ``--passed`` landing on top of a customer's
+    ``changes_requested`` still shows BOTH on the board, not just the
+    winner.
     """
     svc = _board_service()
     resp = _route_write(
@@ -1543,6 +1568,7 @@ def record_uat_verdict(
             "assignment_id": assignment_id,
             "uat_state": uat_state,
             "uat_reason": uat_reason,
+            "actor": actor,
         },
     )
     if resp is not None:
@@ -1551,6 +1577,7 @@ def record_uat_verdict(
         assignment_id=assignment_id,
         uat_state=uat_state,
         uat_reason=uat_reason,
+        actor=actor,
     )
 
 
@@ -1559,8 +1586,9 @@ def _record_uat_verdict_local(
     assignment_id: str,
     uat_state: str | None,
     uat_reason: str | None = None,
+    actor: str = "operator",
 ) -> None:
-    """UPDATE the assignment's uat_state/uat_reason.
+    """UPDATE the assignment's uat_state/uat_reason/uat_actor.
 
     #2687: single-row writer, mirroring
     :func:`_record_test_verdict_local` — kept deliberately simpler: no
@@ -1569,46 +1597,93 @@ def _record_uat_verdict_local(
     uat_state``'s docstring for why), just the verdict, an audit row, and
     (on a failure) a durable issue-context entry so the next agent on the
     issue sees WHY without re-fetching the PR.
+
+    #3188: before overwriting, reads back whatever verdict is currently
+    stored. If this write actually replaces a REAL prior verdict with a
+    different one (different ``uat_state``, or the same state now
+    attributed to a different ``actor``), that prior ``(state, reason,
+    actor)`` is folded into ``uat_prior`` (JSON) instead of being discarded
+    — a customer's ``changes_requested`` must not vanish with no trace the
+    moment an operator's ``--passed`` lands on top of it (or vice versa).
+    Only ever holds the ONE verdict immediately before this write, not a
+    full history — the complete trail of every verdict this assignment has
+    ever carried is the audit log below (``event_type=f"uat_{uat_state}"``),
+    which this function ALSO writes on every terminal verdict; ``uat_prior``
+    exists so the board can show the conflict without a separate audit
+    query for the common one-override case.
     """
     conn = get_connection()
-    sql.execute(conn,
-        "UPDATE assignments SET uat_state=?, uat_reason=? WHERE assignment_id=?",
-        (uat_state, uat_reason, assignment_id),
-    )
-    conn.commit()
-
     row = sql.execute(conn,
-        "SELECT repo_name, issue_number, machine_name FROM assignments "
-        "WHERE assignment_id=?",
+        "SELECT repo_name, issue_number, machine_name, uat_state, "
+        "uat_reason, uat_actor FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
+
+    uat_prior_json: str | None = None
+    if (
+        uat_state is not None
+        and row is not None
+        and row["uat_state"] is not None
+        and (
+            row["uat_state"] != uat_state
+            or (row["uat_actor"] or "operator") != actor
+        )
+    ):
+        uat_prior_json = json.dumps({
+            "state": row["uat_state"],
+            "reason": row["uat_reason"],
+            "actor": row["uat_actor"] or "operator",
+        })
+
+    sql.execute(conn,
+        "UPDATE assignments SET uat_state=?, uat_reason=?, uat_actor=?, "
+        "uat_prior=COALESCE(?, uat_prior) WHERE assignment_id=?",
+        (
+            uat_state,
+            uat_reason,
+            actor if uat_state is not None else None,
+            uat_prior_json,
+            assignment_id,
+        ),
+    )
+    conn.commit()
 
     if row is not None and uat_state is not None:
         # Mirrors record_test_verdict's `test_state is not None` guard —
         # clearing a verdict (uat_state=None) is a reset, not an event.
+        # #3188: `actor="operator"` keeps the pre-existing "user" audit
+        # convention (a human ran `coord uat` themselves); any other actor
+        # (currently only "customer") is recorded verbatim so the audit log
+        # distinguishes a portal sign-off from an operator's own call.
+        details: dict[str, Any] = {"uat_reason": uat_reason, "uat_actor": actor}
+        if uat_prior_json:
+            details["uat_overrode"] = json.loads(uat_prior_json)
         _record_audit(
             tier="business",
             category="test",
             event_type=f"uat_{uat_state}",
-            actor="user",
+            actor="user" if actor == "operator" else actor,
             summary=f"UAT {uat_state}: {row['repo_name']}#{row['issue_number']}",
             repo=row["repo_name"],
             issue=row["issue_number"],
             assignment_id=assignment_id,
             machine=row["machine_name"],
-            details={"uat_reason": uat_reason},
+            details=details,
         )
 
     # #2687: a failed UAT verdict is "actionable feedback on the PR the
     # same way a failed test verdict is" (the issue's own wording) — carry
     # it into the per-issue digest exactly like record_test_verdict's
     # "Test FAILED" entry does, so the next worker/reviewer on this issue
-    # sees it without re-fetching the PR.
+    # sees it without re-fetching the PR. #3188: tagged with the actor so a
+    # customer's own words read as the customer's, not as an operator's
+    # paraphrase of them.
     if uat_state == "failed" and (uat_reason or "").strip() and row is not None:
+        label = "UAT FAILED (customer)" if actor == "customer" else "UAT FAILED"
         _add_issue_context_entry_local(
             row["repo_name"],
             row["issue_number"],
-            f"UAT FAILED: {uat_reason.strip()}",
+            f"{label}: {uat_reason.strip()}",
             source="uat",
         )
 

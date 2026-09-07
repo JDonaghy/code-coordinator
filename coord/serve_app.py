@@ -3802,6 +3802,7 @@ def openapi_spec() -> dict:
                                     "assignment_id": {"type": "string"},
                                     "uat_state": {"type": "string", "nullable": True},
                                     "uat_reason": {"type": "string", "nullable": True},
+                                    "actor": {"type": "string", "nullable": True},
                                 },
                                 "required": ["assignment_id", "uat_state"],
                             }
@@ -7480,6 +7481,12 @@ def build_app(
                 assignment_id=body["assignment_id"],
                 uat_state=body["uat_state"],
                 uat_reason=body.get("uat_reason"),
+                # #3188: who supplied this verdict — "operator" (the
+                # default, a thin client's `coord uat`) or "customer" (a
+                # portal preview sign-off). Older thin clients that predate
+                # this field simply omit it and get the same "operator"
+                # default the local (non-routed) write path already had.
+                actor=body.get("actor") or "operator",
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
