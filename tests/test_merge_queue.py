@@ -1958,10 +1958,10 @@ class TestDesignRoundPushOnMerge:
         )
         seen_upload = {}
 
-        def _post(url, json=None, headers=None, timeout=None):
+        def _post(url, files=None, headers=None, timeout=None):
             seen_upload["url"] = url
-            seen_upload["json"] = json
-            return _StubResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+            seen_upload["files"] = files
+            return _StubResponse(200, {"key": "rounds/sub_1/1"})
 
         monkeypatch.setattr("httpx.post", _post)
 
@@ -1975,15 +1975,16 @@ class TestDesignRoundPushOnMerge:
         assert events[-1].kind == "design_round_drafted"
         assert "awaiting operator approval" in events[-1].message
         assert "sub_1" in events[-1].message
-        assert seen_upload["url"] == "https://intake.example.com/api/bridge/upload"
-        assert seen_upload["json"]["submission_id"] == "sub_1"
-        assert seen_upload["json"]["files"] == {"contract.md": "# contract"}
+        # #3166: the real route addresses (submission, round) in the URL and
+        # takes a multipart body, one part per file.
+        assert seen_upload["url"] == "https://intake.example.com/api/bridge/mocks/sub_1/1"
+        assert set(seen_upload["files"]) == {"contract.md"}
 
         from coord import portal_store
         rows = portal_store.outbox_for_submission("sub_1")
         assert len(rows) == 1
         assert rows[0].kind == "design_round"
-        assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
+        assert rows[0].fields["design_round"]["bundle_key"] == "rounds/sub_1/1"
         assert "Ship the thing." in rows[0].fields["design_round"]["outcome_definition"]
         assert rows[0].state == portal_store.STATE_DRAFT
         assert portal_store.pending_outbox() == []
@@ -2000,8 +2001,8 @@ class TestDesignRoundPushOnMerge:
         )
         monkeypatch.setattr(
             "httpx.post",
-            lambda url, json=None, headers=None, timeout=None: _StubResponse(
-                200, {"bundle_key": "bundles/sub_1/r1.tar"}
+            lambda url, files=None, headers=None, timeout=None: _StubResponse(
+                200, {"key": "rounds/sub_1/1"}
             ),
         )
 
@@ -2103,7 +2104,7 @@ class TestDesignRoundPushOnMerge:
         )
         monkeypatch.setattr(
             "httpx.post",
-            lambda *a, **k: _StubResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"}),
+            lambda *a, **k: _StubResponse(200, {"key": "rounds/sub_1/1"}),
         )
 
         events = process(

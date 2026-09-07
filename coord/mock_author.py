@@ -600,6 +600,44 @@ def collect_mock_bundle_files(
     return files
 
 
+def flatten_bundle_for_upload(files: dict[str, str]) -> dict[str, str]:
+    """Reshape a ``{relative_path: content}`` mapping from
+    :func:`collect_mock_bundle_files` (or the local-checkout counterpart,
+    ``coord.commands.portal._collect_local_mock_bundle_files``) into the
+    bundle-ROOT layout coord-portal's ``POST /api/bridge/mocks/:reference/
+    :round`` upload route requires (#3166).
+
+    That route checks for an exact ``index.html`` entry
+    (``src/routes/mocks.ts``'s ``uploadMockBundle``, ``missing_index_html``)
+    and 400s without one — a bundle-root check, not a prefix search. Both
+    collectors above put every driver-rendered mock fixture under a
+    ``mocks/`` subdirectory (``files[f"mocks/{name}"] = ...``), which is the
+    right shape for the OTHER two things that read their output —
+    :mod:`coord.dashboard.server`'s Gate-A review packet keys off that exact
+    prefix to derive ``mock_repo_path`` for GitHub-hosted stylesheet
+    resolution, and the on-disk layout the collectors themselves read from is
+    genuinely ``tests/acceptance/ms-N/mocks/*`` — but it is the wrong shape
+    for the wire: ``mocks/index.html`` passes every check on THIS side and
+    then 404s on every request the portal ever serves for it once uploaded,
+    because nothing at the bundle root is named ``index.html``.
+
+    So this is a separate reshape, not a change to either collector's own
+    return contract: strip the leading ``mocks/`` a collector always adds to
+    a driver fixture; ``contract.md`` and anything else already at the root
+    pass through unchanged. :func:`coord.portal_sync.push_design_round_bundle`
+    — the shared tail both real callers (the merge-triggered auto-push and
+    ``coord portal publish-mocks``) go through — always applies this
+    immediately before calling
+    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle`, so the two
+    callers cannot drift on bundle layout the way the route itself once
+    drifted from what this module sent it.
+    """
+    return {
+        (path[len("mocks/"):] if path.startswith("mocks/") else path): content
+        for path, content in files.items()
+    }
+
+
 def build_design_round(
     *,
     milestone_title: str,

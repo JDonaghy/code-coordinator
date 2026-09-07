@@ -1423,12 +1423,12 @@ class _UploadClient:
     def __init__(self, bundle_key: str = "bundles/sub-001/r1.tar", error=None):
         self.bundle_key = bundle_key
         self.error = error
-        self.uploads: list[tuple[str, dict]] = []
+        self.uploads: list[tuple[str, dict, int]] = []
 
-    def upload_bundle(self, submission_id: str, files: dict) -> str:
+    def upload_bundle(self, submission_id: str, files: dict, *, round_number: int) -> str:
         if self.error:
             raise self.error
-        self.uploads.append((submission_id, dict(files)))
+        self.uploads.append((submission_id, dict(files), round_number))
         return self.bundle_key
 
 
@@ -1446,7 +1446,13 @@ def test_push_design_round_bundle_uploads_then_enqueues():
     )
 
     assert bundle_key == "bundles/sub-001/r7.tar"
-    assert client.uploads == [(SUB, files)]
+    # #3166: `push_design_round_bundle` flattens the `mocks/` prefix away
+    # before handing the bundle to `upload_bundle` — the portal's upload
+    # route requires `index.html` at the bundle ROOT — and threads the
+    # (default) round number into the same call.
+    assert client.uploads == [
+        (SUB, {"contract.md": "# contract", "index.html": "<html></html>"}, 1)
+    ]
     assert row.kind == portal_sync.KIND_DESIGN_ROUND
     stored = portal_store.outbox_for_submission(SUB)
     assert len(stored) == 1
@@ -1481,6 +1487,37 @@ def test_push_design_round_bundle_round_number_flows_through():
         round_number=2,
     )
     assert row.fields["design_round"]["round"] == 2
+    # #3166: not just the D1 payload — the portal addresses a bundle by
+    # (reference, round) in the URL itself, so the upload call must get it
+    # too, not just `build_design_round`.
+    assert client.uploads[0][2] == 2
+
+
+def test_push_design_round_bundle_flattens_the_mocks_prefix_before_upload():
+    """#3166: `collect_mock_bundle_files` (and its local-checkout
+    counterpart) both nest driver-rendered fixtures under `mocks/` — the
+    right shape for the Gate-A review packet, the wrong shape for the
+    portal's upload route, which 404s forever on a bundle with no root-level
+    `index.html`."""
+    client = _UploadClient()
+    portal_sync.push_design_round_bundle(
+        client,
+        SUB,
+        {
+            "contract.md": "# contract",
+            "mocks/index.html": "<html>index</html>",
+            "mocks/detail.html": "<html>detail</html>",
+        },
+        milestone_title="ms title",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="Ship it.",
+    )
+    uploaded_files = client.uploads[0][1]
+    assert uploaded_files == {
+        "contract.md": "# contract",
+        "index.html": "<html>index</html>",
+        "detail.html": "<html>detail</html>",
+    }
 
 
 # ── automatic status fold (#2588) ────────────────────────────────────────────

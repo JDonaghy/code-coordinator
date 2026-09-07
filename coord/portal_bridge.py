@@ -5,10 +5,15 @@ since ms-1, and the entire ms-3 mail pipeline (``docs/CUSTOMER_PORTAL.md``) is
 live and waiting downstream of a queued outbox row — but nothing on this side
 has ever called it. This module is that client: a thin wrapper over
 coord-portal's bridge routes (``push``, ``pull``, ``heartbeat``, and — as of
-PDR-3/#2508 — ``upload``), matching the wire contract coord-portal's
-``src/bridge/*`` and ``src/routes/bridge.ts`` define. ``upload`` is the one
-route that carries a bundle's raw content rather than D1 metadata — see
-:meth:`PortalBridgeClient.upload_bundle`.
+PDR-3/#2508 — the mock-bundle upload), matching the wire contract
+coord-portal's ``src/bridge/*`` and ``src/routes/bridge.ts`` define. The
+upload is the one route that carries a bundle's raw content rather than D1
+metadata, and the one route whose path carries parameters
+(``POST /api/bridge/mocks/:reference/:round``, coord-portal#120) rather than
+being flat like the other three — see :meth:`PortalBridgeClient.upload_bundle`.
+Its shape here was fixed in #3166 to match what coord-portal actually serves
+after an earlier version of this method invented a plausible-looking
+``POST /api/bridge/upload`` that was never wired up on the other side.
 
 **What this module deliberately does NOT do**, per #2179's own framing —
 those are separate, harder design questions and belong to follow-up issues:
@@ -186,30 +191,42 @@ class PortalBridgeClient:
     max_retries: int = 2
     retry_backoff_secs: float = 1.0
 
-    def _headers(self) -> dict[str, str]:
-        return {
+    def _headers(self, *, json_body: bool = True) -> dict[str, str]:
+        headers = {
             CLIENT_ID_HEADER: self.client_id,
             CLIENT_SECRET_HEADER: self.client_secret,
-            "Content-Type": "application/json",
         }
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        # else: a multipart body (upload_bundle) — leave Content-Type unset
+        # so httpx can fill in `multipart/form-data; boundary=...` itself;
+        # setting it here would strip the boundary the server needs to
+        # parse the parts at all.
+        return headers
 
-    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        url = self.base_url.rstrip("/") + path
+    def _send(self, path: str, attempt: Any) -> dict[str, Any]:
+        """Shared retry/error-handling loop for one POST to *path*.
+
+        *attempt* performs ONE try and returns an ``httpx.Response`` (or
+        raises ``httpx.HTTPError``) — the only thing that differs between a
+        JSON ``push``/``heartbeat`` call and :meth:`upload_bundle`'s
+        multipart one. Every status-code/retry/error-shape decision lives
+        here exactly once so the two request shapes cannot drift in how they
+        handle a 401, a 5xx, or a malformed response.
+        """
         attempts = self.max_retries + 1
         last_error: str | None = None
-        for attempt in range(attempts):
+        for attempt_num in range(attempts):
             try:
-                response = httpx.post(
-                    url, json=body, headers=self._headers(), timeout=self.timeout_secs
-                )
+                response = attempt()
             except httpx.HTTPError as exc:
                 last_error = f"transport error: {exc}"
-                if attempt + 1 < attempts:
+                if attempt_num + 1 < attempts:
                     logger.warning(
                         "portal bridge %s: %s (attempt %d/%d, retrying)",
-                        path, last_error, attempt + 1, attempts,
+                        path, last_error, attempt_num + 1, attempts,
                     )
-                    time.sleep(self.retry_backoff_secs * (attempt + 1))
+                    time.sleep(self.retry_backoff_secs * (attempt_num + 1))
                     continue
                 raise PortalBridgeError(
                     f"POST {path} failed after {attempts} attempt(s): {last_error}"
@@ -225,12 +242,12 @@ class PortalBridgeClient:
                 )
             if 500 <= response.status_code < 600:
                 last_error = f"{response.status_code} {response.text[:200]!r}"
-                if attempt + 1 < attempts:
+                if attempt_num + 1 < attempts:
                     logger.warning(
                         "portal bridge %s: %s (attempt %d/%d, retrying)",
-                        path, last_error, attempt + 1, attempts,
+                        path, last_error, attempt_num + 1, attempts,
                     )
-                    time.sleep(self.retry_backoff_secs * (attempt + 1))
+                    time.sleep(self.retry_backoff_secs * (attempt_num + 1))
                     continue
                 raise PortalBridgeError(
                     f"POST {path} failed after {attempts} attempt(s): {last_error}"
@@ -247,6 +264,15 @@ class PortalBridgeClient:
 
         # Unreachable: the loop above always either returns or raises.
         raise PortalBridgeError(f"POST {path}: exhausted retries: {last_error}")
+
+    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = self.base_url.rstrip("/") + path
+        return self._send(
+            path,
+            lambda: httpx.post(
+                url, json=body, headers=self._headers(), timeout=self.timeout_secs
+            ),
+        )
 
     def push(self, updates: list[BridgeUpdate]) -> list[PushResult]:
         """``POST /api/bridge/push`` — send a batch of coord-owned facts.
@@ -341,9 +367,15 @@ class PortalBridgeClient:
         except ValueError as exc:
             raise PortalBridgeError(f"GET /api/bridge/pull: non-JSON response: {exc}") from exc
 
-    def upload_bundle(self, submission_id: str, files: dict[str, str]) -> str:
-        """``POST /api/bridge/upload`` — store a design round's rendered
-        mock bundle + contract in the portal's R2 (coord-portal#120, PDR-2).
+    def upload_bundle(
+        self, submission_id: str, files: dict[str, str], *, round_number: int
+    ) -> str:
+        """``POST /api/bridge/mocks/{submission_id}/{round_number}`` — store
+        a design round's rendered mock bundle + contract in the portal's R2
+        (coord-portal#120, PDR-2; route contract fixed to match the real
+        server in #3166 — see that issue for the four ways an earlier
+        version of this method disagreed with what coord-portal actually
+        serves).
 
         Deliberately a fourth route, not folded into :meth:`push`: the
         three ``/api/bridge/*`` routes this module otherwise speaks
@@ -354,31 +386,94 @@ class PortalBridgeClient:
         never accidentally routed through :data:`MAX_PUSH_UPDATES`-bounded
         ``push`` batching.
 
-        *files* maps a path relative to the bundle root — e.g.
-        ``"contract.md"``, ``"mocks/index.html"`` — to its text content; see
-        :func:`coord.mock_author.collect_mock_bundle_files`, which builds
-        exactly this mapping by reading a merged Gate-A branch back off
-        GitHub. Returns the R2 object key the portal assigns the bundle —
-        callers thread that straight into the ``design_round`` payload
+        *files* maps a path relative to the bundle ROOT — e.g.
+        ``"contract.md"``, ``"index.html"`` — to its text content. The
+        portal's upload route (``src/routes/mocks.ts``'s ``uploadMockBundle``)
+        checks for an exact ``index.html`` entry and 400s
+        (``missing_index_html``) without it, so a caller whose collector
+        nests mocks under a ``mocks/`` subdirectory (e.g.
+        :func:`coord.mock_author.collect_mock_bundle_files`) must flatten
+        that away first — see
+        :func:`coord.mock_author.flatten_bundle_for_upload`, which
+        :func:`coord.portal_sync.push_design_round_bundle` (the shared tail
+        both real callers go through) always applies before calling this.
+        This method does not flatten on the caller's behalf: it sends
+        exactly the keys it is given, as multipart field names, because it
+        has no way to know which of them are meant to be nested (a future
+        bundle could legitimately want an ``assets/`` subdirectory).
+
+        *round_number* goes in the URL, not the body — the portal addresses
+        a bundle by ``(reference, round)`` before it ever looks at what is
+        inside the multipart body.
+
+        Returns the R2 key prefix the portal assigns the bundle (its ``key``
+        response field, e.g. ``rounds/SUB-XXXXXX/2``) — callers thread that
+        straight into the ``design_round`` payload
         :func:`coord.portal_sync.enqueue_design_round` queues, so the
         customer's browser has something to fetch. Raises
         :class:`PortalBridgeError` the same way every other method here
-        does: a transport failure, a 401, a 4xx/5xx, or a response with no
-        usable ``bundle_key``.
+        does: a transport failure, a 401, a 4xx/5xx (including the portal's
+        own ``missing_index_html``/``round_decided``/``unknown_submission``
+        refusals, which arrive as an ordinary 400/404/409), or a response
+        with no usable ``key``.
         """
         if not files:
             raise PortalBridgeError("upload_bundle() got an empty files mapping")
-        data = self._post(
-            "/api/bridge/upload",
-            {"submission_id": submission_id, "files": files},
+        path = f"/api/bridge/mocks/{submission_id}/{round_number}"
+        url = self.base_url.rstrip("/") + path
+        # One multipart part per file, field name == the file's bundle-root-
+        # relative path — the exact shape `uploadMockBundle` parses
+        # (`for (const [name, value] of form.entries())`). A bare `content`
+        # value (rather than a `(filename, content)` tuple) still gets a
+        # `filename=` on the wire from httpx, so the portal's
+        # `value instanceof File` check still passes; giving it the real
+        # path as the filename too costs nothing and reads better in a
+        # network trace.
+        multipart_files = {
+            name: (name, content.encode("utf-8"), _content_type_for(name))
+            for name, content in files.items()
+        }
+        data = self._send(
+            path,
+            lambda: httpx.post(
+                url,
+                files=multipart_files,
+                headers=self._headers(json_body=False),
+                timeout=self.timeout_secs,
+            ),
         )
-        bundle_key = data.get("bundle_key")
-        if not isinstance(bundle_key, str) or not bundle_key:
+        key = data.get("key")
+        if not isinstance(key, str) or not key:
             raise PortalBridgeError(
-                f"POST /api/bridge/upload: response had no 'bundle_key' "
-                f"string: {data!r}"
+                f"POST {path}: response had no 'key' string: {data!r}"
             )
-        return bundle_key
+        return key
+
+
+#: A minimal extension -> MIME-type table for `upload_bundle`'s multipart
+#: parts. Informational only: coord-portal's own `uploadMockBundle` derives
+#: the R2 object's stored content-type from the path itself
+#: (`contentTypeFor` in `src/routes/mocks.ts`), ignoring whatever this side
+#: sends — so an unmapped extension defaulting to `application/octet-stream`
+#: here costs nothing on the wire, it just makes a packet capture less
+#: informative than it could be.
+_UPLOAD_CONTENT_TYPES: dict[str, str] = {
+    "html": "text/html",
+    "htm": "text/html",
+    "css": "text/css",
+    "md": "text/plain",
+    "txt": "text/plain",
+    "json": "application/json",
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+}
+
+
+def _content_type_for(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return _UPLOAD_CONTENT_TYPES.get(ext, "application/octet-stream")
 
 
 def _utcnow_iso() -> str:
