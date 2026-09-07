@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from coord import portal_store, portal_sync
-from coord.portal_bridge import PortalBridgeError, PushResult
+from coord.portal_bridge import OutboundDraftPushResult, PortalBridgeError, PushResult
 from coord.portal_sync import (
     PortalSyncError,
     enqueue_design_round,
@@ -41,6 +41,8 @@ class FakeClient:
         pull_error: Exception | None = None,
         heartbeat_error: Exception | None = None,
         heartbeat_ok: bool = True,
+        draft_push_outcomes: dict[str, str] | None = None,
+        draft_push_error: Exception | None = None,
     ):
         self.pages = list(pages or [{"events": [], "cursor": None, "has_more": False}])
         self.push_outcomes = push_outcomes or {}
@@ -51,6 +53,12 @@ class FakeClient:
         self.pull_calls: list[str | None] = []
         self.pushes: list[dict] = []
         self.heartbeats = 0
+        # #3178: outbound-drafts publish, scripted like `push`/`push_outcomes`
+        # above but keyed on the draft's own `id` (not a field name — a
+        # single draft push carries several fields at once).
+        self.draft_push_outcomes = draft_push_outcomes or {}
+        self.draft_push_error = draft_push_error
+        self.published_drafts: list[dict] = []
 
     def pull(self, cursor=None, limit=None):
         self.pull_calls.append(cursor)
@@ -82,6 +90,22 @@ class FakeClient:
         if self.heartbeat_error:
             raise self.heartbeat_error
         return self.heartbeat_ok
+
+    def push_outbound_drafts(self, drafts):
+        if self.draft_push_error:
+            raise self.draft_push_error
+        results = []
+        for d in drafts:
+            self.published_drafts.append(d.to_wire())
+            outcome = self.draft_push_outcomes.get(d.id, "applied")
+            results.append(
+                OutboundDraftPushResult(
+                    id=d.id,
+                    outcome=outcome,
+                    reason=None if outcome == "applied" else "unknown_kind",
+                )
+            )
+        return results
 
     # convenience for assertions
     @property
@@ -3455,3 +3479,345 @@ class TestLedgerStatusChange:
         result = portal_sync.fold_status_for_milestone(config, "acme-portal", 5)
         assert result.queued is True
         assert result.failed is False
+
+
+# ── #3178: the draft gate's portal surface (coord-portal#318's companion) ──
+#
+# coord-portal#318 shipped a `coord_outbound_drafts` mirror table, a bridge
+# route for coord to assert what it has queued, and an operator screen that
+# turns approve/reject into `outbound_draft.approved`/`outbound_draft.
+# rejected` events on the existing pull stream. These tests cover coord's
+# side of that: publishing the current `draft` set every tick
+# (`_publish_pending_drafts`) and applying the operator's verdict back
+# (`_consume_draft_verdicts`) through the SAME store functions `coord portal
+# draft edit`/`approve`/`reject` already use — never a second write path.
+
+
+def _draft_verdict_page(
+    *, event_type: str, draft_id: int, kind: str = "question",
+    fields: dict | None = None, event_id: str = "d1",
+) -> dict:
+    """One `outbound_draft.approved`/`.rejected` pull page, in the real wire
+    shape (`BridgeEvent.payload`, coord-portal's `src/bridge/events.ts`): the
+    event body nests under its own `payload` key."""
+    body: dict = {"draft_id": str(draft_id), "kind": kind}
+    if fields is not None:
+        body["fields"] = fields
+    return {
+        "events": [
+            {
+                "id": event_id,
+                "submission_id": SUB,
+                "type": event_type,
+                "payload": body,
+            }
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+
+
+class TestPublishPendingDrafts:
+    def test_nothing_queued_is_a_noop_no_request_sent(self):
+        client = FakeClient()
+        published, errors = portal_sync._publish_pending_drafts(client)
+        assert (published, errors) == (0, [])
+        assert client.published_drafts == []
+
+    def test_a_question_draft_publishes_its_flat_text_field(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        client = FakeClient()
+
+        published, errors = portal_sync._publish_pending_drafts(client)
+
+        assert (published, errors) == (1, [])
+        [wire] = client.published_drafts
+        row = portal_store.draft_outbox(SUB)[0]
+        assert wire["id"] == str(row.id)
+        assert wire["submission_id"] == SUB
+        assert wire["kind"] == "question"
+        assert wire["fields"] == {"question": "which blue?"}
+        assert wire["queued_at"]  # non-empty ISO string
+
+    def test_a_design_round_draft_publishes_only_outcome_definition(self):
+        design_round = {
+            "round": 1,
+            "outcome_definition": "ship the offline-first sync",
+            "bundle_key": "rounds/SUB-001/1",
+            "decomposition": [{"title": "a task"}],
+        }
+        enqueue_design_round(SUB, design_round, config=_Cfg(_approval()))
+        client = FakeClient()
+
+        portal_sync._publish_pending_drafts(client)
+
+        [wire] = client.published_drafts
+        assert wire["kind"] == "design_round"
+        # `bundle_key`/`decomposition` are references, never published as prose.
+        assert wire["fields"] == {"outcome_definition": "ship the offline-first sync"}
+
+    def test_a_relayed_answer_draft_publishes_under_the_answer_key(self):
+        # `answer_question` enqueues the relayed answer itself (#2987),
+        # gated `draft` by default (`DEFAULT_PORTAL_APPROVAL["relayed_answer"]
+        # is True) — no separate `enqueue_relayed_answer` call needed, same
+        # as `TestAnswerQuestionPushesOutbound` above.
+        _push_and_apply_question()
+        portal_store.answer_question(SUB, "the shade of blue", actor="ops")
+        client = FakeClient()
+
+        portal_sync._publish_pending_drafts(client)
+
+        [wire] = [d for d in client.published_drafts if d["kind"] == "relayed_answer"]
+        assert wire["fields"] == {"answer": "the shade of blue"}
+
+    def test_only_the_draft_rows_are_published_not_pending_ones(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))  # draft
+        enqueue_preview(SUB, "https://pr-1.example.pages.dev")  # pending (ungated)
+        client = FakeClient()
+
+        portal_sync._publish_pending_drafts(client)
+
+        assert [d["kind"] for d in client.published_drafts] == ["question"]
+
+    def test_a_transport_failure_is_reported_not_raised(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        client = FakeClient(draft_push_error=PortalBridgeError("boom"))
+
+        published, errors = portal_sync._publish_pending_drafts(client)
+
+        assert published == 0
+        assert any("boom" in e for e in errors)
+
+    def test_a_rejected_outcome_is_reported_as_an_error_not_raised(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        client = FakeClient(draft_push_outcomes={str(row.id): "rejected"})
+
+        published, errors = portal_sync._publish_pending_drafts(client)
+
+        assert published == 0
+        assert any("rejected" in e for e in errors)
+
+    def test_sync_tick_publishes_a_draft_end_to_end(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        client = FakeClient()
+
+        result = sync_tick(client=client)
+
+        assert result.drafts_published == 1
+        assert client.published_drafts[0]["kind"] == "question"
+
+    def test_status_and_preview_drafts_publish_read_only_under_their_own_key(self):
+        row = enqueue_status(SUB, "in-design", config=_Cfg(_approval(status=True)))
+        assert row.state == portal_store.STATE_DRAFT
+        client = FakeClient()
+
+        portal_sync._publish_pending_drafts(client)
+
+        [wire] = client.published_drafts
+        assert wire["fields"] == {"status": "in-design"}
+
+
+class TestConsumeDraftVerdicts:
+    def test_an_approval_with_an_edit_writes_back_the_text_and_sends(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved",
+                    draft_id=row.id,
+                    kind="question",
+                    fields={"question": "cerulean or navy?"},
+                )["events"][0]
+            ]
+        )
+
+        consumed, errors = portal_sync._consume_draft_verdicts()
+
+        assert (consumed, errors) == (1, [])
+        updated = portal_store.get_outbox_row(SUB, row.seq)
+        assert updated.state == portal_store.STATE_PENDING
+        assert updated.fields["question"] == "cerulean or navy?"
+        kinds = [e.kind for e in portal_store.ledger_for_submission(SUB)]
+        assert portal_store.LEDGER_KIND_DRAFT_EDITED in kinds
+        assert portal_store.LEDGER_KIND_DRAFT_APPROVED in kinds
+        assert portal_store.unhandled_events() == []
+
+    def test_an_approval_with_unchanged_text_does_not_ledger_an_edit(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved",
+                    draft_id=row.id,
+                    kind="question",
+                    fields={"question": "which blue?"},
+                )["events"][0]
+            ]
+        )
+
+        consumed, _errors = portal_sync._consume_draft_verdicts()
+
+        assert consumed == 1
+        kinds = [e.kind for e in portal_store.ledger_for_submission(SUB)]
+        assert portal_store.LEDGER_KIND_DRAFT_EDITED not in kinds
+        assert portal_store.LEDGER_KIND_DRAFT_APPROVED in kinds
+
+    def test_approval_goes_through_the_same_store_function_the_cli_uses(
+        self, monkeypatch
+    ):
+        """#3178's own acceptance bar: one approval path, not two."""
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved", draft_id=row.id,
+                )["events"][0]
+            ]
+        )
+
+        calls = []
+        real_approve = portal_store.approve_draft
+
+        def _spy(submission_id, seq, **kw):
+            calls.append((submission_id, seq))
+            return real_approve(submission_id, seq, **kw)
+
+        monkeypatch.setattr(portal_store, "approve_draft", _spy)
+        portal_sync._consume_draft_verdicts()
+
+        assert calls == [(SUB, row.seq)]
+
+    def test_a_rejection_rejects_the_row_and_cascades(self):
+        _question, status = enqueue_question(
+            SUB, "which blue?", config=_Cfg(_approval())
+        )
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.rejected", draft_id=row.id,
+                )["events"][0]
+            ]
+        )
+
+        consumed, errors = portal_sync._consume_draft_verdicts()
+
+        assert (consumed, errors) == (1, [])
+        rows = portal_store.outbox_for_submission(SUB)
+        assert [r.state for r in rows] == [
+            portal_store.STATE_REJECTED,
+            portal_store.STATE_REJECTED,
+        ]
+        assert any(
+            e.kind == portal_store.LEDGER_KIND_DRAFT_REJECTED
+            for e in portal_store.ledger_for_submission(SUB)
+        )
+
+    def test_a_verdict_for_an_already_decided_row_is_a_clean_no_op(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.approve_draft(SUB, row.seq, actor="john")  # CLI got there first
+
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved", draft_id=row.id,
+                )["events"][0]
+            ]
+        )
+
+        consumed, errors = portal_sync._consume_draft_verdicts()
+
+        assert (consumed, errors) == (1, [])  # drained, nothing more to do
+        assert portal_store.get_outbox_row(SUB, row.seq).state == (
+            portal_store.STATE_PENDING
+        )
+        assert portal_store.unhandled_events() == []
+
+    def test_a_malformed_draft_id_is_an_error_and_stays_unhandled(self):
+        portal_store.record_events(
+            [
+                {
+                    "id": "d1",
+                    "submission_id": SUB,
+                    "type": "outbound_draft.approved",
+                    "payload": {"draft_id": "not-a-number", "kind": "question"},
+                }
+            ]
+        )
+
+        consumed, errors = portal_sync._consume_draft_verdicts()
+
+        assert consumed == 0
+        assert errors
+        assert len(portal_store.unhandled_events()) == 1
+
+    def test_a_second_tick_does_not_reprocess_the_same_event(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        portal_store.record_events(
+            [
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved", draft_id=row.id,
+                )["events"][0]
+            ]
+        )
+
+        first = portal_sync._consume_draft_verdicts()
+        second = portal_sync._consume_draft_verdicts()
+
+        assert first == (1, [])
+        assert second == (0, [])
+
+    def test_sync_tick_applies_a_pulled_verdict_end_to_end(self):
+        enqueue_question(SUB, "which blue?", config=_Cfg(_approval()))
+        row = portal_store.draft_outbox(SUB)[0]
+        client = FakeClient(
+            pages=[
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved", draft_id=row.id,
+                )
+            ]
+        )
+
+        result = sync_tick(client=client)
+
+        assert result.draft_verdicts_consumed == 1
+        # Approved during THIS tick's draft-verdict phase, so it is also
+        # eligible for THIS tick's push phase right behind it — end to end,
+        # a portal approval sends in the same tick, not the next one.
+        assert portal_store.get_outbox_row(SUB, row.seq).state == (
+            portal_store.STATE_APPLIED
+        )
+        # Its `needs-input` announcement (queued alongside it by
+        # `enqueue_question`, ungated) was held until the question was
+        # confirmed applied — which just happened THIS tick, so it goes out
+        # right behind it. See the more detailed assertion below.
+        assert result.applied == 2
+
+    def test_needs_input_not_yet_gated_status_row_still_holds_until_approved(self):
+        """The #835 ordering guarantee straight through the portal path too:
+        approving the question via the pulled event must behave exactly like
+        `coord portal draft approve` — the announcement sends only once the
+        question is CONFIRMED applied by the drain, not merely approved."""
+        _question, status = enqueue_question(
+            SUB, "which blue?", config=_Cfg(_approval())
+        )
+        row = portal_store.draft_outbox(SUB)[0]
+        client = FakeClient(
+            pages=[
+                _draft_verdict_page(
+                    event_type="outbound_draft.approved", draft_id=row.id,
+                )
+            ]
+        )
+
+        result = sync_tick(client=client)
+
+        assert result.draft_verdicts_consumed == 1
+        assert client.pushed_kinds == ["question", "status"]
+        assert result.applied == 2

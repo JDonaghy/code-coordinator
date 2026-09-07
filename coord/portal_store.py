@@ -265,6 +265,41 @@ def signoff_events() -> list[PortalEvent]:
     return [_event_from_row(r) for r in rows]
 
 
+def outbound_draft_verdict_events(limit: int = 100) -> list[PortalEvent]:
+    """Every un-consumed ``outbound_draft.approved``/``outbound_draft.rejected``
+    event, oldest first (#3178, coord-portal#318's companion).
+
+    Filtered by ``kind`` the same way :func:`signoff_events` filters on
+    ``signoff``/``signoff.%`` — a cheap indexed-ish scan of one small,
+    closed-vocabulary slice of the inbox — but, unlike that function, ALSO
+    filtered on ``handled_at IS NULL``. That is deliberately the plain shared
+    column here rather than a private watermark of the kind
+    :func:`events_after_verdict_watermark` / ``events_after_question_
+    watermark`` keep for their own consumers: those exist because a
+    non-actionable backlog of OTHER kinds could otherwise starve a real event
+    of their kind sitting behind it forever (see that function's docstring).
+    That risk does not apply here — nothing else in coord ever reads an
+    ``outbound_draft.*`` event (see ``src/bridge/events.ts``'s own note on why
+    this pair is the one exception to "the portal never emits an event about
+    a coord-owned fact"), so this consumer marking one handled the moment it
+    has acted costs no future reader anything, and needs no schema of its own.
+    :func:`coord.portal_sync._consume_draft_verdicts` is the one and only
+    caller.
+    """
+    rows = sql.execute(
+        _conn(),
+        """
+        SELECT * FROM portal_events
+         WHERE handled_at IS NULL
+           AND kind LIKE 'outbound_draft.%'
+         ORDER BY received_at ASC, event_id ASC
+         LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [_event_from_row(r) for r in rows]
+
+
 def events_after_verdict_watermark(
     received_at: float, after_event_id: str, *, limit: int = 100
 ) -> list[tuple[str, PortalEvent]]:
@@ -1002,6 +1037,24 @@ def get_outbox_row(submission_id: str, seq: int) -> OutboxRow | None:
         _conn(),
         "SELECT * FROM portal_outbox WHERE submission_id = ? AND seq = ?",
         (submission_id, seq),
+    ).fetchone()
+    return _outbox_from_row(row) if row is not None else None
+
+
+def get_outbox_row_by_id(row_id: int) -> OutboxRow | None:
+    """One outbox row by its bare ``id`` — the wire identity coord-portal's
+    ``coord_outbound_drafts`` mirror keys off (#3178).
+
+    Every other lookup in this module is keyed on the operator-facing
+    ``(submission_id, seq)`` pair, which is fine for a human typing a CLI
+    command but not for a portal event: ``outbound_draft.approved`` /
+    ``outbound_draft.rejected`` (coord-portal's ``src/bridge/events.ts``)
+    carry only the bare ``draft_id`` coord itself published — see
+    :func:`coord.portal_sync._publish_pending_drafts`. Resolving that back to
+    a row needs this, not :func:`get_outbox_row`.
+    """
+    row = sql.execute(
+        _conn(), "SELECT * FROM portal_outbox WHERE id = ?", (row_id,)
     ).fetchone()
     return _outbox_from_row(row) if row is not None else None
 
