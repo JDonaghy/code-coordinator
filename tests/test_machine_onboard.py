@@ -387,7 +387,7 @@ def test_disabled_linger_crits_and_names_the_delayed_symptom():
 
 def test_probe_coord_on_worker_path_parses_a_found_binary():
     with patch("subprocess.run", return_value=_ssh_result(
-        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
+        "AGENT_PATH_FOUND=1\nCOORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
     )):
         found, error, version = machine_onboard.probe_coord_on_worker_path("host")
     assert found is True
@@ -398,7 +398,8 @@ def test_probe_coord_on_worker_path_parses_a_found_binary():
 def test_probe_coord_on_worker_path_reports_absence_as_a_defect_not_unknown():
     """`found=False` is the whole point of #2937 — it must never collapse
     into the fail-soft UNKNOWN path the way an SSH outage does."""
-    with patch("subprocess.run", return_value=_ssh_result("COORD_ON_WORKER_PATH_OK=0\n")):
+    with patch("subprocess.run",
+               return_value=_ssh_result("AGENT_PATH_FOUND=1\nCOORD_ON_WORKER_PATH_OK=0\n")):
         found, error, version = machine_onboard.probe_coord_on_worker_path("host")
     assert found is False
     assert error is None
@@ -411,9 +412,15 @@ def test_probe_coord_on_worker_path_delegates_to_the_canonical_agent_function():
     `coord.agent.worker_coord_reachable()` a real worker spawn's environment
     is built from, on the worker host's own pinned interpreter, so the two
     checks can never silently disagree (e.g. on a trailing slash, or a PATH
-    entry that's already a resolved `.blue`/`.green` path)."""
+    entry that's already a resolved `.blue`/`.green` path).
+
+    #3170 makes that promise literal on the OTHER axis too: the canonical
+    function is invoked with an explicit `base_env` carrying the AGENT's PATH,
+    never with the default `None`, which resolves against the SSH session's
+    `os.environ` — a PATH no worker is ever spawned with.
+    """
     with patch("subprocess.run", return_value=_ssh_result(
-        "COORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
+        "AGENT_PATH_FOUND=1\nCOORD_ON_WORKER_PATH_OK=1\nVERSION=coord, version 0.9.0\n"
     )) as run:
         machine_onboard.probe_coord_on_worker_path("host")
     args, kwargs = run.call_args
@@ -422,7 +429,13 @@ def test_probe_coord_on_worker_path_delegates_to_the_canonical_agent_function():
     assert argv[-1] == "$HOME/.coord-venv/bin/python3 -"
     script = kwargs["input"]
     assert "from coord.agent import worker_coord_reachable" in script
-    assert "worker_coord_reachable()" in script
+    assert "worker_coord_reachable(base_env)" in script
+    # The regression guard: the bare, environment-defaulting call is gone.
+    assert "worker_coord_reachable()" not in script
+    assert "discover_agent_path()" in script
+    # And the fix must NOT be a hardcoded guess at where the shim lives —
+    # that would re-break the case #2937 was opened for.
+    assert ".local/bin" not in script
 
 
 def test_probe_coord_on_worker_path_fails_soft_when_the_pinned_interpreter_is_gone():
@@ -454,6 +467,157 @@ def test_probe_coord_on_worker_path_fails_soft_on_ssh_trouble():
     assert found is None
     assert "no parseable output" in error
     assert version is None
+
+
+# ── #3170: the worker-PATH probe must read the AGENT's PATH, not the ssh ─────
+#            session's — and must work on launchd as well as systemd.
+
+
+def _discovery_ns(tmp_path, run):
+    """`_AGENT_PATH_DISCOVERY` exec'd into a namespace whose `/proc` and `$HOME`
+    are redirected under *tmp_path* and whose subprocess calls go to *run*.
+
+    The REAL shipped snippet is executed — a string assertion about it would
+    prove nothing about its control flow, which is the whole reason #3170's
+    two CRITs survived a passing test suite.
+    """
+    from pathlib import Path as _RealPath
+
+    def fake_path(raw):
+        text = str(raw)
+        if text.startswith("/proc"):
+            return _RealPath(str(tmp_path / "proc") + text[len("/proc"):])
+        return _RealPath(text)
+
+    fake_path.home = lambda: tmp_path / "home"
+
+    ns = {"__name__": "<agent-path-discovery>"}
+    exec(  # noqa: S102
+        compile(machine_onboard._AGENT_PATH_DISCOVERY, "<discovery>", "exec"), ns
+    )
+    ns["_Path"] = fake_path
+    ns["_sp"] = type("_sp", (), {"run": staticmethod(run)})
+    return ns
+
+
+def _seed_launchd_plist(tmp_path, *, path_value, label="com.jdonaghy.coord-agent"):
+    import plistlib
+
+    agents = tmp_path / "home" / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = agents / (label + ".plist")
+    plist.write_bytes(plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": ["/Users/john/.coord-venv/bin/coord", "agent"],
+        "EnvironmentVariables": {"PATH": path_value, "HOME": "/Users/john"},
+    }))
+    return plist
+
+
+def test_agent_path_discovery_reads_the_running_systemd_units_own_environ(tmp_path):
+    """Linux, unchanged: the LIVE process's `/proc/<pid>/environ`, not what a
+    unit file claims it should be."""
+    environ = tmp_path / "proc" / "4242"
+    environ.mkdir(parents=True)
+    (environ / "environ").write_bytes(
+        b"HOME=/home/john\0PATH=/home/john/.local/bin:/usr/bin\0LANG=C\0"
+    )
+
+    import subprocess as _subprocess
+
+    def run(argv, **kwargs):
+        assert "systemctl" in argv[0]
+        return _subprocess.CompletedProcess(argv, 0, "4242\n", "")
+
+    ns = _discovery_ns(tmp_path, run)
+    assert ns["discover_agent_path"]() == "/home/john/.local/bin:/usr/bin"
+
+
+def test_agent_path_discovery_falls_back_to_the_launchd_plist_on_a_mac(tmp_path):
+    """macOS has no systemd and no /proc, which is why the probe saw nothing
+    there and silently answered from the ssh session's PATH instead. The
+    plist is where `setup-macmini.sh` writes the agent's PATH."""
+    _seed_launchd_plist(tmp_path, path_value="/Users/john/.local/bin:/opt/homebrew/bin:/usr/bin")
+
+    import subprocess as _subprocess
+
+    def run(argv, **kwargs):
+        if "systemctl" in argv[0]:
+            raise FileNotFoundError("systemctl")
+        # Job written but not bootstrapped — `launchctl print` finds nothing.
+        return _subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+    ns = _discovery_ns(tmp_path, run)
+    assert ns["discover_agent_path"]() == (
+        "/Users/john/.local/bin:/opt/homebrew/bin:/usr/bin"
+    )
+
+
+def test_agent_path_discovery_prefers_the_loaded_launchd_jobs_live_environment(tmp_path):
+    """A plist that has been edited since the job was bootstrapped is stale;
+    the loaded job's own environment is what the agent is actually running
+    with, so it wins."""
+    _seed_launchd_plist(tmp_path, path_value="/stale/from/the/plist")
+
+    import subprocess as _subprocess
+
+    def run(argv, **kwargs):
+        if "systemctl" in argv[0]:
+            raise FileNotFoundError("systemctl")
+        assert argv[:2] == ["launchctl", "print"]
+        assert argv[2].endswith("/com.jdonaghy.coord-agent")
+        return _subprocess.CompletedProcess(argv, 0, (
+            "com.jdonaghy.coord-agent = {\n"
+            "\tstate = running\n"
+            "\tenvironment = {\n"
+            "\t\tHOME => /Users/john\n"
+            "\t\tPATH => /Users/john/.local/bin:/usr/bin\n"
+            "\t}\n"
+            "}\n"
+        ), "")
+
+    ns = _discovery_ns(tmp_path, run)
+    assert ns["discover_agent_path"]() == "/Users/john/.local/bin:/usr/bin"
+
+
+def test_agent_path_discovery_returns_none_rather_than_guessing(tmp_path):
+    """Nothing supervises the agent here. The answer is "I don't know" — NOT
+    a hardcoded ~/.local/bin, which is exactly the guess #2937 was opened to
+    replace with evidence."""
+    import subprocess as _subprocess
+
+    def run(argv, **kwargs):
+        if "systemctl" in argv[0]:
+            return _subprocess.CompletedProcess(argv, 0, "0\n", "")
+        raise FileNotFoundError(argv[0])
+
+    ns = _discovery_ns(tmp_path, run)
+    assert ns["discover_agent_path"]() is None
+
+
+def test_worker_path_probe_is_unknown_when_the_agents_own_path_is_undiscoverable():
+    """#3170: the premise of the question is missing, which is a DIFFERENT
+    thing from the defect. Falling back to the ssh session's PATH is what
+    manufactured a permanent CRIT on a healthy mac, so it must not happen —
+    and inventing a pass would be worse still."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "AGENT_PATH_FOUND=0\nCOORD_ON_WORKER_PATH_OK=0\nVERSION=\n"
+    )):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("mac")
+    assert found is None
+    assert version is None
+    assert "could not determine the agent's own PATH" in error
+    assert "LaunchAgents" in error and "systemd" in error
+
+    facts = MachineFacts(
+        name="macmini", configured=True, reachable=True,
+        coord_on_worker_path=None, coord_on_worker_path_error=error,
+    )
+    finding = _by_check(
+        machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_unknown"
+    )
+    assert finding.severity == UNKNOWN
+    assert "could not determine the agent's own PATH" in finding.summary
 
 
 def test_coord_absent_from_worker_path_crits():
@@ -1319,6 +1483,7 @@ def test_the_shell_probe_script_runs_end_to_end_without_touching_a_credential(
     assert probe.identity.forge_can_merge is True
     assert probe.identity.git_push_ok is True
     assert probe.identity.claude_oauth_present is True
+    assert probe.identity.claude_oauth_source == "file"
     assert probe.identity.board_token_accepted is True
     assert probe.identity.backup_env_present is False
     assert probe.login_path_tools == {"cargo": "/usr/bin/cargo", "restic": None}
@@ -1330,6 +1495,139 @@ def test_the_shell_probe_script_runs_end_to_end_without_touching_a_credential(
     )
     assert "--show-token" not in joined_calls
     assert "sk-ant-oat01-x" not in out
+
+
+# ── #3170: Claude OAuth lives in a FILE on linux, the KEYCHAIN on darwin ─────
+
+
+def _run_identity_probe(tmp_path, monkeypatch, capsys, *, platform, security_rc=0):
+    """Exec the REAL shipped `_SHELL_PROBE_SCRIPT` under a stubbed HOME and a
+    stubbed `sys.platform`, and return `(ShellProbe, argv-of-every-call)`.
+
+    No credentials file is seeded: this is the shape of a mac that has
+    completed an interactive `claude` login, where `~/.claude/.credentials.json`
+    does not exist and never will.
+    """
+    import json as _json
+    import subprocess as _subprocess
+    import sys as _sys
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(_sys, "platform", platform)
+    (tmp_path / ".coord").mkdir(exist_ok=True)
+    (tmp_path / ".claude.json").write_text("{}")
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        joined = " ".join(argv) if isinstance(argv, list) else str(argv)
+        if "find-generic-password" in joined:
+            if security_rc is None:
+                raise FileNotFoundError("security")
+            if security_rc == 0:
+                return _subprocess.CompletedProcess(argv, 0, (
+                    'keychain: "/Users/john/Library/Keychains/login.keychain-db"\n'
+                    'class: "genp"\nattributes:\n'
+                    '    "acct"<blob>="john"\n'
+                    '    "svce"<blob>="Claude Code-credentials"\n'
+                ), "")
+            return _subprocess.CompletedProcess(
+                argv, 44, "", "security: SecKeychainSearchCopyNext: "
+                "The specified item could not be found in the keychain."
+            )
+        if "MainPID" in joined:
+            return _subprocess.CompletedProcess(argv, 0, "0\n", "")
+        if "git@github.com" in joined:
+            return _subprocess.CompletedProcess(argv, 1, "", "denied")
+        return _subprocess.CompletedProcess(argv, 1, "", "")
+
+    from coord import client as client_mod
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(client_mod, "resolve_board_service", lambda *a, **k: None)
+
+    params = _json.dumps({"binaries": [], "repo_slug": None})
+    script = machine_onboard._SHELL_PROBE_SCRIPT.replace("__PARAMS__", repr(params))
+    exec(compile(script, "<probe>", "exec"), {"__name__": "__probe__"})  # noqa: S102
+    return machine_onboard.parse_shell_probe(capsys.readouterr().out), calls
+
+
+def test_a_logged_in_mac_reads_its_oauth_from_the_keychain_not_a_missing_file(
+    tmp_path, monkeypatch, capsys
+):
+    """The #3170 regression: `macmini` had completed an interactive `claude`
+    login and was working, but the probe only ever stat'd
+    `~/.claude/.credentials.json` — a path Claude Code does not use on darwin
+    — so a healthy mac carried a CRIT it could never clear, which trains an
+    operator to ignore the CRIT that IS real."""
+    probe, calls = _run_identity_probe(
+        tmp_path, monkeypatch, capsys, platform="darwin", security_rc=0
+    )
+    assert probe.identity.claude_oauth_present is True
+    assert probe.identity.claude_oauth_source == "keychain"
+    assert probe.identity.claude_oauth_reason is None
+
+    # Metadata only: `-w` would print the secret AND prompt for a keychain
+    # unlock, which is why it must never appear.
+    security = [c for c in calls if isinstance(c, list) and "security" in c[0]]
+    assert security and "Claude Code-credentials" in security[0]
+    assert "-w" not in security[0]
+
+    facts = MachineFacts(name="macmini", configured=True, identity=probe.identity)
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.claude_oauth")
+    assert finding.severity == OK
+    assert "Keychain" in finding.summary
+
+
+def test_a_logged_out_mac_still_crits(tmp_path, monkeypatch, capsys):
+    """A false green here is strictly worse than the false red being fixed:
+    with no keychain item, `claude -p` cannot start and this machine would
+    accept dispatches and fail every one of them."""
+    probe, _calls = _run_identity_probe(
+        tmp_path, monkeypatch, capsys, platform="darwin", security_rc=44
+    )
+    assert probe.identity.claude_oauth_present is False
+    assert probe.identity.claude_oauth_source == "keychain"
+    assert "login Keychain" in probe.identity.claude_oauth_reason
+
+    facts = MachineFacts(name="macmini", configured=True, identity=probe.identity)
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.claude_oauth_missing")
+    assert finding.severity == CRIT
+    assert "login Keychain" in finding.summary
+
+
+def test_security_failing_to_run_is_not_laundered_into_logged_in(
+    tmp_path, monkeypatch, capsys
+):
+    """`security` itself being unavailable is not evidence of a login."""
+    probe, _calls = _run_identity_probe(
+        tmp_path, monkeypatch, capsys, platform="darwin", security_rc=None
+    )
+    assert probe.identity.claude_oauth_present is False
+    assert "security" in probe.identity.claude_oauth_reason
+
+
+def test_linux_oauth_still_reads_the_credentials_file_and_never_the_keychain(
+    tmp_path, monkeypatch, capsys
+):
+    """Acceptance: Linux behaviour is unchanged. The keychain branch is darwin
+    only — `security` does not exist there and must not be reached for."""
+    probe, calls = _run_identity_probe(
+        tmp_path, monkeypatch, capsys, platform="linux", security_rc=0
+    )
+    assert probe.identity.claude_oauth_present is False
+    assert probe.identity.claude_oauth_source == "file"
+    assert probe.identity.claude_oauth_reason == (
+        "~/.claude/.credentials.json does not exist"
+    )
+    joined = " ".join(" ".join(c) if isinstance(c, list) else str(c) for c in calls)
+    assert "find-generic-password" not in joined
+
+    facts = MachineFacts(name="laptop", configured=True, identity=probe.identity)
+    finding = _find(machine_onboard.evaluate_identity(facts), "identity.claude_oauth_missing")
+    assert finding.severity == CRIT
+    assert "~/.claude/.credentials.json does not exist" in finding.summary
 
 
 def test_probe_machine_shell_redacts_the_exception_branch_too(monkeypatch):
