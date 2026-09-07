@@ -3219,7 +3219,11 @@ def _journal_from_outbox(
                 continue
             design = row.fields.get("design_round")
             design = design if isinstance(design, dict) else {}
-            bundle_key = design.get("bundle_key") or ""
+            # #3173: the wire field coord emits is ``mock_bundle`` (the name
+            # coord-portal's own aliasing actually reads); ``bundle_key`` is
+            # kept as a fallback so an outbox row queued before that fix
+            # still renders its bundle in the local journal.
+            bundle_key = design.get("mock_bundle") or design.get("bundle_key") or ""
             derived.append(
                 _journal_entry(
                     ts=row.sent_at if row.sent_at is not None else row.enqueued_at,

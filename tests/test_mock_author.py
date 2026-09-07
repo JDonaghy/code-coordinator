@@ -994,12 +994,43 @@ def test_build_design_round_carries_bundle_key_and_outcome_definition():
     )
 
     assert design_round["round"] == 1
-    assert design_round["bundle_key"] == "bundles/sub_1/r1.tar"
+    assert design_round["mock_bundle"] == "bundles/sub_1/r1.tar"
     assert "Ship the thing." in design_round["outcome_definition"]
     assert design_round["decomposition"] == [
         {"issue_number": 101, "group": None, "after": []},
         {"issue_number": 102, "group": None, "after": [101]},
     ]
+
+
+def test_build_design_round_bundle_key_lands_on_a_portal_accepted_wire_name():
+    """#3173: `build_design_round` used to emit `bundle_key`, a ninth field
+    name that is not among the eight aliases coord-portal's `src/rounds.ts`
+    accepts for a design round's mock-bundle reference — the bundle uploaded,
+    the round published, and nothing ever linked to it, silently, on both
+    the customer and operator screens.
+
+    Assert against `PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS` — the list mirrored
+    from the portal's own source — rather than a hardcoded literal, so this
+    test fails loudly if the emitted key and the accepted-alias list ever
+    drift apart again, instead of both quietly agreeing on the wrong name.
+    """
+    design_round = mock_author.build_design_round(
+        milestone_title="Q3 push",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="Ship the thing.",
+        bundle_key="bundles/sub_1/r1.tar",
+    )
+
+    bundle_fields = set(design_round) & set(
+        mock_author.PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS
+    )
+    assert bundle_fields, (
+        f"design_round has no key coord-portal accepts for a mock bundle; "
+        f"emitted keys were {sorted(design_round)}, accepted names are "
+        f"{mock_author.PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS}"
+    )
+    (bundle_field,) = bundle_fields
+    assert design_round[bundle_field] == "bundles/sub_1/r1.tar"
 
 
 def test_build_design_round_falls_back_to_title_when_body_empty():

@@ -638,6 +638,27 @@ def flatten_bundle_for_upload(files: dict[str, str]) -> dict[str, str]:
     }
 
 
+#: The field names coord-portal's `src/rounds.ts` (as of #3173) accepts as
+#: a design round's mock-bundle reference — copied from that file's own
+#: alias list, not restated from memory, so it can be asserted against
+#: rather than duplicated as an opinion. `build_design_round` below emits
+#: `mock_bundle` (the first and canonical one); this tuple exists so
+#: `tests/test_mock_author.py` can assert the emitted key is one coord-portal
+#: actually reads, instead of asserting a dict shape coord merely *intends*
+#: to send — the gap that let `bundle_key` (a ninth, unaccepted name) ship
+#: green in the first place.
+PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS = (
+    "mock_bundle",
+    "mockBundle",
+    "mock_bundle_url",
+    "mockBundleUrl",
+    "mocks",
+    "mock",
+    "bundle",
+    "artifacts",
+)
+
+
 def build_design_round(
     *,
     milestone_title: str,
@@ -656,6 +677,14 @@ def build_design_round(
     for this round's rendered mock bundle + contract — see that method's
     docstring and :func:`coord.portal_sync.enqueue_design_round`'s for why
     the bundle itself is never inlined into this payload.
+
+    The wire key for it is ``mock_bundle`` — one of the aliases
+    coord-portal's ``src/rounds.ts`` actually reads (``design_rounds
+    .mock_bundle`` is the column it lands in). #3173: an earlier version of
+    this function emitted ``bundle_key``, which is not among those aliases,
+    so the bundle uploaded and the round published but no link to it was
+    ever rendered anywhere. Keep the parameter named ``bundle_key`` for
+    readability; the returned dict's key must stay ``mock_bundle``.
 
     A missing/malformed ``## Work order`` block degrades to an empty
     ``decomposition`` rather than raising — a milestone that hasn't written
@@ -687,5 +716,5 @@ def build_design_round(
         "round": round_number,
         "outcome_definition": outcome_definition,
         "decomposition": decomposition,
-        "bundle_key": bundle_key,
+        PORTAL_ACCEPTED_MOCK_BUNDLE_KEYS[0]: bundle_key,
     }
