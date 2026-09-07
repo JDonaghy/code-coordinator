@@ -19,6 +19,7 @@ from coord.smoke import (
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
+    finalize_smoke_fanout,
     match_rules,
     mute_smoke_legs,
     mute_smoke_tally,
@@ -26,6 +27,8 @@ from coord.smoke import (
     pick_smoke_machine,
     resolve_rule_command,
     resolve_smoke_command,
+    smoke_leg_capabilities,
+    smoke_leg_issue_title,
 )
 
 
@@ -1928,9 +1931,13 @@ def test_dispatch_pending_smoke_skips_a_blocked_row(
     })
     import coord.smoke as _smoke
 
-    real = _smoke.dispatch_smoke
+    # #3182: `dispatch_pending_smoke` now calls the full-list
+    # `_dispatch_smoke_legs` (so a capability fan-out isn't undercounted in
+    # its own returned list) rather than the compat-wrapping `dispatch_smoke`
+    # — patch the seam it actually calls.
+    real = _smoke._dispatch_smoke_legs
     monkeypatch.setattr(
-        _smoke, "dispatch_smoke",
+        _smoke, "_dispatch_smoke_legs",
         lambda c, b, cfg, **kw: real(
             c, b, cfg, http_client=client,
             diff_lookup=lambda r, br: _GTK_DIFF, **kw,
@@ -1971,16 +1978,15 @@ def test_dispatch_smoke_records_blocked_when_zero_capable_machines(
     assert "gtk" in (completed.test_reason or "")
 
 
-def test_dispatch_smoke_blocked_reason_names_partition_split_not_missing_capability(
-    repo: Repo,
-) -> None:
-    """#3177 acceptance: a diff whose matched rules need gtk+windows AND
-    macos in the same PR is unroutable as a flat union (no single machine
-    has all three) — but each half IS routable. The recorded reason must say
-    so (naming the machines the split would use), not the generic "no
-    configured machine declares this capability", which is false here: every
-    capability IS declared, just not all on one box (the exact misdiagnosis
-    #3177 opened on, and the #1678 failure mode it must not repeat)."""
+def test_dispatch_smoke_fans_out_one_leg_per_partition(repo: Repo) -> None:
+    """#3182 acceptance: a diff touching src/gtk/, src/win/, and src/macos/
+    produces legs that between them execute all three, on machines that can
+    each run their own — gtk+windows dispatch together to dell64 (the one
+    machine that carries both), macos dispatches separately to macmini. This
+    used to be an unroutable flat union (#3177's own acceptance test, before
+    #3182 wired up the actual fan-out this partitioning was computed for)."""
+    from coord.smoke import _dispatch_smoke_legs, smoke_leg_capabilities
+
     cfg = Config(
         repos=[repo],
         machines=[
@@ -2003,20 +2009,64 @@ def test_dispatch_smoke_blocked_reason_names_partition_split_not_missing_capabil
         "quadraui/src/win/b.rs",
         "quadraui/src/macos/c.rs",
     ]
+    board = Board()
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"},
+        "macmini.tail": {"id": "macmini-leg"},
+    })
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    assert len(legs) == 2
+    by_machine = {a.machine_name: a for a in legs}
+    assert set(by_machine) == {"dell64", "macmini"}
+    assert smoke_leg_capabilities(by_machine["dell64"].issue_title) == ("gtk", "windows")
+    assert smoke_leg_capabilities(by_machine["macmini"].issue_title) == ("macos",)
+    # Every leg landed on `board.active`, same as a single-leg dispatch.
+    assert board.active == legs
+
+    # The parent's aggregate verdict is "running", carrying the manifest that
+    # `finalize_smoke_fanout` needs to fold the legs back together.
+    assert completed.test_state == "running"
+    reason = completed.test_reason or ""
+    assert "[[smoke-fanout:" in reason
+    assert "dell64-leg" in reason and "macmini-leg" in reason
+    assert "gtk+windows" in reason and "macos" in reason
+
+
+def test_dispatch_smoke_unroutable_partition_fails_loudly_at_dispatch(
+    repo: Repo,
+) -> None:
+    """#3182 acceptance: a matched rule's capability that NO configured
+    machine declares at all is a config error, not a routing puzzle — it
+    must fail loudly (naming the capability and the rule) at dispatch time,
+    never a silent retry loop (#1678's shape)."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    diff = ["quadraui/src/gtk/a.rs", "quadraui/src/macos/c.rs"]
     result = dispatch_smoke(
         completed, Board(), cfg,
-        http_client=_MultiHostClient(),
-        diff_lookup=lambda r, b: diff,
+        http_client=_MultiHostClient(), diff_lookup=lambda r, b: diff,
     )
     assert result is None
     assert completed.test_state == "blocked"
     reason = completed.test_reason or ""
-    assert "does not fan a single completion out into concurrent legs yet (#3177)" in reason
-    assert "dell64" in reason
-    assert "macmini" in reason
-    # Must NOT read as a bare capability miss — every capability above IS
-    # declared by some machine.
-    assert "no configured machine declares capability" not in reason
+    assert "macos" in reason
+    assert "capability_rules[1]" in reason
+    assert "quadraui/src/macos/" in reason
 
 
 def test_dispatch_smoke_transient_post_failure_leaves_the_row_redispatchable(
@@ -2239,7 +2289,7 @@ def test_reconcile_dispatches_auto_smoke_for_auto_mode_issue(
         }
 
     with _patch("coord.reconcile._query_agent", side_effect=_fake_agent), \
-         _patch("coord.smoke.dispatch_smoke", return_value=None) as mock_dispatch:
+         _patch("coord.smoke._dispatch_smoke_legs", return_value=[]) as mock_dispatch:
         reconcile(board, gtk_and_server_config)
         assert mock_dispatch.called, (
             "Expected dispatch_smoke to be called for test-mode:auto issue"
@@ -2355,7 +2405,7 @@ def test_reconcile_thin_client_falls_back_to_local_on_daemon_error(
         }
 
     with _patch("coord.reconcile._query_agent", side_effect=_fake_agent), \
-         _patch("coord.smoke.dispatch_smoke", return_value=None) as mock_dispatch:
+         _patch("coord.smoke._dispatch_smoke_legs", return_value=[]) as mock_dispatch:
         reconcile(board, gtk_and_server_config)
 
     # Falls open to "no label" behaviour → respects auto_queue=True → dispatches.
@@ -2438,7 +2488,12 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     eligible = _completed()
     board = Board(completed=[eligible])
     sentinel = object()
-    with _patch("coord.smoke.dispatch_smoke", return_value=sentinel) as mock_dispatch:
+    # #3182: patches the full-list seam `dispatch_pending_smoke` actually
+    # calls (`_dispatch_smoke_legs`, not the compat-wrapping `dispatch_smoke`
+    # — see that function's docstring for why).
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
         result = dispatch_pending_smoke(board, gtk_and_server_config)
     assert mock_dispatch.called
     call_args = mock_dispatch.call_args
@@ -2469,7 +2524,12 @@ def test_dispatch_pending_smoke_promotes_advisory_row_with_confirmed_commits(
     row = replace(_completed(), status="advisory", review_state="advisory")
     board = Board(completed=[row])
     sentinel = object()
-    with _patch("coord.smoke.dispatch_smoke", return_value=sentinel) as mock_dispatch:
+    # #3182: patches the full-list seam `dispatch_pending_smoke` actually
+    # calls (`_dispatch_smoke_legs`, not the compat-wrapping `dispatch_smoke`
+    # — see that function's docstring for why).
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
         result = dispatch_pending_smoke(board, gtk_and_server_config)
 
     assert mock_dispatch.called, "promoted row must fall through to the normal 'done' dispatch"
@@ -2936,3 +2996,166 @@ def test_dispatch_pending_smoke_dispatches_for_a_fix_assignment_through_bulk_pat
     assert dispatched[0].type == "smoke"
     assert dispatched[0].review_of_assignment_id == "fix-1"
     assert dispatched[0] in board.active
+
+
+# ── #3182: fan-out verdict aggregation (finalize_smoke_fanout) ──────────────
+
+
+def _seed_fanout_parent(*, parent_id: str = "w-fanout") -> None:
+    """Dispatch a bare WORK row so `record_test_verdict`/`load_assignment_
+    test_*` have a real row to read/write — mirrors
+    `test_environmental_death_preserves_the_mute_leg_tally`'s own setup."""
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+    work = Assignment(
+        assignment_id=parent_id, machine_name="dell64", repo_name="api",
+        issue_number=7, issue_title="cross-platform fix", type="work",
+        status="done", branch="issue-7",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+
+def _seed_leg(*, leg_id: str, state: str | None, reason: str | None) -> None:
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        record_test_verdict,
+    )
+
+    leg = Assignment(
+        assignment_id=leg_id, machine_name="dell64", repo_name="api",
+        issue_number=7, issue_title="[smoke:gtk] leg", type="smoke",
+        status="done" if state not in (None, "running") else "running",
+        branch="issue-7", review_of_assignment_id="w-fanout",
+    )
+    _record_dispatched_assignment_local(assignment=leg, repo_github="acme/api")
+    if state is not None or reason is not None:
+        record_test_verdict(assignment_id=leg_id, test_state=state, test_reason=reason)
+
+
+def test_finalize_smoke_fanout_waits_for_every_leg(coord_db) -> None:
+    """Not everyone has reported in — the aggregate must stay `running`, not
+    resolve early on the legs that happen to have finished first."""
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    _seed_leg(leg_id="leg-b", state=None, reason=None)
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import load_assignment_test_state  # noqa: PLC0415
+
+    assert load_assignment_test_state("w-fanout") == "running"
+
+
+def test_finalize_smoke_fanout_fails_when_any_leg_fails(coord_db) -> None:
+    """#3182 acceptance: the verdict is red when ANY leg is red, and the
+    reason names which capability set failed rather than a bare failure."""
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    _seed_leg(leg_id="leg-b", state="failed", reason="2 Win32 unit tests regressed")
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        load_assignment_test_state,
+    )
+
+    assert load_assignment_test_state("w-fanout") == "failed"
+    reason = load_assignment_test_reason("w-fanout") or ""
+    assert "[windows] failed" in reason
+    assert "2 Win32 unit tests regressed" in reason
+
+
+def test_finalize_smoke_fanout_passes_when_every_leg_passes(coord_db) -> None:
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    _seed_leg(leg_id="leg-b", state="passed", reason="ok")
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import load_assignment_test_state  # noqa: PLC0415
+
+    assert load_assignment_test_state("w-fanout") == "passed"
+
+
+def test_finalize_smoke_fanout_is_a_noop_for_a_non_fanout_row(coord_db) -> None:
+    """No manifest in `test_reason` — an ordinary single-leg row — must never
+    be touched by the fan-out aggregator."""
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    _seed_fanout_parent()
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason="dispatched: Test stage running (#1426)",
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    assert load_assignment_test_state("w-fanout") == "running"
+
+
+def test_finalize_smoke_fanout_never_clobbers_an_already_terminal_parent(
+    coord_db,
+) -> None:
+    """A human `coord test --passed` (or an earlier finalize call) already
+    landed a terminal verdict — a later leg reporting in must not overwrite
+    it."""
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="failed", reason="late straggler")
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="passed",
+        test_reason="human override via `coord test --passed`",
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    assert load_assignment_test_state("w-fanout") == "passed"
+
+
+def test_smoke_leg_issue_title_round_trips_through_smoke_leg_capabilities() -> None:
+    title = smoke_leg_issue_title("Fix cross-platform bug", ("windows", "gtk"))
+    assert title == "[smoke:gtk+windows] Fix cross-platform bug"
+    assert smoke_leg_capabilities(title) == ("gtk", "windows")
+    # An ordinary, untagged single-leg row is never mistaken for a leg.
+    assert smoke_leg_capabilities("[smoke] Fix cross-platform bug") is None
+    assert smoke_leg_capabilities(None) is None

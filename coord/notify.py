@@ -65,7 +65,12 @@ from coord.progress import parse_progress
 # and none of them import this module.
 from coord.smoke import MUTE_SMOKE_LEG_BUDGET, TEST_STATE_BLOCKED
 from coord.smoke import NO_SMOKE_VERDICT_MARKER as _NO_SMOKE_VERDICT_MARKER
-from coord.smoke import mute_smoke_legs, mute_smoke_tally
+from coord.smoke import (
+    finalize_smoke_fanout,
+    mute_smoke_legs,
+    mute_smoke_tally,
+    smoke_leg_capabilities,
+)
 from coord.state import (
     load_dispatched,
     load_done_reviews_needing_post,
@@ -3424,7 +3429,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 transition.repo_name, transition.issue_number
             )
             if test_mode != "smoke":
-                _record_smoke_verdict(transition, entry, parent_id)
+                # #3182: a capability-partition fan-out leg is identified by
+                # its own `issue_title` tag (`coord.smoke.smoke_leg_issue_
+                # title`) — it self-records onto ITS OWN row, never straight
+                # onto the shared parent (two concurrent legs racing to
+                # overwrite the same row is exactly the #1797 shape), then
+                # every leg's verdict is folded into the parent's aggregate.
+                leg_caps = smoke_leg_capabilities(record.get("issue_title"))
+                if leg_caps is not None:
+                    _record_smoke_verdict(
+                        transition, entry, transition.assignment_id,
+                    )
+                    finalize_smoke_fanout(parent_id)
+                else:
+                    _record_smoke_verdict(transition, entry, parent_id)
     elif transition.event == EVENT_FAILURE and assignment_type == "smoke":
         # #1605: the Test-stage WORKER itself died (a dead agent, a killed
         # process group, a terminal API error — anything short of the
@@ -3485,10 +3503,21 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             from coord.reconcile import (  # noqa: PLC0415
                 propagate_smoke_terminal_failure,
             )
-            propagate_smoke_terminal_failure(
-                parent_assignment_id=parent_id,
-                failure_reason=_failure_reason,
-            )
+            # #3182: same self-record-then-fold split as the EVENT_COMPLETION
+            # branch above — a crashed fan-out leg resolves onto ITS OWN row,
+            # never straight onto the shared parent.
+            leg_caps = smoke_leg_capabilities(record.get("issue_title"))
+            if leg_caps is not None:
+                propagate_smoke_terminal_failure(
+                    parent_assignment_id=transition.assignment_id,
+                    failure_reason=_failure_reason,
+                )
+                finalize_smoke_fanout(parent_id)
+            else:
+                propagate_smoke_terminal_failure(
+                    parent_assignment_id=parent_id,
+                    failure_reason=_failure_reason,
+                )
     elif transition.event == EVENT_COMPLETION:
         # #2188: a `deliverable:analysis` issue that legitimately ended with
         # 0 commits has no diff to point at — the deliverable IS the
