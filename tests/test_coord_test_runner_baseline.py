@@ -93,6 +93,18 @@ if [[ "$1" == "-c" ]]; then
         *coord*)
             # The `import coord` resolution probe: does this venv resolve the
             # package from the BASELINE worktree rather than the branch's?
+            #
+            # #3182: with FAKE_COORD_PROBE_REAL set, hand the runner's OWN
+            # python source ("$@" is `-c <source> <base_wt>`) to a real
+            # interpreter, so the snippet's path comparison is what is under
+            # test rather than a canned exit code. `-S` skips site processing
+            # so this repo's own editable install cannot leak a second `coord`
+            # onto sys.path and decide the answer; FAKE_COORD_PROBE_FLAGS lets
+            # a test add `-P` (do not prepend cwd) to steer resolution AWAY
+            # from the baseline worktree and prove the probe still refuses.
+            if [[ -n "${FAKE_COORD_PROBE_REAL:-}" ]]; then
+                exec "$FAKE_COORD_PROBE_REAL" -S ${FAKE_COORD_PROBE_FLAGS:-} "$@"
+            fi
             exit "${FAKE_COORD_PROBE_EXIT:-0}" ;;
         *)
             exit 0 ;;
@@ -201,6 +213,11 @@ def repo(tmp_path: Path) -> Path:
     (r / "tests" / "test_ambient.py").write_text(
         "def test_one():\n    assert True\n", encoding="utf-8"
     )
+    # #3182: an importable `coord` package AT THE BASE COMMIT, so the tests
+    # that run the runner's real `import coord` resolution probe against the
+    # baseline worktree have something to resolve. Harmless to every other
+    # test here: routing keys off the branch's `coord/thing.py` change below.
+    (r / "coord" / "__init__.py").write_text("", encoding="utf-8")
     (r / "README.md").write_text("init\n", encoding="utf-8")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "initial")
@@ -381,6 +398,79 @@ def test_comparison_is_skipped_when_the_venv_resolves_coord_wrongly(repo: Path) 
     assert "BASELINE-RED" not in result.stdout
     assert "does not resolve 'coord' from the baseline worktree" in (
         result.stderr + result.stdout
+    )
+
+
+def test_probe_matches_through_a_symlinked_tmpdir(repo: Path, tmp_path: Path) -> None:
+    """#3182: the baseline scratch worktree lives under `$(mktemp -d)`, and on
+    macOS that is a path through the `/var -> /private/var` symlink. The probe
+    used to compare `Path(coord.__file__).resolve()` (canonicalised, so
+    `/private/var/...`) against the raw `$base_wt` string (`/var/...`), which
+    can never match — so EVERY macOS Test leg refused the comparison and
+    reported the machine's pre-existing baseline breakage as the branch's.
+    That is exactly the failure this repo's own Test stage hit.
+
+    `TMPDIR` is pointed at a symlink so `mktemp -d` hands the runner a
+    non-canonical path on Linux too — otherwise this test would only be able
+    to fail on a Mac, i.e. nowhere in CI.
+
+    Unlike `test_comparison_is_skipped_when_the_venv_resolves_coord_wrongly`,
+    this drives the runner's REAL probe source through a real interpreter
+    (`FAKE_COORD_PROBE_REAL`); a canned exit code cannot observe a path bug.
+    """
+    real_tmp = tmp_path / "realtmp"
+    real_tmp.mkdir()
+    link_tmp = tmp_path / "linktmp"
+    link_tmp.symlink_to(real_tmp, target_is_directory=True)
+    # Guard the premise: if this ever stops being a non-canonical path the test
+    # would pass vacuously, proving nothing about canonicalisation.
+    assert link_tmp.resolve() != link_tmp
+
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED=BRANCH_FAILED,
+        TMPDIR=str(link_tmp),
+        FAKE_COORD_PROBE_REAL=sys.executable,
+        PYTHONPATH="",
+    )
+
+    assert "does not resolve 'coord' from the baseline worktree" not in (
+        result.stdout + result.stderr
+    )
+    assert result.returncode == 4, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: BASELINE-RED (python)" in result.stdout
+
+
+def test_real_probe_still_refuses_when_coord_comes_from_outside_the_baseline(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The other half of #3182: canonicalising both sides must not soften the
+    gate into one that always says yes.
+
+    Same real probe source, same symlinked `TMPDIR` — only `-P` (do not
+    prepend cwd to `sys.path`) plus a `PYTHONPATH` pointing at the BRANCH
+    worktree differ, so `import coord` resolves outside the baseline tree.
+    The probe must refuse the comparison and let the verdict stay `FAIL`,
+    even though the fake baseline run would otherwise have downgraded it.
+    """
+    real_tmp = tmp_path / "realtmp"
+    real_tmp.mkdir()
+    link_tmp = tmp_path / "linktmp"
+    link_tmp.symlink_to(real_tmp, target_is_directory=True)
+
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED=BRANCH_FAILED,
+        TMPDIR=str(link_tmp),
+        FAKE_COORD_PROBE_REAL=sys.executable,
+        FAKE_COORD_PROBE_FLAGS="-P",
+        PYTHONPATH=str(repo),
+    )
+
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "BASELINE-RED" not in result.stdout
+    assert "does not resolve 'coord' from the baseline worktree" in (
+        result.stdout + result.stderr
     )
 
 

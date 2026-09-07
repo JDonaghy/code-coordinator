@@ -484,11 +484,24 @@ python_baseline_is_red() {
     # install, but it is a property of how pip chose to write the install — not
     # something to assume. Assert it, and skip the comparison rather than
     # silently compare the BRANCH's `coord` against the base's tests.
+    #
+    # #3182: BOTH sides are canonicalised before comparing. `$base_wt` lives
+    # under `$(mktemp -d)`, which on macOS returns `/var/folders/...` — a path
+    # through the `/var -> /private/var` symlink — while `Path.resolve()` on
+    # the imported module returns the `/private/var/...` real path. Comparing
+    # the resolved module path against the UNresolved scratch path therefore
+    # never matched on any Mac, so this probe refused the comparison on every
+    # macOS Test leg and the gate reported pre-existing baseline breakage as
+    # the branch's. `base in pkg.parents` rather than a string prefix, so a
+    # sibling directory that merely starts with the same characters (a
+    # `.../baseline-2` next to `.../baseline`) cannot satisfy it either.
     if ! (cd "$base_wt" && "$venv/bin/python" -c "
 import pathlib, sys
 import coord
-sys.exit(0 if str(pathlib.Path(coord.__file__).resolve()).startswith('$base_wt') else 9)
-") >/dev/null 2>&1; then
+base = pathlib.Path(sys.argv[1]).resolve()
+pkg = pathlib.Path(coord.__file__).resolve()
+sys.exit(0 if base in pkg.parents else 9)
+" "$base_wt") >/dev/null 2>&1; then
         warn "baseline: the branch venv does not resolve 'coord' from the baseline worktree — reporting the failure as the branch's, uncompared"
         return 1
     fi
