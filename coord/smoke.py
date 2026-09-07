@@ -17,6 +17,13 @@ Public entry points:
 
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
+- `partition_capability_requirements(touched_files, rules, capable_for)`
+  (#3177) — pure: groups matched rules' requirements into the fewest
+  capability sets a single configured machine can each satisfy, and reports
+  separately any requirement no machine can EVER satisfy. `dispatch_smoke`
+  uses it only to give an unroutable flat union a more accurate diagnosis
+  (naming the machines that WOULD cover it split apart) — it does not yet
+  drive an actual multi-leg dispatch; see the note above its definition.
 - `resolve_smoke_command(repo, smoke_cfg, touched_files=None)` — pure: picks
   the Test-stage command, provenance included. A matched rule's own
   `command` (#3056) outranks the repo/fleet-wide sources — see
@@ -201,6 +208,12 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
     the trailing slash form to be strict.
 
     Returns capabilities in deterministic order (first-seen across rules).
+
+    #3177: this union assumes a SINGLE machine will satisfy everything it
+    returns — true whenever the matched rules' capabilities all live on one
+    machine, false the moment they don't (GTK+Windows vs. macOS: no machine
+    ever has both). See `partition_capability_requirements` for the routing
+    query that doesn't make that assumption.
     """
     seen: dict[str, None] = {}
     for path in touched_files:
@@ -210,6 +223,140 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
             for cap in rule.requires:
                 seen.setdefault(cap, None)
     return list(seen.keys())
+
+
+# ── Partitioning (#3177) ─────────────────────────────────────────────────────
+#
+# `match_rules` above returns ONE union — every capability any matched rule
+# asked for, on the assumption a single machine will end up satisfying all of
+# it. That assumption breaks the moment two matched rules need capabilities no
+# single machine will ever carry together (GTK+Windows vs. macOS is the
+# canonical case, #3177): the union becomes unroutable even though each half,
+# routed separately, is perfectly satisfiable.
+#
+# `partition_capability_requirements` is the fix at the ROUTING layer: it
+# groups matched rules' requirements into the fewest sets that some
+# configured machine can each satisfy on its own, and separately reports any
+# single rule's requirement that NO machine can ever satisfy (a config error,
+# not a routing puzzle). It does not, by itself, dispatch more than one Test
+# leg — `dispatch_smoke` still dispatches exactly one leg, sized to the first
+# partition, and only *diagnoses* the multi-partition case (see its call site)
+# so the failure names the real cause ("this needs N machines together") set
+# instead of the misleading "no machine declares capability X" a flat union
+# produces. Actually fanning out into N concurrent smoke legs — and ANDing
+# their verdicts into the parent's `test_state` — is real follow-up work: the
+# rest of the pipeline (`coord.claim`'s branch-scoped smoke dedupe, the
+# `test`-stage leg count in `coord.stage_projection._leg_count_for_stage`, the
+# single-authoritative-write model in `coord.notify._record_smoke_verdict`,
+# and the Rust mirror in `tui/src/app/pipeline.rs`) all currently assume
+# exactly one smoke assignment represents one Test-stage attempt. Wiring
+# concurrent siblings through those without turning "3 fan-out legs" into "3
+# retries" on the board is a second, larger change on top of this one.
+
+
+@dataclass(frozen=True)
+class SmokePartition:
+    """One capability set that some single configured machine can satisfy —
+    i.e. one Test-stage leg, if/when the fan-out described above ships.
+    """
+
+    capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnroutableCapability:
+    """A matched rule's `requires` that NO configured machine satisfies at
+    all — a config error, never a routing puzzle: no amount of splitting
+    into more legs makes an uninstalled capability appear.
+    """
+
+    capabilities: tuple[str, ...]
+    rule_index: int
+    rule_files: tuple[str, ...]
+
+    def describe(self) -> str:
+        caps = ", ".join(self.capabilities)
+        files = ", ".join(self.rule_files)
+        return (
+            f"capability set [{caps}] required by "
+            f"smoke_tests.capability_rules[{self.rule_index}] (files={files!r}) "
+            "— no configured machine declares all of it"
+        )
+
+
+def partition_capability_requirements(
+    touched_files: list[str],
+    rules: list[SmokeRule],
+    capable_for: Callable[[list[str]], bool],
+) -> tuple[list[SmokePartition], list[UnroutableCapability]]:
+    """Group matched rules' `requires` into the fewest capability sets each
+    satisfiable by a single machine, per the module-level note above.
+
+    *capable_for(caps)* answers "does at least one configured machine (that
+    can also build/test this repo) declare every capability in `caps`?" —
+    callers pass a closure over :func:`_capability_matched_machines` so this
+    function stays config/board-shape agnostic and unit-testable without a
+    real `Config`.
+
+    Algorithm: distinct non-empty `requires` sets are visited in first-match
+    rule-declaration order (deterministic — that order is the config
+    author's own explicit list, not set/dict iteration order). A set that no
+    machine can satisfy AT ALL becomes an :class:`UnroutableCapability` and
+    is never merged into anything (merging never helps — no machine gaining
+    a partner requirement makes an absent capability present). Every
+    routable set is greedily folded into the first existing partition whose
+    UNION with it is still satisfiable by some one machine; if none accepts
+    it, it starts a new partition.
+
+    This is deliberately greedy, not minimum-partition-optimal: declaration
+    order is a natural, predictable tiebreak, and the artifact under test —
+    coordinator.yml's own hand-written rule list — is small enough that
+    greedy-vs-optimal never actually differs in practice (see the module
+    docstring's GTK+Windows / macOS example, where greedy already finds the
+    2-partition optimum).
+
+    Rules with an empty `requires` never enter this — they mean "no extra
+    capability needed", already handled by the existing any-capable-machine
+    path in `dispatch_smoke`, not a partition of their own.
+    """
+    seen: dict[frozenset[str], tuple[int, list[str]]] = {}
+    order: list[frozenset[str]] = []
+    for i, rule in enumerate(rules):
+        if not rule.requires:
+            continue
+        if not any(
+            path.startswith(pattern) for path in touched_files for pattern in rule.files
+        ):
+            continue
+        key = frozenset(rule.requires)
+        if key not in seen:
+            seen[key] = (i, list(rule.files))
+            order.append(key)
+
+    groups: list[set[str]] = []
+    unroutable: list[UnroutableCapability] = []
+    for key in order:
+        rule_index, rule_files = seen[key]
+        caps = set(key)
+        if not capable_for(sorted(caps)):
+            unroutable.append(UnroutableCapability(
+                capabilities=tuple(sorted(caps)),
+                rule_index=rule_index,
+                rule_files=tuple(rule_files),
+            ))
+            continue
+        merged = False
+        for i, group in enumerate(groups):
+            candidate = group | caps
+            if capable_for(sorted(candidate)):
+                groups[i] = candidate
+                merged = True
+                break
+        if not merged:
+            groups.append(caps)
+
+    partitions = [SmokePartition(capabilities=tuple(sorted(g))) for g in groups]
+    return partitions, unroutable
 
 
 # ── Machine selection ───────────────────────────────────────────────────────
@@ -942,8 +1089,22 @@ def _report_unroutable_smoke(
     attempts: list[SmokeAttempt],
     *,
     paused_capable: list[str] | None = None,
+    partition_hint: str | None = None,
 ) -> None:
     """Report — once — that the Test stage has no machine it can run on.
+
+    *partition_hint* (#3177): set by the caller when the flat union of
+    matched rules' capabilities is unroutable but
+    :func:`partition_capability_requirements` shows the SAME rules would be
+    individually routable, split across more than one machine — e.g. a diff
+    matching both a `gtk` rule and a `macos` rule where no single machine has
+    both, but one machine has each. That is not "no configured machine
+    declares this capability" (every capability IS declared, just not all on
+    one box); saying so anyway is exactly the misdiagnosis #3177 opened on.
+    `dispatch_smoke` does not yet fan out into concurrent legs (see the
+    module note above `partition_capability_requirements`), so this stays a
+    blocked verdict — just one that names the real fix instead of pointing
+    an operator at hardware they don't need to buy.
 
     #1672/#1678: the old code logged a WARNING and returned. Nothing was
     written anywhere the TUI, `coord gates` or the board could show it, and
@@ -997,6 +1158,17 @@ def _report_unroutable_smoke(
             f"Tried {len(attempts)} — "
             + "; ".join(a.describe() for a in attempts)
             + "."
+        )
+    elif partition_hint:
+        message = (
+            f"Test stage cannot be routed to ONE machine: capability set "
+            f"[{caps}] for repo {completed.repo_name!r} is the UNION of "
+            f"more than one matched rule, and no single configured machine "
+            f"declares all of it. {partition_hint} Splitting this diff's "
+            f"Test stage across those machines would resolve it, but "
+            f"`dispatch_smoke` does not fan a single completion out into "
+            f"concurrent legs yet (#3177) — this is a real fix, not "
+            f"'add a capability nobody has'."
         )
     else:
         message = (
@@ -1375,8 +1547,45 @@ def dispatch_smoke(
         # (or there were none at all, including "none — they're all paused
         # or in quiet hours right now", #2636). Report it where the board
         # can show it, exactly once — never the silent 30 s spin of #1678.
+        #
+        # #3177: before reporting the flat union as unroutable, check
+        # whether it's unroutable ONLY because it's a union — i.e. the
+        # matched rules, taken separately, ARE each satisfiable, just not by
+        # the same machine. That's a materially different diagnosis (see
+        # `_report_unroutable_smoke`'s `partition_hint`) and telling them
+        # apart costs nothing extra: this reuses the exact same
+        # `_capability_matched_machines` check every candidate above already
+        # went through.
+        partition_hint: str | None = None
+        if required_caps and not attempts and not paused_capable:
+            def _capable_for(caps: list[str]) -> bool:
+                return bool(_capability_matched_machines(
+                    caps, completed.repo_name, config
+                ))
+
+            partitions, unroutable = partition_capability_requirements(
+                touched, smoke_cfg.capability_rules, _capable_for
+            )
+            if not unroutable and len(partitions) > 1:
+                per_partition = "; ".join(
+                    f"[{', '.join(p.capabilities)}] -> "
+                    + ", ".join(
+                        sorted(
+                            m.name
+                            for m in _capability_matched_machines(
+                                list(p.capabilities), completed.repo_name, config
+                            )
+                        )
+                    )
+                    for p in partitions
+                )
+                partition_hint = (
+                    f"Split into {len(partitions)} machine-satisfiable "
+                    f"partitions: {per_partition}."
+                )
         _report_unroutable_smoke(
-            completed, required_caps, attempts, paused_capable=paused_capable
+            completed, required_caps, attempts,
+            paused_capable=paused_capable, partition_hint=partition_hint,
         )
         return None
 
