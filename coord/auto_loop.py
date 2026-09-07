@@ -1621,7 +1621,13 @@ def run_for_fix_transition(
         )
         return []
 
-    fix.review_state = "dispatched"
+    # #3180: `dispatch_review` may have short-circuited mechanically
+    # (coordinator-doc/sealed-path violation on the fix's own diff) and
+    # already finalized `review` + propagated `fix.review_state="done"`
+    # before returning — see `dispatch_pending_reviews`'s matching guard for
+    # why stomping "dispatched" over that must be skipped here too.
+    if review.status != "done":
+        fix.review_state = "dispatched"
     write_board(board)
 
     log.info(

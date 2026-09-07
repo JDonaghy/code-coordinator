@@ -1453,6 +1453,153 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     )
 
 
+# ── #3180: mandatory-verdict detection, shared by the briefing text AND the
+# dispatch-time mechanical short-circuit ────────────────────────────────────
+#
+# Both `build_review_briefing` (the reviewer's own copy of the rule) and
+# `dispatch_review` (the #3180 short-circuit that records the verdict WITHOUT
+# spending a review leg) need to answer the exact same question — "does this
+# diff trip a MANDATORY request-changes rule?" — and must never answer it
+# differently. Before #3180 the answer was computed once, inline inside
+# `build_review_briefing`, purely to decide which paragraph to print; nothing
+# else ever asked. Pulling the touched-path detection AND the banner text out
+# into these two functions makes them the single source of truth for both
+# consumers, so the mechanical verdict's body is always byte-identical to
+# what the reviewer would have been shown, and a future edit to the rule
+# text can't update one copy and silently leave the other stale.
+
+
+def _coordinator_doc_violation_lines(
+    diff_text: str | None, coordinator_doc_paths: list[str] | None,
+) -> tuple[list[str] | None, list[str]]:
+    """(#2966/#3180) Detect a diff touching a coordinator-owned doc.
+
+    Returns ``(touched_paths, banner_lines)`` when *diff_text* touches one of
+    *coordinator_doc_paths* — this is always a MANDATORY request-changes,
+    never inverted by assignment type (see `build_review_briefing`'s
+    docstring). Returns ``(None, [])`` when there is nothing to check or
+    nothing touched — the caller falls back to its own "reminder, not a
+    violation" text in that case.
+    """
+    if not coordinator_doc_paths or not diff_text:
+        return None, []
+    touched_docs = _diff_touched_sealed_paths(diff_text, coordinator_doc_paths)
+    if not touched_docs:
+        return None, []
+    lines = [
+        "## \U0001f6a8 COORDINATOR-OWNED DOC EDITED",
+        "",
+        (
+            "The diff modifies a coordinator-owned doc: "
+            + ", ".join(f"`{p}`" for p in touched_docs)
+            + ". \"Only the coordinator writes docs\" — a worker must "
+            "never edit the repo's own rulebook or other shared docs; "
+            "parallel doc edits from independent workers collide "
+            "(#2966). **request-changes is mandatory here**, regardless "
+            "of anything else in this diff — even if the edit itself "
+            "looks correct in isolation."
+        ),
+    ]
+    return touched_docs, lines
+
+
+def _sealed_path_violation_lines(
+    assignment_type: str,
+    diff_text: str | None,
+    sealed_paths: list[str] | None,
+    sealed_entrypoints: list[str] | None,
+) -> tuple[list[str] | None, list[str]]:
+    """(#944/#1175/#3180) Detect a MANDATORY sealed-path violation.
+
+    Honors the same #1175 ``SEALED_PATH_AUTHOR_TYPES`` inversion
+    `build_review_briefing` applies: for a ``test-author``/``mock-author``
+    diff, writing under *sealed_paths* IS the job, so only a touch OUTSIDE
+    it is mandatory (a "scope violation"); for every other assignment type,
+    touching *sealed_paths* at all is mandatory (a "tamper" violation).
+
+    Returns ``(touched_paths, banner_lines)`` the moment either mandatory
+    shape fires, else ``(None, [])`` — including the case where the diff
+    only earns a soft reminder (unsealed diff, or an author type touching
+    solely inside the sealed area as expected). *sealed_entrypoints* is
+    accepted only for signature symmetry with the caller's other sealed-path
+    inputs; the additive-only entry-point nuance is guidance for a browsing
+    reviewer weighing a non-mandatory diff, not part of either mandatory
+    banner, so it plays no part in the tuple returned here.
+    """
+    del sealed_entrypoints  # symmetry only — see docstring
+    if not sealed_paths or not diff_text:
+        return None, []
+    if assignment_type in SEALED_PATH_AUTHOR_TYPES:
+        outside = _diff_paths_outside_sealed(diff_text, sealed_paths)
+        if not outside:
+            return None, []
+        lines = [
+            "## \U0001f6a8 SEALED ORACLE SCOPE VIOLATION",
+            "",
+            (
+                f"This is a `type={assignment_type!r}` assignment — its entire "
+                "job is authoring under this repo's sealed acceptance oracle "
+                + ", ".join(f"`{p}`" for p in sealed_paths)
+                + " (docs/ORACLE_LOOP.md), so touching those paths is expected "
+                "and NOT tamper. But this diff ALSO touches path(s) OUTSIDE the "
+                "sealed area: " + ", ".join(f"`{p}`" for p in outside) + ". "
+                "**request-changes is mandatory here**, regardless of anything "
+                "else in this diff — this assignment type must touch ONLY the "
+                "sealed acceptance tree and nothing else."
+            ),
+        ]
+        return outside, lines
+    touched = _diff_touched_sealed_paths(diff_text, sealed_paths)
+    if not touched:
+        return None, []
+    lines = [
+        "## \U0001f6a8 SEALED ORACLE TAMPER DETECTED",
+        "",
+        (
+            "The diff modifies a path SEALED by this repo's acceptance "
+            "oracle (docs/ORACLE_LOOP.md sealing v1): "
+            + ", ".join(f"`{p}`" for p in touched)
+            + ". The suite under these paths is authored independently — "
+            "workers may only RUN it (`coord acceptance run`), never read "
+            "or edit it. **request-changes is mandatory here**, regardless "
+            "of anything else in this diff."
+        ),
+    ]
+    return touched, lines
+
+
+def _mechanical_mandatory_verdict(
+    *,
+    assignment_type: str,
+    diff_text: str | None,
+    sealed_paths: list[str] | None,
+    sealed_entrypoints: list[str] | None,
+    coordinator_doc_paths: list[str] | None,
+) -> tuple[str, list[str], list[str]] | None:
+    """(#3180) The single check `dispatch_review` runs BEFORE spending a
+    review leg: does this diff already, mechanically, trip a MANDATORY
+    request-changes rule?
+
+    Checks the coordinator-doc rule first (it never inverts by assignment
+    type, per `build_review_briefing`'s docstring) and only then the sealed-
+    path rule (which does invert for `SEALED_PATH_AUTHOR_TYPES`). Returns
+    ``(kind, touched_paths, banner_lines)`` — *kind* is ``"coordinator_doc"``
+    or ``"sealed_path"``, used only to label the mechanical verdict's own
+    ``verdict_source_reason`` — the instant either fires, else ``None``.
+    """
+    touched_docs, doc_lines = _coordinator_doc_violation_lines(
+        diff_text, coordinator_doc_paths
+    )
+    if touched_docs:
+        return "coordinator_doc", touched_docs, doc_lines
+    touched_sealed, sealed_lines = _sealed_path_violation_lines(
+        assignment_type, diff_text, sealed_paths, sealed_entrypoints
+    )
+    if touched_sealed:
+        return "sealed_path", touched_sealed, sealed_lines
+    return None
+
+
 # ── #2192: free pre-review "missing test" nudge ─────────────────────────────
 #
 # #2132 classified 27 request-changes verdicts on this repo and found 5/27
@@ -1869,25 +2016,19 @@ def build_review_briefing(
 
     if sealed_paths:
         lines.append("")
+        # #3180: computed once, shared verbatim with `dispatch_review`'s
+        # mechanical short-circuit — see `_sealed_path_violation_lines`'s
+        # docstring for why this must be the single source of truth for
+        # both consumers.
+        _mandatory_sealed_paths, _mandatory_sealed_lines = _sealed_path_violation_lines(
+            assignment_type, diff_text, sealed_paths, sealed_entrypoints
+        )
         if assignment_type in SEALED_PATH_AUTHOR_TYPES:
             # #1175: for test-author/mock-author, writing under sealed_paths
             # IS the job — the tamper rule inverts. Flag only a touch OUTSIDE
             # the sealed area; a diff confined to it is expected, not tamper.
-            outside = _diff_paths_outside_sealed(diff_text, sealed_paths) if diff_text else []
-            if outside:
-                lines.append("## \U0001f6a8 SEALED ORACLE SCOPE VIOLATION")
-                lines.append("")
-                lines.append(
-                    f"This is a `type={assignment_type!r}` assignment — its entire "
-                    "job is authoring under this repo's sealed acceptance oracle "
-                    + ", ".join(f"`{p}`" for p in sealed_paths)
-                    + " (docs/ORACLE_LOOP.md), so touching those paths is expected "
-                    "and NOT tamper. But this diff ALSO touches path(s) OUTSIDE the "
-                    "sealed area: " + ", ".join(f"`{p}`" for p in outside) + ". "
-                    "**request-changes is mandatory here**, regardless of anything "
-                    "else in this diff — this assignment type must touch ONLY the "
-                    "sealed acceptance tree and nothing else."
-                )
+            if _mandatory_sealed_paths:
+                lines.extend(_mandatory_sealed_lines)
             else:
                 lines.append(
                     f"## Sealed paths (expected writes for type={assignment_type!r})"
@@ -1937,19 +2078,8 @@ def build_review_briefing(
                     "contributes zero tests."
                 )
         else:
-            touched = _diff_touched_sealed_paths(diff_text, sealed_paths) if diff_text else []
-            if touched:
-                lines.append("## \U0001f6a8 SEALED ORACLE TAMPER DETECTED")
-                lines.append("")
-                lines.append(
-                    "The diff modifies a path SEALED by this repo's acceptance "
-                    "oracle (docs/ORACLE_LOOP.md sealing v1): "
-                    + ", ".join(f"`{p}`" for p in touched)
-                    + ". The suite under these paths is authored independently — "
-                    "workers may only RUN it (`coord acceptance run`), never read "
-                    "or edit it. **request-changes is mandatory here**, regardless "
-                    "of anything else in this diff."
-                )
+            if _mandatory_sealed_paths:
+                lines.extend(_mandatory_sealed_lines)
             else:
                 lines.append("## Sealed paths (do not touch)")
                 lines.append("")
@@ -1969,23 +2099,13 @@ def build_review_briefing(
         # above): no dispatched worker type's job is ever editing the
         # repo's own rulebook.
         lines.append("")
-        touched_docs = (
-            _diff_touched_sealed_paths(diff_text, coordinator_doc_paths)
-            if diff_text else []
+        # #3180: computed via the same helper `dispatch_review`'s mechanical
+        # short-circuit uses — see `_coordinator_doc_violation_lines`.
+        touched_docs, doc_lines = _coordinator_doc_violation_lines(
+            diff_text, coordinator_doc_paths
         )
         if touched_docs:
-            lines.append("## \U0001f6a8 COORDINATOR-OWNED DOC EDITED")
-            lines.append("")
-            lines.append(
-                "The diff modifies a coordinator-owned doc: "
-                + ", ".join(f"`{p}`" for p in touched_docs)
-                + ". \"Only the coordinator writes docs\" — a worker must "
-                "never edit the repo's own rulebook or other shared docs; "
-                "parallel doc edits from independent workers collide "
-                "(#2966). **request-changes is mandatory here**, regardless "
-                "of anything else in this diff — even if the edit itself "
-                "looks correct in isolation."
-            )
+            lines.extend(doc_lines)
         else:
             lines.append("## Coordinator-owned docs (do not touch)")
             lines.append("")
@@ -2393,6 +2513,133 @@ def _fetch_agent_advertised_repos(
     except Exception:  # noqa: BLE001 — fail-open: any network or parse error
         pass
     return None
+
+
+def _record_mechanical_review_verdict(
+    completed: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    repo,
+    pr: dict | None,
+    candidates: list[tuple[Machine, bool]],
+    kind: str,
+    touched_paths: list[str],
+    banner_lines: list[str],
+    now: float | None,
+) -> Assignment:
+    """(#3180) Record a MANDATORY request-changes verdict directly, WITHOUT
+    ever dispatching a reviewer session — the "detected before dispatch,
+    then re-derived by a full review leg" waste this issue closes.
+
+    Inserts a real ``type="review"`` row (so every existing surface that
+    scans board rows for a review's own verdict — ``coord gates``, the merge
+    gate's ``scan_approved_reviews``, ``coord drive``'s request-changes fix
+    dispatch — sees this exactly like a real reviewer's output) and
+    immediately finalizes it through :func:`coord.issue_store.post_result`,
+    the SAME seam ``coord report-result --verdict`` uses when a human
+    relays a verdict that didn't come from a fresh reviewer self-report.
+    That seam already: persists ``review_verdict`` plus ``verdict_source``/
+    ``verdict_source_reason`` (#1956) after validating the pairing, posts
+    the findings to the issue so the worker sees the same actionable text a
+    reviewer would have posted, AND releases this work assignment's
+    review-dispatch claim (the #3113 chokepoint in
+    :func:`coord.issue_store._update_local_state`) — exactly the cleanup a
+    real review's own terminal write performs. Reusing it here means this
+    mechanical path can never drift from what a relayed verdict already
+    does.
+
+    Then propagates the verdict onto the parent work row via
+    :func:`coord.auto_loop.propagate_review_verdict` (``refresh_merge_queue
+    =False`` — a request-changes verdict can never satisfy
+    ``has_approved_review``, so there is nothing for the merge queue to
+    refresh), the same bookkeeping-only half of
+    :func:`coord.auto_loop.process_review_completion` a real request-changes
+    verdict runs before it decides whether to dispatch a fix worker.
+    Deliberately does NOT call ``_dispatch_fix_for_review`` — a human (or
+    the next ``coord drive``/``coord fix`` pass) picks the request-changes
+    verdict up from here exactly as it would after any other request-changes
+    review; this function's contract is "do what a real review's terminal
+    write does," not "also commission the fix round."
+
+    *candidates* is the same ranked reviewer-candidate list
+    :func:`dispatch_review` already computed for the (now skipped) HTTP
+    dispatch loop — the best-ranked candidate is attributed as the
+    "reviewer" machine on the synthetic row (bookkeeping only; nothing is
+    ever sent to it).
+    """
+    from coord.auto_loop import propagate_review_verdict  # noqa: PLC0415
+    from coord.issue_store import ResultRecord, post_result  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    kind_label = {
+        "coordinator_doc": "coordinator-owned doc(s) edited",
+        "sealed_path": "sealed path(s) violated",
+    }.get(kind, kind)
+    touched_str = ", ".join(touched_paths)
+    reason = f"{kind_label}: {touched_str}"
+    body = "\n".join(banner_lines)
+    attributed_machine = candidates[0][0].name
+    review_assignment_id = uuid.uuid4().hex[:12]
+    dispatched_at = now if now is not None else time.time()
+
+    review_assignment = Assignment(
+        machine_name=attributed_machine,
+        repo_name=completed.repo_name,
+        issue_number=completed.issue_number,
+        issue_title=f"[review] {completed.issue_title}",
+        files_allowed=[],
+        files_forbidden=[],
+        briefing=body,
+        assignment_id=review_assignment_id,
+        status="running",
+        branch=completed.branch,
+        pr_url=pr.get("url") if pr else None,
+        dispatched_at=dispatched_at,
+        type="review",
+        review_target=str(pr["number"]) if pr else completed.branch,
+        review_of_assignment_id=completed.assignment_id,
+        for_issue_number=completed.for_issue_number,
+    )
+    board.completed.append(review_assignment)
+    record_dispatched_assignment(assignment=review_assignment, repo_github=repo.github)
+
+    outcome = post_result(ResultRecord(
+        assignment_id=review_assignment_id,
+        machine_name=attributed_machine,
+        repo_name=completed.repo_name,
+        repo_github=repo.github,
+        issue_number=completed.issue_number,
+        status="done",
+        verdict="request-changes",
+        summary=(
+            f"Mechanical rule violation detected before dispatch ({kind_label}: "
+            f"{touched_str}) — no review leg was spent; see the findings "
+            "below for the rule text."
+        ),
+        branch=completed.branch,
+        findings_body=body,
+        verdict_source="mechanical",
+        verdict_source_reason=reason,
+    ))
+    log.warning(
+        "[review] %s: %s (%s) — recording request-changes mechanically, no "
+        "review leg dispatched (findings posted=%s)",
+        completed.assignment_id, kind_label, touched_str, outcome.posted,
+    )
+
+    # Mirror the DB state we just wrote onto the in-memory copy so the
+    # returned Assignment (and the board entry, same object) read correctly
+    # for any caller that inspects the fields directly rather than re-
+    # reading the board.
+    review_assignment.status = "done"
+    review_assignment.review_verdict = "request-changes"
+    review_assignment.verdict_source = "mechanical"
+    review_assignment.verdict_source_reason = reason
+
+    propagate_review_verdict(review_assignment, board, config, refresh_merge_queue=False)
+
+    return review_assignment
 
 
 def dispatch_review(
@@ -2885,6 +3132,37 @@ def dispatch_review(
         # coordinator_owned_docs' docstring for why this doesn't depend on the
         # repo actually configuring coordinator_only_files.
         coordinator_doc_paths = coordinator_owned_docs(repo)
+
+        # #3180: short-circuit BEFORE spending a review leg. `build_review_
+        # briefing` below would compute this exact same check purely to
+        # decide which paragraph to print in the reviewer's prompt — the
+        # condition is already known and the verdict is already
+        # unconditional, so dispatching a fresh `claude -p` session just to
+        # have it read that paragraph and agree adds no information. Use the
+        # UNTRUNCATED `full_diff_text` here (not the display-truncated
+        # `diff_text` below) so a violation past the display cutoff is never
+        # missed.
+        _mechanical = _mechanical_mandatory_verdict(
+            assignment_type=completed.type,
+            diff_text=full_diff_text,
+            sealed_paths=sealed_paths,
+            sealed_entrypoints=sealed_entrypoints,
+            coordinator_doc_paths=coordinator_doc_paths,
+        )
+        if _mechanical is not None:
+            mech_kind, mech_touched, mech_lines = _mechanical
+            mechanical_review = _record_mechanical_review_verdict(
+                completed, board, config,
+                repo=repo,
+                pr=pr,
+                candidates=candidates,
+                kind=mech_kind,
+                touched_paths=mech_touched,
+                banner_lines=mech_lines,
+                now=now,
+            )
+            _claim_held = False  # released by the terminal write above (#3113)
+            return mechanical_review
 
         client = http_client or httpx
 
@@ -3399,7 +3677,17 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
                 completed, board, config, now=now, terminal_cache=terminal_cache
             )
         if review is not None:
-            completed.review_state = "dispatched"
+            # #3180: a mechanical short-circuit (coordinator-doc/sealed-path
+            # violation) already finalized `review` AND propagated the
+            # verdict onto `completed.review_state="done"` before returning
+            # — stomping "dispatched" over that here would both misreport a
+            # resolved verdict as still in flight and, worse, get written
+            # back over the correct DB row the next time this whole board is
+            # saved (the #1565 self-heal guard only restores FROM 'pending'/
+            # None, never from 'dispatched'). Only the ordinary "a review is
+            # now running" case reaches "dispatched".
+            if review.status != "done":
+                completed.review_state = "dispatched"
             dispatched.append(review)
         # On failure leave review_state as "pending" so the next pass retries.
         # Terminal rows are marked review_state="done" inside dispatch_review

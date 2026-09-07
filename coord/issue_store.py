@@ -69,6 +69,7 @@ __all__ = [
     "VERDICT_SOURCE_AGENT",
     "VERDICT_SOURCE_RECOVERED",
     "VERDICT_SOURCE_OVERRIDDEN",
+    "VERDICT_SOURCE_MECHANICAL",
     "get_audit_runs_for_epic",
     "diff_audit_goals",
 ]
@@ -92,8 +93,17 @@ _VALID_VERDICTS = (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
 VERDICT_SOURCE_AGENT = "agent"
 VERDICT_SOURCE_RECOVERED = "recovered"
 VERDICT_SOURCE_OVERRIDDEN = "overridden"
+# #3180: a verdict computed mechanically, before any reviewer session was
+# ever dispatched — coordinator-owned-doc / sealed-path detection that was
+# already known and unconditional at prompt-assembly time (see
+# coord.review._mechanical_mandatory_verdict). Distinct from "overridden"
+# (a human/gate overrules a real reviewer's own verdict) and "recovered" (a
+# real reviewer session reached a verdict but never emitted the structured
+# header) — a "mechanical" verdict has no reviewer session behind it at all.
+VERDICT_SOURCE_MECHANICAL = "mechanical"
 _VALID_VERDICT_SOURCES = (
     VERDICT_SOURCE_AGENT, VERDICT_SOURCE_RECOVERED, VERDICT_SOURCE_OVERRIDDEN,
+    VERDICT_SOURCE_MECHANICAL,
 )
 
 ResultStatus = Literal["done", "blocked", "already-implemented"]
@@ -488,7 +498,7 @@ def _validate_result(record: ResultRecord) -> None:
             "the provenance of the verdict being recorded, and there is no "
             "verdict here for it to describe (#1956)."
         )
-    if record.verdict_source in ("recovered", "overridden") and not (
+    if record.verdict_source in ("recovered", "overridden", "mechanical") and not (
         record.verdict_source_reason and record.verdict_source_reason.strip()
     ):
         raise ValueError(
