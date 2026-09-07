@@ -416,6 +416,14 @@ def partition_capability_requirements(
 # sweep if a partition never got a machine at all — the existing, generic
 # mechanism, not a fan-out-specific reinvention of it.
 
+# Restricted to `[a-z0-9+_-]` — every capability name in this codebase
+# (gtk, windows, macos, browser, provider:opencode via `+`-joining, etc.)
+# fits that class. If `coordinator.yml` ever declares a capability with an
+# uppercase letter, a dot, or another character outside it,
+# `smoke_leg_capabilities()` silently returns None for that leg (misread as
+# an ordinary untagged row) rather than raising — nothing today validates
+# capability naming at config-load time, so keep new capability names
+# lowercase/`[a-z0-9+_-]` until that validation exists.
 _LEG_TAG_RE = re.compile(r"^\[smoke:([a-z0-9+_-]+)\] ")
 
 
@@ -2251,9 +2259,26 @@ def _dispatch_smoke_fanout(
     # `finalize_smoke_fanout` can find every leg again from just this row —
     # covering EVERY known partition so far, even on a partial round (some
     # partition still missing a machine). #1819: never over a terminal
-    # verdict already on the row.
+    # verdict already on the row. TEST_STATE_BLOCKED is included alongside
+    # ("passed", "skipped", "failed") — NOT just those three — because a
+    # mixed round (one partition durably unroutable via
+    # `_report_unroutable_smoke` above, a sibling partition dispatched fine)
+    # leaves `completed.test_state` freshly set to TEST_STATE_BLOCKED by that
+    # very call, a few lines up, in this same synchronous invocation. Without
+    # this exclusion the unconditional "running" stamp below would silently
+    # clobber that blocked verdict back to "running" on the very next line,
+    # AND the blocked partition is never added to `leg_manifest` (only
+    # dispatched/already-existing legs are), so the manifest this stamp
+    # writes would name only the routable partitions — `finalize_smoke_fanout`
+    # would later see every *listed* leg terminal and resolve the aggregate
+    # to e.g. "passed" with zero awareness the blocked partition ever
+    # existed (#3182 review). Leaving the row at TEST_STATE_BLOCKED instead
+    # keeps the failure loud and permanent: nothing else in this module
+    # revisits a `blocked` parent row to relax it back to "running" or
+    # "passed" — only an explicit `coord diagnose --stage test --reset`
+    # clears it, same as the single-leg unroutable case.
     if leg_manifest and completed.assignment_id is not None and completed.test_state not in (
-        "passed", "skipped", "failed",
+        "passed", "skipped", "failed", TEST_STATE_BLOCKED,
     ):
         from coord.state import record_test_verdict  # noqa: PLC0415
 

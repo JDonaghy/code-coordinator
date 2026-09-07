@@ -3946,18 +3946,33 @@ def build_app(
             })
 
         elif action == "dispatch_smoke":
-            from coord.smoke import dispatch_smoke
+            # #3182 review: `dispatch_smoke()` is a compat wrapper that
+            # returns only the FIRST leg of a capability fan-out — every
+            # other call site that needs the full list
+            # (`dispatch_pending_smoke`, the notify/reconcile fold-in paths)
+            # was switched to `_dispatch_smoke_legs`; this manual-trigger
+            # surface was the one still under-reporting a multi-partition
+            # dispatch. Board state itself was always correct either way
+            # (both legs land on `board.active`) — only the JSON echoed back
+            # to the operator was missing the second+ leg.
+            from coord.smoke import _dispatch_smoke_legs
 
             try:
-                result = dispatch_smoke(assignment, board, config)
+                legs = _dispatch_smoke_legs(assignment, board, config)
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-            if result:
+            if legs:
                 _write_board(board)
                 return JSONResponse({
                     "ok": True,
-                    "machine_name": result.machine_name,
-                    "assignment_id": result.assignment_id,
+                    # Back-compat: the first leg's fields at the top level,
+                    # same shape as before for a single-leg (the common) case.
+                    "machine_name": legs[0].machine_name,
+                    "assignment_id": legs[0].assignment_id,
+                    "legs": [
+                        {"machine_name": leg.machine_name, "assignment_id": leg.assignment_id}
+                        for leg in legs
+                    ],
                 })
             return JSONResponse({
                 "ok": False,

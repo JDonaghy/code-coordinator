@@ -1258,7 +1258,7 @@ class TestPipelineAction:
         client = _client()
         with (
             patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
-            patch("coord.smoke.dispatch_smoke", return_value=smoke_assignment),
+            patch("coord.smoke._dispatch_smoke_legs", return_value=[smoke_assignment]),
             patch("coord.dashboard.server.write_board"),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -1270,12 +1270,53 @@ class TestPipelineAction:
         assert data["ok"] is True
         assert data["machine_name"] == "gpu-box"
         assert data["assignment_id"] == "smk00001"
+        assert data["legs"] == [{"machine_name": "gpu-box", "assignment_id": "smk00001"}]
+
+    def test_dispatch_smoke_fanout_reports_every_leg(self) -> None:
+        """#3182 review: the manual "Dispatch Smoke" button used to call the
+        compat-wrapping `dispatch_smoke()`, which only ever returns the FIRST
+        leg of a capability fan-out — silently under-reporting a second leg
+        to the operator even though both legs were correctly dispatched onto
+        the board. Switched to `_dispatch_smoke_legs` so the JSON response
+        names every leg."""
+        leg_a = Assignment(
+            machine_name="dell64", repo_name="api", issue_number=42,
+            issue_title="[smoke:gtk+windows] Fix auth", assignment_id="smk-a",
+            status="running", type="smoke",
+        )
+        leg_b = Assignment(
+            machine_name="macmini", repo_name="api", issue_number=42,
+            issue_title="[smoke:macos] Fix auth", assignment_id="smk-b",
+            status="running", type="smoke",
+        )
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
+            patch("coord.smoke._dispatch_smoke_legs", return_value=[leg_a, leg_b]),
+            patch("coord.dashboard.server.write_board"),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_smoke",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        # Back-compat top-level fields still name the first leg...
+        assert data["machine_name"] == "dell64"
+        assert data["assignment_id"] == "smk-a"
+        # ...but `legs` names BOTH, so the operator isn't left thinking only
+        # one machine picked up the work.
+        assert data["legs"] == [
+            {"machine_name": "dell64", "assignment_id": "smk-a"},
+            {"machine_name": "macmini", "assignment_id": "smk-b"},
+        ]
 
     def test_dispatch_smoke_none_returns_error(self) -> None:
         client = _client()
         with (
             patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
-            patch("coord.smoke.dispatch_smoke", return_value=None),
+            patch("coord.smoke._dispatch_smoke_legs", return_value=[]),
         ):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",

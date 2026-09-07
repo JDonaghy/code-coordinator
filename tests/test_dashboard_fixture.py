@@ -678,7 +678,7 @@ def _no_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("coord.review.dispatch_review", _boom)
     monkeypatch.setattr("coord.review.dispatch_headless_fix", _boom)
-    monkeypatch.setattr("coord.smoke.dispatch_smoke", _boom)
+    monkeypatch.setattr("coord.smoke._dispatch_smoke_legs", _boom)
     monkeypatch.setattr("coord.merge_queue.enqueue", _boom)
     monkeypatch.setattr("coord.merge_queue.process", _boom)
     monkeypatch.setattr("coord.state.record_test_verdict", _boom)
