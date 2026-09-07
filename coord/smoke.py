@@ -241,7 +241,7 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
 # not a routing puzzle). It does not, by itself, dispatch more than one Test
 # leg — `dispatch_smoke` still dispatches exactly one leg, sized to the first
 # partition, and only *diagnoses* the multi-partition case (see its call site)
-# so the failure names the real cause ("this needs N machines together") set
+# so the failure names the real cause ("this needs N machines together")
 # instead of the misleading "no machine declares capability X" a flat union
 # produces. Actually fanning out into N concurrent smoke legs — and ANDing
 # their verdicts into the parent's `test_state` — is real follow-up work: the
