@@ -2690,3 +2690,185 @@ class TestDriveQueueTitles:
         ]["application/json"]["schema"]
         errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
         assert errors == [], errors
+
+
+class TestPipelineLegsAPI:
+    """`GET /api/pipeline/{repo}/{issue}/legs` — one row per dispatched
+    assignment leg, the per-leg machine/timing data #100's stage-flow view
+    needs and `GET /api/pipeline`'s one-row-per-work-item shape cannot carry
+    (#3184)."""
+
+    def test_unknown_repo_returns_clean_404(self) -> None:
+        client = _client()
+        r = client.get("/api/pipeline/nonexistent/42/legs")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_non_integer_issue_returns_clean_404(self) -> None:
+        client = _client()
+        r = client.get("/api/pipeline/api/not-a-number/legs")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_issue_with_no_board_rows_is_200_with_empty_legs_not_a_404(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/pipeline/api/42/legs")
+
+        assert r.status_code == 200
+        assert r.json() == {"repo_name": "api", "issue_number": 42, "legs": []}
+
+    def test_legs_are_newest_dispatch_first_and_carry_machine_and_timing(
+        self,
+    ) -> None:
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api", issue_number=42,
+                    issue_title="t", assignment_id="w1", type="work",
+                    status="done", dispatched_at=100.0, finished_at=150.0,
+                ),
+                Assignment(
+                    machine_name="reviewer-box", repo_name="api", issue_number=42,
+                    issue_title="t", assignment_id="r1", type="review",
+                    status="done", dispatched_at=160.0, finished_at=180.0,
+                    review_of_assignment_id="w1",
+                ),
+            ],
+            active=[
+                # In-flight: dispatched, no finished_at yet — must still be a
+                # row (never omitted), so the client can run an elapsed timer.
+                Assignment(
+                    machine_name="smoke-box", repo_name="api", issue_number=42,
+                    issue_title="t", assignment_id="s1", type="smoke",
+                    status="running", dispatched_at=200.0,
+                ),
+            ],
+        )
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/pipeline/api/42/legs")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["repo_name"] == "api"
+        assert body["issue_number"] == 42
+        # Newest-dispatch-first — the client must never have to sort.
+        assert [leg["assignment_id"] for leg in body["legs"]] == ["s1", "r1", "w1"]
+
+        in_flight = body["legs"][0]
+        assert in_flight["stage"] == "smoke"
+        assert in_flight["status"] == "running"
+        assert in_flight["machine_name"] == "smoke-box"
+        assert in_flight["dispatched_at"] == 200.0
+        assert in_flight["finished_at"] is None
+
+        review_leg = body["legs"][1]
+        assert review_leg["stage"] == "review"
+        assert review_leg["machine_name"] == "reviewer-box"
+        assert review_leg["finished_at"] == 180.0
+
+        work_leg = body["legs"][2]
+        assert work_leg["stage"] == "work"
+        assert work_leg["machine_name"] == "laptop"
+        assert work_leg["dispatched_at"] == 100.0
+        assert work_leg["finished_at"] == 150.0
+
+    def test_row_selection_matches_coord_gates_assignments_for_issue(self) -> None:
+        """Built directly on `coord.gates.assignments_for_issue` — same rows,
+        same (raw-or-effective) issue matching, so this endpoint and `coord
+        gates <repo> <issue>` can never disagree about what belongs here.
+        Includes a #1553 oracle-loop slice row booked to a different
+        (tracking) issue but FOR this one."""
+        from coord.gates import assignments_for_issue
+
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api", issue_number=42,
+                    issue_title="t", assignment_id="w1", type="work",
+                    status="done", dispatched_at=1.0,
+                ),
+                Assignment(
+                    machine_name="precision", repo_name="api", issue_number=1537,
+                    issue_title="[test-author] slice", assignment_id="ta1",
+                    type="test-author", status="done", for_issue_number=42,
+                    dispatched_at=2.0,
+                ),
+                Assignment(
+                    machine_name="laptop", repo_name="api", issue_number=99,
+                    issue_title="unrelated", assignment_id="other",
+                    type="work", status="done", dispatched_at=3.0,
+                ),
+            ]
+        )
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/pipeline/api/42/legs")
+
+        served_ids = {leg["assignment_id"] for leg in r.json()["legs"]}
+        expected_ids = {
+            a.assignment_id for a in assignments_for_issue(board, "api", 42)
+        }
+        assert served_ids == expected_ids == {"w1", "ta1"}
+
+    def test_response_matches_its_openapi_schema(self) -> None:
+        board = Board(
+            active=[
+                Assignment(
+                    machine_name="laptop", repo_name="api", issue_number=42,
+                    issue_title="t", assignment_id="w1", type="work",
+                    status="running", dispatched_at=1.0,
+                ),
+            ]
+        )
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/pipeline/api/42/legs")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/pipeline/{repo}/{issue}/legs"]["get"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_fixture_mode_serves_the_same_route_from_seeded_board(self) -> None:
+        """#3184: coord-web's e2e boots a real `coord web --fixture`, so a
+        route that only works against a live board is untestable there."""
+        from coord.dashboard.fixture import parse_fixture
+
+        fixture = parse_fixture({
+            "config": {
+                "repos": [{"name": "api", "github": "acme/api"}],
+                "machines": [{
+                    "name": "laptop", "host": "laptop.tailnet", "repos": ["api"],
+                    "repo_paths": {"api": "/tmp/api"},
+                }],
+            },
+            "board": {
+                "assignments": [
+                    {
+                        "machine_name": "laptop", "repo_name": "api",
+                        "issue_number": 42, "issue_title": "t",
+                        "assignment_id": "w1", "type": "work", "status": "done",
+                        "dispatched_at": 100.0, "finished_at": 150.0,
+                    },
+                    {
+                        "machine_name": "smoke-box", "repo_name": "api",
+                        "issue_number": 42, "issue_title": "t",
+                        "assignment_id": "s1", "type": "smoke",
+                        "status": "running", "dispatched_at": 200.0,
+                    },
+                ],
+                "round_number": 1,
+            },
+        })
+        client = TestClient(build_app(fixture.config(None), fixture=fixture))
+        r = client.get("/api/pipeline/api/42/legs")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert [leg["assignment_id"] for leg in body["legs"]] == ["s1", "w1"]
+        assert body["legs"][0]["finished_at"] is None

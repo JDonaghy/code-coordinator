@@ -320,6 +320,12 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     ("MilestoneGateColumnsWire", "review_verdict"): (
         "'approve' | 'request-changes' | null"
     ),
+    # #3184 — GET /api/pipeline/{repo}/{issue}/legs. `stage` is the
+    # assignment's own `type` (coord/dashboard/server.py PipelineLegWire
+    # docstring), same value set as `Assignment.type` above; `status` is the
+    # raw `Assignment.status`, unmodified.
+    ("PipelineLegWire", "stage"): "AssignmentType",
+    ("PipelineLegWire", "status"): "AssignmentStatus | null",
 }
 
 # Hand-authored wire-contract enums — see module docstring for why these are
