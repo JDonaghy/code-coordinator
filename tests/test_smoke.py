@@ -2069,6 +2069,80 @@ def test_dispatch_smoke_unroutable_partition_fails_loudly_at_dispatch(
     assert "quadraui/src/macos/" in reason
 
 
+def test_dispatch_smoke_fanout_mixed_round_keeps_blocked_partition_visible(
+    repo: Repo,
+) -> None:
+    """#3182 review (blocking finding): a mixed fan-out round — one partition
+    dispatches fine (gtk, to desktop-a), a sibling partition (browser) is
+    durably unroutable because its only capable candidate's own `/health`
+    probe contradicts its declared capability (#1570 D — `node` missing) —
+    must leave the parent's aggregate at ``TEST_STATE_BLOCKED``, naming
+    browser, and must NOT silently re-stamp it "running" once the routable
+    leg's manifest entry is folded in. Before the fix, the unconditional
+    "running" stamp at the end of `_dispatch_smoke_fanout` clobbered the
+    blocked verdict `_report_unroutable_smoke` had just written on the very
+    same row, in the same call — and the blocked partition, never added to
+    `leg_manifest`, would vanish from the manifest `finalize_smoke_fanout`
+    later folds, letting the aggregate resolve to "passed" once the
+    desktop-a leg passed, with the browser partition never having been
+    tested at all."""
+    from coord.smoke import TEST_STATE_BLOCKED, _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("desktop-a", "desktop-a.tail", caps=["gtk"], path="/d/api"),
+            _machine("ci-box", "ci-box.tail", caps=["browser"], path="/c/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["src/e2e/"], requires=["browser"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    diff = ["src/gtk/a.c", "src/e2e/b.spec.ts"]
+    board = Board()
+    client = _MultiHostClient(
+        health={
+            # ci-box declares "browser" in coordinator.yml, but its own probe
+            # says `node` is missing — the #1570 D durable refusal (a
+            # registered CAPABILITY_PREREQS tool), not a transient
+            # connectivity failure.
+            "ci-box.tail": {
+                "tool_versions": {
+                    "node": {
+                        "found": False, "version": None, "min_version": None,
+                        "meets_floor": None, "capability": "browser", "ok": False,
+                    },
+                },
+            },
+        },
+        assign={"desktop-a.tail": {"id": "desktop-a-leg"}},
+    )
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    # The routable partition still dispatches — a durably-unroutable sibling
+    # must not hold back a partition that CAN run.
+    assert len(legs) == 1
+    assert legs[0].machine_name == "desktop-a"
+    assert board.active == legs
+
+    # The parent's aggregate must stay BLOCKED, naming browser — never
+    # silently re-stamped "running" (which would erase the blocked verdict
+    # and let a later `finalize_smoke_fanout` resolve the aggregate to
+    # "passed" once the desktop-a leg lands, with browser never having been
+    # tested).
+    assert completed.test_state == TEST_STATE_BLOCKED
+    reason = completed.test_reason or ""
+    assert "browser" in reason
+    assert "[[smoke-fanout:" not in reason  # no manifest written over it
+
+
 def test_dispatch_smoke_transient_post_failure_leaves_the_row_redispatchable(
     three_gtk_config: Config,
 ) -> None:
