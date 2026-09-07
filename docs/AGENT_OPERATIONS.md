@@ -1311,6 +1311,10 @@ automatically after every worktree clean — and never touches a per-checkout
 
 ## Daemon-host unit inventory — what dellserver runs
 
+> **If the daemon host is gone rather than misconfigured, you want
+> [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md), not this table.** This section says what a
+> healthy host runs; that one says what to do in the next hour when there is no host.
+
 **If the daemon host is lost, this is the list you rebuild from.** Which units
 a host runs is not derivable from the wheel: `deploy/` ships *all* of them and
 `coord release verify` deliberately refuses to infer intent from that

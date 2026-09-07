@@ -1,6 +1,6 @@
 # Mac mini — hardware sizing + provisioning runbook
 
-> **Status:** decision + runbook (2026-07-25). Sizing analysis for adding a Mac mini (M4) to the
+> **Status:** decision + runbook (2026-07-25); **provisioned and verified 2026-09-06**. Sizing analysis for adding a Mac mini (M4) to the
 > fleet as the macOS build/test/attended-session machine. The *port* itself is scoped in
 > [`CROSS_PLATFORM.md`](CROSS_PLATFORM.md) (milestone #39 / epic #1160) — this doc is only about the
 > **hardware**: what to buy, why not to rent, and how to provision it once it lands.
@@ -87,6 +87,11 @@ Two reasons the purchase wins regardless of the exact rate:
 
 ## Provisioning runbook
 
+**`scripts/setup-macmini.sh` does steps 1–8 of this, idempotently.** Copy it to the mac and run it
+there in an interactive session (`--with-sudo` for Remote Login + no-sleep, `--with-launchd` to
+write the agent plist, `--skip-clones` to make the run ssh-safe). Read this section anyway: the
+script automates the steps, not the judgement about what the box should be allowed to do.
+
 Order matters loosely; the coord agent goes last.
 
 1. **macOS setup**
@@ -126,12 +131,19 @@ Order matters loosely; the coord agent goes last.
    systemd (also #1158 / CP-3) — so `install-agent.sh` and `deploy/coord-agent.service`, which are
    the Linux fleet's source of truth for the agent's PATH (#1671), **do not apply here**. There is
    no checked-in launchd plist yet; writing one, with the PATH entry from step 5, is part of #1158 /
-   CP-3. Until then this box's PATH is hand-rolled and will fail *silently* if it's wrong — the
-   agent starts, `/health` answers, capabilities read "not found", and smoke dispatch quietly
-   refuses to route.
-9. **Register in `coordinator.yml`** with `concurrency: 1` and an `os:macos` capability, then route
-   the macOS suites to it via `smoke_tests.capability_rules` (#1159 / CP-4 adds the `os:*`
-   capability convention and the CI matrix).
+   CP-3. **`scripts/setup-macmini.sh` generates an interim one** (`--with-launchd`) with that PATH
+   entry already filled in — it is not the CP-3 deliverable, just a working stopgap. A wrong PATH
+   here fails *silently*: the agent starts, `/health` answers, capabilities read "not found", and
+   smoke dispatch quietly refuses to route.
+9. **Register in `coordinator.yml`** with `coord machine add` — `--max-workers 1`, and an
+   `os:macos` capability once #1159 / CP-4 adds the `os:*` convention and the CI matrix (there is
+   no such capability rule today, so adding it now routes nothing).
+
+   > **`concurrency: 1` is not a key.** Earlier revisions of this step said so, and it does
+   > nothing: `_parse_machines` (`coord/config.py`) reads named keys and never rejects unknown
+   > ones, so the line is silently dropped and the box inherits the fleet-wide
+   > `concurrency.max_workers` — 8 on this fleet, i.e. the exact two-concurrent-Rust-builds
+   > swap scenario the sizing section above argues against. The field is **`max_workers`**.
 
 ## What non-macOS work to route there
 
@@ -187,13 +199,102 @@ locally *before* being added to the config. Start narrow:
 
 ```yaml
 - name: macmini
-  capabilities: [rust, python]            # NOT gtk
-  repos: [claude-coordinator, quadraui]   # hold vimcode until GTK4-on-mac is deliberate
+  host: macmini.tailf46ef8.ts.net         # the MagicDNS FQDN, not the short name
+  capabilities: [python, rust]            # NOT gtk, NOT browser
+  repos: [claude-coordinator, coord-tui]  # hold vimcode until GTK4-on-mac is deliberate
+  max_workers: 1
+  repo_paths:
+    claude-coordinator: ~/src/code-coordinator   # name != directory, on purpose (#2104)
+    coord-tui: ~/src/coord-tui
 ```
+
+**`coord-tui`, not `quadraui`, is the right first Rust repo** — this changed after the paragraph
+above was written. quadraui's `test_command` now ends in a
+`cargo clippy --target x86_64-pc-windows-msvc` leg, and dell64 is the only machine with that
+toolchain, so a quadraui dispatch here fails in the Test stage regardless of how good the mac is
+at Rust. coord-tui has pinned quadraui by git rev since #1973, so it needs no sibling checkout and
+no symlink. `browser` is held back for a separate reason: node and npm resolve fine, but
+`playwright-browsers` is not installed, so the capability would probe unmet.
 
 Then verify by hand (`pytest`; `cargo test` in `tui/`) and widen from there. Note the one real
 setup gap: **`coord agent` under launchd is CP-3 (#1158) and unbuilt** — until it lands, run the
 agent in a foreground/tmux session or hand-write a plist.
+
+## Provisioning traps found in practice (2026-09-06)
+
+The runbook above is sound; these are the things it did not say, each of which cost time on the
+first real provisioning run. **`scripts/setup-macmini.sh` automates steps 1–8 of the runbook and
+already handles every trap in this list** — it exists so the second mac does not rediscover them.
+
+**1. The state root is NOT `~/.coord` on macOS.** `coord/platform_paths.py` resolves through
+`platformdirs` for `sys.platform in ("win32", "darwin")`, so the mac reads
+`~/Library/Application Support/coord/coordinator.yml`. Symlinking the Linux path instead is the
+single most expensive mistake available here, because it does not error — the agent starts,
+`/health` answers 200, and it publishes `capabilities: []` with a `config_free` notice buried in
+the payload. Every config-vs-`/health` cross-check then reads as absence rather than truth. Put
+the symlink in the native directory and make `~/.coord` a symlink *to* that directory, so the
+fleet's runbook paths keep resolving and there is exactly one state dir rather than two that
+drift. (`$COORD_DIR` also overrides on every platform, checked before the `sys.platform` branch —
+but setting it only in the agent's plist gives the agent and the interactive CLI different roots,
+which is worse than either choice made consistently.)
+
+**2. The login keychain is unreachable from a non-interactive ssh session.** `gh` stores its token
+there, and `gh repo clone` leaves an https remote whose credential helper needs it too. Over ssh
+you get `gh auth status` failing on a perfectly authenticated gh, and
+`git pull` dying with `failed to get: -25308` / `could not read Username for 'https://github.com'`.
+Nothing is wrong with the box — run those steps in an interactive session on the mac, or fetch
+via an SSH URL with a forwarded agent (`ssh -A`). This is why the setup script only *requires* gh
+when it is actually cloning.
+
+**3. `runtime.coord_on_worker_path_missing` is a false CRIT on macOS.** `coord machine doctor
+--ssh` reports that a worker cannot resolve `coord`. It can. The probe delegates to
+`worker_coord_reachable(base_env=None)`, which resolves against *that process's* `os.environ` —
+over ssh, the session PATH. On Debian/Ubuntu the default `.profile` puts `~/.local/bin` there, so
+the Linux fleet passes; macOS's non-interactive ssh PATH is `/usr/bin:/bin:/usr/sbin:/sbin` and
+the shim is invisible. Confirm by hand before chasing it:
+
+```bash
+ssh macmini 'AGENT_PATH="$HOME/.coord-venv/bin:$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+"$HOME/.coord-venv/bin/python3" - "$AGENT_PATH" <<"PY"
+import sys, os
+from coord.agent import worker_coord_reachable
+print(worker_coord_reachable({**os.environ, "PATH": sys.argv[1]}))
+PY'
+```
+
+On the first mac that printed `(True, "... 'coord' resolves at ~/.local/bin/coord ...")` while the
+doctor CRIT stood — the shim was fine all along.
+
+**4. launchd has no `StartLimitBurst`.** The plist mirrors the Linux unit's `Restart=always` with
+`KeepAlive`, but `ThrottleInterval` only rate-limits the respawn (one per 10s) — there is no
+equivalent of systemd's give-up-and-land-in-`failed`. A genuinely broken agent retries forever and
+looks alive in `launchctl list`. Read the `last exit code` line from
+`launchctl print gui/$(id -u)/com.jdonaghy.coord-agent`, not the process's existence.
+
+**5. `launchctl bootstrap gui/$(id -u)` works over ssh** when the user is logged in at the console
+— which is the arrangement you want anyway, since LaunchAgents start at **login, not boot**.
+Without auto-login the agent does not come back after a reboot, and nothing distinguishes that
+from the machine being switched off. `loginctl enable-linger` has no macOS equivalent; the linger
+probe correctly reports UNKNOWN rather than a defect.
+
+**6. Remote Login is off by default and `systemsetup -setremotelogin on` needs Full Disk Access**
+for the calling terminal, so it fails silently from a plain shell. Enable it in
+System Settings → General → Sharing. Until it is on, `coord machine doctor --ssh`, remote session
+inspection (`coord/interactive.py`), and every recovery path have no channel to the box —
+note that `coord release propagate` does *not* use ssh (it is an HTTP `POST /update` to the
+agent), so ssh is precisely the channel you need when propagation is what stranded the agent.
+
+**7. Two identity CRITs are real, and both need an interactive session on the mac.**
+`identity.git_push_missing` (no `ssh -T git@github.com` key — every worker commits, then fails to
+push, destroying the session's work) and `identity.claude_oauth_missing` (no
+`~/.claude/.credentials.json`, so `claude -p` cannot start and the machine fails every dispatch it
+accepts). Neither is visible from `/health`. Clear both before routing work.
+
+**8. Cosmetic, but it will make you look twice:** `hostname -s` is `Johns-Mac-mini`, not the
+machine name — always pass `--machine` explicitly rather than relying on the Linux installer's
+hostname default. And the tailnet peer's `HostName` is the literal "John's Mac mini" with a curly
+apostrophe, so `coord machine add`'s short-name tailnet lookup misses and reports
+`host_resolution_unknown` (`?`, not `✓`). The FQDN is correct; it writes anyway.
 
 ## Ongoing hygiene
 
@@ -213,4 +314,6 @@ agent in a foreground/tmux session or hand-write a plist.
   #1159 CI matrix + `os:*` capability rules).
 - [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md) — agent install, the PyPI-not-editable invariant,
   service restart, `did not come back` triage.
+- [`../scripts/setup-macmini.sh`](../scripts/setup-macmini.sh) — the provisioning script for steps
+  1–8, with every trap from the section above already handled.
 - [`OPERATING_GOTCHAS.md`](OPERATING_GOTCHAS.md) — fleet traps that each cost a real dispatch.
