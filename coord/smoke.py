@@ -199,6 +199,17 @@ A `baseline-red` verdict has no `coord test` flag — print the marker only.
 # ── Rule matching ───────────────────────────────────────────────────────────
 
 
+def _rule_matches(touched_files: list[str], rule: SmokeRule) -> bool:
+    """Does any touched path start with any of `rule.files`'s prefixes?
+
+    The one "does this rule apply" test, shared by `match_rules` and
+    `partition_capability_requirements` so the two matchers can't silently
+    drift apart (e.g. one growing a case-insensitive or glob match the other
+    doesn't) — see the #3177 review note this was factored out to satisfy.
+    """
+    return any(path.startswith(pattern) for path in touched_files for pattern in rule.files)
+
+
 def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
     """Return the union of `requires` for any rule that any touched file hits.
 
@@ -216,12 +227,11 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
     query that doesn't make that assumption.
     """
     seen: dict[str, None] = {}
-    for path in touched_files:
-        for rule in rules:
-            if not any(path.startswith(pattern) for pattern in rule.files):
-                continue
-            for cap in rule.requires:
-                seen.setdefault(cap, None)
+    for rule in rules:
+        if not _rule_matches(touched_files, rule):
+            continue
+        for cap in rule.requires:
+            seen.setdefault(cap, None)
     return list(seen.keys())
 
 
@@ -324,9 +334,7 @@ def partition_capability_requirements(
     for i, rule in enumerate(rules):
         if not rule.requires:
             continue
-        if not any(
-            path.startswith(pattern) for path in touched_files for pattern in rule.files
-        ):
+        if not _rule_matches(touched_files, rule):
             continue
         key = frozenset(rule.requires)
         if key not in seen:
@@ -1556,33 +1564,46 @@ def dispatch_smoke(
         # apart costs nothing extra: this reuses the exact same
         # `_capability_matched_machines` check every candidate above already
         # went through.
+        # This diagnosis is a nice-to-have on top of the report below, not a
+        # precondition for it — `_report_unroutable_smoke` is documented
+        # "never raises: a board-write failure must not take the caller
+        # down", so a malformed `capability_rules` entry here must not raise
+        # before that guarantee is reached either. Fall back to no hint.
         partition_hint: str | None = None
         if required_caps and not attempts and not paused_capable:
-            def _capable_for(caps: list[str]) -> bool:
-                return bool(_capability_matched_machines(
-                    caps, completed.repo_name, config
-                ))
+            try:
+                def _capable_for(caps: list[str]) -> bool:
+                    return bool(_capability_matched_machines(
+                        caps, completed.repo_name, config
+                    ))
 
-            partitions, unroutable = partition_capability_requirements(
-                touched, smoke_cfg.capability_rules, _capable_for
-            )
-            if not unroutable and len(partitions) > 1:
-                per_partition = "; ".join(
-                    f"[{', '.join(p.capabilities)}] -> "
-                    + ", ".join(
-                        sorted(
-                            m.name
-                            for m in _capability_matched_machines(
-                                list(p.capabilities), completed.repo_name, config
+                partitions, unroutable = partition_capability_requirements(
+                    touched, smoke_cfg.capability_rules, _capable_for
+                )
+                if not unroutable and len(partitions) > 1:
+                    per_partition = "; ".join(
+                        f"[{', '.join(p.capabilities)}] -> "
+                        + ", ".join(
+                            sorted(
+                                m.name
+                                for m in _capability_matched_machines(
+                                    list(p.capabilities), completed.repo_name, config
+                                )
                             )
                         )
+                        for p in partitions
                     )
-                    for p in partitions
+                    partition_hint = (
+                        f"Split into {len(partitions)} machine-satisfiable "
+                        f"partitions: {per_partition}."
+                    )
+            except Exception:
+                logger.exception(
+                    "dispatch_smoke: partition_capability_requirements diagnosis "
+                    "failed for %s#%s — falling back to the flat-union reason.",
+                    completed.repo_name, completed.issue_number,
                 )
-                partition_hint = (
-                    f"Split into {len(partitions)} machine-satisfiable "
-                    f"partitions: {per_partition}."
-                )
+                partition_hint = None
         _report_unroutable_smoke(
             completed, required_caps, attempts,
             paused_capable=paused_capable, partition_hint=partition_hint,
