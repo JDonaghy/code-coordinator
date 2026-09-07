@@ -673,7 +673,13 @@ if agent_path:
 
 ok = False
 version = ""
+worker_path = ""
 if base_env is not None:
+    # #3176: computed regardless of `ok`, so a False verdict ships the exact
+    # PATH it searched rather than a bare boolean nobody can interrogate
+    # after the fact — the whole reason the #3170 theory took hand-rolling a
+    # reproduction script on the box to even investigate.
+    worker_path = _worker_subprocess_env(base_env).get("PATH", "")
     ok, _msg = worker_coord_reachable(base_env)
     if ok:
         env = _worker_subprocess_env(base_env)
@@ -685,6 +691,7 @@ if base_env is not None:
         except Exception:
             version = ""
 print("AGENT_PATH_FOUND=" + ("1" if base_env is not None else "0"))
+print("WORKER_PATH=" + worker_path)
 print("COORD_ON_WORKER_PATH_OK=" + ("1" if ok else "0"))
 print("VERSION=" + version.replace("\\n", " "))
 """
@@ -738,6 +745,15 @@ def probe_coord_on_worker_path(
     guessing off the ssh session's PATH is exactly the bug above. ``found=False``
     — the actual defect this check exists to catch — is the one outcome that
     must never collapse into UNKNOWN.
+
+    **#3176: a bare ``found=False`` named no evidence.** Confirming (or
+    refuting) the CRIT it produces meant hand-rolling this exact probe again
+    by hand over ssh — which is how #3176 itself got investigated, and
+    exactly the kind of unconfirmed verdict #2096 exists to catch. ``error``
+    now also carries the post-strip worker PATH that ``worker_coord_reachable``
+    actually searched when ``found=False`` (``"searched PATH: ..."``) — an
+    observation taken from the same probe run that produced the verdict, not
+    a re-guess after the fact.
     """
     import subprocess  # noqa: PLC0415
 
@@ -776,7 +792,17 @@ def probe_coord_on_worker_path(
                 version = line[len("VERSION="):].strip() or None
         return True, None, version
     if "COORD_ON_WORKER_PATH_OK=0" in text:
-        return False, None, None
+        # #3176: a bare False told nobody what PATH was actually searched, so
+        # confirming (or refuting) a CRIT meant hand-rolling this exact probe
+        # over ssh a second time. WORKER_PATH is the post-strip PATH
+        # worker_coord_reachable() searched, straight off the same run that
+        # produced the verdict — an observation, not a re-guess.
+        worker_path = None
+        for line in text.splitlines():
+            if line.startswith("WORKER_PATH="):
+                worker_path = line[len("WORKER_PATH="):].strip() or None
+        detail = f"searched PATH: {worker_path!r}" if worker_path else None
+        return False, detail, None
     return None, "worker-PATH probe produced no parseable output", None
 
 
@@ -2002,6 +2028,11 @@ def evaluate_runtime(facts: MachineFacts) -> list[Finding]:
                     "cannot run `coord test` to record a verdict. This is exactly "
                     "the #2937 gap: every other layer here, and `/health` itself, "
                     "only ever sees the AGENT's own PATH"
+                    + (
+                        f" ({facts.coord_on_worker_path_error})"
+                        if facts.coord_on_worker_path_error
+                        else ""
+                    )
                 ),
                 subject=facts.name,
                 fix=(

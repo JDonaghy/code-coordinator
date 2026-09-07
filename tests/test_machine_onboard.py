@@ -438,6 +438,38 @@ def test_probe_coord_on_worker_path_delegates_to_the_canonical_agent_function():
     assert ".local/bin" not in script
 
 
+def test_probe_coord_on_worker_path_reports_the_searched_path_on_absence():
+    """#3176: a bare `found=False` named no evidence — confirming (or
+    refuting) it meant hand-rolling this exact probe again by hand over ssh,
+    which is how #3176 itself got investigated. The post-strip WORKER_PATH
+    the remote script actually searched must ride along in `error` even on
+    the boolean-False branch, not just the UNKNOWN/SSH-trouble ones."""
+    with patch("subprocess.run", return_value=_ssh_result(
+        "AGENT_PATH_FOUND=1\n"
+        "WORKER_PATH=/home/john/.cargo/bin:/home/john/.local/bin:/usr/bin:/bin\n"
+        "COORD_ON_WORKER_PATH_OK=0\n"
+        "VERSION=\n"
+    )):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is False
+    assert error == (
+        "searched PATH: '/home/john/.cargo/bin:/home/john/.local/bin:/usr/bin:/bin'"
+    )
+    assert version is None
+
+
+def test_probe_coord_on_worker_path_absence_without_a_reported_path_stays_none():
+    """An older probe script (or a stripped WORKER_PATH= line) must not turn
+    into a fabricated diagnostic — no evidence means no evidence, exactly
+    like the pre-#3176 behaviour this replaces."""
+    with patch("subprocess.run",
+               return_value=_ssh_result("AGENT_PATH_FOUND=1\nCOORD_ON_WORKER_PATH_OK=0\n")):
+        found, error, version = machine_onboard.probe_coord_on_worker_path("host")
+    assert found is False
+    assert error is None
+    assert version is None
+
+
 def test_probe_coord_on_worker_path_fails_soft_when_the_pinned_interpreter_is_gone():
     """If `~/.coord-venv/bin/python3` itself doesn't resolve on the remote
     shell (e.g. the venv was never installed), the remote shell reports a
@@ -635,6 +667,25 @@ def test_coord_absent_from_worker_path_crits():
     assert finding.severity == CRIT
     assert "worker" in finding.summary.lower()
     assert "~/.coord-venv" in finding.fix
+
+
+def test_coord_absent_from_worker_path_crit_names_the_searched_path():
+    """#3176: the CRIT must show its work — the exact PATH the probe
+    searched — so a false positive is falsifiable by reading the doctor's
+    own output, instead of requiring a hand-rolled reproduction on the box."""
+    facts = MachineFacts(
+        name="macmini", configured=True, host="macmini.tail1234.ts.net",
+        declared_capabilities=["python"], declared_repos=["api"],
+        repo_paths={"api": "~/src/api"}, known_repos=["api"],
+        coord_on_worker_path=False,
+        coord_on_worker_path_error=(
+            "searched PATH: '/Users/john/.cargo/bin:/Users/john/.local/bin:"
+            "/usr/bin:/bin'"
+        ),
+    )
+    finding = _by_check(machine_onboard.evaluate(facts), "runtime.coord_on_worker_path_missing")
+    assert finding.severity == CRIT
+    assert "/Users/john/.local/bin" in finding.summary
 
 
 def test_coord_on_worker_path_unknown_without_the_ssh_probe(cfg):
