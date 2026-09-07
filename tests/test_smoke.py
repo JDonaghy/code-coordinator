@@ -14,12 +14,15 @@ from coord.smoke import (
     NO_SMOKE_VERDICT_MARKER,
     SMOKE_SYSTEM_PROMPT,
     SmokeCommand,
+    SmokePartition,
+    UnroutableCapability,
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
     match_rules,
     mute_smoke_legs,
     mute_smoke_tally,
+    partition_capability_requirements,
     pick_smoke_machine,
     resolve_rule_command,
     resolve_smoke_command,
@@ -119,6 +122,109 @@ def test_match_rules_no_trailing_slash_matches_files_too() -> None:
     """A rule `src/gtk` (no slash) is the loose form — catches gtk_helpers.c."""
     rules = [SmokeRule(files=["src/gtk"], requires=["gtk"])]
     assert match_rules(["src/gtk_helpers.c"], rules) == ["gtk"]
+
+
+# ── Partitioning (#3177) ─────────────────────────────────────────────────────
+#
+# The quadraui shape from the issue: `precision` has gtk, `dell64` has
+# gtk+windows, `macmini` has macos. No machine ever has more than one of
+# {gtk+windows, macos}. `capable_for` below mirrors
+# `_capability_matched_machines` without needing a real Config/Machine.
+
+
+_QUADRAUI_MACHINE_CAPS = {
+    "precision": {"gtk"},
+    "dell64": {"gtk", "windows"},
+    "macmini": {"macos"},
+}
+
+
+def _quadraui_capable_for(caps: list[str]) -> bool:
+    wanted = set(caps)
+    return any(wanted <= have for have in _QUADRAUI_MACHINE_CAPS.values())
+
+
+_QUADRAUI_RULES = [
+    SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+    SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+    SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+]
+
+
+def test_partition_merges_rules_one_machine_can_cover_together() -> None:
+    """gtk + windows: no rule alone needs both, but dell64 has both, so they
+    fold into ONE partition rather than becoming two legs for no reason."""
+    partitions, unroutable = partition_capability_requirements(
+        ["quadraui/src/gtk/a.rs", "quadraui/src/win/b.rs"],
+        _QUADRAUI_RULES,
+        _quadraui_capable_for,
+    )
+    assert unroutable == []
+    assert partitions == [SmokePartition(capabilities=("gtk", "windows"))]
+
+
+def test_partition_splits_when_no_machine_covers_the_union() -> None:
+    """The #831 4-backend shape: gtk+windows+macos in one diff. The flat
+    union (all three) is unroutable — no machine has macos AND gtk/windows —
+    but split into two groups, each IS routable: this is the fan-out the
+    issue asks for at the routing layer."""
+    partitions, unroutable = partition_capability_requirements(
+        [
+            "quadraui/src/gtk/a.rs",
+            "quadraui/src/win/b.rs",
+            "quadraui/src/macos/c.rs",
+        ],
+        _QUADRAUI_RULES,
+        _quadraui_capable_for,
+    )
+    assert unroutable == []
+    assert len(partitions) == 2
+    cap_sets = {frozenset(p.capabilities) for p in partitions}
+    assert cap_sets == {frozenset({"gtk", "windows"}), frozenset({"macos"})}
+
+
+def test_partition_macos_only_diff_is_a_single_partition() -> None:
+    partitions, unroutable = partition_capability_requirements(
+        ["quadraui/src/macos/c.rs"], _QUADRAUI_RULES, _quadraui_capable_for,
+    )
+    assert unroutable == []
+    assert partitions == [SmokePartition(capabilities=("macos",))]
+
+
+def test_partition_reports_unroutable_when_no_machine_has_the_capability() -> None:
+    """A capability nobody declares at all is a config error, not something
+    splitting into more legs could ever fix."""
+    rules = [SmokeRule(files=["src/cuda/"], requires=["cuda"])]
+    partitions, unroutable = partition_capability_requirements(
+        ["src/cuda/kernel.cu"], rules, _quadraui_capable_for,
+    )
+    assert partitions == []
+    assert len(unroutable) == 1
+    bad = unroutable[0]
+    assert bad.capabilities == ("cuda",)
+    assert bad.rule_index == 0
+    assert bad.rule_files == ("src/cuda/",)
+    assert "cuda" in bad.describe()
+    assert "capability_rules[0]" in bad.describe()
+
+
+def test_partition_returns_nothing_for_rules_with_no_requires() -> None:
+    """An empty `requires` means 'no extra capability' — not a partition of
+    its own; `dispatch_smoke`'s existing any-capable-machine path owns it."""
+    rules = [SmokeRule(files=["src/cli/"], requires=[])]
+    partitions, unroutable = partition_capability_requirements(
+        ["src/cli/main.py"], rules, _quadraui_capable_for,
+    )
+    assert partitions == []
+    assert unroutable == []
+
+
+def test_partition_ignores_unmatched_rules() -> None:
+    partitions, unroutable = partition_capability_requirements(
+        ["docs/README.md"], _QUADRAUI_RULES, _quadraui_capable_for,
+    )
+    assert partitions == []
+    assert unroutable == []
 
 
 # ── Rule command override (#3056) ───────────────────────────────────────────
@@ -1863,6 +1969,54 @@ def test_dispatch_smoke_records_blocked_when_zero_capable_machines(
     assert result is None
     assert completed.test_state == "blocked"
     assert "gtk" in (completed.test_reason or "")
+
+
+def test_dispatch_smoke_blocked_reason_names_partition_split_not_missing_capability(
+    repo: Repo,
+) -> None:
+    """#3177 acceptance: a diff whose matched rules need gtk+windows AND
+    macos in the same PR is unroutable as a flat union (no single machine
+    has all three) — but each half IS routable. The recorded reason must say
+    so (naming the machines the split would use), not the generic "no
+    configured machine declares this capability", which is false here: every
+    capability IS declared, just not all on one box (the exact misdiagnosis
+    #3177 opened on, and the #1678 failure mode it must not repeat)."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("precision", "precision.tail", caps=["gtk"], path="/p/api"),
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    result = dispatch_smoke(
+        completed, Board(), cfg,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: diff,
+    )
+    assert result is None
+    assert completed.test_state == "blocked"
+    reason = completed.test_reason or ""
+    assert "does not fan a single completion out into concurrent legs yet (#3177)" in reason
+    assert "dell64" in reason
+    assert "macmini" in reason
+    # Must NOT read as a bare capability miss — every capability above IS
+    # declared by some machine.
+    assert "no configured machine declares capability" not in reason
 
 
 def test_dispatch_smoke_transient_post_failure_leaves_the_row_redispatchable(
