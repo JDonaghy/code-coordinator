@@ -2661,6 +2661,144 @@ def test_dispatch_review_patch_id_hashes_untruncated_diff(
     assert len(payload["briefing"]) < len(big_diff)
 
 
+def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
+    two_machine_config: Config,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#3196 regression: a reviewer was briefed with a diff that showed
+    CLAUDE.md as changed when the PR (one commit ahead of main) never
+    touched it — content from an earlier, already-merged commit (the repo's
+    seed commit) leaking in because `gh pr diff` disagreed with the
+    branch's real merge-base diff. Reproduces that shape: `diff_fetcher`
+    (standing in for a stale `pr_diff`/`gh pr diff` result) returns a diff
+    naming a file the branch never touched, while a fresh compare of the
+    branch's own current refs (`compare_files_fetcher`) reports only the
+    file the branch actually changed. Asserts the briefed diff is replaced
+    wholesale by the compare-derived diff, so the reviewer only ever sees
+    the branch's own files."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "stale-diff-review-1"})
+
+    # What `pr_diff`/`gh pr diff` returned: a spurious CLAUDE.md addition —
+    # content from the repo's seed commit, not this branch — alongside the
+    # branch's real change.
+    stale_diff = (
+        "diff --git a/CLAUDE.md b/CLAUDE.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/CLAUDE.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+# Project rules\n"
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def convert():\n"
+        "+    return None\n"
+    )
+    # What the branch's own commit(s) actually touched, per a fresh compare
+    # of its current refs.
+    fresh_diff = (
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def convert():\n"
+        "+    return None\n"
+    )
+
+    compare_calls: list[tuple] = []
+
+    def _compare_files(repo_github: str, base: str, head: str) -> list[str]:
+        compare_calls.append((repo_github, base, head))
+        return ["converter.py"]
+
+    def _compare_diff(repo_github: str, base: str, head: str) -> str:
+        compare_calls.append((repo_github, base, head))
+        return fresh_diff
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 31, "url": "https://github.com/acme/api/pull/31", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: stale_diff,
+        compare_files_fetcher=_compare_files,
+        compare_diff_fetcher=_compare_diff,
+    )
+
+    assert result is not None
+    assert client.calls, "expected a dispatch POST"
+    _, payload = client.calls[0]
+    briefing = payload["briefing"]
+
+    # The reviewer must never see a diff hunk for CLAUDE.md — the file the
+    # PR never touched — only one for the branch's own file. (CLAUDE.md
+    # still appears elsewhere in the briefing's boilerplate coordinator-doc
+    # reminder — that's unrelated to the embedded diff and expected.)
+    assert "diff --git a/CLAUDE.md" not in briefing
+    assert "diff --git a/converter.py" in briefing
+    assert briefing.count("diff --git") == 1
+
+    # Both the file-list and the replacement-diff cross-checks ran against
+    # the branch's own current refs (base branch, `completed.branch`), not
+    # some cached/stale base.
+    assert compare_calls
+    for _repo, base, head in compare_calls:
+        assert base == two_machine_config.repo("api").default_branch
+        assert head == completed.branch
+
+    # The mismatch is logged so the coordinator's own log carries a record
+    # of the stale-diff replacement.
+    matching = [rec for rec in caplog.records if "stale/incorrect diff base" in rec.message]
+    assert matching, caplog.text
+
+
+def test_dispatch_review_keeps_diff_when_compare_agrees(
+    two_machine_config: Config,
+) -> None:
+    """#3196: the cross-check must be silent (no replacement) when the
+    fetched diff's files already match a fresh compare of the branch's
+    current refs — the common case, where `pr_diff` was correct all along."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "agreeing-diff-review-1"})
+    diff = (
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def convert():\n"
+        "+    return None\n"
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("compare_diff_fetcher must not be called when files agree")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 32, "url": "https://github.com/acme/api/pull/32", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+        compare_files_fetcher=lambda repo, base, head: ["converter.py"],
+        compare_diff_fetcher=_boom,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    assert "converter.py" in payload["briefing"]
+
+
 def test_dispatch_review_logs_missing_test_coverage_but_still_dispatches(
     two_machine_config: Config, caplog: pytest.LogCaptureFixture,
 ) -> None:
