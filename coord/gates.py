@@ -309,6 +309,70 @@ def _find_verdict_unparseable_review(
     return candidates[-1]
 
 
+def _gate_a_exempt_note_for_winner(
+    issue_number: int, repo_cfg, config: "Config | None", gh_ops: "GhOps | None",
+) -> str | None:
+    """(#3202) ``coord gates``-facing surfacing of a milestone that carries
+    a Gate-A contract AND exempts one or more issues from the acceptance-
+    slice gate — one of the two surfaces (alongside the pre-dispatch guard,
+    :func:`coord.milestone_dispatch.issue_oracle_ready`) the issue names as
+    "where a milestone [is] already in that state", so an operator reading
+    ``coord gates`` output sees the exposure without having to already know
+    to go look at the manifest by hand.
+
+    ``Assignment`` carries no ``milestone_number`` column of its own (that
+    field lives on the pre-dispatch ``Proposal`` only, spent the moment a
+    dispatch is recorded) — so this resolves it the same way
+    :func:`coord.branch_model.resolve_base_branch_for_issue_number` resolves
+    a milestone issue's base branch just above this call site: a live
+    ``get_issue`` lookup, gated behind *gh_ops* actually implementing it.
+    Looked up against *issue_number* — the issue the caller actually asked
+    ``coord gates`` about, i.e. ``report.issue_number`` — rather than the
+    winning row's own (possibly-tracking-issue) ``issue_number``/
+    ``for_issue_number``, since that's the milestone membership an operator
+    reading this report means.
+
+    ``None`` (nothing to append) when: *config*/*repo_cfg* aren't in hand,
+    the repo has no acceptance driver configured at all (cheapest possible
+    short-circuit — never spends an issue fetch a milestone-unaware repo has
+    no use for), or *gh_ops* doesn't implement the (optional, like
+    :meth:`GhOps.branch_has_merge_commit` and friends) ``get_issue``/
+    ``get_repo_file`` reads — including the common ``gh_ops=None`` case,
+    i.e. a caller that didn't ask for live lookups at all (every existing
+    ``FakeGh`` test stub predates both methods, so this is a true no-op
+    against the whole existing test suite until a stub opts in). Delegates
+    the actual manifest/contract fetch, detection and wording entirely to
+    :func:`coord.acceptance.fetch_gate_a_exempt_warning` — the SAME function
+    :func:`coord.review._fetch_gate_a_exempt_warning` delegates to (and, one
+    level down, the same ``gate_a_exempt_exposure``/``gate_a_exempt_warning``
+    primitives :func:`coord.diagnose.gate_a_exempt_exposure_lines` renders
+    for a caller with a manifest/contract already in hand) — so this can
+    never drift from what those other surfaces say about the same state.
+    Fail-open on any error: advisory only, never worth failing ``coord
+    gates`` over.
+    """
+    if config is None or repo_cfg is None or not config.acceptance.has_driver(repo_cfg.name):
+        return None
+    get_issue = getattr(gh_ops, "get_issue", None)
+    file_fetcher = getattr(gh_ops, "get_repo_file", None)
+    if get_issue is None or file_fetcher is None:
+        return None
+    try:
+        issue_data = get_issue(repo_cfg.github, issue_number) or {}
+        milestone = issue_data.get("milestone") or {}
+        milestone_number = milestone.get("number") if isinstance(milestone, dict) else None
+        if milestone_number is None:
+            return None
+
+        from coord.acceptance import fetch_gate_a_exempt_warning  # noqa: PLC0415
+
+        return fetch_gate_a_exempt_warning(
+            config, repo_cfg, milestone_number, file_fetcher=file_fetcher,
+        )
+    except Exception:  # noqa: BLE001 — advisory only, never break `coord gates`
+        return None
+
+
 def build_gate_report(
     board: "Board",
     config: "Config",
@@ -366,6 +430,11 @@ def build_gate_report(
 
     winner = _select_winning_work_assignment(work_like)
     report.branch = winner.branch
+
+    gate_a_exempt_note = _gate_a_exempt_note_for_winner(issue_number, repo_cfg, config, gh_ops)
+    if gate_a_exempt_note:
+        report.notes.append(gate_a_exempt_note)
+
     if not winner.branch:
         report.notes.append(
             f"winning work assignment {winner.assignment_id!r} has no branch — "

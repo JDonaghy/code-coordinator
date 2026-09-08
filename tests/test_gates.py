@@ -741,3 +741,103 @@ class TestFixRoundTestGateAttribution:
 
         text = format_gate_report(report)
         assert "test   : passed (recorded on 8965c04)" in text
+
+
+class _FakeGhWithGateA(FakeGh):
+    """#3202: adds the two OPTIONAL ``GhOps`` methods
+    ``_gate_a_exempt_note_for_winner`` needs (``get_issue``, ``get_repo_file``)
+    on top of :class:`FakeGh`'s SHA/patch-id stubs — every other ``FakeGh``
+    use in this file predates both, so this is a separate subclass rather
+    than adding them to the shared stub (which would be an unrelated
+    behaviour change for every other test in this file)."""
+
+    def __init__(self, *, milestone_number: int | None, files: dict[str, str]):
+        super().__init__()
+        self.milestone_number = milestone_number
+        self.files = files
+
+    def get_issue(self, repo: str, issue_number: int) -> dict:
+        if self.milestone_number is None:
+            return {}
+        return {"milestone": {"number": self.milestone_number}}
+
+    def get_repo_file(self, repo: str, path: str, branch: str = "develop") -> str:
+        if path not in self.files:
+            raise RuntimeError(f"404: {path}")
+        return self.files[path]
+
+
+class TestGateAExemptNote:
+    """#3202: ``coord gates`` surfacing a milestone that carries a Gate-A
+    contract AND exempts one or more issues from the acceptance-slice gate —
+    one of the two "where a milestone [is] already in that state" surfaces
+    the issue names, alongside the pre-dispatch guard
+    (``coord.milestone_dispatch.issue_oracle_ready``)."""
+
+    def _config_with_driver(self) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+
+    def test_note_appended_when_milestone_exempts_issues(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithGateA(
+            milestone_number=5,
+            files={
+                "tests/acceptance/ms-5/manifest.yml": "exempt: [2, 3]\n",
+                "tests/acceptance/ms-5/contract.md": "**B1** x\n**B2** y\n",
+            },
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        note = next((n for n in report.notes if "3202" in n), None)
+        assert note is not None, report.notes
+        assert "ms-5" in note
+        assert "2 declared behaviours" in note
+
+    def test_no_note_when_manifest_has_no_exempt_list(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithGateA(
+            milestone_number=5,
+            files={"tests/acceptance/ms-5/manifest.yml": "tests: {}\n"},
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        assert not any("3202" in n for n in report.notes)
+
+    def test_no_note_when_repo_has_no_acceptance_driver(self, config: Config) -> None:
+        """The cheap short-circuit: a repo with no acceptance driver
+        configured never even fetches the issue's milestone."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+
+        def _refuse_get_issue(*_a, **_k):
+            raise AssertionError("must not fetch the issue at all")
+
+        gh = _FakeGhWithGateA(milestone_number=5, files={})
+        gh.get_issue = _refuse_get_issue  # type: ignore[assignment]
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+        assert not any("3202" in n for n in report.notes)
+
+    def test_no_note_when_gh_ops_lacks_get_repo_file(self) -> None:
+        """A plain ``FakeGh`` (every other test in this file) has neither
+        optional method — must degrade to a silent no-op, not an
+        ``AttributeError``."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(
+            board, self._config_with_driver(), "api", 42, gh_ops=FakeGh(),
+        )
+        assert not any("3202" in n for n in report.notes)
+
+    def test_no_note_when_gh_ops_is_none(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=None)
+        assert not any("3202" in n for n in report.notes)

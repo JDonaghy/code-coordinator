@@ -2377,74 +2377,24 @@ def _fetch_gate_a_exempt_warning(
     *,
     file_fetcher=None,
 ) -> str | None:
-    """(#3202) Fetch *milestone_number*'s manifest + Gate-A contract and, if
-    the manifest exempts one or more issues from needing an acceptance
-    slice, return the canonical :func:`coord.acceptance.gate_a_exempt_warning`
-    text for the reviewer's briefing — or ``None`` when there's nothing to
-    warn about, or nothing to check at all.
+    """(#3202) Thin wrapper over :func:`coord.acceptance.fetch_gate_a_exempt_warning`
+    — kept as a module-level name here (rather than inlined at the one call
+    site below) purely so existing callers/tests that import
+    ``coord.review._fetch_gate_a_exempt_warning`` directly keep working.
 
-    Fail-open like every other best-effort fetch this module makes ahead of
-    :func:`build_review_briefing` (``review_head_sha``, ``review_patch_id``
-    above): a missing manifest/contract, a repo with no acceptance driver
-    configured, no milestone on the issue, or a transient network hiccup all
-    return ``None`` rather than raise — this is an advisory surfacing, never
-    a gate, so a fetch failure must never affect whether or how a review is
-    dispatched.
-
-    ``exempt:`` is milestone-level and lives only in the legacy single
-    ``manifest.(yml|yaml|json)`` file, never a per-issue
-    ``manifest.d/`` fragment (see ``coord.acceptance``'s
-    ``MANIFEST_FRAGMENTS_DIRNAME`` comment: "rare, hand-edited... stays a
-    single shared file by choice"), so only that file needs checking here —
-    unlike a full manifest load, no fragment merge is needed.
+    #3202 review: the fetch-and-detect logic used to live here directly and
+    was the ONLY wired caller of ``coord.acceptance``'s detection helpers —
+    `coord.diagnose.gate_a_exempt_exposure_lines` and `coord gates` (see
+    :func:`coord.gates.build_gate_report`) now share the exact same fetch
+    loop via that one function instead of each re-deriving it, so a future
+    edit to the fetch/candidate-resolution rules can't update this copy and
+    silently leave the others stale.
     """
-    if milestone_number is None or not config.acceptance.has_driver(repo.name):
-        return None
+    from coord.acceptance import fetch_gate_a_exempt_warning  # noqa: PLC0415
 
-    from coord.acceptance import (  # noqa: PLC0415
-        gate_a_contract_candidates,
-        gate_a_exempt_exposure,
-        gate_a_exempt_warning,
-        ms_dirname,
-        parse_manifest_text,
-        search_roots_for_repo,
+    return fetch_gate_a_exempt_warning(
+        config, repo, milestone_number, file_fetcher=file_fetcher,
     )
-
-    fetch = file_fetcher or github_ops.get_repo_file
-
-    manifest_data = None
-    for root in search_roots_for_repo(config, repo.name):
-        ms_dir = f"{root.rstrip('/')}/{ms_dirname(milestone_number)}"
-        for ext in (".yml", ".yaml", ".json"):
-            try:
-                text = fetch(repo.github, f"{ms_dir}/manifest{ext}", repo.default_branch)
-            except Exception:  # noqa: BLE001 — this extension/root doesn't exist
-                continue
-            try:
-                manifest_data = parse_manifest_text(
-                    text, source=f"{ms_dir}/manifest{ext}"
-                )
-            except Exception:  # noqa: BLE001 — malformed manifest: fail open
-                manifest_data = None
-            break
-        if manifest_data is not None:
-            break
-
-    if manifest_data is None or not manifest_data.exempt:
-        return None
-
-    contract_text: str | None = None
-    for path in gate_a_contract_candidates(config, repo.name, milestone_number):
-        try:
-            contract_text = fetch(repo.github, path, repo.default_branch)
-            break
-        except Exception:  # noqa: BLE001 — try the next candidate root
-            continue
-
-    exposure = gate_a_exempt_exposure(milestone_number, manifest_data, contract_text)
-    if exposure is None:
-        return None
-    return gate_a_exempt_warning(exposure)
 
 
 def open_pr_for_completed_work(

@@ -136,20 +136,30 @@ def gate_a_exempt_exposure_lines(
     manifest: "ManifestData",
     contract_text: str | None,
 ) -> list[str]:
-    """``coord doctor``/``coord gates``-facing surfacing (#3202) of a
-    milestone already carrying a Gate-A contract AND exempting one or more
-    issues from the acceptance-slice gate — the state that let the
-    format-converter ms-1 incident ship a contract-violating UI through
-    Review, CI and unit tests, caught only by a human at the UAT gate.
+    """Surfacing (#3202) of a milestone already carrying a Gate-A contract
+    AND exempting one or more issues from the acceptance-slice gate — the
+    state that let the format-converter ms-1 incident ship a
+    contract-violating UI through Review, CI and unit tests, caught only by
+    a human at the UAT gate.
+
+    For a caller that has ALREADY fetched *manifest*/*contract_text* by some
+    other means and just wants the lines to print (a future ``coord
+    doctor`` per-milestone pass, once one exists — no fleet-wide milestone
+    iteration exists to hang it off of today, so nothing calls this yet).
+    ``coord gates`` (:func:`coord.gates.build_gate_report`) and the
+    reviewer's briefing (``coord.review.build_review_briefing``) instead go
+    through :func:`coord.acceptance.fetch_gate_a_exempt_warning`, which owns
+    the manifest/contract FETCH those two need and isn't a fit for this
+    function's "data already in hand" shape — but both paths bottom out in
+    the exact same :func:`coord.acceptance.gate_a_exempt_exposure` /
+    :func:`coord.acceptance.gate_a_exempt_warning` pair, so the wording can
+    never drift between them.
 
     Returns ``[]`` when there's nothing to report (no manifest exemptions).
     Delegates the actual detection AND the wording to
     :func:`coord.acceptance.gate_a_exempt_exposure` /
-    :func:`coord.acceptance.gate_a_exempt_warning` — the single source of
-    truth every surface reading this state renders (the pre-dispatch
-    guard's exemption suggestion and the reviewer's briefing,
-    ``coord.review.build_review_briefing``, are the other two) — rather
-    than re-deriving the detection rule or the wording here.
+    :func:`coord.acceptance.gate_a_exempt_warning` rather than re-deriving
+    either here.
     """
     from coord.acceptance import gate_a_exempt_exposure, gate_a_exempt_warning  # noqa: PLC0415
 
