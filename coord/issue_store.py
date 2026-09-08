@@ -287,36 +287,28 @@ def _update_local_state(
     )
     conn.commit()
 
-    # #3113: this is the generic chokepoint where ANY assignment (review,
-    # smoke, work, ...) transitions to a terminal status — the same moment
-    # `coord.claim.has_active_followup` starts reporting "not in flight"
-    # (board partitioning keys off exactly this status, #_board_mapping.
-    # _ACTIVE_STATUSES). A `type="review"` row leaving the active state is
-    # therefore exactly when its dispatch-time claim (coord.state.
+    # #3113/#3206: this is the generic chokepoint where ANY assignment
+    # (review, smoke, work, ...) transitions to a terminal status — the same
+    # moment `coord.claim.has_active_followup` starts reporting "not in
+    # flight" (board partitioning keys off exactly this status, #_board_
+    # mapping._ACTIVE_STATUSES). A `type="review"` row leaving the active
+    # state is therefore exactly when its dispatch-time claim (coord.state.
     # claim_review_dispatch) must be released — otherwise a legitimate later
     # re-review of the same work assignment (the `coord review <id>` escape
-    # hatch) would find the claim still held forever. Best-effort: a lookup
-    # failure here must never turn a successful status write into a raised
-    # exception.
-    try:
-        row = sql.execute(
-            conn,
-            "SELECT type, review_of_assignment_id FROM assignments WHERE assignment_id=?",
-            (assignment_id,),
-        ).fetchone()
-        if row is not None:
-            row_type = row["type"] if hasattr(row, "keys") else row[0]
-            row_of_id = (
-                row["review_of_assignment_id"] if hasattr(row, "keys") else row[1]
-            )
-            if row_type == "review" and row_of_id:
-                from coord.state import (  # noqa: PLC0415
-                    _release_review_dispatch_claim_local,
-                )
+    # hatch) would find the claim still held forever.
+    #
+    # #3206: the type/review_of_assignment_id check + release used to be
+    # duplicated inline here AND, independently, missing entirely from
+    # `coord.state._mark_notified_local` (the `coord notify` polling path a
+    # reaper-killed headless review's terminal write goes through when no
+    # daemon reconcile tick got there first) — the exact "two surfaces, two
+    # implementations" split-brain #2096 warns about, and how a SIGKILLed
+    # review's claim leaked forever (coord-tui#49). Both seams now call the
+    # same `coord.state.release_review_claim_if_row_is_review` — one
+    # question, one answer.
+    from coord.state import release_review_claim_if_row_is_review  # noqa: PLC0415
 
-                _release_review_dispatch_claim_local(row_of_id)
-    except Exception:  # noqa: BLE001 — best-effort; never break the status write
-        pass
+    release_review_claim_if_row_is_review(assignment_id)
 
 
 def _record_notification(

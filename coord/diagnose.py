@@ -709,7 +709,44 @@ def diagnose_stage(
 def _recover_review(
     board, config, latest, state, res: DiagnoseResult, *, dry_run: bool
 ) -> None:
-    from coord.state import load_assignment_review_findings  # noqa: PLC0415
+    from coord.state import has_review_claim, load_assignment_review_findings  # noqa: PLC0415
+
+    # #3206: a review row that has no live session left (status is already
+    # terminal — the `running`/`pending` + machine-unconfigured phantom case
+    # above already returned before reaching here, and #1180's "resolve the
+    # reviewed id" comment on `_do_reset` explains why `review_of_assignment_
+    # id` is the FK to check) but whose work assignment's `review_claims` row
+    # is STILL held is permanently wedged: every future `dispatch_review` for
+    # that work assignment loses `claim_review_dispatch` forever and denies
+    # with the misleading #3113 "lost the atomic dispatch-claim race" reason
+    # — even though nothing is racing. `latest.status not in ("running",
+    # "pending")` is a positive disproof that anything is still in flight to
+    # release it itself, so this is checked FIRST, before any of the
+    # per-shape branches below: none of the "healthy"/"recovered" outcomes
+    # they report are actually dispatchable while the claim is held (this is
+    # exactly the coord-tui#49 repro — a SIGKILLed review that reached
+    # `status=failed` and then reported "review stage looks healthy").
+    work_assignment_id = (
+        latest.review_of_assignment_id
+        if latest.type == "review" and latest.review_of_assignment_id
+        else latest.assignment_id
+    )
+    if (
+        latest.status not in ("running", "pending")
+        and work_assignment_id
+        and has_review_claim(work_assignment_id)
+    ):
+        res.findings.append(
+            f"review stage is terminal (status={latest.status!r}) but its "
+            f"review-dispatch claim for work assignment {work_assignment_id} "
+            "is still held (leaked review_claims row, #3206) — every future "
+            "dispatch_review for this work assignment will deny with the "
+            "misleading #3113 'lost the atomic dispatch-claim race' reason "
+            "until it is released. Re-run with --reset to release it."
+        )
+        res.recovered = False
+        res.needs_reset = True
+        return
 
     has_findings = False
     if latest.assignment_id:
@@ -1408,7 +1445,30 @@ def _reset_review_stage(
         repo_name, issue_number, types=("review",),
         review_of_assignment_id=assignment_id,
     )
-    res.actions_taken.append(f"deleted {deleted} review row(s) → stage grey")
+    # #3206: VERIFY the delete actually persisted before reporting it as an
+    # action taken — `delete_assignments_for_issue`'s own `cur.rowcount`
+    # only proves the DELETE statement was issued and committed on ITS
+    # connection; it is not proof the row is gone from the canonical board
+    # (the coord-tui#49 `--reset` run reported "deleted 1 review row(s)"
+    # while `f00d5e20670c` was still present, unchanged, on the daemon's
+    # board immediately afterward). A re-read against the same predicate,
+    # taken AFTER the write, is the observation #2096 requires before a
+    # success line is trustworthy — the claim-release and review_state
+    # writes below already get exactly this scrutiny implicitly, since
+    # their own callers read the board fresh next; the delete's rowcount
+    # was the one unverified "success" in this function.
+    still_present = state.count_review_rows_for_reset(
+        repo_name, issue_number, review_of_assignment_id=assignment_id
+    )
+    if still_present:
+        res.actions_taken.append(
+            f"delete requested for {deleted} review row(s), but "
+            f"{still_present} still present on re-read — the row delete did "
+            "NOT persist (#3206); stage grey/re-reviewable status below "
+            "does not depend on this delete having landed"
+        )
+    else:
+        res.actions_taken.append(f"deleted {deleted} review row(s) → stage grey")
     # #3113: the raw DELETE above never goes through
     # ``coord.issue_store._update_local_state`` — the ONLY other seam that
     # releases a ``review_claims`` row (on a review assignment's own

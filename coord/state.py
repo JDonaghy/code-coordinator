@@ -2109,6 +2109,18 @@ def _mark_notified_local(
         )
     conn.commit()
 
+    # #3206: this write can be the FIRST (and, absent a daemon reconcile
+    # tick, only) place a review assignment's terminal status ever lands —
+    # e.g. a headless review reaped by `AgentServer._reap`'s 7200s max-wait
+    # SIGKILL, observed here via `coord notify`'s own agent poll rather than
+    # the daemon's passive reconcile tick. Release its review-dispatch claim
+    # the same way `coord.issue_store._update_local_state` does for every
+    # other terminal-status seam — `release_review_claim_if_row_is_review`
+    # is a no-op for the composite `f"{aid}:stuck"`-style keys the four
+    # override events above pass (no row matches that string), so this is
+    # safe to call unconditionally.
+    release_review_claim_if_row_is_review(assignment_id)
+
     # #1036: this is the single funnel every notify.py call site (completion,
     # failure, advisory, stuck, needs-attention, stalled, liveness) reaches —
     # hook here rather than at each of the ~10 mark_notified() call sites.
@@ -2316,6 +2328,39 @@ def _claim_review_dispatch_local(of_assignment_id: str) -> bool:
     return (cur.rowcount or 0) > 0
 
 
+def has_review_claim(of_assignment_id: str) -> bool:
+    """True when *of_assignment_id* still holds a live ``review_claims`` row
+    (#3206) — the read side of :func:`claim_review_dispatch`/
+    :func:`release_review_dispatch_claim`, used by ``coord diagnose --stage
+    review`` to cross-check a review row's own terminal ``status`` against
+    the claim table, so a leaked claim (one whose releasing write went
+    through a seam other than :func:`release_review_claim_if_row_is_review`)
+    is reported as an unhealthy, undispatchable stage instead of silently
+    passing.
+
+    **Local-DB read only** — unlike ``claim_review_dispatch``/
+    ``release_review_dispatch_claim``, this does NOT route to the daemon via
+    ``board_service``. ``review_claims`` lives on the canonical board (the
+    ``coord serve`` daemon's DB, per this function's own module docs above);
+    a thin client's local ``~/.coord/coord.db`` copy is empty/stale for this
+    table exactly like it is for `build_board()` (`#615`,
+    `_thin_client_local_board_guard`). Giving this its own daemon-routed GET
+    endpoint is tracked separately — see the #3206 issue's closing note on
+    thin-client visibility — so for now this answers correctly on the daemon
+    host (where the local DB IS canonical) and undercounts on a thin client,
+    same known limitation as the rest of this diagnostic path.
+    """
+    if not of_assignment_id:
+        return False
+    conn = get_connection()
+    row = sql.execute(
+        conn,
+        "SELECT 1 FROM review_claims WHERE of_assignment_id=?",
+        (of_assignment_id,),
+    ).fetchone()
+    return row is not None
+
+
 def release_review_dispatch_claim(of_assignment_id: str) -> None:
     """Release a claim taken by :func:`claim_review_dispatch`.
 
@@ -2348,6 +2393,53 @@ def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
     conn = get_connection()
     sql.execute(conn, "DELETE FROM review_claims WHERE of_assignment_id=?", (of_assignment_id,))
     conn.commit()
+
+
+def release_review_claim_if_row_is_review(assignment_id: str) -> None:
+    """Release *assignment_id*'s own review-dispatch claim, iff that row is
+    itself a ``type="review"`` assignment (#3206).
+
+    This is the ONE "did a review assignment just reach a terminal status,
+    and if so release the claim it took" check — every seam capable of
+    writing a review row's terminal ``status`` must call this SAME function
+    immediately after its own write, rather than re-deriving the
+    ``type == "review" and review_of_assignment_id`` test independently.
+    Before #3206 there were two such seams reading the row and applying that
+    test on their own: :func:`coord.issue_store._update_local_state` (the
+    worker self-report / git-floor-backstop path) had it; this module's own
+    :func:`_mark_notified_local` (the ``coord notify`` polling path a
+    reaper-killed headless review's terminal write goes through when no
+    daemon reconcile tick got there first) did not. That gap is exactly how
+    a review SIGKILLed by ``AgentServer._reap``'s 7200s max-wait ceiling
+    left its ``review_claims`` row held forever: `_mark_notified_local`
+    wrote ``status='failed'`` and stopped, so every later
+    ``dispatch_review`` for the same work assignment lost
+    ``claim_review_dispatch`` permanently and denied with the misleading
+    "lost the atomic dispatch-claim race — #3113" reason, even though
+    nothing was racing (coord-tui#49, stuck ~11h). One shared function
+    closes the gap for both existing callers and any future one.
+
+    Best-effort: a lookup failure here must never turn a successful status
+    write into a raised exception.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    try:
+        row = sql.execute(
+            conn,
+            "SELECT type, review_of_assignment_id FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is not None:
+            row_type = row["type"] if hasattr(row, "keys") else row[0]
+            row_of_id = (
+                row["review_of_assignment_id"] if hasattr(row, "keys") else row[1]
+            )
+            if row_type == "review" and row_of_id:
+                _release_review_dispatch_claim_local(row_of_id)
+    except Exception:  # noqa: BLE001 — best-effort; never break the status write
+        pass
 
 
 # ── Review-findings tracking ──────────────────────────────────────────────────
@@ -2537,6 +2629,37 @@ def delete_assignments_for_issue(
     )
     conn.commit()
     return cur.rowcount
+
+
+def count_review_rows_for_reset(
+    repo_name: str, issue_number: int, *, review_of_assignment_id: str
+) -> int:
+    """Count ``type='review'`` rows still matching
+    :func:`delete_assignments_for_issue`'s own ``review_of_assignment_id``
+    predicate (#3206) — used by ``coord diagnose --reset`` to VERIFY a
+    review-row delete actually persisted before reporting success, rather
+    than trusting the delete call's own rowcount.
+
+    A ``DELETE`` statement's rowcount only proves the statement was issued
+    and committed on its own connection; it is not proof the row is
+    actually gone from the canonical board afterward (the coord-tui#49
+    ``--reset`` run reported "deleted 1 review row(s)" while the row was
+    still present, unchanged, on the daemon's board immediately after —
+    exactly the "unconfirmed success" shape #2096 calls a defect: a
+    reported outcome must come from a re-read taken AFTER the write, never
+    from the write call's own return value alone). Re-querying with a fresh
+    read against the same predicate is that re-read.
+    """
+    if not review_of_assignment_id:
+        return 0
+    conn = get_connection()
+    row = sql.execute(
+        conn,
+        "SELECT COUNT(*) AS c FROM assignments WHERE repo_name=? AND "
+        "issue_number=? AND type='review' AND review_of_assignment_id=?",
+        (repo_name, issue_number, review_of_assignment_id),
+    ).fetchone()
+    return int(row["c"] if hasattr(row, "keys") else row[0])
 
 
 def reset_work_review_state(

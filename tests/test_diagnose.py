@@ -985,6 +985,125 @@ def test_reset_review_releases_stale_dispatch_claim(monkeypatch, config, coord_d
     assert state.claim_review_dispatch("w1") is True
 
 
+def test_diagnose_review_detects_leaked_claim_on_terminal_row(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3206 part 2 regression: a review row that has ALREADY reached a
+    terminal status (e.g. reaped by a SIGKILL, `status="failed"`) whose work
+    assignment's `review_claims` row is still held used to report "review
+    stage looks healthy" — the diagnostic never cross-checked `review_claims`
+    against a terminal `status`, only the review row's own status/verdict
+    shape. Every future `dispatch_review` for this work assignment is
+    permanently wedged behind that leaked claim (denying with the misleading
+    #3113 "lost the atomic dispatch-claim race" reason), so this must surface
+    as unhealthy with `needs_reset=True`, never "healthy".
+    """
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="dispatched",
+        dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="failed", dispatched_at=200.0,
+        review_of="w1", failure_reason="reap: SIGKILL after 7200s max-wait",
+    ))
+    # Simulate the leak: the claim was taken at dispatch time and never
+    # released, because the terminal write went through a seam (pre-fix)
+    # that never checked `review_claims` at all.
+    assert state.claim_review_dispatch("w1") is True
+
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(
+            aid="rv1", typ="review", status="failed", dispatched_at=200.0,
+            review_of="w1",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.recovered is False
+    assert res.needs_reset is True
+    assert any("review_claims" in f or "review-dispatch claim" in f for f in res.findings)
+    # The claim itself is untouched by a dry-run diagnosis — still leaked.
+    assert state.claim_review_dispatch("w1") is False
+
+
+def test_diagnose_review_healthy_when_no_claim_leaked(
+    monkeypatch, config, coord_db
+) -> None:
+    """Sibling of the leaked-claim regression above: a terminal review row
+    with NO outstanding claim (the ordinary, already-released case) must
+    still report healthy — the new #3206 cross-check must not flag every
+    terminal review as unhealthy, only ones with a real leaked claim."""
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="done",
+        verdict="approve", dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="done", verdict="approve",
+        dispatched_at=200.0, review_of="w1",
+    ))
+    # No claim taken — mirrors the ordinary post-release state.
+
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(
+            aid="rv1", typ="review", status="done", verdict="approve",
+            dispatched_at=200.0, review_of="w1",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.recovered is True
+    assert any("healthy" in f for f in res.findings)
+
+
+def test_reset_review_reports_delete_failure_when_row_survives(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3206 part 3 regression: `--reset`'s "deleted N review row(s)" line
+    used to trust `delete_assignments_for_issue`'s own rowcount — which only
+    proves the DELETE statement was issued and committed on its own
+    connection, not that the row is actually gone from the canonical board
+    afterward (the coord-tui#49 `--reset` run reported "deleted 1 review
+    row(s)" while the row was still present, unchanged, immediately after).
+    Simulate that exact non-persisting write and assert the action line is
+    honest about it rather than claiming success from an unconfirmed write.
+    """
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="done",
+        dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="failed", dispatched_at=200.0, review_of="w1",
+    ))
+    # Simulate a delete call that reports success (rowcount=1) but never
+    # actually removes the row — exactly the non-persisting write #3206 saw.
+    monkeypatch.setattr(state, "delete_assignments_for_issue", lambda *a, **k: 1)
+
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(
+            aid="rv1", typ="review", status="failed", dispatched_at=200.0,
+            review_of="w1",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    assert any("did NOT persist" in a for a in res.actions_taken)
+    assert not any(a.startswith("deleted 1 review row(s)") for a in res.actions_taken)
+
+
 def test_reset_review_real_db_resets_test_author_via_review_fk_sparing_sibling(
     monkeypatch, config, coord_db
 ) -> None:
