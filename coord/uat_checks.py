@@ -42,9 +42,10 @@ per-issue `UatChecks` overrides) and hangs it off `Repo.uat_checks`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-import httpx
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import httpx
 
 #: Default per-request timeout for a declared-checks fetch (seconds). Kept
 #: short and non-configurable-per-repo on purpose -- a UAT check that hangs
@@ -157,7 +158,11 @@ class UatCheckResult:
     failing: str | None = None
 
 
-Fetcher = Callable[[str], httpx.Response]
+#: A callable taking the preview URL and returning an `httpx.Response`-shaped
+#: object. Quoted so the alias resolves to a `ForwardRef` at runtime instead of
+#: touching the (deliberately lazily imported) `httpx` module -- see the
+#: import-cost note on `_default_fetcher`.
+Fetcher = Callable[[str], "httpx.Response"]
 
 
 def evaluate_uat_checks(
@@ -185,6 +190,18 @@ def evaluate_uat_checks(
     returning an `httpx.Response`-shaped object -- so a check can be
     evaluated with zero real network I/O.
     """
+    # `httpx` is imported HERE, not at module scope, on purpose. This module
+    # is reached from `coord.models` -> `coord.config`, and config *parsing*
+    # runs on a bare `python3` with only this checkout on `sys.path` in the
+    # epic-up/epic-down remote registration block (see
+    # tests/test_epic_up_down_symlinked_config_1887.py) -- a module-scope
+    # `import httpx` there turns "validate the YAML I just wrote" into a
+    # `ModuleNotFoundError`. Actually running a check is a network operation
+    # and always happens inside a full install, so the cost lands where the
+    # dependency is genuinely needed. Same pattern as `coord.board_service` /
+    # `coord.progress`.
+    import httpx  # noqa: PLC0415 — keep config-only import paths httpx-free
+
     getter = fetch or (
         lambda u: httpx.get(u, timeout=timeout, follow_redirects=False)
     )

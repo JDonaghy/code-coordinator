@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -324,3 +329,82 @@ def test_default_fetch_uses_httpx_get_without_following_redirects(monkeypatch) -
     assert result.ok is True
     assert captured["url"] == "https://preview.example/"
     assert captured["follow_redirects"] is False
+
+
+# ── the config-only import path must stay httpx-free ────────────────────────
+#
+# `coord.config` -> `coord.models` -> `coord.uat_checks`. Config *parsing*
+# runs under a bare `python3` in the epic-up/epic-down remote registration
+# block (tests/test_epic_up_down_symlinked_config_1887.py), where httpx is
+# not importable — a module-scope `import httpx` here broke it outright. The
+# checks below run in a SUBPROCESS: by the time this file's body executes,
+# pytest collection has already imported httpx into this interpreter, so a
+# same-process blocker would never be consulted.
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_BLOCK_HTTPX = """
+import sys, importlib.abc
+
+class _BlockHttpx(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name.split('.')[0] == 'httpx':
+            raise ModuleNotFoundError("No module named 'httpx'", name='httpx')
+        return None
+
+sys.meta_path.insert(0, _BlockHttpx())
+"""
+
+
+def _run_without_httpx(script: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-c", _BLOCK_HTTPX + script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(_REPO_ROOT),
+        env=dict(os.environ),
+    )
+
+
+def test_the_blocker_itself_bites() -> None:
+    """Guard the guard: if the blocker silently stopped working, the two
+    tests below would pass no matter what `coord.uat_checks` imports."""
+    result = _run_without_httpx("import httpx")
+    assert result.returncode != 0
+    assert "No module named 'httpx'" in result.stderr
+
+
+def test_importing_uat_checks_does_not_need_httpx() -> None:
+    result = _run_without_httpx(
+        "import coord.uat_checks as m\n"
+        "import sys\n"
+        "assert 'httpx' not in sys.modules, 'httpx was imported as a side effect'\n"
+        "assert m.UatChecks(expected_status=200).is_empty() is False\n"
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+
+
+def test_loading_config_does_not_need_httpx(tmp_path: Path) -> None:
+    """The end-to-end shape of the regression: validate a real
+    coordinator.yml with httpx absent, exactly as the daemon-host
+    registration block does."""
+    cfg = tmp_path / "coordinator.yml"
+    cfg.write_text(
+        "repos:\n"
+        "  - name: demo\n"
+        "    github: acme/demo\n"
+        "machines:\n"
+        "  - name: box\n"
+        "    host: box\n"
+        "    repos: [demo]\n",
+        encoding="utf-8",
+    )
+    result = _run_without_httpx(
+        "import sys\n"
+        "from coord.config import load\n"
+        f"cfg = load({str(cfg)!r})\n"
+        "assert [r.name for r in cfg.repos] == ['demo']\n"
+        "assert 'httpx' not in sys.modules, 'httpx was imported as a side effect'\n"
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
