@@ -91,14 +91,18 @@ def _insert_assignment(
         "issue_title": "Test issue",
         "status": "running",
         "provider_name": "claude-pty",
+        "type": "chat",
+        "review_of_assignment_id": None,
     }
     vals.update(overrides)
     conn.execute(
         """INSERT INTO assignments
            (assignment_id, machine_name, repo_name, repo_github,
-            issue_number, issue_title, status, provider_name)
+            issue_number, issue_title, status, provider_name, type,
+            review_of_assignment_id)
            VALUES (:assignment_id, :machine_name, :repo_name, :repo_github,
-                   :issue_number, :issue_title, :status, :provider_name)""",
+                   :issue_number, :issue_title, :status, :provider_name,
+                   :type, :review_of_assignment_id)""",
         vals,
     )
     conn.commit()
@@ -806,3 +810,94 @@ class TestDeadPaneTreatedAsReapable:
         kill_calls = [c for c in run_calls if "kill-session" in c]
         assert kill_calls, "expected a `tmux kill-session` call for the empty session"
         assert "coord-" + aid in kill_calls[0]
+
+
+# ── #3206: `_mark_stale_reap_in_db` must release a leaked review claim ──────
+#
+# `_mark_stale_reap_in_db` is the remote-fallback sibling of
+# `reap_stale_interactive_sessions`'s own raw-SQL terminal-status write — hit
+# whenever a dead remote interactive session has no branch/repo path to push
+# through `finalize_remote_interactive_exit` (coord/review.py:1141-1147 names
+# this the third of exactly three seams allowed to write a terminal status).
+# It must call `release_review_claim_if_row_is_review` the same way, or an
+# interactively-dispatched `type="review"` leg reaped here leaks its
+# `review_claims` row exactly like the headless-reaper bug this issue fixes.
+
+
+class TestMarkStaleReapInDbReleasesReviewClaim:
+    def test_review_row_reaped_without_branch_releases_its_claim(
+        self, coord_db: Any
+    ) -> None:
+        """No branch derivable → `_mark_stale_reap_in_db` fires directly
+        (mirrors `test_dead_session_no_branch_marks_failed_in_db` above);
+        confirm the review's claim on its work assignment is released too."""
+        from coord import state
+        from coord.interactive import reap_stale_remote_interactive_sessions
+
+        aid = "remote-review-no-branch"
+        _insert_assignment(
+            coord_db, aid, type="review", review_of_assignment_id="w-remote-1",
+        )
+        assert state.claim_review_dispatch("w-remote-1") is True  # simulate live claim
+
+        board = _make_remote_board(
+            assignment_id=aid,
+            dispatched_at=_old_dispatched_at(),
+            branch=None,  # no branch → can't finalize, falls back to the bare mark
+        )
+        cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
+
+        mock_derive = MagicMock()
+        mock_derive.returncode = 1
+        mock_derive.stdout = ""
+
+        with patch("coord.interactive._probe_remote_tmux_alive",
+                   return_value=(False, True)), \
+             patch("coord.interactive.subprocess.run",
+                   return_value=mock_derive), \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_fin:
+            reaped = reap_stale_remote_interactive_sessions(board, cfg)
+
+        mock_fin.assert_not_called()
+        assert aid in reaped
+
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", (aid,)
+        ).fetchone()
+        db_status = row["status"] if hasattr(row, "keys") else row[0]
+        assert db_status == "failed"
+
+        # Claim released → a fresh claim for the same work assignment succeeds.
+        assert state.claim_review_dispatch("w-remote-1") is True
+
+    def test_non_review_row_reaped_without_branch_does_not_touch_unrelated_claim(
+        self, coord_db: Any
+    ) -> None:
+        from coord import state
+        from coord.interactive import reap_stale_remote_interactive_sessions
+
+        aid = "remote-chat-no-branch"
+        _insert_assignment(coord_db, aid, type="chat")
+        assert state.claim_review_dispatch("some-other-work") is True
+
+        board = _make_remote_board(
+            assignment_id=aid,
+            dispatched_at=_old_dispatched_at(),
+            branch=None,
+        )
+        cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
+
+        mock_derive = MagicMock()
+        mock_derive.returncode = 1
+        mock_derive.stdout = ""
+
+        with patch("coord.interactive._probe_remote_tmux_alive",
+                   return_value=(False, True)), \
+             patch("coord.interactive.subprocess.run",
+                   return_value=mock_derive), \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_fin:
+            reap_stale_remote_interactive_sessions(board, cfg)
+
+        mock_fin.assert_not_called()
+        # Still held — the reaped row was not a review of "some-other-work".
+        assert state.claim_review_dispatch("some-other-work") is False

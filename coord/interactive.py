@@ -4362,7 +4362,11 @@ def reap_stale_interactive_sessions(
         return []
 
     from coord import sql  # noqa: PLC0415
-    from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        COORD_DIR,
+        get_connection,
+        release_review_claim_if_row_is_review,
+    )
 
     if worktrees_dir is None:
         worktrees_dir = COORD_DIR / "worktrees"
@@ -4488,6 +4492,18 @@ def reap_stale_interactive_sessions(
                 (terminal_status, now, a.assignment_id),
             )
             conn.commit()
+            # #3206: this raw SQL terminal-status write bypasses
+            # `coord.issue_store._update_local_state`, so an interactively
+            # dispatched (`provider_name="claude-pty"`) type="review" leg
+            # reaped here (the Work→Review handoff and the `coord review
+            # <id>` escape hatch both dispatch one, per review.py:3789-3795)
+            # would otherwise leak its `review_claims` row exactly like the
+            # headless reaper path did before #3206 — wedging every later
+            # `dispatch_review` for the same work assignment behind the
+            # misleading #3113 "lost the atomic dispatch-claim race" denial.
+            # Safe to call unconditionally: it's a no-op for any row whose
+            # type isn't "review".
+            release_review_claim_if_row_is_review(a.assignment_id)
         except Exception:  # noqa: BLE001
             pass  # non-fatal — the board update below still releases the claim
 
@@ -4568,7 +4584,10 @@ def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) 
     """
     try:
         from coord import sql  # noqa: PLC0415
-        from coord.state import get_connection  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            get_connection,
+            release_review_claim_if_row_is_review,
+        )
         conn = get_connection()
         sql.execute(
             conn,
@@ -4577,6 +4596,13 @@ def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) 
             (status, finished_at, assignment_id),
         )
         conn.commit()
+        # #3206: this raw SQL terminal-status write is the remote-fallback
+        # sibling of reap_stale_interactive_sessions's DB update above and
+        # bypasses `coord.issue_store._update_local_state` the same way —
+        # release the review-dispatch claim here too so a reaped remote
+        # interactive review doesn't leak its `review_claims` row. No-op
+        # for any row whose type isn't "review".
+        release_review_claim_if_row_is_review(assignment_id)
     except Exception:  # noqa: BLE001
         pass
 

@@ -726,6 +726,18 @@ def _recover_review(
     # they report are actually dispatchable while the claim is held (this is
     # exactly the coord-tui#49 repro — a SIGKILLed review that reached
     # `status=failed` and then reported "review stage looks healthy").
+    # #3206 fix-review note: there is a narrow, real false-positive window
+    # here on a legitimate re-review. `dispatch_review` (review.py) takes
+    # `claim_review_dispatch` BEFORE it ever inserts the new review's
+    # `assignments` row. If this function runs in that gap, `latest` above
+    # still resolves to the *previous* terminal review row, `has_review_claim`
+    # is now True (it's the new, in-flight dispatch's claim, not a leak), and
+    # this would misreport a leaked claim — with `--reset` then releasing a
+    # claim a live dispatch still needs. No known way to distinguish the two
+    # cases from this read alone (both look like "terminal review row +
+    # live claim"); flagged here rather than fixed, since fixing it would
+    # need `dispatch_review` to expose in-flight state this function can
+    # check first.
     work_assignment_id = (
         latest.review_of_assignment_id
         if latest.type == "review" and latest.review_of_assignment_id
@@ -1457,6 +1469,19 @@ def _reset_review_stage(
     # writes below already get exactly this scrutiny implicitly, since
     # their own callers read the board fresh next; the delete's rowcount
     # was the one unverified "success" in this function.
+    #
+    # Scope note: this re-read uses the same `get_connection()` singleton,
+    # in the same process, immediately after `conn.commit()` — within a
+    # single connection it cannot observe a delete that "didn't stick" the
+    # way the original coord-tui#49 evidence looked (the daemon's board
+    # still showing the row afterward implies a *different* connection/
+    # process saw stale state, not this one). What this DOES still catch:
+    # a genuine concurrent insert/delete race from another connection or
+    # process, and any future predicate mismatch between the delete and
+    # this re-read. It is narrower than "verify the delete actually
+    # persisted" sounds, but it's a real gate, not a tautology — see
+    # `tests/test_diagnose.py`'s coverage that mocks
+    # `delete_assignments_for_issue`'s rowcount to exercise the failure path.
     still_present = state.count_review_rows_for_reset(
         repo_name, issue_number, review_of_assignment_id=assignment_id
     )
