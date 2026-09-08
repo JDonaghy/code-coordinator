@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Iterable
 
 import httpx
@@ -18,7 +19,7 @@ from coord.comments import (
     format_refused_premise,
 )
 from coord.config import Config
-from coord.models import EPIC_DECOMPOSE_TYPE, Proposal, Repo, coordinator_owned_docs
+from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo, coordinator_owned_docs
 
 AGENT_PORT = 7433
 
@@ -1050,6 +1051,133 @@ def dispatch_with_retry(
         except ValueError:
             raise
     raise last_exc  # unreachable, but satisfies type checker
+
+
+@dataclass
+class FixMachineSelection:
+    """Outcome of picking a machine for a same-branch fix dispatch (#3208).
+
+    Same-branch fix dispatch (``coord fix``) used to aim unconditionally at
+    the ORIGINAL worker's machine and, when that machine was merely asleep
+    or powered off, surface nothing but a bare ``dispatch failed: timed
+    out`` — no machine name, no hint that reachability was even the
+    problem, no way to redirect. This is the ONE place that answers "which
+    machine should a same-branch fix run on" for both doors onto ``coord
+    fix`` — the failed-test/CI/acceptance/UAT door
+    (``coord.commands.plan_followup._dispatch_followup``) and the
+    request-changes-review door (``coord.auto_loop._dispatch_fix``) — so
+    the two can never again drift into disagreeing answers for the same
+    question (#2096, "one question, one answer").
+
+    ``machine`` is the chosen target, or ``None`` if nothing capable is
+    reachable right now. ``tried`` lists every candidate actually
+    considered, in the order tried, paired with why it was skipped
+    (unreachable — with the classified network reason — not capable, or
+    paused) so a refusal can name names instead of leaving the operator to
+    guess which piece of infrastructure is at fault.
+    """
+
+    machine: Machine | None
+    tried: list[tuple[str, str]]
+
+
+def select_fix_machine(
+    *,
+    original_machine_name: str,
+    repo_name: str,
+    machines: list[Machine],
+    override_machine_name: str | None = None,
+    status_fetcher=None,
+) -> FixMachineSelection:
+    """Pick a machine for a same-branch fix dispatch (#3208).
+
+    Prefers *original_machine_name* — the branch is already checked out
+    there — but skips it, and falls through to any other machine configured
+    for *repo_name* (in ``machines`` order), the moment it fails a LIVE
+    reachability probe, not just a config-capability check. Before this, an
+    original machine that was merely asleep/offline stalled the whole
+    dispatch instead of routing around it, even though the branch lives on
+    the remote and a fresh worktree can be built anywhere (#3208).
+
+    *override_machine_name* — from ``coord fix --machine`` — restricts the
+    candidate list to exactly that machine: the caller is asserting where
+    to send it, so no further fallback is attempted. An unreachable or
+    incapable override still comes back through ``.tried``, named, rather
+    than silently falling through to somewhere the caller didn't ask for.
+
+    *status_fetcher* defaults to :func:`coord.network.fetch_status` — the
+    same liveness probe ``coord status`` already uses — and is injectable
+    so tests never make a real network call.
+    """
+    from coord.machine_pause import follow_on_paused_set
+    from coord.network import fetch_status as _fetch_status
+
+    fetch = status_fetcher or _fetch_status
+    # #2240: the same follow-on cordon `_dispatch_fix` has always used — a
+    # fix leg is the tail of already-running work, not new work, so an
+    # explicit release pause (not a routing-only `coord pause`) must not
+    # filter its host out.
+    paused = follow_on_paused_set(machines)
+
+    def _capable(m: Machine) -> bool:
+        return m.can_work_on(repo_name) and m.repo_path(repo_name) is not None
+
+    tried: list[tuple[str, str]] = []
+
+    if override_machine_name is not None:
+        m = next((mm for mm in machines if mm.name == override_machine_name), None)
+        if m is None:
+            tried.append((override_machine_name, "not configured in coordinator.yml"))
+            return FixMachineSelection(None, tried)
+        candidates = [m]
+    else:
+        original = next(
+            (m for m in machines if m.name == original_machine_name), None
+        )
+        if original is None:
+            tried.append((original_machine_name, "not configured in coordinator.yml"))
+        candidates = ([original] if original is not None else []) + [
+            m for m in machines if m.name != original_machine_name
+        ]
+
+    for m in candidates:
+        if m.name in paused:
+            tried.append((m.name, "paused via `coord pause`"))
+            continue
+        if not _capable(m):
+            tried.append((m.name, f"cannot work on repo {repo_name!r}"))
+            continue
+        result = fetch(m)
+        if result.ok:
+            return FixMachineSelection(m, tried)
+        tried.append((m.name, result.error or "unreachable"))
+
+    return FixMachineSelection(None, tried)
+
+
+def describe_fix_machine_failure(
+    original_machine_name: str,
+    selection: FixMachineSelection,
+    *,
+    override_machine_name: str | None = None,
+) -> str:
+    """Render :class:`FixMachineSelection`'s ``tried`` list into one
+    actionable line (#3208) — names every machine actually considered and
+    why, instead of a bare ``dispatch failed: timed out``.
+    """
+    if not selection.tried:
+        return (
+            "no machine is configured to work on this repo (original "
+            f"worker machine was {original_machine_name!r})"
+        )
+    detail = "; ".join(f"{name} ({why})" for name, why in selection.tried)
+    if override_machine_name is not None:
+        return f"--machine {override_machine_name!r} refused: {detail}"
+    return (
+        f"original machine {original_machine_name!r} and every capable "
+        f"fallback are unusable right now: {detail}. Redirect with `coord "
+        "fix ... --machine <name>` once `coord status` shows one up."
+    )
 
 
 def compute_do_not_touch(

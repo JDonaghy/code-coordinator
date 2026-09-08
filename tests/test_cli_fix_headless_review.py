@@ -44,6 +44,18 @@ CONFIG_YAML_LOOP_DISABLED = CONFIG_YAML.replace(
     "  auto_loop: true", "  auto_loop: false"
 )
 
+# #3208: a second machine capable of the same repo, for the reachability-
+# fallback / --machine redirect tests below.
+CONFIG_YAML_TWO_MACHINES = CONFIG_YAML.replace(
+    "pipeline:",
+    "  - name: server\n"
+    "    host: server.tailnet\n"
+    "    repos: [api]\n"
+    "    repo_paths:\n"
+    "      api: /tmp/api-server\n"
+    "pipeline:",
+)
+
 WORK_BRANCH = "issue-42-feature-x"
 
 
@@ -51,6 +63,13 @@ WORK_BRANCH = "issue-42-feature-x"
 def config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
     p.write_text(CONFIG_YAML)
+    return p
+
+
+@pytest.fixture
+def config_file_two_machines(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_TWO_MACHINES)
     return p
 
 
@@ -123,6 +142,25 @@ def _http_mock(new_id: str = "fix-new") -> MagicMock:
 
 def _run(config_file: Path, *args: str):
     return CliRunner().invoke(main, ["fix", *args, "--config", str(config_file)])
+
+
+@pytest.fixture(autouse=True)
+def _machine_always_reachable(monkeypatch: pytest.MonkeyPatch):
+    """#3208: `coord fix` now probes reachability (`coord.dispatch.
+    select_fix_machine`, via `coord.network.fetch_status`) before picking a
+    machine for either door — the REVIEW-id door (`_dispatch_fix`) and the
+    WORK-id door (`_dispatch_followup`). Every test in this module predates
+    that probe and configures a single ``laptop.tailnet`` host that doesn't
+    actually resolve — default it (and anything else) to reachable so these
+    tests keep exercising what they said they exercise. The unreachable-
+    machine behavior itself is covered where it's introduced (auto_loop /
+    dispatch tests), not duplicated here."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=3.0: StatusResult(data={}),
+    )
 
 
 # ── The acceptance case ──────────────────────────────────────────────────────
@@ -694,3 +732,205 @@ class TestFixFromFailedAcceptanceGate:
         assert result.exit_code == 0, result.output
         assert "Test failure" in captured["briefing"]
         assert "assert 1 == 2" in captured["briefing"]
+
+
+# ── #3208: a failed UAT verdict defaults --guidance instead of demanding it ──
+
+
+class TestFixFromUatFailure:
+    def test_uat_failure_with_force_defaults_guidance_from_uat_reason(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """The board already holds a full write-up of what's wrong
+        (`uat_reason`, from `coord uat --failed` or a customer portal
+        sign-off) — a caller forcing a fix for a UAT failure should not
+        have to retype it via --guidance."""
+        work = _work(
+            test_state="passed", smoke_test="pass",
+            uat_state="failed",
+            uat_reason="Gate-A divergence: empty-cart checkout still shows the old total",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            return {"id": "fix-uat"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--force", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "defaulted to uat_reason" in result.output
+        assert "UAT failure" in captured["briefing"]
+        assert "empty-cart checkout still shows the old total" in captured["briefing"]
+
+    def test_uat_failure_still_needs_force(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """A UAT failure is a fifth door onto `coord fix`, but — unlike a
+        failed test verdict, red CI, or a failed acceptance trust gate — it
+        does not by itself skip the --force gate: nothing here has
+        independently confirmed the PR is red the way those three do."""
+        work = _work(
+            test_state="passed", smoke_test="pass",
+            uat_state="failed", uat_reason="checkout total is wrong",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        result = CliRunner().invoke(
+            main, ["fix", "work-abc", "--config", str(config_file)]
+        )
+        assert result.exit_code != 0
+        assert "expected a failed test" in result.output
+
+    def test_explicit_guidance_overrides_the_uat_reason_default(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        work = _work(
+            test_state="passed", smoke_test="pass",
+            uat_state="failed", uat_reason="checkout total is wrong",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            return {"id": "fix-uat-2"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, [
+                    "fix", "work-abc", "--force",
+                    "--guidance", "Ignore the total; fix the currency symbol instead.",
+                    "--config", str(config_file),
+                ]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "defaulted to uat_reason" not in result.output
+        assert "Ignore the total; fix the currency symbol instead." in captured["briefing"]
+
+
+# ── #3208: redirect a same-branch fix around an unreachable machine ─────────
+
+
+class TestFixMachineRedirect:
+    """The WORK-id door onto `coord fix` (failed test / red CI / acceptance
+    / UAT) must not blindly re-aim at the original worker's machine when
+    it's unreachable — it falls back to another capable, reachable one
+    automatically, or refuses by NAME with a `--machine` hint (#3208)."""
+
+    def test_falls_back_automatically_when_original_is_unreachable(
+        self, config_file_two_machines: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        from coord.network import StatusResult
+
+        work = _work(smoke_test="fail", smoke_test_reason="flaky test")
+        state_mod.save_board(Board(completed=[work]))
+
+        def _status(machine, timeout=3.0):
+            if machine.name == "laptop":
+                return StatusResult(error="timeout")
+            return StatusResult(data={})
+
+        monkeypatch.setattr("coord.network.fetch_status", _status)
+        monkeypatch.setattr(
+            "coord.github_ops.branch_exists_on_remote", lambda *a, **k: True,
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["machine_name"] = proposal.machine_name
+            return {"id": "fix-redirect"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(config_file_two_machines)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "redirecting" in result.output
+        assert "laptop" in result.output
+        assert "server" in result.output
+        assert captured["machine_name"] == "server"
+
+    def test_machine_flag_redirects_explicitly(
+        self, config_file_two_machines: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """--machine pins the dispatch to exactly the named machine, even
+        when the original is reachable — the caller is asserting where to
+        send it."""
+        work = _work(smoke_test="fail", smoke_test_reason="flaky test")
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.github_ops.branch_exists_on_remote", lambda *a, **k: True,
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["machine_name"] = proposal.machine_name
+            return {"id": "fix-explicit"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, [
+                    "fix", "work-abc", "--machine", "server",
+                    "--config", str(config_file_two_machines),
+                ]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["machine_name"] == "server"
+
+    def test_refusal_names_the_unreachable_machine_when_nothing_is_usable(
+        self, config_file_two_machines: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        from coord.network import StatusResult
+
+        work = _work(smoke_test="fail", smoke_test_reason="flaky test")
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.network.fetch_status",
+            lambda machine, timeout=3.0: StatusResult(error="timeout"),
+        )
+
+        result = CliRunner().invoke(
+            main, ["fix", "work-abc", "--config", str(config_file_two_machines)]
+        )
+
+        assert result.exit_code != 0
+        assert "laptop" in result.output
+        assert "server" in result.output
+        assert "--machine" in result.output
+        # The dispatch-level "timed out" message this issue was filed about
+        # must no longer be the ONLY thing on screen — the machine names
+        # and the redirect hint must be there too.
+        assert "cannot dispatch fix" in result.output

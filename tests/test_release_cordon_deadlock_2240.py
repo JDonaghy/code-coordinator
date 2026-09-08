@@ -608,6 +608,7 @@ def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
 
     from coord.auto_loop import _dispatch_fix
     from coord.models import Assignment, Board
+    from coord.network import StatusResult
 
     config = _review_config()
     for name in ("laptop", "server"):
@@ -631,10 +632,15 @@ def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
     mock_http.post.return_value.json.return_value = {"id": "fix-2240"}
     mock_http.post.return_value.raise_for_status = MagicMock()
 
+    # #3208: `_dispatch_fix` now probes reachability before picking a
+    # machine — `laptop.tail`/`server.tail` don't actually resolve, so
+    # without this stub every candidate would look unreachable regardless
+    # of the cordon this test is actually about. Default both reachable.
     with patch("coord.auto_loop.record_dispatched_assignment"):
         result = _dispatch_fix(
             work, "Fix briefing.", board, config, iteration=1,
             http_client=mock_http,
+            status_fetcher=lambda machine, timeout=3.0: StatusResult(data={}),
         )
 
     assert result is not None, (
