@@ -45,6 +45,7 @@ from coord.events import (
     EventSource,
     build_events_route,
 )
+from coord.events import _format_log_event as _format_agent_log_sse_event
 from coord.board_schema import BoardDriveQueueEntry
 from coord.board_service import read_board, write_board
 from coord.drive_queue import (
@@ -682,6 +683,55 @@ def _fetch_agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0)
         return resp.json()
     except Exception:
         return None
+
+
+# #3195: GET /api/assignment/{id}/log proxy tuning — the same defaults the
+# agent's own /stream/{id} (coord/events.py's stream_assignment_log) uses for
+# its poll cadence and keepalive, so a live leg feels the same whether the
+# TUI talks to the agent directly or coord-web talks to it through here.
+_LOG_PROXY_POLL_INTERVAL_S = 1.0
+_LOG_PROXY_KEEPALIVE_S = 15.0
+# After this many consecutive network failures reaching the owning agent,
+# give up and tell the client rather than polling forever — an agent that's
+# down for maintenance must not turn into an SSE stream that hangs open with
+# no signal.
+_LOG_PROXY_MAX_CONSECUTIVE_ERRORS = 5
+_LOG_PROXY_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+def _fetch_agent_log(
+    host: str,
+    assignment_id: str,
+    since: int,
+    port: int = AGENT_PORT,
+    timeout: float = 10.0,
+) -> tuple[int, bytes, dict]:
+    """Synchronous ``GET /logs/{id}?since=N`` against an agent — safe to call
+    from a thread executor (#3195).
+
+    Returns ``(status_code, body, headers)``. ``status_code`` is ``0`` for a
+    network-level failure (agent host unreachable) — distinct from an actual
+    HTTP status the agent returned — so the SSE proxy loop above can tell
+    "the agent said no" from "we couldn't even ask it" and retry the latter
+    a bounded number of times instead of surfacing it as a hard 404.
+    """
+    try:
+        resp = httpx.get(
+            f"http://{host}:{port}/logs/{assignment_id}",
+            params={"since": since} if since else None,
+            timeout=timeout,
+        )
+        return (
+            resp.status_code,
+            resp.content,
+            {k.lower(): v for k, v in resp.headers.items()},
+        )
+    except httpx.HTTPError:
+        return 0, b"", {}
 
 
 async def _poll_once(
@@ -1778,6 +1828,50 @@ def openapi_spec() -> dict:
                     "200": {"description": "OK"},
                     "404": {"description": "Assignment/branch/repo not found"},
                     "500": {"description": "gh lookup failed"},
+                },
+            }
+        },
+        "/api/assignment/{id}/log": {
+            "get": {
+                "summary": (
+                    "#3195: stream an assignment's turn-by-turn NDJSON log "
+                    "(SSE), proxied from the owning agent's GET /logs/{id}"
+                ),
+                "description": (
+                    "The dashboard already knows which machine owns an "
+                    "assignment (board state) — the caller never passes "
+                    "one. Streams `text/event-stream`: `event: log` frames "
+                    "carry the agent's NDJSON log bytes verbatim (never "
+                    "reparsed here — a second parser here would drift from "
+                    "the TUI's own turn-by-turn rendering), a final "
+                    "`event: end` frame closes the stream once the "
+                    "assignment reaches a terminal status, and "
+                    "`event: error` reports an agent-side failure. The "
+                    "`id:` on each frame is a byte offset usable as "
+                    "`Last-Event-ID` (or a `?since=` query param) to "
+                    "resume a dropped connection. A finished assignment "
+                    "still gets its whole log back, as the first frame."
+                ),
+                "parameters": [
+                    _dashboard_path_param("id", "assignment id"),
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer"},
+                        "description": (
+                            "byte offset to resume from — same cursor as "
+                            "Last-Event-ID"
+                        ),
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "text/event-stream"},
+                    "404": {
+                        "description": (
+                            "Unknown assignment, or no machine recorded for it"
+                        )
+                    },
                 },
             }
         },
@@ -3649,6 +3743,122 @@ def build_app(
         except RuntimeError as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def api_assignment_log(request: Request) -> Response:
+        """GET /api/assignment/{id}/log — #3195: coord-web has no route that
+        reaches an assignment's turn-by-turn log; only the owning agent
+        server does (``GET /logs/{id}``, ``coord/agent_app.py`` — the same
+        seam ``coord log <id> --machine NAME`` reads). This resolves the
+        owning machine from board state (the caller never passes one) and
+        streams the agent's response back as SSE, polling with a byte-offset
+        cursor — the same mechanism the agent's own ``/stream/{id}``
+        (``coord.events.stream_assignment_log``) uses to tail a local file,
+        just polling over HTTP instead of reading bytes off disk directly.
+
+        Parses nothing: each ``event: log`` frame carries the agent's NDJSON
+        log bytes verbatim, via the SAME ``_format_log_event`` framing the
+        agent's own stream uses (imported as ``_format_agent_log_sse_event``)
+        — one answer for "how is a log chunk framed as SSE", not a second
+        implementation that could drift from it. A finished assignment still
+        gets its whole log back, as the very first frame (offset 0 reads the
+        complete file).
+        """
+        assignment_id = request.path_params["id"]
+        board = _read_board()
+        assignment = board.find_by_id(assignment_id)
+        if assignment is None:
+            return JSONResponse({"error": "assignment not found"}, status_code=404)
+
+        since_raw = (
+            request.headers.get("last-event-id")
+            or request.query_params.get("since")
+            or "0"
+        )
+        try:
+            start_offset = max(0, int(since_raw))
+        except ValueError:
+            start_offset = 0
+
+        if _fixture is not None:
+            # Seeded log text — never reach a real agent in fixture mode.
+            text = _fixture.log(assignment_id)
+            body_bytes = text.encode("utf-8")
+
+            async def canned():
+                yield b"retry: 2000\n\n"
+                if start_offset < len(body_bytes):
+                    yield _format_agent_log_sse_event(
+                        len(body_bytes),
+                        body_bytes[start_offset:].decode("utf-8", errors="replace"),
+                    )
+                yield f"id: {len(body_bytes)}\nevent: end\ndata: {{}}\n\n".encode("utf-8")
+
+            return StreamingResponse(
+                canned(), media_type="text/event-stream", headers=_LOG_PROXY_SSE_HEADERS
+            )
+
+        machine = next(
+            (m for m in config.machines if m.name == assignment.machine_name), None
+        )
+        if machine is None:
+            return JSONResponse(
+                {"error": f"no machine recorded for assignment {assignment_id!r}"},
+                status_code=404,
+            )
+        host = machine.host
+
+        async def stream():
+            offset = start_offset
+            yield b"retry: 2000\n\n"
+            loop = asyncio.get_running_loop()
+            last_yield = time.monotonic()
+            consecutive_errors = 0
+            while True:
+                if await request.is_disconnected():
+                    return
+                status_code, body, headers = await loop.run_in_executor(
+                    None, _fetch_agent_log, host, assignment_id, offset
+                )
+                if status_code == 404:
+                    yield (
+                        f"id: {offset}\nevent: error\ndata: "
+                        f"{json.dumps({'error': 'no log file for this assignment'})}\n\n"
+                    ).encode("utf-8")
+                    return
+                if status_code != 200:
+                    # Covers both a real non-200 from the agent and the `0`
+                    # sentinel `_fetch_agent_log` returns for a network
+                    # failure — bounded retries either way, then a clean
+                    # error frame instead of a stream that hangs forever.
+                    consecutive_errors += 1
+                    if consecutive_errors > _LOG_PROXY_MAX_CONSECUTIVE_ERRORS:
+                        yield (
+                            f"id: {offset}\nevent: error\ndata: "
+                            f"{json.dumps({'error': f'agent unreachable (last status {status_code})'})}\n\n"
+                        ).encode("utf-8")
+                        return
+                    await asyncio.sleep(_LOG_PROXY_POLL_INTERVAL_S)
+                    continue
+                consecutive_errors = 0
+                if body:
+                    offset += len(body)
+                    yield _format_agent_log_sse_event(
+                        offset, body.decode("utf-8", errors="replace")
+                    )
+                    last_yield = time.monotonic()
+                    continue
+                agent_status = headers.get("x-coord-log-status", "")
+                if agent_status not in ("running", "pending", ""):
+                    yield f"id: {offset}\nevent: end\ndata: {{}}\n\n".encode("utf-8")
+                    return
+                if time.monotonic() - last_yield >= _LOG_PROXY_KEEPALIVE_S:
+                    yield b": keepalive\n\n"
+                    last_yield = time.monotonic()
+                await asyncio.sleep(_LOG_PROXY_POLL_INTERVAL_S)
+
+        return StreamingResponse(
+            stream(), media_type="text/event-stream", headers=_LOG_PROXY_SSE_HEADERS
+        )
+
     async def api_pipeline(request: Request) -> JSONResponse:
         """GET /api/pipeline — return PipelineView for every type='work' assignment.
 
@@ -5170,6 +5380,7 @@ def build_app(
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),
+        Route("/api/assignment/{id}/log", api_assignment_log, methods=["GET"]),
         Route("/api/chat", api_chat, methods=["POST"]),
         Route("/api/pipeline", api_pipeline, methods=["GET"]),
         Route(
