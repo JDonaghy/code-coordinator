@@ -54,6 +54,7 @@ from coord.models import (
     Assignment,
     Board,
     Machine,
+    Repo,
     coordinator_owned_docs,
     trust_issue_closed_for,
 )
@@ -1757,6 +1758,7 @@ def build_review_briefing(
     review_provider: str | None = None,
     completion_summary: str | None = None,
     commit_messages: list[str] | None = None,
+    gate_a_exempt_warning: str | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -1858,6 +1860,19 @@ def build_review_briefing(
     embed" discipline as ``MAX_CLAUDE_MD_CHARS``/``truncate_diff_text`` above,
     since a multi-round fix-review branch can otherwise grow this section
     without bound.
+
+    *gate_a_exempt_warning* (#3202) is the pre-computed
+    :func:`coord.acceptance.gate_a_exempt_warning` text for this issue's
+    milestone, or ``None`` when the milestone has no Gate-A contract, its
+    manifest exempts no issues, or the fetch failed — this function stays
+    pure and never fetches the manifest/contract itself, matching every
+    other pre-fetched-by-the-caller input above (*diff_text*, *sealed_paths*,
+    ...). When given, an advisory (non-blocking) section is rendered so the
+    reviewer sees the same trade-off text the pre-dispatch guard and
+    ``coord doctor``/``coord gates`` show — this is deliberately never a
+    mandatory ``request-changes`` banner: exempting acceptance slices on a
+    milestone with a signed contract can be the right call, this only makes
+    sure the reviewer is not the last human interposed in the loop.
     """
 
     lines: list[str] = []
@@ -2117,6 +2132,24 @@ def build_review_briefing(
                 "suggestion, regardless of assignment type."
             )
 
+    if gate_a_exempt_warning:
+        # #3202: advisory only — never a mandatory request-changes banner,
+        # unlike the sealed-path/coordinator-doc sections above. Exempting
+        # acceptance slices on a milestone with a signed Gate-A contract can
+        # be the right call; this just makes sure the reviewer sees the same
+        # trade-off text the pre-dispatch guard and `coord doctor`/`coord
+        # gates` show, instead of the contract's behaviours going unverified
+        # by anything but a human at the UAT gate with nobody having said so.
+        lines.append("")
+        lines.append("## Gate-A contract exempts acceptance slices (#3202)")
+        lines.append("")
+        lines.append(gate_a_exempt_warning)
+        lines.append(
+            "Not a blocking finding on its own — note it in your review "
+            "(non-blocking) so it's visible, rather than silently passing "
+            "over it."
+        )
+
     lines.append("")
     lines.append("## What to do")
     lines.append("")
@@ -2335,6 +2368,83 @@ def _resolve_pr_base_branch(
         milestone_number = fetch_milestone(repo.github, completed.issue_number)
         base_branch = resolve_base_branch(repo, milestone_number)
     return base_branch
+
+
+def _fetch_gate_a_exempt_warning(
+    repo: Repo,
+    config: Config,
+    milestone_number: int | None,
+    *,
+    file_fetcher=None,
+) -> str | None:
+    """(#3202) Fetch *milestone_number*'s manifest + Gate-A contract and, if
+    the manifest exempts one or more issues from needing an acceptance
+    slice, return the canonical :func:`coord.acceptance.gate_a_exempt_warning`
+    text for the reviewer's briefing — or ``None`` when there's nothing to
+    warn about, or nothing to check at all.
+
+    Fail-open like every other best-effort fetch this module makes ahead of
+    :func:`build_review_briefing` (``review_head_sha``, ``review_patch_id``
+    above): a missing manifest/contract, a repo with no acceptance driver
+    configured, no milestone on the issue, or a transient network hiccup all
+    return ``None`` rather than raise — this is an advisory surfacing, never
+    a gate, so a fetch failure must never affect whether or how a review is
+    dispatched.
+
+    ``exempt:`` is milestone-level and lives only in the legacy single
+    ``manifest.(yml|yaml|json)`` file, never a per-issue
+    ``manifest.d/`` fragment (see ``coord.acceptance``'s
+    ``MANIFEST_FRAGMENTS_DIRNAME`` comment: "rare, hand-edited... stays a
+    single shared file by choice"), so only that file needs checking here —
+    unlike a full manifest load, no fragment merge is needed.
+    """
+    if milestone_number is None or not config.acceptance.has_driver(repo.name):
+        return None
+
+    from coord.acceptance import (  # noqa: PLC0415
+        gate_a_contract_candidates,
+        gate_a_exempt_exposure,
+        gate_a_exempt_warning,
+        ms_dirname,
+        parse_manifest_text,
+        search_roots_for_repo,
+    )
+
+    fetch = file_fetcher or github_ops.get_repo_file
+
+    manifest_data = None
+    for root in search_roots_for_repo(config, repo.name):
+        ms_dir = f"{root.rstrip('/')}/{ms_dirname(milestone_number)}"
+        for ext in (".yml", ".yaml", ".json"):
+            try:
+                text = fetch(repo.github, f"{ms_dir}/manifest{ext}", repo.default_branch)
+            except Exception:  # noqa: BLE001 — this extension/root doesn't exist
+                continue
+            try:
+                manifest_data = parse_manifest_text(
+                    text, source=f"{ms_dir}/manifest{ext}"
+                )
+            except Exception:  # noqa: BLE001 — malformed manifest: fail open
+                manifest_data = None
+            break
+        if manifest_data is not None:
+            break
+
+    if manifest_data is None or not manifest_data.exempt:
+        return None
+
+    contract_text: str | None = None
+    for path in gate_a_contract_candidates(config, repo.name, milestone_number):
+        try:
+            contract_text = fetch(repo.github, path, repo.default_branch)
+            break
+        except Exception:  # noqa: BLE001 — try the next candidate root
+            continue
+
+    exposure = gate_a_exempt_exposure(milestone_number, manifest_data, contract_text)
+    if exposure is None:
+        return None
+    return gate_a_exempt_warning(exposure)
 
 
 def open_pr_for_completed_work(
@@ -2663,6 +2773,7 @@ def dispatch_review(
     commit_messages_fetcher=None,
     compare_files_fetcher=None,
     compare_diff_fetcher=None,
+    gate_a_manifest_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -2718,6 +2829,13 @@ def dispatch_review(
     tips), can't carry that same staleness, so it is the arbiter: any file
     *diff_fetcher* claims that a fresh compare doesn't corroborate makes its
     whole diff untrustworthy, and the compare's own diff replaces it outright.
+
+    *gate_a_manifest_fetcher* is an optional ``(repo_github: str, path: str,
+    branch: str) -> str`` callable (#3202), the ``file_fetcher`` passed
+    through to :func:`_fetch_gate_a_exempt_warning`. Defaults to
+    :func:`coord.github_ops.get_repo_file`; inject a stub in tests so this
+    advisory lookup never shells out to a live ``gh``. Entirely fail-open —
+    see that function's docstring.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -3210,6 +3328,30 @@ def dispatch_review(
         # repo actually configuring coordinator_only_files.
         coordinator_doc_paths = coordinator_owned_docs(repo)
 
+        # #3202: advisory-only surfacing — does this issue's milestone carry
+        # a Gate-A contract AND exempt one or more issues from the
+        # acceptance-slice gate? Fetched independently of `base_branch`
+        # above: the acceptance driver / Gate-A machinery applies whether or
+        # not the repo opted into the `develop_branch` git model, so this
+        # can't reuse that milestone lookup. Cheap no-op (no `gh` call) for
+        # every repo with no acceptance driver configured at all.
+        _fetch_ms = milestone_fetcher or _fetch_issue_milestone_number
+        try:
+            _gate_a_milestone_number = (
+                _fetch_ms(repo.github, completed.issue_number)
+                if config.acceptance.has_driver(repo.name)
+                else None
+            )
+        except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+            _gate_a_milestone_number = None
+        try:
+            gate_a_exempt_warning_text = _fetch_gate_a_exempt_warning(
+                repo, config, _gate_a_milestone_number,
+                file_fetcher=gate_a_manifest_fetcher,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+            gate_a_exempt_warning_text = None
+
         # #3180: short-circuit BEFORE spending a review leg. `build_review_
         # briefing` below would compute this exact same check purely to
         # decide which paragraph to print in the reviewer's prompt — the
@@ -3314,6 +3456,7 @@ def dispatch_review(
                 assignment_type=completed.type,
                 completion_summary=completed.completion_summary,
                 commit_messages=commit_messages,
+                gate_a_exempt_warning=gate_a_exempt_warning_text,
             )
 
             payload = {

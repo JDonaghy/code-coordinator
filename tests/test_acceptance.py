@@ -10,6 +10,7 @@ import pytest
 from coord.acceptance import (
     ACCEPTANCE_DIRNAME,
     ForPathResolutionError,
+    GateAExemptExposure,
     MANIFEST_FRAGMENTS_DIRNAME,
     MOCK_EXT_TO_DRIVER_KIND,
     ManifestData,
@@ -22,16 +23,20 @@ from coord.acceptance import (
     classify_expected_red_clear_result,
     clear_expected_red_entries,
     clear_expected_red_via_pr,
+    count_declared_behaviours,
     dump_manifest_error_hint,
     expected_red_failure_summary,
     failure_summary,
     find_ms_manifest_for_issue_via_api,
     gate_a_contract_candidates,
     gate_a_contract_path,
+    gate_a_exempt_exposure,
+    gate_a_exempt_warning,
     issue_dirname,
     list_expected_red_via_api,
     load_expected_red,
     load_manifest,
+    manifest_exempt_generated_comment,
     missing_expected_red_warning,
     ms_dir_for_issue,
     oracle_loop_contract_block,
@@ -1727,3 +1732,276 @@ class TestResolveForPath:
             )
         assert "--no-acceptance" in str(exc.value)
         assert "--for-path" in str(exc.value)
+
+
+# ── #3202: Gate-A exempt-exposure warning ────────────────────────────────────
+
+
+class TestCountDeclaredBehaviours:
+    """#3202: heuristic distinct-bold-label count anchoring one behaviour
+    each — matching both known contract dialects: this repo's own
+    ``**§4a**`` (tests/acceptance/ms-51/contract.md) and the
+    format-converter ms-1 incident's ``**B4**``."""
+
+    def test_counts_distinct_labels(self) -> None:
+        text = "**B1** does X.\n**B2** does Y.\n**B3** does Z.\n"
+        assert count_declared_behaviours(text) == 3
+
+    def test_dedupes_a_label_referenced_twice(self) -> None:
+        text = "**B1** does X. Later, **B1** is referenced again in a footnote."
+        assert count_declared_behaviours(text) == 1
+
+    def test_matches_section_style_labels(self) -> None:
+        text = "- **§1a** An h1.\n- **§1b** A count.\n- **§2a** A tablist.\n"
+        assert count_declared_behaviours(text) == 3
+
+    def test_empty_text_returns_zero(self) -> None:
+        assert count_declared_behaviours("") == 0
+
+    def test_text_with_no_labels_returns_zero(self) -> None:
+        assert count_declared_behaviours("Just prose, no labels here.") == 0
+
+    def test_long_bold_phrase_is_not_mistaken_for_a_label(self) -> None:
+        text = "**This is a long bold phrase, not a behaviour label**"
+        assert count_declared_behaviours(text) == 0
+
+
+class TestGateAExemptExposure:
+    """#3202: the core detection — does a milestone's manifest exempt any
+    issue from the acceptance-slice gate, and if so, what does its Gate-A
+    contract declare?"""
+
+    def test_none_when_manifest_exempts_nothing(self) -> None:
+        manifest = ManifestData(exempt=frozenset())
+        assert gate_a_exempt_exposure(1, manifest, "**B1** x") is None
+
+    def test_exposure_when_manifest_exempts_issues(self) -> None:
+        manifest = ManifestData(exempt=frozenset({6, 2, 4}))
+        exposure = gate_a_exempt_exposure(
+            1, manifest, "**B1** x\n**B2** y\n**B3** z\n"
+        )
+        assert exposure == GateAExemptExposure(
+            milestone_number=1, exempt_issues=(2, 4, 6), behaviour_count=3,
+        )
+
+    def test_missing_contract_text_yields_zero_behaviour_count_not_none(self) -> None:
+        manifest = ManifestData(exempt=frozenset({6}))
+        exposure = gate_a_exempt_exposure(1, manifest, None)
+        assert exposure is not None
+        assert exposure.behaviour_count == 0
+
+
+class TestGateAExemptWarning:
+    """#3202: the single canonical warning text — every surface (the
+    pre-dispatch guard, coord doctor/gates, the reviewer's briefing) renders
+    this exact text rather than re-deriving its own wording ("one question,
+    one answer")."""
+
+    def test_names_milestone_behaviour_count_and_exempt_issues(self) -> None:
+        exposure = GateAExemptExposure(
+            milestone_number=1, exempt_issues=(2, 3, 4), behaviour_count=9,
+        )
+        text = gate_a_exempt_warning(exposure)
+        assert "ms-1" in text
+        assert "9 declared behaviours" in text
+        assert "#2" in text and "#3" in text and "#4" in text
+        assert "3202" in text
+
+    def test_singular_wording_for_one_behaviour_and_one_issue(self) -> None:
+        exposure = GateAExemptExposure(
+            milestone_number=1, exempt_issues=(2,), behaviour_count=1,
+        )
+        text = gate_a_exempt_warning(exposure)
+        assert "1 declared behaviour)" in text
+        assert "exempts 1 issue " in text
+
+    def test_zero_behaviour_count_says_unavailable_rather_than_zero(self) -> None:
+        exposure = GateAExemptExposure(
+            milestone_number=1, exempt_issues=(2,), behaviour_count=0,
+        )
+        text = gate_a_exempt_warning(exposure)
+        assert "0 declared behaviours" not in text
+        assert "count unavailable" in text
+
+
+class TestManifestExemptGeneratedComment:
+    """#3202: "say it in the manifest too" — the generated comment block a
+    human/agent editing an ``exempt:`` list is expected to paste alongside
+    it, making the trade explicit rather than an unstated side effect."""
+
+    def test_comment_names_milestone_behaviour_count_and_issues(self) -> None:
+        exposure = GateAExemptExposure(
+            milestone_number=7, exempt_issues=(10, 11), behaviour_count=5,
+        )
+        comment = manifest_exempt_generated_comment(exposure)
+        assert all(
+            line.startswith("#") for line in comment.splitlines() if line.strip()
+        )
+        assert "ms-7" in comment
+        assert "5 behaviour" in comment
+        assert "#10" in comment and "#11" in comment
+        assert "3202" in comment
+
+    def test_zero_behaviour_count_says_unknown_number(self) -> None:
+        exposure = GateAExemptExposure(
+            milestone_number=7, exempt_issues=(10,), behaviour_count=0,
+        )
+        comment = manifest_exempt_generated_comment(exposure)
+        assert "an unknown number of" in comment
+
+
+class TestDiagnoseGateAExemptExposureLines:
+    """#3202: coord.diagnose's ``coord doctor``/``coord gates``-facing
+    wrapper must reuse coord.acceptance's detection + wording verbatim (one
+    question, one answer) rather than re-deriving either."""
+
+    def test_empty_when_nothing_exempted(self) -> None:
+        from coord.diagnose import gate_a_exempt_exposure_lines
+
+        manifest = ManifestData(exempt=frozenset())
+        assert gate_a_exempt_exposure_lines(1, manifest, "**B1** x") == []
+
+    def test_matches_coord_acceptance_wording_verbatim(self) -> None:
+        from coord.diagnose import gate_a_exempt_exposure_lines
+
+        manifest = ManifestData(exempt=frozenset({2, 3}))
+        contract = "**B1** x\n**B2** y\n"
+        lines = gate_a_exempt_exposure_lines(5, manifest, contract)
+        exposure = gate_a_exempt_exposure(5, manifest, contract)
+        assert lines == [gate_a_exempt_warning(exposure)]
+
+
+class TestBuildReviewBriefingGateAExemptWarning:
+    """#3202: the reviewer's briefing renders the pre-computed warning as an
+    advisory section — never a mandatory request-changes banner, unlike the
+    sealed-path/coordinator-doc sections."""
+
+    def _briefing(self, **kwargs) -> str:
+        from coord.config import ReviewsConfig
+        from coord.review import build_review_briefing
+
+        base = dict(
+            pr_number=1,
+            pr_url="https://example.test/pr/1",
+            repo_github="acme/api",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Some issue",
+            issue_body="body",
+            branch="issue-42-x",
+            worker_machine="laptop",
+            same_as_worker=False,
+            reviews_cfg=ReviewsConfig(),
+            repo_claude_md=None,
+        )
+        base.update(kwargs)
+        return build_review_briefing(**base)
+
+    def test_no_section_when_warning_is_none(self) -> None:
+        briefing = self._briefing(gate_a_exempt_warning=None)
+        assert "3202" not in briefing
+
+    def test_advisory_section_rendered_when_warning_given(self) -> None:
+        warning_text = "⚠️ ms-1 has a Gate-A contract ... (#3202)"
+        briefing = self._briefing(gate_a_exempt_warning=warning_text)
+        assert "## Gate-A contract exempts acceptance slices (#3202)" in briefing
+        assert warning_text in briefing
+        assert "Not a blocking finding on its own" in briefing
+
+
+class TestFetchGateAExemptWarning:
+    """#3202: dispatch_review's own manifest+contract fetch ahead of the
+    reviewer's briefing — fail-open in every direction, since this is an
+    advisory surfacing that must never affect whether a review dispatches."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self, *, has_driver: bool = True) -> Config:
+        drivers = (
+            {"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            if has_driver else {}
+        )
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    @staticmethod
+    def _refuse_to_fetch(*_a, **_k):
+        raise AssertionError("should not fetch when short-circuited")
+
+    def test_none_when_repo_has_no_driver(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(has_driver=False), 5,
+            file_fetcher=self._refuse_to_fetch,
+        )
+        assert result is None
+
+    def test_none_when_milestone_number_is_none(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), None,
+            file_fetcher=self._refuse_to_fetch,
+        )
+        assert result is None
+
+    def test_none_when_manifest_has_no_exempt_list(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "tests: {}\n"
+            raise RuntimeError("not found")
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), 5, file_fetcher=fetch,
+        )
+        assert result is None
+
+    def test_none_when_no_manifest_found_at_all(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        def fetch(repo_github, path, branch):
+            raise RuntimeError("404")
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), 5, file_fetcher=fetch,
+        )
+        assert result is None
+
+    def test_warning_built_from_manifest_and_contract(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [2, 3]\n"
+            if path.endswith("contract.md"):
+                return "**B1** x\n**B2** y\n"
+            raise RuntimeError("not found")
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), 5, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "ms-5" in result
+        assert "#2" in result and "#3" in result
+        assert "2 declared behaviours" in result
+
+    def test_missing_contract_still_warns_with_unavailable_count(self) -> None:
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [2]\n"
+            raise RuntimeError("404")
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), 5, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "count unavailable" in result
