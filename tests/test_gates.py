@@ -841,3 +841,108 @@ class TestGateAExemptNote:
         board = Board(active=[], completed=[work])
         report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=None)
         assert not any("3202" in n for n in report.notes)
+
+
+class _FakeGhWithExemptDep(_FakeGhWithGateA):
+    """#3212: adds the third OPTIONAL ``GhOps`` method
+    ``_exempt_dependency_notes_for_winner`` needs (``issue_is_closed``) on
+    top of ``_FakeGhWithGateA``'s ``get_issue``/``get_repo_file`` stubs."""
+
+    def __init__(
+        self, *, milestone_number: int | None, files: dict[str, str],
+        closed_issues: frozenset[int] = frozenset(),
+    ) -> None:
+        super().__init__(milestone_number=milestone_number, files=files)
+        self.closed_issues = closed_issues
+
+    def issue_is_closed(self, repo: str, issue_number: int) -> bool:
+        return issue_number in self.closed_issues
+
+
+class TestExemptDependencyNote:
+    """#3212: ``coord gates`` surfacing an ``exempt:`` entry whose
+    justification names another issue as covering it (``covered_by:``, or a
+    plain entry's inline ``#M`` comment) when that promise is unmet — the
+    format-converter ms-1 incident one hop further: #6 was exempted "covered
+    by #2", #2 merged with zero spec files, and nothing ever re-checked
+    that. Sibling to :class:`TestGateAExemptNote` above."""
+
+    def _config_with_driver(self) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+
+    def test_note_appended_when_covering_issue_still_open(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithExemptDep(
+            milestone_number=1,
+            files={
+                "tests/acceptance/ms-1/manifest.yml": (
+                    "exempt:\n  - 6  # One-page UI -- covered by the harness #2 stands up\n"
+                ),
+            },
+            closed_issues=frozenset(),  # #2 never closed
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        note = next((n for n in report.notes if "3212" in n), None)
+        assert note is not None, report.notes
+        assert "#6" in note and "#2" in note
+        assert "has not landed" in note
+
+    def test_no_note_when_covering_issue_closed(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithExemptDep(
+            milestone_number=1,
+            files={
+                "tests/acceptance/ms-1/manifest.yml": (
+                    "exempt:\n  - 6  # One-page UI -- covered by the harness #2 stands up\n"
+                ),
+            },
+            closed_issues=frozenset({2}),
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        assert not any("3212" in n for n in report.notes)
+
+    def test_no_note_when_exempt_entry_names_no_dependency(self) -> None:
+        """A bare `exempt: [6]` with no comment naming another issue has
+        nothing to check — must not fabricate a dependency out of thin air."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithExemptDep(
+            milestone_number=1,
+            files={"tests/acceptance/ms-1/manifest.yml": "exempt: [6]\n"},
+            closed_issues=frozenset(),
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        assert not any("3212" in n for n in report.notes)
+
+    def test_no_note_when_gh_ops_lacks_issue_is_closed(self) -> None:
+        """`_FakeGhWithGateA` (used by every #3202 test above) has neither
+        this method — must degrade to a silent no-op, never an
+        ``AttributeError``, and must never fall back to a live `gh` call."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        gh = _FakeGhWithGateA(
+            milestone_number=1,
+            files={
+                "tests/acceptance/ms-1/manifest.yml": (
+                    "exempt:\n  - 6  # covered by #2\n"
+                ),
+            },
+        )
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=gh)
+        assert not any("3212" in n for n in report.notes)
+
+    def test_no_note_when_gh_ops_is_none(self) -> None:
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=None)
+        assert not any("3212" in n for n in report.notes)

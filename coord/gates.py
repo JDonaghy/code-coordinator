@@ -373,6 +373,55 @@ def _gate_a_exempt_note_for_winner(
         return None
 
 
+def _exempt_dependency_notes_for_winner(
+    issue_number: int, repo_cfg, config: "Config | None", gh_ops: "GhOps | None",
+) -> list[str]:
+    """(#3212) ``coord gates``-facing surfacing of an exemption whose
+    justification names another issue as covering it, when that promise is
+    unmet — a milestone's manifest saying "#6 needs no acceptance slice,
+    covered by #2" is only true once #2 has actually landed (and produced
+    its declared artifact, if any); nothing previously re-checked that.
+
+    Sibling to :func:`_gate_a_exempt_note_for_winner` immediately above: same
+    "resolve the milestone via a live ``get_issue`` lookup against
+    *issue_number*" approach, delegating detection entirely to
+    :func:`coord.acceptance.fetch_exempt_dependency_warnings` so this never
+    re-derives the manifest fetch or the unmet-dependency check
+    independently (the same one-fetch-and-detect-seam discipline #3202's
+    module note in ``coord/acceptance.py`` already established).
+
+    ``[]`` (nothing to append) under the same conditions
+    :func:`_gate_a_exempt_note_for_winner` bails on, plus: *gh_ops* doesn't
+    implement ``issue_is_closed`` — the dependency check itself has nothing
+    to run against, so this must not silently fall back to a live ``gh``
+    call a test double never opted into (every existing ``FakeGh`` predates
+    this method, same as ``get_issue``/``get_repo_file`` above). Fail-open on
+    any error: advisory only, never worth failing ``coord gates`` over.
+    """
+    if config is None or repo_cfg is None or not config.acceptance.has_driver(repo_cfg.name):
+        return []
+    get_issue = getattr(gh_ops, "get_issue", None)
+    file_fetcher = getattr(gh_ops, "get_repo_file", None)
+    issue_is_closed = getattr(gh_ops, "issue_is_closed", None)
+    if get_issue is None or file_fetcher is None or issue_is_closed is None:
+        return []
+    try:
+        issue_data = get_issue(repo_cfg.github, issue_number) or {}
+        milestone = issue_data.get("milestone") or {}
+        milestone_number = milestone.get("number") if isinstance(milestone, dict) else None
+        if milestone_number is None:
+            return []
+
+        from coord.acceptance import fetch_exempt_dependency_warnings  # noqa: PLC0415
+
+        return fetch_exempt_dependency_warnings(
+            config, repo_cfg, milestone_number,
+            file_fetcher=file_fetcher, issue_is_closed=issue_is_closed,
+        )
+    except Exception:  # noqa: BLE001 — advisory only, never break `coord gates`
+        return []
+
+
 def build_gate_report(
     board: "Board",
     config: "Config",
@@ -434,6 +483,9 @@ def build_gate_report(
     gate_a_exempt_note = _gate_a_exempt_note_for_winner(issue_number, repo_cfg, config, gh_ops)
     if gate_a_exempt_note:
         report.notes.append(gate_a_exempt_note)
+    report.notes.extend(
+        _exempt_dependency_notes_for_winner(issue_number, repo_cfg, config, gh_ops)
+    )
 
     if not winner.branch:
         report.notes.append(
