@@ -238,6 +238,89 @@ def test_stale_concurrent_rebuild_is_never_published(
 # ── #1597: single-flight rebuild + serialize-once ────────────────────────────
 
 
+# Bound for the barrier below.  Generous on purpose: it is only ever reached
+# when the build genuinely never starts (a real bug), so a large value costs
+# a passing run nothing and buys a loaded runner all the slack it needs.
+_BUILD_START_TIMEOUT = 30.0
+
+
+async def _await_single_flight_barrier(started, *, timeout: float = _BUILD_START_TIMEOUT) -> None:
+    """Block until the single in-flight ``_build()`` has reached its
+    instrumented hook (``started``) AND every follower request has had ample
+    event-loop turns to queue behind it — the precondition each single-flight
+    test needs before it releases the build.
+
+    A fixed ``await asyncio.sleep(0.2)`` used to stand in for both halves of
+    that, and it flaked on CI: ``_build()`` runs on a threadpool worker via
+    ``run_in_threadpool``, so on a loaded 2-core runner in the middle of a
+    ~20-minute suite that worker is not guaranteed to be *scheduled* — let
+    alone to reach ``board_projection()`` — within 200 ms of the requests
+    being created.  When it wasn't, ``assert started.is_set()`` fired against
+    perfectly correct single-flight behaviour ("the build never started"),
+    the build was never released, and the run went red for a timing budget
+    rather than a defect.
+
+    Waiting on the event itself removes that wall-clock cliff and is also
+    *faster* on an idle machine (the build typically starts in single-digit
+    milliseconds).  The follower half no longer depends on wall clock at
+    all: followers make progress purely by taking event-loop turns (the
+    ASGI transport does no real I/O and never blocks), so yielding the loop
+    a fixed number of times is the property that actually matters — a
+    sleep only ever bought turns indirectly.
+    """
+    import asyncio  # noqa: PLC0415
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not started.is_set():
+        assert loop.time() < deadline, (
+            f"the build never started within {timeout:.0f}s"
+        )
+        await asyncio.sleep(0.005)
+    # The leader is in flight and pinned there (it can't finish until the
+    # caller sets `release`).  Hand the loop back repeatedly so every
+    # follower task runs all the way into `board()` and parks on the
+    # leader's future before the caller releases the build — a follower that
+    # arrived *after* the build finished would start a second one and break
+    # the "exactly one build" assertion these tests exist to make.
+    for _ in range(200):
+        await asyncio.sleep(0)
+
+
+def test_single_flight_barrier_tolerates_a_slow_to_start_build() -> None:
+    """Guard on the barrier itself: a build that takes far longer than the
+    old fixed 200 ms budget to reach ``board_projection()`` — the CI reality
+    that made the three tests below flaky — must be waited for, not failed."""
+    import asyncio
+    import threading
+
+    started = threading.Event()
+
+    async def _run() -> None:
+        # Fires an order of magnitude past the old 0.2 s barrier, from a real
+        # worker thread, exactly like the threadpool build it stands in for.
+        threading.Timer(2.0, started.set).start()
+        await _await_single_flight_barrier(started)
+        assert started.is_set()
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=_BUILD_START_TIMEOUT))
+
+
+def test_single_flight_barrier_still_fails_when_the_build_never_starts() -> None:
+    """...and the barrier keeps its teeth: an event that never fires is a
+    real defect and must still surface as a failure, not a hang."""
+    import asyncio
+    import threading
+
+    never = threading.Event()
+
+    async def _run() -> None:
+        await _await_single_flight_barrier(never, timeout=0.05)
+
+    with pytest.raises(AssertionError, match="the build never started"):
+        asyncio.run(_run())
+
+
 def test_board_single_flight_rebuild_runs_once(
     detail_db: Path, valid_config_path: Path, monkeypatch
 ) -> None:
@@ -262,7 +345,12 @@ def test_board_single_flight_rebuild_runs_once(
         nonlocal call_count
         call_count += 1
         started.set()
-        assert release.wait(timeout=5), "test driver never released the build"
+        # Generous bound (the driver releases within milliseconds of seeing
+        # `started`): this is a deadlock guard, not a timing assertion, and a
+        # tight one is just a second wall-clock cliff on a loaded runner.
+        assert release.wait(timeout=_BUILD_START_TIMEOUT), (
+            "test driver never released the build"
+        )
         return original_projection(self)
 
     monkeypatch.setattr(SqliteStore, "board_projection", slow_projection)
@@ -275,10 +363,9 @@ def test_board_single_flight_rebuild_runs_once(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
-            # Give every caller a beat to reach the daemon and queue up
-            # behind the single in-flight build before it's released.
-            await asyncio.sleep(0.2)
-            assert started.is_set(), "the build never started"
+            # Let the single build actually get in flight, and every caller
+            # queue up behind it, before it's released.
+            await _await_single_flight_barrier(started)
             release.set()
             return await asyncio.gather(*tasks)
 
@@ -318,7 +405,12 @@ def test_board_single_flight_failure_reaches_all_waiters(
         nonlocal call_count
         call_count += 1
         started.set()
-        assert release.wait(timeout=5), "test driver never released the build"
+        # Generous bound (the driver releases within milliseconds of seeing
+        # `started`): this is a deadlock guard, not a timing assertion, and a
+        # tight one is just a second wall-clock cliff on a loaded runner.
+        assert release.wait(timeout=_BUILD_START_TIMEOUT), (
+            "test driver never released the build"
+        )
         raise RuntimeError("boom")
 
     monkeypatch.setattr(SqliteStore, "board_projection", failing_projection)
@@ -331,8 +423,7 @@ def test_board_single_flight_failure_reaches_all_waiters(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
-            await asyncio.sleep(0.2)
-            assert started.is_set(), "the build never started"
+            await _await_single_flight_barrier(started)
             release.set()
             return await asyncio.gather(*tasks)
 
@@ -385,7 +476,12 @@ def test_board_single_flight_survives_non_board_read_error(
         nonlocal call_count
         call_count += 1
         started.set()
-        assert release.wait(timeout=5), "test driver never released the build"
+        # Generous bound (the driver releases within milliseconds of seeing
+        # `started`): this is a deadlock guard, not a timing assertion, and a
+        # tight one is just a second wall-clock cliff on a loaded runner.
+        assert release.wait(timeout=_BUILD_START_TIMEOUT), (
+            "test driver never released the build"
+        )
         raise RuntimeError("boom-not-a-board-read-error")
 
     monkeypatch.setattr(GateSnapshotRefresher, "snapshot", failing_snapshot)
@@ -398,8 +494,7 @@ def test_board_single_flight_survives_non_board_read_error(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
-            await asyncio.sleep(0.2)
-            assert started.is_set(), "the build never started"
+            await _await_single_flight_barrier(started)
             release.set()
             return await asyncio.gather(*tasks, return_exceptions=True)
 
