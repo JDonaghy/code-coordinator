@@ -887,6 +887,163 @@ def dump_manifest_error_hint(acceptance_root: Path) -> str:
     )
 
 
+# ── #3202: Gate-A contract exempt-exposure warning ──────────────────────────
+#
+# A milestone can carry a Gate-A contract (the customer-facing behaviour
+# spec a human signed off on, docs/ORACLE_LOOP.md) while ALSO exempting some
+# or all of its issues from the acceptance-slice gate via manifest.yml's
+# `exempt:` list (the #1138 issue-level opt-out — see `ManifestData`'s
+# docstring above). Each is individually reasonable — the decomposition may
+# judge the work not oracle-shaped, and the contract may exist only because
+# a customer needed a design round — but the combination means NOTHING
+# checks the contract's behaviours except a human at the UAT gate, one step
+# before merge. The format-converter ms-1 incident (#3202) shipped a UI with
+# no source pane at all, contradicting the approved mock's primary screen,
+# through Review, CI and unit tests, caught only by a human looking.
+#
+# Neither side refuses the combination — a refusal here would just get
+# worked around, and it is sometimes the right call. This only makes the
+# trade VISIBLE, with the SAME wording, at every seam that reads this state:
+# the pre-dispatch guard that suggests the exemption in the first place,
+# `coord doctor`/`coord gates` for a milestone already in that state, and
+# the reviewer's own briefing (`coord.review.build_review_briefing`).
+# `gate_a_exempt_warning` below is the single canonical text every one of
+# those seams renders — never re-derive the wording independently, or a
+# future edit updates one copy and silently leaves the others stale (the
+# same "one question, one answer" discipline as #3180's mechanical-verdict
+# helpers in `coord.review`).
+
+_BEHAVIOUR_LABEL_RE = re.compile(r"\*\*(§\d+[a-zA-Z]?|[A-Za-z]{1,3}\d{1,3})\*\*")
+
+
+def count_declared_behaviours(contract_text: str) -> int:
+    """Best-effort count of individually-labelled behaviours in a Gate-A
+    ``contract.md``'s prose (#3202).
+
+    Every contract this codebase has authored anchors one assertable
+    behaviour with a short bold label — ``**§4a**`` (this repo's own
+    ``tests/acceptance/ms-51/contract.md``) or ``**B4**`` (the
+    format-converter ms-1 incident #3202 describes) — so a distinct-label
+    count is a reasonable proxy for "how much of this contract exists"
+    without this module needing to parse, or agree on, one fixed markdown
+    dialect across repos. Labels are deduplicated (a label referenced
+    twice — e.g. once in prose and again in a footnote — counts once).
+
+    Returns ``0`` for text with no such labels — a contract written in some
+    other style, an empty string, or no contract at all — rather than
+    falling back to a heading count or another guess: ``0`` is a visible
+    "this heuristic found nothing", not a silently wrong number.
+    """
+    if not contract_text:
+        return 0
+    return len({m.group(1) for m in _BEHAVIOUR_LABEL_RE.finditer(contract_text)})
+
+
+@dataclass(frozen=True)
+class GateAExemptExposure:
+    """One milestone's #3202 exposure: it exempts one or more issues from
+    the acceptance-slice gate, so a Gate-A contract's behaviours go
+    unverified by anything but UAT for that exempted work.
+
+    Built by :func:`gate_a_exempt_exposure`; a caller that wants the
+    canonical detection rule applied should go through that function rather
+    than constructing this directly — it is the one place "does this
+    milestone have this exposure" is answered (see the module note above).
+    """
+
+    milestone_number: int
+    exempt_issues: "tuple[int, ...]"
+    #: :func:`count_declared_behaviours` applied to the milestone's
+    #: contract.md, or ``0`` when the contract couldn't be fetched/parsed —
+    #: see that function's docstring for why ``0`` is left visible rather
+    #: than hidden behind a fallback guess.
+    behaviour_count: int
+
+
+def gate_a_exempt_exposure(
+    milestone_number: int,
+    manifest: ManifestData,
+    contract_text: str | None,
+) -> "GateAExemptExposure | None":
+    """Detect #3202's exposure for one milestone: does *manifest* exempt any
+    issue from the acceptance-slice gate at all?
+
+    Returns ``None`` when ``manifest.exempt`` is empty — the ordinary case,
+    nothing to warn about. *contract_text* is optional: pass ``None`` when
+    the contract couldn't be fetched (every caller here is fail-open) and
+    the returned exposure just carries ``behaviour_count=0`` rather than
+    blocking detection on a fetch that failed.
+
+    This function does not itself decide whether a Gate-A contract exists
+    for *milestone_number* — callers are expected to only reach this once
+    they already know one does (the same "only call this once contract.md
+    exists" precondition every other Gate-A-gated check in this module
+    already applies, e.g. :func:`gate_a_contract_candidates`'s callers).
+    """
+    if not manifest.exempt:
+        return None
+    return GateAExemptExposure(
+        milestone_number=milestone_number,
+        exempt_issues=tuple(sorted(manifest.exempt)),
+        behaviour_count=count_declared_behaviours(contract_text or ""),
+    )
+
+
+def gate_a_exempt_warning(exposure: GateAExemptExposure) -> str:
+    """The single canonical #3202 warning text for *exposure* — rendered
+    verbatim (never re-derived) by every surface that reads this state: the
+    pre-dispatch guard's exemption suggestion, ``coord doctor``/``coord
+    gates``, the reviewer's briefing (``coord.review.build_review_briefing``),
+    and :func:`manifest_exempt_generated_comment` below.
+    """
+    n = len(exposure.exempt_issues)
+    issues_str = ", ".join(f"#{i}" for i in exposure.exempt_issues)
+    behaviours_str = (
+        f"{exposure.behaviour_count} declared behaviour"
+        f"{'s' if exposure.behaviour_count != 1 else ''}"
+        if exposure.behaviour_count
+        else "declared behaviours (count unavailable)"
+    )
+    return (
+        f"⚠️ ms-{exposure.milestone_number} has a Gate-A contract "
+        f"({behaviours_str}) but exempts {n} issue{'s' if n != 1 else ''} "
+        f"({issues_str}) from acceptance slices — nothing but a human at the "
+        "UAT gate verifies the contract's behaviours for that work (#3202). "
+        "This can be the right call (the work may not be oracle-shaped), but "
+        "make it deliberately, not as a silent side effect of the exempt: "
+        "list."
+    )
+
+
+def manifest_exempt_generated_comment(exposure: GateAExemptExposure) -> str:
+    """Generated ``#`` comment block (#3202) recording, in the manifest
+    itself, exactly what an ``exempt:`` list trades away — so the next
+    person reading ``manifest.yml`` sees the consequence stated in writing,
+    rather than an unstated side effect of a bare list of issue numbers.
+
+    Pure text generation; this module never auto-edits a hand-maintained
+    manifest (``exempt:`` is "rare, hand-edited" — see the
+    :data:`MANIFEST_FRAGMENTS_DIRNAME` comment above) — a caller (a human
+    author, or `coord acceptance author` tooling) is responsible for
+    actually inserting the returned text next to the ``exempt:`` block.
+    """
+    issues_str = ", ".join(f"#{i}" for i in exposure.exempt_issues)
+    behaviours = (
+        f"{exposure.behaviour_count}" if exposure.behaviour_count
+        else "an unknown number of"
+    )
+    return (
+        "# ── #3202: this exempts the contract's behaviours from verification ──\n"
+        f"# ms-{exposure.milestone_number}'s Gate-A contract declares "
+        f"{behaviours} behaviour(s).\n"
+        f"# This exempt: list opts {issues_str} out of authoring an "
+        "acceptance slice, so none\n"
+        "# of those behaviours are checked by anything but a human at the "
+        "UAT gate for\n"
+        "# that work. Confirmed intentional, not an oversight.\n"
+    )
+
+
 def acceptance_capability_gap(
     capability: str, repo_name: str, config: Config,
 ) -> Machine | None:
