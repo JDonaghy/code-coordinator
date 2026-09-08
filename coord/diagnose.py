@@ -169,6 +169,47 @@ def gate_a_exempt_exposure_lines(
     return [gate_a_exempt_warning(exposure)]
 
 
+# ── #3212: exempt-dependency surfacing ──────────────────────────────────────
+
+
+def exempt_dependency_lines(
+    manifest: "ManifestData",
+    repo_github: str,
+    *,
+    issue_is_closed=None,
+    artifact_root: "Path | None" = None,
+) -> list[str]:
+    """Surfacing (#3212) of every ``exempt:`` entry in *manifest* whose
+    justification names another issue as covering it (``covered_by:``, or a
+    plain entry's inline ``# ... #M`` comment) and that promise is unmet —
+    sibling to :func:`gate_a_exempt_exposure_lines` above, same "caller
+    already has the manifest in hand" shape (a future ``coord doctor``
+    per-milestone pass; ``coord gates``/the reviewer's briefing instead go
+    through :func:`coord.acceptance.fetch_exempt_dependency_warnings`, which
+    owns the fetch this function doesn't need).
+
+    Returns ``[]`` when *manifest* declares no dependencies at all. Delegates
+    detection AND wording to :func:`coord.acceptance.verify_exempt_dependency`
+    / :func:`coord.acceptance.unmet_exempt_dependency_warnings` rather than
+    re-deriving either here — the same "never a second copy" discipline
+    :func:`gate_a_exempt_exposure_lines` already documents for its own pair.
+    """
+    from coord.acceptance import (  # noqa: PLC0415
+        unmet_exempt_dependency_warnings,
+        verify_exempt_dependency,
+    )
+
+    if not manifest.exempt_deps:
+        return []
+    statuses = [
+        verify_exempt_dependency(
+            dep, repo_github, issue_is_closed=issue_is_closed, artifact_root=artifact_root,
+        )
+        for dep in manifest.exempt_deps.values()
+    ]
+    return unmet_exempt_dependency_warnings(statuses)
+
+
 # ── stage / assignment resolution ───────────────────────────────────────────
 
 

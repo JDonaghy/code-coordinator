@@ -9,6 +9,8 @@ import pytest
 
 from coord.acceptance import (
     ACCEPTANCE_DIRNAME,
+    ExemptDependency,
+    ExemptDependencyStatus,
     ForPathResolutionError,
     GateAExemptExposure,
     MANIFEST_FRAGMENTS_DIRNAME,
@@ -25,8 +27,10 @@ from coord.acceptance import (
     clear_expected_red_via_pr,
     count_declared_behaviours,
     dump_manifest_error_hint,
+    exempt_dependency_warning,
     expected_red_failure_summary,
     failure_summary,
+    fetch_exempt_dependency_warnings,
     fetch_gate_a_exempt_warning,
     find_ms_manifest_for_issue_via_api,
     gate_a_contract_candidates,
@@ -38,12 +42,15 @@ from coord.acceptance import (
     load_expected_red,
     load_manifest,
     manifest_exempt_generated_comment,
+    merge_manifest_data,
     missing_expected_red_warning,
     ms_dir_for_issue,
     oracle_loop_contract_block,
     parse_manifest_text,
     resolve_for_path,
     search_roots_for_repo,
+    unmet_exempt_dependency_warnings,
+    verify_exempt_dependency,
 )
 # Aliased on import: pytest treats any module-level `test_*` name as a
 # collectible test function, and `test_ids_for_issue` takes required
@@ -286,6 +293,77 @@ class TestParseManifestText:
         data = parse_manifest_text("exempt: 1125\n")
         assert data.exempt == frozenset()
 
+    def test_no_comment_no_dependency_inferred(self) -> None:
+        """A plain `exempt:` entry with no trailing comment (the common
+        case) has nothing to infer -- exempt_deps stays empty."""
+        data = parse_manifest_text("exempt: [1125, 1130]\n")
+        assert data.exempt_deps == {}
+
+    def test_comment_naming_another_issue_inferred_as_dependency(self) -> None:
+        """#3212: the exact format-converter ms-1 shape -- a plain integer
+        entry whose trailing comment names a different issue is read as
+        that issue's exemption deferring coverage to the named one."""
+        data = parse_manifest_text(
+            "exempt:\n  - 6  # One-page UI -- covered by the harness #2 stands up\n"
+        )
+        assert data.exempt == frozenset({6})
+        assert data.exempt_deps == {
+            6: ExemptDependency(issue=6, covered_by=2, artifact=None, source="comment")
+        }
+
+    def test_comment_naming_itself_not_a_dependency(self) -> None:
+        """A comment that only references the SAME issue number (e.g. a
+        cross-link, not a coverage claim) must not be misread as self-
+        covering -- nothing to infer."""
+        data = parse_manifest_text("exempt:\n  - 6  # see #6 for context\n")
+        assert data.exempt_deps == {}
+
+    def test_first_issue_reference_in_comment_wins(self) -> None:
+        data = parse_manifest_text(
+            "exempt:\n  - 6  # covered by #2, follow-up tracked in #9\n"
+        )
+        assert data.exempt_deps[6].covered_by == 2
+
+    def test_structured_exempt_entry_declares_dependency(self) -> None:
+        """#3212's suggested structured shape:
+        `{issue: N, covered_by: M, artifact: "glob"}`."""
+        data = parse_manifest_text(
+            "exempt:\n"
+            "  - issue: 6\n"
+            "    covered_by: 2\n"
+            '    artifact: "tests/**/*.spec.ts"\n'
+        )
+        assert data.exempt == frozenset({6})
+        assert data.exempt_deps == {
+            6: ExemptDependency(
+                issue=6, covered_by=2, artifact="tests/**/*.spec.ts", source="declared",
+            )
+        }
+
+    def test_structured_entry_without_covered_by_has_no_dependency(self) -> None:
+        """A structured entry can still just be a bare exemption -- only
+        `covered_by` turns it into a checkable promise."""
+        data = parse_manifest_text("exempt:\n  - issue: 6\n")
+        assert data.exempt == frozenset({6})
+        assert data.exempt_deps == {}
+
+    def test_structured_entry_wins_over_comment_inference(self) -> None:
+        """A declared `covered_by` is authoritative -- a plain-entry comment
+        guess must never override it (mixed list, same manifest)."""
+        data = parse_manifest_text(
+            "exempt:\n"
+            "  - issue: 6\n"
+            "    covered_by: 2\n"
+            "  - 7  # covered by #3\n"
+        )
+        assert data.exempt_deps[6] == ExemptDependency(issue=6, covered_by=2, source="declared")
+        assert data.exempt_deps[7] == ExemptDependency(issue=7, covered_by=3, source="comment")
+
+    def test_malformed_structured_entry_missing_issue_ignored(self) -> None:
+        data = parse_manifest_text("exempt:\n  - covered_by: 2\n")
+        assert data.exempt == frozenset()
+        assert data.exempt_deps == {}
+
     def test_empty_text_returns_empty_data(self) -> None:
         assert parse_manifest_text("") == ManifestData()
 
@@ -296,6 +374,30 @@ class TestParseManifestText:
     def test_non_mapping_raises(self) -> None:
         with pytest.raises(ManifestError, match="must be a mapping"):
             parse_manifest_text("- a\n- b\n")
+
+
+class TestMergeManifestDataExemptDeps:
+    """#3212: exempt_deps merges across manifest sources the same
+    per-issue-keyed way expected_red does -- a later source's dependency for
+    the same issue number wins rather than being dropped."""
+
+    def test_deps_union_across_sources(self) -> None:
+        a = parse_manifest_text("exempt:\n  - 6  # covered by #2\n")
+        b = parse_manifest_text("exempt:\n  - 7  # covered by #3\n")
+        merged = merge_manifest_data(a, b)
+        assert merged.exempt == frozenset({6, 7})
+        assert merged.exempt_deps[6].covered_by == 2
+        assert merged.exempt_deps[7].covered_by == 3
+
+    def test_later_source_wins_on_same_issue(self) -> None:
+        a = parse_manifest_text("exempt:\n  - 6  # covered by #2\n")
+        b = parse_manifest_text(
+            "exempt:\n  - issue: 6\n    covered_by: 9\n    artifact: \"x/**\"\n"
+        )
+        merged = merge_manifest_data(a, b)
+        assert merged.exempt_deps[6] == ExemptDependency(
+            issue=6, covered_by=9, artifact="x/**", source="declared",
+        )
 
 
 class TestExpectedRedParsing:
@@ -1905,6 +2007,44 @@ class TestDiagnoseGateAExemptExposureLines:
         assert lines == [gate_a_exempt_warning(exposure)]
 
 
+class TestDiagnoseExemptDependencyLines:
+    """#3212: sibling to ``TestDiagnoseGateAExemptExposureLines`` above —
+    a caller with a manifest already in hand (a future ``coord doctor``
+    per-milestone pass) gets the same detection + wording
+    ``coord.acceptance.verify_exempt_dependency`` computes, never a second
+    copy."""
+
+    def test_empty_when_no_dependencies_declared(self) -> None:
+        from coord.diagnose import exempt_dependency_lines
+
+        manifest = ManifestData(exempt=frozenset({6}))
+        assert exempt_dependency_lines(manifest, "acme/format-converter") == []
+
+    def test_matches_coord_acceptance_wording_verbatim(self) -> None:
+        from coord.diagnose import exempt_dependency_lines
+
+        manifest = parse_manifest_text(
+            "exempt:\n  - 6  # One-page UI -- covered by the harness #2 stands up\n"
+        )
+        lines = exempt_dependency_lines(
+            manifest, "acme/format-converter", issue_is_closed=lambda r, n: False,
+        )
+        status = verify_exempt_dependency(
+            manifest.exempt_deps[6], "acme/format-converter",
+            issue_is_closed=lambda r, n: False,
+        )
+        assert lines == [exempt_dependency_warning(status)]
+
+    def test_empty_when_dependency_met(self) -> None:
+        from coord.diagnose import exempt_dependency_lines
+
+        manifest = parse_manifest_text("exempt:\n  - 6  # covered by #2\n")
+        lines = exempt_dependency_lines(
+            manifest, "acme/format-converter", issue_is_closed=lambda r, n: True,
+        )
+        assert lines == []
+
+
 class TestBuildReviewBriefingGateAExemptWarning:
     """#3202: the reviewer's briefing renders the pre-computed warning as an
     advisory section — never a mandatory request-changes banner, unlike the
@@ -1939,6 +2079,44 @@ class TestBuildReviewBriefingGateAExemptWarning:
         warning_text = "⚠️ ms-1 has a Gate-A contract ... (#3202)"
         briefing = self._briefing(gate_a_exempt_warning=warning_text)
         assert "## Gate-A contract exempts acceptance slices (#3202)" in briefing
+        assert warning_text in briefing
+        assert "Not a blocking finding on its own" in briefing
+
+
+class TestBuildReviewBriefingExemptDependencyWarnings:
+    """#3212: sibling to ``TestBuildReviewBriefingGateAExemptWarning`` above —
+    the reviewer's briefing renders unmet exemption-dependency warnings as
+    their own advisory section, never a mandatory request-changes banner."""
+
+    def _briefing(self, **kwargs) -> str:
+        from coord.config import ReviewsConfig
+        from coord.review import build_review_briefing
+
+        base = dict(
+            pr_number=1,
+            pr_url="https://example.test/pr/1",
+            repo_github="acme/api",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Some issue",
+            issue_body="body",
+            branch="issue-42-x",
+            worker_machine="laptop",
+            same_as_worker=False,
+            reviews_cfg=ReviewsConfig(),
+            repo_claude_md=None,
+        )
+        base.update(kwargs)
+        return build_review_briefing(**base)
+
+    def test_no_section_when_warnings_empty_or_none(self) -> None:
+        assert "3212" not in self._briefing(exempt_dependency_warnings=None)
+        assert "3212" not in self._briefing(exempt_dependency_warnings=[])
+
+    def test_advisory_section_rendered_when_warnings_given(self) -> None:
+        warning_text = "⚠️ #6's acceptance-slice exemption ... (#3212)"
+        briefing = self._briefing(exempt_dependency_warnings=[warning_text])
+        assert "## An acceptance exemption's promise is unmet (#3212)" in briefing
         assert warning_text in briefing
         assert "Not a blocking finding on its own" in briefing
 
@@ -2060,6 +2238,67 @@ class TestFetchGateAExemptWarning:
         assert result is None
 
 
+class TestFetchExemptDependencyWarningsWrapper:
+    """#3212: ``coord.review._fetch_exempt_dependency_warnings`` — sibling to
+    ``TestFetchGateAExemptWarning`` above, the thin wrapper
+    :func:`coord.review.dispatch_review` calls ahead of the reviewer's
+    briefing."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self, *, has_driver: bool = True) -> Config:
+        drivers = (
+            {"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            if has_driver else {}
+        )
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_none_when_repo_has_no_driver(self) -> None:
+        from coord.review import _fetch_exempt_dependency_warnings
+
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch when short-circuited")
+
+        result = _fetch_exempt_dependency_warnings(
+            self._repo(), self._config(has_driver=False), 5, file_fetcher=refuse,
+        )
+        assert result == []
+
+    def test_reports_unmet_dependency(self) -> None:
+        from coord.review import _fetch_exempt_dependency_warnings
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt:\n  - 6  # covered by #2\n"
+            raise RuntimeError("not found")
+
+        result = _fetch_exempt_dependency_warnings(
+            self._repo(), self._config(), 5,
+            file_fetcher=fetch, issue_is_closed=lambda r, n: False,
+        )
+        assert len(result) == 1
+        assert "#6" in result[0] and "#2" in result[0]
+
+    def test_empty_when_dependency_met(self) -> None:
+        from coord.review import _fetch_exempt_dependency_warnings
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt:\n  - 6  # covered by #2\n"
+            raise RuntimeError("not found")
+
+        result = _fetch_exempt_dependency_warnings(
+            self._repo(), self._config(), 5,
+            file_fetcher=fetch, issue_is_closed=lambda r, n: True,
+        )
+        assert result == []
+
+
 class TestAcceptanceFetchGateAExemptWarning:
     """#3202: :func:`coord.acceptance.fetch_gate_a_exempt_warning` is now the
     single fetch-and-detect seam ``coord.review._fetch_gate_a_exempt_warning``
@@ -2126,3 +2365,213 @@ class TestAcceptanceFetchGateAExemptWarning:
             self._config(), self._repo(), 5, file_fetcher=fetch,
         )
         assert result is None
+
+
+# ── #3212: exempt-dependency verification ───────────────────────────────────
+
+
+class TestVerifyExemptDependency:
+    """#3212: the core check -- does an exemption's promise actually hold?
+    Reproduces the format-converter ms-1 incident directly: #6 exempted
+    "covered by #2", #2 merged, but produced zero spec files."""
+
+    def _dep(self, **kw) -> ExemptDependency:
+        return ExemptDependency(issue=6, covered_by=2, **kw)
+
+    def test_unmet_when_covering_issue_not_closed(self) -> None:
+        status = verify_exempt_dependency(
+            self._dep(), "acme/format-converter", issue_is_closed=lambda r, n: False,
+        )
+        assert status.covered_by_closed is False
+        assert status.artifact_found is None  # no artifact declared: not checked
+        assert status.unmet is True
+
+    def test_met_when_covering_issue_closed_and_no_artifact_declared(self) -> None:
+        status = verify_exempt_dependency(
+            self._dep(), "acme/format-converter", issue_is_closed=lambda r, n: True,
+        )
+        assert status.covered_by_closed is True
+        assert status.artifact_found is None
+        assert status.unmet is False
+
+    def test_unmet_when_closed_but_declared_artifact_missing(self, tmp_path: Path) -> None:
+        """The exact #3212 incident: #2 closed (merged), but never produced
+        the spec files its exemption's promise named."""
+        (tmp_path / "tests").mkdir()
+        status = verify_exempt_dependency(
+            self._dep(artifact="tests/**/*.spec.ts"),
+            "acme/format-converter",
+            issue_is_closed=lambda r, n: True,
+            artifact_root=tmp_path,
+        )
+        assert status.covered_by_closed is True
+        assert status.artifact_found is False
+        assert status.unmet is True
+
+    def test_met_when_closed_and_artifact_present(self, tmp_path: Path) -> None:
+        specs = tmp_path / "tests" / "e2e"
+        specs.mkdir(parents=True)
+        (specs / "one_page.spec.ts").write_text("test('x', () => {})")
+        status = verify_exempt_dependency(
+            self._dep(artifact="tests/**/*.spec.ts"),
+            "acme/format-converter",
+            issue_is_closed=lambda r, n: True,
+            artifact_root=tmp_path,
+        )
+        assert status.artifact_found is True
+        assert status.unmet is False
+
+    def test_artifact_declared_but_no_root_given_fails_closed(self) -> None:
+        """No local checkout in hand (e.g. the GitHub-API-only fetch seam)
+        to glob against, yet an artifact WAS declared -- this must not
+        silently pass the promise; it fails closed to "not found" rather
+        than skipping the check the way an unset ``artifact`` would."""
+        status = verify_exempt_dependency(
+            self._dep(artifact="tests/**/*.spec.ts"),
+            "acme/format-converter",
+            issue_is_closed=lambda r, n: True,
+            artifact_root=None,
+        )
+        assert status.artifact_found is False
+        assert status.unmet is True
+
+    def test_defaults_to_real_github_ops_issue_is_closed(self, monkeypatch) -> None:
+        """No injected fetcher: falls back to
+        ``coord.github_ops.issue_is_closed`` -- the same "did this land"
+        answer every other seam in this codebase uses, never re-derived."""
+        import coord.github_ops as github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+        status = verify_exempt_dependency(self._dep(), "acme/format-converter")
+        assert status.covered_by_closed is True
+
+
+class TestExemptDependencyWarning:
+    def test_names_issue_and_dependency_and_reason(self) -> None:
+        status = ExemptDependencyStatus(
+            dep=ExemptDependency(issue=6, covered_by=2, source="comment"),
+            covered_by_closed=False,
+        )
+        text = exempt_dependency_warning(status)
+        assert "#6" in text and "#2" in text
+        assert "has not landed" in text
+        assert "3212" in text
+        assert "inferred from the exempt: entry's own comment" in text
+
+    def test_declared_source_has_no_inferred_caveat(self) -> None:
+        status = ExemptDependencyStatus(
+            dep=ExemptDependency(issue=6, covered_by=2, source="declared"),
+            covered_by_closed=False,
+        )
+        text = exempt_dependency_warning(status)
+        assert "inferred" not in text
+
+    def test_artifact_missing_reason_named(self) -> None:
+        status = ExemptDependencyStatus(
+            dep=ExemptDependency(
+                issue=6, covered_by=2, artifact="tests/**/*.spec.ts", source="declared",
+            ),
+            covered_by_closed=True,
+            artifact_found=False,
+        )
+        text = exempt_dependency_warning(status)
+        assert "tests/**/*.spec.ts" in text
+        assert "has not landed" not in text  # covering issue DID land
+
+
+class TestUnmetExemptDependencyWarnings:
+    def test_filters_to_only_unmet(self) -> None:
+        met = ExemptDependencyStatus(
+            dep=ExemptDependency(issue=6, covered_by=2), covered_by_closed=True,
+        )
+        unmet = ExemptDependencyStatus(
+            dep=ExemptDependency(issue=7, covered_by=3), covered_by_closed=False,
+        )
+        result = unmet_exempt_dependency_warnings([met, unmet])
+        assert len(result) == 1
+        assert "#7" in result[0] and "#3" in result[0]
+
+    def test_empty_when_nothing_unmet(self) -> None:
+        met = ExemptDependencyStatus(
+            dep=ExemptDependency(issue=6, covered_by=2), covered_by_closed=True,
+        )
+        assert unmet_exempt_dependency_warnings([met]) == []
+
+
+class TestFetchExemptDependencyWarnings:
+    """#3212: the fetch-and-detect seam ``coord gates``/the reviewer's
+    briefing both call, mirroring ``TestAcceptanceFetchGateAExemptWarning``
+    above for the #3202 case."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self, *, has_driver: bool = True) -> Config:
+        drivers = (
+            {"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            if has_driver else {}
+        )
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_none_when_repo_has_no_driver(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch when short-circuited")
+
+        result = fetch_exempt_dependency_warnings(
+            self._config(has_driver=False), self._repo(), 1, file_fetcher=refuse,
+        )
+        assert result == []
+
+    def test_empty_when_milestone_number_is_none(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch when short-circuited")
+
+        result = fetch_exempt_dependency_warnings(
+            self._config(), self._repo(), None, file_fetcher=refuse,
+        )
+        assert result == []
+
+    def test_empty_when_manifest_has_no_exempt_deps(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [6]\n"  # bare, no dependency
+            raise RuntimeError("not found")
+
+        result = fetch_exempt_dependency_warnings(
+            self._config(), self._repo(), 1, file_fetcher=fetch,
+        )
+        assert result == []
+
+    def test_reports_unmet_dependency_from_comment(self) -> None:
+        """The exact format-converter ms-1 manifest text from the issue."""
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return (
+                    "exempt:\n"
+                    "  - 6  # One-page UI -- covered by the harness #2 stands up\n"
+                )
+            raise RuntimeError("not found")
+
+        result = fetch_exempt_dependency_warnings(
+            self._config(), self._repo(), 1,
+            file_fetcher=fetch, issue_is_closed=lambda r, n: False,
+        )
+        assert len(result) == 1
+        assert "#6" in result[0] and "#2" in result[0]
+
+    def test_empty_when_dependency_met(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt:\n  - 6  # covered by #2\n"
+            raise RuntimeError("not found")
+
+        result = fetch_exempt_dependency_warnings(
+            self._config(), self._repo(), 1,
+            file_fetcher=fetch, issue_is_closed=lambda r, n: True,
+        )
+        assert result == []

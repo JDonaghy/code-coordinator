@@ -1759,6 +1759,7 @@ def build_review_briefing(
     completion_summary: str | None = None,
     commit_messages: list[str] | None = None,
     gate_a_exempt_warning: str | None = None,
+    exempt_dependency_warnings: list[str] | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -1873,6 +1874,18 @@ def build_review_briefing(
     mandatory ``request-changes`` banner: exempting acceptance slices on a
     milestone with a signed contract can be the right call, this only makes
     sure the reviewer is not the last human interposed in the loop.
+
+    *exempt_dependency_warnings* (#3212) is the pre-computed
+    :func:`coord.acceptance.fetch_exempt_dependency_warnings` list for this
+    issue's milestone — one entry per ``exempt:`` entry whose justification
+    names another issue as covering it (``covered_by``/inline comment) and
+    that promise is unmet: the named issue hasn't landed, or hasn't produced
+    its declared artifact. Empty/``None`` when there's nothing unmet, or the
+    fetch failed — same pure-function, pre-fetched-by-the-caller contract as
+    *gate_a_exempt_warning* immediately above, and same advisory (never
+    mandatory ``request-changes``) posture: a stale dependency doesn't make
+    THIS diff wrong, it means an earlier exemption's promise wasn't kept, so
+    the reviewer is told rather than asked to act on it.
     """
 
     lines: list[str] = []
@@ -2150,6 +2163,22 @@ def build_review_briefing(
             "over it."
         )
 
+    if exempt_dependency_warnings:
+        # #3212: same advisory posture as the #3202 block above — an unmet
+        # dependency is a fact about an EARLIER exemption, not a defect in
+        # this diff, so it's surfaced, never a mandatory request-changes.
+        lines.append("")
+        lines.append("## An acceptance exemption's promise is unmet (#3212)")
+        lines.append("")
+        for warning in exempt_dependency_warnings:
+            lines.append(warning)
+            lines.append("")
+        lines.append(
+            "Not a blocking finding on its own — note it in your review "
+            "(non-blocking) so it's visible, rather than silently passing "
+            "over it."
+        )
+
     lines.append("")
     lines.append("## What to do")
     lines.append("")
@@ -2394,6 +2423,30 @@ def _fetch_gate_a_exempt_warning(
 
     return fetch_gate_a_exempt_warning(
         config, repo, milestone_number, file_fetcher=file_fetcher,
+    )
+
+
+def _fetch_exempt_dependency_warnings(
+    repo: Repo,
+    config: Config,
+    milestone_number: int | None,
+    *,
+    file_fetcher=None,
+    issue_is_closed=None,
+) -> list[str]:
+    """(#3212) Thin wrapper over
+    :func:`coord.acceptance.fetch_exempt_dependency_warnings` — sibling to
+    :func:`_fetch_gate_a_exempt_warning` immediately above, same "keep a
+    module-level name here so a test can stub it without reaching into
+    ``coord.acceptance``" rationale, and same discipline: this is the only
+    place :func:`build_review_briefing`'s *exempt_dependency_warnings* input
+    gets computed, never re-derived at the call site.
+    """
+    from coord.acceptance import fetch_exempt_dependency_warnings  # noqa: PLC0415
+
+    return fetch_exempt_dependency_warnings(
+        config, repo, milestone_number,
+        file_fetcher=file_fetcher, issue_is_closed=issue_is_closed,
     )
 
 
@@ -2724,6 +2777,7 @@ def dispatch_review(
     compare_files_fetcher=None,
     compare_diff_fetcher=None,
     gate_a_manifest_fetcher=None,
+    exempt_dependency_issue_is_closed_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -2786,6 +2840,16 @@ def dispatch_review(
     :func:`coord.github_ops.get_repo_file`; inject a stub in tests so this
     advisory lookup never shells out to a live ``gh``. Entirely fail-open —
     see that function's docstring.
+
+    *exempt_dependency_issue_is_closed_fetcher* is an optional
+    ``(repo_github: str, issue_number: int) -> bool`` callable (#3212), the
+    ``issue_is_closed`` passed through to
+    :func:`_fetch_exempt_dependency_warnings`. Defaults to
+    :func:`coord.github_ops.issue_is_closed`; inject a stub in tests so this
+    check never shells out to a live ``gh``. Entirely fail-open at the fetch
+    layer (a manifest/parse failure yields no warnings), but the dependency
+    check itself is fail-CLOSED once a manifest is in hand — see
+    :func:`coord.acceptance.verify_exempt_dependency`'s docstring.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -3311,6 +3375,18 @@ def dispatch_review(
         except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
             gate_a_exempt_warning_text = None
 
+        # #3212: same advisory posture, one hop further down the same promise
+        # chain — does this milestone's `exempt:` list defer coverage to
+        # another issue whose delivery was never actually verified?
+        try:
+            exempt_dependency_warnings_text = _fetch_exempt_dependency_warnings(
+                repo, config, _gate_a_milestone_number,
+                file_fetcher=gate_a_manifest_fetcher,
+                issue_is_closed=exempt_dependency_issue_is_closed_fetcher,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+            exempt_dependency_warnings_text = None
+
         # #3180: short-circuit BEFORE spending a review leg. `build_review_
         # briefing` below would compute this exact same check purely to
         # decide which paragraph to print in the reviewer's prompt — the
@@ -3416,6 +3492,7 @@ def dispatch_review(
                 completion_summary=completed.completion_summary,
                 commit_messages=commit_messages,
                 gate_a_exempt_warning=gate_a_exempt_warning_text,
+                exempt_dependency_warnings=exempt_dependency_warnings_text,
             )
 
             payload = {
