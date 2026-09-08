@@ -625,6 +625,23 @@ def test_uat_stage_latest_by_dispatch_wins():
     assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.DONE
 
 
+def test_uat_stage_newest_with_no_verdict_does_not_fall_back_to_stale_pass():
+    """#3210: a same-branch fix round's fresh work row has NO verdict of its
+    own yet — the badge must read PENDING (ask again), never fall through to
+    an older sibling's stale "passed"/"failed". Before this, the function
+    filtered to rows *with* a verdict before picking the latest, so a
+    verdict-less newest row was invisible and an older "passed" resurfaced
+    as DONE for code that had since been rewritten — the same stale-PASS
+    hole `coord.merge_queue.evaluate_uat_verdict` was fixed for, and this
+    badge must never disagree with that gate (#2096: one question, one
+    answer)."""
+    a = [
+        _work(assignment_id="w1", status="done", dispatched_at=1.0, uat_state="passed"),
+        _work(assignment_id="w2", status="done", dispatched_at=2.0, uat_state=None),
+    ]
+    assert sp.uat_stage_status_for(a, is_closed=False, require_plan=False) == sp.PENDING
+
+
 def test_stage_status_for_dispatches_uat_to_dedicated_function():
     """#2951 cause 2: before this branch existed, `stage_status_for` matched
     on `type == "uat"`, which no assignment is ever created with, so the

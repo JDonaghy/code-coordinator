@@ -1179,6 +1179,26 @@ def fix(
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
 
+    # #3210: a same-branch fix is about to rewrite the code on this branch —
+    # any UAT verdict already recorded on `assignment` (passed OR failed)
+    # describes code that is about to be superseded. Clear it back to NULL
+    # (the reset `state._record_uat_verdict_local` already documents, just
+    # never wired to this seam) so `evaluate_uat_verdict` asks for a fresh
+    # look at what actually lands, instead of either replaying a stale FAILED
+    # against a fix that already addressed it (format-converter#6) or —
+    # the dangerous direction — silently clearing the merge gate off a stale
+    # PASSED for code no human has looked at.
+    if assignment.uat_state is not None:
+        from coord.state import record_uat_verdict  # noqa: PLC0415
+
+        prior_uat_state = assignment.uat_state
+        record_uat_verdict(assignment_id=assignment.assignment_id, uat_state=None)
+        click.echo(
+            f"  uat verdict cleared (#3210): {assignment.assignment_id} carried "
+            f"uat_state={prior_uat_state!r} for the pre-fix code — a fresh "
+            "`coord uat` verdict is required before this can merge."
+        )
+
     click.echo(f"Fix-up worker dispatched (assignment {new_id})")
     click.echo(f"  branch: {assignment.branch}")
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")

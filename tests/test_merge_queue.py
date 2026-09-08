@@ -5060,6 +5060,44 @@ class TestUatGate:
         assert ok is False
         assert "regressed" in message
 
+    def test_evaluate_uat_verdict_stale_pass_does_not_survive_a_same_branch_fix(self) -> None:
+        # #3210: the dangerous direction. UAT passed on the original work,
+        # then something else (CI, review, test) sent it back for a
+        # same-branch fix. The fresh fix-round work row carries NO verdict
+        # yet (a real `coord fix` dispatch clears it explicitly — #3210 —
+        # but even a fix round that somehow lands with uat_state=None
+        # untouched must not fall through to the OLDER "passed"). A stale
+        # PASS clearing the gate for a rewrite nobody looked at is a
+        # correctness hole, not a cosmetic annoyance.
+        cfg = self._config()
+        old = self._work("w1", uat_state="passed", dispatched_at=1.0)
+        fix_round = self._work("w2", uat_state=None, dispatched_at=2.0)
+        fix_round.branch = "worker/w1"
+        board = self._board(completed=[old, fix_round])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "uat verdict missing" in message
+        assert "coord uat w2 --passed|--failed" in message
+
+    def test_evaluate_uat_verdict_stale_fail_does_not_survive_a_same_branch_fix(self) -> None:
+        # #3210 (the direction actually observed on format-converter#6): a
+        # FAILED verdict must not keep blocking a fix round that already
+        # addressed it, just because the fix round's own row has no verdict
+        # yet — it should read "missing" (ask again), not replay the old
+        # FAILED reason against code that no longer exists.
+        cfg = self._config()
+        old = self._work(
+            "w1", uat_state="failed", uat_reason="renderLoadedScreen shows binary garbage",
+            dispatched_at=1.0,
+        )
+        fix_round = self._work("w2", uat_state=None, dispatched_at=2.0)
+        fix_round.branch = "worker/w1"
+        board = self._board(completed=[old, fix_round])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is False
+        assert "uat verdict missing" in message
+        assert "renderLoadedScreen" not in message
+
     # ── evaluate_uat_verdict: live preview lookup (#2948) ──
 
     def test_evaluate_uat_verdict_resolves_via_live_deployment_lookup(self) -> None:

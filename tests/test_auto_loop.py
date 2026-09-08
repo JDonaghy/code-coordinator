@@ -407,6 +407,44 @@ class TestProcessReviewCompletion:
             f"branch; got {sent_payload.get('target_branch')!r}"
         )
 
+    def test_request_changes_dispatch_clears_a_stale_uat_verdict(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#3210: a request-changes review is itself proof the branch is
+        about to be rewritten. If the reviewed work already carries a UAT
+        verdict — passed OR failed — it describes code this fix round is
+        about to supersede. Passed is the dangerous direction: left in
+        place, a fix landing on top of it would clear the merge gate for a
+        rewrite nobody has looked at."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "Missing tests for edge case X.\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        work.uat_state = "passed"
+        work.uat_actor = "operator"
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        assert work.uat_state is None
+        assert work.uat_reason is None
+        assert work.uat_actor is None
+
     def test_request_changes_work_not_on_board_returns_no_work_found(
         self, config: Config, tmp_path
     ) -> None:

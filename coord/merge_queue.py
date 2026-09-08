@@ -1075,24 +1075,29 @@ def evaluate_uat_verdict(
     posture as the review gate's :func:`has_approved_review`: a verdict
     this gate exists specifically to force a human to record is never
     assumed to exist merely because the board can't prove otherwise.
+
+    #3210: only the SINGLE most-recently-dispatched work row's own verdict
+    is ever consulted — never an older sibling's, even when the newest row
+    carries no verdict at all. A bounce/fix round rewrites the code, so its
+    own ``uat_state`` (typically ``None`` until someone looks again) is the
+    only thing that can answer "what does UAT say about the branch as it
+    exists RIGHT NOW" — mirrors the same ``branch_work[0]`` read
+    :func:`_run_declared_uat_checks` already relies on (#2096: one question,
+    one answer). The previous implementation searched BACKWARD past a
+    verdict-less newest row for the first older sibling that had one, which
+    silently resurrected a stale verdict — a stale FAILED wrongly blocked
+    already-fixed code (format-converter#6), and the dangerous mirror image
+    is a stale PASSED clearing the gate for a rewrite nobody has reviewed.
     """
     branch_work = _uat_branch_work(entry, board)
     aid = getattr(entry, "assignment_id", None)
     uat_state: str | None = None
     uat_reason: str | None = None
     if branch_work:
-        # Most-recently-dispatched row carrying ANY verdict wins — mirrors
-        # find_scoped_review_candidate's "latest wins" rationale: a bounce/
-        # fix round's fresh work assignment is a new thing for the operator
-        # to look at, so an older sibling's stale verdict must not paper
-        # over it.
-        for a in branch_work:
-            state = getattr(a, "uat_state", None)
-            if state:
-                uat_state = state
-                uat_reason = getattr(a, "uat_reason", None)
-                aid = getattr(a, "assignment_id", None) or aid
-                break
+        newest = branch_work[0]
+        uat_state = getattr(newest, "uat_state", None)
+        uat_reason = getattr(newest, "uat_reason", None)
+        aid = getattr(newest, "assignment_id", None) or aid
     if uat_state == "passed":
         return True, ""
 
