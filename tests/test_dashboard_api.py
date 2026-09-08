@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -3059,3 +3059,210 @@ class TestIssueDetailAPI:
         spec = openapi_spec()
         assert "/api/issue/{repo}/{number}" in spec["paths"]
         assert "get" in spec["paths"]["/api/issue/{repo}/{number}"]
+
+
+class TestAssignmentLogAPI:
+    """``GET /api/assignment/{id}/log`` — #3195: coord-web has no route that
+    reaches an assignment's turn-by-turn log; only the owning agent server
+    does (``GET /logs/{id}``). This proxies that route, resolving the
+    owning machine from board state, and streams it back as SSE.
+    """
+
+    def _board_with_running(self, machine_name: str = "laptop") -> Board:
+        return Board(active=[
+            Assignment(
+                machine_name=machine_name, repo_name="api", issue_number=42,
+                issue_title="Fix auth", assignment_id="work001",
+                status="running",
+            ),
+        ])
+
+    def test_unknown_assignment_returns_404(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
+            r = client.get("/api/assignment/nope/log")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_no_machine_recorded_for_assignment_returns_404(self) -> None:
+        """The assignment is on the board but names a machine that isn't in
+        this dashboard's coordinator.yml — a clean 404, not a crash trying
+        to resolve a host that doesn't exist."""
+        client = _client()
+        board = self._board_with_running(machine_name="a-machine-nobody-configured")
+        with patch("coord.dashboard.server.read_board", return_value=board):
+            r = client.get("/api/assignment/work001/log")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_streams_ndjson_log_as_sse_and_resolves_the_owning_machine(self) -> None:
+        """The proxy must resolve the machine FROM BOARD STATE — the issue's
+        whole point is that the caller never passes one — and must forward
+        the agent's NDJSON bytes verbatim (no reparsing here)."""
+        calls: list[tuple] = []
+
+        def fake_fetch(host, assignment_id, since, port=None, timeout=None):
+            calls.append((host, assignment_id, since))
+            if len(calls) == 1:
+                return 200, b'{"type": "turn", "n": 1}\n', {"x-coord-log-status": "running"}
+            return 200, b"", {"x-coord-log-status": "done"}
+
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_running()),
+            patch("coord.dashboard.server._fetch_agent_log", side_effect=fake_fetch),
+        ):
+            r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        assert 'data: {"type": "turn", "n": 1}' in r.text
+        assert "event: end" in r.text
+        # Resolved "laptop" (the assignment's machine_name) — the configured
+        # machine's host — never something the caller supplied.
+        assert calls[0][0] == "laptop.tailnet"
+        assert calls[0][1] == "work001"
+
+    def test_finished_assignment_still_returns_its_whole_log(self) -> None:
+        """A completed assignment (no `since` in the request) must get the
+        FULL log back as its first frame, not an empty stream — the issue's
+        explicit acceptance bar for a non-live leg."""
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=42,
+                issue_title="Fix auth", assignment_id="work001",
+                status="done", finished_at=1.0,
+            ),
+        ])
+        full_log = '{"type": "turn", "n": 1}\n{"type": "result"}\n'
+        seen_since: list[int] = []
+
+        def fake_fetch(host, assignment_id, since, port=None, timeout=None):
+            seen_since.append(since)
+            if since == 0:
+                return 200, full_log.encode("utf-8"), {"x-coord-log-status": "done"}
+            return 200, b"", {"x-coord-log-status": "done"}
+
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server._fetch_agent_log", side_effect=fake_fetch),
+        ):
+            r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert '{"type": "turn", "n": 1}' in r.text
+        assert '{"type": "result"}' in r.text
+        assert "event: end" in r.text
+        assert seen_since[0] == 0  # no ?since= given -> starts from the top
+
+    def test_since_query_param_is_forwarded_as_the_resume_cursor(self) -> None:
+        calls: list[int] = []
+
+        def fake_fetch(host, assignment_id, since, port=None, timeout=None):
+            calls.append(since)
+            return 200, b"", {"x-coord-log-status": "done"}
+
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_running()),
+            patch("coord.dashboard.server._fetch_agent_log", side_effect=fake_fetch),
+        ):
+            r = client.get("/api/assignment/work001/log?since=128")
+
+        assert r.status_code == 200
+        assert calls[0] == 128
+
+    def test_agent_reports_unknown_assignment_as_an_sse_error_event(self) -> None:
+        """The agent itself 404s (assignment untracked and no conventional
+        log file) — surfaced as an `event: error` frame, not a bare proxy
+        crash."""
+        def fake_fetch(host, assignment_id, since, port=None, timeout=None):
+            return 404, b"", {}
+
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_running()),
+            patch("coord.dashboard.server._fetch_agent_log", side_effect=fake_fetch),
+        ):
+            r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert "event: error" in r.text
+
+    def test_agent_unreachable_gives_up_after_bounded_retries(self) -> None:
+        """#2096: a gate (here, the stream) must be able to fail — an agent
+        that's simply down for maintenance must not turn into an SSE stream
+        that hangs open forever with no signal. `_fetch_agent_log`'s `0`
+        sentinel (network error) is retried a bounded number of times, then
+        surfaced as an error frame."""
+        def fake_fetch(host, assignment_id, since, port=None, timeout=None):
+            return 0, b"", {}
+
+        client = _client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_running()),
+            patch("coord.dashboard.server._fetch_agent_log", side_effect=fake_fetch),
+            patch("asyncio.sleep", new=AsyncMock(return_value=None)),
+        ):
+            r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert "event: error" in r.text
+        assert "unreachable" in r.text
+
+    def test_fixture_mode_serves_the_seeded_log_never_a_real_agent(self) -> None:
+        """#3195: coord-web's e2e boots a real `coord web --fixture`, so this
+        route must work from the same fixture files as every other route —
+        and must never shell out to a real agent while doing it."""
+        from coord.dashboard.fixture import parse_fixture
+
+        fixture = parse_fixture({
+            "board": {"assignments": [
+                {
+                    "machine_name": "laptop", "repo_name": "api",
+                    "issue_number": 42, "issue_title": "Fix auth",
+                    "assignment_id": "work001", "status": "done",
+                },
+            ]},
+            "logs": {"work001": '{"type": "turn", "n": 1}\n{"type": "result"}\n'},
+        })
+
+        def _boom(*a, **k):
+            raise AssertionError("fixture mode reached a real agent")
+
+        with patch("coord.dashboard.server._fetch_agent_log", side_effect=_boom):
+            client = TestClient(build_app(fixture.config(None), fixture=fixture))
+            r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert '{"type": "turn", "n": 1}' in r.text
+        assert '{"type": "result"}' in r.text
+        assert "event: end" in r.text
+
+    def test_fixture_mode_unseeded_log_ends_cleanly_with_no_content(self) -> None:
+        from coord.dashboard.fixture import parse_fixture
+
+        fixture = parse_fixture({
+            "board": {"assignments": [
+                {
+                    "machine_name": "laptop", "repo_name": "api",
+                    "issue_number": 42, "issue_title": "Fix auth",
+                    "assignment_id": "work001", "status": "done",
+                },
+            ]},
+        })
+        client = TestClient(build_app(fixture.config(None), fixture=fixture))
+        r = client.get("/api/assignment/work001/log")
+
+        assert r.status_code == 200
+        assert "event: log" not in r.text
+        assert "event: end" in r.text
+
+    def test_route_appears_in_the_served_openapi_spec(self) -> None:
+        """Same #78-shaped guard as ``TestIssueDetailAPI`` above — a route
+        the served spec doesn't list can't be verified by coord-web's
+        contract test."""
+        spec = openapi_spec()
+        assert "/api/assignment/{id}/log" in spec["paths"]
+        assert "get" in spec["paths"]["/api/assignment/{id}/log"]

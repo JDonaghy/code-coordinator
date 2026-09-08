@@ -48,6 +48,7 @@ Fixture schema (every key optional except ``board``)::
       "report_results":  {"issue-activity": {...coord.reports.ReportResult.to_dict()...}},
       "review_findings": {"rev-1": {"verdict": "approve", "body": "..."}},
       "diffs":           {"work-1": "diff --git ..."},
+      "logs":            {"work-1": "{\"type\": \"turn\", ...}\n{\"type\": \"tool\", ...}\n"},
       "chat_reply":      "canned /api/chat response text",
       "events": [ {"after": 0.25, "type": "board_updated", "data": {}} ],
       "autoplay_events": false,     # play the script at startup too (default: no)
@@ -213,6 +214,10 @@ class FixtureServer:
     report_results_raw: dict = field(default_factory=dict)
     review_findings_raw: dict = field(default_factory=dict)
     diffs: dict = field(default_factory=dict)
+    #: #3195: seeded NDJSON log text backing `GET /api/assignment/{id}/log`,
+    #: keyed by assignment id — see `log()`. One canned string per id, same
+    #: convention as `diffs` above.
+    logs: dict = field(default_factory=dict)
     chat_reply: str = "fixture mode: the coordinator assistant is not wired up."
     events: list[ScriptedEvent] = field(default_factory=list)
     autoplay_events: bool = False
@@ -371,6 +376,15 @@ class FixtureServer:
 
     def diff(self, assignment_id: str) -> str:
         return self.diffs.get(assignment_id, "")
+
+    def log(self, assignment_id: str) -> str:
+        """Seeded NDJSON log text for *assignment_id* (#3195), or ``""`` if
+        unseeded — same one-canned-string-per-id shape as :meth:`diff`. A
+        fixture that wants a partial-then-resumed stream seeds the FULL
+        text here; `api_assignment_log`'s fixture branch slices it at the
+        client's requested `since` offset itself, exactly like the live
+        agent-proxy path does with the real file's bytes."""
+        return self.logs.get(assignment_id, "")
 
     def config(self, fallback: Config | None = None) -> Config:
         """Resolve the Config the seeded server runs with.
@@ -606,6 +620,10 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
     if not all(isinstance(v, str) for v in diffs.values()):
         raise FixtureError("fixture 'diffs' values must be strings")
 
+    logs = _as_dict(raw.get("logs"), "logs")
+    if not all(isinstance(v, str) for v in logs.values()):
+        raise FixtureError("fixture 'logs' values must be strings")
+
     report_catalogue_raw = raw.get("report_catalogue")
     if report_catalogue_raw is not None and not isinstance(report_catalogue_raw, dict):
         raise FixtureError(
@@ -646,6 +664,7 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
         report_results_raw=report_results_raw,
         review_findings_raw=_as_dict(raw.get("review_findings"), "review_findings"),
         diffs=diffs,
+        logs=logs,
         events=_parse_events(raw.get("events")),
         autoplay_events=bool(raw.get("autoplay_events", False)),
         now=now,
