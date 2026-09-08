@@ -8,6 +8,8 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from coord.uat_checks import UatCheckConfig
+
 # #316: pattern that distinguishes a file-path value for `new_issue_guidance`
 # from inline markdown text.  Matches paths like `docs/ISSUE_GUIDANCE.md` or
 # `GUIDANCE.txt` but not multi-line or space-containing strings.
@@ -154,6 +156,16 @@ class Repo:
     # URL of any kind and must be read from the GitHub Deployment the CI
     # action creates per PR (`coord.github_ops.get_pr_deployment_url`).
     uat_live_preview: bool = False
+    # #3198: declared, machine-checkable UAT assertions -- the third way to
+    # satisfy the UAT gate, alongside an operator's `coord uat --passed` and
+    # a customer's portal sign-off (#3188). `None` (the default) means "no
+    # declared checks" -- the gate stays exactly as human as it always was.
+    # See `coord.uat_checks` for the assertion vocabulary and the safety
+    # rationale, and `coord.merge_queue._run_declared_uat_checks` for how a
+    # passing evaluation is folded into the SAME `uat_state`/`uat_reason`
+    # `coord uat --passed` writes (attributed to `actor="checker"`), so
+    # `evaluate_uat_verdict` never needs to know a third path exists.
+    uat_checks: UatCheckConfig | None = None
 
     def resolve_uat_preview_url(
         self,

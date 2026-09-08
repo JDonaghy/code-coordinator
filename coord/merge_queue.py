@@ -51,7 +51,8 @@ from coord.models import (
     trust_issue_closed_for,
 )
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
-from coord.state import COORD_DIR, dismiss_drive_escalation
+from coord.state import COORD_DIR, dismiss_drive_escalation, record_uat_verdict
+from coord.uat_checks import UatCheckResult, evaluate_uat_checks
 
 _log = logging.getLogger(__name__)
 
@@ -967,6 +968,14 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
     OR ``uat_live_preview`` (opt-in to the live GitHub-Deployment lookup) —
     either one alone is a full opt-in; a repo needs neither to leave the gate
     off, matching the pre-#2948 behaviour of an unset ``uat_preview``.
+
+    #3198: an entry whose issue is listed in the repo's
+    ``uat_checks.exempt`` is never gated at all — not "runs a declared check
+    and auto-passes", genuinely not required, mirroring
+    ``tests/acceptance/ms-NN/manifest.yml``'s ``exempt:`` list for a slice
+    with no user-visible surface. Checked before the opt-in test above so an
+    exempt issue is exempt regardless of which of ``uat_preview``/
+    ``uat_live_preview`` the repo has configured.
     """
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None or config is None:
@@ -976,6 +985,11 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
         return False
     repo = _uat_repo_for(entry, config)
     if repo is None:
+        return False
+    uat_checks_cfg = getattr(repo, "uat_checks", None)
+    if uat_checks_cfg is not None and uat_checks_cfg.is_exempt(
+        getattr(entry, "issue_number", None)
+    ):
         return False
     return bool(repo.uat_preview) or bool(getattr(repo, "uat_live_preview", False))
 
@@ -1098,6 +1112,79 @@ def evaluate_uat_verdict(
         )
     message += f" — run: coord uat {aid or '<assignment-id>'} --passed|--failed"
     return False, message
+
+
+def _run_declared_uat_checks(
+    entry: "QueuedMerge", board, config, gh_ops: "GhOps | None"
+) -> "UatCheckResult | None":
+    """Attempt *entry*'s repo's declared UAT checks (#3198) and, on an
+    all-pass verdict, record it exactly as ``coord uat --passed`` would —
+    attributed to ``actor="checker"`` rather than a person — so the very
+    next :func:`evaluate_uat_verdict` call reads the SAME ``uat_state``/
+    ``uat_reason`` fields it always has, no changes needed there.
+
+    Returns ``None`` when there is nothing to attempt — no repo, no
+    declared checks (or this issue is exempt, or its resolved assertion set
+    is empty), no work assignment to attribute a verdict to, an assignment
+    that ALREADY carries a verdict (human or a prior checker pass — this
+    never overrides one, matching :func:`evaluate_uat_verdict`'s own
+    fail-closed posture), or no preview URL resolves. Returns the
+    :class:`~coord.uat_checks.UatCheckResult` otherwise, whether it passed
+    or failed, so a caller can name the failing assertion in its own block
+    message without :func:`evaluate_uat_verdict` needing to know this third
+    path exists.
+
+    Only ever called from the LIVE (non-dry-run) merge path — a
+    fetch-and-possibly-write side effect has no business running on a
+    read-only plan/status recompute (see :func:`display_error`'s and
+    :func:`_entry_gate_status`'s own docstrings on why those stay I/O-light).
+    """
+    repo = _uat_repo_for(entry, config)
+    if repo is None:
+        return None
+    uat_checks_cfg = getattr(repo, "uat_checks", None)
+    if uat_checks_cfg is None:
+        return None
+    checks = uat_checks_cfg.resolve_for_issue(getattr(entry, "issue_number", None))
+    if checks is None:
+        return None
+
+    branch_work = _uat_branch_work(entry, board)
+    if not branch_work:
+        # Same fail-closed posture as evaluate_uat_verdict: no identifiable
+        # work assignment means no row to attribute a checker verdict to.
+        return None
+    target = branch_work[0]
+    if getattr(target, "uat_state", None):
+        # A verdict already exists — human or an earlier checker pass.
+        # Never silently overwrite it with a fresh auto-check.
+        return None
+
+    preview_url = _resolve_uat_preview_url(entry, config, gh_ops)
+    if not preview_url:
+        return None
+
+    result = evaluate_uat_checks(preview_url, checks)
+    if result.ok:
+        target.uat_state = "passed"
+        target.uat_reason = result.summary
+        target.uat_actor = "checker"
+        try:
+            record_uat_verdict(
+                assignment_id=getattr(target, "assignment_id", None),
+                uat_state="passed",
+                uat_reason=result.summary,
+                actor="checker",
+            )
+        except Exception:  # noqa: BLE001 — the in-memory pass above already
+            # lets THIS merge attempt proceed; the DB write is durability
+            # for future reads, not the source of truth for this attempt.
+            logging.getLogger(__name__).warning(
+                "uat_checks: passed but failed to persist verdict for %s",
+                getattr(target, "assignment_id", None),
+                exc_info=True,
+            )
+    return result
 
 
 # ── Gate-bypass auditing (#1213) ────────────────────────────────────────────
@@ -7161,12 +7248,27 @@ def process(
                 and config is not None
                 and requires_uat(entry, config)
             ):
+                # #3198: before asking a human, give the repo's declared
+                # checks (if any) a chance to auto-pass against the same
+                # preview URL the message below would print. A pass here
+                # writes the SAME uat_state/uat_reason `coord uat --passed`
+                # would, so the evaluate_uat_verdict call immediately after
+                # reads it back like any other recorded verdict.
+                uat_check_result = (
+                    None
+                    if board is None
+                    else _run_declared_uat_checks(entry, board, config, gh_ops)
+                )
                 uat_ok, uat_msg = (
                     (False, "uat verdict required but board unavailable to confirm")
                     if board is None
                     else evaluate_uat_verdict(entry, board, config, gh_ops)
                 )
                 if not uat_ok:
+                    if uat_check_result is not None and not uat_check_result.ok:
+                        uat_msg += (
+                            f" — declared check failed: {uat_check_result.failing}"
+                        )
                     entry.error = uat_msg
                     events.append(MergeEvent(entry, "uat_required", uat_msg))
                     continue  # skip this entry; try the next in the group

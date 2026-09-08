@@ -822,6 +822,87 @@ def test_repo_has_uat_preview_false_when_neither_set():
     assert sp.repo_has_uat_preview("api", config) is False
 
 
+def test_repo_has_uat_preview_false_when_issue_exempt():
+    """#3198: an issue listed under `Repo.uat_checks.exempt` must read as
+    "gate off" on the board — the same answer `coord.merge_queue.
+    requires_uat` now gives — or the badge and the real gate disagree
+    (#2096's split-brain)."""
+    from coord.uat_checks import UatCheckConfig
+
+    config = _StubConfig([
+        Repo(
+            name="api", github="acme/api", uat_preview="https://{branch}.example.dev/",
+            uat_checks=UatCheckConfig(exempt_issues=frozenset({2})),
+        ),
+    ])
+    assert sp.repo_has_uat_preview("api", config, issue_number=2) is False
+
+
+def test_repo_has_uat_preview_true_for_a_non_exempt_issue_in_same_repo():
+    from coord.uat_checks import UatCheckConfig
+
+    config = _StubConfig([
+        Repo(
+            name="api", github="acme/api", uat_preview="https://{branch}.example.dev/",
+            uat_checks=UatCheckConfig(exempt_issues=frozenset({2})),
+        ),
+    ])
+    assert sp.repo_has_uat_preview("api", config, issue_number=3) is True
+
+
+def test_repo_has_uat_preview_exemption_ignored_when_no_issue_number_given():
+    # Backward-compatible default: a caller with no issue in hand degrades
+    # to the pre-#3198 per-repo-only answer rather than exempting nothing
+    # it wasn't asked about.
+    from coord.uat_checks import UatCheckConfig
+
+    config = _StubConfig([
+        Repo(
+            name="api", github="acme/api", uat_preview="https://{branch}.example.dev/",
+            uat_checks=UatCheckConfig(exempt_issues=frozenset({2})),
+        ),
+    ])
+    assert sp.repo_has_uat_preview("api", config) is True
+
+
+def test_board_projection_uat_badge_absent_for_exempt_issue():
+    """End-to-end (#3198): a per-issue-exempt slice must not show a "uat"
+    stage badge at all, mirroring `requires_uat` exempting it from the real
+    merge gate — verified through `compute_board_stage_projection`, not
+    just the helper function, so the two per-issue keys sharing one repo
+    can't quietly collide (see the (repo, issue) cache-key comment)."""
+    from coord.uat_checks import UatCheckConfig
+
+    config = _StubConfig([
+        Repo(
+            name="api", github="acme/api", uat_preview="https://{branch}.example.dev/",
+            uat_checks=UatCheckConfig(exempt_issues=frozenset({2})),
+        ),
+    ])
+    issues = [
+        {"repo_name": "api", "number": 2, "title": "scaffold", "state": "open"},
+        {"repo_name": "api", "number": 3, "title": "real feature", "state": "open"},
+    ]
+    assignments = [
+        _work(issue_number=2, status="done", dispatched_at=1.0),
+        _work(issue_number=3, status="done", dispatched_at=1.0),
+    ]
+    mq_items = [
+        _entry(state="open", branch="issue-2-scaffold", issue_number=2),
+        _entry(state="open", branch="issue-3-feature", issue_number=3),
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=mq_items,
+        default_gates=["test", "review", "uat", "merge"],
+        config=config,
+    )
+    by_issue = {e["issue_number"]: e for e in out}
+    assert "uat" not in by_issue[2]["stages"]
+    assert "uat" in by_issue[3]["stages"]
+
+
 def test_uat_preview_url_for_returns_none_for_uat_live_preview_only_repo():
     """This module does no I/O (see module docstring), so it can't run the
     live GitHub-Deployment lookup `uat_live_preview` opts into — it can only

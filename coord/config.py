@@ -23,6 +23,7 @@ from coord.liveness_auditor import (
 from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
 from coord.platform_paths import default_coord_dir
 from coord.sql import DIALECT_POSTGRES, DIALECT_SQLITE
+from coord.uat_checks import HeaderAssertion, UatCheckConfig, UatChecks
 
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
@@ -2493,8 +2494,146 @@ _KNOWN_REPO_KEYS = frozenset(
         "provider",
         "uat_preview",
         "uat_live_preview",
+        "uat_checks",
     }
 )
+
+#: The `uat_checks:` (and each `uat_checks.issues[N]:` override) keys that
+#: define an assertion set -- shared between the repo-wide block and every
+#: per-issue override so both are parsed by the same function (#3198).
+_UAT_CHECKS_BASE_KEYS = frozenset(
+    {"expected_status", "headers_present", "headers_absent", "body_contains"}
+)
+
+
+def _parse_uat_header_assertion(raw: Any, ctx: str) -> HeaderAssertion:
+    """Parse one `headers_present` entry: `"Name"` (present, any value) or
+    `"Name: substring"` (present AND the value contains `substring`)."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"{ctx} must be a non-empty string")
+    name, sep, contains = raw.partition(":")
+    name = name.strip()
+    if not name:
+        raise ConfigError(f"{ctx}: header name must not be empty")
+    contains = contains.strip() if sep else ""
+    return HeaderAssertion(name=name, contains=contains or None)
+
+
+def _parse_uat_checks_block(raw: Any, ctx: str) -> UatChecks:
+    """Parse one assertion set -- either the repo-wide `uat_checks:` block
+    or a single `uat_checks.issues[N]:` override (#3198). Both share the
+    same four keys (`_UAT_CHECKS_BASE_KEYS`); the caller strips/validates
+    the extra `exempt`/`issues` keys that only the repo-wide block allows.
+    """
+    if raw is None:
+        return UatChecks()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx} must be a mapping")
+
+    expected_status = raw.get("expected_status")
+    if expected_status is not None:
+        if isinstance(expected_status, bool) or not isinstance(expected_status, int):
+            raise ConfigError(f"{ctx}.expected_status must be an integer")
+        if not (100 <= expected_status <= 599):
+            raise ConfigError(
+                f"{ctx}.expected_status must be a valid HTTP status code (100-599)"
+            )
+
+    headers_present_raw = raw.get("headers_present", []) or []
+    if not isinstance(headers_present_raw, list):
+        raise ConfigError(f"{ctx}.headers_present must be a list of strings")
+    headers_present = tuple(
+        _parse_uat_header_assertion(h, f"{ctx}.headers_present[{j}]")
+        for j, h in enumerate(headers_present_raw)
+    )
+
+    headers_absent_raw = raw.get("headers_absent", []) or []
+    if not isinstance(headers_absent_raw, list) or not all(
+        isinstance(h, str) and h.strip() for h in headers_absent_raw
+    ):
+        raise ConfigError(f"{ctx}.headers_absent must be a list of non-empty strings")
+    headers_absent = tuple(h.strip() for h in headers_absent_raw)
+
+    body_contains_raw = raw.get("body_contains", []) or []
+    if isinstance(body_contains_raw, str):
+        body_contains_raw = [body_contains_raw]
+    if not isinstance(body_contains_raw, list) or not all(
+        isinstance(b, str) and b for b in body_contains_raw
+    ):
+        raise ConfigError(
+            f"{ctx}.body_contains must be a string or a list of non-empty strings"
+        )
+    body_contains = tuple(body_contains_raw)
+
+    return UatChecks(
+        expected_status=expected_status,
+        headers_present=headers_present,
+        headers_absent=headers_absent,
+        body_contains=body_contains,
+    )
+
+
+def _parse_uat_checks(raw: Any, repo_index: int) -> UatCheckConfig | None:
+    """Parse a repo's `uat_checks:` block (#3198) -- the declared-checks
+    third path for the UAT gate, alongside `uat_preview`/`uat_live_preview`.
+
+    `None` (key absent) means "no declared checks", the safe default: the
+    UAT gate stays exactly as human as it was before this feature existed
+    (`coord.uat_checks.UatCheckConfig.resolve_for_issue`'s contract). An
+    explicit but empty `uat_checks: {}` is legal, if pointless on its own —
+    kept legal so a repo can declare only `exempt`/`issues` with no
+    repo-wide base assertion set.
+    """
+    if raw is None:
+        return None
+    ctx = f"repos[{repo_index}].uat_checks"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx} must be a mapping")
+
+    unknown_top = sorted(set(raw) - _UAT_CHECKS_BASE_KEYS - {"exempt", "issues"})
+    if unknown_top:
+        raise ConfigError(f"{ctx} has unrecognised key(s): {unknown_top!r}")
+
+    base = _parse_uat_checks_block(
+        {k: v for k, v in raw.items() if k in _UAT_CHECKS_BASE_KEYS}, ctx
+    )
+
+    # #1138-style: mirrors `tests/acceptance/ms-NN/manifest.yml`'s `exempt:`
+    # list -- issues with no user-visible surface at all skip the UAT gate
+    # entirely (see `coord.merge_queue.requires_uat`), not just the
+    # auto-check attempt.
+    exempt_raw = raw.get("exempt", []) or []
+    if not isinstance(exempt_raw, list) or not all(
+        isinstance(n, int) and not isinstance(n, bool) for n in exempt_raw
+    ):
+        raise ConfigError(f"{ctx}.exempt must be a list of issue numbers")
+    exempt_issues = frozenset(exempt_raw)
+
+    issues_raw = raw.get("issues", {}) or {}
+    if not isinstance(issues_raw, dict):
+        raise ConfigError(
+            f"{ctx}.issues must be a mapping of issue number -> assertion set"
+        )
+    issue_checks: dict[int, UatChecks] = {}
+    for key, value in issues_raw.items():
+        try:
+            issue_number = int(key)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{ctx}.issues key {key!r} must be an issue number")
+        if not isinstance(value, dict):
+            raise ConfigError(f"{ctx}.issues[{issue_number}] must be a mapping")
+        unknown = sorted(set(value) - _UAT_CHECKS_BASE_KEYS)
+        if unknown:
+            raise ConfigError(
+                f"{ctx}.issues[{issue_number}] has unrecognised key(s) "
+                f"{unknown!r} -- 'exempt'/'issues' cannot nest inside a "
+                "per-issue override; use the top-level 'exempt' list instead"
+            )
+        issue_checks[issue_number] = _parse_uat_checks_block(
+            value, f"{ctx}.issues[{issue_number}]"
+        )
+
+    return UatCheckConfig(checks=base, issue_checks=issue_checks, exempt_issues=exempt_issues)
 
 
 def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
@@ -2632,6 +2771,14 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         if not isinstance(uat_live_preview_raw, bool):
             raise ConfigError(f"repos[{i}].uat_live_preview must be a boolean")
 
+        # #3198: uat_checks — declared, machine-checkable UAT assertions,
+        # the third way to satisfy the UAT gate. Independent of
+        # uat_preview/uat_live_preview: a repo can declare checks without
+        # either (they simply never get a preview URL to run against, so
+        # the gate stays fully human), or set uat_preview/uat_live_preview
+        # without checks (today's behaviour, unchanged).
+        uat_checks = _parse_uat_checks(entry.get("uat_checks"), i)
+
         repos.append(
             Repo(
                 name=name,
@@ -2652,6 +2799,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 provider=repo_provider,
                 uat_preview=uat_preview,
                 uat_live_preview=uat_live_preview_raw,
+                uat_checks=uat_checks,
             )
         )
     return repos, warnings

@@ -711,7 +711,9 @@ def _repo_for(repo_name: str, config: Any | None) -> Any | None:
         return None
 
 
-def repo_has_uat_preview(repo_name: str, config: Any | None) -> bool:
+def repo_has_uat_preview(
+    repo_name: str, config: Any | None, *, issue_number: int | None = None
+) -> bool:
     """The per-repo half of ``coord.merge_queue.requires_uat``'s two-part
     UAT opt-in (#2687) — the fleet-wide half (``"uat" in default_gates``) is
     threaded separately as ``uat_enabled`` (see :func:`pipeline_stage_names`).
@@ -726,9 +728,22 @@ def repo_has_uat_preview(repo_name: str, config: Any | None) -> bool:
     blocking on it. Answering "has this repo opted in" any other way here
     than ``requires_uat`` does is exactly the split-brain #2948 exists to
     close.
+
+    #3198: *issue_number*, when given, also honours ``Repo.uat_checks``'
+    per-issue ``exempt`` list — the same short-circuit ``requires_uat``
+    applies before its own opt-in check. Omitted (``None``, the default)
+    never exempts anything, so a caller with no issue in hand (there isn't
+    one, structurally, today) degrades to the pre-#3198 per-repo-only
+    answer rather than raising. Keeping this check here — instead of
+    duplicating it at each of this function's call sites — is what keeps
+    the board's "uat" badge and ``coord merge``'s actual gate answering the
+    same question the same way (#2096).
     """
     repo = _repo_for(repo_name, config)
     if repo is None:
+        return False
+    uat_checks_cfg = getattr(repo, "uat_checks", None)
+    if uat_checks_cfg is not None and uat_checks_cfg.is_exempt(issue_number):
         return False
     return bool(getattr(repo, "uat_preview", None)) or bool(
         getattr(repo, "uat_live_preview", False)
@@ -1028,7 +1043,12 @@ def compute_board_stage_projection(
     # gets a projection row for stage_counts to land in.
     keys = set(is_closed_by_key) | set(assignments_by_key) | set(assignments_by_effective_key)
 
-    uat_enabled_by_repo: dict[str, bool] = {}
+    # #3198: keyed on (repo_name, issue_number), not just repo_name — a
+    # per-issue `uat_checks.exempt` entry means two issues in the same repo
+    # can now legitimately disagree on this, which a repo-only cache key
+    # would silently paper over (whichever issue was resolved first would
+    # "win" for every sibling).
+    uat_enabled_by_repo: dict[tuple[str, int], bool] = {}
 
     result: list[dict[str, Any]] = []
     for repo_name, issue_number in keys:
@@ -1048,9 +1068,11 @@ def compute_board_stage_projection(
         # reaches the fallback when the raw list is empty.
         projection_assignments = issue_assignments or _widen_work_like_types(effective_assignments)
         merge_entry = merge_by_key.get(key)
-        if repo_name not in uat_enabled_by_repo:
-            uat_enabled_by_repo[repo_name] = repo_has_uat_preview(repo_name, config)
-        uat_enabled = uat_enabled_by_repo[repo_name]
+        if key not in uat_enabled_by_repo:
+            uat_enabled_by_repo[key] = repo_has_uat_preview(
+                repo_name, config, issue_number=issue_number
+            )
+        uat_enabled = uat_enabled_by_repo[key]
         entry = compute_issue_projection(
             projection_assignments,
             merge_entry,
