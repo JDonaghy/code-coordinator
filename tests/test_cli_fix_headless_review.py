@@ -833,6 +833,101 @@ class TestFixFromUatFailure:
         assert "Ignore the total; fix the currency symbol instead." in captured["briefing"]
 
 
+# ── #3210: a same-branch fix invalidates the ORIGINAL's stale UAT verdict ────
+
+
+class TestFixInvalidatesStaleUatVerdict:
+    def test_dangerous_direction_a_stale_pass_is_cleared_by_a_test_failure_fix(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """The risk #3210 actually cares about: UAT already passed, then the
+        Test gate went red and a same-branch fix is dispatched to address
+        THAT. The stale `uat_state=passed` describes code this fix is about
+        to rewrite — it must not survive the dispatch, or the merge gate
+        would clear a rewrite nobody has looked at."""
+        work = _work(
+            test_state="failed", test_reason="assert 1 == 2",
+            uat_state="passed", uat_actor="operator",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "fix-clears-uat"}), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "uat verdict cleared" in result.output
+
+        from coord.board_service import read_board
+
+        reloaded = read_board().find_by_id("work-abc")
+        assert reloaded is not None
+        assert reloaded.uat_state is None
+        assert reloaded.uat_actor is None
+
+    def test_observed_direction_a_stale_fail_is_cleared_by_the_uat_triggered_fix(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """format-converter#6's shape: UAT itself failed, `coord fix --force`
+        dispatches a same-branch fix off that failure, and the OLD failed
+        verdict — the one that just got addressed — must not keep blocking
+        the merge gate afterward."""
+        work = _work(
+            test_state="passed", smoke_test="pass",
+            uat_state="failed",
+            uat_reason="renderLoadedScreen shows binary garbage instead of the source doc",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "fix-clears-uat-2"}), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--force", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "uat verdict cleared" in result.output
+
+        from coord.board_service import read_board
+
+        reloaded = read_board().find_by_id("work-abc")
+        assert reloaded is not None
+        assert reloaded.uat_state is None
+
+    def test_no_prior_uat_verdict_prints_nothing_extra(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """No verdict to invalidate — the new #3210 line must not appear."""
+        work = _work(test_state="failed", test_reason="assert 1 == 2")
+        state_mod.save_board(Board(completed=[work]))
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
+        )
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "fix-no-uat"}), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "uat verdict cleared" not in result.output
+
+
 # ── #3208: redirect a same-branch fix around an unreachable machine ─────────
 
 

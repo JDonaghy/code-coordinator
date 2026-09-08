@@ -443,6 +443,17 @@ def uat_stage_status_for(
     on assignment *type*, and nothing ever creates a ``type="uat"``
     assignment — the badge sat PENDING forever regardless of the recorded
     verdict (#2951 cause 2).
+
+    #3210: reads the single most-recently-dispatched WORK row's own
+    ``uat_state`` — never an older sibling's, even when the newest row
+    carries no verdict at all. This used to filter to rows *with* a verdict
+    first (mirroring ``test_stage_status_for``'s shape) and pick the latest
+    of THOSE, which let a same-branch fix round with no verdict yet fall
+    through to an older sibling's stale one — the same badge would read DONE
+    (green) for a fix that rewrote the code out from under a "passed" nobody
+    has re-checked, exactly the split-brain ``coord.merge_queue.
+    evaluate_uat_verdict`` was fixed to stop answering differently (#2096:
+    one question, one answer — this badge and that gate must agree).
     """
     work_status = stage_status_for_internal_work(
         assignments_for_issue, is_closed=is_closed, require_plan=require_plan
@@ -451,8 +462,7 @@ def uat_stage_status_for(
         return SKIPPED if is_closed else PENDING
 
     work = assignments_for_stage(assignments_for_issue, "work", require_plan=require_plan)
-    with_verdict = [a for a in work if (a.uat_state or "") != ""]
-    verdict_assignment = _latest_by_dispatch(with_verdict)
+    verdict_assignment = _latest_by_dispatch(work)
     verdict = verdict_assignment.uat_state if verdict_assignment else None
     if verdict == "passed":
         return DONE

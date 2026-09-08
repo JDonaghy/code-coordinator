@@ -942,6 +942,29 @@ def _dispatch_fix_for_review(
             detail=detail,
         )]
 
+    # #3210: a request-changes review is itself evidence the branch is about
+    # to be rewritten — same reasoning as the WORK-id door onto `coord fix`
+    # (`coord.commands.plan_followup.fix`). If `work` already carries a UAT
+    # verdict, it describes code that this fix round is about to supersede;
+    # leaving it in place would let a stale PASSED clear the merge gate for
+    # code no human has looked at (the dangerous direction #3210 reports).
+    # Reset in-memory too, not just the DB write, so anything reading `work`
+    # off THIS in-process `board` for the rest of this tick sees it cleared
+    # immediately rather than on the next board reload.
+    if work.uat_state is not None:
+        from coord.state import record_uat_verdict  # noqa: PLC0415
+
+        prior_uat_state = work.uat_state
+        record_uat_verdict(assignment_id=work.assignment_id, uat_state=None)
+        work.uat_state = None
+        work.uat_reason = None
+        work.uat_actor = None
+        log.info(
+            "auto_loop: cleared stale uat_state=%r on %s (#3210) — review "
+            "%s's fix round is about to rewrite the code it described",
+            prior_uat_state, work.assignment_id, review.assignment_id,
+        )
+
     log.info(
         "auto_loop: dispatched fix worker %s for review %s (iteration %d/%d)",
         fix.assignment_id, review.assignment_id, next_iteration, max_iter,
