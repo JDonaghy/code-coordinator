@@ -613,6 +613,45 @@ class TestIssueOracleReady:
         assert "ms-37" in readiness.reason
         assert "coord acceptance author api <tracking_issue> --issue 1118" in readiness.reason
 
+    def test_no_slice_reason_names_gate_a_exempt_trade_off(self) -> None:
+        """#3202: the pre-dispatch guard that suggests adding this issue to
+        `exempt:` — the exact "decision is actually made" seam the issue
+        names — must say what that trade would cost: the contract's
+        declared behaviours going unverified by anything but a human at
+        UAT."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({}, contract="**B1** x\n**B2** y\n**B3** z\n")
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(contract="**B1** x\n**B2** y\n**B3** z\n"),
+        )
+        assert readiness.reason is not None
+        assert "3202" in readiness.reason
+        assert "3 declared behaviours" in readiness.reason
+        assert "#1118" in readiness.reason  # names the hypothetical exempt set
+        assert "manifest.yml" in readiness.reason
+        assert "this exempts the contract's behaviours from verification" in readiness.reason
+
+    def test_no_slice_reason_omits_trade_off_when_milestone_is_gate_a_exempt(self) -> None:
+        """A milestone that has declared `gate_a: {exempt: true}` (no Gate-A
+        contract obligation at all) must not have the guard assert one
+        exists just because contract.md happens not to be fetchable."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch(
+            {"tests/acceptance/ms-37/manifest.yml": "gate_a:\n  exempt: true\n"},
+            contract=None,
+        )
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(contract=None),
+        )
+        assert readiness.reason is not None
+        assert "3202" not in readiness.reason
+
     def test_ok_when_slice_authored_and_kind_supported(self) -> None:
         cfg = _oracle_cfg(kind="cli-pytest")
         repo = cfg.repo("api")

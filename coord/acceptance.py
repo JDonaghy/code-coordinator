@@ -904,14 +904,32 @@ def dump_manifest_error_hint(acceptance_root: Path) -> str:
 # Neither side refuses the combination — a refusal here would just get
 # worked around, and it is sometimes the right call. This only makes the
 # trade VISIBLE, with the SAME wording, at every seam that reads this state:
-# the pre-dispatch guard that suggests the exemption in the first place,
-# `coord doctor`/`coord gates` for a milestone already in that state, and
-# the reviewer's own briefing (`coord.review.build_review_briefing`).
+#
+# - the pre-dispatch guard that suggests the exemption in the first place
+#   (`coord.milestone_dispatch.issue_oracle_ready`'s "add it to `exempt:`"
+#   refusal reason, via `_gate_a_exempt_trade_off_note`) — also where "say
+#   it in the manifest too" is delivered: that note hands the operator
+#   `manifest_exempt_generated_comment`'s ready-to-paste text alongside the
+#   suggestion, since nothing in this codebase edits `exempt:` on a human's
+#   behalf (it is "rare, hand-edited" by design — see
+#   `MANIFEST_FRAGMENTS_DIRNAME`'s comment below);
+# - `coord gates` for a milestone already in that state
+#   (`coord.gates._gate_a_exempt_note_for_winner`, via
+#   :func:`fetch_gate_a_exempt_warning` below — the shared fetch-and-detect
+#   seam this module exposes so neither caller re-derives the manifest/
+#   contract fetch loop independently); and
+# - the reviewer's own briefing (`coord.review.build_review_briefing`, via
+#   the same :func:`fetch_gate_a_exempt_warning`).
+#
 # `gate_a_exempt_warning` below is the single canonical text every one of
 # those seams renders — never re-derive the wording independently, or a
 # future edit updates one copy and silently leaves the others stale (the
 # same "one question, one answer" discipline as #3180's mechanical-verdict
-# helpers in `coord.review`).
+# helpers in `coord.review`). `coord.diagnose.gate_a_exempt_exposure_lines`
+# renders the same detection + wording for a caller that already has a
+# manifest/contract in hand (no fetch of its own) — not yet called from
+# `coord doctor`, which has no existing per-milestone iteration to hang it
+# off without new fleet-wide scanning plumbing that is out of scope here.
 
 _BEHAVIOUR_LABEL_RE = re.compile(r"\*\*(§\d+[a-zA-Z]?|[A-Za-z]{1,3}\d{1,3})\*\*")
 
@@ -972,15 +990,35 @@ def gate_a_exempt_exposure(
     nothing to warn about. *contract_text* is optional: pass ``None`` when
     the contract couldn't be fetched (every caller here is fail-open) and
     the returned exposure just carries ``behaviour_count=0`` rather than
-    blocking detection on a fetch that failed.
+    blocking detection on a fetch that failed — UNLESS *manifest* itself
+    says there is no contract to fetch in the first place (see below), in
+    which case ``None`` (no exposure at all) is returned instead.
 
-    This function does not itself decide whether a Gate-A contract exists
-    for *milestone_number* — callers are expected to only reach this once
-    they already know one does (the same "only call this once contract.md
+    This function does not itself CONFIRM a Gate-A contract exists for
+    *milestone_number* — a caller with a genuinely-fetched *contract_text*
+    already knows one does (the same "only call this once contract.md
     exists" precondition every other Gate-A-gated check in this module
-    already applies, e.g. :func:`gate_a_contract_candidates`'s callers).
+    already applies, e.g. :func:`gate_a_contract_candidates`'s callers) and
+    gets an exposure back regardless of ``manifest.gate_a_exempt``.
+
+    #3202 review: a caller that could NOT fetch a contract (*contract_text*
+    is ``None``) is in a genuinely ambiguous spot — a transient fetch
+    failure and "no contract.md was ever authored" look identical from out
+    here. *manifest* itself resolves that ambiguity in exactly the one case
+    it can: ``manifest.gate_a_exempt`` (``gate_a: {exempt: true, ...}`` —
+    docs/ORACLE_LOOP.md) is the milestone's own declared, reviewable opt-out
+    from Gate-A, recorded in the same file this function already reads. When
+    it's set, "couldn't fetch a contract" is read as "there isn't one to
+    fetch" rather than "unknown" — so this returns ``None`` (no exposure,
+    nothing to warn about) instead of asserting "has a Gate-A contract" with
+    a fabricated "count unavailable". A fetch failure with
+    ``gate_a_exempt`` unset keeps the prior fail-loud behaviour (warn with
+    "count unavailable") — the plain network-hiccup case, where hiding the
+    warning would be the wrong direction to fail in.
     """
     if not manifest.exempt:
+        return None
+    if contract_text is None and manifest.gate_a_exempt:
         return None
     return GateAExemptExposure(
         milestone_number=milestone_number,
@@ -1042,6 +1080,103 @@ def manifest_exempt_generated_comment(exposure: GateAExemptExposure) -> str:
         "UAT gate for\n"
         "# that work. Confirmed intentional, not an oversight.\n"
     )
+
+
+# (repo_github: str, path: str, branch: str) -> file content. Raises on
+# not-found (mirrors ``coord.github_ops.get_repo_file``) — every caller here
+# treats any exception as "this candidate doesn't exist" and tries the next
+# one, so a fetcher that instead returned ``None``/``""`` on a miss would be
+# indistinguishable from a genuinely empty file.
+GateAExemptFileFetcher = Callable[[str, str, str], str]
+
+
+def fetch_gate_a_exempt_warning(
+    config: Config,
+    repo: Repo,
+    milestone_number: int | None,
+    *,
+    file_fetcher: GateAExemptFileFetcher | None = None,
+) -> str | None:
+    """(#3202) Fetch *milestone_number*'s manifest + Gate-A contract off
+    *repo*'s default branch and, if the manifest exempts one or more issues
+    from needing an acceptance slice, return the canonical
+    :func:`gate_a_exempt_warning` text — or ``None`` when there's nothing to
+    warn about, or nothing to check at all.
+
+    THE single fetch-and-detect seam for this state (#3202 review finding:
+    the reviewer's briefing, ``coord gates``, and any future ``coord
+    doctor`` surfacing must all call this rather than re-deriving the
+    manifest/contract fetch loop each independently — a second copy is
+    exactly how the reviewer-briefing-only version of this fix drifted from
+    the "every seam" claim in this module's own docstring).
+
+    Fail-open like every other best-effort fetch this module makes ahead of
+    a briefing/report: a missing manifest/contract, a repo with no
+    acceptance driver configured, no milestone in hand, or a transient
+    network hiccup all return ``None`` rather than raise — this is an
+    advisory surfacing, never a gate, so a fetch failure must never affect
+    whether or how a review/report proceeds.
+
+    *file_fetcher* defaults to :func:`coord.github_ops.get_repo_file` (a
+    real ``gh`` call); inject a stub in tests so this advisory lookup never
+    shells out live.
+
+    ``exempt:`` is milestone-level and lives only in the legacy single
+    ``manifest.(yml|yaml|json)`` file, never a per-issue ``manifest.d/``
+    fragment (see :data:`MANIFEST_FRAGMENTS_DIRNAME`'s comment: "rare,
+    hand-edited... stays a single shared file by choice"), so only that file
+    needs checking here — unlike a full manifest load, no fragment merge is
+    needed.
+
+    #3202 review (non-blocking): tries ``.yml``/``.yaml``/``.json`` under
+    every :func:`search_roots_for_repo` root, breaking out of the extension
+    loop the moment any fetch succeeds — even if the fetched text then fails
+    to parse (``manifest_data`` resets to ``None`` and the loop moves to the
+    next root, never trying a sibling extension under the SAME root that
+    might have parsed). Accepted: a root carrying two same-named manifests
+    at different extensions, one malformed, is not a shape this codebase
+    produces — not incidental, a deliberate simplicity/rare-edge-case trade.
+    """
+    if milestone_number is None or not config.acceptance.has_driver(repo.name):
+        return None
+
+    from coord import github_ops  # noqa: PLC0415
+
+    fetch = file_fetcher or github_ops.get_repo_file
+
+    manifest_data: ManifestData | None = None
+    for root in search_roots_for_repo(config, repo.name):
+        ms_dir = f"{root.rstrip('/')}/{ms_dirname(milestone_number)}"
+        for ext in (".yml", ".yaml", ".json"):
+            try:
+                text = fetch(repo.github, f"{ms_dir}/manifest{ext}", repo.default_branch)
+            except Exception:  # noqa: BLE001 — this extension/root doesn't exist
+                continue
+            try:
+                manifest_data = parse_manifest_text(
+                    text, source=f"{ms_dir}/manifest{ext}"
+                )
+            except Exception:  # noqa: BLE001 — malformed manifest: fail open
+                manifest_data = None
+            break
+        if manifest_data is not None:
+            break
+
+    if manifest_data is None or not manifest_data.exempt:
+        return None
+
+    contract_text: str | None = None
+    for path in gate_a_contract_candidates(config, repo.name, milestone_number):
+        try:
+            contract_text = fetch(repo.github, path, repo.default_branch)
+            break
+        except Exception:  # noqa: BLE001 — try the next candidate root
+            continue
+
+    exposure = gate_a_exempt_exposure(milestone_number, manifest_data, contract_text)
+    if exposure is None:
+        return None
+    return gate_a_exempt_warning(exposure)
 
 
 def acceptance_capability_gap(

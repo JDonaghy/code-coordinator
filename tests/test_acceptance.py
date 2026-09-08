@@ -27,6 +27,7 @@ from coord.acceptance import (
     dump_manifest_error_hint,
     expected_red_failure_summary,
     failure_summary,
+    fetch_gate_a_exempt_warning,
     find_ms_manifest_for_issue_via_api,
     gate_a_contract_candidates,
     gate_a_contract_path,
@@ -1790,6 +1791,39 @@ class TestGateAExemptExposure:
         assert exposure is not None
         assert exposure.behaviour_count == 0
 
+    def test_none_when_contract_missing_and_manifest_declares_gate_a_exempt(self) -> None:
+        """#3202 review (blocking): a milestone that has DECLARED, in its own
+        manifest, that it needs no Gate-A contract at all
+        (`gate_a: {exempt: true}` — docs/ORACLE_LOOP.md) must not be told it
+        "has a Gate-A contract" just because a fetch for one came back
+        empty. Before this fix, a fetch failure and a genuine
+        `gate_a_exempt` opt-out were indistinguishable and both produced a
+        `behaviour_count=0` exposure worded as if a contract existed."""
+        manifest = ManifestData(exempt=frozenset({6}), gate_a_exempt=True)
+        assert gate_a_exempt_exposure(1, manifest, None) is None
+
+    def test_still_warns_on_missing_contract_when_not_gate_a_exempt(self) -> None:
+        """The plain fetch-failure case (no `gate_a_exempt` opt-out
+        recorded) keeps failing LOUD, not silent — a transient network
+        hiccup must not hide a real exposure. Same fixture as
+        ``test_missing_contract_text_yields_zero_behaviour_count_not_none``,
+        just spelling out the ``gate_a_exempt`` default explicitly."""
+        manifest = ManifestData(exempt=frozenset({6}), gate_a_exempt=False)
+        exposure = gate_a_exempt_exposure(1, manifest, None)
+        assert exposure is not None
+        assert exposure.behaviour_count == 0
+
+    def test_confirmed_contract_still_warns_even_when_gate_a_exempt(self) -> None:
+        """`gate_a_exempt` only resolves the AMBIGUOUS "couldn't fetch a
+        contract" case — it must never suppress a warning once a contract
+        was actually, successfully fetched (`gate_a_exempt` bypasses the
+        human SIGN-OFF, docs/ORACLE_LOOP.md; it says nothing about whether
+        the contract's behaviours are covered by acceptance slices)."""
+        manifest = ManifestData(exempt=frozenset({6}), gate_a_exempt=True)
+        exposure = gate_a_exempt_exposure(1, manifest, "**B1** x\n**B2** y\n")
+        assert exposure is not None
+        assert exposure.behaviour_count == 2
+
 
 class TestGateAExemptWarning:
     """#3202: the single canonical warning text — every surface (the
@@ -2005,3 +2039,90 @@ class TestFetchGateAExemptWarning:
         )
         assert result is not None
         assert "count unavailable" in result
+
+    def test_none_when_contract_missing_and_manifest_declares_gate_a_exempt(self) -> None:
+        """#3202 review (blocking): the false-positive this fix closes, at
+        the actual dispatch-review integration point (not just the pure
+        ``gate_a_exempt_exposure`` unit above) — a manifest that both
+        exempts issues AND declares ``gate_a: {exempt: true}`` must not be
+        told "has a Gate-A contract" just because every candidate
+        contract.md path 404s."""
+        from coord.review import _fetch_gate_a_exempt_warning
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [2]\ngate_a:\n  exempt: true\n"
+            raise RuntimeError("404")
+
+        result = _fetch_gate_a_exempt_warning(
+            self._repo(), self._config(), 5, file_fetcher=fetch,
+        )
+        assert result is None
+
+
+class TestAcceptanceFetchGateAExemptWarning:
+    """#3202: :func:`coord.acceptance.fetch_gate_a_exempt_warning` is now the
+    single fetch-and-detect seam ``coord.review._fetch_gate_a_exempt_warning``
+    (see ``TestFetchGateAExemptWarning`` above, which exercises it via that
+    thin wrapper) AND ``coord.gates._gate_a_exempt_note_for_winner`` both
+    call, rather than each re-deriving its own copy of the manifest/contract
+    fetch loop. Direct coverage here, decoupled from either caller."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self, *, has_driver: bool = True) -> Config:
+        drivers = (
+            {"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            if has_driver else {}
+        )
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_none_when_repo_has_no_driver(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch when short-circuited")
+
+        result = fetch_gate_a_exempt_warning(
+            self._config(has_driver=False), self._repo(), 5, file_fetcher=refuse,
+        )
+        assert result is None
+
+    def test_none_when_milestone_number_is_none(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch when short-circuited")
+
+        result = fetch_gate_a_exempt_warning(
+            self._config(), self._repo(), None, file_fetcher=refuse,
+        )
+        assert result is None
+
+    def test_warning_built_from_manifest_and_contract(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [2, 3]\n"
+            if path.endswith("contract.md"):
+                return "**B1** x\n**B2** y\n"
+            raise RuntimeError("not found")
+
+        result = fetch_gate_a_exempt_warning(
+            self._config(), self._repo(), 5, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "ms-5" in result
+        assert "#2" in result and "#3" in result
+        assert "2 declared behaviours" in result
+
+    def test_none_when_contract_missing_and_manifest_declares_gate_a_exempt(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt: [2]\ngate_a:\n  exempt: true\n"
+            raise RuntimeError("404")
+
+        result = fetch_gate_a_exempt_warning(
+            self._config(), self._repo(), 5, file_fetcher=fetch,
+        )
+        assert result is None

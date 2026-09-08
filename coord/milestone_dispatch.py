@@ -540,6 +540,67 @@ class OracleReadiness:
     gate_a_state: str = ""
 
 
+def _gate_a_exempt_trade_off_note(
+    repo_cfg: Repo,
+    config: "Config",
+    milestone_number: int,
+    manifest,
+    issue_number: int,
+    fetch: ManifestFetch,
+) -> str:
+    """(#3202) Appended to :func:`issue_oracle_ready`'s "no acceptance slice
+    yet, add it to `exempt:` instead" suggestion — the pre-dispatch guard
+    message the issue names as "the decision is actually made". Names what
+    exempting *issue_number* would trade away, using the same canonical
+    :func:`coord.acceptance.gate_a_exempt_warning` wording every other
+    #3202 surface renders (never re-derived independently here), computed
+    AS IF *issue_number* were already added to the milestone's `exempt:`
+    list — the exact edit the suggestion above is proposing.
+
+    Returns ``""`` (nothing appended) on any fetch/parse hiccup, or when the
+    milestone's own manifest has already declared it needs no Gate-A
+    contract at all (``gate_a_exempt`` — see
+    :func:`coord.acceptance.gate_a_exempt_exposure`'s precondition):
+    fail-open, this is advisory text glued onto a refusal reason that must
+    never itself become a new failure mode.
+
+    *fetch* is the caller's already-memoized ``(repo_github, path, branch)
+    -> content | None`` seam (:func:`issue_oracle_ready`'s local closure) —
+    the contract is known to exist at this call site (:func:`gate_a_status`
+    already passed), so reusing it costs no extra `gh` round trip.
+    """
+    try:
+        from coord.acceptance import (  # noqa: PLC0415
+            ManifestData,
+            gate_a_contract_candidates,
+            gate_a_exempt_exposure,
+            gate_a_exempt_warning,
+            manifest_exempt_generated_comment,
+        )
+
+        contract_text: str | None = None
+        for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
+            contract_text = fetch(repo_cfg.github, path, repo_cfg.default_branch)
+            if contract_text is not None:
+                break
+
+        hypothetical = ManifestData(
+            exempt=frozenset(set(manifest.exempt) | {issue_number}),
+            gate_a_exempt=manifest.gate_a_exempt,
+        )
+        exposure = gate_a_exempt_exposure(milestone_number, hypothetical, contract_text)
+        if exposure is None:
+            return ""
+        return (
+            f"\n\n{gate_a_exempt_warning(exposure)}\n\nIf you do exempt it, "
+            "paste this next to the `exempt:` list in manifest.yml so the "
+            "trade is recorded, not just implied:\n\n"
+            f"{manifest_exempt_generated_comment(exposure)}"
+        )
+    except Exception:  # noqa: BLE001 — advisory only, never break the refusal
+        return ""
+
+
 def issue_oracle_ready(
     repo_cfg: Repo,
     config: "Config",
@@ -659,6 +720,7 @@ def issue_oracle_ready(
             f"the driver rather than consuming it)? Add {issue_number} to "
             f"tests/acceptance/ms-{milestone_number}/manifest.yml's `exempt:` "
             "list, or label the issue `oracle:exempt`."
+            f"{_gate_a_exempt_trade_off_note(repo_cfg, config, milestone_number, manifest, issue_number, fetch)}"
         )
     elif unsupported:
         reason = (
