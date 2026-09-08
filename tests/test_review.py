@@ -2799,6 +2799,158 @@ def test_dispatch_review_keeps_diff_when_compare_agrees(
     assert "converter.py" in payload["briefing"]
 
 
+def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replacement(
+    two_machine_config: Config,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#3196 review follow-up: a pure rename (`git mv old new`, no content
+    change) makes `diff_file_paths` report BOTH `old.py` and `new.py` as
+    "touched" — the `diff --git a/old b/new` header line alone carries no
+    signal they're the same content moving. GitHub's compare API only ever
+    reports the NEW path under `.files[].filename` (`previous_filename` is a
+    separate field the cross-check doesn't read), so `old.py` is legitimately
+    absent from `known_files` even though nothing is stale. This must NOT be
+    treated as an unexpected file and must NOT trigger a diff replacement —
+    unlike the genuinely-stale case in
+    `test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file`."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "pure-rename-review-1"})
+
+    # A pure rename `foo.py` -> `bar.py` with no content change, exactly as
+    # `git mv foo.py bar.py` produces: no `---`/`+++` lines at all.
+    rename_diff = (
+        "diff --git a/foo.py b/bar.py\n"
+        "similarity index 100%\n"
+        "rename from foo.py\n"
+        "rename to bar.py\n"
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "compare_diff_fetcher must not be called — the rename is not a "
+            "genuine mismatch and must not trigger a replacement"
+        )
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 33, "url": "https://github.com/acme/api/pull/33", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: rename_diff,
+        # A fresh compare only ever reports the rename's NEW path — GitHub's
+        # `previous_filename` field is never surfaced through this seam.
+        compare_files_fetcher=lambda repo, base, head: ["bar.py"],
+        compare_diff_fetcher=_boom,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    assert "diff --git a/foo.py b/bar.py" in payload["briefing"]
+    # No false-positive "stale/incorrect diff base" log for a routine rename.
+    matching = [rec for rec in caplog.records if "stale/incorrect diff base" in rec.message]
+    assert not matching, caplog.text
+
+
+def test_dispatch_review_cross_check_fails_open_when_compare_files_unavailable(
+    two_machine_config: Config,
+) -> None:
+    """#3196 review follow-up: when `compare_files_fetcher` itself fails
+    (raises, or the compare API is unreachable), the cross-check must fail
+    open — dispatch proceeds with the original `full_diff_text` untouched
+    rather than blocking review dispatch on an unrelated GitHub outage."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "compare-files-unavailable-1"})
+    diff = (
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def convert():\n"
+        "+    return None\n"
+    )
+
+    def _compare_files_boom(*args, **kwargs):
+        raise RuntimeError("gh api compare: rate limited")
+
+    def _compare_diff_boom(*args, **kwargs):
+        raise AssertionError("compare_diff_fetcher must not be called — cross-check skipped")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 34, "url": "https://github.com/acme/api/pull/34", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+        compare_files_fetcher=_compare_files_boom,
+        compare_diff_fetcher=_compare_diff_boom,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    # The original diff is embedded verbatim — the cross-check never ran.
+    assert "diff --git a/converter.py" in payload["briefing"]
+
+
+def test_dispatch_review_keeps_stale_diff_when_compare_diff_replacement_unavailable(
+    two_machine_config: Config,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#3196 review follow-up: a genuine mismatch is detected (the compare
+    confirms the diff is stale), but the replacement fetch
+    (`compare_diff_fetcher`) itself fails. This must fail SAFE — keep the
+    original (untrusted) diff rather than crash dispatch — while still
+    logging the mismatch so it's visible in the coordinator's own log."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "compare-diff-unavailable-1"})
+    # A plain source file (not a coordinator-owned doc, which would instead
+    # trip the separate mechanical #3180 short-circuit and never dispatch a
+    # review leg at all — irrelevant to what this test is checking).
+    stale_diff = (
+        "diff --git a/spurious.py b/spurious.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/spurious.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+SPURIOUS = True\n"
+    )
+
+    def _compare_diff_boom(*args, **kwargs):
+        raise RuntimeError("gh api compare: rate limited")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 35, "url": "https://github.com/acme/api/pull/35", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: stale_diff,
+        compare_files_fetcher=lambda repo, base, head: ["converter.py"],
+        compare_diff_fetcher=_compare_diff_boom,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    # Replacement was unavailable, so the original (untrusted) diff rides
+    # along — the mismatch is logged rather than silently swallowed.
+    assert "diff --git a/spurious.py" in payload["briefing"]
+    matching = [rec for rec in caplog.records if "stale/incorrect diff base" in rec.message]
+    assert matching, caplog.text
+
+
 def test_dispatch_review_logs_missing_test_coverage_but_still_dispatches(
     two_machine_config: Config, caplog: pytest.LogCaptureFixture,
 ) -> None:
