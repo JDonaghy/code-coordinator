@@ -18,6 +18,7 @@ from coord.config import (
     _parse_store,
     load,
 )
+from coord.uat_checks import HeaderAssertion
 
 
 def test_load_valid_config(valid_config_path: Path) -> None:
@@ -711,6 +712,203 @@ def test_uat_preview_resolve_url_unknown_placeholder_left_verbatim() -> None:
     )
     url = repo.resolve_uat_preview_url(branch="b1")
     assert url == "https://{typo_field}.example.pages.dev/"
+
+
+# ── uat_checks (#3198) ───────────────────────────────────────────────────────
+
+
+def test_uat_checks_default_none(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    # #3198 safe default: no declared checks means no change to the
+    # existing (fully human) UAT gate behaviour.
+    assert cfg.repo("api").uat_checks is None
+
+
+def test_uat_checks_full_block_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      expected_status: 200\n"
+        "      headers_present:\n"
+        "        - \"content-security-policy: connect-src 'none'\"\n"
+        "        - x-frame-options\n"
+        "      headers_absent:\n"
+        "        - cf-access-jwt-assertion\n"
+        "      body_contains: Format Converter\n"
+        "      exempt: [3, 4, 5]\n"
+        "      issues:\n"
+        "        6:\n"
+        "          body_contains: New Feature X\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    uat_checks = cfg.repo("api").uat_checks
+    assert uat_checks is not None
+    assert uat_checks.checks.expected_status == 200
+    assert uat_checks.checks.headers_present == (
+        HeaderAssertion(name="content-security-policy", contains="connect-src 'none'"),
+        HeaderAssertion(name="x-frame-options", contains=None),
+    )
+    assert uat_checks.checks.headers_absent == ("cf-access-jwt-assertion",)
+    assert uat_checks.checks.body_contains == ("Format Converter",)
+    assert uat_checks.exempt_issues == frozenset({3, 4, 5})
+    assert uat_checks.issue_checks[6].body_contains == ("New Feature X",)
+    # The declared exemption + per-issue override shape the issue asks for:
+    # exempt issues resolve to no check at all, an overridden issue gets its
+    # own assertion set, and everything else falls back to the repo-wide one.
+    assert uat_checks.resolve_for_issue(3) is None  # exempt
+    assert uat_checks.resolve_for_issue(6).body_contains == ("New Feature X",)
+    assert uat_checks.resolve_for_issue(2).expected_status == 200
+
+
+def test_uat_checks_body_contains_accepts_a_single_string(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      body_contains: hello\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").uat_checks.checks.body_contains == ("hello",)
+
+
+def test_uat_checks_empty_block_is_legal_but_empty(tmp_path: Path) -> None:
+    # An explicit `uat_checks: {}` is legal — it's how a repo could declare
+    # only `exempt`/`issues` with no repo-wide base assertion set — but the
+    # resulting UatChecks is empty and must never autopass anything.
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    uat_checks: {}\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    uat_checks = cfg.repo("api").uat_checks
+    assert uat_checks is not None
+    assert uat_checks.checks.is_empty()
+    assert uat_checks.resolve_for_issue(1) is None
+
+
+def test_uat_checks_not_a_mapping_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    uat_checks: nope\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="uat_checks must be a mapping"):
+        load(p)
+
+
+def test_uat_checks_unknown_top_level_key_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      expected_statuz: 200\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="uat_checks has unrecognised key"):
+        load(p)
+
+
+def test_uat_checks_expected_status_non_int_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      expected_status: '200'\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="expected_status must be an integer"):
+        load(p)
+
+
+def test_uat_checks_expected_status_out_of_range_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      expected_status: 9000\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="valid HTTP status code"):
+        load(p)
+
+
+def test_uat_checks_exempt_non_list_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      exempt: 3\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="uat_checks.exempt must be a list"):
+        load(p)
+
+
+def test_uat_checks_issues_override_cannot_nest_exempt(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      issues:\n"
+        "        6:\n"
+        "          exempt: [6]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="unrecognised key"):
+        load(p)
+
+
+def test_uat_checks_issues_key_must_be_an_issue_number(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    uat_checks:\n"
+        "      issues:\n"
+        "        not-a-number:\n"
+        "          expected_status: 200\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="must be an issue number"):
+        load(p)
 
 
 # ── Config path resolution (~/.coord/coordinator.yml) ────────────────────────

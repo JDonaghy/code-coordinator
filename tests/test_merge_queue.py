@@ -27,6 +27,7 @@ from coord.merge_queue import (
     sequence,
 )
 from coord.models import Assignment
+from coord.uat_checks import HeaderAssertion, UatCheckConfig, UatCheckResult, UatChecks
 from coord import db as db_mod
 from coord import sql
 from tests import backends
@@ -66,6 +67,7 @@ def _q(
     pr: int | None = None,
     assignment_type: str = "work",
     required_gates: list[str] | None = None,
+    issue_number: int = 1,
 ) -> QueuedMerge:
     return QueuedMerge(
         assignment_id=aid,
@@ -73,7 +75,7 @@ def _q(
         repo_github=repo_github,
         branch=branch or f"worker/{aid}",
         target_branch=target,
-        issue_number=1,
+        issue_number=issue_number,
         issue_title="t",
         state=state,
         size=size,
@@ -4875,6 +4877,7 @@ class TestUatGate:
         uat_preview: str | None = "https://preview.example/{branch}",
         uat_live_preview: bool = False,
         repo_name: str = "api",
+        uat_checks: "UatCheckConfig | None" = None,
     ):
         """A minimal config-like object with a real Repo behind ``.repo()``."""
         from dataclasses import dataclass, field as dc_field
@@ -4903,6 +4906,7 @@ class TestUatGate:
         cfg._repo = Repo(
             name=repo_name, github="acme/api",
             uat_preview=uat_preview, uat_live_preview=uat_live_preview,
+            uat_checks=uat_checks,
         )
         return cfg
 
@@ -5242,6 +5246,206 @@ class TestUatGate:
         entry.error = "uat verdict missing — run: coord uat w1 --passed|--failed"
         board = self._board(completed=[self._work("w1", uat_state=None)])
         assert mq.display_error(entry, board, cfg) is None
+
+    # ── requires_uat: per-issue exemption (#3198) ──
+
+    def test_requires_uat_false_when_issue_listed_in_uat_checks_exempt(self) -> None:
+        # #3198 item 4: an issue with no user-visible surface at all is
+        # exempt from the UAT gate entirely — mirrors
+        # tests/acceptance/ms-NN/manifest.yml's `exempt:` list.
+        uat_checks = UatCheckConfig(exempt_issues=frozenset({2, 3}))
+        cfg = self._config(gates=["review", "uat", "merge"], uat_checks=uat_checks)
+        assert mq.requires_uat(_q("a", issue_number=2), cfg) is False
+
+    def test_requires_uat_true_when_exempt_list_names_a_different_issue(self) -> None:
+        uat_checks = UatCheckConfig(exempt_issues=frozenset({2, 3}))
+        cfg = self._config(gates=["review", "uat", "merge"], uat_checks=uat_checks)
+        assert mq.requires_uat(_q("a", issue_number=6), cfg) is True
+
+
+class TestUatDeclaredChecks:
+    """#3198: the third way to satisfy the UAT gate — a repo's declared,
+    machine-checkable assertions, run against the same preview URL
+    `_resolve_uat_preview_url` already resolves. On an all-pass verdict
+    `_run_declared_uat_checks` records the SAME `uat_state`/`uat_reason`
+    `coord uat --passed` writes (attributed to `actor="checker"`), so
+    `evaluate_uat_verdict` needs no changes at all to read it back."""
+
+    _config = staticmethod(TestUatGate._config)
+    _board = staticmethod(TestUatGate._board)
+    _work = staticmethod(TestUatGate._work)
+
+    # ── _run_declared_uat_checks ──
+
+    def test_returns_none_when_no_checks_declared(self) -> None:
+        cfg = self._config(uat_checks=None)
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        assert mq._run_declared_uat_checks(_q("w1"), board, cfg, None) is None
+
+    def test_returns_none_when_issue_is_exempt(self, monkeypatch) -> None:
+        uat_checks = UatCheckConfig(
+            checks=UatChecks(expected_status=200), exempt_issues=frozenset({1}),
+        )
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        called = []
+        monkeypatch.setattr(
+            mq, "evaluate_uat_checks", lambda *a, **k: called.append(1)
+        )
+        assert mq._run_declared_uat_checks(_q("w1", issue_number=1), board, cfg, None) is None
+        assert not called
+
+    def test_returns_none_when_no_work_assignment(self) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        board = self._board()  # empty — no branch work at all
+        assert mq._run_declared_uat_checks(_q("w1"), board, cfg, None) is None
+
+    def test_never_overrides_an_existing_verdict(self, monkeypatch) -> None:
+        # A verdict already on file — human or an earlier checker pass —
+        # must never be silently re-evaluated and overwritten.
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1", uat_state="failed", uat_reason="human said no")
+        board = self._board(completed=[work])
+        called = []
+        monkeypatch.setattr(
+            mq, "evaluate_uat_checks", lambda *a, **k: called.append(1)
+        )
+        assert mq._run_declared_uat_checks(_q("w1"), board, cfg, None) is None
+        assert not called
+        assert work.uat_state == "failed"
+
+    def test_returns_none_when_no_preview_url_resolves(self, monkeypatch) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_preview=None, uat_live_preview=False, uat_checks=uat_checks)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        called = []
+        monkeypatch.setattr(
+            mq, "evaluate_uat_checks", lambda *a, **k: called.append(1)
+        )
+        assert mq._run_declared_uat_checks(_q("w1"), board, cfg, None) is None
+        assert not called
+
+    def test_all_pass_records_checker_verdict_on_memory_and_via_state(
+        self, monkeypatch
+    ) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+
+        monkeypatch.setattr(
+            mq,
+            "evaluate_uat_checks",
+            lambda url, checks: UatCheckResult(
+                ok=True, summary=f"GET {url} -> 200", evidence=(f"GET {url} -> 200",)
+            ),
+        )
+        recorded = {}
+
+        def fake_record(*, assignment_id, uat_state, uat_reason, actor):
+            recorded.update(
+                assignment_id=assignment_id, uat_state=uat_state,
+                uat_reason=uat_reason, actor=actor,
+            )
+
+        monkeypatch.setattr(mq, "record_uat_verdict", fake_record)
+
+        result = mq._run_declared_uat_checks(_q("w1"), board, cfg, None)
+
+        assert result is not None and result.ok is True
+        # In-memory assignment updated immediately — the very next
+        # evaluate_uat_verdict call (same process() tick) must see it.
+        assert work.uat_state == "passed"
+        assert work.uat_actor == "checker"
+        assert "200" in (work.uat_reason or "")
+        assert recorded == {
+            "assignment_id": "w1",
+            "uat_state": "passed",
+            "uat_reason": work.uat_reason,
+            "actor": "checker",
+        }
+        ok, _ = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+        assert ok is True
+
+    def test_a_failed_check_does_not_write_any_verdict(self, monkeypatch) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+
+        monkeypatch.setattr(
+            mq,
+            "evaluate_uat_checks",
+            lambda url, checks: UatCheckResult(
+                ok=False, summary="expected 200, got 302",
+                failing="expected_status=200",
+            ),
+        )
+
+        def boom(**kwargs):
+            raise AssertionError("must never write a verdict on a failed check")
+
+        monkeypatch.setattr(mq, "record_uat_verdict", boom)
+
+        result = mq._run_declared_uat_checks(_q("w1"), board, cfg, None)
+
+        assert result is not None and result.ok is False
+        assert result.failing == "expected_status=200"
+        assert work.uat_state is None
+
+    # ── process() integration: the failing assertion is named (#3198) ──
+
+    def test_process_autopasses_uat_via_declared_checks(self, monkeypatch) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+
+        monkeypatch.setattr(
+            mq,
+            "evaluate_uat_checks",
+            lambda url, checks: UatCheckResult(ok=True, summary="GET ok"),
+        )
+        monkeypatch.setattr(mq, "record_uat_verdict", lambda **kwargs: None)
+
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert not any(e.kind == "uat_required" for e in events)
+        assert items[0].state == MERGED
+        assert work.uat_actor == "checker"
+
+    def test_process_names_the_failing_assertion_when_declared_check_fails(
+        self, monkeypatch
+    ) -> None:
+        uat_checks = UatCheckConfig(checks=UatChecks(expected_status=200))
+        cfg = self._config(uat_checks=uat_checks)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+
+        monkeypatch.setattr(
+            mq,
+            "evaluate_uat_checks",
+            lambda url, checks: UatCheckResult(
+                ok=False, summary="expected 200, got 302 (Access redirect)",
+                failing="expected_status=200",
+            ),
+        )
+
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        blocked = [e for e in events if e.kind == "uat_required"]
+        assert len(blocked) == 1
+        assert "declared check failed: expected_status=200" in blocked[0].message
+        assert items[0].state == PENDING
+        assert work.uat_state is None
 
 
 class TestGateBypassAudit:
