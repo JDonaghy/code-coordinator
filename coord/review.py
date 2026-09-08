@@ -3057,8 +3057,26 @@ def dispatch_review(
             except Exception:  # noqa: BLE001 — fail-open: cross-check unavailable, trust pr_diff
                 known_files = None
             if known_files is not None:
+                known_files_set = set(known_files)
                 claimed_files = set(github_ops.diff_file_paths(full_diff_text))
-                unexpected = claimed_files - set(known_files)
+                # #3196 review: a pure rename (`diff --git a/old b/new`, no
+                # content change) makes `diff_file_paths` report BOTH `old`
+                # and `new` as "touched" — the a/b-side header line alone
+                # carries no signal they're the same content moving, exactly
+                # as `diff_pure_renames`'s own docstring documents for the
+                # sealed-tamper carve-out below. GitHub's compare API only
+                # ever reports the NEW path under `.files[].filename`
+                # (`previous_filename` is a separate field this cross-check
+                # doesn't read), so an unfiltered comparison would flag the
+                # old side of every rename-containing PR as "unexpected" and
+                # replace a diff that was never stale. Drop the old side of
+                # any pure rename whose new side the compare confirms before
+                # deciding anything is actually unexpected.
+                renamed_old_paths = {
+                    old for old, new in github_ops.diff_pure_renames(full_diff_text)
+                    if new in known_files_set
+                }
+                unexpected = claimed_files - known_files_set - renamed_old_paths
                 if unexpected:
                     log.warning(
                         "[review] %s: diff_fetcher reported file(s) %s not "
