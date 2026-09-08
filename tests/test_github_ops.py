@@ -1814,6 +1814,50 @@ class TestGetCompareDiff:
         assert result == github_ops.compute_patch_id(diff)
 
 
+class TestGetCompareFiles:
+    """#1720: the file-list-only compare — cheaper than fetching
+    :func:`get_compare_diff`'s full unified diff and parsing headers out of
+    it. #3196: also the trust anchor :func:`coord.review.dispatch_review`
+    cross-checks a `pr_diff`-fetched diff against, since it queries the
+    compare API with ref *names* GitHub always resolves fresh, unlike
+    `gh pr diff`'s PR-object-cached diff."""
+
+    def test_returns_the_changed_file_list(self) -> None:
+        raw = "converter.py\nREADME.md\n"
+        with patch("coord.github_ops._gh", return_value=raw) as mock_gh:
+            result = github_ops.get_compare_files("acme/api", "main", "feature")
+        assert result == ["converter.py", "README.md"]
+        args = mock_gh.call_args.args
+        assert args[0] == "api"
+        assert args[1] == "repos/acme/api/compare/main...feature"
+        assert "--jq" in args
+        assert args[args.index("--jq") + 1] == ".files[].filename"
+
+    def test_strips_blank_lines(self) -> None:
+        raw = "converter.py\n\n\nREADME.md\n"
+        with patch("coord.github_ops._gh", return_value=raw):
+            result = github_ops.get_compare_files("acme/api", "main", "feature")
+        assert result == ["converter.py", "README.md"]
+
+    def test_empty_response_returns_empty_list_not_none(self) -> None:
+        """No files changed is a real, confirmed answer — distinct from
+        `None` (couldn't ask), which callers fail open on."""
+        with patch("coord.github_ops._gh", return_value=""):
+            result = github_ops.get_compare_files("acme/api", "main", "feature")
+        assert result == []
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_compare_files("acme/api", "main", "feature") is None
+
+    def test_works_with_a_sha_as_head(self) -> None:
+        with patch("coord.github_ops._gh", return_value="f.py\n") as mock_gh:
+            result = github_ops.get_compare_files("acme/api", "main", "deadbeef1234")
+        assert result == ["f.py"]
+        args = mock_gh.call_args.args
+        assert args[1] == "repos/acme/api/compare/main...deadbeef1234"
+
+
 class TestGhMissingOrHung:
     """#1483: `_gh` is the single seam every helper in this module funnels
     through, so a missing/hung `gh` binary must fail the same way (a

@@ -2960,6 +2960,17 @@ def pr_diff(repo_github: str, pr_number: int, *, max_chars: int | None = 60000) 
     needed for content-hashing via ``compute_patch_id``, which must not hash
     a mutated/truncated string). Best-effort: returns None on any ``gh`` error
     so the caller falls back to the in-briefing three-dot diff instructions.
+
+    #3196: this goes through GitHub's own PR-object diff computation (no
+    explicit ``base``/``head`` refs on the wire, unlike :func:`get_compare_diff`),
+    which a live incident showed can disagree with the branch's real
+    merge-base diff and surface an unrelated, already-merged commit's file
+    as if the branch had touched it. This function does not defend against
+    that itself — :func:`coord.review.dispatch_review` is the one call site
+    that embeds this output in a reviewer briefing, and it cross-checks the
+    result against a fresh :func:`get_compare_files`/:func:`get_compare_diff`
+    query (ref *names*, always resolved to their current tips) before
+    trusting it, replacing this function's output wholesale on a mismatch.
     """
     try:
         diff = _gh("pr", "diff", str(pr_number), "--repo", repo_github,

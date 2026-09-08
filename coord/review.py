@@ -2661,6 +2661,8 @@ def dispatch_review(
     diff_fetcher=None,
     commits_ahead_checker=None,
     commit_messages_fetcher=None,
+    compare_files_fetcher=None,
+    compare_diff_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -2700,6 +2702,22 @@ def dispatch_review(
     ``gh pr view --json commits`` call); inject a stub in tests so dispatch
     never shells out to a live ``gh``. Fail-open: an exception here yields an
     empty list, never a blocked dispatch.
+
+    *compare_files_fetcher* is an optional ``(repo_github: str, base: str,
+    head: str) -> list[str] | None`` callable (#3196) and *compare_diff_fetcher*
+    the matching ``(repo_github: str, base: str, head: str) -> str | None``
+    one. Default to :func:`coord.github_ops.get_compare_files` /
+    :func:`coord.github_ops.get_compare_diff` respectively; inject stubs in
+    tests. Together they cross-check *diff_fetcher*'s output (see the #3196
+    comment at the call site below) — ``gh pr diff`` resolves against
+    GitHub's PR-object diff computation, which a live incident showed can
+    disagree with the branch's real three-dot compare and surface an
+    unrelated, already-merged commit's file as if this branch had touched
+    it. The compare API, queried directly with *base_branch*/
+    ``completed.branch`` (ref names GitHub always resolves to their current
+    tips), can't carry that same staleness, so it is the arbiter: any file
+    *diff_fetcher* claims that a fresh compare doesn't corroborate makes its
+    whole diff untrustworthy, and the compare's own diff replaces it outright.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -3016,6 +3034,47 @@ def dispatch_review(
         # then truncated locally from the same fetch — no second `gh` call.
         _diff = diff_fetcher or github_ops.pr_diff
         full_diff_text = _diff(repo.github, pr["number"], max_chars=None) if pr else None
+
+        # #3196: cross-check `pr_diff`'s file list against a fresh, explicit
+        # compare of the branch's own current refs before trusting it. A
+        # reviewer was briefed with a diff that showed CLAUDE.md as changed
+        # when the PR never touched it — content from an earlier, already-
+        # merged commit (this repo's seed commit) leaking in because `gh pr
+        # diff` resolves through GitHub's PR-object diff computation, which
+        # can disagree with the branch's real merge-base diff (async lag, or
+        # a rewritten base branch). `get_compare_files` queries the compare
+        # API directly with `base_branch`/`completed.branch` — ref *names*,
+        # which GitHub always resolves fresh to their current tips — so it
+        # can't carry that same staleness. Any file `full_diff_text` claims
+        # that this compare doesn't corroborate makes the whole diff
+        # untrustworthy (not just that one file — a diff computed against
+        # the wrong base is wrong throughout), so it's replaced outright by
+        # the compare's own diff rather than patched.
+        if full_diff_text:
+            _compare_files = compare_files_fetcher or github_ops.get_compare_files
+            try:
+                known_files = _compare_files(repo.github, base_branch, completed.branch)
+            except Exception:  # noqa: BLE001 — fail-open: cross-check unavailable, trust pr_diff
+                known_files = None
+            if known_files is not None:
+                claimed_files = set(github_ops.diff_file_paths(full_diff_text))
+                unexpected = claimed_files - set(known_files)
+                if unexpected:
+                    log.warning(
+                        "[review] %s: diff_fetcher reported file(s) %s not "
+                        "present in a fresh compare(%s...%s) — stale/incorrect "
+                        "diff base (#3196); replacing with the compare diff",
+                        completed.assignment_id, sorted(unexpected),
+                        base_branch, completed.branch,
+                    )
+                    _compare_diff = compare_diff_fetcher or github_ops.get_compare_diff
+                    try:
+                        replacement = _compare_diff(repo.github, base_branch, completed.branch)
+                    except Exception:  # noqa: BLE001 — fail-safe: keep original diff on error
+                        replacement = None
+                    if replacement is not None:
+                        full_diff_text = replacement
+
         diff_text = (
             github_ops.truncate_diff_text(full_diff_text) if full_diff_text is not None else None
         )
