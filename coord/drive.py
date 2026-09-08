@@ -39,6 +39,16 @@ failure quoted in its briefing.  The loop re-tests and repeats, bounded by
 branch already carries the original work's commit — so a no-op fix does not
 wedge the pipeline (observed on #1445).
 
+A FAILED UAT VERDICT IS THE SAME SHAPE (#3201).  ``coord merge``'s UAT gate
+(#2687/#2947) is human-attended — an operator's ``coord uat --failed --note``
+or a customer's portal ``preview.changes_requested`` sign-off
+(claude-coordinator#3188) — and a *recorded failure* carries a reason exactly
+the way a failed test does, so :func:`_decide_merge` runs ``coord fix`` on it
+too, same branch, same escalated model, same ``--max-fix-rounds`` budget
+shared with the test/review loops.  A *missing* verdict is a different thing
+entirely — nobody has looked yet — and never auto-dispatches anything; it
+just waits for a human, the way it always has.
+
 Everywhere coord ALREADY has a path, this observes rather than acts — in
 particular it never dispatches the Test-stage smoke assignment (coord's own
 ``dispatch_pending_smoke`` does) or a REVIEW fix (the notify timer's auto-loop
@@ -3457,6 +3467,7 @@ def _escalate_merge(
     *,
     gate_kind: str | None = None,
     gate_reason: str | None = None,
+    fix_rounds: int = 0,
 ) -> Action:
     """Build the EXIT action for a merge status retrying cannot fix (#1505).
 
@@ -3480,6 +3491,17 @@ def _escalate_merge(
     (re-confirm the test verdict, or a scoped/full re-review) rather than the
     generic "inspect the plan" fallback below.
 
+    *gate_kind* ``"uat"`` (#3201) is a DIFFERENT shape from smoke/review —
+    there is no divergence to reconcile (this driver has no cached UAT
+    verdict of its own to contradict the gate with); it fires only after
+    :func:`_decide_merge`'s own bounded fix-dispatch loop has spent its whole
+    ``fix_rounds`` budget re-briefing a fix worker with each new failed
+    verdict and the gate is STILL failing. That is a design disagreement
+    between what was built and what the customer/operator wants, not a bug a
+    human can "reconcile" the way a stale smoke/review cache can — so the
+    proposed action is to look at the branch and the latest UAT reason
+    directly, not to re-run anything.
+
     *gate_reason* (#2229) is the text that gate_kind was classified from,
     when it is NOT `state.merge_reason` — i.e. when the board carried no
     reason and :func:`_effective_merge_gate_reason` recovered the refusal
@@ -3489,6 +3511,11 @@ def _escalate_merge(
     recorded ``--gate merge_reason=…`` pair still reports the BOARD's own
     (empty) value — the gates block is a snapshot of board state, and
     overwriting it here would hide the very divergence being escalated.
+
+    *fix_rounds* (#3201) is ``counters.fix_rounds`` at the moment the ``"uat"``
+    budget was exhausted — quoted in the escalation narrative so a human
+    reading it knows how many fix attempts already failed to satisfy the
+    verdict, not just that it did. Unused for every other *gate_kind*.
 
     Otherwise, the proposed command mirrors the #1477 resolution this issue
     was opened over: when a PR is known, ``gh pr merge --rebase`` + ``coord
@@ -3522,6 +3549,14 @@ def _escalate_merge(
             f"delta is safe>'   # or a full re-review: coord review "
             f"{state.work_aid}"
         )
+    elif gate_kind == "uat":
+        proposed = (
+            f"coord uat {state.work_aid} --passed   # only if the current "
+            "preview is actually fine now — otherwise this is a design "
+            "disagreement: look at the branch and the reason(s) above and "
+            "either redirect the work by hand or accept the delivered "
+            "behaviour"
+        )
     elif pr_number is not None:
         proposed = f"gh pr merge {pr_number} --rebase && coord reconcile-merges"
     else:
@@ -3530,7 +3565,19 @@ def _escalate_merge(
             "# inspect the gates, then decide"
         )
 
-    if gate_kind is not None:
+    if gate_kind == "uat":
+        reported = state.merge_reason if gate_reason is None else gate_reason
+        reason = (
+            f"uat_repeatedly_failed — after {fix_rounds} fix round(s) "
+            f"carrying each new UAT reason, coord merge's own gate still "
+            f"reports {reported!r} (latest verdict: "
+            f"uat_state={state.work_uat_state or '(none)'!r} uat_reason="
+            f"{state.work_uat_reason or '(none)'!r} uat_actor="
+            f"{state.work_uat_actor or 'operator'!r}) — this reads as a "
+            "design disagreement, not a bug a fix round can close; a human "
+            "must decide"
+        )
+    elif gate_kind is not None:
         driver_view = (
             f"test_state={state.work_test_state!r}"
             if gate_kind == "smoke"
@@ -3555,6 +3602,7 @@ def _escalate_merge(
         ("merge_reason", state.merge_reason or "(none)"),
         ("review_verdict", state.review_verdict or "(none)"),
         ("test_state", state.work_test_state or "(none)"),
+        ("uat_state", state.work_uat_state or "(none)"),
         ("pr_url", state.merge_pr_url or "(none)"),
     )
     gates_summary = " | ".join(f"{k}={v}" for k, v in gate_pairs)
@@ -3659,26 +3707,84 @@ def _decide_merge(
             )
         )
     # #2947 (follow-up to #2687): the UAT gate is a human-attended block — no
-    # `coord merge` retry, re-test, or re-review can clear it, only an
-    # operator recording `coord uat <id> --passed|--failed` after clicking
-    # through the deployed preview. Before this check, `_merge_gate_kind`
-    # returned `None` for every UAT wording (`_UAT_GATE_MARKERS` did not
-    # exist), so this fell through to the same bounded retry every other
-    # retryable status uses — burning the whole `--max-merge-attempts`
-    # budget against a gate that cannot change no matter how many times
-    # `coord merge --only` is retried, then dying with a terminal `blocked`
-    # drive-queue entry nothing re-evaluates (`coord/drive_queue.py`'s
-    # `blocked` state). Checked here, before the divergence classification
-    # (which deliberately has no `"uat"` arm — see
-    # `_merge_gate_divergence`'s docstring) and before the status switch
-    # below, mirrors the #2704 `unknown_head` arm immediately above: wait for
-    # a human to act rather than spend an attempt or escalate. `gate_reason`
-    # already carries `evaluate_uat_verdict`'s full message — the missing/
-    # failed verdict, the resolved preview URL (or why none resolved), and
-    # the exact `coord uat` command — so surfacing it verbatim here is what
-    # gets it into this driver's `STATUS:`/`coord status` output next to the
-    # command that clears it, per #2687's own filing.
+    # `coord merge` retry can clear it, only an operator or a customer
+    # recording a verdict after looking at the deployed preview. Checked here,
+    # before the divergence classification (which deliberately has no `"uat"`
+    # arm — see `_merge_gate_divergence`'s docstring) and before the status
+    # switch below, mirrors the #2704 `unknown_head` arm immediately above.
+    #
+    # #3201: a *missing* verdict (nobody has looked yet) and a *recorded
+    # failure* (someone looked and said what's wrong) are NOT the same
+    # situation, even though `_merge_gate_kind` classifies both as "uat" —
+    # `evaluate_uat_verdict`'s message text is what a human reads, not what
+    # this function should branch on (parsing "FAILED" out of a formatted
+    # string one more time would be a second implementation of the same
+    # answer `state.work_uat_state` already carries verbatim from the board,
+    # #2096 "one question, one answer"). Only `state.work_uat_state ==
+    # "failed"` — the LATEST work row's own verdict, exactly the row
+    # `evaluate_uat_verdict` itself gives priority to — is actionable; a
+    # missing verdict still just waits, never auto-dispatching on absence
+    # (the issue's own guard rail: absence means nobody has looked yet).
     if _merge_gate_kind(gate_reason) == "uat":
+        if state.work_uat_state == "failed" and (state.work_uat_reason or "").strip():
+            # A failed verdict IS the brief — the same shape `coord test
+            # --fail --reason` already has (#200), whether an operator typed
+            # `coord uat --failed --note` or a customer answered
+            # `preview.changes_requested` in the portal (claude-coordinator
+            # #3188 attributes both through the identical `uat_state`/
+            # `uat_reason`/`uat_actor` fields, so this arm reaches a worker
+            # for either source with no extra plumbing). Bounded by the SAME
+            # `fix_rounds` budget the test-failed/request-changes arms
+            # already share (and the stale-smoke re-test arm above) — a UAT
+            # verdict that keeps failing after repeated rounds is a design
+            # disagreement, not a bug, and escalates to a human instead of
+            # looping forever.
+            if counters.fix_rounds >= opts.max_fix_rounds:
+                return _escalate_merge(
+                    state,
+                    state.merge_status,
+                    gate_kind="uat",
+                    gate_reason=gate_reason,
+                    fix_rounds=counters.fix_rounds,
+                )
+            counters.fix_rounds += 1
+            who = (
+                "The customer"
+                if state.work_uat_actor == "customer"
+                else "An operator"
+            )
+            guidance = (
+                f"{who} reviewed the deployed preview for this branch and "
+                f"rejected it (UAT FAILED):\n\n{state.work_uat_reason.strip()}\n\n"
+                "Fix this on the SAME branch — do not start a new one. This "
+                "is customer/operator-observed behaviour, not a test "
+                "failure, so there is no failing suite to point at: the "
+                "note above IS the brief."
+            )
+            # `--force` is `coord fix`'s existing release valve for "the
+            # caller has real evidence of a problem this command's own
+            # doors (test_state/acceptance_state/CI) don't check for" — a
+            # UAT verdict is exactly that: a human's judgment call on a
+            # rendered preview, never a re-runnable measurement (see
+            # `Assignment.uat_state`'s docstring), so it was never going to
+            # be a fifth hardcoded door there. `--guidance` carries the
+            # reason verbatim into the fix worker's briefing.
+            return Action(
+                kind=RUN,
+                label=(
+                    f"MERGE: UAT failed → fix round {counters.fix_rounds}/"
+                    f"{opts.max_fix_rounds} (coord fix {state.work_aid})"
+                ),
+                command=(
+                    "fix", state.work_aid, "--force", "--guidance", guidance,
+                ),
+                error_message=(
+                    f"coord fix {state.work_aid} --force failed to dispatch "
+                    "a UAT fix-up.\n"
+                    f"   Continue by hand: coord assign --interactive "
+                    f"--fix-of {state.work_aid}"
+                ),
+            )
         return _wait(
             label=(
                 "MERGE: blocked on UAT — a human must record a verdict; "

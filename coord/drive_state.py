@@ -97,6 +97,22 @@ class IssueState:
     work_provider: str = ""
     work_test_state: str = ""
     work_test_reason: str = ""
+    # #3201: the LATEST work row's own human UAT verdict — "" | "passed" |
+    # "failed", mirroring `work_test_state` above. Sourced from the same
+    # `Assignment.uat_state`/`uat_reason`/`uat_actor` fields
+    # `coord.merge_queue.evaluate_uat_verdict` reads (via its own
+    # branch-chain walk) to decide whether `coord merge` blocks — this is
+    # the SAME question, just answered off the one work row `coord drive`
+    # already tracks everywhere else (#2096, "one question, one answer": no
+    # second re-derivation of "did UAT fail", just this module's usual
+    # projection of the already-fetched board payload). `work_uat_actor` is
+    # "operator" (a human ran `coord uat`) or "customer" (a portal preview
+    # sign-off, claude-coordinator#3188) — `coord.drive._decide_merge` uses
+    # it only to attribute the fix-worker briefing, never to change what
+    # counts as a failure.
+    work_uat_state: str = ""
+    work_uat_reason: str = ""
+    work_uat_actor: str = ""
     work_review_state: str = ""
     work_review_iter: int = 0
     work_exit_code: int | None = None
@@ -275,6 +291,17 @@ class IssueState:
         printed, and the stall detector nudged `coord notify` every
         `--stall` minutes as if nothing were happening. Real transitions,
         rendered as a stall.
+
+        #3201: `work_uat_state`/`work_uat_reason` are included for the same
+        reason — an operator's `coord uat --failed --note` or a customer's
+        `preview.changes_requested` (claude-coordinator#3188) is a real,
+        externally-caused transition on a row every other tracked field
+        (`work_status`, `merge_status`/`merge_reason`, …) can otherwise leave
+        completely unchanged, since it lands on an assignment that is
+        already `done` and already merge-queued.  Omitting these would mute
+        the `state:` log line for exactly the event this issue exists to
+        react to, and let the stall detector misread a fresh verdict as
+        "still nothing happening".
         """
         return "|".join(
             str(v)
@@ -282,6 +309,8 @@ class IssueState:
                 self.work_aid,
                 self.work_status,
                 self.work_test_state,
+                self.work_uat_state,
+                self.work_uat_reason,
                 # #2199: the trust gate's own verdict is a real transition
                 # the same way work_test_state is — see the docstring above
                 # for why omitting an analogous field mutes the `state:`
@@ -471,6 +500,9 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_provider=g(work, "provider_name"),
         work_test_state=g(work, "test_state"),
         work_test_reason=g(work, "test_reason"),
+        work_uat_state=g(work, "uat_state"),
+        work_uat_reason=g(work, "uat_reason"),
+        work_uat_actor=g(work, "uat_actor"),
         work_review_state=g(work, "review_state"),
         work_review_iter=int(g(work, "review_iteration", 0) or 0),
         work_exit_code=None if exit_code is None else int(exit_code),

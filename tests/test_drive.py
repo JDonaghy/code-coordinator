@@ -4070,6 +4070,166 @@ def test_uat_gate_reached_via_the_diagnostic_fallback_still_waits():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #3201: a FAILED UAT verdict (never a missing one) is actionable feedback —
+# it must dispatch a same-branch fix leg carrying the reason, the same shape
+# `coord test --fail --reason` already has, bounded by the same `fix_rounds`
+# budget the test-failed/request-changes arms share, and escalate once that
+# budget is spent (a UAT verdict that keeps failing is a design disagreement,
+# not a bug).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_uat_gate_dispatches_a_same_branch_fix_when_the_latest_verdict_failed():
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="layout broke on mobile",
+        )
+    )
+    assert action.kind == RUN
+    assert action.command[:4] == ("fix", "w1", "--force", "--guidance")
+    assert "layout broke on mobile" in action.command[4]
+    assert "UAT failed" in action.label
+    assert "fix round 1/" in action.label
+
+
+def test_uat_gate_never_dispatches_a_fix_for_a_missing_verdict():
+    """The issue's own guard rail: absence means nobody has looked yet, so a
+    missing (not failed) verdict must still just wait — even though
+    `merge_reason` names the identical "uat" gate kind."""
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_MISSING,
+            work_uat_state="",
+            work_uat_reason="",
+        )
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+
+
+def test_uat_gate_ignores_a_failed_verdict_with_no_recorded_reason():
+    """Mirrors the #2596 empty-test-reason guard: a `uat_state='failed'` with
+    nothing in `uat_reason` is not a brief a fix worker can act on, so this
+    must not dispatch — same posture as a missing verdict."""
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="   ",
+        )
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+
+
+def test_uat_fix_briefing_attributes_a_customer_verdict():
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="the checkout button is unreadable on dark mode",
+            work_uat_actor="customer",
+        )
+    )
+    assert action.kind == RUN
+    assert "customer" in action.command[4].lower()
+
+
+def test_uat_fix_briefing_attributes_an_operator_verdict_by_default():
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="layout broke on mobile",
+            work_uat_actor="",
+        )
+    )
+    assert action.kind == RUN
+    assert "operator" in action.command[4].lower()
+
+
+def test_uat_fix_dispatch_is_bounded_by_max_fix_rounds_then_escalates():
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UAT_VERDICT_FAILED,
+        work_uat_state="failed",
+        work_uat_reason="layout broke on mobile",
+    )
+
+    first = step(s, opts, counters=counters)
+    assert first.kind == RUN
+    second = step(s, opts, counters=counters)
+    assert second.kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_ESCALATED
+    assert "uat" in exhausted.message.lower()
+    assert "layout broke on mobile" in exhausted.message
+
+
+def test_uat_fix_dispatch_respects_max_fix_rounds_zero():
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="layout broke on mobile",
+        ),
+        DriveOptions(machine="precision", max_fix_rounds=0),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
+def test_uat_fix_dispatch_shares_the_fix_rounds_budget_with_test_failures():
+    """The issue's own guard rail bounds "the loop" — singular — the way the
+    fix budget already bounds test failures, not a second independent
+    counter. One fix round already spent on a failed TEST verdict must count
+    against a SUBSEQUENT UAT failure's budget on the same issue."""
+    counters = DriveCounters(fix_rounds=1)
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UAT_VERDICT_FAILED,
+        work_uat_state="failed",
+        work_uat_reason="layout broke on mobile",
+    )
+
+    only_round_left = step(s, opts, counters=counters)
+    assert only_round_left.kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_ESCALATED
+
+
+def test_uat_gate_still_waits_on_smoke_or_review_divergence_precedence():
+    """A failed UAT verdict must not be misread as a smoke/review divergence
+    even once it dispatches a fix — `_merge_gate_divergence` deliberately has
+    no `"uat"` arm, so this only stays true if `_decide_merge` intercepts
+    `"uat"` (both the wait and the new fix-dispatch shapes) before that check
+    runs."""
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="layout broke on mobile",
+        )
+    )
+    assert action.kind == RUN
+    assert action.command[0] == "fix"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
 # real about the code, but `coord merge`'s own live attempt has only
 # observed it fail ONCE so far and is already re-running the failed job(s)
