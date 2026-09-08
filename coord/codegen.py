@@ -247,6 +247,7 @@ SCHEMA_DISPLAY_ORDER: tuple[str, ...] = (
     "JournalResponse",
     "JournalEntryWire",
     "JournalLinkWire",
+    "IssueDetailWire",
 )
 
 # (schema name, field name) -> literal TS type, bypassing the mechanical
@@ -326,6 +327,11 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # raw `Assignment.status`, unmodified.
     ("PipelineLegWire", "stage"): "AssignmentType",
     ("PipelineLegWire", "status"): "AssignmentStatus | null",
+    # #3194 — GET /api/issue/{repo}/{number}. `state` is GitHub's own
+    # issue state (coord/dashboard/server.py IssueDetailWire docstring),
+    # never a queue/pipeline state — same two-value vocabulary as
+    # MilestoneSummaryWire/MilestoneDetail above.
+    ("IssueDetailWire", "state"): "'open' | 'closed'",
 }
 
 # Hand-authored wire-contract enums — see module docstring for why these are

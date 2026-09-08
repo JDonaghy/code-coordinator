@@ -387,6 +387,35 @@ class PipelineLegsResponse:
     legs: list[PipelineLegWire]
 
 
+@dataclasses.dataclass(frozen=True)
+class IssueDetailWire:
+    """``GET /api/issue/{repo}/{number}`` — #3194: a per-issue read surface
+    for the Board detail view, whether or not the issue has ever been
+    dispatched.
+
+    Reads the exact store row ``coord serve``'s own ``GET /issue/
+    {repo_name}/{number}`` (#1337) serves — local DB only, never a
+    re-derivation and never a GitHub call on the request path (the
+    dashboard has no credentials and must not acquire any). ``state`` is
+    GitHub's own open/closed, never a queue/pipeline state. ``html_url`` is
+    built HERE, server-side, from the repo's configured ``github: owner/repo``
+    slug (``coordinator.yml``) — the coord repo *name* is not always that
+    slug (``claude-coordinator`` -> ``JDonaghy/code-coordinator``), so
+    composing this URL client-side is structurally unfixable in the browser
+    and must not be attempted there.
+    """
+
+    repo_name: str
+    number: int
+    title: str
+    body: str
+    state: str
+    labels: list[str]
+    milestone_number: int | None
+    milestone_title: str | None
+    html_url: str
+
+
 def gate_a_decision_for_milestone(
     config: Config, repo_cfg: "Repo", milestone_number: int
 ) -> "tuple[GateADecision, str | None]":
@@ -944,6 +973,10 @@ def openapi_spec() -> dict:
     # `dataclass_schema` walk as the milestone/journal endpoints below; the
     # handler returns a literal `dataclasses.asdict(PipelineLegsResponse)`.
     pipeline_legs_response_ref = dataclass_schema(PipelineLegsResponse, components)
+    # #3194: GET /api/issue/{repo}/{number} — the per-issue read surface.
+    # Same plain `dataclass_schema` walk; the handler returns a literal
+    # `dataclasses.asdict(IssueDetailWire)`.
+    issue_detail_ref = dataclass_schema(IssueDetailWire, components)
     # #2428 DQW-1 / #1849: the drive-queue entry schema comes from the same
     # explicit DTO the daemon publishes as `BoardDriveQueueEntry` on `/board`
     # (`coord/board_schema.py`) — not from a hand-maintained field list, and
@@ -1848,6 +1881,43 @@ def openapi_spec() -> dict:
                         },
                     },
                     "404": {"description": "Unknown repo, or a non-integer issue"},
+                },
+            }
+        },
+        "/api/issue/{repo}/{number}": {
+            "get": {
+                "summary": (
+                    "#3194: one issue's full body + GitHub metadata, "
+                    "whether or not it has ever been dispatched"
+                ),
+                "description": (
+                    "Reads the same store row `coord serve`'s own GET "
+                    "/issue/{repo_name}/{number} (#1337) serves — local DB "
+                    "only, never a GitHub call on the request path. "
+                    "`html_url` is built server-side from the repo's "
+                    "configured `github: owner/repo` slug — the coord repo "
+                    "name is not always that slug, so the client must never "
+                    "compose this URL itself. An unknown repo, an unknown "
+                    "issue number, or an issue the store has never synced "
+                    "all return a 404."
+                ),
+                "parameters": [
+                    _dashboard_path_param("repo", "repo name (coordinator.yml)"),
+                    _dashboard_path_param("number", "GitHub issue number"),
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": issue_detail_ref}
+                        },
+                    },
+                    "404": {
+                        "description": (
+                            "Unknown repo, a non-integer issue number, or an "
+                            "issue the store has never synced"
+                        )
+                    },
                 },
             }
         },
@@ -3778,6 +3848,86 @@ def build_app(
         )
         return JSONResponse(dataclasses.asdict(response))
 
+    def _read_issue(repo_name: str, number: int) -> dict | None:
+        """The full local issue-store row for ``(repo_name, number)``, or
+        ``None`` (#3194).
+
+        Same store ``coord serve``'s own ``GET /issue/{repo_name}/{number}``
+        (#1337) serves, resolved the SAME daemon-vs-local way ``_read_board()``
+        / ``coord.state.get_issue_titles`` already do: thin client
+        (``board_service`` configured) -> that route via
+        :func:`coord.client.fetch_issue`; co-located -> the local ``issues``
+        table directly, decoded through the SAME :func:`coord.board_schema.
+        decode_row` the daemon's ``dao.SqliteStore.get_issue`` calls — so the
+        two paths can never disagree about what a row looks like (#2096: one
+        question, one answer). Deliberately never a GitHub call: the
+        dashboard has no credentials and must not acquire any.
+        """
+        from coord import board_service  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import fetch_issue  # noqa: PLC0415
+
+            return fetch_issue(svc, repo_name, number)
+        from coord import sql  # noqa: PLC0415
+        from coord.board_schema import decode_row  # noqa: PLC0415
+        from coord.db import get_connection  # noqa: PLC0415
+
+        conn = get_connection()
+        raw = sql.execute(
+            conn,
+            "SELECT * FROM issues WHERE repo_name = ? AND number = ?",
+            (repo_name, number),
+        ).fetchone()
+        return decode_row("issues", raw, full=True) if raw is not None else None
+
+    async def api_issue(request: Request) -> JSONResponse:
+        """GET /api/issue/{repo}/{number} — #3194: coord-web's Board detail
+        has no source for an issue's body (or a working GitHub link) for an
+        issue that has never been dispatched — see ``_read_issue`` for the
+        read, unchanged from ``coord serve``'s own single-issue detail
+        route. This handler's own job is just the two things only the
+        SERVER can do: resolve ``repo`` (coordinator.yml's name) to the
+        repo's configured ``github: owner/repo`` slug for ``html_url``
+        (the coord repo name is not always that slug — e.g.
+        ``claude-coordinator`` -> ``JDonaghy/code-coordinator`` — so the
+        client can never build this itself), and turn an unknown repo /
+        non-integer number / never-synced issue into a clean 404 JSON body.
+        """
+        repo_name = request.path_params["repo"]
+        try:
+            number = int(request.path_params["number"])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "issue number must be an integer"}, status_code=404
+            )
+
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            return JSONResponse(
+                {"error": f"unknown repo {repo_name!r}"}, status_code=404
+            )
+
+        row = _read_issue(repo_cfg.name, number)
+        if row is None:
+            return JSONResponse(
+                {"error": f"unknown issue {repo_name}#{number}"}, status_code=404
+            )
+
+        detail = IssueDetailWire(
+            repo_name=str(row.get("repo_name") or repo_cfg.name),
+            number=int(row.get("number") or number),
+            title=str(row.get("title") or ""),
+            body=str(row.get("body") or ""),
+            state=str(row.get("state") or "open"),
+            labels=list(row.get("labels") or []),
+            milestone_number=row.get("milestone_number"),
+            milestone_title=row.get("milestone_title"),
+            html_url=f"https://github.com/{repo_cfg.github}/issues/{number}",
+        )
+        return JSONResponse(dataclasses.asdict(detail))
+
     # Actions whose live handler returns a fixed-shape success envelope. The
     # fixture branch below reproduces that envelope exactly (`ok: true` plus
     # whatever fields the client reads) so a seeded acceptance run exercises
@@ -5025,6 +5175,7 @@ def build_app(
         Route(
             "/api/pipeline/{repo}/{issue}/legs", api_pipeline_legs, methods=["GET"]
         ),
+        Route("/api/issue/{repo}/{number}", api_issue, methods=["GET"]),
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         Route("/api/portal/needs-input", api_portal_needs_input, methods=["GET"]),
         Route("/api/portal/answer", api_portal_answer, methods=["POST"]),

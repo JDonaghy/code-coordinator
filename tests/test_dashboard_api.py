@@ -2872,3 +2872,190 @@ class TestPipelineLegsAPI:
         body = r.json()
         assert [leg["assignment_id"] for leg in body["legs"]] == ["s1", "w1"]
         assert body["legs"][0]["finished_at"] is None
+
+
+class TestIssueDetailAPI:
+    """`GET /api/issue/{repo}/{number}` — #3194: coord-web's Board detail has
+    no source for an issue's body (or a working GitHub link) for an issue
+    that has never been dispatched. Reads the same local ``issues`` store row
+    ``coord serve``'s own ``GET /issue/{repo_name}/{number}`` (#1337) serves,
+    and builds ``html_url`` server-side from the repo's configured
+    ``github: owner/repo`` slug — never from the coord repo name, which is
+    not always that slug.
+    """
+
+    def _config_with_name_ne_slug(self) -> Config:
+        """A repo whose coordinator.yml *name* differs from its GitHub
+        *slug* — ``claude-coordinator`` -> ``JDonaghy/code-coordinator`` is
+        the real mapping this repo ships (#3194's acceptance case)."""
+        return Config(
+            repos=[
+                Repo(name="api", github="acme/api"),
+                Repo(name="claude-coordinator", github="JDonaghy/code-coordinator"),
+            ],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet",
+                repos=["api", "claude-coordinator"],
+                repo_paths={"api": "/tmp/api", "claude-coordinator": "/tmp/cc"},
+            )],
+        )
+
+    def test_unknown_repo_returns_clean_404(self, rw_db) -> None:
+        client = _client()
+        r = client.get("/api/issue/nonexistent/42")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_non_integer_number_returns_clean_404(self, rw_db) -> None:
+        client = _client()
+        r = client.get("/api/issue/api/not-a-number")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+
+    def test_known_repo_but_never_synced_issue_returns_clean_404(self, rw_db) -> None:
+        """The repo is configured but the store has never seen this issue
+        (never dispatched, never synced) — a clean 404, not a traceback."""
+        client = _client()
+        r = client.get("/api/issue/api/9999")
+        assert r.status_code == 404
+        assert "traceback" not in r.text.lower()
+        assert r.json()["error"]
+
+    def test_full_body_state_labels_and_milestone_are_served(self, rw_db) -> None:
+        from coord.state import _upsert_issue_local
+
+        _upsert_issue_local("api", {
+            "number": 2,
+            "title": "coord web has no per-issue read surface",
+            "body": "## The gap\n\nfull untruncated body text here",
+            "state": "open",
+            "labels": ["bug", "coord-web"],
+            "milestone_number": 7,
+            "milestone_title": "v0.5",
+        })
+
+        client = _client()
+        r = client.get("/api/issue/api/2")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["repo_name"] == "api"
+        assert body["number"] == 2
+        assert body["title"] == "coord web has no per-issue read surface"
+        assert body["body"] == "## The gap\n\nfull untruncated body text here"
+        assert body["state"] == "open"
+        assert body["labels"] == ["bug", "coord-web"]
+        assert body["milestone_number"] == 7
+        assert body["milestone_title"] == "v0.5"
+        assert body["html_url"] == "https://github.com/acme/api/issues/2"
+
+    def test_html_url_uses_the_configured_slug_not_the_repo_name(self, rw_db) -> None:
+        """#3194's acceptance case: the coord repo *name* is not always the
+        GitHub *slug* — prepending the owner to the name is not the fix
+        either. Verified live against ``claude-coordinator`` ->
+        ``JDonaghy/code-coordinator``."""
+        from coord.state import _upsert_issue_local
+
+        _upsert_issue_local("claude-coordinator", {
+            "number": 3072, "title": "split the release", "state": "open",
+        })
+
+        client = TestClient(build_app(self._config_with_name_ne_slug()))
+        r = client.get("/api/issue/claude-coordinator/3072")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["html_url"] == "https://github.com/JDonaghy/code-coordinator/issues/3072"
+
+    def test_closed_issue_reports_github_state_not_a_queue_state(self, rw_db) -> None:
+        from coord.state import _upsert_issue_local
+
+        _upsert_issue_local("api", {"number": 5, "title": "done", "state": "closed"})
+
+        client = _client()
+        r = client.get("/api/issue/api/5")
+
+        assert r.status_code == 200
+        assert r.json()["state"] == "closed"
+
+    def test_thin_client_routes_to_the_daemon_instead_of_the_local_db(
+        self, rw_db, monkeypatch
+    ) -> None:
+        """On a thin-client dashboard host (``board_service`` configured),
+        the read must go through the daemon's ``GET /issue/{repo}/{number}``
+        (#1337) — never this process's own local ``issues`` table, which
+        would silently answer with stale or absent data off the daemon
+        host (mirrors ``TestPortalThinClientRouting`` above)."""
+        import coord.client as cc
+        from coord.state import _upsert_issue_local
+
+        # Sits in THIS (thin client's) own local DB under the SAME key —
+        # must NOT be what's served, proving the handler isn't reading it.
+        _upsert_issue_local("api", {
+            "number": 2, "title": "LOCAL — must not be served", "state": "open",
+        })
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+        def fake_get(url, **kw):
+            assert url == "http://daemon:7435/issue/api/2"
+
+            class _Resp:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return {
+                        "repo_name": "api",
+                        "number": 2,
+                        "title": "REMOTE — from the daemon",
+                        "body": "remote body",
+                        "state": "open",
+                        "labels": [],
+                        "milestone_number": None,
+                        "milestone_title": None,
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        client = _client()
+        r = client.get("/api/issue/api/2")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["title"] == "REMOTE — from the daemon"
+        assert body["html_url"] == "https://github.com/acme/api/issues/2"
+
+    def test_response_matches_its_openapi_schema(self, rw_db) -> None:
+        from coord.state import _upsert_issue_local
+
+        _upsert_issue_local("api", {
+            "number": 2, "title": "t", "body": "b", "state": "open",
+            "labels": ["x"], "milestone_number": 1, "milestone_title": "v1",
+        })
+
+        client = _client()
+        r = client.get("/api/issue/api/2")
+
+        assert r.status_code == 200
+        spec = openapi_spec()
+        schema = spec["paths"]["/api/issue/{repo}/{number}"]["get"]["responses"][
+            "200"
+        ]["content"]["application/json"]["schema"]
+        errors = validate_json_schema(r.json(), schema, spec["components"]["schemas"])
+        assert errors == [], errors
+
+    def test_route_appears_in_the_served_openapi_spec(self) -> None:
+        """coord-web's ``e2e/api-routes.spec.ts`` (coord-web#78) fails the
+        moment its client names a path the served spec doesn't have — the
+        check that makes the sibling slice safe."""
+        spec = openapi_spec()
+        assert "/api/issue/{repo}/{number}" in spec["paths"]
+        assert "get" in spec["paths"]["/api/issue/{repo}/{number}"]
