@@ -57,6 +57,21 @@ def two_machine_config(repo: Repo) -> Config:
     )
 
 
+@pytest.fixture(autouse=True)
+def _machines_always_reachable(monkeypatch: pytest.MonkeyPatch):
+    """#3208: `dispatch_ci_fix` → `coord.auto_loop._dispatch_fix` now probes
+    reachability (`coord.dispatch.select_fix_machine`, via `coord.network.
+    fetch_status`) before picking a machine. This module's `laptop.tail`/
+    `server.tail` hosts don't actually resolve — default them to reachable
+    so these tests keep exercising CI-fix dispatch, not machine selection."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=3.0: StatusResult(data={}),
+    )
+
+
 def _entry(*, error: str | None = "checks failed: acceptance (failure)") -> QueuedMerge:
     return QueuedMerge(
         assignment_id="w1",

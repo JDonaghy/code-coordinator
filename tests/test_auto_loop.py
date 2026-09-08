@@ -22,7 +22,53 @@ from coord.auto_loop import (
 )
 from coord.config import Config, ModelsConfig, PipelineConfig, ReviewsConfig
 from coord.models import Assignment, Board, Machine, Repo
+from coord.network import StatusResult
 from coord.review import ReviewFindings
+
+
+def _reachable_status_fetcher(machine: Machine) -> StatusResult:
+    """#3208: `_dispatch_fix` now probes reachability (`coord.dispatch.
+    select_fix_machine`, via `coord.network.fetch_status`) before ever
+    picking a machine. Every pre-#3208 test here dispatches against a fake
+    ``*.tail`` hostname that isn't actually resolvable, so without this
+    stub every one of them would now fail machine selection before reaching
+    whatever they actually mean to exercise. Reports every machine reachable
+    — the pre-#3208 default behavior — so those tests keep testing what they
+    said they test; the reachability-fallback behavior itself gets its own
+    tests below (`TestDispatchFixReachabilityFallback`)."""
+    return StatusResult(data={})
+
+
+def _unreachable_status_fetcher(*unreachable_names: str):
+    """A status fetcher that reports the named machines unreachable and
+    every other machine reachable — for tests of the #3208 fallback/refusal
+    behavior itself."""
+
+    def _fetch(machine: Machine) -> StatusResult:
+        if machine.name in unreachable_names:
+            return StatusResult(error="timeout")
+        return StatusResult(data={})
+
+    return _fetch
+
+
+@pytest.fixture(autouse=True)
+def _default_all_machines_reachable(monkeypatch):
+    """#3208: `select_fix_machine` (via `_dispatch_fix`) now probes
+    reachability with `coord.network.fetch_status` before picking a machine
+    for a same-branch fix. Every test in this module predates that probe and
+    dispatches against fake `*.tail` hostnames that don't actually resolve —
+    default every machine to reachable, fleet-wide for this test module, so
+    the ~30 existing `process_review_completion`/`_dispatch_fix` call sites
+    keep exercising what they said they exercise rather than all failing
+    machine selection before reaching it. Tests of the #3208
+    fallback/refusal behavior itself (`TestSelectFixMachine`,
+    `TestDispatchFixReachabilityFallback`) override this per-test via
+    `monkeypatch.setattr` or an explicit `status_fetcher=`."""
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=3.0: StatusResult(data={}),
+    )
 
 
 # ── Shared fixtures ──────────────────────────────────────────────────────────
@@ -2600,6 +2646,7 @@ class TestDispatchFixRemoteBranchGuard:
                 work, "Fix briefing.", board, cfg, iteration=1,
                 http_client=mock_http,
                 remote_branch_checker=_checker,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is not None
@@ -2625,6 +2672,7 @@ class TestDispatchFixRemoteBranchGuard:
                 work, "Fix briefing.", board, cfg, iteration=1,
                 http_client=mock_http,
                 remote_branch_checker=lambda repo, branch: False,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is None
@@ -2649,6 +2697,7 @@ class TestDispatchFixRemoteBranchGuard:
                 work, "Fix briefing.", board, cfg, iteration=1,
                 http_client=mock_http,
                 remote_branch_checker=lambda repo, branch: True,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is not None
@@ -2701,6 +2750,7 @@ class TestDispatchFixDbContention:
             result = _dispatch_fix(
                 work, "Fix briefing.", board, cfg, iteration=1,
                 http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is None
@@ -2728,6 +2778,7 @@ class TestDispatchFixDbContention:
             _dispatch_fix(
                 work, "Fix briefing.", board, cfg, iteration=1,
                 http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert board.active == []
@@ -2751,6 +2802,7 @@ class TestDispatchFixDbContention:
                 _dispatch_fix(
                     work, "Fix briefing.", board, cfg, iteration=1,
                     http_client=mock_http,
+                    status_fetcher=_reachable_status_fetcher,
                 )
 
 
@@ -2781,6 +2833,7 @@ class TestDispatchFixTestAuthorType:
             result = _dispatch_fix(
                 work, "Fix briefing.", board, config, iteration=1,
                 http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is not None
@@ -2859,6 +2912,7 @@ class TestDispatchFixMockAuthorType:
             result = _dispatch_fix(
                 work, "Fix briefing.", board, config, iteration=1,
                 http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
             )
 
         assert result is not None
@@ -3004,3 +3058,245 @@ class TestProcessReviewCompletionMockAuthorType:
         assert "Contract names a field" in sent_payload["briefing"]
         assert "ensure all tests pass" not in sent_payload["briefing"].lower()
         assert "make them pass" not in sent_payload["briefing"].lower()
+
+
+# ── #3208: reachability-aware machine selection for same-branch fix ────────
+
+
+class TestSelectFixMachine:
+    """`coord.dispatch.select_fix_machine` — the ONE function both doors
+    onto `coord fix` (the review-verdict door and the failed-test/CI/
+    acceptance/UAT door) use to answer "which machine should this same-
+    branch fix run on", so the two can never disagree (#2096, #3208)."""
+
+    def _machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="laptop", host="laptop.tail",
+                capabilities=["python"], repos=["api"],
+                repo_paths={"api": "/work/api"},
+            ),
+            Machine(
+                name="server", host="server.tail",
+                capabilities=["python"], repos=["api"],
+                repo_paths={"api": "/srv/api"},
+            ),
+        ]
+
+    def test_picks_original_when_reachable(self) -> None:
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            status_fetcher=_reachable_status_fetcher,
+        )
+        assert selection.machine is not None
+        assert selection.machine.name == "laptop"
+        assert selection.tried == []
+
+    def test_falls_back_to_reachable_machine_when_original_unreachable(self) -> None:
+        """#3208: the core fix — an original machine that's merely asleep
+        must not stall the whole dispatch when another capable machine is
+        up and the branch can be fetched from the remote."""
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            status_fetcher=_unreachable_status_fetcher("laptop"),
+        )
+        assert selection.machine is not None
+        assert selection.machine.name == "server"
+        assert selection.tried == [("laptop", "timeout")]
+
+    def test_none_reachable_names_every_candidate_tried(self) -> None:
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            status_fetcher=_unreachable_status_fetcher("laptop", "server"),
+        )
+        assert selection.machine is None
+        assert {name for name, _ in selection.tried} == {"laptop", "server"}
+
+    def test_override_machine_restricts_candidates_to_just_that_one(self) -> None:
+        """--machine pins the dispatch; no falling back to some OTHER
+        machine the caller didn't ask for, even if one is reachable."""
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            override_machine_name="server",
+            status_fetcher=_reachable_status_fetcher,
+        )
+        assert selection.machine is not None
+        assert selection.machine.name == "server"
+
+    def test_override_machine_unreachable_is_named_not_silently_skipped(self) -> None:
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            override_machine_name="server",
+            status_fetcher=_unreachable_status_fetcher("server"),
+        )
+        assert selection.machine is None
+        assert selection.tried == [("server", "timeout")]
+
+    def test_override_machine_unknown_name_is_named(self) -> None:
+        from coord.dispatch import select_fix_machine
+
+        selection = select_fix_machine(
+            original_machine_name="laptop",
+            repo_name="api",
+            machines=self._machines(),
+            override_machine_name="nonexistent",
+        )
+        assert selection.machine is None
+        assert selection.tried == [
+            ("nonexistent", "not configured in coordinator.yml")
+        ]
+
+    def test_paused_machine_is_named_and_skipped(self) -> None:
+        from coord.dispatch import select_fix_machine
+
+        with patch(
+            "coord.machine_pause.follow_on_paused_set", return_value={"laptop"}
+        ):
+            selection = select_fix_machine(
+                original_machine_name="laptop",
+                repo_name="api",
+                machines=self._machines(),
+                status_fetcher=_reachable_status_fetcher,
+            )
+        assert selection.machine is not None
+        assert selection.machine.name == "server"
+        assert selection.tried == [("laptop", "paused via `coord pause`")]
+
+
+class TestDescribeFixMachineFailure:
+    """`coord.dispatch.describe_fix_machine_failure` — the message BOTH
+    doors onto `coord fix` render, so the operator sees the same actionable
+    line (naming the unreachable machine + how to redirect) no matter which
+    door they hit (#3208)."""
+
+    def test_names_the_unreachable_machine_and_the_redirect_flag(self) -> None:
+        from coord.dispatch import FixMachineSelection, describe_fix_machine_failure
+
+        selection = FixMachineSelection(None, [("elitebook", "timeout")])
+        msg = describe_fix_machine_failure("elitebook", selection)
+        assert "elitebook" in msg
+        assert "timeout" in msg
+        assert "--machine" in msg
+
+    def test_override_failure_names_the_override_not_the_original(self) -> None:
+        from coord.dispatch import FixMachineSelection, describe_fix_machine_failure
+
+        selection = FixMachineSelection(None, [("server", "timeout")])
+        msg = describe_fix_machine_failure(
+            "laptop", selection, override_machine_name="server",
+        )
+        assert "server" in msg
+
+
+# ── #3208: `_dispatch_fix` end-to-end reachability fallback ────────────────
+
+
+class TestDispatchFixReachabilityFallback:
+    """`_dispatch_fix` (used by both `coord fix <review_id>` and the
+    review→fix auto-loop) must route around an unreachable original machine
+    instead of stalling, and must surface a NAMED reason (via
+    `failure_detail`) when nothing usable is left (#3208)."""
+
+    def _work(self, machine: str = "laptop") -> Assignment:
+        return Assignment(
+            machine_name=machine,
+            repo_name="api",
+            issue_number=9,
+            issue_title="Fix thing",
+            briefing="Original briefing.",
+            assignment_id="work-3208",
+            status="done",
+            branch="issue-9-fix-thing",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            type="work",
+        )
+
+    def test_falls_back_to_a_reachable_machine_when_original_is_asleep(self) -> None:
+        cfg = _two_machine_config()
+        work = self._work(machine="laptop")
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3208-a"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+                remote_branch_checker=lambda repo, branch: True,
+                status_fetcher=_unreachable_status_fetcher("laptop"),
+            )
+
+        assert result is not None
+        assert result.machine_name == "server"
+
+    def test_names_the_unreachable_machine_when_nothing_is_usable(self) -> None:
+        cfg = _two_machine_config()
+        work = self._work(machine="laptop")
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        failure_detail: list[str] = []
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+                status_fetcher=_unreachable_status_fetcher("laptop", "server"),
+                failure_detail=failure_detail,
+            )
+
+        assert result is None
+        mock_http.post.assert_not_called()
+        assert failure_detail
+        assert "laptop" in failure_detail[0]
+        assert "server" in failure_detail[0]
+        assert "--machine" in failure_detail[0]
+
+    def test_review_arm_surfaces_the_named_reason_not_the_generic_one(self) -> None:
+        """`_dispatch_fix_for_review` (the review→fix auto-loop's own
+        dispatch step, and what `coord fix <review_id>` ultimately calls)
+        must forward the specific reason into its LoopAction detail instead
+        of the old generic "agent unreachable or no capable machine" line
+        that gave the operator nothing to act on."""
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        cfg = _two_machine_config()
+        work = _work_assignment(assignment_id="work-3208b")
+        review = _review_assignment(assignment_id="review-3208b", review_of="work-3208b")
+        board = _board_with(work, review)
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. fix it\n"
+        )
+
+        with patch("coord.auto_loop.record_dispatched_assignment"), patch(
+            "coord.network.fetch_status",
+            _unreachable_status_fetcher("laptop", "server"),
+        ):
+            actions = _dispatch_fix_for_review(review, findings, board, cfg)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "no_work_found"
+        assert "laptop" in actions[0].detail
+        assert "server" in actions[0].detail
+        assert "--machine" in actions[0].detail

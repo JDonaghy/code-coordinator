@@ -9,7 +9,12 @@ creating a closed loop.
 The loop terminates when:
   - A review approves the changes (verdict = ``approve``)
   - The iteration count hits ``pipeline.max_review_iterations``
-  - A fix worker fails to dispatch (agent unreachable, no capable machine, etc.)
+  - A fix worker fails to dispatch — no configured machine is both capable
+    of the repo and actually reachable right now (#3208: an unreachable
+    ORIGINAL worker machine alone no longer stops this — see
+    ``coord.dispatch.select_fix_machine``, which falls back to another
+    capable, reachable machine first and names every machine it tried when
+    none is usable)
 
 Config (coordinator.yml)::
 
@@ -268,8 +273,14 @@ def process_review_completion(
     http_client: httpx.Client | None = None,
     terminal_cache: dict | None = None,
     dispatch_fixes: bool = True,
+    override_machine: str | None = None,
 ) -> list[LoopAction]:
     """Process a completed review assignment through the auto-loop.
+
+    *override_machine* (#3208, from ``coord fix --machine``) is forwarded to
+    :func:`_dispatch_fix_for_review` when a fix is dispatched; it has no
+    effect on any other outcome (approve, max-iterations, terminal-skip,
+    ...).
 
     Parses the reviewer's verdict (local log or agent HTTP fallback when
     *machine_host* is supplied), then either:
@@ -438,6 +449,7 @@ def process_review_completion(
     return _dispatch_fix_for_review(
         review, findings, board, config,
         http_client=http_client, terminal_cache=terminal_cache,
+        override_machine=override_machine,
     )
 
 
@@ -805,8 +817,13 @@ def _dispatch_fix_for_review(
     *,
     http_client: httpx.Client | None = None,
     terminal_cache: dict | None = None,
+    override_machine: str | None = None,
 ) -> list[LoopAction]:
-    """Find the reviewed work assignment and dispatch a fix worker for it."""
+    """Find the reviewed work assignment and dispatch a fix worker for it.
+
+    *override_machine* (#3208, from ``coord fix --machine``) is forwarded
+    straight to :func:`_dispatch_fix` — see its docstring.
+    """
     # Locate the work assignment that was reviewed.
     work: Assignment | None = None
     if review.review_of_assignment_id:
@@ -903,16 +920,26 @@ def _dispatch_fix_for_review(
         work, merged_findings, next_iteration, max_iter
     )
     model = _fix_model_for_iteration(config, next_iteration)
+    fix_failure: list[str] = []
     fix = _dispatch_fix(
         work, briefing, board, config, next_iteration,
         model=model, http_client=http_client,
+        override_machine=override_machine, failure_detail=fix_failure,
     )
 
     if fix is None:
+        # #3208: name the machine(s) actually tried and why, when
+        # `_dispatch_fix` could produce one — falls back to the old generic
+        # line only for a failure mode it can't attribute to a machine (e.g.
+        # persistent DB contention recording the dispatched assignment).
+        detail = (
+            fix_failure[0] if fix_failure
+            else "fix worker dispatch failed (agent unreachable or no capable machine)"
+        )
         return [LoopAction(
             kind="no_work_found",
             assignment_id=review.assignment_id,
-            detail="fix worker dispatch failed (agent unreachable or no capable machine)",
+            detail=detail,
         )]
 
     log.info(
@@ -1158,11 +1185,25 @@ def _dispatch_fix(
     model: str | None = None,
     http_client: httpx.Client | None = None,
     remote_branch_checker=None,
+    override_machine: str | None = None,
+    status_fetcher=None,
+    failure_detail: list[str] | None = None,
 ) -> Assignment | None:
     """POST a fix assignment to the agent server.
 
     Prefers the same machine as the original worker (the branch is already
-    checked out there).  Falls back to any capable machine.
+    checked out there). Falls back to any OTHER capable machine that is
+    actually reachable right now (#3208) — see
+    :func:`coord.dispatch.select_fix_machine`, the one function both doors
+    onto ``coord fix`` use to answer "which machine" (#2096).
+
+    *override_machine* — from ``coord fix --machine`` — pins the dispatch to
+    exactly that machine (no fallback). *status_fetcher* is forwarded to
+    :func:`coord.dispatch.select_fix_machine` for test injection. When the
+    caller passes a *failure_detail* list, a human-readable reason (naming
+    the machine(s) tried and why) is appended to it whenever this returns
+    ``None`` for lack of a usable machine — the #3208 fix for a bare
+    "dispatch failed: timed out" with no named cause.
 
     #1176/#2302: the dispatched type mirrors ``work.type`` for any
     :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` member (``"test-author"``,
@@ -1180,41 +1221,27 @@ def _dispatch_fix(
     Returns the new Assignment (already added to ``board.active``), or None
     on failure.
     """
-    # Pick machine: prefer the original worker's machine first.
-    machine = next(
-        (m for m in config.machines if m.name == work.machine_name), None
+    from coord.dispatch import describe_fix_machine_failure, select_fix_machine
+
+    selection = select_fix_machine(
+        original_machine_name=work.machine_name,
+        repo_name=work.repo_name,
+        machines=config.machines,
+        override_machine_name=override_machine,
+        status_fetcher=status_fetcher,
     )
-    # #2240: the pause set here is `follow_on_paused_set()`, NOT `paused_set()`
-    # — a fix leg is the tail of work that is already running (dispatched
-    # after a `request-changes` review verdict on a row that has not gone
-    # anywhere new), so a release cordon ("route no NEW work here") must not
-    # filter its host out. This is the same fix as `coord/review.py`'s
-    # reviewer-selection change; leaving this call on `paused_set()` would
-    # reproduce the fleet-wide deadlock for the fix leg instead of the
-    # review leg. Explicit pauses and quiet hours still apply.
-    from coord.machine_pause import follow_on_paused_set
-    paused = follow_on_paused_set(config.machines)
-    if (
-        machine is None
-        or not machine.can_work_on(work.repo_name)
-        or machine.repo_path(work.repo_name) is None
-        or machine.name in paused
-    ):
-        # Fallback: any machine capable of working on this repo, minus
-        # any the user has paused via `coord pause` (routing-pause).
-        candidates = [
-            m for m in config.machines
-            if m.can_work_on(work.repo_name)
-            and m.repo_path(work.repo_name) is not None
-            and m.name not in paused
-        ]
-        if not candidates:
-            log.warning(
-                "auto_loop: no machine can handle repo %r (paused=%r)",
-                work.repo_name, sorted(paused)
-            )
-            return None
-        machine = candidates[0]
+    machine = selection.machine
+    if machine is None:
+        reason = describe_fix_machine_failure(
+            work.machine_name, selection, override_machine_name=override_machine,
+        )
+        log.warning(
+            "auto_loop: fix dispatch for %s declined: %s",
+            work.assignment_id, reason,
+        )
+        if failure_detail is not None:
+            failure_detail.append(reason)
+        return None
 
     # #586: if we ended up routing to a different machine than the original
     # worker, the branch must exist on the remote so the fix worker can fetch

@@ -76,6 +76,23 @@ def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path
     return d
 
 
+@pytest.fixture(autouse=True)
+def _machines_always_reachable(monkeypatch: pytest.MonkeyPatch):
+    """#3208: `coord fix` now probes reachability (`coord.dispatch.
+    select_fix_machine`, via `coord.network.fetch_status`) before picking a
+    machine. This module's `laptop.tailnet`/`server.tailnet` hosts don't
+    actually resolve — default them to reachable so `TestFix` keeps
+    exercising same-branch fix dispatch, not machine selection. The
+    unreachable-machine fallback/refusal behavior itself is covered where
+    it's introduced (tests/test_auto_loop.py)."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=3.0: StatusResult(data={}),
+    )
+
+
 # ── coord test --fail --output ──────────────────────────────────────────
 
 

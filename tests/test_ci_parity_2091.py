@@ -237,6 +237,21 @@ def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path
     return d
 
 
+@pytest.fixture(autouse=True)
+def _machine_always_reachable(monkeypatch: pytest.MonkeyPatch):
+    """#3208: `coord fix` now probes reachability (`coord.dispatch.
+    select_fix_machine`, via `coord.network.fetch_status`) before picking a
+    machine. This module's `laptop.tailnet` host doesn't actually resolve —
+    default it to reachable so these CI-parity tests keep exercising CI
+    parity, not machine selection."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=3.0: StatusResult(data={}),
+    )
+
+
 def _cfg(path: Path):
     return load_config(path)
 

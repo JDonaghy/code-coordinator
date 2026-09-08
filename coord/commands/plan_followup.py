@@ -106,6 +106,7 @@ def _dispatch_followup(
     type: str = "work",
     files_likely: list[str] | None = None,
     inherit_branch: bool = True,
+    machine_name: str | None = None,
 ) -> str:
     """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID.
 
@@ -125,6 +126,14 @@ def _dispatch_followup(
     PLAN assignment: a plan never pushes, its recorded branch is a
     throwaway worktree name (sometimes a stale/wrong capture), and the
     work it spawns must start a FRESH branch derived from the issue.
+
+    *machine_name* (#3208) overrides which machine the follow-up is
+    dispatched to — defaults to ``original.machine_name``, same as before
+    this parameter existed. A same-branch fix caller that has already
+    resolved a live, capable machine via
+    :func:`coord.dispatch.select_fix_machine` (because the original worker's
+    machine turned out to be unreachable) passes that resolved name here
+    instead of unconditionally re-aiming at the original.
     """
     from coord.board_service import read_board, write_board
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
@@ -137,7 +146,7 @@ def _dispatch_followup(
 
     proposal = Proposal(
         id=0,
-        machine_name=original.machine_name,
+        machine_name=machine_name or original.machine_name,
         repo_name=original.repo_name,
         issue_number=original.issue_number,
         issue_title=original.issue_title,
@@ -633,6 +642,7 @@ def _fix_from_review(
     *,
     guidance: str,
     force: bool,
+    machine_override: str | None = None,
 ) -> None:
     """#1622: dispatch a HEADLESS fix round for a request-changes review.
 
@@ -727,6 +737,7 @@ def _fix_from_review(
     before = {a.assignment_id for a in board.active}
     actions = auto_loop.process_review_completion(
         review, board, cfg, log_path=log_path, machine_host=machine_host,
+        override_machine=machine_override,
     )
 
     # `process_review_completion` mutates the board and leaves persistence to
@@ -813,7 +824,24 @@ def _fix_from_review(
         "max_review_iterations or the #522 terminal-work guard."
     ),
 )
-def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> None:
+@click.option(
+    "--machine",
+    "machine_override",
+    default=None,
+    help=(
+        "Redirect this same-branch fix to a specific machine instead of the "
+        "original worker's (#3208) — e.g. when `coord status` shows the "
+        "original asleep/unreachable. The branch is fetched from the remote, "
+        "so any machine configured for this repo works. Without this flag, "
+        "an unreachable original now falls back to another capable, reachable "
+        "machine automatically; this flag only matters when you want a "
+        "SPECIFIC one, or every automatic fallback was also unreachable."
+    ),
+)
+def fix(
+    assignment_id: str, config_path: Path, guidance: str, force: bool,
+    machine_override: str | None,
+) -> None:
     from coord.board_service import read_board
     from coord.state import COORD_DIR
 
@@ -829,7 +857,10 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # `coord.auto_loop`, which owns same-branch fix dispatch — this command
     # deliberately does not grow a second implementation of it.
     if assignment.type == "review":
-        _fix_from_review(cfg, board, assignment, guidance=guidance, force=force)
+        _fix_from_review(
+            cfg, board, assignment, guidance=guidance, force=force,
+            machine_override=machine_override,
+        )
         return
 
     # #1384: gate on the canonical `test_state` with the legacy `smoke_test`
@@ -852,6 +883,16 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # the drive-queue entry parked after burning its retry budget (ms-65 /
     # #2282, observed live 2026-08-17).
     acceptance_failed = assignment.acceptance_state == "failed"
+
+    # #3208: a failed human/customer UAT verdict (`coord uat --failed` or a
+    # customer portal `preview.changes_requested`, #2687/#3188) is a FIFTH
+    # door — distinct from the four above, so it does NOT by itself skip the
+    # `--force` gate below (nothing here has independently confirmed the PR
+    # is red the way a test/CI/acceptance failure does). What it DOES supply
+    # is evidence to brief the fix worker with: `uat_reason` already holds
+    # the full write-up of what's wrong, so a caller forcing a fix for a UAT
+    # failure should not have to retype it via `--guidance`.
+    uat_failed = assignment.uat_state == "failed"
 
     # #1622 (part 3): red CI is the third trigger.  Only consulted when the
     # local test gate has NOT already failed, so the cheap in-DB path stays
@@ -937,14 +978,26 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
                     err=True,
                 )
             sys.exit(1)
+        if not guidance and uat_failed and assignment.uat_reason:
+            # #3208: the board already holds a full write-up of what's
+            # broken (`uat_reason` — the Gate-A/preview divergence detail a
+            # customer or operator recorded via `coord uat --failed`) — don't
+            # make the caller retype it.
+            guidance = assignment.uat_reason
+            click.echo(
+                f"  guidance: defaulted to uat_reason (#3208, {len(guidance)} "
+                "chars) — pass --guidance explicitly to override",
+            )
         if not guidance:
-            # There's no failed verdict, CI read, or test-output file to
-            # brief the fix worker with — `--force` alone would dispatch it
-            # blind. Require the caller to say what's actually broken.
+            # There's no failed verdict, CI read, uat_reason, or test-output
+            # file to brief the fix worker with — `--force` alone would
+            # dispatch it blind. Require the caller to say what's actually
+            # broken.
             click.echo(
                 f"error: --force on assignment {assignment_id} also needs "
-                "--guidance — there's no failed test verdict or CI read to "
-                "brief the fix worker with, so say what's actually broken.",
+                "--guidance — there's no failed test verdict, CI read, or "
+                "UAT reason to brief the fix worker with, so say what's "
+                "actually broken.",
                 err=True,
             )
             sys.exit(1)
@@ -970,6 +1023,10 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
         # smoke/test-reason fallbacks below apply here: this door fires
         # precisely when Test/CI are NOT what's red.
         test_output = assignment.acceptance_reason or ""
+    elif uat_failed and not test_failed and assignment.uat_reason:
+        # #3208: same shape as the acceptance-trust-gate branch above — a
+        # UAT failure's own recorded reason IS the evidence for this door.
+        test_output = assignment.uat_reason
     elif test_output_file.exists():
         test_output = test_output_file.read_text()
     elif assignment.smoke_test_reason or assignment.test_reason:
@@ -988,7 +1045,13 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
         )
 
     guidance_text = guidance or "Fix the failing tests and push."
-    if forced_without_evidence:
+    if forced_without_evidence and uat_failed and assignment.uat_reason:
+        # #3208: a real, board-recorded UAT failure — not the caller merely
+        # attesting the PR is red — so give it its own heading rather than
+        # the generic "unverified" one below.
+        _what = f"a failed UAT verdict ({assignment.uat_actor or 'operator'}, #2687/#3208)"
+        _failure_heading = "UAT failure"
+    elif forced_without_evidence:
         _what = (
             "a reported failure (--force: neither a failed test verdict nor "
             "an automated CI read found one — the caller attests the PR is "
@@ -1020,6 +1083,67 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
         f"- Commit your fixes and push with git push origin HEAD"
     )
 
+    # #3208: pick a machine to run the fix on BEFORE ever POSTing — same
+    # selector the review-verdict door uses (`coord.dispatch.
+    # select_fix_machine`), so the two doors onto `coord fix` can never
+    # disagree about "which machine" (#2096). Prefers the original worker's
+    # machine, but a live reachability probe (not just config capability)
+    # skips it — and falls through to another capable, reachable machine —
+    # the moment it's asleep/offline, instead of the previous unconditional
+    # re-aim that surfaced only as a bare `dispatch failed: timed out` with
+    # no named cause (format-converter#6 / #3208).
+    from coord.dispatch import describe_fix_machine_failure, select_fix_machine
+
+    selection = select_fix_machine(
+        original_machine_name=assignment.machine_name,
+        repo_name=assignment.repo_name,
+        machines=cfg.machines,
+        override_machine_name=machine_override,
+    )
+    if selection.machine is None:
+        click.echo(
+            f"error: cannot dispatch fix for assignment {assignment_id}: "
+            + describe_fix_machine_failure(
+                assignment.machine_name, selection,
+                override_machine_name=machine_override,
+            ),
+            err=True,
+        )
+        sys.exit(1)
+    if selection.machine.name != assignment.machine_name:
+        # #586 (mirrored from `coord.auto_loop._dispatch_fix`): routing to a
+        # DIFFERENT machine than the original worker only works if the
+        # branch actually exists on the remote for the new machine to fetch
+        # — otherwise the fix worker starts from an empty checkout with no
+        # commits and no clear error. A WORK assignment reaching this arm of
+        # `coord fix` has normally already cleared Test/Review (both of
+        # which require a pushed branch), but check rather than assume.
+        from coord import github_ops  # noqa: PLC0415
+
+        repo_for_check = cfg.repo(assignment.repo_name)
+        if (
+            repo_for_check is not None
+            and assignment.branch
+            and not github_ops.branch_exists_on_remote(
+                repo_for_check.github, assignment.branch
+            )
+        ):
+            click.echo(
+                f"error: cannot redirect fix for {assignment_id} to "
+                f"{selection.machine.name!r} — branch {assignment.branch!r} "
+                f"is not on the remote, so a different machine cannot fetch "
+                f"it. The original machine {assignment.machine_name!r} must "
+                "push it first, or dispatch from that machine once it's "
+                "reachable again.",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(
+            f"  redirecting: original machine {assignment.machine_name!r} "
+            f"unusable — dispatching to {selection.machine.name!r} instead "
+            "(#3208; the branch is fetched from the remote)",
+        )
+
     # Determine escalated model for the fix-up.
     original_model = assignment.model or cfg.models.default
     escalated = cfg.models.next_model(original_model)
@@ -1027,7 +1151,10 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
         click.echo(f"  escalating model: {original_model} → {escalated}")
 
     try:
-        new_id = _dispatch_followup(cfg, assignment, briefing, model=escalated)
+        new_id = _dispatch_followup(
+            cfg, assignment, briefing, model=escalated,
+            machine_name=selection.machine.name,
+        )
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)
