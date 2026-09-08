@@ -4330,6 +4330,149 @@ class TestReviewDispatchClaim:
         assert state.claim_review_dispatch("") is True
 
 
+# ── #3206: a reaper-killed review's claim must not leak ─────────────────────
+
+
+def _seed_review_row(
+    assignment_id: str, *, review_of_assignment_id: str, status: str = "running",
+) -> None:
+    """Insert a real ``type="review"`` row FK'd to *review_of_assignment_id*,
+    mirroring how `dispatch_review` actually creates one."""
+    from coord.models import Assignment
+
+    state.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=7,
+            issue_title="[review] Some work",
+            assignment_id=assignment_id,
+            type="review",
+            status=status,
+            review_of_assignment_id=review_of_assignment_id,
+        ),
+        repo_github="acme/api",
+    )
+
+
+class TestReleaseReviewClaimIfRowIsReview:
+    """`release_review_claim_if_row_is_review` (#3206): the ONE "is this a
+    review row, and if so release the claim it took" check every seam
+    capable of writing a review assignment's terminal status must share —
+    see the function's own docstring for the split-brain #3206 closes."""
+
+    def test_releases_claim_for_a_review_row(self, coord_db) -> None:
+        _seed_review_row("rv1", review_of_assignment_id="w1")
+        assert state.claim_review_dispatch("w1") is True
+
+        state.release_review_claim_if_row_is_review("rv1")
+
+        assert state.claim_review_dispatch("w1") is True  # released, reclaimable
+
+    def test_noop_for_a_non_review_row(self, coord_db) -> None:
+        """A `type="work"` (or any non-review) row must never release a
+        claim — only its OWN review row's terminal write may."""
+        from coord.models import Assignment
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="work", assignment_id="w1", type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+        assert state.claim_review_dispatch("w1") is True
+
+        state.release_review_claim_if_row_is_review("w1")
+
+        # Still held — "w1" itself is the work row, not a review of it.
+        assert state.claim_review_dispatch("w1") is False
+
+    def test_noop_for_unknown_or_empty_id(self, coord_db) -> None:
+        state.release_review_claim_if_row_is_review("")  # must not raise
+        state.release_review_claim_if_row_is_review("does-not-exist")  # must not raise
+
+
+class TestHasReviewClaim:
+    """`has_review_claim` (#3206): the read side used by `coord diagnose
+    --stage review` to cross-check a terminal review row against the claim
+    table it can no longer trust the review row's own status to reflect."""
+
+    def test_true_while_claimed(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        assert state.has_review_claim("w1") is True
+
+    def test_false_after_release(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        state.release_review_dispatch_claim("w1")
+        assert state.has_review_claim("w1") is False
+
+    def test_false_when_never_claimed(self, coord_db) -> None:
+        assert state.has_review_claim("never-claimed") is False
+
+    def test_false_for_empty_id(self, coord_db) -> None:
+        assert state.has_review_claim("") is False
+
+
+class TestMarkNotifiedReleasesLeakedReviewClaim:
+    """#3206 root-cause regression: a review assignment reaped by
+    `AgentServer._reap`'s SIGKILL max-wait ceiling writes its terminal
+    `status="failed"` into the board via `coord notify`'s own agent-poll
+    path (`coord.notify.post_transition` → `mark_notified` →
+    `_mark_notified_local`) whenever no daemon reconcile tick observed the
+    completion first. Before the fix, `_mark_notified_local` wrote the
+    terminal status and stopped — unlike
+    `coord.issue_store._update_local_state`, it never checked
+    `review_claims` at all, so the claim was held FOREVER and every later
+    `dispatch_review` for the same work assignment denied with the
+    misleading #3113 'lost the atomic dispatch-claim race' reason even
+    though nothing was racing (coord-tui#49, stuck ~11h)."""
+
+    def test_event_failure_releases_the_claim(self, coord_db) -> None:
+        from coord.comments import EVENT_FAILURE
+
+        _seed_review_row("rv1", review_of_assignment_id="w1", status="running")
+        assert state.claim_review_dispatch("w1") is True
+
+        # Mirrors `coord.notify.post_transition`'s generic EVENT_FAILURE arm
+        # (the one a `type="review"` reap-kill actually hits — there is no
+        # review-specific EVENT_FAILURE branch in that elif chain).
+        state.mark_notified(
+            "rv1", EVENT_FAILURE, branch=None, failure_reason=None, exit_code=137,
+        )
+
+        assert state.claim_review_dispatch("w1") is True  # released, reclaimable
+
+    def test_event_completion_releases_the_claim(self, coord_db) -> None:
+        """Sibling case: a review that finishes cleanly (`EVENT_COMPLETION`)
+        must release the claim through this same seam too — not just the
+        failure path."""
+        from coord.comments import EVENT_COMPLETION
+
+        _seed_review_row("rv1", review_of_assignment_id="w1", status="running")
+        assert state.claim_review_dispatch("w1") is True
+
+        state.mark_notified("rv1", EVENT_COMPLETION, branch="issue-7-foo")
+
+        assert state.claim_review_dispatch("w1") is True
+
+    def test_override_event_composite_key_is_a_harmless_noop(self, coord_db) -> None:
+        """`EVENT_STUCK`/`EVENT_NEEDS_ATTENTION`/etc. pass a composite
+        `f"{aid}:stuck"`-style key that never matches a real assignment row
+        — the claim-release lookup must tolerate that silently, exactly like
+        the existing status UPDATE already does (see `_mark_notified_local`'s
+        own #1036 comment)."""
+        from coord.comments import EVENT_STUCK
+
+        _seed_review_row("rv1", review_of_assignment_id="w1", status="running")
+        assert state.claim_review_dispatch("w1") is True
+
+        state.mark_notified("rv1:stuck", EVENT_STUCK)
+
+        # Untouched — "rv1:stuck" matched no row, so nothing was released.
+        assert state.claim_review_dispatch("w1") is False
+
+
 # ── #3113: render_issue_context_entries exempts review findings from the
 #    block-level char cap ───────────────────────────────────────────────────
 
