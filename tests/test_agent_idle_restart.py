@@ -290,14 +290,46 @@ class TestIdleRestartWatcherEndToEnd:
             debounce_seconds=0.2,
         )
 
+    # Number of observed polls a "must not restart" test waits out before
+    # believing its own negative result. Each loop iteration sleeps at least
+    # `poll_seconds` (0.05s), so >= 8 ticks is >= 0.35s of continuously-
+    # observed idle — comfortably past the 0.2s debounce window a restart
+    # would have to clear.
+    _TICKS_PAST_DEBOUNCE = 8
+
+    def _staged_slot(self, monkeypatch, tmp_path: Path, ticks: list):
+        """Stage a swap-is-waiting slot pair AND count watcher polls.
+
+        `_idle_restart_target` calls `current_slot` first thing on every
+        tick, before any veto, so appending here is an exact poll counter.
+        A "must not restart" assertion can then wait for *observed* polls
+        instead of napping a fixed number of seconds and hoping enough of
+        them landed: a bare sleep that comes up short (the Test stage runs
+        `pytest -n auto`, 16 workers deep) turns these vetoes vacuous —
+        they'd pass without the watcher ever having reached the decision
+        they exist to guard.
+        """
+
+        def _current(vd):
+            ticks.append(time.time())
+            return tmp_path / "new-slot"
+
+        monkeypatch.setattr(agent_update, "current_slot", _current)
+        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
+
+    def _polled_past_debounce(self, ticks: list) -> None:
+        assert _wait_until(
+            lambda: len(ticks) >= self._TICKS_PAST_DEBOUNCE, timeout=10.0
+        ), f"watcher only polled {len(ticks)}x — it never reached the decision point"
+
     def test_no_restart_while_assignment_is_live(self, tmp_path, monkeypatch):
         server, repo = _make_server(tmp_path)
         _assign_running(server, repo)
         restarted: list = []
+        ticks: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
-        monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
-        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
+        self._staged_slot(monkeypatch, tmp_path, ticks)
         monkeypatch.setattr(
             agent_update, "_smoke_check",
             lambda slot, *, target_version: (True, "9.9.9", "ok"),
@@ -306,9 +338,10 @@ class TestIdleRestartWatcherEndToEnd:
         watcher = self._watcher(server, tmp_path, restarted)
         watcher.start()
         try:
-            # Comfortably longer than the debounce window — if the guard
-            # were broken this would already have fired.
-            time.sleep(0.6)
+            # Observed polls, not a nap: past the debounce window the guard
+            # would have to clear, so if it were broken this would already
+            # have fired.
+            self._polled_past_debounce(ticks)
             assert not restarted, "must not restart while an assignment is live"
         finally:
             watcher.stop()
@@ -355,16 +388,25 @@ class TestIdleRestartWatcherEndToEnd:
         simply never fires there, however long it goes idle."""
         server, _ = _make_server(tmp_path)
         restarted: list = []
+        ticks: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: True)
         monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
-        monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
-        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
+        self._staged_slot(monkeypatch, tmp_path, ticks)
+        # The colocation veto must be the ONLY reason nothing happens. Left
+        # unpatched, the real `_smoke_check` runs against a slot directory
+        # that doesn't exist, fails, and blocks the restart on its own — so
+        # this test went green even with the daemon guard deleted (verified
+        # by mutation), grading nothing.
+        monkeypatch.setattr(
+            agent_update, "_smoke_check",
+            lambda slot, *, target_version: (True, "9.9.9", "ok"),
+        )
 
         watcher = self._watcher(server, tmp_path, restarted)
         watcher.start()
         try:
-            time.sleep(0.6)
+            self._polled_past_debounce(ticks)
             assert not restarted
         finally:
             watcher.stop()
@@ -378,11 +420,11 @@ class TestIdleRestartWatcherEndToEnd:
         long the debounce window is held."""
         server, _ = _make_server(tmp_path)
         restarted: list = []
+        ticks: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
         monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: True)
-        monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
-        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
+        self._staged_slot(monkeypatch, tmp_path, ticks)
         monkeypatch.setattr(
             agent_update, "_smoke_check",
             lambda slot, *, target_version: (True, "9.9.9", "ok"),
@@ -391,7 +433,7 @@ class TestIdleRestartWatcherEndToEnd:
         watcher = self._watcher(server, tmp_path, restarted)
         watcher.start()
         try:
-            time.sleep(0.6)
+            self._polled_past_debounce(ticks)
             assert not restarted, "must not restart while a coord-* tmux session is live"
         finally:
             watcher.stop()
@@ -413,15 +455,42 @@ class TestIdleRestartWatcherEndToEnd:
         )
 
         watcher = self._watcher(server, tmp_path, restarted)
+        recorded: list[dict] = []
+
+        def _refusal_recorded() -> bool:
+            # `_write_last_update` is a plain (non-atomic) `write_text`, and
+            # the watcher rewrites this file once per debounce window for as
+            # long as the slot stays bad — so poll through
+            # `_read_last_update`, which returns None on a torn/absent read,
+            # and keep the first fully-parsed refusal we see.
+            record = agent_app._read_last_update(server.state_dir)
+            if record and record.get("result") == "failed":
+                recorded.append(record)
+                return True
+            return False
+
         watcher.start()
         try:
-            time.sleep(0.6)
+            # Wait for the OBSERVED refusal — the /health record the watcher
+            # writes only after it has actually reached `_restart_onto` and
+            # rejected the slot — rather than napping a hardcoded 0.6s and
+            # hoping the debounce window elapsed inside it. The old fixed
+            # sleep made this flaky under the Test stage's `pytest -n auto`
+            # (16 workers, each spawning subprocesses): a tick that lands
+            # late leaves `last_update.json` unwritten and the read below
+            # blows up with FileNotFoundError. Waiting on the artifact is
+            # also the stronger assertion — it proves the decision point was
+            # reached and the failing branch taken, where the sleep only
+            # proved some time passed.
+            assert _wait_until(_refusal_recorded, timeout=10.0), (
+                "watcher never recorded the failed re-smoke-check"
+            )
             assert not restarted
         finally:
             watcher.stop()
             server.shutdown()
 
-        last = json.loads((server.state_dir / "last_update.json").read_text())
+        last = recorded[0]
         assert last["result"] == "failed"
         assert "idle self-restart" in last["mode"]
         assert "boom" in (last["error"] or "")
