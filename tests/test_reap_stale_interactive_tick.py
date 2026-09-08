@@ -54,13 +54,15 @@ def _insert_assignment(
     machine_name: str = "mymachine",
     repo_name: str = "myrepo",
     issue_number: int = 42,
+    review_of_assignment_id: str | None = None,
 ) -> None:
     """Insert a minimal interactive assignment row into the in-memory DB."""
     conn.execute(
         """INSERT INTO assignments
            (assignment_id, machine_name, repo_name, repo_github,
-            issue_number, issue_title, status, type, provider_name)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            issue_number, issue_title, status, type, provider_name,
+            review_of_assignment_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             assignment_id,
             machine_name,
@@ -71,6 +73,7 @@ def _insert_assignment(
             status,
             atype,
             provider_name,
+            review_of_assignment_id,
         ),
     )
     conn.commit()
@@ -190,3 +193,70 @@ class TestReapStaleInteractiveSessionsTick:
         audit_mock.assert_called_once()
         _, kwargs = audit_mock.call_args
         assert kwargs["event_type"] == "reap_stale_interactive_session"
+
+
+class TestReapStaleInteractiveSessionsReleasesReviewClaim:
+    """#3206: an interactively-dispatched (``provider_name="claude-pty"``)
+    ``type="review"`` leg whose tmux session dies must have its
+    ``review_claims`` row released here, the same as every other
+    terminal-status seam — otherwise every later ``dispatch_review`` for its
+    work assignment denies forever with the misleading #3113 'lost the
+    atomic dispatch-claim race' reason (coord/review.py:1141-1147 lists this
+    reaper as one of exactly three seams allowed to write a terminal
+    status)."""
+
+    def test_dead_review_session_releases_its_claim(
+        self, coord_db: sqlite3.Connection
+    ) -> None:
+        from coord import state
+        from coord.serve_app import _reap_stale_interactive_sessions_tick
+
+        _insert_assignment(
+            coord_db,
+            "rv-dead-1",
+            atype="review",
+            review_of_assignment_id="w-1",
+        )
+        assert state.claim_review_dispatch("w-1") is True  # simulate the live claim
+
+        cfg = _minimal_config()
+        with (
+            patch("coord.interactive.tmux_available", return_value=True),
+            patch("coord.interactive.tmux_session_alive", return_value=False),
+            patch(
+                "coord.interactive._get_local_short_hostname",
+                return_value="mymachine",
+            ),
+            patch("coord.interactive._remove_worktree"),
+        ):
+            reaped = _reap_stale_interactive_sessions_tick(cfg)
+
+        assert reaped == ["rv-dead-1"]
+        # Claim released → a fresh claim for the same work assignment succeeds.
+        assert state.claim_review_dispatch("w-1") is True
+
+    def test_dead_non_review_session_does_not_touch_unrelated_claim(
+        self, coord_db: sqlite3.Connection
+    ) -> None:
+        """A reaped `type="chat"` row must never release a claim it doesn't own."""
+        from coord import state
+        from coord.serve_app import _reap_stale_interactive_sessions_tick
+
+        _insert_assignment(coord_db, "aid-dead-unrelated", atype="chat")
+        assert state.claim_review_dispatch("some-other-work") is True
+
+        cfg = _minimal_config()
+        with (
+            patch("coord.interactive.tmux_available", return_value=True),
+            patch("coord.interactive.tmux_session_alive", return_value=False),
+            patch(
+                "coord.interactive._get_local_short_hostname",
+                return_value="mymachine",
+            ),
+            patch("coord.interactive._remove_worktree"),
+        ):
+            reaped = _reap_stale_interactive_sessions_tick(cfg)
+
+        assert reaped == ["aid-dead-unrelated"]
+        # Still held — the reaped row was not a review of "some-other-work".
+        assert state.claim_review_dispatch("some-other-work") is False

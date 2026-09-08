@@ -2870,9 +2870,18 @@ def dispatch_review(
     # `completed.assignment_id`; the loser denies here, before spending
     # anything on a candidate machine. Released by every subsequent
     # `_deny(...)` call in this function (see `_claim_held` above) and, once
-    # this call succeeds through to a real dispatch, by the review
-    # assignment's own terminal-status write (`coord.issue_store.
-    # _update_local_state`) — never left permanently held.
+    # this call succeeds through to a real dispatch, by every seam that can
+    # write the review assignment's own terminal status — all of which now
+    # route through the single `coord.state.
+    # release_review_claim_if_row_is_review` check (#3206):
+    # `coord.issue_store._update_local_state` (worker self-report / git-floor
+    # backstop), `coord.state._mark_notified_local` (the `coord notify`
+    # polling path a headless reap's SIGKILL lands through), and
+    # `coord.interactive.reap_stale_interactive_sessions` /
+    # `_mark_stale_reap_in_db` (the local/remote interactive-session
+    # reapers — dispatch_review is also reachable for a `provider_name=
+    # "claude-pty"` type="review" leg, see the Work→Review handoff below).
+    # Never left permanently held by any of them.
     from coord.state import claim_review_dispatch  # noqa: PLC0415
 
     if not claim_review_dispatch(completed.assignment_id):
