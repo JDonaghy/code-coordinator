@@ -805,6 +805,33 @@ def ms_dir_for_issue(acceptance_root: Path, issue_number: int) -> str | None:
     return None
 
 
+def ms_dir_for_exempt_issue(acceptance_root: Path, issue_number: int) -> str | None:
+    """(#3212) Sibling to :func:`ms_dir_for_issue`: the ``ms-NN`` directory
+    name (under *acceptance_root*) whose manifest's ``exempt:`` list names
+    *issue_number*, or ``None`` if no manifest exempts it.
+
+    Exists so :func:`oracle_loop_contract_block` can still point an exempted
+    issue's worker at the milestone's Gate-A contract/mocks even though the
+    issue itself has no test mapping (:func:`ms_dir_for_issue` returns
+    ``None`` for it) — an exemption waives the *automated gate*, not the
+    *design contract* the milestone's mocks define (issue #3212's "more
+    damaging half": before this, an exempted issue's worker briefing carried
+    zero pointer to either).
+
+    Same per-file scan discipline as :func:`ms_dir_for_issue` (never merges
+    manifests first) — recovering *which* directory did the exempting is the
+    whole point, same as recovering which directory owns a test mapping.
+    """
+    for path in _manifest_paths(acceptance_root):
+        try:
+            data = parse_manifest_text(path.read_text(), source=str(path))
+        except Exception:  # noqa: BLE001 — a malformed manifest is skipped, not raised
+            continue
+        if issue_number in data.exempt:
+            return _ms_dir_for_manifest_path(path).name
+    return None
+
+
 def oracle_loop_contract_block(
     acceptance_root: Path,
     repo_name: str,
@@ -815,13 +842,18 @@ def oracle_loop_contract_block(
     """The worker briefing contract (#945, docs/ORACLE_LOOP.md "The worker
     briefing contract") prepended to the TOP of a Work briefing when
     *issue_number* has a sealed acceptance slice authored for it under
-    *acceptance_root*.
+    *acceptance_root* — or (#3212) is exempted from one, in which case a
+    variant of the same block still points at the milestone's Gate-A
+    contract/mocks, just worded for "no automated gate checks you against
+    this, but the design contract still applies" rather than "run `coord
+    acceptance run` against your own slice".
 
-    Returns ``""`` when the issue has no authored slice yet (nothing to
-    point the worker at — Gate A/#931 hasn't run for it) or on any read
-    error. Fully fail-soft — mirrors ``coord.state.issue_context_block``
-    (#603): this runs on the dispatch hot path, so a manifest hiccup must
-    degrade to "no block" rather than break dispatch.
+    Returns ``""`` when the issue has neither an authored slice nor an
+    exemption naming it (nothing to point the worker at — Gate A/#931 hasn't
+    run for it) or on any read error. Fully fail-soft — mirrors
+    ``coord.state.issue_context_block`` (#603): this runs on the dispatch hot
+    path, so a manifest hiccup must degrade to "no block" rather than break
+    dispatch.
 
     *acceptance_dirname* (#2896) is the repo-relative dirname the returned
     text should NAME (``contract.md``/``mocks/`` paths, the "may not edit"
@@ -834,8 +866,12 @@ def oracle_loop_contract_block(
     repo-relative name to print — or the printed path won't match where the
     scan actually found the slice.
     """
+    exempt = False
     try:
         ms_dir = ms_dir_for_issue(acceptance_root, issue_number)
+        if ms_dir is None:
+            ms_dir = ms_dir_for_exempt_issue(acceptance_root, issue_number)
+            exempt = ms_dir is not None
     except Exception:  # noqa: BLE001 — never let a manifest read break dispatch
         return ""
     if ms_dir is None:
@@ -844,6 +880,35 @@ def oracle_loop_contract_block(
     dirname = acceptance_dirname.rstrip("/") if acceptance_dirname else ACCEPTANCE_DIRNAME
     contract_path = f"{dirname}/{ms_dir}/contract.md"
     mocks_dir = f"{dirname}/{ms_dir}/mocks"
+
+    if exempt:
+        # #3212: the issue's OWN slice is waived, but the milestone's Gate-A
+        # contract/mocks are still the design truth — an exemption from
+        # verification is not an exemption from the spec. Deliberately drops
+        # the "run `coord acceptance run --issue N`" instruction below (there
+        # is no slice of this issue's own to run) but keeps the "don't touch
+        # the sealed tree" and "write your own tests" bullets, since both
+        # still apply verbatim to an exempted issue.
+        return (
+            "## 🔒 Oracle-loop acceptance contract — READ THIS FIRST "
+            "(exempted issue, #3212)\n\n"
+            f"This issue is **exempted** from its own acceptance-slice gate "
+            f"(`{dirname}/{ms_dir}/manifest.*`'s `exempt:` list) — but "
+            "exemption waives the automated *verification*, not the "
+            f"*design*. Treat `{contract_path}` (the black-box surface) — "
+            f"and, if present, the rendered mock(s) under `{mocks_dir}/` — "
+            "as the spec for what you build, exactly as if your own slice "
+            "were being checked against them. No automated suite verifies "
+            "this issue at all (that is what the exemption means), so a "
+            "human at UAT is the only thing left between a mismatch and the "
+            "customer — match the mocks precisely.\n\n"
+            f"- You **may not** edit `{dirname}/**` (contract, mocks, or any "
+            "sealed suite), even though your own slice is exempt from it.\n"
+            "- Write your own unit / internal tests — that is still your "
+            "job, and the only automated coverage this issue will get.\n\n"
+            "---\n\n"
+        )
+
     return (
         "## 🔒 Oracle-loop acceptance contract — READ THIS FIRST\n\n"
         "This issue has a sealed acceptance slice authored for it. Treat "
@@ -1531,6 +1596,127 @@ def fetch_exempt_dependency_warnings(
         for dep in manifest_data.exempt_deps.values()
     ]
     return unmet_exempt_dependency_warnings(statuses)
+
+
+# ── #3212 "Related mitigation" — the reviewer never sees the mocks ─────────
+#
+# docs/ORACLE_LOOP.md's worker briefing contract (oracle_loop_contract_block
+# above) points the WORKER at a milestone's Gate-A contract/mocks. The
+# reviewer never got the same pointer — issue #3212's own words: "Today the
+# reviewer gets the diff, the repo's CLAUDE.md, the generic checklist and the
+# issue — but not mocks/index.html, the one artifact that defines what
+# 'correct' means for that screen." A reviewer asked "does this match the
+# approved screen?" would likely catch a mismatch a reviewer asked "is this
+# good code?" has no reason to. This section is the reviewer-facing rendering
+# of that same pointer, fetched via the GitHub API (the reviewer briefing has
+# no local checkout in hand — see fetch_gate_a_exempt_warning's identical
+# GateAExemptFileFetcher shape immediately above).
+
+
+def oracle_loop_contract_reviewer_note(
+    *, contract_path: str, mocks_dir: str, exempt: bool,
+) -> str:
+    """(#3212) The reviewer-facing rendering of the same pointer
+    :func:`oracle_loop_contract_block` gives the worker. Same canonical-
+    wording discipline as :func:`gate_a_exempt_warning` /
+    :func:`exempt_dependency_warning` — one function renders this text,
+    every caller (currently just :func:`fetch_oracle_loop_contract_note`)
+    uses it verbatim rather than re-wording it independently.
+    """
+    lines = [
+        "This issue's milestone carries a signed Gate-A design contract. "
+        f"Before judging correctness, read `{contract_path}` (the black-box "
+        f"surface) and, if present, the rendered mock(s) under `{mocks_dir}/` "
+        "— not just the diff, CLAUDE.md and the issue. A diff can pass every "
+        "generic check and still contradict the approved screen; only the "
+        "contract/mocks say what \"correct\" means here."
+    ]
+    if exempt:
+        lines.append(
+            "This issue's OWN acceptance slice is exempted from the "
+            "automated gate (see the milestone manifest's `exempt:` list) — "
+            "which makes this review the only automated check left before a "
+            "human sees it at UAT. Read the contract/mocks with that in "
+            "mind."
+        )
+    return "\n\n".join(lines)
+
+
+def fetch_oracle_loop_contract_note(
+    config: Config,
+    repo: Repo,
+    milestone_number: int | None,
+    issue_number: int,
+    *,
+    file_fetcher: GateAExemptFileFetcher | None = None,
+) -> str | None:
+    """(#3212) Fetch *milestone_number*'s manifest off *repo*'s default
+    branch and, if *issue_number* has an authored acceptance slice OR is
+    named in an ``exempt:`` list, return
+    :func:`oracle_loop_contract_reviewer_note` for it — the reviewer's copy
+    of the same pointer :func:`oracle_loop_contract_block` gives the worker.
+
+    ``None`` when there's nothing to point at (no milestone in hand, no
+    acceptance driver configured, or the issue is neither sliced nor
+    exempted in any root's manifest) or on any fetch/parse hiccup —
+    fail-open, same as :func:`fetch_gate_a_exempt_warning` /
+    :func:`fetch_exempt_dependency_warnings`: this is advisory, never a gate,
+    so a lookup failure must never affect whether a review proceeds.
+
+    Tries every :func:`search_roots_for_repo` root in turn — like
+    :func:`gate_a_contract_candidates`, which root actually governs a bare
+    milestone number isn't knowable ahead of time. Only the legacy
+    single-file ``manifest.(yml|yaml|json)`` is checked per root (same scope
+    as :func:`_fetch_milestone_manifest_data`, which this deliberately does
+    NOT reuse: that helper only tells the caller whether the milestone's
+    manifest parsed, not which root it parsed from, and the contract/mocks
+    paths below must come from the SAME root the match was found under) —
+    an issue whose test mapping lives *only* in a per-issue
+    ``manifest.d/<issue>.(yml|json)`` fragment (#2543) and carries no
+    ``exempt:`` entry is not detected here. Accepted, matching the identical
+    documented scope of the #3202 machinery this sits alongside.
+
+    *file_fetcher* defaults to :func:`coord.github_ops.get_repo_file`;
+    inject a stub in tests so this never shells out to a live ``gh``.
+    """
+    if milestone_number is None or not config.acceptance.has_driver(repo.name):
+        return None
+
+    from coord import github_ops  # noqa: PLC0415
+
+    fetch = file_fetcher or github_ops.get_repo_file
+    for root in search_roots_for_repo(config, repo.name):
+        dirname = root.rstrip("/") or ACCEPTANCE_DIRNAME
+        ms_dir = ms_dirname(milestone_number)
+        manifest_data: ManifestData | None = None
+        for ext in (".yml", ".yaml", ".json"):
+            try:
+                text = fetch(
+                    repo.github, f"{dirname}/{ms_dir}/manifest{ext}", repo.default_branch,
+                )
+            except Exception:  # noqa: BLE001 — this extension/root doesn't exist
+                continue
+            try:
+                manifest_data = parse_manifest_text(
+                    text, source=f"{dirname}/{ms_dir}/manifest{ext}"
+                )
+            except Exception:  # noqa: BLE001 — malformed manifest: try next root
+                manifest_data = None
+            break
+        if manifest_data is None:
+            continue
+
+        exempt = issue_number in manifest_data.exempt
+        has_slice = bool(test_ids_for_issue(manifest_data.tests, issue_number))
+        if not exempt and not has_slice:
+            continue
+
+        return oracle_loop_contract_reviewer_note(
+            contract_path=f"{dirname}/{ms_dir}/contract.md",
+            mocks_dir=f"{dirname}/{ms_dir}/mocks",
+            exempt=exempt,
+        )
+    return None
 
 
 def acceptance_capability_gap(
