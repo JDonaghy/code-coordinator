@@ -46,7 +46,7 @@ import httpx
 
 from coord import github_ops
 from coord.config import Config, ReviewsConfig
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.models import (
     CLOSES_ISSUE_TYPES,
     SEALED_PATH_AUTHOR_TYPES,
@@ -3455,7 +3455,7 @@ def dispatch_review(
 
             url = f"http://{machine.host}:{AGENT_PORT}/assign"
             try:
-                resp = client.post(url, json=payload, timeout=15)
+                resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
                 resp.raise_for_status()
                 agent_response = resp.json()
             except httpx.HTTPStatusError as exc:
@@ -4299,7 +4299,7 @@ def dispatch_scoped_review(
 
         url = f"http://{machine.host}:{AGENT_PORT}/assign"
         try:
-            resp = client.post(url, json=payload, timeout=15)
+            resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
             resp.raise_for_status()
             agent_response = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:

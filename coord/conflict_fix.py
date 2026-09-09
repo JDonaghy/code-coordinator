@@ -42,7 +42,7 @@ import httpx
 
 from coord.acceptance import MANIFEST_FRAGMENTS_DIRNAME
 from coord.config import Config
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.merge_queue import QueuedMerge
 from coord.models import (
     SEALED_MANIFEST_FILENAME,
@@ -976,7 +976,7 @@ def dispatch_conflict_fix(
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
     try:
-        resp = client.post(url, json=payload, timeout=15)
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException):

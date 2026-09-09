@@ -70,7 +70,7 @@ import httpx
 
 from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 # #2170: the SAME marker/exit-code convention `scripts/coord-test-runner.sh`
 # and `coord.revalidate` use for a red baseline — imported (not re-literalled)
@@ -1664,7 +1664,7 @@ def _walk_candidates_and_dispatch(
 
         url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
         try:
-            resp = client.post(url, json=payload, timeout=15)
+            resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
             resp.raise_for_status()
             agent_response = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:

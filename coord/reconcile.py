@@ -11,7 +11,7 @@ import httpx
 from typing import TYPE_CHECKING
 
 from coord.config import INTERACTIVE_SESSION_TYPES, Config
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
@@ -1694,7 +1694,7 @@ def _reassign(
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     try:
-        resp = httpx.post(url, json=payload, timeout=15)
+        resp = httpx.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException):
