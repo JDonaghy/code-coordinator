@@ -23,6 +23,24 @@ from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo, coordinat
 
 AGENT_PORT = 7433
 
+# #3214: format-converter#6 — a UAT fix-up `coord fix --force` dispatch
+# timed out identically twice, 19 minutes apart, against a machine that
+# `coord.dispatch.select_fix_machine`'s own LIVE reachability probe (a
+# separate, ~3s `/status` GET — see `coord.network.fetch_status`) had
+# already confirmed was up. The agent's own `POST /assign` handler
+# (`coord/agent_app.py`) runs `server.assign()` INLINE on its event loop and
+# does real blocking `git worktree add` work there (documented in that
+# handler's own #3145 audit note) — ordinary git/process latency, not the
+# 600s-class `build_command` a worker session can take, but routinely more
+# than a few seconds on a loaded host or a large repo. The bare `timeout=15`
+# below was tuned for a fast confirm-and-202 response, not for the endpoint
+# it actually calls, so a machine that was genuinely reachable and genuinely
+# working still surfaced as a bare "dispatch failed: timed out" indistinct
+# from an unreachable one. Raised well past ordinary worktree-setup latency
+# — this bounds ACTUAL unreachability (already screened out for the `coord
+# fix` callers above), not a slow-but-working `/assign`.
+_ASSIGN_POST_TIMEOUT_SECS = 60.0
+
 _log = logging.getLogger(__name__)
 
 
@@ -938,7 +956,7 @@ def dispatch(
     ):
         payload["provider"] = effective_provider_name
 
-    resp = httpx.post(url, json=payload, timeout=15)
+    resp = httpx.post(url, json=payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
     if (
         resp.status_code == 400
         and "provider" in payload
@@ -988,7 +1006,7 @@ def dispatch(
 
         definition = config.providers.definitions[effective_provider_name]
         retry_payload = dict(payload, provider_def=provider_def_to_wire(definition))
-        resp = httpx.post(url, json=retry_payload, timeout=15)
+        resp = httpx.post(url, json=retry_payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
 
     if resp.status_code == 400 and "cost_ceiling_usd" in payload:
         # #2131: the agent lane lags the CLI/daemon lane (a `coord/agent.py`
@@ -1005,7 +1023,7 @@ def dispatch(
         degraded_payload = {
             k: v for k, v in payload.items() if k != "cost_ceiling_usd"
         }
-        retried = httpx.post(url, json=degraded_payload, timeout=15)
+        retried = httpx.post(url, json=degraded_payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
         if retried.status_code != 400:
             _log.warning(
                 "agent %s rejected cost_ceiling_usd (#2131) — dispatched "
