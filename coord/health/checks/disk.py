@@ -35,6 +35,12 @@ def probe_disk(ctx: HealthContext) -> list[CheckResult]:
     are skipped too — on a single-root machine ``/``, ``/home`` and
     ``~/.coord`` are the same device, and three identical CRIT lines is noise
     that trains an operator to skim.
+
+    A filesystem that reports ``total == 0`` (e.g. macOS autofs mounts like
+    ``/home``, which ``os.stat`` sees as present with their own device
+    number) cannot be sized at all — that is reported as UNKNOWN, never as
+    CRIT.  "I cannot size this mount" and "this mount is completely full"
+    are different facts (#3218).
     """
     th = ctx.thresholds
     results: list[CheckResult] = []
@@ -66,7 +72,29 @@ def probe_disk(ctx: HealthContext) -> list[CheckResult]:
             continue
 
         total = float(usage.total)
-        free_pct = (usage.free / total * 100.0) if total > 0 else 0.0
+        if total <= 0:
+            # A zero-total filesystem (e.g. macOS autofs ``/home``) isn't
+            # "100% used" — it's a mount we cannot size at all. Reporting
+            # CRIT here would claim "completely full", a different fact
+            # from "cannot be sized", and one this host can never clear.
+            results.append(
+                CheckResult(
+                    check_id="disk",
+                    scope="machine",
+                    subject=str(raw),
+                    severity=Severity.UNKNOWN,
+                    headroom="filesystem reports zero total size (cannot determine usage)",
+                    values={
+                        "path": str(path),
+                        "total_bytes": usage.total,
+                        "free_bytes": usage.free,
+                        "used_bytes": usage.used,
+                    },
+                )
+            )
+            continue
+
+        free_pct = usage.free / total * 100.0
         used_pct = 100.0 - free_pct
 
         if free_pct < th.disk_crit_free_pct:
