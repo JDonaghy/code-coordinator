@@ -42,7 +42,7 @@ import httpx
 from coord import github_ops
 from coord.acceptance import ACCEPTANCE_DIRNAME
 from coord.config import Config, entrypoint_sibling_acceptance_dir
-from coord.dispatch import AGENT_PORT, DispatchRefused
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS, DispatchRefused
 from coord.machine_pause import paused_set
 from coord.milestone_dispatch import (
     MilestoneDispatchError,
@@ -733,7 +733,7 @@ def dispatch_test_author(
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
-    resp = client.post(url, json=payload, timeout=15)
+    resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
     resp.raise_for_status()
     agent_response = resp.json()
 

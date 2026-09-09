@@ -4320,6 +4320,50 @@ def test_uat_fixup_dispatch_parks_after_the_retry_limit_without_spending_a_fix_r
     assert counters.fix_rounds == 0
 
 
+def test_uat_fixup_dispatch_park_retry_command_survives_a_single_quote_in_the_reason():
+    """Reviewer nit on #3214: `work_uat_reason` is free-text an operator or
+    a UAT reviewer typed — it can itself contain a single quote (e.g. "the
+    button's label is wrong"). The parked action's message embeds a
+    hand-runnable ``coord fix ... --guidance <reason>`` command for the
+    operator to copy-paste; a bare ``f"'{reason}'"`` wrap breaks out of its
+    own quoting the moment the reason contains a ``'``, producing a command
+    that is NOT directly copy-pasteable (exactly the nit called out in
+    review). It must be shell-safe via proper quoting (`shlex.quote`), and
+    round-tripping it through `shlex.split` must recover the original
+    guidance text unchanged."""
+    import shlex
+
+    counters = DriveCounters(
+        uat_fixup_dispatch_failures=_UAT_FIXUP_DISPATCH_RETRY_LIMIT,
+        last_uat_fixup_dispatch_error="error: dispatch failed: timed out",
+    )
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    reason_with_quote = "the button's label doesn't match the mock"
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UAT_VERDICT_FAILED,
+        work_uat_state="failed",
+        work_uat_reason=reason_with_quote,
+    )
+
+    action = step(s, opts, counters=counters)
+    assert action.is_exit
+
+    # Pull the retry command out of the human-facing message and confirm a
+    # shell can actually tokenize it (a bare `'...'` wrap around text that
+    # itself contains `'` would raise ValueError here, or worse, silently
+    # split mid-argument).
+    line = next(
+        ln for ln in action.message.splitlines() if "Retry by hand" in ln
+    )
+    retry_command = line.split(": ", 1)[1].strip()
+    tokens = shlex.split(retry_command)
+    assert tokens[:3] == ["coord", "fix", s.work_aid]
+    assert "--guidance" in tokens
+    guidance_idx = tokens.index("--guidance")
+    assert tokens[guidance_idx + 1] == reason_with_quote
+
+
 def test_driver_retries_a_failing_uat_fixup_dispatch_then_parks_without_a_work_attempt(
     driver_factory, monkeypatch, coord_db,
 ):

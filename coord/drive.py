@@ -98,6 +98,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -3729,9 +3730,13 @@ def _park_uat_fixup_dispatch_failure(
         "a rejected fix, so no fix round was spent (#3214). Last failure: "
         f"{last_error.strip() or '(no output captured)'}"
     )
-    retry_command = (
-        f"coord fix {state.work_aid} --force --guidance "
-        f"'{(state.work_uat_reason or '').strip()}'"
+    # shlex.quote (not a bare `'...'` wrap): work_uat_reason is a free-text
+    # operator/reviewer verdict message that can itself contain a single
+    # quote, which would otherwise break the printed command out of its
+    # quoting and make it not directly copy-pasteable into a shell.
+    retry_command = "coord fix {aid} --force --guidance {reason}".format(
+        aid=shlex.quote(state.work_aid or ""),
+        reason=shlex.quote((state.work_uat_reason or "").strip()),
     )
     command: list[str] = [
         "escalate", "record", state.repo, str(state.issue),

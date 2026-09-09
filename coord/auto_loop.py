@@ -48,7 +48,7 @@ import httpx
 from coord import sql
 from coord.config import Config
 from coord.db import is_lock_contention_error
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord import github_ops
 from coord.models import SEALED_PATH_AUTHOR_TYPES, Assignment, Board
 from coord.review import (
@@ -1351,7 +1351,7 @@ def _dispatch_fix(
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
     try:
-        resp = client.post(url, json=payload, timeout=15)
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException) as exc:

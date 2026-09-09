@@ -42,7 +42,7 @@ import httpx
 
 from coord import github_ops
 from coord.acceptance import gate_a_contract_path
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import REVIEWER_SYSTEM_PROMPT
 
@@ -327,7 +327,7 @@ def dispatch_gate_b_review(
     client = http_client or httpx
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     try:
-        resp = client.post(url, json=payload, timeout=15)
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException) as exc:

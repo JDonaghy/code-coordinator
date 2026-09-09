@@ -33,13 +33,30 @@ AGENT_PORT = 7433
 # handler's own #3145 audit note) — ordinary git/process latency, not the
 # 600s-class `build_command` a worker session can take, but routinely more
 # than a few seconds on a loaded host or a large repo. The bare `timeout=15`
-# below was tuned for a fast confirm-and-202 response, not for the endpoint
-# it actually calls, so a machine that was genuinely reachable and genuinely
-# working still surfaced as a bare "dispatch failed: timed out" indistinct
-# from an unreachable one. Raised well past ordinary worktree-setup latency
-# — this bounds ACTUAL unreachability (already screened out for the `coord
-# fix` callers above), not a slow-but-working `/assign`.
-_ASSIGN_POST_TIMEOUT_SECS = 60.0
+# a POST to `/assign` used to carry was tuned for a fast confirm-and-202
+# response, not for the endpoint it actually calls, so a machine that was
+# genuinely reachable and genuinely working still surfaced as a bare
+# "dispatch failed: timed out" indistinct from an unreachable one.
+#
+# This is not unique to `coord fix` — every one of this repo's `POST
+# /assign` call sites (`dispatch()` below, plus `auto_loop.py`,
+# `conflict_fix.py`, `gate_b.py`, `review.py` x2, `smoke.py`, `reconcile.py`,
+# `test_author.py`, and `test_chat.py`) hits the identical blocking handler,
+# so all of them share this constant rather than each carrying its own
+# hand-tuned `timeout=15` (#2096: one question, one answer). Exported (no
+# leading underscore) so those modules can import it instead of re-deriving
+# their own value.
+#
+# Raised well past ordinary worktree-setup latency — this bounds ACTUAL
+# unreachability, not a slow-but-working `/assign`. The `coord fix` callers
+# already screen out unreachability with a live pre-probe before ever
+# reaching this timeout; plain `coord assign`/`coord approve` dispatches
+# (`coord/commands/dispatch.py`, `coord/commands/plan_followup.py`,
+# `coord/milestone_dispatch.py`) do not, so a genuinely dead machine now
+# takes up to 60s to fail there instead of 15s — a real but accepted latency
+# trade-off against a worker that legitimately just needs more time to set
+# up a worktree.
+ASSIGN_POST_TIMEOUT_SECS = 60.0
 
 _log = logging.getLogger(__name__)
 
@@ -956,7 +973,7 @@ def dispatch(
     ):
         payload["provider"] = effective_provider_name
 
-    resp = httpx.post(url, json=payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
+    resp = httpx.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
     if (
         resp.status_code == 400
         and "provider" in payload
@@ -1006,7 +1023,7 @@ def dispatch(
 
         definition = config.providers.definitions[effective_provider_name]
         retry_payload = dict(payload, provider_def=provider_def_to_wire(definition))
-        resp = httpx.post(url, json=retry_payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
+        resp = httpx.post(url, json=retry_payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
 
     if resp.status_code == 400 and "cost_ceiling_usd" in payload:
         # #2131: the agent lane lags the CLI/daemon lane (a `coord/agent.py`
@@ -1023,7 +1040,7 @@ def dispatch(
         degraded_payload = {
             k: v for k, v in payload.items() if k != "cost_ceiling_usd"
         }
-        retried = httpx.post(url, json=degraded_payload, timeout=_ASSIGN_POST_TIMEOUT_SECS)
+        retried = httpx.post(url, json=degraded_payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         if retried.status_code != 400:
             _log.warning(
                 "agent %s rejected cost_ceiling_usd (#2131) — dispatched "

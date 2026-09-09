@@ -23,7 +23,7 @@ from pathlib import Path
 import httpx
 
 from coord.config import Config
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.models import Assignment, Machine, Repo
 
 # Soft caps so the seed briefing stays bounded.  Diffs on large refactors can
@@ -321,7 +321,7 @@ def dispatch_test_chat(
         "branch": default_branch,
     }
     try:
-        resp = httpx.post(url, json=payload, timeout=15)
+        resp = httpx.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
