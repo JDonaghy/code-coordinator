@@ -1010,9 +1010,29 @@ def _uat_branch_work(entry: "QueuedMerge", board) -> list:
     return branch_work
 
 
+@dataclass(frozen=True)
+class UatPreviewResolution:
+    """Outcome of :func:`_resolve_uat_preview_url` (#3216).
+
+    A bare ``str | None`` can't tell a caller WHY resolution failed — which
+    is exactly how #3216 happened: ``evaluate_uat_verdict`` told the operator
+    "no matching GitHub Deployment found for this branch" for a *gh_ops*
+    stand-in (:class:`coord.gate_snapshot.GateSnapshot`, pre-fix) that was
+    never even asked, because the ``AttributeError`` from a missing
+    ``get_pr_deployment_url`` was swallowed by the same bare
+    ``except Exception`` that legitimately catches a live lookup failure.
+    ``reason`` is populated only when ``url`` is ``None`` and names which
+    case applied, so a stand-in that cannot answer reads as "not asked",
+    never as "asked and there was nothing".
+    """
+
+    url: str | None
+    reason: str | None = None
+
+
 def _resolve_uat_preview_url(
     entry: "QueuedMerge", config, gh_ops: "GhOps | None"
-) -> str | None:
+) -> UatPreviewResolution:
     """Resolve the preview URL to surface for *entry* (#2948).
 
     Resolution order:
@@ -1023,29 +1043,59 @@ def _resolve_uat_preview_url(
     2. ``Repo.uat_live_preview`` — the live GitHub-Deployment lookup
        (:func:`coord.github_ops.get_pr_deployment_url`, via *gh_ops*),
        matched on environment name rather than recency. Requires both a
-       *gh_ops* and a known branch; returns ``None`` on any read failure
-       rather than raising.
+       *gh_ops* that actually offers the method and a known branch; returns
+       an unresolved result on any read failure rather than raising.
 
-    Returns ``None`` when neither resolves — never a guessed/constructed
-    URL (the #2948 bug: a template placeholder that renders a plausible but
-    dead link).
+    Returns a :class:`UatPreviewResolution` with ``url=None`` when neither
+    resolves — never a guessed/constructed URL (the #2948 bug: a template
+    placeholder that renders a plausible but dead link).
+
+    #3216: *gh_ops* is probed via ``getattr(gh_ops, "get_pr_deployment_url",
+    None)`` — the same optional-method convention
+    :meth:`GhOps.branch_has_merge_commit`'s docstring already prescribes —
+    rather than called unconditionally. A *gh_ops* stand-in missing the
+    method (``None``, or a duck-typed object that predates #2948) is
+    reported as "no live lookup available", distinct from a lookup that ran
+    and genuinely found nothing.
     """
     repo = _uat_repo_for(entry, config)
     if repo is None:
-        return None
+        return UatPreviewResolution(None, "repo not found in configuration")
     if repo.uat_preview:
-        return repo.resolve_uat_preview_url(
-            branch=getattr(entry, "branch", None),
-            issue_number=getattr(entry, "issue_number", None),
-            pr_number=getattr(entry, "pr_number", None),
+        return UatPreviewResolution(
+            repo.resolve_uat_preview_url(
+                branch=getattr(entry, "branch", None),
+                issue_number=getattr(entry, "issue_number", None),
+                pr_number=getattr(entry, "pr_number", None),
+            )
+        )
+    if not getattr(repo, "uat_live_preview", False):
+        return UatPreviewResolution(
+            None, "no uat_preview override configured and uat_live_preview is not enabled"
         )
     branch = getattr(entry, "branch", None)
-    if getattr(repo, "uat_live_preview", False) and gh_ops is not None and branch:
-        try:
-            return gh_ops.get_pr_deployment_url(entry.repo_github, branch)
-        except Exception:  # noqa: BLE001 — no URL to report, not a crash
-            return None
-    return None
+    if not branch:
+        return UatPreviewResolution(
+            None, "no uat_preview override configured and the branch is unknown"
+        )
+    lookup = getattr(gh_ops, "get_pr_deployment_url", None)
+    if lookup is None:
+        return UatPreviewResolution(
+            None,
+            "no uat_preview override configured and no live GitHub-Deployment "
+            "lookup is available from this read path",
+        )
+    try:
+        url = lookup(entry.repo_github, branch)
+    except Exception:  # noqa: BLE001 — no URL to report, not a crash
+        url = None
+    if url:
+        return UatPreviewResolution(url)
+    return UatPreviewResolution(
+        None,
+        "no uat_preview override configured and no matching GitHub Deployment "
+        "found for this branch",
+    )
 
 
 def evaluate_uat_verdict(
@@ -1101,20 +1151,16 @@ def evaluate_uat_verdict(
     if uat_state == "passed":
         return True, ""
 
-    preview_url = _resolve_uat_preview_url(entry, config, gh_ops)
+    resolution = _resolve_uat_preview_url(entry, config, gh_ops)
     if uat_state == "failed":
         reason_part = f": {uat_reason}" if (uat_reason or "").strip() else ""
         message = f"uat verdict FAILED{reason_part}"
     else:
         message = "uat verdict missing"
-    if preview_url:
-        message += f" — preview: {preview_url}"
+    if resolution.url:
+        message += f" — preview: {resolution.url}"
     else:
-        message += (
-            " — preview URL could not be resolved (no uat_preview override "
-            "configured and no matching GitHub Deployment found for this "
-            "branch)"
-        )
+        message += f" — preview URL could not be resolved ({resolution.reason})"
     message += f" — run: coord uat {aid or '<assignment-id>'} --passed|--failed"
     return False, message
 
@@ -1165,7 +1211,7 @@ def _run_declared_uat_checks(
         # Never silently overwrite it with a fresh auto-check.
         return None
 
-    preview_url = _resolve_uat_preview_url(entry, config, gh_ops)
+    preview_url = _resolve_uat_preview_url(entry, config, gh_ops).url
     if not preview_url:
         return None
 
@@ -3755,6 +3801,18 @@ class GhOps(Protocol):
         real Cloudflare Pages project. See
         :func:`coord.github_ops.get_pr_deployment_url` for the actual ``gh
         api`` calls and the environment-name matching rule.
+
+        Optional on stub ``GhOps`` implementations, same contract as
+        :meth:`branch_has_merge_commit`: ``_resolve_uat_preview_url`` detects
+        support via ``getattr(gh_ops, "get_pr_deployment_url", None)`` and
+        treats a missing method as "no live lookup available" rather than
+        crashing — but unlike the other optional methods here, a *real*
+        stand-in that only serves cached, tick-refreshed data (i.e.
+        :class:`coord.gate_snapshot.GateSnapshot`) MUST still implement this
+        one: the #3216 bug was exactly a snapshot that duck-typed every
+        other seam except this one, silently reporting every
+        ``uat_live_preview`` repo's preview link as permanently
+        unresolvable on the ``/board`` read path forever.
         """
         ...
 

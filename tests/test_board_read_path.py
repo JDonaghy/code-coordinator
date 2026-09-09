@@ -1041,6 +1041,228 @@ def test_gate_refresher_branch_sha_failure_is_fail_open(rw_db, monkeypatch) -> N
     assert snap.get_branch_patch_id("acme/api", "main", "issue-42-fix") is None
 
 
+# ── #3216: the board-served UAT preview URL (`get_pr_deployment_url`) ───────
+
+
+def test_gate_snapshot_answers_get_pr_deployment_url(rw_db, monkeypatch) -> None:
+    """#3216 (third #1640/#1998 recurrence): the snapshot must answer
+    `get_pr_deployment_url` — the #2948 lookup `merge_queue.
+    _resolve_uat_preview_url` uses for a repo opted into `uat_live_preview`.
+
+    Before this fix `GateSnapshot` didn't implement this method at all, so
+    handing it to `evaluate_uat_verdict` as `gh_ops` raised an
+    `AttributeError` that `_resolve_uat_preview_url`'s bare
+    `except Exception` swallowed — every `/board`-served UAT block on such a
+    repo permanently read "no matching GitHub Deployment found for this
+    branch", even though a live `coord merge --dry-run` (real `github_ops`)
+    resolved a real, live URL for the exact same branch.
+    """
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config, PipelineConfig
+    from coord.models import Repo
+
+    _seed_pending_merge(rw_db)
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+    monkeypatch.setattr(
+        github_ops, "get_pr_deployment_url",
+        lambda repo, branch: "https://8c305d13.format-converter-6bi.pages.dev",
+    )
+
+    config = Config(
+        repos=[Repo(name="api", github="acme/api", uat_preview=None, uat_live_preview=True)],
+        machines=[],
+        pipeline=PipelineConfig(default_gates=["uat", "merge"]),
+    )
+
+    # Pre-refresh: unknown, not an AttributeError — the fail-open contract.
+    assert gs.GateSnapshot().get_pr_deployment_url("acme/api", "issue-42-fix") is None
+
+    snap = gs.GateSnapshotRefresher().refresh(config)
+
+    assert (
+        snap.get_pr_deployment_url("acme/api", "issue-42-fix")
+        == "https://8c305d13.format-converter-6bi.pages.dev"
+    )
+
+
+def test_gate_refresher_deployment_lookup_scoped_to_live_preview_repos(
+    rw_db, monkeypatch
+) -> None:
+    """#3216: the deployment-URL sweep only ever calls GitHub for a pending
+    entry whose repo has `uat_live_preview` set and no `uat_preview`
+    override — an explicit override always wins (`_resolve_uat_preview_url`'s
+    resolution order) and a repo with neither never blocks on the UAT gate at
+    all (`merge_queue.requires_uat`), so both cases have no use for a live
+    lookup. The fleet is GitHub-throttle-sensitive (#2989/#2988); this sweep
+    must not widen past entries that can actually use the result.
+    """
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config, PipelineConfig
+    from coord.models import Repo
+
+    def _insert(repo_name: str, repo_github: str, branch: str, aid: str) -> None:
+        rw_db.execute(
+            "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+            "branch, target_branch, issue_number, issue_title, state, pr_number) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (aid, repo_name, repo_github, branch, "main", 1, "t", "pending", None),
+        )
+    _insert("live", "acme/live", "issue-1-x", "w-live")
+    _insert("override", "acme/override", "issue-2-x", "w-override")
+    _insert("off", "acme/off", "issue-3-x", "w-off")
+    rw_db.commit()
+
+    calls: list[tuple[str, str]] = []
+
+    def _get_deployment_url(repo: str, branch: str) -> str:
+        calls.append((repo, branch))
+        return "https://example.pages.dev"
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+    monkeypatch.setattr(github_ops, "get_pr_deployment_url", _get_deployment_url)
+
+    config = Config(
+        repos=[
+            Repo(name="live", github="acme/live", uat_preview=None, uat_live_preview=True),
+            Repo(
+                name="override", github="acme/override",
+                uat_preview="https://preview.example/{branch}", uat_live_preview=True,
+            ),
+            Repo(name="off", github="acme/off", uat_preview=None, uat_live_preview=False),
+        ],
+        machines=[],
+        pipeline=PipelineConfig(default_gates=["uat", "merge"]),
+    )
+
+    snap = gs.GateSnapshotRefresher().refresh(config)
+
+    assert calls == [("acme/live", "issue-1-x")]
+    assert snap.get_pr_deployment_url("acme/live", "issue-1-x") == "https://example.pages.dev"
+    assert snap.get_pr_deployment_url("acme/override", "issue-2-x") is None
+    assert snap.get_pr_deployment_url("acme/off", "issue-3-x") is None
+
+
+def test_plan_uat_block_reason_surfaces_snapshot_deployment_url(rw_db) -> None:
+    """#3216 acceptance bar: `plan()` (the function `/board`'s `merge_plan`
+    is built from, per `serve_app.py`) handed a `GateSnapshot` carrying a
+    deployment URL must produce a `reason` containing `preview: <url>` — the
+    same wording a live `coord merge --dry-run` (real `github_ops`) would
+    print for the identical entry, closing the "three readers, three
+    answers" split #3216 reports.
+    """
+    import coord.gate_snapshot as gs
+    import coord.merge_queue as mq
+    from coord.config import Config, PipelineConfig
+    from coord.models import Assignment, Board, Repo
+
+    _seed_pending_merge(rw_db)
+
+    config = Config(
+        repos=[Repo(name="api", github="acme/api", uat_preview=None, uat_live_preview=True)],
+        machines=[],
+        pipeline=PipelineConfig(default_gates=["uat", "merge"]),
+    )
+    board = Board(
+        active=[],
+        completed=[
+            Assignment(
+                machine_name="m1", repo_name="api", issue_number=42, issue_title="t",
+                assignment_id="work1", type="work", status="done",
+                branch="issue-42-fix", uat_state=None,
+            )
+        ],
+    )
+    snapshot = gs.GateSnapshot(
+        deployment_urls={
+            ("acme/api", "issue-42-fix"): "https://8c305d13.format-converter-6bi.pages.dev",
+        },
+    )
+
+    plan = mq.plan(board, config, ci_store=None, gh_ops=snapshot)
+
+    entry = next(pm for pm in plan if pm.assignment_id == "work1")
+    assert entry.status == mq.PLAN_BLOCKED
+    assert "preview: https://8c305d13.format-converter-6bi.pages.dev" in (entry.reason or "")
+
+
+def test_gate_snapshot_answers_every_required_gh_ops_method() -> None:
+    """#3216 ratchet: the test #1640 and #1998 should each have left behind.
+
+    Scans `coord.merge_queue`'s source for every `GhOps` protocol method
+    invoked through a variable literally named `gh_ops` — both unconditional
+    (`gh_ops.method(...)`) and optional-probe (`getattr(gh_ops, "method",
+    ...)`) call sites, since the #1998 precedent (`get_branch_commit_
+    timestamp`) is itself only ever reached via the optional-probe pattern
+    despite `GateSnapshot` being required to answer it. Excludes the
+    methods `GhOps` only ever calls from the mutating LIVE merge path
+    (`process()`/`reconcile_conflict_entries()`, which never receive a
+    `GateSnapshot` — see `coord.gate_snapshot`'s module docstring, "the live
+    merge execution path... keeps its own live CiStore") or that are
+    deliberately, by design, left unanswered by the read-only snapshot (a
+    live mergeability probe with no meaningful cached shape — see
+    `_entry_gate_status`'s own comment on `check_pr_mergeable`).
+
+    A method added to `GhOps` and called unconditionally (or via the
+    optional-probe pattern) from anywhere in `merge_queue` that is NOT one
+    of those documented exclusions must be answered by `GateSnapshot` or
+    this test fails — instead of `/board` silently diverging from the live
+    gate for it, the exact #1640/#1998/#3216 mechanism.
+    """
+    import inspect
+    import re
+
+    import coord.gate_snapshot as gs
+    import coord.merge_queue as mq
+
+    protocol_methods = {
+        name for name in vars(mq.GhOps) if not name.startswith("_")
+    }
+    source = inspect.getsource(mq)
+    direct = set(re.findall(r"\bgh_ops\.([a-zA-Z_][a-zA-Z0-9_]*)\(", source))
+    guarded = set(
+        re.findall(r"""getattr\(\s*gh_ops\s*,\s*["'](\w+)["']""", source)
+    )
+    referenced = (direct | guarded) & protocol_methods
+
+    # Mutating operations only ever invoked from the live merge path
+    # (`process()`), which always gets real `github_ops`, never a
+    # `GateSnapshot` — see the module docstring's "the live merge execution
+    # path... keeps its own live CiStore; only the read path serves from
+    # the snapshot."
+    write_only = {
+        "create_pr", "merge_pr", "close_issue", "edit_pr_body", "get_pr_body",
+        "has_open_children", "get_compare_files", "get_pr_size",
+    }
+    # Deliberately NOT cached by `GateSnapshot` — a live-only mergeability
+    # probe whose absence already degrades safely to "inconclusive" by
+    # design (see `_entry_gate_status`'s own comment on `check_pr_mergeable`
+    # and `branch_has_merge_commit`/`find_pr_for_branch`/`pr_is_merged`'s
+    # own "Optional on stub GhOps implementations" docstrings).
+    deliberately_uncached = {
+        "check_pr_mergeable", "branch_has_merge_commit", "find_pr_for_branch",
+        "pr_is_merged",
+    }
+    required = referenced - write_only - deliberately_uncached
+
+    snap = gs.GateSnapshot()
+    missing = sorted(name for name in required if not hasattr(snap, name))
+    assert missing == [], (
+        f"GateSnapshot doesn't implement {missing} — GhOps method(s) called "
+        "from coord.merge_queue that a GateSnapshot stand-in must answer, "
+        "or /board silently diverges from the live gate for them "
+        "(#1640/#1998/#3216)."
+    )
+
+
 # ── Invariant 2: no collection endpoint returns unbounded text ───────────────
 
 

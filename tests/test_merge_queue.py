@@ -5151,6 +5151,40 @@ class TestUatGate:
         assert ok is False
         assert "could not be resolved" in message
 
+    def test_evaluate_uat_verdict_gh_ops_missing_method_reads_as_not_asked(self) -> None:
+        # #3216: a `gh_ops` stand-in that simply lacks `get_pr_deployment_url`
+        # (e.g. a `GateSnapshot` that predates #3216, or any future duck-typed
+        # stand-in that hasn't grown the method yet) must not be told "no
+        # matching GitHub Deployment found for this branch" — that sentence
+        # claims GitHub was actually asked, which never happened. It must
+        # read as "no live lookup available" instead, distinctly from the
+        # genuinely-asked-and-empty case below.
+        @dataclass
+        class _NoDeploymentLookupGh:
+            """Deliberately missing `get_pr_deployment_url`."""
+
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(
+            _q("w1"), board, cfg, _NoDeploymentLookupGh()
+        )
+        assert ok is False
+        assert "could not be resolved" in message
+        assert "no matching GitHub Deployment found" not in message
+        assert "no live GitHub-Deployment lookup is available" in message
+
+    def test_evaluate_uat_verdict_live_lookup_found_nothing_names_that_case(self) -> None:
+        # The mirror image of the test above: a `gh_ops` that DOES offer
+        # `get_pr_deployment_url` and was actually called, but found no
+        # matching Deployment — this is the one case allowed to say so.
+        cfg = self._config(uat_preview=None, uat_live_preview=True)
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg, FakeGh())
+        assert ok is False
+        assert "no matching GitHub Deployment found for this branch" in message
+
     # ── merge_gate_failures / passes_merge_gates ──
 
     def test_merge_gate_failures_includes_uat(self) -> None:
