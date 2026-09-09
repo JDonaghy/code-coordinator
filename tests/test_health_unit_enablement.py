@@ -11,6 +11,7 @@ directly here, not just described.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,60 @@ def test_installed_but_masked_unit_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(ue, "_is_enabled", lambda name, **kw: ("masked", None))
     results = ue.probe_unit_enablement(make_ctx(tmp_path))
     assert results[0].severity is Severity.WARN
+
+
+# ── #3219: masked-by-policy sentinel ──────────────────────────────────────
+
+
+def test_masked_unit_with_no_sentinel_entry_is_not_suppressed(tmp_path, monkeypatch) -> None:
+    """#3219: absence of a sentinel entry must not read as "suppressed" —
+    the sentinel is the signal, not the masked state itself."""
+    _install(tmp_path, "coord-release-propagate.timer")
+    monkeypatch.setattr(ue, "_is_enabled", lambda name, **kw: ("masked", None))
+    results = ue.probe_unit_enablement(make_ctx(tmp_path))
+    assert len(results) == 1
+    r = results[0]
+    assert r.severity is Severity.WARN
+    assert r.values["suppressed"] is False
+    assert r.values["suppress_reason"] is None
+    assert r.values["suppress_set"] is None
+
+
+def test_masked_unit_covered_by_the_watchdog_suppress_sentinel_is_flagged(
+    tmp_path, monkeypatch
+) -> None:
+    """#3219 (follow-up to #3049): a unit masked on purpose — covered by
+    the same ``watchdog-suppress.json`` sentinel the fleet watchdog,
+    `unit_drift`, and `timer_active` already honour — still reports the
+    honest WARN (severity is this probe's call, not a policy layer's), but
+    surfaces the sentinel's reason/set date in ``values`` so a
+    policy-aware consumer (`coord release verify`, #3049) can render it as
+    masked-by-policy instead of paging on it."""
+    _install(tmp_path, "coord-release-propagate.timer")
+    monkeypatch.setattr(ue, "_is_enabled", lambda name, **kw: ("masked", None))
+
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "watchdog-suppress.json").write_text(
+        json.dumps(
+            {
+                "coord-release-propagate.timer": {
+                    "reason": "manual release rolls by choice -- masked, not broken",
+                    "set": "2026-08-26",
+                    "expires": None,
+                }
+            }
+        )
+    )
+
+    results = ue.probe_unit_enablement(make_ctx(tmp_path, coord_dir=coord_dir))
+    assert len(results) == 1
+    r = results[0]
+    # Still the honest WARN — this probe has no policy context of its own.
+    assert r.severity is Severity.WARN
+    assert r.values["suppressed"] is True
+    assert r.values["suppress_reason"] == "manual release rolls by choice -- masked, not broken"
+    assert r.values["suppress_set"] == "2026-08-26"
 
 
 def test_is_enabled_error_is_unknown_not_ok_or_warn(tmp_path, monkeypatch) -> None:

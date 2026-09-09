@@ -40,6 +40,22 @@ Judgement (:func:`grade_timer_state`) is pure and takes plain
 ``systemctl --user show`` fields, so it is unit-testable against a
 hand-built dict with no systemd, no fleet, and no root — same split
 ``spawned_coord.py`` documents for "measure locally, judge centrally".
+
+#3219 — a masked timer is not a neglected one
+----------------------------------------------
+A timer `systemctl --user mask`ed on purpose (the same deliberate-manual-
+release-rolls case :mod:`coord.health.checks.unit_drift` documents for
+#3049) reports `UnitFileState=masked`, which lands in `_INACTIVE_STATES`
+below and grades CRIT — indistinguishable, to this probe, from a timer
+nobody ever enabled. This probe still reports the honest severity: masking
+a timer that is supposed to fire on its own schedule is a real fault from
+*this* probe's narrow view, and deciding whether that's wanted is policy
+this probe has no context for. But — mirroring `unit_drift` exactly — it
+also checks the SAME sentinel the watchdog already honours
+(`~/.coord/watchdog-suppress.json`, #2580) and publishes the verdict in
+`values["suppressed"]` (plus `"suppress_reason"`/`"suppress_set"`), so a
+policy-aware consumer (`coord release verify`, #3049) can render "masked by
+policy" instead of surfacing an unclearable CRIT.
 """
 
 from __future__ import annotations
@@ -52,7 +68,7 @@ from coord.health.checks.unit_drift import (
     resolve_systemd_user_dir,
 )
 from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import check
+from coord.health.registry import check, is_suppressed, load_suppressions
 
 # systemctl is fast, but a wedged call must not eat the whole health-tick
 # budget — same rationale/value as spawned_coord._SYSTEMCTL_TIMEOUT.
@@ -217,10 +233,29 @@ def probe_timer_active(ctx: HealthContext) -> list[CheckResult]:
         ]
 
     states = _timer_states(tuple(present))
+    # #3219: same sentinel unit_drift already reads (#3049,
+    # ~/.coord/watchdog-suppress.json) — a timer masked on purpose reads
+    # identically to a neglected one to systemctl, so `values["suppressed"]`
+    # is published for every result here regardless of severity, mirroring
+    # unit_drift's convention, so a policy-aware consumer can tell the two
+    # apart without this probe guessing at policy itself.
+    suppressions = load_suppressions(ctx.coord_dir)
     results: list[CheckResult] = []
     for name in present:
         fields = states.get(name)
         values = {"unit": name, "reference_source": reference.source}
+        # Bare unit name first, matching the key fleet_watchdog's own
+        # timer-disabled check already suppresses under
+        # (`suppress_keys=(unit,)`) — an operator who suppressed this unit
+        # for the watchdog does not maintain a second key for this probe.
+        # `timer_active:<name>` is also accepted for symmetry with
+        # unit_drift's `unit_drift:<name>`.
+        suppressed, entry = is_suppressed(
+            suppressions, (name, f"timer_active:{name}"), now=ctx.now
+        )
+        values["suppressed"] = suppressed
+        values["suppress_reason"] = (entry or {}).get("reason") if suppressed else None
+        values["suppress_set"] = (entry or {}).get("set") if suppressed else None
         if fields is None:
             results.append(
                 CheckResult(
