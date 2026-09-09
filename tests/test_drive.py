@@ -60,6 +60,7 @@ from coord.drive import (
     GitMergeVerifier,
     LockBusy,
     OracleDecision,
+    _UAT_FIXUP_DISPATCH_RETRY_LIMIT,
     _die,
     _remote_matches_repo,
     coord_argv,
@@ -4167,8 +4168,14 @@ def test_uat_fix_dispatch_is_bounded_by_max_fix_rounds_then_escalates():
 
     first = step(s, opts, counters=counters)
     assert first.kind == RUN
+    # #3214: `decide()` no longer spends a fix round just for DECIDING to
+    # dispatch (only a confirmed subprocess success does, via
+    # `Driver._loop`) — simulate that confirmation here, the way a real
+    # poll cycle's successful `coord fix` would.
+    counters.fix_rounds += 1
     second = step(s, opts, counters=counters)
     assert second.kind == RUN
+    counters.fix_rounds += 1
     exhausted = step(s, opts, counters=counters)
     assert exhausted.is_exit
     assert exhausted.exit_code == EXIT_ESCALATED
@@ -4206,6 +4213,7 @@ def test_uat_fix_dispatch_shares_the_fix_rounds_budget_with_test_failures():
 
     only_round_left = step(s, opts, counters=counters)
     assert only_round_left.kind == RUN
+    counters.fix_rounds += 1  # #3214: simulate `Driver._loop` confirming it
     exhausted = step(s, opts, counters=counters)
     assert exhausted.is_exit
     assert exhausted.exit_code == EXIT_ESCALATED
@@ -4227,6 +4235,171 @@ def test_uat_gate_still_waits_on_smoke_or_review_divergence_precedence():
     )
     assert action.kind == RUN
     assert action.command[0] == "fix"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3214: format-converter#6 — a UAT fix-up dispatch (`coord fix --force`)
+# that times out used to kill the WHOLE drive session with `exit_code=1`,
+# twice, 19 minutes apart — the exact "continue by hand" outcome #3201
+# existed to remove, and the issue was simultaneously sitting `waiting` in
+# the drive queue the whole time. A dispatch that never reached a worker is
+# an INFRASTRUCTURE failure, not a rejected fix: it must retry a bounded
+# number of times, then park with the dispatch error named, WITHOUT dying
+# and WITHOUT spending a fix round on an attempt that was never dispatched.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_uat_fixup_dispatch_action_retries_on_a_transient_failure_instead_of_dying():
+    """`on_error="warn"` is what lets `Driver._loop` retry next poll instead
+    of raising `DriveError` and exiting 1 — the #3214 defect verbatim."""
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason=UAT_VERDICT_FAILED,
+            work_uat_state="failed",
+            work_uat_reason="layout broke on mobile",
+        )
+    )
+    assert action.kind == RUN
+    assert action.on_error == "warn"
+    # `dispatch_kind` is what `Driver._loop` reads to track the bounded
+    # retry counter and write the "dispatched"/"could not be dispatched"
+    # audit events — see the field's own docstring.
+    assert action.dispatch_kind == "uat_fixup"
+
+
+def test_uat_fixup_dispatch_does_not_spend_a_fix_round_just_by_being_decided():
+    """#2096 "unconfirmed success is a defect": `decide()` only ever DECIDES
+    to try a dispatch — it cannot know the subprocess will succeed. Spending
+    `fix_rounds` here (before `Driver._loop` ever ran the command) would
+    silently eat the "design disagreement" budget on dispatch attempts that
+    never reached a worker."""
+    counters = DriveCounters()
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UAT_VERDICT_FAILED,
+        work_uat_state="failed",
+        work_uat_reason="layout broke on mobile",
+    )
+    step(s, counters=counters)
+    assert counters.fix_rounds == 0
+    # ...but the label still narrates the round this attempt WOULD be, so an
+    # operator watching the pane sees "fix round 1/3" on the very first try.
+    action = step(s, counters=counters)
+    assert "fix round 1/" in action.label
+
+
+def test_uat_fixup_dispatch_parks_after_the_retry_limit_without_spending_a_fix_round():
+    """Once `Driver._loop` has already recorded
+    `_UAT_FIXUP_DISPATCH_RETRY_LIMIT` consecutive dispatch failures (the
+    ONLY way this counter ever advances — see the field's docstring),
+    `decide()` must stop retrying and park instead — even though
+    `fix_rounds` itself was never touched and the design-disagreement budget
+    is nowhere near exhausted."""
+    counters = DriveCounters(
+        uat_fixup_dispatch_failures=_UAT_FIXUP_DISPATCH_RETRY_LIMIT,
+        last_uat_fixup_dispatch_error="error: dispatch failed: timed out",
+    )
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UAT_VERDICT_FAILED,
+        work_uat_state="failed",
+        work_uat_reason="layout broke on mobile",
+    )
+
+    action = step(s, opts, counters=counters)
+    assert action.is_exit
+    # #1844's contract, reused here on purpose: EXIT_DISPATCH_REFUSED is what
+    # lets `coord/drive_queue.py`'s tick block this entry WITHOUT spending a
+    # queue launch attempt — never EXIT_ESCALATED, which still spends one.
+    assert action.exit_code == EXIT_DISPATCH_REFUSED
+    assert "timed out" in action.message
+    assert f"{_UAT_FIXUP_DISPATCH_RETRY_LIMIT} attempt" in action.message
+    assert action.command[:2] == ("escalate", "record")
+    assert counters.fix_rounds == 0
+
+
+def test_driver_retries_a_failing_uat_fixup_dispatch_then_parks_without_a_work_attempt(
+    driver_factory, monkeypatch, coord_db,
+):
+    """End-to-end through `Driver.run()` (#3214): a `coord fix --force` that
+    fails the SAME way every time (a generic non-refusal failure — the
+    incident's own `error: dispatch failed: timed out`) must retry exactly
+    `_UAT_FIXUP_DISPATCH_RETRY_LIMIT` times, never raise `DriveError`/exit 1,
+    and finish by parking on `EXIT_DISPATCH_REFUSED` with the failure named —
+    the audit trail distinguishing every failed attempt from a (never
+    reached) successful dispatch along the way.
+    """
+    monkeypatch.setattr(
+        "coord.drive.Driver._post_escalation_comment", lambda *a, **kw: None
+    )
+    # Pin `coord_argv()`'s prefix to a single element so the recorded argvs
+    # below are decided by the code under test, not by whether `coord` is on
+    # the *host's* $PATH (#2564).
+    monkeypatch.setenv("COORD_DRIVE_COORD_BIN", "coord")
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0,
+        uat_state="failed", uat_reason="layout broke on mobile",
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    payload["merge_plan"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "status": "BLOCKED",
+            "reason": UAT_VERDICT_FAILED,
+            "assignment_id": "w1",
+        }
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_fix_rounds=3, deadline_mins=5.0,
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def failing_dispatch(argv, **kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "  escalating model: sonnet → opus\n",
+            "error: dispatch failed: timed out",
+        )
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_dispatch)
+    assert driver.run() == EXIT_DISPATCH_REFUSED
+
+    argvs = [" ".join(a) for a in calls]
+    fix_attempts = [a for a in argvs if a.startswith("coord fix ")]
+    assert len(fix_attempts) == _UAT_FIXUP_DISPATCH_RETRY_LIMIT
+    assert any("escalate record" in a for a in argvs), argvs
+
+    rows = _drive_audit_rows(coord_db)
+    event_types = [r["event_type"] for r in rows]
+    assert (
+        event_types.count("uat_fixup_dispatch_failed")
+        == _UAT_FIXUP_DISPATCH_RETRY_LIMIT
+    )
+    # Never once claimed a dispatch succeeded — the incident this closes.
+    assert "uat_fixup_dispatched" not in event_types
+    assert event_types[-1] == "drive_exited"
+    exit_details = json.loads(rows[-1]["details_json"])
+    assert exit_details["exit_code"] == EXIT_DISPATCH_REFUSED
+    assert "timed out" in rows[-1]["summary"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

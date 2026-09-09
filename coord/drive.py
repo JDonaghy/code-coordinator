@@ -253,6 +253,28 @@ _CAPTURED_OUTPUT_LIMIT = 4000
 # never *tightened* for the environmental case.
 _ENVIRONMENTAL_WORK_RETRY_BUDGET = 5
 
+# #3214: how many CONSECUTIVE times a same-branch UAT fix-up dispatch
+# (`coord fix <work_aid> --force`, dispatched from the "uat" arm of
+# `_decide_merge` below) may fail to even START before this session stops
+# retrying and parks instead of dying. format-converter#6: the dispatch
+# timed out identically twice, 19 minutes apart — not a one-off blip — and
+# each failure killed the WHOLE drive session with `exit_code=1`, exactly
+# the "continue by hand" outcome #3201 existed to remove. Deliberately a
+# SEPARATE, small budget from `opts.max_fix_rounds`: a dispatch that never
+# reached a worker is an INFRASTRUCTURE failure (an unreachable machine, the
+# `/assign` endpoint's own blocking git-worktree setup outrunning the
+# client's POST timeout — see `coord.dispatch.dispatch`'s timeout comment),
+# never evidence the fix itself is wrong, so it must not spend the budget
+# `_escalate_merge`'s "uat_repeatedly_failed" arm uses to detect a genuine
+# design disagreement (#2096, "one question, one answer": "could we even
+# ask a worker to try?" and "did the fix satisfy UAT?" are different
+# questions with different counters). `state.work_uat_state` stays "failed"
+# until a dispatch actually SUCCEEDS (only a successful `coord fix` clears
+# it — #3210), so a failed dispatch re-enters the exact same branch on the
+# very next poll with no board change at all: the natural, free retry
+# signal — bounded here so it does not retry forever.
+_UAT_FIXUP_DISPATCH_RETRY_LIMIT = 2
+
 # #2443: how many CONSECUTIVE polls of the IDENTICAL `Action.label` to
 # tolerate before `Driver._loop` checks whether its own on-disk `coord`
 # install has moved since this session started. Below this, a same-label
@@ -553,6 +575,28 @@ class DriveCounters:
     # slice's author AND the issue's own work row in the same session —
     # sharing a counter would let one budget silently starve the other.
     acceptance_author_retries: int = 0
+    # #3214: consecutive FAILED attempts to dispatch a same-branch UAT
+    # fix-up (`coord fix <work_aid> --force` from the "uat" arm of
+    # `_decide_merge`) — deliberately NOT the same counter as `fix_rounds`
+    # above. `fix_rounds` answers "how many times has a worker actually been
+    # asked to fix this"; this answers "how many times in a row could we not
+    # even ask" — a dispatch that timed out or hit an unreachable machine
+    # never reached a worker at all. Incremented by `Driver._loop` (not
+    # `decide()`) right after a `dispatch_kind="uat_fixup"` RUN Action's
+    # subprocess returns non-zero for a reason OTHER than the deterministic
+    # `EXIT_DISPATCH_REFUSED` (that one already exits immediately — see
+    # `_loop`'s RUN handling), and reset to 0 the moment one such dispatch
+    # actually succeeds. Bounded by `_UAT_FIXUP_DISPATCH_RETRY_LIMIT`; once
+    # reached, `_decide_merge` parks instead of trying again — see that
+    # constant's docstring.
+    uat_fixup_dispatch_failures: int = 0
+    # #3214: the most recent UAT fix-up dispatch failure's own captured
+    # output (`Driver._last_run_output`, same source `last_merge_diagnostic`
+    # above reads) — quoted verbatim in the park message once
+    # `uat_fixup_dispatch_failures` hits its limit, so the escalation names
+    # the REAL failure ("dispatch failed: timed out") instead of a generic
+    # "could not dispatch" with no evidence attached.
+    last_uat_fixup_dispatch_error: str = ""
 
     def slice_budget(self) -> "DriveCounters":
         """This run's slice-landing budget, created on first use (#2079)."""
@@ -607,6 +651,20 @@ class Action:
     # (e.g. bypassing a stale pre-dispatch refusal) leave a durable trail
     # instead of only a run-log line nobody queries later.
     audit_event: tuple[str, str, dict[str, Any]] | None = None
+    # #3214: tags a RUN Action whose OUTCOME (not just its decision to fire)
+    # `Driver._loop` must track across polls with its own bounded counter —
+    # "" for every ordinary RUN action (unchanged). `"uat_fixup"` marks the
+    # same-branch UAT fix-up dispatch (`coord fix <work_aid> --force`, from
+    # the "uat" arm of `_decide_merge`): on success `_loop` bumps
+    # `counters.fix_rounds` (deferred here, not inside `decide()`, because
+    # only `_loop` — after the subprocess actually returns — knows whether a
+    # fix round was genuinely spent, as opposed to a dispatch that never
+    # reached a worker); on a non-refusal failure it bumps
+    # `counters.uat_fixup_dispatch_failures` instead and records a distinct
+    # audit event, so the audit trail can tell "dispatched" apart from
+    # "could not be dispatched" without depending on whether the queue
+    # happened to move for an unrelated reason.
+    dispatch_kind: str = ""
 
     @property
     def is_exit(self) -> bool:
@@ -3637,6 +3695,75 @@ def _escalate_merge(
     )
 
 
+def _park_uat_fixup_dispatch_failure(
+    state: IssueState, *, attempts: int, last_error: str
+) -> Action:
+    """Build the EXIT action for a UAT fix-up dispatch that could not even
+    START, `attempts` times in a row (#3214).
+
+    Structurally close to :func:`_escalate_dead_end` (a pure ``EXIT`` action
+    describing a board write `Driver._loop`'s exit handling performs, never a
+    direct `coord.state` call) but a DIFFERENT exit code on purpose:
+    :data:`EXIT_ESCALATED` (what :func:`_escalate_merge` uses for a UAT
+    verdict that keeps failing on its merits) reads as "a human decision is
+    waiting" and, per ``coord/drive_queue.py``'s ``_fetch_exit_reasons``,
+    still spends a queue launch attempt on the way to `blocked`. A dispatch
+    that never reached a worker is not that — it is the SAME shape
+    :data:`EXIT_DISPATCH_REFUSED` already exists for (a `coord fix` dispatch
+    this run attempted did not go through), so reusing it here is what lets
+    the queue tick skip straight to `blocked` with NO attempt spent (#1844's
+    contract), instead of burning a launch attempt re-observing an
+    infrastructure failure retrying already ruled out.
+
+    *attempts* is `counters.uat_fixup_dispatch_failures` at the moment the
+    `_UAT_FIXUP_DISPATCH_RETRY_LIMIT` budget was exhausted. *last_error* is
+    the most recent attempt's own captured output
+    (`counters.last_uat_fixup_dispatch_error`) — quoted verbatim so the
+    escalation names the real failure instead of a bare "could not dispatch".
+    """
+    reason = (
+        f"uat_fixup_dispatch_failed — could not dispatch a same-branch "
+        f"`coord fix --force` after {attempts} attempt(s); this is an "
+        "INFRASTRUCTURE failure (an unreachable machine, or `/assign`'s own "
+        "blocking git-worktree setup outrunning the dispatch timeout), not "
+        "a rejected fix, so no fix round was spent (#3214). Last failure: "
+        f"{last_error.strip() or '(no output captured)'}"
+    )
+    retry_command = (
+        f"coord fix {state.work_aid} --force --guidance "
+        f"'{(state.work_uat_reason or '').strip()}'"
+    )
+    command: list[str] = [
+        "escalate", "record", state.repo, str(state.issue),
+        "--stage", "merge",
+        "--reason", reason,
+        "--gate", f"uat_state={state.work_uat_state or '(none)'}",
+        "--gate", f"uat_reason={state.work_uat_reason or '(none)'}",
+        "--command", retry_command,
+    ]
+    if state.work_aid:
+        command += ["--assignment", state.work_aid]
+
+    return Action(
+        kind=EXIT,
+        exit_code=EXIT_DISPATCH_REFUSED,
+        message=(
+            f"could not dispatch the UAT fix-up: "
+            f"{last_error.strip() or 'dispatch failed'} ({attempts} "
+            "attempt(s)) — parking without spending a fix round (#3214).\n"
+            f"   Retry by hand once `coord status` shows a reachable "
+            f"machine: {retry_command}\n"
+            f"   Recorded on the board — see: coord escalate list --repo "
+            f"{state.repo}"
+        ),
+        command=tuple(command),
+        error_message=(
+            "failed to record the dispatch-failure escalation on the board "
+            f"(parking anyway — retry by hand: {retry_command})"
+        ),
+    )
+
+
 def _decide_merge(
     state: IssueState, opts: DriveOptions, counters: DriveCounters
 ) -> Action:
@@ -3747,7 +3874,28 @@ def _decide_merge(
                     gate_reason=gate_reason,
                     fix_rounds=counters.fix_rounds,
                 )
-            counters.fix_rounds += 1
+            # #3214: a dispatch that never even STARTS (an unreachable
+            # machine, `/assign`'s own blocking git-worktree setup outrunning
+            # the client timeout) is bounded by its OWN counter, separate
+            # from `fix_rounds` — see `_UAT_FIXUP_DISPATCH_RETRY_LIMIT`'s
+            # docstring. Checked here, every poll, because `state.
+            # work_uat_state` stays "failed" (only a SUCCESSFUL `coord fix`
+            # clears it, #3210) until a dispatch actually lands, so a failed
+            # attempt re-enters this exact branch next poll for free.
+            if counters.uat_fixup_dispatch_failures >= _UAT_FIXUP_DISPATCH_RETRY_LIMIT:
+                return _park_uat_fixup_dispatch_failure(
+                    state,
+                    attempts=counters.uat_fixup_dispatch_failures,
+                    last_error=counters.last_uat_fixup_dispatch_error,
+                )
+            # #3214 (review, #2096 "unconfirmed success is a defect"):
+            # `fix_rounds` is deliberately NOT incremented here anymore —
+            # deciding to RUN this Action is not evidence a worker was ever
+            # briefed, only that this driver is ABOUT to try. `Driver._loop`
+            # bumps it once the subprocess actually returns 0 (a confirmed
+            # dispatch); `next_round` below is display-only, for a label
+            # that still reads "fix round 1/3" on the very first attempt.
+            next_round = counters.fix_rounds + 1
             who = (
                 "The customer"
                 if state.work_uat_actor == "customer"
@@ -3772,17 +3920,23 @@ def _decide_merge(
             return Action(
                 kind=RUN,
                 label=(
-                    f"MERGE: UAT failed → fix round {counters.fix_rounds}/"
+                    f"MERGE: UAT failed → fix round {next_round}/"
                     f"{opts.max_fix_rounds} (coord fix {state.work_aid})"
                 ),
                 command=(
                     "fix", state.work_aid, "--force", "--guidance", guidance,
                 ),
+                # #3214: a non-refusal dispatch failure must retry, not kill
+                # the session — `Driver._loop` reads `dispatch_kind` to track
+                # the bounded retry counter and audit trail this arm needs.
+                on_error="warn",
+                dispatch_kind="uat_fixup",
                 error_message=(
                     f"coord fix {state.work_aid} --force failed to dispatch "
-                    "a UAT fix-up.\n"
-                    f"   Continue by hand: coord assign --interactive "
-                    f"--fix-of {state.work_aid}"
+                    "a UAT fix-up "
+                    f"(attempt {counters.uat_fixup_dispatch_failures + 1}/"
+                    f"{_UAT_FIXUP_DISPATCH_RETRY_LIMIT}) — retrying next "
+                    "poll (#3214)."
                 ),
             )
         return _wait(
@@ -5202,6 +5356,23 @@ class Driver:
                         else counters
                     )
                     budget.last_merge_diagnostic = self._last_run_output
+                if rc == 0 and action.dispatch_kind == "uat_fixup":
+                    # #3214: the ONE place a UAT fix-up dispatch is confirmed
+                    # to have actually reached a worker (#2096 "unconfirmed
+                    # success is a defect" — `decide()` only ever DECIDED to
+                    # try; this is the observation taken AFTER the subprocess
+                    # returned). Spend the fix round now, not optimistically
+                    # in `decide()`, and clear the failure streak so a later,
+                    # unrelated dispatch hiccup starts its own fresh budget.
+                    counters.uat_fixup_dispatch_failures = 0
+                    self._record_drive_audit(
+                        "uat_fixup_dispatched",
+                        f"UAT fix-up dispatched for {state.work_aid} "
+                        f"(fix round {counters.fix_rounds + 1}/"
+                        f"{self.opts.max_fix_rounds})",
+                        details={"assignment_id": state.work_aid},
+                    )
+                    counters.fix_rounds += 1
                 if rc != 0:
                     # #1844: `coord assign`/`coord approve-plan` exits this
                     # SAME code (see EXIT_DISPATCH_REFUSED's docstring) only
@@ -5243,6 +5414,27 @@ class Driver:
                         if self._last_run_output
                         else base_msg
                     )
+                    if action.dispatch_kind == "uat_fixup":
+                        # #3214: a non-refusal dispatch failure — retryable,
+                        # bounded by `_UAT_FIXUP_DISPATCH_RETRY_LIMIT` (the
+                        # deterministic EXIT_DISPATCH_REFUSED case above
+                        # already raised and never reaches here). Recorded as
+                        # its OWN audit event type so "dispatched" and
+                        # "could not be dispatched" are never the same row —
+                        # reading the trail must never depend on the queue
+                        # happening to move for an unrelated reason.
+                        counters.uat_fixup_dispatch_failures += 1
+                        counters.last_uat_fixup_dispatch_error = msg
+                        self._record_drive_audit(
+                            "uat_fixup_dispatch_failed",
+                            f"UAT fix-up dispatch failed for {state.work_aid} "
+                            f"(attempt {counters.uat_fixup_dispatch_failures}/"
+                            f"{_UAT_FIXUP_DISPATCH_RETRY_LIMIT}): {msg}",
+                            details={
+                                "assignment_id": state.work_aid,
+                                "attempt": counters.uat_fixup_dispatch_failures,
+                            },
+                        )
                     if action.on_error == "warn":
                         self.warn(msg)
                     else:
