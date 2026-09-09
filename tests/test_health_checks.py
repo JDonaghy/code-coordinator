@@ -103,6 +103,22 @@ def test_disk_crit_below_7_pct_free(tmp_path, fake_disk) -> None:
     assert result.severity is Severity.CRIT
 
 
+def test_disk_zero_total_is_unknown_not_crit(tmp_path, fake_disk) -> None:
+    """macOS autofs ``/home`` reports total=0 — that's "cannot size this
+    mount", not "100% used", and must never render as an unclearable CRIT
+    (#3218)."""
+    answers, devices = fake_disk
+    answers["/home"] = _usage(total=0, free=0)
+    devices["/home"] = 9
+    ctx = make_ctx(tmp_path, thresholds=HealthConfig(disk_paths=["/home"]))
+    (result,) = disk.probe_disk(ctx)
+    assert result.severity is Severity.UNKNOWN
+    assert "total_bytes" in result.values
+    assert result.values["total_bytes"] == 0
+    assert "free_pct" not in result.values
+    assert "used_pct" not in result.values
+
+
 def test_disk_dedupes_paths_on_the_same_filesystem(tmp_path, fake_disk) -> None:
     """Three identical CRIT lines for one full root trains an operator to skim."""
     answers, devices = fake_disk
