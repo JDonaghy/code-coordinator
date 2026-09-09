@@ -58,6 +58,19 @@ that could not actually clear it (the live gate, e.g. ``coord merge
 fix: serve the timestamp from tick-refreshed data instead of leaving the
 duck-typed seam unimplemented.
 
+#3216: third recurrence, same mechanism, for ``get_pr_deployment_url`` — the
+#2948 lookup ``merge_queue._resolve_uat_preview_url`` uses to resolve a
+repo's ``uat_live_preview`` UAT-gate preview URL. The snapshot never grew
+this method at all, so every ``/board``-served UAT-gate block on such a repo
+read "preview URL could not be resolved ... no matching GitHub Deployment
+found for this branch" — a sentence about GitHub, from a code path that
+never reached GitHub — permanently, for every tick, on every machine reading
+``/board`` (coord-tui foremost), while ``coord merge --dry-run`` and the
+persisted ``merge_queue.error`` from an earlier live ``process()`` pass both
+showed the real, live (200) URL. Same fix, same shape: serve the URL from
+tick-refreshed data (``deployment_urls`` below), populated only for the
+entries that can actually use it — see :meth:`GateSnapshotRefresher.refresh`.
+
 Fail-open by construction for a pair that has *never* been refreshed at all
 (no backend configured yet, ``ci_available=False``): ``commit_messages`` /
 ``epic_issues`` still yield ``[]`` / ``False`` in that case, and
@@ -167,6 +180,17 @@ class GateSnapshot:
     branch_commit_timestamps: dict[tuple[str, str], float | None] = field(
         default_factory=dict
     )
+    # #3216: (repo, branch) -> the live GitHub-Deployment preview URL for
+    # that branch (`coord.github_ops.get_pr_deployment_url`), for the
+    # #2948 UAT-gate preview-link resolution
+    # (`merge_queue._resolve_uat_preview_url`). Populated only for entries
+    # whose repo has `uat_live_preview` set and no `uat_preview` override —
+    # see `GateSnapshotRefresher.refresh` — so a key that is absent means
+    # either "not yet refreshed" or "this repo doesn't use the live lookup",
+    # both of which the consumer already treats identically to a live
+    # lookup that found nothing: same fail-open *caching* convention as
+    # `branch_shas` above.
+    deployment_urls: dict[tuple[str, str], str | None] = field(default_factory=dict)
     # #1904: repo -> whether the inner CiStore believes this repo declares
     # CI at all — the signal `expects_checks` below needs to tell "no CI
     # configured" apart from "CI exists but never reported for this PR"
@@ -238,6 +262,11 @@ class GateSnapshot:
     def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
         return self.branch_commit_timestamps.get((repo, branch))
 
+    # ── github_ops view consumed by the #2948 UAT preview-URL lookup ───────
+    # (#3216 — merge_queue._resolve_uat_preview_url)
+    def get_pr_deployment_url(self, repo: str, branch: str) -> str | None:
+        return self.deployment_urls.get((repo, branch))
+
 
 class GateSnapshotRefresher:
     """Owns the current :class:`GateSnapshot`; refreshed by the daemon tick.
@@ -263,10 +292,13 @@ class GateSnapshotRefresher:
         Reads the queue from the local DB, fetches CI checks + PR commit
         messages (+ epic-ness of any closing-keyword targets) per pending
         entry with a PR, plus (#1640) the branch/base HEAD SHAs and the
-        branch's patch-id, and (#1998) the target branch's HEAD commit
-        timestamp, for every pending entry, and atomically publishes a new
-        snapshot.  Per-entry failures degrade that entry to the fail-open
-        values; they never abort the pass or unpublish other entries' data.
+        branch's patch-id, (#1998) the target branch's HEAD commit
+        timestamp, and (#3216) the live GitHub-Deployment preview URL for
+        any pending entry whose repo has ``uat_live_preview`` set and no
+        ``uat_preview`` override, for every pending entry, and atomically
+        publishes a new snapshot.  Per-entry failures degrade that entry to
+        the fail-open values; they never abort the pass or unpublish other
+        entries' data.
 
         Cost note (#1640): the SHA sweep adds up to two ``gh api
         repos/…/branches/…`` calls and one ``gh api compare`` per pending
@@ -322,6 +354,7 @@ class GateSnapshotRefresher:
         branch_shas: dict[tuple[str, str], str | None] = {}
         branch_patch_ids: dict[tuple[str, str, str], str | None] = {}
         branch_commit_timestamps: dict[tuple[str, str], float | None] = {}
+        deployment_urls: dict[tuple[str, str], str | None] = {}
         workflows_declared: dict[str, bool] = {}
         for entry in pending:
             # Branch HEAD + merge-base HEAD + the branch's patch-id against
@@ -365,6 +398,36 @@ class GateSnapshotRefresher:
                     branch_patch_ids[pid_key] = github_ops.get_branch_patch_id(*pid_key)
                 except Exception:  # noqa: BLE001 — fail-open for this entry
                     branch_patch_ids[pid_key] = None
+            # #3216: the live GitHub-Deployment preview URL — but ONLY for an
+            # entry whose repo actually needs it: `uat_preview` (the
+            # override template) always wins over the live lookup (see
+            # `merge_queue._resolve_uat_preview_url`'s resolution order), so
+            # a repo that sets it never reaches GitHub here; a repo with
+            # neither `uat_preview` nor `uat_live_preview` set never blocks
+            # on the UAT gate at all (`merge_queue.requires_uat`) and has no
+            # use for this lookup either. That keeps the extra `gh api`
+            # call bounded exactly like the SHA/patch-id sweep above — at
+            # most one per distinct (repo, branch) pending entry actually
+            # opted into the live lookup, not one per pending entry overall
+            # — which matters on a fleet already GitHub-throttle-sensitive
+            # (#2989/#2988).
+            dep_repo, dep_branch = entry.repo_github, entry.branch
+            if dep_repo and dep_branch and (dep_repo, dep_branch) not in deployment_urls:
+                try:
+                    repo_cfg = config.repo(entry.repo_name)
+                except Exception:  # noqa: BLE001 — unknown repo: nothing to look up
+                    repo_cfg = None
+                if (
+                    repo_cfg is not None
+                    and not repo_cfg.uat_preview
+                    and getattr(repo_cfg, "uat_live_preview", False)
+                ):
+                    try:
+                        deployment_urls[(dep_repo, dep_branch)] = (
+                            github_ops.get_pr_deployment_url(dep_repo, dep_branch)
+                        )
+                    except Exception:  # noqa: BLE001 — fail-open for this branch
+                        deployment_urls[(dep_repo, dep_branch)] = None
 
         for entry in entries:
             key = (entry.repo_github, int(entry.pr_number))
@@ -424,6 +487,7 @@ class GateSnapshotRefresher:
             branch_shas=branch_shas,
             branch_patch_ids=branch_patch_ids,
             branch_commit_timestamps=branch_commit_timestamps,
+            deployment_urls=deployment_urls,
             workflows_declared=workflows_declared,
             ci_available=ci_available,
             refreshed_at=time.time(),
