@@ -99,13 +99,44 @@ def no_network(monkeypatch):
     (`laptop.tailnet`/`server.tailnet`) that don't exist, so without this
     every test below would pay a real (if fast-failing) ssh attempt per
     machine.  Tests that actually exercise the seam override it back.
+
+    #3219 test-fix: `_fetch_board` seals the CLI's OWN `/board` read — but
+    `rv.gather` opens a SECOND, independent one to name the daemon's lane
+    (`release_verify._default_board_fetch`), and that one defaults to
+    `http://127.0.0.1:7435`: the LIVE `coord-serve` on whatever machine is
+    running pytest.  On a fleet host it answers, so `_scope_gate` printed a
+    real advisory (`coord-serve process (daemon): on 0.5.421, expected
+    0.4.111`) onto the run's stderr, and every assertion in this module
+    that read the merged stream flipped with the fleet's live version —
+    green on a laptop with no daemon, red on a fleet host.  Same board,
+    same question, so it is sealed here too rather than left as a second
+    unsealed answer.
     """
+    from coord import network  # noqa: PLC0415 — import cycle at module scope
+    from coord import release_verify as rv  # noqa: PLC0415
+
     monkeypatch.setattr(release_cmd, "_fetch_board", lambda: ({}, None))
     monkeypatch.setattr(
         release_cmd, "_post",
         lambda *a, **k: pytest.fail("no test should POST without saying so"),
     )
     monkeypatch.setattr(release_cmd, "_interactive_session_busy", lambda config: [])
+    monkeypatch.setattr(rv, "_default_board_fetch", lambda: {})
+    # ...and the per-host `/health` sweep `rv.gather` runs alongside it: this
+    # docstring promises no per-host HTTP, but `laptop.tailnet` /
+    # `server.tailnet` were being resolved for real on every test here. Pin
+    # the exact DNS-failure status those names produce on a host that cannot
+    # resolve them, so a name that DOES resolve somewhere cannot change what
+    # this module observes either. (`_stub_verify` replaces `rv.gather`
+    # wholesale and is unaffected; this covers the tests that don't.)
+    monkeypatch.setattr(
+        network, "check_machine",
+        lambda machine, timeout=None: network.MachineStatus(
+            machine=machine,
+            state=network.DNS_ERROR,
+            reason="hostname not resolvable (Tailscale up?)",
+        ),
+    )
 
 
 def _records(state_dir):
@@ -334,8 +365,8 @@ def test_history_json_is_machine_readable(valid_config_path, state_dir, no_netwo
         ["release", "propagate", "--config", str(valid_config_path),
          "--target", "0.4.111"],
     )
-    result = CliRunner().invoke(main, ["release", "history", "--json"])
-    payload = json.loads(result.output)
+    result = _stdout_only_runner().invoke(main, ["release", "history", "--json"])
+    payload = json.loads(result.stdout)
     assert payload[0]["status"] == rp.STATUS_DEFERRED
 
 
@@ -343,14 +374,89 @@ def test_propagate_json_output_is_the_record(valid_config_path, state_dir, no_ne
                                              monkeypatch):
     monkeypatch.setattr(release_cmd, "_fetch_board",
                         lambda: ({}, "ConnectError: refused"))
-    result = CliRunner().invoke(
+    # #3219 test-fix: `result.stdout`, via the same `_stdout_only_runner`
+    # the `--drain --json` tests below already use — NOT the merged
+    # `result.output` (`CliRunner()` defaults to `mix_stderr=True` on click
+    # 8.1). A `--json` run's contract is "the record on stdout, diagnostics
+    # on stderr", so asserting against the merged stream made this test
+    # fail on any run that legitimately printed a diagnostic — which
+    # `_scope_gate`'s advisory does. That was a defect in the assertion,
+    # not in the command. One question, one answer.
+    result = _stdout_only_runner().invoke(
         main,
         ["release", "propagate", "--config", str(valid_config_path),
          "--target", "0.4.111", "--json"],
     )
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["target_version"] == "0.4.111"
     assert payload["status"] == rp.STATUS_DEFERRED
+
+
+def test_a_live_daemon_advisory_does_not_corrupt_the_json_record(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The 2026-09-09 failure, pinned so it cannot come back silently.
+
+    `rv.gather`'s own `/board` read reached the LIVE `coord-serve` on the
+    machine running pytest, which was on 0.5.421 while this run's
+    `--target` is 0.4.111. Nothing this run attempted names the
+    `coord-serve process (daemon)` lane, so `scope_verification` scores
+    that CRIT as ADVISORY and `_scope_gate` prints it — correctly, as a
+    diagnostic, on stderr. The bug was reading the merged stream.
+
+    This drives that exact shape deliberately (overriding `no_network`'s
+    seal, per its docstring) and asserts BOTH halves: that the advisory is
+    really reached — without which the test would pass on an empty report
+    and prove nothing — and that stdout still carries exactly one JSON
+    document.
+    """
+    from coord import release_verify as rv  # noqa: PLC0415
+
+    monkeypatch.setattr(release_cmd, "_fetch_board",
+                        lambda: ({}, "ConnectError: refused"))
+    monkeypatch.setattr(
+        rv, "_default_board_fetch",
+        lambda: {
+            "fleet_health": {
+                "fleet_checks": [
+                    {
+                        "check_id": "fleet_deploy_lanes",
+                        "values": {"lanes": {rv.DAEMON_SERVE_LANE: "0.5.421"}},
+                    }
+                ]
+            }
+        },
+    )
+    result = _stdout_only_runner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    # The advisory is REACHED — otherwise this proves nothing — and lands
+    # on stderr, where a diagnostic belongs, not on stdout.
+    assert "advisory [crit]" in result.stderr, result.stderr
+    assert "0.5.421" in result.stderr, result.stderr
+    # `json.loads` raises on trailing data, so this alone proves stdout
+    # carried the record and nothing else.
+    payload = json.loads(result.stdout)
+    assert payload["status"] == rp.STATUS_DEFERRED
+    assert payload["target_version"] == "0.4.111"
+    # ...and the advisory reached the machine-readable record too, not just
+    # the human-readable stderr line.
+    assert [f["severity"] for f in payload["gate"]["advisory"]] == ["crit"], payload["gate"]
+
+    # The merged stream — what this test's predecessor asserted against —
+    # is exactly what the diagnostic corrupts. Pinned here so the reason
+    # for `_stdout_only_runner` above is not just a comment: if someone
+    # "simplifies" it back to `CliRunner()`, this line says why not.
+    merged = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--json"],
+    )
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(merged.output)
 
 
 # ── a fired deploy gate is a window, not a blocker ───────────────────────
