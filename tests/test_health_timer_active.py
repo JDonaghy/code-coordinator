@@ -14,6 +14,7 @@ did, which is the failure this module closes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,90 @@ def test_timer_states_parses_a_wedged_systemctl_gracefully(monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", _boom)
     assert ta._timer_states(("x.timer",)) == {}
+
+
+# ── #3219: masked-by-policy sentinel ──────────────────────────────────────
+
+
+def test_masked_timer_with_no_sentinel_entry_is_not_suppressed(tmp_path, monkeypatch) -> None:
+    """#3219: absence of a sentinel entry must not read as "suppressed" —
+    the sentinel is the signal, not the masked state itself."""
+    packaged = _make_deploy_dir(tmp_path, {"coord-release-propagate.timer": TIMER_TEXT})
+    use_packaged(monkeypatch, packaged)
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True)
+    (installed_dir / "coord-release-propagate.timer").write_text(TIMER_TEXT)
+
+    monkeypatch.setattr(
+        ta, "_timer_states",
+        lambda units: {
+            "coord-release-propagate.timer": {
+                "Id": "coord-release-propagate.timer",
+                "UnitFileState": "masked",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            }
+        },
+    )
+    results = ta.probe_timer_active(make_ctx(tmp_path))
+    assert len(results) == 1
+    r = results[0]
+    assert r.severity is Severity.CRIT
+    assert r.values["suppressed"] is False
+    assert r.values["suppress_reason"] is None
+    assert r.values["suppress_set"] is None
+
+
+def test_masked_timer_covered_by_the_watchdog_suppress_sentinel_is_flagged(
+    tmp_path, monkeypatch
+) -> None:
+    """#3219 (follow-up to #3049): a timer masked on purpose — covered by
+    the same ``watchdog-suppress.json`` sentinel the fleet watchdog and
+    `unit_drift` already honour — still reports the honest CRIT (severity
+    is this probe's call, not a policy layer's), but surfaces the
+    sentinel's reason/set date in ``values`` so a policy-aware consumer
+    (`coord release verify`, #3049) can render it as masked-by-policy
+    instead of an unclearable fault."""
+    packaged = _make_deploy_dir(tmp_path, {"coord-release-propagate.timer": TIMER_TEXT})
+    use_packaged(monkeypatch, packaged)
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True)
+    (installed_dir / "coord-release-propagate.timer").write_text(TIMER_TEXT)
+
+    monkeypatch.setattr(
+        ta, "_timer_states",
+        lambda units: {
+            "coord-release-propagate.timer": {
+                "Id": "coord-release-propagate.timer",
+                "UnitFileState": "masked",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            }
+        },
+    )
+
+    coord_dir = tmp_path / ".coord"
+    coord_dir.mkdir()
+    (coord_dir / "watchdog-suppress.json").write_text(
+        json.dumps(
+            {
+                "coord-release-propagate.timer": {
+                    "reason": "manual release rolls by choice -- masked, not broken",
+                    "set": "2026-08-26",
+                    "expires": None,
+                }
+            }
+        )
+    )
+
+    results = ta.probe_timer_active(make_ctx(tmp_path, coord_dir=coord_dir))
+    assert len(results) == 1
+    r = results[0]
+    # Still the honest CRIT — this probe has no policy context of its own.
+    assert r.severity is Severity.CRIT
+    assert r.values["suppressed"] is True
+    assert r.values["suppress_reason"] == "manual release rolls by choice -- masked, not broken"
+    assert r.values["suppress_set"] == "2026-08-26"
 
 
 def test_probe_is_registered_in_the_machine_scope_registry() -> None:

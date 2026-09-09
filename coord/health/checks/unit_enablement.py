@@ -29,6 +29,23 @@ lanes. An *installed* one that the manifest expects and that
 `systemctl --user is-enabled` reports as anything other than enabled is
 exactly the state that hid the propagate timer.
 
+#3219 — a masked unit is not a disabled one
+----------------------------------------------
+`systemctl --user mask` leaves `is-enabled` reporting `masked` — one of the
+"anything other than enabled" states this probe exists to catch, so a unit
+masked on purpose (#3049's manual-release-rolls case, same one
+:mod:`coord.health.checks.unit_drift` and
+:mod:`coord.health.checks.timer_active` document) reads identically here to
+one nobody ever enabled. This probe still reports the honest WARN — from
+this probe's narrow view a manifest-required unit not running is a real
+fact, and deciding whether that's wanted is policy it has no context for —
+but, mirroring `unit_drift`, it also checks the SAME sentinel the watchdog
+already honours (`~/.coord/watchdog-suppress.json`, #2580) and publishes the
+verdict in `values["suppressed"]` (plus `"suppress_reason"`/
+`"suppress_set"`), so a policy-aware consumer (`coord release verify`,
+#3049) can render "masked by policy" instead of surfacing an unclearable
+finding.
+
 #3128 — a host that never installed the unit at all
 ------------------------------------------------------
 The boundary above has a blind spot: it can only judge units a host has
@@ -66,7 +83,7 @@ from coord.health.checks.unit_drift import (
     resolve_systemd_user_dir,
 )
 from coord.health.models import CheckResult, HealthContext, Severity
-from coord.health.registry import check
+from coord.health.registry import check, is_suppressed, load_suppressions
 
 # `systemctl --user is-enabled` states that mean "this will run". `static`
 # is deliberately excluded: every manifest unit ships an `[Install]`
@@ -253,8 +270,31 @@ def probe_unit_enablement(ctx: HealthContext) -> list[CheckResult]:
     required: set[str] = set(units_for_role(declaration.role)) if declaration.declared else set()
     reference = resolve_reference(ctx) if required else None
 
+    # #3219: same sentinel unit_drift/timer_active already read (#3049,
+    # ~/.coord/watchdog-suppress.json) — a unit masked on purpose reports
+    # `is-enabled` as `masked`, indistinguishable here from one nobody ever
+    # enabled. `values["suppressed"]` is published for every result below
+    # regardless of severity, mirroring unit_drift's convention, so a
+    # policy-aware consumer can tell the two apart without this probe
+    # guessing at policy itself.
+    suppressions = load_suppressions(ctx.coord_dir)
+
     for name in all_manifest_units():
         installed_path = installed_dir / name
+        # Bare unit name first, matching the key fleet_watchdog's own
+        # checks already suppress under (`suppress_keys=(unit,)`) — an
+        # operator who suppressed this unit for the watchdog does not
+        # maintain a second key for this probe. `unit_enablement:<name>` is
+        # also accepted for symmetry with unit_drift's `unit_drift:<name>`.
+        suppressed, entry = is_suppressed(
+            suppressions, (name, f"unit_enablement:{name}"), now=ctx.now
+        )
+        suppress_values = {
+            "suppressed": suppressed,
+            "suppress_reason": (entry or {}).get("reason") if suppressed else None,
+            "suppress_set": (entry or {}).get("set") if suppressed else None,
+        }
+
         if not installed_path.exists():
             if name in required:
                 results.append(
@@ -279,6 +319,7 @@ def probe_unit_enablement(ctx: HealthContext) -> list[CheckResult]:
                             "state": None,
                             "role": declaration.role,
                             "required": True,
+                            **suppress_values,
                         },
                     )
                 )
@@ -290,7 +331,11 @@ def probe_unit_enablement(ctx: HealthContext) -> list[CheckResult]:
             continue
 
         state, error = _is_enabled(name)
-        values: dict = {"installed_path": str(installed_path), "state": state}
+        values: dict = {
+            "installed_path": str(installed_path),
+            "state": state,
+            **suppress_values,
+        }
 
         if error:
             results.append(
