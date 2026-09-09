@@ -1760,6 +1760,7 @@ def build_review_briefing(
     commit_messages: list[str] | None = None,
     gate_a_exempt_warning: str | None = None,
     exempt_dependency_warnings: list[str] | None = None,
+    oracle_contract_note: str | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -1875,6 +1876,20 @@ def build_review_briefing(
     milestone with a signed contract can be the right call, this only makes
     sure the reviewer is not the last human interposed in the loop.
 
+    *oracle_contract_note* (#3212 "Related mitigation") is the pre-computed
+    :func:`coord.acceptance.fetch_oracle_loop_contract_note` text for this
+    issue — the reviewer's copy of the same "read the Gate-A contract/mocks,
+    not just the diff" pointer :func:`coord.acceptance.oracle_loop_contract_block`
+    already gives the worker. ``None``/empty when the issue has neither an
+    authored acceptance slice nor an exemption naming it, or the fetch
+    failed. Before this, the reviewer was never shown the mocks under any
+    circumstance — the exact gap the format-converter ms-1 incident
+    describes ("a reviewer asked 'does this match the approved screen?'
+    would likely have caught it; a reviewer asked 'is this good code?' had
+    no reason to"). Rendered prominently, right after the issue body, since
+    it changes what "correct" means for the whole review — not an advisory
+    footnote like the two blocks above.
+
     *exempt_dependency_warnings* (#3212) is the pre-computed
     :func:`coord.acceptance.fetch_exempt_dependency_warnings` list for this
     issue's milestone — one entry per ``exempt:`` entry whose justification
@@ -1920,6 +1935,16 @@ def build_review_briefing(
         lines.append("")
         lines.append(issue_body.strip())
     lines.append("")
+
+    if oracle_contract_note:
+        # #3212 "Related mitigation": the same contract/mocks pointer the
+        # worker gets, given to the reviewer too — placed right after the
+        # issue, before the generic checklist/diff, since it reframes what
+        # "correct" means for everything that follows.
+        lines.append("## 🔒 Oracle-loop acceptance contract — read before judging correctness (#3212)")
+        lines.append("")
+        lines.append(oracle_contract_note)
+        lines.append("")
 
     if repo_claude_md:
         lines.append("## Project rules (from CLAUDE.md)")
@@ -2450,6 +2475,30 @@ def _fetch_exempt_dependency_warnings(
     )
 
 
+def _fetch_oracle_loop_contract_note(
+    repo: Repo,
+    config: Config,
+    milestone_number: int | None,
+    issue_number: int,
+    *,
+    file_fetcher=None,
+) -> str | None:
+    """(#3212 "Related mitigation") Thin wrapper over
+    :func:`coord.acceptance.fetch_oracle_loop_contract_note` — sibling to
+    :func:`_fetch_gate_a_exempt_warning` / :func:`_fetch_exempt_dependency_warnings`
+    immediately above, same "keep a module-level name here so a test can
+    stub it without reaching into ``coord.acceptance``" rationale, and same
+    discipline: this is the only place :func:`build_review_briefing`'s
+    *oracle_contract_note* input gets computed, never re-derived at the call
+    site.
+    """
+    from coord.acceptance import fetch_oracle_loop_contract_note  # noqa: PLC0415
+
+    return fetch_oracle_loop_contract_note(
+        config, repo, milestone_number, issue_number, file_fetcher=file_fetcher,
+    )
+
+
 def open_pr_for_completed_work(
     completed: Assignment,
     config: Config,
@@ -2836,10 +2885,14 @@ def dispatch_review(
 
     *gate_a_manifest_fetcher* is an optional ``(repo_github: str, path: str,
     branch: str) -> str`` callable (#3202), the ``file_fetcher`` passed
-    through to :func:`_fetch_gate_a_exempt_warning`. Defaults to
-    :func:`coord.github_ops.get_repo_file`; inject a stub in tests so this
-    advisory lookup never shells out to a live ``gh``. Entirely fail-open —
-    see that function's docstring.
+    through to :func:`_fetch_gate_a_exempt_warning` — and, since #3212, also
+    to :func:`_fetch_exempt_dependency_warnings` and
+    :func:`_fetch_oracle_loop_contract_note`: all three read the same
+    milestone manifest shape off the same branch, so one injected stub
+    covers every caller rather than three independent ones drifting apart.
+    Defaults to :func:`coord.github_ops.get_repo_file`; inject a stub in
+    tests so this advisory lookup never shells out to a live ``gh``.
+    Entirely fail-open — see that function's docstring.
 
     *exempt_dependency_issue_is_closed_fetcher* is an optional
     ``(repo_github: str, issue_number: int) -> bool`` callable (#3212), the
@@ -3387,6 +3440,18 @@ def dispatch_review(
         except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
             exempt_dependency_warnings_text = None
 
+        # #3212 "Related mitigation": the reviewer's own copy of the same
+        # Gate-A contract/mocks pointer the worker's briefing gets (#945) —
+        # the format-converter ms-1 incident's root cause was never showing
+        # this to EITHER of them, exempted or not.
+        try:
+            oracle_contract_note_text = _fetch_oracle_loop_contract_note(
+                repo, config, _gate_a_milestone_number, completed.issue_number,
+                file_fetcher=gate_a_manifest_fetcher,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+            oracle_contract_note_text = None
+
         # #3180: short-circuit BEFORE spending a review leg. `build_review_
         # briefing` below would compute this exact same check purely to
         # decide which paragraph to print in the reviewer's prompt — the
@@ -3493,6 +3558,7 @@ def dispatch_review(
                 commit_messages=commit_messages,
                 gate_a_exempt_warning=gate_a_exempt_warning_text,
                 exempt_dependency_warnings=exempt_dependency_warnings_text,
+                oracle_contract_note=oracle_contract_note_text,
             )
 
             payload = {

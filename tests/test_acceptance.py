@@ -32,6 +32,7 @@ from coord.acceptance import (
     failure_summary,
     fetch_exempt_dependency_warnings,
     fetch_gate_a_exempt_warning,
+    fetch_oracle_loop_contract_note,
     find_ms_manifest_for_issue_via_api,
     gate_a_contract_candidates,
     gate_a_contract_path,
@@ -44,8 +45,10 @@ from coord.acceptance import (
     manifest_exempt_generated_comment,
     merge_manifest_data,
     missing_expected_red_warning,
+    ms_dir_for_exempt_issue,
     ms_dir_for_issue,
     oracle_loop_contract_block,
+    oracle_loop_contract_reviewer_note,
     parse_manifest_text,
     resolve_for_path,
     search_roots_for_repo,
@@ -1424,6 +1427,207 @@ class TestOracleLoopContractBlock:
         assert "`tests/acceptance/" not in block
 
 
+class TestMsDirForExemptIssue:
+    """#3212: sibling to ms_dir_for_issue, but for an issue named in a
+    manifest's `exempt:` list rather than one with a test mapping."""
+
+    def test_none_when_no_manifest_exempts_it(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        assert ms_dir_for_exempt_issue(root, 6) is None
+
+    def test_none_when_issue_has_a_slice_but_is_not_exempted(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms25").mkdir(parents=True)
+        (root / "ms25" / "manifest.yml").write_text("tests:\n  ms25::a: 945\n")
+        assert ms_dir_for_exempt_issue(root, 945) is None
+
+    def test_finds_the_owning_dir_for_a_plain_exempt_entry(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text(
+            "exempt:\n  - 6  # One-page UI — covered by the harness #2 stands up\n"
+        )
+        assert ms_dir_for_exempt_issue(root, 6) == "ms1"
+
+    def test_finds_the_owning_dir_for_a_declared_exempt_entry(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text(
+            "exempt:\n  - {issue: 6, covered_by: 2, artifact: \"tests/**/*.spec.ts\"}\n"
+        )
+        assert ms_dir_for_exempt_issue(root, 6) == "ms1"
+
+    def test_none_on_malformed_manifest(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text("exempt: [not, a, list, of, ints\n")
+        assert ms_dir_for_exempt_issue(root, 6) is None
+
+
+class TestOracleLoopContractBlockForExemptedIssue:
+    """#3212 blocking finding: an exemption must not suppress the worker's
+    design-contract pointer — before this, an exempted issue's worker
+    briefing carried the exact same "" oracle_loop_contract_block returns
+    for an issue whose slice hasn't been authored at all, indistinguishable
+    from "nothing to point at". A milestone can still carry a signed Gate-A
+    contract/mocks even for an issue whose OWN acceptance slice is waived."""
+
+    def test_empty_when_issue_is_neither_sliced_nor_exempted(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text("exempt: [7]\n")
+        assert oracle_loop_contract_block(root, "format-converter", 6) == ""
+
+    def test_exempted_issue_still_gets_a_block(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text(
+            "exempt:\n  - 6  # One-page UI — covered by the harness #2 stands up\n"
+        )
+        block = oracle_loop_contract_block(root, "format-converter", 6)
+        assert block != ""
+        assert block.startswith("## 🔒 Oracle-loop acceptance contract")
+        assert "exempted" in block
+        assert "tests/acceptance/ms1/contract.md" in block
+        assert "tests/acceptance/ms1/mocks/" in block
+        # Still forbidden to touch the sealed tree, even though this
+        # issue's own slice is exempt from it.
+        assert "tests/acceptance/**" in block
+        # No per-issue `coord acceptance run` instruction — there is no
+        # slice of this issue's own to run.
+        assert "coord acceptance run --repo format-converter --issue 6" not in block
+
+    def test_slice_takes_priority_over_a_stray_exempt_entry(self, tmp_path: Path) -> None:
+        """An issue that has BOTH an authored slice and (by authoring
+        mistake) an exempt entry gets the normal authored-slice block, not
+        the exempted-issue variant — ms_dir_for_issue is checked first."""
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text(
+            "tests:\n  ms1::a: 6\nexempt: [6]\n"
+        )
+        block = oracle_loop_contract_block(root, "format-converter", 6)
+        assert "exempted" not in block
+        assert "coord acceptance run --repo format-converter --issue 6" in block
+
+    def test_empty_on_malformed_manifest(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms1").mkdir(parents=True)
+        (root / "ms1" / "manifest.yml").write_text("exempt: [not, a, list, of, ints\n")
+        assert oracle_loop_contract_block(root, "format-converter", 6) == ""
+
+
+class TestOracleLoopContractReviewerNote:
+    """#3212 "Related mitigation": the reviewer-facing rendering — same
+    contract/mocks pointer as the worker's block, worded for judging
+    correctness rather than avoiding a sealed-path edit."""
+
+    def test_non_exempt_note(self) -> None:
+        note = oracle_loop_contract_reviewer_note(
+            contract_path="tests/acceptance/ms-1/contract.md",
+            mocks_dir="tests/acceptance/ms-1/mocks",
+            exempt=False,
+        )
+        assert "tests/acceptance/ms-1/contract.md" in note
+        assert "tests/acceptance/ms-1/mocks/" in note
+        assert "exempted" not in note
+
+    def test_exempt_note_names_the_uat_risk(self) -> None:
+        note = oracle_loop_contract_reviewer_note(
+            contract_path="tests/acceptance/ms-1/contract.md",
+            mocks_dir="tests/acceptance/ms-1/mocks",
+            exempt=True,
+        )
+        assert "exempted" in note
+        assert "UAT" in note
+
+
+class TestFetchOracleLoopContractNote:
+    """#3212 "Related mitigation": fetch_oracle_loop_contract_note is the
+    reviewer-briefing-facing fetch-and-detect seam, fail-open like the
+    #3202 machinery it sits alongside."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self, *, has_driver: bool = True) -> Config:
+        drivers = (
+            {"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            if has_driver else {}
+        )
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_none_when_repo_has_no_driver(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(has_driver=False), self._repo(), 5, 6, file_fetcher=refuse,
+        )
+        assert result is None
+
+    def test_none_when_milestone_number_is_none(self) -> None:
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(), self._repo(), None, 6, file_fetcher=refuse,
+        )
+        assert result is None
+
+    def test_none_when_no_manifest_found_at_all(self) -> None:
+        def fetch(repo_github, path, branch):
+            raise RuntimeError("404")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(), self._repo(), 5, 6, file_fetcher=fetch,
+        )
+        assert result is None
+
+    def test_none_when_issue_neither_sliced_nor_exempted(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms5::a: 999\n"
+            raise RuntimeError("404")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(), self._repo(), 5, 6, file_fetcher=fetch,
+        )
+        assert result is None
+
+    def test_note_for_an_authored_slice(self) -> None:
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms5::a: 6\n"
+            raise RuntimeError("404")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(), self._repo(), 5, 6, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "tests/acceptance/ms-5/contract.md" in result
+        assert "exempted" not in result
+
+    def test_note_for_an_exempted_issue(self) -> None:
+        """The exact format-converter ms-1 shape: #6 named in `exempt:`,
+        never in `tests:`."""
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt:\n  - 6  # covered by the harness #2 stands up\n"
+            raise RuntimeError("404")
+
+        result = fetch_oracle_loop_contract_note(
+            self._config(), self._repo(), 1, 6, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "tests/acceptance/ms-1/contract.md" in result
+        assert "exempted" in result
+
+
 class TestGateAContractCandidates:
     """#2896: a bare milestone number doesn't say which acceptance search
     root its contract lives under — gate_a_contract_candidates tries every
@@ -2119,6 +2323,97 @@ class TestBuildReviewBriefingExemptDependencyWarnings:
         assert "## An acceptance exemption's promise is unmet (#3212)" in briefing
         assert warning_text in briefing
         assert "Not a blocking finding on its own" in briefing
+
+
+class TestBuildReviewBriefingOracleContractNote:
+    """#3212 "Related mitigation": the reviewer's briefing renders the same
+    Gate-A contract/mocks pointer the worker gets — placed right after the
+    issue body, since (unlike the two advisory sections above) it reframes
+    what "correct" means for the whole review rather than reporting a
+    side-fact."""
+
+    def _briefing(self, **kwargs) -> str:
+        from coord.config import ReviewsConfig
+        from coord.review import build_review_briefing
+
+        base = dict(
+            pr_number=1,
+            pr_url="https://example.test/pr/1",
+            repo_github="acme/api",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Some issue",
+            issue_body="body",
+            branch="issue-42-x",
+            worker_machine="laptop",
+            same_as_worker=False,
+            reviews_cfg=ReviewsConfig(),
+            repo_claude_md=None,
+        )
+        base.update(kwargs)
+        return build_review_briefing(**base)
+
+    def test_no_section_when_note_is_none(self) -> None:
+        briefing = self._briefing(oracle_contract_note=None)
+        assert "3212" not in briefing
+
+    def test_section_rendered_when_note_given(self) -> None:
+        note_text = (
+            "Before judging correctness, read `tests/acceptance/ms-1/"
+            "contract.md` ..."
+        )
+        briefing = self._briefing(oracle_contract_note=note_text)
+        assert (
+            "## 🔒 Oracle-loop acceptance contract — read before judging "
+            "correctness (#3212)" in briefing
+        )
+        assert note_text in briefing
+        # Placed right after the issue, before the checklist/diff.
+        assert briefing.index(note_text) < briefing.index("## Review checklist")
+
+
+class TestFetchOracleLoopContractNoteWrapper:
+    """#3212: ``coord.review._fetch_oracle_loop_contract_note`` — sibling to
+    ``TestFetchGateAExemptWarning`` below, the thin wrapper over
+    :func:`coord.acceptance.fetch_oracle_loop_contract_note`."""
+
+    def _repo(self) -> Repo:
+        return Repo(name="api", github="acme/api", default_branch="main")
+
+    def _config(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")},
+            ),
+        )
+
+    def test_none_when_milestone_number_is_none(self) -> None:
+        from coord.review import _fetch_oracle_loop_contract_note
+
+        def refuse(*_a, **_k):
+            raise AssertionError("should not fetch")
+
+        result = _fetch_oracle_loop_contract_note(
+            self._repo(), self._config(), None, 6, file_fetcher=refuse,
+        )
+        assert result is None
+
+    def test_delegates_to_acceptance_module(self) -> None:
+        from coord.review import _fetch_oracle_loop_contract_note
+
+        def fetch(repo_github, path, branch):
+            if path.endswith("manifest.yml"):
+                return "exempt:\n  - 6  # covered by the harness #2 stands up\n"
+            raise RuntimeError("404")
+
+        result = _fetch_oracle_loop_contract_note(
+            self._repo(), self._config(), 1, 6, file_fetcher=fetch,
+        )
+        assert result is not None
+        assert "tests/acceptance/ms-1/contract.md" in result
+        assert "exempted" in result
 
 
 class TestFetchGateAExemptWarning:

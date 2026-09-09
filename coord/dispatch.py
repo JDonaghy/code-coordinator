@@ -756,8 +756,12 @@ def dispatch(
     # acceptance driver configured (the oracle-loop proxy — #944 never landed
     # a milestone-level flag, so "driver configured for this repo" is the
     # signal, mirroring the tests/acceptance/ auto-seal above) AND this issue
-    # already has an authored slice (oracle_loop_contract_block returns ""
-    # otherwise, e.g. before Gate A/#931 has run for it).
+    # already has an authored slice, OR (#3212) is exempted from one —
+    # oracle_loop_contract_block covers both and returns "" only when neither
+    # applies (e.g. before Gate A/#931 has run for it at all). An exemption
+    # waives the automated gate, not the design contract the milestone's
+    # mocks define, so the worker still needs the pointer — see
+    # oracle_loop_contract_block's docstring for the exempted-issue variant.
     briefing_text = proposal.briefing
     if proposal.type == "work" and proposal.issue_number:
         from pathlib import Path  # noqa: PLC0415
