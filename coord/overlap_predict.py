@@ -182,9 +182,55 @@ def _clean_path(token: str) -> str:
     # A repo path has a directory separator or an extension. "TODO" doesn't.
     if "/" not in text and "." not in text:
         return ""
-    if text in {".", "..", "/"}:
+    if text in {".", "..", "/"} or set(text) == {"."}:
         return ""
     return text
+
+
+# #3258: a label prefix inside a ## Files block that names one purpose.
+# `Touch:` declares files IN scope and is parsed exactly like an inline
+# `Files:` line (comma/whitespace-separated, so it also fixes "multiple paths
+# on one bullet" — the split just never ran on a bulleted line before).
+# `Forbidden:` declares files OUT of scope and must NEVER be read as a
+# declaration — recognised (so it doesn't look like prose and end the block)
+# but always yields zero paths.
+_LABEL_RE = re.compile(r"^\s*(touch|forbidden)\s*:\s*(.*)$", re.IGNORECASE)
+
+# #3258: a markdown table row — `| coord/foo.py | why |`. Only the first cell
+# is ever read as a path; a header (`| File | Why |`) or separator
+# (`|---|---|`) row yields no path (neither cell has a `/` or `.`) but is
+# still a RECOGNISED table line, so it doesn't end the block either.
+_TABLE_ROW_RE = re.compile(r"^\s{0,3}\|")
+
+
+def _table_cell(line: str) -> str:
+    """The first non-empty cell of a ``| a | b |``-shaped row, or ``""``."""
+    parts = [p.strip() for p in line.strip().strip("|").split("|")]
+    return parts[0] if parts else ""
+
+
+def _parse_entry(text: str) -> tuple[list[str], bool]:
+    """One bullet's or bare line's paths, plus whether the line was
+    RECOGNISED at all (as opposed to prose).
+
+    A recognised-but-empty line (``Forbidden: ...``) must not be mistaken for
+    prose by the caller — see the two ``collected``-gated branches in
+    :func:`parse_declared_files` for why that distinction is what lets
+    prose-before-the-first-entry (#3258 shape 1) be skipped instead of
+    ending the block, while prose AFTER a real entry still ends it exactly
+    as before.
+    """
+    label = _LABEL_RE.match(text)
+    if label is not None:
+        verb, rest = label.group(1).lower(), label.group(2)
+        if verb == "forbidden":
+            return [], True
+        paths = [p for p in (_clean_path(c) for c in re.split(r"[,\s]+", rest)) if p]
+        return paths, True
+    cleaned = _clean_path(text)
+    if cleaned:
+        return [cleaned], True
+    return [], False
 
 
 def parse_declared_files(body: str | None) -> list[str]:
@@ -224,9 +270,16 @@ def parse_declared_files(body: str | None) -> list[str]:
         take_inline((heading or inline).group(1))
         index += 1
         in_fence = False
-        # Consume the block: bullets, fenced lines and bare paths. Stop at the
-        # next heading or at the first line that is plainly prose, so a "##
-        # Files" section followed by a paragraph doesn't swallow the paragraph.
+        collected = False
+        # Consume the block: bullets, fenced lines, table rows and bare
+        # paths. Stop at the next heading, or at the first UNRECOGNISED
+        # (plainly prose) line — but only once something real has already
+        # been collected (#3258 shape 1): an explanatory sentence BETWEEN the
+        # heading and the actual list is skipped rather than ending the block
+        # before a single bullet is read. Prose AFTER a real entry still ends
+        # the block exactly as before — that asymmetry is what keeps a
+        # trailing paragraph from being swallowed (see the existing test for
+        # it).
         while index < len(lines):
             entry = lines[index]
             if _FENCE_RE.match(entry):
@@ -234,7 +287,10 @@ def parse_declared_files(body: str | None) -> list[str]:
                 index += 1
                 continue
             if in_fence:
-                take(_clean_path(entry))
+                cleaned = _clean_path(entry)
+                if cleaned:
+                    take(cleaned)
+                    collected = True
                 index += 1
                 continue
             if not entry.strip():
@@ -244,18 +300,79 @@ def parse_declared_files(body: str | None) -> list[str]:
                 break
             bullet = _BULLET_RE.match(entry)
             if bullet is not None:
-                cleaned = _clean_path(bullet.group(1))
-                if not cleaned:
+                paths, recognized = _parse_entry(bullet.group(1))
+                for path in paths:
+                    take(path)
+                if paths:
+                    collected = True
+                elif not recognized and collected:
                     break
-                take(cleaned)
                 index += 1
                 continue
-            cleaned = _clean_path(entry)
-            if not cleaned:
+            if _TABLE_ROW_RE.match(entry):
+                cleaned = _clean_path(_table_cell(entry))
+                if cleaned:
+                    take(cleaned)
+                    collected = True
+                index += 1
+                continue
+            paths, recognized = _parse_entry(entry)
+            for path in paths:
+                take(path)
+            if paths:
+                collected = True
+                index += 1
+                continue
+            if recognized:
+                # Recognised-but-empty (e.g. a bare `Forbidden: ...` line) —
+                # structural, not prose; keep scanning without ending the
+                # block.
+                index += 1
+                continue
+            if collected:
                 break
-            take(cleaned)
             index += 1
     return out
+
+
+def has_files_heading(body: str | None) -> bool:
+    """Whether *body* has a recognised ``## Files`` heading or inline
+    ``Files:`` declarator — independent of whether anything under it parses.
+
+    #3258: this is what lets :func:`malformed_files_warning` tell "no
+    declaration" (silence is correct — rule 3) apart from "a declaration was
+    attempted and nothing in it parsed" (silence was the bug). Keys off the
+    SAME two regexes :func:`parse_declared_files` starts a block on, so the
+    two can never disagree about what counts as an attempt.
+    """
+    try:
+        lines = str(body or "").splitlines()
+    except Exception:  # noqa: BLE001 — an unreadable body is just "no heading"
+        return False
+    return any(_HEADING_RE.match(line) or _INLINE_RE.match(line) for line in lines)
+
+
+def malformed_files_warning(body: str | None) -> str:
+    """#3258: the line `add` should print when a Files declaration was
+    attempted but parsed to zero paths.
+
+    Purely advisory — it never changes the ORDER (rule 1), the same posture
+    :func:`fanout_warnings` takes for a declaration that is too broad rather
+    than too malformed to carry any signal. Returns ``""`` both for the
+    common case (no heading at all — nothing to warn about) and the success
+    case (it parsed fine), so a caller can append the result unconditionally.
+    """
+    if parse_declared_files(body):
+        return ""
+    if not has_files_heading(body):
+        return ""
+    return (
+        "warning: this issue has a `## Files` heading but it parsed to zero "
+        "paths (#3258) — it will NOT be used to order this entry against "
+        "other in-flight work. Supported shapes: one path per bullet or "
+        "line, a `Touch:` (or `Forbidden:`) label per line, or a markdown "
+        "table with the path as the first column."
+    )
 
 
 # ── footprints ───────────────────────────────────────────────────────────────
