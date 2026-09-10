@@ -996,6 +996,122 @@ def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
     assert calls["purge"] == ("api", 42, "review")
 
 
+# ── #3223: review-reset must stop a live/headless leg BEFORE deleting its
+# row — never fire tmux-only, never delete a row it couldn't confirm dead ──
+
+
+def test_reset_review_stops_live_headless_leg_before_deleting_row(
+    monkeypatch, config
+) -> None:
+    """coord-tui#81: a headless review leg (`interactive=False`, the ordinary
+    auto-loop shape) wedged with `status='running'` must be CANCELLED on the
+    agent (`_kill_session`, which now has a non-tmux branch for exactly this
+    case — #3223) before its row is deleted. The session probed/killed must
+    be the review leg itself (`rv1`), never the work row it reviewed
+    (`w1`) — `w1` is long done and has no process to stop."""
+    calls = _stub(
+        monkeypatch,
+        session=lambda a: "live" if a.assignment_id == "rv1" else "dead",
+    )
+    delete_calls: list = []
+    monkeypatch.setattr(
+        "coord.state.delete_assignments_for_issue",
+        lambda repo, issue, *, types, review_of_assignment_id=None: delete_calls.append(
+            (repo, issue, types, review_of_assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr("coord.state.reset_work_review_state", lambda *a, **k: 1)
+    monkeypatch.setattr("coord.state.clear_issue_context_by_source", lambda *a, **k: 1)
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", lambda *a, **k: None)
+    monkeypatch.setattr("coord.state.count_review_rows_for_reset", lambda *a, **k: 0)
+
+    a = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    # The live session stopped was the review leg, not the reviewed work row.
+    assert calls["kill"] == ["rv1"]
+    assert delete_calls == [("api", 42, ("review",), "w1")]
+    assert res.reset_performed is True
+    assert any("stopped the live review session" in x for x in res.actions_taken)
+
+
+def test_reset_review_failed_stop_leaves_row_intact(monkeypatch, config) -> None:
+    """coord-tui#81 (the reported failure mode): when the stop cannot be
+    confirmed — `_kill_session` returns False, e.g. the agent is unreachable
+    or its own post-cancel status disagrees — the review row must NOT be
+    deleted. Deleting it anyway destroys the only handle `coord stop` has to
+    find the assignment by, turning a visible stall into an invisible orphan
+    that still holds a worker slot forever."""
+    calls = _stub(monkeypatch, session="live")
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: (
+        calls["kill"].append(a.assignment_id) or False
+    ))
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("must not delete/mutate rows when the stop failed")
+
+    monkeypatch.setattr("coord.state.delete_assignments_for_issue", _boom)
+    monkeypatch.setattr("coord.state.reset_work_review_state", _boom)
+    monkeypatch.setattr("coord.state.clear_issue_context_by_source", _boom)
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", _boom)
+
+    a = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert calls["kill"] == ["rv1"]
+    assert res.reset_performed is False
+    assert res.needs_reset is True
+    assert any(
+        "could not stop" in f and "rv1" in f and "coord stop" in f
+        for f in res.findings
+    )
+
+
+def test_kill_session_cancels_headless_leg_via_agent(monkeypatch, config) -> None:
+    """Unit-level #3223 regression on `_kill_session` itself: when tmux has
+    no session at all for the assignment (the headless shape), it must fall
+    through to the agent's own `POST /cancel/{id}` — the same seam `coord
+    stop` uses — rather than silently reporting success for a tmux kill
+    that targeted a session which never existed."""
+    from coord.network import CancelResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_running", lambda *a, **k: False)
+    seen: list = []
+
+    def _fake_cancel(machine, assignment_id, **kwargs):
+        seen.append((machine.name, assignment_id))
+        return CancelResult(ok=True, status="cancelled")
+
+    monkeypatch.setattr("coord.network.cancel_assignment", _fake_cancel)
+    a = _assign(aid="rv1", typ="review", status="running")
+
+    assert diagnose._kill_session(a, config) is True
+    assert seen == [("precision", "rv1")]
+
+
+def test_kill_session_headless_cancel_failure_is_not_swallowed(
+    monkeypatch, config
+) -> None:
+    """The headless branch must report False (not silently True) when the
+    agent's own cancel could not be confirmed — e.g. the agent is
+    unreachable, or its post-cancel status isn't 'cancelled'."""
+    from coord.network import CancelResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_running", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: CancelResult(
+            ok=False, error="connection error"
+        ),
+    )
+    a = _assign(aid="rv1", typ="review", status="running")
+
+    assert diagnose._kill_session(a, config) is False
+
+
 def _record(a: Assignment) -> None:
     """Insert a real DB row.  ``record_dispatched_assignment`` is a dispatch-time
     insert (status='running', no verdict columns), so the completed review

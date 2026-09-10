@@ -512,28 +512,84 @@ def _finalize_dead(assignment: "Assignment", config: "Config") -> str:
 
 
 def _kill_session(assignment: "Assignment", config: "Config") -> bool:
-    """``tmux kill-session`` for *assignment* (local or remote).  Used by reset
-    to stop a live session before finalizing.  Returns True when the kill ran."""
+    """Stop *assignment*'s live session, whichever shape it is, and confirm it
+    actually stopped.  Used by reset to stop a live session before
+    finalizing/deleting its row.
+
+    #3223: a tmux ``kill-session`` alone is blind to HEADLESS workers. A
+    headless assignment (``interactive=False`` — the ordinary shape of an
+    auto-loop review/work leg) is a plain ``claude -p`` subprocess spawned
+    directly by ``AgentServer.assign``; it never has a tmux session, so
+    ``tmux kill-session`` targets a session that never existed, silently
+    does nothing, and (pre-fix) still reported success. This now branches:
+    an interactive tmux pane is killed via tmux as before; anything else is
+    treated as headless and stopped through the agent's own
+    ``POST /cancel/{id}`` — the same seam ``coord stop`` uses (there is
+    exactly one way to ask "did this assignment get cancelled", not two
+    implementations that could disagree).
+
+    Returns True only when a fresh liveness re-probe, taken AFTER the stop
+    attempt, confirms the session is actually gone (#2096) — never from the
+    mere absence of an exception. Callers gating a destructive action (e.g.
+    deleting the only board row `coord stop` can find the assignment by)
+    must treat False as "did not stop, do not proceed."
+    """
     import subprocess  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
         TmuxHost,
         tmux_session_name,
+        tmux_session_running,
     )
 
     if not assignment.assignment_id:
         return False
     host = TmuxHost(ssh_target=_ssh_target_for(assignment, config))
     sname = tmux_session_name(assignment.assignment_id)
+
     try:
-        subprocess.run(
-            host.cmd(["kill-session", "-t", sname]),
-            capture_output=True,
-            timeout=20,
+        was_tmux_live = tmux_session_running(sname, host=host)
+    except Exception:  # noqa: BLE001 — probe error; fall through to the
+        # headless branch rather than claim a tmux session that may or may
+        # not exist — the agent cross-check below is the authoritative one
+        # for anything tmux can't positively confirm.
+        was_tmux_live = False
+
+    if was_tmux_live:
+        try:
+            subprocess.run(
+                host.cmd(["kill-session", "-t", sname]),
+                capture_output=True,
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; the re-probe below is the real verdict
+            log.warning("tmux kill-session failed for %s: %s", assignment.assignment_id, exc)
+        try:
+            return not tmux_session_running(sname, host=host)
+        except Exception as exc:  # noqa: BLE001 — can't confirm; don't claim success
+            log.warning(
+                "could not re-probe tmux session %s after kill: %s", sname, exc
+            )
+            return False
+
+    # No tmux session at all — the headless shape (#3223). The only seam
+    # that can reach it is the agent's own POST /cancel/{id}.
+    machine = _resolve_machine(config, assignment.machine_name)
+    if machine is None:
+        log.warning(
+            "cannot stop headless assignment %s: machine %r not in config",
+            assignment.assignment_id, assignment.machine_name,
         )
-        return True
-    except Exception:  # noqa: BLE001 — best-effort
         return False
+    from coord.network import cancel_assignment  # noqa: PLC0415
+
+    result = cancel_assignment(machine, assignment.assignment_id)
+    if not result.ok:
+        log.warning(
+            "agent cancel failed for headless assignment %s on %s: %s",
+            assignment.assignment_id, machine.name, result.error,
+        )
+    return result.ok
 
 
 def _reconcile_issue_merges(
@@ -1431,9 +1487,15 @@ def _do_reset(
             if latest.type == "review" and latest.review_of_assignment_id
             else latest.assignment_id
         )
+        # #3223: `latest` — NOT `target_id` — is the row whose SESSION might
+        # still be live. When `latest.type == "review"`, `target_id` is the FK
+        # to the (already-done) work row being reviewed; the live/wedged
+        # process, if any, is the review leg itself (`latest`). Threaded
+        # through separately so `_reset_review_stage` can stop the right
+        # session before touching any row.
         _reset_review_stage(
             config, repo_name, issue_number, res,
-            dry_run=dry_run, assignment_id=target_id,
+            dry_run=dry_run, assignment_id=target_id, live_assignment=latest,
         )
         return
     if stage == "test":
@@ -1448,7 +1510,10 @@ def _do_reset(
         res.needs_reset = True
         return
     if _session_state(latest, config) == "live" and _kill_session(latest, config):
-        res.actions_taken.append("stopped the live session (tmux kill-session)")
+        # #3223: `_kill_session` now covers both shapes — tmux for an
+        # interactive pane, agent `POST /cancel/{id}` for a headless leg —
+        # so the message no longer names a single mechanism.
+        res.actions_taken.append("stopped the live session")
     try:
         res.actions_taken.append(f"finalized session ({_finalize_dead(latest, config)})")
     except Exception as exc:  # noqa: BLE001 — fall back to a direct terminal mark
@@ -1463,7 +1528,7 @@ def _do_reset(
 
 def _reset_review_stage(
     config, repo_name: str, issue_number: int, res: DiagnoseResult, *,
-    dry_run: bool, assignment_id: str,
+    dry_run: bool, assignment_id: str, live_assignment: "Assignment",
 ) -> None:
     """Wipe a completed review so the stage returns to grey + re-reviewable:
     delete the ``type='review'`` rows, reset the work's ``review_state``, and
@@ -1479,21 +1544,61 @@ def _reset_review_stage(
     guards against. ``work``/``plan`` behavior is unchanged (still issue-wide,
     which is safe for those types).
 
-    Callers must resolve this themselves: the review stage's ``latest`` row can
-    be either the reviewed assignment (test-author/mock-author, no review
-    dispatched yet) or a ``type='review'`` row pointing at it via
-    ``review_of_assignment_id`` — the two cases need different resolution. See
-    ``_do_reset``.
+    ``live_assignment`` is a DIFFERENT id: it's the actual row whose SESSION
+    might still be running — the review leg itself when one was dispatched
+    (``latest.type == "review"``), or the same row as ``assignment_id`` for
+    the JIT test-author/mock-author case. See ``_do_reset``'s #3223 note.
+
+    Callers must resolve ``assignment_id`` themselves: the review stage's
+    ``latest`` row can be either the reviewed assignment (test-author/
+    mock-author, no review dispatched yet) or a ``type='review'`` row
+    pointing at it via ``review_of_assignment_id`` — the two cases need
+    different resolution. See ``_do_reset``.
+
+    #3223: before touching any row, stop ``live_assignment``'s session if it
+    might still be running — a headless review leg (``interactive=False``,
+    the ordinary auto-loop shape) is a plain agent subprocess with no tmux
+    session; the only way to reach it is the agent's own
+    ``POST /cancel/{id}`` (``_kill_session`` now covers this). Order matters:
+    cancel on the agent FIRST, then clear the board — reversing it destroys
+    the only handle ``coord stop`` has to find the assignment by, converting
+    a visible stall into an invisible orphan holding a worker slot forever.
+    When the stop can't be confirmed, this reports why and returns WITHOUT
+    deleting anything, leaving the row as the recovery handle it has to be.
     """
     from coord import state  # noqa: PLC0415
 
     if dry_run:
-        res.findings.append(
-            "(dry-run) would DELETE the review rows, reset work review_state → "
-            "pending, and purge #603 review notes (box → grey, re-reviewable)"
+        tail = (
+            "DELETE the review rows, reset work review_state → pending, "
+            "and purge #603 review notes (box → grey, re-reviewable)"
         )
+        if _session_state(live_assignment, config) != "dead":
+            msg = (
+                f"(dry-run) would first stop {live_assignment.assignment_id}'s "
+                f"live session, then {tail}"
+            )
+        else:
+            msg = f"(dry-run) would {tail}"
+        res.findings.append(msg)
         res.needs_reset = True
         return
+
+    if _session_state(live_assignment, config) != "dead":
+        if _kill_session(live_assignment, config):
+            res.actions_taken.append(
+                f"stopped the live review session ({live_assignment.assignment_id})"
+            )
+        else:
+            res.findings.append(
+                f"could not stop {live_assignment.assignment_id}'s session — "
+                "leaving the review row in place (it's the only handle "
+                "`coord stop` has); resolve manually, e.g. `coord stop "
+                f"{live_assignment.assignment_id}`, then re-run --reset"
+            )
+            res.needs_reset = True
+            return
+
     deleted = state.delete_assignments_for_issue(
         repo_name, issue_number, types=("review",),
         review_of_assignment_id=assignment_id,

@@ -346,6 +346,75 @@ def inject_message(
     return resp.status_code, body
 
 
+@dataclass
+class CancelResult:
+    """Result of ``POST /cancel/{id}`` to an agent — the only mechanism that
+    can stop a HEADLESS worker (#3223).  A ``claude -p`` review/work leg
+    dispatched by the agent (``interactive=False``, the normal shape for an
+    auto-loop review) is a plain subprocess tracked in the agent's own
+    ``_assignments`` dict; it has no tmux session at all, so a tmux
+    ``kill-session`` targets a session that never existed and silently does
+    nothing. This is the same endpoint ``coord stop`` posts to — one seam,
+    so "did this assignment actually get cancelled" has one answer instead
+    of two implementations that could quietly disagree.
+
+    ``ok`` is derived from the agent's own POST-cancel status, not from the
+    absence of an exception (#2096): ``AgentServer.cancel`` blocks on
+    ``proc.wait()`` (SIGTERM then, on timeout, SIGKILL) before returning, so
+    a ``status == "cancelled"`` response is a real post-action observation
+    that the process was reaped — not just proof the request was sent.
+    """
+
+    ok: bool
+    status: str | None = None
+    dirty_worktree_reason: str | None = None
+    error: str | None = None
+
+
+def cancel_assignment(
+    machine: Machine,
+    assignment_id: str,
+    *,
+    rescue: bool = False,
+    push_mode: str | None = None,
+    timeout: float = 20.0,
+) -> CancelResult:
+    """POST /cancel/{id} to `machine` and confirm the agent actually stopped
+    it. Never raises: network/HTTP/decode failures all come back as
+    ``CancelResult(ok=False, error=...)`` so a caller sweeping several
+    assignments can't have one unreachable machine blow up the sweep.
+    """
+    params: dict[str, str] = {}
+    if rescue:
+        params["rescue"] = "1"
+    if push_mode:
+        params["push_mode"] = push_mode
+    url = f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}"
+    try:
+        resp = httpx.post(url, params=params or None, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 — classify uniformly, never propagate
+        _, reason = classify_error(e)
+        return CancelResult(ok=False, error=reason)
+    if resp.status_code == 404:
+        return CancelResult(
+            ok=False, error=f"unknown assignment {assignment_id!r} on {machine.name}"
+        )
+    if resp.status_code != 200:
+        return CancelResult(ok=False, error=f"HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except ValueError:
+        return CancelResult(ok=False, error="invalid JSON from /cancel")
+    status = data.get("status")
+    ok = status == "cancelled"
+    return CancelResult(
+        ok=ok,
+        status=status,
+        dirty_worktree_reason=data.get("dirty_worktree_reason"),
+        error=None if ok else f"agent reported status={status!r} after cancel",
+    )
+
+
 def clean_worktrees(
     machine: Machine,
     *,
