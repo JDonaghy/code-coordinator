@@ -628,25 +628,86 @@ def test_review_stage_prefers_newer_real_review_over_wedged_test_author(
     assert calls["recover"] == []  # healthy path — no transcript recovery needed
 
 
-# ── stale-but-live → needs reset ─────────────────────────────────────────────
+# ── stale-but-live → needs reset (#3222: judged on the OUTPUT gap) ─────────
 
 
 def test_stale_live_work_session_needs_reset(monkeypatch, config) -> None:
+    """#3222: a session dispatched only seconds ago but SILENT past the
+    threshold is stale — dispatch age must not save it."""
+    from coord.network import StatusResult
+
     _stub(monkeypatch, session="live")
-    old = time.time() - 3 * 24 * 3600  # 3 days ago
-    a = _assign(aid="w1", typ="work", status="running", dispatched_at=old)
+    now = time.time()
+    a = _assign(aid="w1", typ="work", status="running", dispatched_at=now - 4.0)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [{"id": "w1", "last_output_at": now - 51 * 60.0}]}
+        ),
+    )
     board = Board(active=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "work")
     assert res.needs_reset is True
 
 
 def test_recent_live_work_session_is_left_running(monkeypatch, config) -> None:
+    """#3222: a session dispatched 13h ago but still emitting output every
+    few seconds must NOT be flagged stale — the old `dispatched_at`-only
+    check would have called this stale past its 12h default for no reason."""
+    from coord.network import StatusResult
+
     _stub(monkeypatch, session="live")
-    a = _assign(aid="w1", typ="work", status="running", dispatched_at=time.time())
+    now = time.time()
+    a = _assign(aid="w1", typ="work", status="running", dispatched_at=now - 13 * 3600.0)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [{"id": "w1", "last_output_at": now - 4.0}]}
+        ),
+    )
     board = Board(active=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "work")
     assert res.needs_reset is False
     assert res.recovered is True
+
+
+def test_stale_live_review_session_needs_reset_not_healthy(monkeypatch, config) -> None:
+    """coord-tui#81 repro: a review dispatched 4 seconds before it wedged —
+    51 minutes of silence, board still `running` — must be reported stale,
+    not fall through to the 'review stage looks healthy' catch-all."""
+    from coord.network import StatusResult
+
+    _stub(monkeypatch, session="live")
+    now = time.time()
+    a = _assign(aid="rv1", typ="review", status="running", dispatched_at=now - 4.0)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [{"id": "rv1", "last_output_at": now - 51 * 60.0}]}
+        ),
+    )
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review")
+    assert res.needs_reset is True
+    assert not any("looks healthy" in f for f in res.findings)
+
+
+def test_is_stale_falls_back_to_dispatched_at_when_output_unknown(monkeypatch, config) -> None:
+    """When the agent can't be asked at all (unreachable, or no machine to
+    resolve), `_is_stale` falls back to dispatch age rather than silently
+    reporting "not stale" forever."""
+    from coord.network import StatusResult
+
+    now = time.time()
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(error="connection error"),
+    )
+    fresh = _assign(aid="w1", typ="work", status="running", dispatched_at=now - 4.0)
+    assert diagnose._is_stale(fresh, config) is False
+
+    old = _assign(aid="w2", typ="work", status="running", dispatched_at=now - 3 * 24 * 3600.0)
+    assert diagnose._is_stale(old, config) is True
 
 
 # ── merge reconcile ──────────────────────────────────────────────────────────
