@@ -2328,11 +2328,17 @@ MAX_CI_INFRA_RERUNS = 2
 # thing again and see" genuinely is the remedy, staleness has no re-run
 # remedy at all; `process()` now parks on the FIRST stale reading (see the
 # `_ci_checks_are_stale` block in `process()` and `ci_stale_reason`'s
-# rebase-and-push wording). Kept defined — rather than deleted — only
-# because `QueuedMerge.ci_stale_reruns` and `coord.commands.drive_queue
-# ._run_auto_revalidate_checks_stale` still reference it; the latter shares
-# this module's exact same broken primitive from a second call site and is
-# a known follow-up, not something this fix's file scope covers.
+# rebase-and-push wording). `coord.commands.drive_queue
+# ._run_auto_revalidate_checks_stale` — the unattended periodic call site
+# (#2535) that shared this exact broken primitive from a second, independent
+# call site — was fixed identically in the same change (#3266): it no
+# longer fires a rerun either, and no longer reads or writes this budget at
+# all. Kept defined — rather than deleted — because `QueuedMerge.
+# ci_stale_reruns` still exists for rows written before this fix (see its
+# own comment) and because `coord.commands.merge._apply_ci_revalidation`
+# (the opt-in ``--revalidate`` CLI arm) still references it; that caller is
+# lower severity (opt-in, human-invoked) and is a tracked follow-up, not
+# something this fix's file scope covers.
 MAX_CI_STALE_RERUNS = 2
 
 # #2252: at most one auto-rerun per failure streak before a genuinely-
@@ -3464,13 +3470,16 @@ def ci_revalidation_candidates(
     `rerun_for_pr` replays the same run against the same base it already
     used, so it can never see the new one. `process()`'s OWN #2197
     auto-rerun for this trigger was dropped for that reason (see
-    `MAX_CI_STALE_RERUNS`'s comment); the two remaining callers of this
-    function — `coord.commands.merge._apply_ci_revalidation` (the
-    ``--revalidate`` CI arm) and `coord.commands.drive_queue
-    ._run_auto_revalidate_checks_stale` (the unattended periodic rerun) —
-    still call `rerun_for_pr` on what this returns and are equally unable to
-    clear the block. Left as-is here: fixing either is a change to those
-    modules, out of this function's/file's scope, and a known follow-up.
+    `MAX_CI_STALE_RERUNS`'s comment), and `coord.commands.drive_queue
+    ._run_auto_revalidate_checks_stale` (the unattended periodic call site)
+    was fixed the same way in the same change — it still calls this
+    function to find the candidates, but only to report them, never to
+    rerun anything. The one remaining caller that still calls
+    `rerun_for_pr` on what this returns is `coord.commands.merge
+    ._apply_ci_revalidation` (the opt-in ``--revalidate`` CI arm) — equally
+    unable to clear the block, but lower severity since a human has to
+    explicitly ask for it. Left as-is here: fixing it is a change to that
+    module, out of this function's/file's scope, and a tracked follow-up.
     """
     if ci_store is None or not ci_store.is_available:
         return []
@@ -3698,16 +3707,28 @@ class QueuedMerge:
     # (#1851) — a PASSING check recorded against a base that has since
     # moved, capped at `MAX_CI_STALE_RERUNS`.
     #
-    # #3266: `process()` no longer increments this — see
-    # `MAX_CI_STALE_RERUNS`'s comment for why a same-run re-run can never
-    # answer a staleness reading, so `process()` now parks on the FIRST
-    # stale reading instead of spending this budget. Left in place (rather
-    # than dropped from the schema) so a row written before this fix, still
+    # #3266: NEITHER of this module's two call sites increments this any
+    # more — see `MAX_CI_STALE_RERUNS`'s comment for why a same-run re-run
+    # can never answer a staleness reading. `process()` now parks on the
+    # FIRST stale reading instead of spending this budget, and
+    # `coord.commands.drive_queue._run_auto_revalidate_checks_stale` (the
+    # unattended periodic call site — #2535) was fixed the same way in the
+    # same change: it reports a `checks_stale` block for visibility but no
+    # longer reads OR writes this field at all. Left in place (rather than
+    # dropped from the schema) so a row written before this fix, still
     # carrying a nonzero count from the old behaviour, has somewhere to
     # decode it — `process()`'s "genuinely fresh" reset still zeroes it, so
-    # it converges to 0 and stays there. 0 for every entry that has never
-    # gone CI-stale under the old behaviour, and for rows predating this
-    # column.
+    # it converges to 0 and stays there for good. 0 for every entry that has
+    # never gone CI-stale under the old behaviour, and for rows predating
+    # this column.
+    #
+    # `coord.commands.merge._apply_ci_revalidation` (the opt-in
+    # ``--revalidate`` CLI arm) is the one remaining caller of
+    # `ci_revalidation_candidates` that still calls `rerun_for_pr` for this
+    # exact condition — it does not touch this counter (no budget, no cap;
+    # a human invoked it once, on purpose), but it is equally unable to
+    # clear a staleness block for the reason above, and is a tracked,
+    # lower-severity follow-up (see its own docstring).
     ci_stale_reruns: int = 0
     # #2252: count of automatic `CiStore.rerun_failed_for_pr` calls
     # `process()` has issued for this entry's CURRENT streak of genuinely-
