@@ -821,7 +821,10 @@ def retry_on_locked(
 # #3236: bumped 13 -> 14 for the four `drive_queue.plan_destructive`/
 # `apply_verdict`/`apply_verdict_reason`/`apply_verdict_at` columns appended
 # to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 14
+#
+# #3263: bumped 14 -> 15 for the two `merge_queue.ci_seen_checks_sha`/
+# `ci_seen_check_names_json` columns appended to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 15
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1054,7 +1057,9 @@ _SCHEMA_SQL = """
             ci_fix_head_sha TEXT NOT NULL DEFAULT '',
             ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0,
             ci_fix_detail_sha TEXT NOT NULL DEFAULT '',
-            ci_fix_detail_json TEXT
+            ci_fix_detail_json TEXT,
+            ci_seen_checks_sha TEXT NOT NULL DEFAULT '',
+            ci_seen_check_names_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -2198,6 +2203,13 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     "ALTER TABLE drive_queue ADD COLUMN apply_verdict TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE drive_queue ADD COLUMN apply_verdict_reason TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE drive_queue ADD COLUMN apply_verdict_at REAL",
+    # #3263: the persisted half of the check-set shrinkage guard — see
+    # `coord.merge_queue.QueuedMerge.ci_seen_checks_sha`'s docstring and
+    # `coord.ci_store.shrunk_check_names`. ''/NULL for every row predating
+    # this migration, read identically to "nothing observed yet for this
+    # commit" by `coord.merge_queue._ci_seen_check_names`.
+    "ALTER TABLE merge_queue ADD COLUMN ci_seen_checks_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE merge_queue ADD COLUMN ci_seen_check_names_json TEXT",
 ]
 
 
