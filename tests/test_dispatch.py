@@ -1395,26 +1395,33 @@ class TestEpicDispatchGuard:
 
 class TestEpicDecomposeBriefing:
     """#3132 acceptance: dispatching `type="epic-decompose"` against a
-    fixture epic renders a briefing carrying the decompose-and-queue
-    contract — cap of 6, chain serially, leave the epic open — as a durable
-    part of what the worker is told, not just something the epic's own body
-    happens to say.
+    fixture epic renders a briefing carrying the decompose contract — file
+    and register children, implement slice 1, leave the epic open — as a
+    durable part of what the worker is told, not just something the epic's
+    own body happens to say.
+
+    #3246: queuing the first batch of children and re-queuing the epic
+    behind them used to be steps 2/3 of this same contract, worker-executed
+    — and worked only ~half the time, invisibly, because a one-shot
+    worker's own report of having run `coord drive-queue add` was the only
+    evidence it ever happened. Those two steps moved coordinator-side (see
+    `coord.drive`'s post-leg handling), so the contract no longer asks the
+    worker to run them — it explicitly tells the worker NOT to.
     """
 
     def test_contract_text_states_the_full_workflow(self) -> None:
         """Unit-level: the contract text itself names every step #3132's
-        acceptance criteria call out."""
+        acceptance criteria call out, and explicitly hands #3246's two
+        queueing steps to the coordinator rather than asking for them."""
         assert "add-child" in EPIC_DECOMPOSE_CONTRACT
-        assert "At most 6" in EPIC_DECOMPOSE_CONTRACT
-        assert "chained serially" in EPIC_DECOMPOSE_CONTRACT
-        assert "Re-queue this epic" in EPIC_DECOMPOSE_CONTRACT
         assert "Implement only the first slice" in EPIC_DECOMPOSE_CONTRACT
         assert "Leave this epic open" in EPIC_DECOMPOSE_CONTRACT
+        assert "Do NOT queue" in EPIC_DECOMPOSE_CONTRACT
+        assert "coordinator-side" in EPIC_DECOMPOSE_CONTRACT
 
     def test_epic_decompose_briefing_names_the_issue(self) -> None:
         rendered = epic_decompose_briefing(1120)
         assert "#1120" in rendered
-        assert "At most 6" in rendered
         assert "Leave this epic open" in rendered
 
     @patch("coord.dispatch.httpx.post")
@@ -1446,8 +1453,8 @@ class TestEpicDecomposeBriefing:
 
         mock_post.assert_called_once()
         wire_briefing = mock_post.call_args.kwargs["json"]["briefing"]
-        assert "At most 6" in wire_briefing
-        assert "chained serially" in wire_briefing
+        assert "Do NOT queue" in wire_briefing
+        assert "coordinator-side" in wire_briefing
         assert "Leave this epic open" in wire_briefing
         assert "#1120" in wire_briefing
         # The operator/epic-author's own briefing text is preserved too —

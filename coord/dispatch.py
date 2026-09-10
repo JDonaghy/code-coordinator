@@ -267,20 +267,21 @@ child issue this epic implies. Register each one against this epic with \
 number>` (REPO EPIC ISSUE, all positional — no `--child` flag) so the \
 epic's checklist and this epic's tracking stay in sync — never hand-edit \
 the checklist directly.
-2. **Queue the first batch.** At most 6 of the newly-filed children, \
-chained serially so they land one at a time: `coord drive-queue add <repo> \
-<child 1>`, then `coord drive-queue add <repo> <child 2> --after <repo>#\
-<child 1>`, and so on.
-3. **Re-queue this epic behind that batch** — `coord drive-queue add <repo> \
-<this epic's issue number> --after <repo>#<child N>` (the last one queued) \
-— so decomposition continues once the first batch lands, if more children \
-remain.
-4. **Implement only the first slice in this pickup.** Do not attempt the \
+2. **Implement only the first slice in this pickup.** Do not attempt the \
 whole epic in one PR — that defeats the point of decomposing it.
-5. **Leave this epic open.** Do not close it yourself and do not word your \
+3. **Leave this epic open.** Do not close it yourself and do not word your \
 PR body as "Closes #N" — the coordinator already opens this PR with `Refs \
 #N`, non-closing, for exactly this reason. The epic closes only when its \
 checklist is complete.
+
+Do NOT queue the newly-filed children or re-queue this epic yourself —
+`coord drive-queue add` is coordinator-side once this assignment reports
+`done` (#3246): it reads the checklist you just wrote back off GitHub (not
+your own report of it), queues the first ready batch chained serially, and
+re-queues this epic behind them. That step used to be step 2/3 of this same
+list and worked only ~half the time when a one-shot worker session did it —
+moving it here means it happens from an OBSERVATION of the checklist, not
+from trusting this session's own final message.
 """
 
 

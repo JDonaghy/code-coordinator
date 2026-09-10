@@ -55,13 +55,17 @@ from coord.drive import (
     DriveError,
     DriveOptions,
     Driver,
+    EpicChecklistSnapshot,
+    EpicChildStatus,
     FileLock,
     GitHubAcceptanceGateChecker,
     GitMergeVerifier,
     LockBusy,
     OracleDecision,
+    _EPIC_DECOMPOSE_BATCH_SIZE,
     _UAT_FIXUP_DISPATCH_RETRY_LIMIT,
     _die,
+    _epic_decompose_batch,
     _remote_matches_repo,
     coord_argv,
     decide,
@@ -69,8 +73,15 @@ from coord.drive import (
     resolve_oracle_decision,
 )
 from coord.drive_state import IssueState
+from coord.drive_queue import entry_key
 from coord.failure_class import environmental_backoff_secs
-from coord.models import POLICY_REFUSAL_MARKER, PREMISE_REFUSAL_MARKER, Machine, Repo
+from coord.models import (
+    EPIC_DECOMPOSE_TYPE,
+    POLICY_REFUSAL_MARKER,
+    PREMISE_REFUSAL_MARKER,
+    Machine,
+    Repo,
+)
 from coord.usage_limits import PlanLimits
 
 
@@ -114,13 +125,21 @@ class FakeVerifier:
         has_commits: bool | None = True,
         merged: bool = True,
         head_sha: str | None = "deadbeef" * 5,
+        # #3246: the epic-decompose follow-up's fetched snapshot. `None`
+        # (the default) is only ever OBSERVED for a non-`epic-decompose`
+        # row — `_decide_epic_decompose_followup` short-circuits on
+        # `work_type` before ever calling this, so every pre-#3246 test
+        # (which never sets `work_type="epic-decompose"`) is unaffected.
+        epic_snapshot: "EpicChecklistSnapshot | None" = None,
     ) -> None:
         self._has_commits = has_commits
         self._merged = merged
         self._head_sha = head_sha
+        self._epic_snapshot = epic_snapshot
         self.commits_calls = 0
         self.merged_calls = 0
         self.head_sha_calls = 0
+        self.epic_snapshot_calls = 0
 
     def branch_has_commits(self, s: IssueState) -> bool | None:
         self.commits_calls += 1
@@ -133,6 +152,10 @@ class FakeVerifier:
     def branch_head_sha(self, s: IssueState) -> str | None:
         self.head_sha_calls += 1
         return self._head_sha
+
+    def epic_checklist_snapshot(self, s: IssueState) -> "EpicChecklistSnapshot | None":
+        self.epic_snapshot_calls += 1
+        return self._epic_snapshot
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -2272,6 +2295,214 @@ def done_work(**kw) -> IssueState:
     base = dict(work_aid="w1", work_status="done", work_branch="issue-1392-x")
     base.update(kw)
     return state(**base)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3246: epic-decompose's steps 2/3, coordinator-side
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# `EPIC_DECOMPOSE_CONTRACT` used to ask the worker to queue the first batch
+# of newly-filed children and re-queue the epic behind them — and across the
+# only two legs that have ever run, that worked exactly once
+# (claude-coordinator#3230); the other (#3226) reported both steps done and
+# neither queue row ever existed. These tests cover the coordinator-side
+# replacement: `_epic_decompose_batch` (pure planner over a fetched
+# snapshot) and its wiring into `decide()`.
+
+EPIC = 3230
+CHILD_A = 3232
+CHILD_B = 3233
+CHILD_C = 3234
+
+
+def epic_done_work(**kw) -> IssueState:
+    base = dict(
+        work_aid="w1",
+        work_status="done",
+        work_branch="issue-3230-x",
+        work_type=EPIC_DECOMPOSE_TYPE,
+        issue=EPIC,
+    )
+    base.update(kw)
+    return state(**base)
+
+
+class TestEpicDecomposeBatchPlanner:
+    """`_epic_decompose_batch` — pure, no network, asserts directly on the
+    snapshot -> Action mapping."""
+
+    def test_no_children_is_a_noop(self) -> None:
+        """Step 1 (decompose) filing zero children is a DIFFERENT defect
+        than the one #3246 closes — nothing to queue, so this function
+        stays out of the way rather than guessing or dying."""
+        snap = EpicChecklistSnapshot(children=(), queued_keys=frozenset(), epic_after=())
+        assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
+
+    def test_first_unqueued_child_is_queued_with_no_after(self) -> None:
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A),),
+            queued_keys=frozenset(),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        assert action.command == ("drive-queue", "add", "r", str(CHILD_A))
+
+    def test_second_child_chains_after_the_first(self) -> None:
+        """The first child is already queued (a previous poll's action) —
+        the next call must queue the second one chained behind it, not
+        re-queue the first or skip straight to the epic."""
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
+            queued_keys=frozenset({entry_key("r", CHILD_A)}),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        assert action.command == (
+            "drive-queue", "add", "r", str(CHILD_B), "--after", entry_key("r", CHILD_A),
+        )
+
+    def test_batch_fully_queued_then_requeues_the_epic_behind_the_last(self) -> None:
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
+            queued_keys=frozenset({entry_key("r", CHILD_A), entry_key("r", CHILD_B)}),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        assert action.command == (
+            "drive-queue", "add", "r", str(EPIC), "--after", entry_key("r", CHILD_B),
+        )
+
+    def test_everything_already_done_is_a_noop(self) -> None:
+        """Batch fully queued AND the epic's own `after=` already names the
+        last batch child — nothing left to do; must fall through to the
+        ordinary Test/Review/Merge machinery instead of re-issuing the same
+        `add` forever."""
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
+            queued_keys=frozenset({entry_key("r", CHILD_A), entry_key("r", CHILD_B)}),
+            epic_after=(entry_key("r", CHILD_B),),
+        )
+        assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
+
+    def test_closed_child_is_excluded_from_the_batch(self) -> None:
+        """A child already closed (e.g. #1057/#1061-shaped: an existing
+        issue adopted rather than re-filed, already done) never gets
+        queued — there is nothing left to do for it."""
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A, closed=True), EpicChildStatus(CHILD_B)),
+            queued_keys=frozenset(),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        # CHILD_B is first in the (closed-filtered) batch, so no --after yet.
+        assert action.command == ("drive-queue", "add", "r", str(CHILD_B))
+
+    def test_child_blocked_on_an_open_dependency_is_skipped(self) -> None:
+        """The claude-coordinator#3230 shape: an epic author marks a child
+        conditional via `{after: #N}` onto something not yet closed — the
+        SAME mechanism `ready_frontier` already respects — rather than this
+        function ever having to parse free-form epic prose to find it."""
+        snap = EpicChecklistSnapshot(
+            children=(
+                EpicChildStatus(CHILD_A),
+                EpicChildStatus(CHILD_B, after=(9999,)),  # #9999 still open
+                EpicChildStatus(CHILD_C),
+            ),
+            queued_keys=frozenset({entry_key("r", CHILD_A)}),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        # CHILD_B is blocked, so CHILD_C is next after CHILD_A, not CHILD_B.
+        assert action.command == (
+            "drive-queue", "add", "r", str(CHILD_C), "--after", entry_key("r", CHILD_A),
+        )
+
+    def test_blocked_child_becomes_eligible_once_its_dependency_closes(self) -> None:
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A, after=(9999,)),),
+            queued_keys=frozenset(),
+            epic_after=(),
+        )
+        assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
+
+        snap_closed = EpicChecklistSnapshot(
+            children=(
+                EpicChildStatus(9999, closed=True),
+                EpicChildStatus(CHILD_A, after=(9999,)),
+            ),
+            queued_keys=frozenset({entry_key("r", 9999)}),
+            epic_after=(),
+        )
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap_closed)
+        assert action is not None
+        assert action.command == ("drive-queue", "add", "r", str(CHILD_A))
+
+    def test_batch_is_capped_at_six(self) -> None:
+        children = tuple(EpicChildStatus(3000 + i) for i in range(9))
+        assert len(children) > _EPIC_DECOMPOSE_BATCH_SIZE
+        queued = frozenset(
+            entry_key("r", c.issue_number) for c in children[:_EPIC_DECOMPOSE_BATCH_SIZE]
+        )
+        snap = EpicChecklistSnapshot(children=children, queued_keys=queued, epic_after=())
+        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
+        assert action is not None
+        # The 7th child (index 6) is NOT queued — the epic re-queue behind
+        # the 6th is next, not a 7th batch member.
+        last_in_batch = children[_EPIC_DECOMPOSE_BATCH_SIZE - 1].issue_number
+        assert action.command == (
+            "drive-queue", "add", "r", str(EPIC), "--after", entry_key("r", last_in_batch),
+        )
+
+
+class TestEpicDecomposeFollowupWiring:
+    """Integration through `decide()`/`step()` — the type gate, the
+    fetch-failure wait, and the plain-`work` no-op."""
+
+    def test_plain_work_never_calls_the_snapshot_fetch(self) -> None:
+        """The overwhelming majority of rows are `type="work"` — the
+        snapshot fetch (a live GitHub + drive-queue read) must never even
+        run for them."""
+        verifier = FakeVerifier(epic_snapshot=None)
+        action = step(done_work(work_test_state=""), verifier=verifier)
+        assert verifier.epic_snapshot_calls == 0
+        assert action.kind == WAIT  # unaffected: normal Test-stage wait
+
+    def test_snapshot_fetch_failure_waits_instead_of_guessing(self) -> None:
+        verifier = FakeVerifier(epic_snapshot=None)
+        action = step(epic_done_work(work_test_state=""), verifier=verifier)
+        assert action.kind == WAIT
+        assert "#3246" in action.label
+
+    def test_pending_batch_item_short_circuits_the_test_gate(self) -> None:
+        """While the batch is still being queued, `decide()` must hand back
+        THAT `coord drive-queue add`, not fall through to whatever the Test
+        gate would otherwise do."""
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A),),
+            queued_keys=frozenset(),
+            epic_after=(),
+        )
+        verifier = FakeVerifier(epic_snapshot=snap)
+        action = step(epic_done_work(work_test_state=""), verifier=verifier)
+        assert action.kind == RUN
+        assert action.command == ("drive-queue", "add", REPO, str(CHILD_A))
+
+    def test_fully_satisfied_batch_falls_through_to_the_test_gate(self) -> None:
+        """Nothing left to queue — must behave byte-identically to a plain
+        `work` done row reaching the same point."""
+        snap = EpicChecklistSnapshot(
+            children=(EpicChildStatus(CHILD_A),),
+            queued_keys=frozenset({entry_key(REPO, CHILD_A)}),
+            epic_after=(entry_key(REPO, CHILD_A),),
+        )
+        verifier = FakeVerifier(epic_snapshot=snap)
+        action = step(epic_done_work(work_test_state=""), verifier=verifier)
+        assert action.kind == WAIT  # same as test_non_oracle_drive_never_touches_the_trust_gate
 
 
 # ── #2199: the oracle-loop TRUST GATE (`_decide_acceptance_gate`) ──────────
