@@ -297,7 +297,13 @@ def approve(
     from coord import freshness as fresh
     from coord.board_service import read_board, write_board
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph, transitive_deps
-    from coord.dispatch import compute_do_not_touch, dispatch, dispatch_with_retry, post_briefing
+    from coord.dispatch import (
+        compute_do_not_touch,
+        dispatch,
+        dispatch_with_retry,
+        post_briefing,
+        route_work_by_capability,
+    )
     from coord.network import classify_error, fetch_repos
     from coord.state import (
         clear_proposals,
@@ -393,6 +399,46 @@ def approve(
         click.echo("No proposals remain after claim check.", err=True)
         sys.exit(1)
     selected = unclaimed
+
+    # ── Capability-based reroute (#3241) ────────────────────────────────
+    # Must run BEFORE the freshness pre-check right below (which fetches
+    # `machine_repos` and computes staleness/busy keyed to `p.machine_name`)
+    # and before the per-proposal loop further down (whose operator-facing
+    # echo and `dispatched_this_batch` bookkeeping are also keyed to
+    # `p.machine_name`). `dispatch()` performs this SAME reroute again
+    # internally (`route_work_by_capability`, reused here rather than
+    # duplicated) — that call stays, since `dispatch()` has other callers
+    # besides this one — but doing it here FIRST mutates `p.machine_name`
+    # in place before any of THIS caller's own precomputed state is built,
+    # so that state (and the echo below) reflects where the work actually
+    # lands, and the reroute inside `dispatch()` becomes a same-machine
+    # no-op the second time it runs. Without this, a reroute previously
+    # happened silently inside `dispatch()`: the echo told the operator
+    # work went to the originally proposed machine, the freshness/staleness
+    # check and `pull_repos` list were computed for that wrong machine (so
+    # a stale/dirty checkout on the REAL target was never pulled), and the
+    # #2804 same-batch collision guard (`dispatched_this_batch`) recorded
+    # each rerouted proposal under its stale proposed name instead of the
+    # real target — defeating the very race guard it exists to provide for
+    # two proposals in one batch that reroute onto the same machine.
+    for p in selected:
+        if p.type != "work":
+            continue
+        routing = route_work_by_capability(
+            proposed_machine_name=p.machine_name,
+            repo_name=p.repo_name,
+            files_likely=p.files_likely,
+            machines=cfg.machines,
+            capability_rules=cfg.smoke_tests.capability_rules,
+        )
+        if routing is not None and routing.rerouted:
+            click.echo(
+                f"  [{p.id}] capability-rerouted {p.machine_name} → "
+                f"{routing.machine_name} (#3241 — {p.machine_name} does not "
+                "cover this diff's required capabilities)",
+                err=True,
+            )
+            p.machine_name = routing.machine_name
 
     # ── Freshness pre-check ──────────────────────────────────────────
     machine_repos: dict[str, dict | None] = {}
