@@ -1036,6 +1036,24 @@ class LivenessAuditorConfig:
     claude_bin: str | None = None
 
 
+# #3261 (S-1 of the "pipeline gate as a data object" epic): the fleet-wide
+# vocabulary of names a gate list (``default_gates`` or a ``labels[*]``
+# value) may contain. Today this is a name list only — membership is all
+# ``_parse_pipeline`` checks below. A later slice of #3261 grows each name
+# into a full ``GateSpec`` (applicability / producer / verdict vocabulary /
+# evaluator / fail-route); this constant is the seed that validation and the
+# eventual registry both key off of.
+#
+# Seeded with exactly the four names in use fleet-wide today (verified
+# against the live daemon config, 2026-09-10) — adding a fifth name here
+# without also implementing it is allowed (mirrors ``SUPPORTED_KINDS`` /
+# ``run_driver()`` in ``coord/acceptance_drivers.py``, which rejects a
+# declared-but-unimplemented *kind* rather than no-opping); the point of this
+# set is only to make an unrecognised name — a typo, most often — a load-time
+# error instead of a gate that silently never fires.
+KNOWN_GATE_NAMES: frozenset[str] = frozenset({"test", "review", "uat", "merge"})
+
+
 @dataclass
 class PipelineConfig:
     """Assignment lifecycle gate configuration.
@@ -1044,6 +1062,12 @@ class PipelineConfig:
     assignment unless overridden by an issue label.  ``labels`` maps GitHub
     issue label names to gate lists, allowing per-label overrides — e.g.
     a ``hotfix`` label could bypass review with ``hotfix: [merge]``.
+
+    Every gate name in ``default_gates`` and in each ``labels[*]`` list must
+    be a member of :data:`KNOWN_GATE_NAMES` — ``_parse_pipeline`` raises
+    :class:`ConfigError` on an unrecognised name rather than accepting it
+    silently (#3261 S-1). A name nothing consumes used to be
+    indistinguishable from a name that works.
 
     ``auto_loop`` enables the automated review → fix → re-review cycle.
     When ``True`` (default), a review that requests changes automatically
@@ -3468,6 +3492,13 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         value = raw["default_gates"]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ConfigError("pipeline.default_gates must be a list of strings")
+        unknown = [v for v in value if v not in KNOWN_GATE_NAMES]
+        if unknown:
+            raise ConfigError(
+                f"pipeline.default_gates has unknown gate name(s): "
+                f"{', '.join(sorted(set(unknown)))} "
+                f"(known gates: {', '.join(sorted(KNOWN_GATE_NAMES))})"
+            )
         cfg.default_gates = list(value)
 
     if "labels" in raw:
@@ -3480,6 +3511,13 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
             if not isinstance(v, list) or not all(isinstance(g, str) for g in v):
                 raise ConfigError(
                     f"pipeline.labels[{k!r}] must be a list of gate name strings"
+                )
+            unknown = [g for g in v if g not in KNOWN_GATE_NAMES]
+            if unknown:
+                raise ConfigError(
+                    f"pipeline.labels[{k!r}] has unknown gate name(s): "
+                    f"{', '.join(sorted(set(unknown)))} "
+                    f"(known gates: {', '.join(sorted(KNOWN_GATE_NAMES))})"
                 )
         cfg.labels = {k: list(v) for k, v in value.items()}
 

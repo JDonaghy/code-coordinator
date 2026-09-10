@@ -9,6 +9,7 @@ import pytest
 
 from coord.config import (
     ConfigError,
+    KNOWN_GATE_NAMES,
     PipelineConfig,
     ProviderDef,
     ProvidersConfig,
@@ -1121,6 +1122,66 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
     # Default default_gates: Test comes before Review (smoke before PR/review).
     assert cfg.pipeline.gates_for_label("coord") == ["test", "review", "merge"]
     assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
+
+
+# ── #3261 S-1: unknown gate names must fail config load, never silently ─────
+
+
+def test_known_gate_names_seed_set() -> None:
+    """The seed registry is exactly the four gates in use fleet-wide today —
+    growing this set is a deliberate, reviewed act, not an accident."""
+    assert KNOWN_GATE_NAMES == {"test", "review", "uat", "merge"}
+
+
+def test_pipeline_default_gates_rejects_unknown_name(tmp_path: Path) -> None:
+    """A typo'd gate name in default_gates (e.g. 'reveiw' for 'review') used
+    to parse clean and silently drop the intended gate fleet-wide. It must
+    now fail config load instead."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, reveiw, merge]\n"
+    )
+    with pytest.raises(ConfigError, match="unknown gate name.*reveiw"):
+        load(p)
+
+
+def test_pipeline_labels_rejects_unknown_gate_name(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    hotfix: [merge, bogus]\n"
+    )
+    with pytest.raises(ConfigError, match=r"labels\['hotfix'\].*unknown gate name.*bogus"):
+        load(p)
+
+
+def test_pipeline_default_gates_accepts_all_known_names(tmp_path: Path) -> None:
+    """A config using every currently-recognised gate name still loads,
+    unchanged, in each of default_gates and labels."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, review, uat, merge]\n"
+        "  labels:\n"
+        "    hotfix: [uat, merge]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.default_gates == ["test", "review", "uat", "merge"]
+    assert cfg.pipeline.gates_for_label("hotfix") == ["uat", "merge"]
 
 
 # ── #846: attention_thresholds / convergence_rounds ─────────────────────────
