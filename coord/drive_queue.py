@@ -94,6 +94,7 @@ from coord.gate_a import is_gate_a_refusal_reason
 from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
+    CI_ABSENT_PREFIX,
     CI_STALE_PREFIX,
     PLAN_READY,
     ci_rollup_all_clear,
@@ -3030,7 +3031,7 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
     cycle) instead of the real one-line fix (`coord merge --revalidate`, or
     fixing the failing CI check).
 
-    Four shapes, all written by `coord/drive.py`'s own merge-stage decision
+    Five shapes, all written by `coord/drive.py`'s own merge-stage decision
     functions — none of them a "no assignment created" signal:
 
     * `_die`'s exhausted-merge-attempts wording ("merge attempted N times
@@ -3047,6 +3048,23 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
       ("smoke_required —" / "review_required —" / "merge_status=...") — the
       #1505/#1526 immediate-escalation path, which already recorded its own
       accurate `coord escalate record` before this drive exited.
+    * `is_ci_absent_reason` — #3254's `checks_absent` immediate-die wording
+      (``f"{state.merge_reason} — push a new commit; this gate cannot clear
+      on retry (#3254)..."``, `coord/drive.py`'s `_decide_merge`). Like the
+      four siblings above it is a clean, evidenced merge-gate refusal, not a
+      dispatch failure — and unlike them it is *provably unretryable* rather
+      than merely still-in-flight, which is exactly why `_decide_merge` dies
+      immediately instead of looping. `is_ci_absent_reason` itself is a
+      strict ``str.startswith`` check against `coord.merge_queue`'s
+      ``CI_ABSENT_PREFIX`` (``"CI never ran:"``) — true of the bare
+      `state.merge_reason`, but *this* function is handed the fully wrapped
+      `own_reason` (``f"drive exited for {ident} (exit_code=...): {message}"``
+      — see `_drive_exit_summary`), where that prefix sits mid-string, not
+      at position 0. So this checks for `CI_ABSENT_PREFIX` as a *substring*
+      instead, the same way every other shape above is matched (``"merge
+      attempted"``, ``"checks failed"``, ...) rather than re-using
+      `is_ci_absent_reason` directly against text it was never built to
+      classify.
     """
     if not reason:
         return False
@@ -3059,7 +3077,9 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
         return True
     if "smoke_required —" in lowered or "review_required —" in lowered:
         return True
-    return "merge_status=" in lowered
+    if "merge_status=" in lowered:
+        return True
+    return CI_ABSENT_PREFIX.lower() in lowered
 
 
 def merge_plan_inspect_command(repo: str) -> str:
@@ -3097,14 +3117,16 @@ def merge_gate_remedy_command(reason: str | None, repo: str, issue: int) -> str:
 
     Every other shape this matches — red CI (``checks failed``), a
     review/smoke gate divergence (``review_required —``/``smoke_required
-    —``), an opaque terminal ``merge_status=`` — has no single command that
-    is always both correct and safe to run without a human first reading
-    the actual gate state (fixing a named CI check, recovering or re-running
-    a review, deciding a UAT verdict). Guessing wrong there is worse than
-    not guessing: the menu this feeds runs the command on one click. So
-    every one of those falls back to the read-only inspect command instead
-    — see #3016's design note ("a wrong 'Recommended' is worse than no
-    recommendation").
+    —``), an opaque terminal ``merge_status=``, or #3254's ``checks_absent``
+    (no checks ever reported for the PR) — has no single command that is
+    always both correct and safe to run without a human first reading the
+    actual gate state (fixing a named CI check, recovering or re-running a
+    review, deciding a UAT verdict, or — for ``checks_absent`` — pushing a
+    fresh commit or confirming it is genuinely safe to force-merge). Guessing
+    wrong there is worse than not guessing: the menu this feeds runs the
+    command on one click. So every one of those falls back to the read-only
+    inspect command instead — see #3016's design note ("a wrong
+    'Recommended' is worse than no recommendation").
 
     Callers are expected to gate on :func:`_is_merge_gate_block_reason`
     first; called on a reason that ISN'T a merge-gate block at all, this
