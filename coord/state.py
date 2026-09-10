@@ -7839,6 +7839,68 @@ def get_issue_titles(keys: Iterable[tuple[str, int]]) -> dict[str, str]:
     return out
 
 
+def cached_open_issues(repo_names: Iterable[str]) -> list[dict]:
+    """Cached issue rows (``repo_name``, ``number``, ``title``, ``state``,
+    ``labels`` — ``labels`` decoded to a plain ``list[str]``) for every
+    ``repo_names`` entry, straight off the locally-cached ``issues`` table —
+    backs ``coord plans --lint-epics``' :func:`coord.plans.find_unlabelled_epics`
+    scan (#3227).
+
+    Routes to the daemon when ``board_service`` is set, else reads the local
+    ``issues`` table directly — the same split as :func:`get_issue_titles`,
+    for the same reason: a thin client (``coord web``/``coord plans`` pointed
+    at a remote daemon) has no local ``issues`` table, so a bare local SELECT
+    here would silently return an empty list and the lint would falsely
+    report "clean" on every machine but the daemon host.
+
+    Fail-soft like :func:`fetch_leg_counts`/``coord.reports._default_completed_source``:
+    an unreadable local DB (or a daemon predating the ``/issues`` route, or
+    any transport failure) degrades to ``[]`` rather than raising — a lint
+    scan should never crash the rest of ``coord plans``' output over this.
+    """
+    names = sorted({r for r in repo_names if r})
+    if not names:
+        return []
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_cached_issues  # noqa: PLC0415
+
+        return fetch_cached_issues(svc, names)
+    return _cached_open_issues_local(names)
+
+
+def _cached_open_issues_local(repo_names: list[str] | None = None) -> list[dict]:
+    """Local-DB half of :func:`cached_open_issues` — also what the daemon's
+    ``GET /issues`` route runs, on the daemon's own DB, to serve a thin
+    client's request. ``repo_names=None`` reads every repo's rows.
+    """
+    try:
+        conn = get_connection()
+        if repo_names:
+            placeholders = ",".join("?" for _ in repo_names)
+            rows = sql.execute(
+                conn,
+                "SELECT repo_name, number, title, state, labels FROM issues "  # noqa: S608 — placeholders only
+                f"WHERE repo_name IN ({placeholders})",
+                tuple(repo_names),
+            ).fetchall()
+        else:
+            rows = sql.execute(
+                conn, "SELECT repo_name, number, title, state, labels FROM issues"
+            ).fetchall()
+    except Exception:  # noqa: BLE001 — an unreadable cache is an empty scan
+        return []
+    out: list[dict] = []
+    for r in rows:
+        row = dict(r)
+        try:
+            row["labels"] = json.loads(row.get("labels") or "[]")
+        except (TypeError, ValueError):
+            row["labels"] = []
+        out.append(row)
+    return out
+
+
 def leg_counts() -> dict[str, dict[str, int]]:
     """All-time per-issue assignment leg counts by type, keyed ``"repo#N"``
     (#3060) — backs ``GET /api/drive-queue``'s ``leg_counts`` sibling field.

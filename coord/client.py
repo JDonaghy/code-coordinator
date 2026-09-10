@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -761,6 +762,33 @@ def fetch_leg_counts(
     except Exception:  # noqa: BLE001
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def fetch_cached_issues(
+    svc: ServiceConfig, repo_names: Iterable[str], *, timeout: float = _DEFAULT_TIMEOUT
+) -> list[dict]:
+    """GET the daemon's locally-cached ``issues`` rows for ``repo_names``
+    (#3227), backing :func:`coord.state.cached_open_issues` — the
+    ``coord plans --lint-epics`` scan's daemon-routed half.
+
+    ``[]`` on ANY failure — including a 404 from a daemon predating this
+    route — fail-soft, mirrors :func:`fetch_leg_counts`: a thin client's
+    lint should just report nothing rather than raise outright because the
+    daemon it's pointed at is older than this feature.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/issues",
+            params=[("repo_name", r) for r in repo_names],
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return []
+    issues = data.get("issues") if isinstance(data, dict) else None
+    return issues if isinstance(issues, list) else []
 
 
 def fetch_drive_queue_entry(

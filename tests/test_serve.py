@@ -3585,6 +3585,38 @@ def test_serve_leg_counts(tmp_path: Path, valid_config_path: Path, rw_db):
         assert r.json() == {"api#1": {"work": 1, "review": 1}}
 
 
+def test_serve_issues_collection(tmp_path: Path, valid_config_path: Path, rw_db):
+    """#3227: `GET /issues` — the daemon-routed half of
+    `coord.state.cached_open_issues`, backing `coord plans --lint-epics` on
+    a thin client. Deliberately its own endpoint, like `/leg-counts`: the
+    `Board` model has no `issues` field, so there's no `/board` read to
+    piggyback on."""
+    import json as _json
+
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels) "
+        "VALUES ('api', 1, 'Epic: foo', 'open', ?)",
+        (_json.dumps(["epic"]),),
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels) "
+        "VALUES ('other-repo', 2, 'Epic: bar', 'open', ?)",
+        (_json.dumps([]),),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.get("/issues", params={"repo_name": "api"})
+        assert r.status_code == 200
+        issues = r.json()["issues"]
+        assert [(i["repo_name"], i["number"]) for i in issues] == [("api", 1)]
+        assert issues[0]["labels"] == ["epic"]
+
+        # Omitting repo_name entirely reads every repo's cached rows.
+        r_all = cli.get("/issues")
+        assert {i["repo_name"] for i in r_all.json()["issues"]} == {"api", "other-repo"}
+
+
 def test_serve_drive_queue_enqueue_at_explicit_position(
     tmp_path: Path, valid_config_path: Path, rw_db
 ):
