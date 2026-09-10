@@ -62,6 +62,7 @@ project; nothing here depends on a live worktree or a real browser install.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -74,10 +75,12 @@ from coord.acceptance_drivers import (
     FIXTURE_SERVER_DEPENDENT_KINDS,
     SUPPORTED_KINDS,
     VALIDATE_ONLY_KINDS,
+    parse_conftest_json,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
     parse_terraform_validate_json,
     parse_test_output,
+    parse_tflint_json,
     render_run_command,
     run_driver,
 )
@@ -963,3 +966,310 @@ class TestParseTerraformValidateJson:
         tests = parse_terraform_validate_json(json.dumps({"foo": "bar"}))
         assert len(tests) == 1
         assert tests[0]["status"] == "fail"
+
+
+class TestParseTflintJson:
+    """#3234: `tflint --format=json` -> normalized `{"id", "status",
+    "message"}` entries, the same shape `parse_terraform_validate_json`
+    already produces so both fold onto one `tests` list."""
+
+    def test_clean_pass_no_issues(self) -> None:
+        stdout = json.dumps({"issues": [], "errors": []})
+        assert parse_tflint_json(stdout) == [
+            {"id": "tflint", "status": "pass", "message": ""},
+        ]
+
+    def test_only_nonblocking_issues_still_passes(self) -> None:
+        stdout = json.dumps({
+            "issues": [{
+                "rule": {"name": "terraform_deprecated_interpolation", "severity": "warning"},
+                "message": "old interpolation style",
+                "range": {"filename": "main.tf", "start": {"line": 3}},
+            }],
+            "errors": [],
+        })
+        assert parse_tflint_json(stdout) == [
+            {"id": "tflint", "status": "pass", "message": "1 non-blocking issue(s)"},
+        ]
+
+    def test_error_severity_issue_reported_as_fail(self) -> None:
+        stdout = json.dumps({
+            "issues": [{
+                "rule": {"name": "terraform_required_version", "severity": "error"},
+                "message": "provider version must be pinned",
+                "range": {"filename": "main.tf", "start": {"line": 1}},
+            }],
+            "errors": [],
+        })
+        assert parse_tflint_json(stdout) == [{
+            "id": "main.tf:1: terraform_required_version",
+            "status": "fail",
+            "message": "provider version must be pinned",
+        }]
+
+    def test_multiple_error_issues_each_get_own_entry_warnings_dropped(self) -> None:
+        stdout = json.dumps({
+            "issues": [
+                {"rule": {"name": "rule_a", "severity": "error"}, "message": "a bad",
+                 "range": {"filename": "a.tf", "start": {"line": 1}}},
+                {"rule": {"name": "rule_b", "severity": "error"}, "message": "b bad",
+                 "range": {"filename": "b.tf", "start": {"line": 2}}},
+                {"rule": {"name": "rule_c", "severity": "warning"}, "message": "c minor",
+                 "range": {"filename": "c.tf", "start": {"line": 3}}},
+            ],
+            "errors": [],
+        })
+        tests = parse_tflint_json(stdout)
+        assert [t["id"] for t in tests] == ["a.tf:1: rule_a", "b.tf:2: rule_b"]
+        assert all(t["status"] == "fail" for t in tests)
+
+    def test_top_level_execution_errors_fail_the_whole_check(self) -> None:
+        # An execution error (bad .tflint.hcl, unresolvable plugin) means
+        # tflint never got far enough to lint anything -- distinct from a
+        # clean "issues": [] run and must not read as one.
+        stdout = json.dumps({"issues": [], "errors": [{"message": "failed to load plugin"}]})
+        tests = parse_tflint_json(stdout)
+        assert len(tests) == 1
+        assert tests[0] == {
+            "id": "tflint", "status": "fail",
+            "message": "tflint reported execution error(s): failed to load plugin",
+        }
+
+    def test_empty_stdout_reports_failure_not_empty_pass(self) -> None:
+        tests = parse_tflint_json("", exit_code=127, stderr="sh: 1: tflint: not found")
+        assert len(tests) == 1
+        assert tests[0]["id"] == "tflint"
+        assert tests[0]["status"] == "fail"
+        assert "not found" in tests[0]["message"]
+        assert "exit 127" in tests[0]["message"]
+
+    def test_non_json_stdout_reports_failure(self) -> None:
+        tests = parse_tflint_json("not json at all", exit_code=1)
+        assert len(tests) == 1
+        assert tests[0]["id"] == "tflint"
+        assert tests[0]["status"] == "fail"
+
+    def test_missing_issues_key_treated_as_unrecognized(self) -> None:
+        tests = parse_tflint_json(json.dumps({"foo": "bar"}))
+        assert len(tests) == 1
+        assert tests[0]["status"] == "fail"
+
+
+class TestParseConftestJson:
+    """#3234: `conftest test --output=json` -> normalized `{"id", "status",
+    "message"}` entries, matching this module's other parse_* functions'
+    shape."""
+
+    def test_clean_pass_no_findings(self) -> None:
+        stdout = json.dumps([
+            {"filename": "main.tf", "namespace": "main", "successes": 3,
+             "failures": [], "warnings": [], "exceptions": []},
+        ])
+        assert parse_conftest_json(stdout) == [
+            {"id": "conftest: main.tf", "status": "pass", "message": ""},
+        ]
+
+    def test_warnings_do_not_fail_but_are_noted(self) -> None:
+        stdout = json.dumps([
+            {"filename": "main.tf", "successes": 1, "failures": [], "exceptions": [],
+             "warnings": [{"msg": "consider tagging"}]},
+        ])
+        assert parse_conftest_json(stdout) == [
+            {"id": "conftest: main.tf", "status": "pass", "message": "1 warning(s)"},
+        ]
+
+    def test_failure_reported_per_violation(self) -> None:
+        stdout = json.dumps([
+            {"filename": "main.tf", "successes": 0,
+             "failures": [{"msg": "required tag 'owner' is missing"}],
+             "warnings": [], "exceptions": []},
+        ])
+        assert parse_conftest_json(stdout) == [{
+            "id": "main.tf: required tag 'owner' is missing",
+            "status": "fail",
+            "message": "required tag 'owner' is missing",
+        }]
+
+    def test_policy_exception_fails_distinctly_from_a_violation(self) -> None:
+        # A rego evaluation error (undefined function, missing input field
+        # a rule assumed existed) means the policy never rendered a real
+        # verdict at all -- must not be confused with "no violations found".
+        stdout = json.dumps([
+            {"filename": "main.tf", "successes": 0, "failures": [],
+             "warnings": [], "exceptions": [{"msg": "undefined function foo"}]},
+        ])
+        tests = parse_conftest_json(stdout)
+        assert len(tests) == 1
+        assert tests[0]["status"] == "fail"
+        assert "policy error" in tests[0]["id"]
+        assert tests[0]["message"] == "undefined function foo"
+
+    def test_multiple_files_each_reported(self) -> None:
+        stdout = json.dumps([
+            {"filename": "a.tf", "successes": 1, "failures": [], "warnings": [], "exceptions": []},
+            {"filename": "b.tf", "successes": 0,
+             "failures": [{"msg": "no local-exec"}], "warnings": [], "exceptions": []},
+        ])
+        assert parse_conftest_json(stdout) == [
+            {"id": "conftest: a.tf", "status": "pass", "message": ""},
+            {"id": "b.tf: no local-exec", "status": "fail", "message": "no local-exec"},
+        ]
+
+    def test_empty_array_is_a_real_pass_not_a_crash(self) -> None:
+        # A well-formed, genuinely empty report (no matching input files)
+        # is a real observation -- distinct from the crash cases below,
+        # which must fail rather than read as "nothing to check".
+        assert parse_conftest_json("[]") == [
+            {"id": "conftest", "status": "pass", "message": "no input files evaluated"},
+        ]
+
+    def test_empty_stdout_reports_failure_not_empty_pass(self) -> None:
+        tests = parse_conftest_json("", exit_code=127, stderr="sh: 1: conftest: not found")
+        assert len(tests) == 1
+        assert tests[0]["id"] == "conftest"
+        assert tests[0]["status"] == "fail"
+        assert "not found" in tests[0]["message"]
+
+    def test_non_list_stdout_reports_failure(self) -> None:
+        tests = parse_conftest_json(json.dumps({"not": "a list"}))
+        assert len(tests) == 1
+        assert tests[0]["status"] == "fail"
+
+
+def _write_executable(path: Path, script: str) -> None:
+    """A fake binary standing in for the real `tflint`/`conftest` (neither
+    installed in this test environment, same trick `_fake_terraform`/
+    `TestRunDriverWebPlaywright`'s `pw()` use)."""
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+class TestRunDriverTerraformPolicyGate:
+    """#3234: `_run_terraform` runs an opt-in tflint/conftest policy gate
+    after `validate`, gated on `.tflint.hcl`/`policy/` presence in the
+    driven repo's cwd, and folds the results onto the same `tests` list."""
+
+    @staticmethod
+    def _terraform_ok() -> str:
+        validate_json = json.dumps(
+            {"valid": True, "error_count": 0, "warning_count": 0, "diagnostics": []}
+        )
+        return _fake_terraform(validate_json=validate_json)
+
+    def test_no_policy_files_means_no_policy_entries(self, tmp_path) -> None:
+        # An un-opted-in repo (neither convention file present) keeps
+        # getting exactly the plain validate-only verdict it always did.
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+        ]
+        assert result.exit_code == 0
+
+    def test_tflint_runs_when_config_file_present(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / ".tflint.hcl").write_text("")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        issues = json.dumps({"issues": [], "errors": []})
+        _write_executable(
+            bin_dir / "tflint",
+            "#!/bin/sh\n"
+            f'if [ "$1" = --format=json ]; then echo {shlex.quote(issues)}; else exit 9; fi\n',
+        )
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+            {"id": "tflint", "status": "pass", "message": ""},
+        ]
+        assert result.exit_code == 0
+
+    def test_tflint_error_issue_fails_the_overall_run(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / ".tflint.hcl").write_text("")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        issues = json.dumps({
+            "issues": [{
+                "rule": {"name": "terraform_required_version", "severity": "error"},
+                "message": "provider version must be pinned",
+                "range": {"filename": "main.tf", "start": {"line": 1}},
+            }],
+            "errors": [],
+        })
+        _write_executable(bin_dir / "tflint", f"#!/bin/sh\necho {shlex.quote(issues)}\n")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        # `validate` itself passed cleanly, but a real policy violation was
+        # found -- the driver's own exit_code must reflect that too (#2096:
+        # unconfirmed success is a defect; a caller reading exit_code alone
+        # must not see this as a clean run).
+        assert result.exit_code != 0
+        assert {
+            "id": "main.tf:1: terraform_required_version",
+            "status": "fail",
+            "message": "provider version must be pinned",
+        } in result.tests
+
+    def test_missing_tflint_binary_fails_rather_than_silently_passing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Opted in (.tflint.hcl present) but the binary isn't -- must not
+        # be silently dropped and read as "no violations found".
+        (tmp_path / ".tflint.hcl").write_text("")
+        monkeypatch.setenv("PATH", str(tmp_path / "no-such-bin-dir"))
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        tflint_entries = [t for t in result.tests if t["id"] == "tflint"]
+        assert len(tflint_entries) == 1
+        assert tflint_entries[0]["status"] == "fail"
+        assert result.exit_code != 0
+
+    def test_conftest_runs_when_policy_dir_present(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / "policy").mkdir()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        report = json.dumps([
+            {"filename": "main.tf", "successes": 1, "failures": [], "warnings": [], "exceptions": []},
+        ])
+        _write_executable(bin_dir / "conftest", f"#!/bin/sh\necho {shlex.quote(report)}\n")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+            {"id": "conftest: main.tf", "status": "pass", "message": ""},
+        ]
+        assert result.exit_code == 0
+
+    def test_conftest_failure_fails_the_overall_run(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / "policy").mkdir()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        report = json.dumps([
+            {"filename": "main.tf", "successes": 0,
+             "failures": [{"msg": "no local-exec"}], "warnings": [], "exceptions": []},
+        ])
+        _write_executable(bin_dir / "conftest", f"#!/bin/sh\necho {shlex.quote(report)}\n")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        assert result.exit_code != 0
+        assert {
+            "id": "main.tf: no local-exec", "status": "fail", "message": "no local-exec",
+        } in result.tests
+
+    def test_both_tools_run_and_merge_when_both_opted_in(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / ".tflint.hcl").write_text("")
+        (tmp_path / "policy").mkdir()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        tflint_report = json.dumps({"issues": [], "errors": []})
+        conftest_report = json.dumps([
+            {"filename": "main.tf", "successes": 1, "failures": [], "warnings": [], "exceptions": []},
+        ])
+        _write_executable(bin_dir / "tflint", f"#!/bin/sh\necho {shlex.quote(tflint_report)}\n")
+        _write_executable(bin_dir / "conftest", f"#!/bin/sh\necho {shlex.quote(conftest_report)}\n")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+        result = run_driver("terraform", self._terraform_ok(), cwd=str(tmp_path))
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+            {"id": "tflint", "status": "pass", "message": ""},
+            {"id": "conftest: main.tf", "status": "pass", "message": ""},
+        ]
+        assert result.exit_code == 0

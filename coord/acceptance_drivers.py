@@ -44,6 +44,21 @@ diagnostic, or a single failing entry when ``init`` itself never gets far
 enough to run ``validate`` at all) comes out regardless of what the driven
 repo's own terraform version prints to plain stdout. This is a compile
 check, not an acceptance oracle — see :data:`VALIDATE_ONLY_KINDS`.
+
+``terraform`` additionally runs a deterministic policy gate (#3234, epic
+#3230 child 3) whenever the driven repo has opted in by carrying the
+convention files: ``tflint`` (rule-based HCL/provider checks — pinned
+provider versions, etc.) when a ``.tflint.hcl`` exists at the repo root,
+and ``conftest``/OPA (org policy over raw ``.tf`` source — no plaintext
+secrets, required tags, no ``local-exec``, no ``prevent_destroy``
+removal) when a ``policy/`` directory of ``*.rego`` files exists. Like
+``validate``, each forces its own structured JSON report
+(``--format=json`` / ``--output=json``) and is folded into the same
+normalized ``tests`` list — see :func:`parse_tflint_json` /
+:func:`parse_conftest_json`. This still proves only that the config obeys
+a fixed, mechanically-checkable ruleset, never whether the change itself
+is the *right* change — that judgment call stays with the reviewer (epic
+#3230 child 4), not this gate.
 """
 
 from __future__ import annotations
@@ -80,13 +95,16 @@ FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
 # verdict — this is NOT "not yet implemented", `run_driver` runs it for real
 # — but one that is intentionally scoped narrower than a full acceptance
 # oracle by design, not by a missing shared dependency. `terraform` runs
-# `init -backend=false` + `validate` only: a compile check that proves the
-# config parses and providers resolve syntactically, not that the
-# infrastructure does what was asked (no `terraform plan`, no credentials,
-# no apply — epic #3230's later children). Distinct from
-# FIXTURE_SERVER_DEPENDENT_KINDS above — that gap closes once a *shared*
-# dependency (the fixture server, #1538) ships; this one closes only when a
-# *later child issue* widens what this adapter itself runs.
+# `init -backend=false` + `validate` (#3232), plus an opt-in tflint/conftest
+# policy gate (#3234, #3230 child 3) — all of it static analysis over the
+# `.tf` source, proving the config parses/resolves and obeys a fixed
+# ruleset, never that the infrastructure does what was asked (no `terraform
+# plan`, no credentials, no apply — epic #3230's later children). The name
+# refers to that plan/apply/credentials scope, not literally "only
+# `validate` ever runs". Distinct from FIXTURE_SERVER_DEPENDENT_KINDS above
+# — that gap closes once a *shared* dependency (the fixture server, #1538)
+# ships; this one closes only when a *later child issue* (a live plan,
+# #3230's credentialed children) widens what this adapter itself runs.
 # `coord.repo_onboard`'s oracle-readiness layer reads this the same way it
 # reads FIXTURE_SERVER_DEPENDENT_KINDS, so a driver-present repo doesn't
 # silently read as fully oracle-ready.
@@ -387,6 +405,15 @@ def _run_terraform(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
     JSON; :func:`parse_terraform_validate_json` turns that into a single
     explicit failing entry rather than a silent empty list, so a broken
     ``init`` is never confused with "0 tests, nothing to report".
+
+    After ``validate``, also runs :func:`_run_terraform_policy_gate`
+    (#3234) and folds its entries onto the same ``tests`` list — the
+    deterministic tflint/conftest policy gate is not a separate driver
+    kind, it's this same adapter widened, per :data:`VALIDATE_ONLY_KINDS`'s
+    "closes only when a later child issue widens what this adapter itself
+    runs". Runs regardless of whether ``validate`` itself passed — a repo
+    with a policy violation AND an unrelated syntax error should surface
+    both, not just whichever ran first.
     """
     full_command = f"{run_command} -json"
     try:
@@ -408,11 +435,98 @@ def _run_terraform(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
     tests = parse_terraform_validate_json(
         proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
     )
-    return DriverResult(
-        exit_code=proc.returncode,
-        tests=tests,
-        raw_output=(proc.stdout or "") + (proc.stderr or ""),
-    )
+    raw_output = (proc.stdout or "") + (proc.stderr or "")
+
+    policy_tests, policy_raw = _run_terraform_policy_gate(cwd, timeout=timeout)
+    tests += policy_tests
+    raw_output += policy_raw
+
+    exit_code = proc.returncode
+    if exit_code == 0 and any(t.get("status") == "fail" for t in policy_tests):
+        # `validate` itself passed but a policy check failed — the overall
+        # command outcome must reflect that too, not just `tests` (#2096:
+        # unconfirmed success is a defect; a caller reading `exit_code`
+        # alone, e.g. `DriverResult.ok`, must not read this run as clean).
+        exit_code = 1
+
+    return DriverResult(exit_code=exit_code, tests=tests, raw_output=raw_output)
+
+
+def _run_terraform_policy_gate(cwd: str, *, timeout: int) -> tuple[list[dict], str]:
+    """The deterministic tflint/conftest policy gate (#3234, epic #3230
+    child 3) — the rule-based half of the terraform oracle, so the
+    reviewer's prose (child 4) is reserved for judgment calls a linter
+    can't make.
+
+    Each tool is opt-in per repo, gated on a convention file's presence so
+    a repo that hasn't adopted either yet keeps getting a plain
+    validate-only verdict rather than a gate it never configured:
+
+    - ``tflint --format=json`` runs when ``<cwd>/.tflint.hcl`` exists
+      (tflint auto-discovers it; no ``--config`` needed). Parsed by
+      :func:`parse_tflint_json`.
+    - ``conftest test --output=json --policy policy --parser hcl2 .`` runs
+      when ``<cwd>/policy/`` exists (conftest's own default policy dir
+      name) — reads raw ``.tf`` source directly, no ``terraform plan``/
+      credentials required, consistent with this driver's whole v1 scope.
+      Parsed by :func:`parse_conftest_json`.
+
+    A configured tool that fails to produce a parseable report (missing
+    binary, crashed invocation) is folded into a **failing** entry by its
+    parse_* function, never silently dropped — an opted-in check that
+    can't run is not the same as "no violations found" (#2096: a gate must
+    be able to fail, and an unconfirmed outcome is not a pass).
+
+    Returns ``(tests, raw_output)`` to be merged onto the caller's own
+    ``validate`` results — mirrors :func:`_run_terraform`'s own
+    ``(tests, raw_output)`` shape so both compose the same way.
+    """
+    tests: list[dict] = []
+    raw_output = ""
+
+    if (Path(cwd) / ".tflint.hcl").is_file():
+        try:
+            proc = subprocess.run(
+                "tflint --format=json",
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise DriverError(
+                f"tflint policy check timed out after {timeout}s"
+            ) from e
+        except OSError as e:
+            raise DriverError(f"tflint policy check failed to start: {e}") from e
+        tests += parse_tflint_json(
+            proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+        )
+        raw_output += (proc.stdout or "") + (proc.stderr or "")
+
+    if (Path(cwd) / "policy").is_dir():
+        try:
+            proc = subprocess.run(
+                "conftest test --output=json --policy policy --parser hcl2 .",
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise DriverError(
+                f"conftest policy check timed out after {timeout}s"
+            ) from e
+        except OSError as e:
+            raise DriverError(f"conftest policy check failed to start: {e}") from e
+        tests += parse_conftest_json(
+            proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+        )
+        raw_output += (proc.stdout or "") + (proc.stderr or "")
+
+    return tests, raw_output
 
 
 def parse_test_output(output: str) -> list[dict]:
@@ -801,6 +915,180 @@ def parse_terraform_validate_json(
             "status": "fail",
             "message": "terraform validate reported invalid with no parseable diagnostics",
         })
+    return tests
+
+
+def parse_tflint_json(stdout: str, *, exit_code: int = 0, stderr: str = "") -> list[dict]:
+    """Parse ``tflint --format=json``'s built-in structured report (a core
+    tflint flag, not a plugin) into normalized ``{"id", "status",
+    "message"}`` dicts — the same shape :func:`parse_terraform_validate_json`
+    already produces, so both fold onto one ``tests`` list (#3234).
+
+    The report is ``{"issues": [{"rule": {"name": str, "severity":
+    "error"|"warning"|"notice"}, "message": str, "range": {"filename": str,
+    "start": {"line": int}}}, ...], "errors": [...]}``. ``severity="error"``
+    issues (the ones a repo's ``.tflint.hcl`` promotes to blocking — e.g. a
+    pinned-provider-version rule) each become a ``status="fail"`` entry;
+    ``warning``/``notice`` issues don't block, so — mirroring
+    :func:`parse_terraform_validate_json`'s own warning handling — they're
+    folded into a single ``status="pass"`` entry's message rather than each
+    getting their own failing-looking row. A non-empty top-level
+    ``"errors"`` (tflint's own execution errors — a malformed
+    ``.tflint.hcl``, an unresolvable plugin — distinct from lint *issues*
+    found in the driven repo's ``.tf`` files) always fails the whole check,
+    since it means tflint never got far enough to actually lint anything.
+
+    Never returns ``[]`` on a crash — empty or non-JSON *stdout* (missing
+    ``tflint`` binary, a bare shell "not found") surfaces as a single
+    explicit failing ``"tflint"`` entry with *stderr*'s tail, mirroring
+    :func:`parse_terraform_validate_json`'s "a crashed run must surface as
+    a failure, never as an empty pass list" rule — an opted-in check
+    (``.tflint.hcl`` present) that silently produced nothing is not the
+    same as "no violations found".
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": (
+                f"tflint produced no output (exit {exit_code}): "
+                f"{tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, dict) or "issues" not in report:
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": f"unrecognized `tflint --format=json` output: {tail}",
+        }]
+
+    top_errors = report.get("errors") or []
+    if top_errors:
+        parts = [
+            str(e.get("message", e)) if isinstance(e, dict) else str(e)
+            for e in top_errors
+        ]
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": f"tflint reported execution error(s): {'; '.join(parts)}",
+        }]
+
+    issues = [i for i in (report.get("issues") or []) if isinstance(i, dict)]
+    error_issues = [
+        i for i in issues if (i.get("rule") or {}).get("severity") == "error"
+    ]
+
+    if not error_issues:
+        other_count = len(issues)
+        message = f"{other_count} non-blocking issue(s)" if other_count else ""
+        return [{"id": "tflint", "status": "pass", "message": message}]
+
+    tests = []
+    for issue in error_issues:
+        rule = issue.get("rule") or {}
+        rule_name = str(rule.get("name", "") or "unknown-rule")
+        rng = issue.get("range") if isinstance(issue.get("range"), dict) else {}
+        filename = str(rng.get("filename", "") or "") if rng else ""
+        start = rng.get("start") if isinstance(rng.get("start"), dict) else {}
+        line = start.get("line") if start else None
+        location = f"{filename}:{line}" if filename and line else filename
+        node_id = f"{location}: {rule_name}" if location else rule_name
+        tests.append({
+            "id": node_id,
+            "status": "fail",
+            "message": str(issue.get("message", "") or ""),
+        })
+    return tests
+
+
+def parse_conftest_json(stdout: str, *, exit_code: int = 0, stderr: str = "") -> list[dict]:
+    """Parse ``conftest test --output=json``'s built-in structured report
+    (a core conftest flag, not a plugin) into normalized ``{"id", "status",
+    "message"}`` dicts — the same shape the rest of this module's parse_*
+    functions produce (#3234).
+
+    The report is a JSON array with one object per file conftest evaluated:
+    ``{"filename": str, "namespace": str, "successes": int, "failures":
+    [{"msg": str}, ...], "warnings": [...], "exceptions": [{"msg": str},
+    ...]}``. Each ``failures[]`` entry (a rego policy rule that denied the
+    input) becomes its own ``status="fail"`` entry. Each ``exceptions[]``
+    entry (the *policy itself* erroring — a rego syntax mistake, a missing
+    input field a rule assumed existed) ALSO fails — an exception means the
+    policy never got to render a verdict at all, which is not the same as
+    "no violations found" and must not be read as one. A file with neither
+    collapses to one ``status="pass"`` entry noting its warning count,
+    mirroring :func:`parse_terraform_validate_json`'s/:func:`parse_tflint_json`'s
+    "non-blocking findings fold into the pass message" convention.
+
+    Never returns ``[]`` on a crash — empty or non-JSON *stdout* (missing
+    ``conftest`` binary, an empty/misnamed ``policy/`` dir conftest itself
+    rejects before evaluating anything) surfaces as a single explicit
+    failing ``"conftest"`` entry with *stderr*'s tail, same "crashed run
+    must surface as a failure" rule as this module's other parse_*
+    functions. A well-formed report that is a JSON array with zero entries
+    (conftest given no matching input files) is left as a single
+    ``status="pass"`` entry rather than an empty list — an opted-in check
+    (``policy/`` present) producing a genuinely empty, well-formed report is
+    still a real (if vacuous) observation, distinct from the crash case
+    above.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "conftest",
+            "status": "fail",
+            "message": (
+                f"conftest produced no output (exit {exit_code}): "
+                f"{tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, list):
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "conftest",
+            "status": "fail",
+            "message": f"unrecognized `conftest --output=json` output: {tail}",
+        }]
+
+    tests = []
+    for entry in report:
+        if not isinstance(entry, dict):
+            continue
+        filename = str(entry.get("filename", "") or "conftest")
+        failures = entry.get("failures") or []
+        exceptions = entry.get("exceptions") or []
+        warnings = entry.get("warnings") or []
+
+        for f in failures:
+            msg = str((f.get("msg", "") if isinstance(f, dict) else str(f)) or "")
+            tests.append({
+                "id": f"{filename}: {msg}" if msg else filename,
+                "status": "fail",
+                "message": msg,
+            })
+        for e in exceptions:
+            msg = str((e.get("msg", "") if isinstance(e, dict) else str(e)) or "")
+            tests.append({
+                "id": f"{filename}: policy error: {msg}" if msg else f"{filename}: policy error",
+                "status": "fail",
+                "message": msg,
+            })
+        if not failures and not exceptions:
+            warning_count = len(warnings)
+            message = f"{warning_count} warning(s)" if warning_count else ""
+            tests.append({"id": f"conftest: {filename}", "status": "pass", "message": message})
+
+    if not tests:
+        tests.append({"id": "conftest", "status": "pass", "message": "no input files evaluated"})
     return tests
 
 

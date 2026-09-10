@@ -1716,12 +1716,13 @@ def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
             layer="oracle", check="oracle.validate_only_scope", severity=WARN,
             summary=(
                 f"{kinds_str} runs `terraform init -backend=false` + "
-                "`terraform validate` only (#3232) — a compile check that "
-                "proves the config parses and providers resolve "
-                "syntactically, not that the infrastructure does what was "
-                "asked. No `terraform plan` (needs provider credentials — "
-                "#3230 child 2) and no ephemeral apply (#3230 child 6) yet, "
-                "so this is a smoke net, not a pinned oracle"
+                "`terraform validate` (#3232), plus an opt-in tflint/"
+                "conftest policy gate (#3234) — all static analysis that "
+                "proves the config parses, resolves, and obeys a fixed "
+                "ruleset, not that the infrastructure does what was asked. "
+                "No `terraform plan` (needs provider credentials — #3230 "
+                "child 2) and no ephemeral apply (#3230 child 6) yet, so "
+                "this is a smoke net, not a pinned oracle"
             ),
             fix=(
                 "none available yet — #3230's child 2 (plan/credentials) "
