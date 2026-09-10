@@ -927,6 +927,40 @@ def test_a_directory_declaration_under_the_fanout_threshold_does_not_warn(cli, d
     assert "warning:" not in result.output
 
 
+# ── #3258: a Files heading that parses to zero paths must say so ────────────
+
+
+def test_a_files_heading_that_parses_to_nothing_warns(cli, coord_db):
+    # No bullets, no bare paths, no table — just prose under the heading.
+    # Before #3258 this was byte-identical to declaring nothing at all.
+    backends.upsert_issue(
+        coord_db, repo_name=REPO, number=420, title="issue 420",
+        body="## Files\nSee the PR description for the affected files.\n",
+        state="open",
+    )
+    coord_db.commit()
+
+    result = cli("add", REPO, "420")
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" in result.output
+    assert "#3258" in result.output
+    assert "zero paths" in result.output
+    # ORDER, never REFUSE — the entry still queues with no `after`.
+    assert queued(420)["after_json"] == []
+
+
+def test_a_well_formed_files_heading_does_not_trigger_the_malformed_warning(
+    cli, declare,
+):
+    declare(421, "coord/overlap_predict.py")
+
+    result = cli("add", REPO, "421")
+
+    assert result.exit_code == 0, result.output
+    assert "#3258" not in result.output
+
+
 def test_editing_the_issue_live_narrows_a_stale_bare_directory_declaration(
     cli, declare, monkeypatch,
 ):

@@ -112,6 +112,7 @@ from coord.overlap_predict import (
     declared_footprints,
     fanout_warnings,
     inflight_footprints,
+    malformed_files_warning,
     parse_declared_files,
     predict_overlap,
     predictions_from_audit,
@@ -449,10 +450,11 @@ def drive_queue_add(
     # the feature existed.
     prediction = Prediction()
     staleness_note = ""
+    malformed_note = ""
     auto_after: list[str] = []
     rejected_after: list[str] = []
     if not no_predict_overlap:
-        prediction, staleness_note = _predict_overlap(
+        prediction, staleness_note, malformed_note = _predict_overlap(
             config_path, repo, issue, existing_entries
         )
         candidate_after = _applicable_auto_after(
@@ -522,6 +524,12 @@ def drive_queue_add(
     # even if that leaves nothing else to report, since a rejection an
     # operator asked for and got no acknowledgement of looks identical to one
     # that silently didn't take.
+    # #3258: plus a warning when THIS candidate's own `## Files` heading
+    # parsed to zero paths — the silent-miss this issue is about. Shown
+    # regardless of whether anything else fired, for the same reason as the
+    # --reject-after confirmation above: an author who wrote a declaration
+    # that never took must not see output byte-identical to "declared
+    # nothing".
     overlap_notes: list[str] = []
     if auto_after:
         overlap_notes.append(prediction.reason)
@@ -531,6 +539,8 @@ def drive_queue_add(
             "rejected via --reject-after (not applied): " + ", ".join(rejected_after)
         )
     overlap_notes.extend(fanout_warnings(prediction))
+    if malformed_note:
+        overlap_notes.append(malformed_note)
     if staleness_note:
         overlap_notes.append(staleness_note)
     overlap_note = ("\n" + "\n".join(overlap_notes)) if overlap_notes else ""
@@ -825,7 +835,7 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
 
 def _predict_overlap(
     config_path: Path, repo: str, issue: int, existing_entries: list[QueueEntry],
-) -> tuple[Prediction, str]:
+) -> tuple[Prediction, str, str]:
     """Compare this issue's declared files against work already in flight.
 
     Same-repo only: two repos' paths cannot collide, and comparing them would
@@ -833,19 +843,29 @@ def _predict_overlap(
     checked first (ground truth); a queued entry with no branch yet is
     compared declaration-to-declaration, and only when it has one.
 
-    Returns ``(prediction, staleness_note)`` — see `_candidate_body` for when
-    the note is non-empty. Every OTHER body this consults (an in-flight
-    branch's own declaration, an unrelated queued entry's) still comes from
-    the plain cache: re-reading fifteen bodies live on every `add` is exactly
-    the cost the module's docstring rejects, and #2601's own report is about
-    correcting THIS entry's declaration, not anyone else's.
+    Returns ``(prediction, staleness_note, malformed_warning)`` — see
+    `_candidate_body` for when the staleness note is non-empty, and
+    :func:`coord.overlap_predict.malformed_files_warning` (#3258) for the
+    third: a `## Files` heading was present on THIS candidate but parsed to
+    zero paths, so the declaration silently carried no ordering signal.
+    Computed here (not just where `candidate` ends up empty below) because
+    that IS the path a malformed declaration takes — rule 3 treats "no
+    heading" and "an unparsed heading" identically for ordering purposes, but
+    the operator reading `add`'s output must not.
+
+    Every OTHER body this consults (an in-flight branch's own declaration, an
+    unrelated queued entry's) still comes from the plain cache: re-reading
+    fifteen bodies live on every `add` is exactly the cost the module's
+    docstring rejects, and #2601's own report is about correcting THIS
+    entry's declaration, not anyone else's.
     """
     coordinates = _repo_coordinates(config_path, repo)
     if coordinates is None:
-        return Prediction(), ""
+        return Prediction(), "", ""
     repo_github, base_branch = coordinates
 
     candidate_body, staleness_note = _candidate_body(repo, issue, repo_github)
+    malformed_warning = malformed_files_warning(candidate_body)
 
     def body_fetcher(repo_name: str, number: int) -> str:
         if repo_name == repo and number == issue:
@@ -855,8 +875,10 @@ def _predict_overlap(
     candidate = collect_candidate_files(repo, issue, body_fetcher)
     if not candidate:
         # Rule 3: no prediction is a valid answer. Nothing is fetched, nothing
-        # is compared, and the add is byte-identical to the pre-#2247 one.
-        return Prediction(), ""
+        # is compared, and the add is byte-identical to the pre-#2247 one —
+        # except for `malformed_warning`, which fires precisely in this
+        # branch when the empty candidate was a parse failure, not silence.
+        return Prediction(), staleness_note, malformed_warning
 
     key = entry_key(repo, issue)
     footprints = inflight_footprints(
@@ -878,7 +900,11 @@ def _predict_overlap(
             synced_at_fetcher=_issue_body_synced_at,
         )
     )
-    return predict_overlap(candidate, footprints, exclude_keys={key}), staleness_note
+    return (
+        predict_overlap(candidate, footprints, exclude_keys={key}),
+        staleness_note,
+        malformed_warning,
+    )
 
 
 def _applicable_auto_after(
