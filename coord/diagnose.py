@@ -857,8 +857,8 @@ def _recover_review(
                 res.actions_taken.append("recovered review verdict/findings from transcript")
             res.actions_taken.append(f"finalized phantom review session ({_finalize_dead(latest, config)})")
             res.recovered = True
-    elif state == "live" and _is_stale(latest):
-        res.findings.append("review session is LIVE but stale (idle days) — capturing read-only, reset to clear")
+    elif state == "live" and _is_stale(latest, config):
+        res.findings.append("review session is LIVE but stale (silent past threshold) — capturing read-only, reset to clear")
         if not dry_run and _recover_review_findings(latest, config):
             res.actions_taken.append("captured current review findings from transcript (session left running)")
         res.needs_reset = True
@@ -1090,8 +1090,8 @@ def _recover_work_like(
             _prune_orphan_for_failed(board, config, latest, res, dry_run=dry_run)
         if not res.needs_reset:
             res.recovered = True
-    elif state == "live" and _is_stale(latest):
-        res.findings.append("session is LIVE but stale (idle days) — reset to clear it")
+    elif state == "live" and _is_stale(latest, config):
+        res.findings.append("session is LIVE but stale (silent past threshold) — reset to clear it")
         res.needs_reset = True
     elif state == "live":
         res.findings.append("session is live and recent — left running")
@@ -1655,13 +1655,81 @@ def _cleanup_issue(
             res.actions_taken.append(f"cleanup: marked phantom row {a.assignment_id} terminal ({exc})")
 
 
-def _is_stale(assignment: "Assignment", *, max_age_hours: float = 12.0) -> bool:
-    """A still-running session whose dispatch is older than *max_age_hours* is
-    treated as stale (abandoned/idle) — recovery can't safely finalize a live
-    session, so these escalate to a reset offer."""
+def _last_output_at(assignment: "Assignment", config: "Config") -> float | None:
+    """The Unix timestamp of *assignment*'s most recent output, per its own
+    agent's ``/status`` (``last_output_at`` — the agent stats its own log
+    file's mtime, #1632; the same field :mod:`coord.notifier` reads for its
+    output-silence probe). ``None`` when the machine can't be resolved, the
+    agent is unreachable, or the agent's ``active`` list doesn't carry this
+    id (already finished, or never produced a byte of output yet) — the
+    caller must not read ``None`` as "silent", only as "unknown"."""
+    if not assignment.assignment_id:
+        return None
+    machine = _resolve_machine(config, assignment.machine_name)
+    if machine is None:
+        return None
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    result = fetch_status(machine)
+    if not result.ok or result.data is None:
+        return None
+    active = result.data.get("active") or []
+    for entry in active:
+        if isinstance(entry, dict) and entry.get("id") == assignment.assignment_id:
+            value = entry.get("last_output_at")
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _is_stale(
+    assignment: "Assignment",
+    config: "Config",
+    *,
+    max_silence_secs: float | None = None,
+) -> bool:
+    """A still-``live`` session that has gone SILENT for *max_silence_secs* is
+    stale (wedged) — recovery can't safely finalize a live session, so these
+    escalate to a reset offer.
+
+    #3222: this used to measure ``time.time() - assignment.dispatched_at`` —
+    how long ago the session *started* — against a 12h default. That is the
+    wrong clock in both directions: a review wedged 51 minutes into a
+    4-second-old dispatch read as fresh (51min < 12h) and was reported
+    "healthy" (the coord-tui#81 incident this closes), while a
+    long-but-healthy session past 12h and still emitting output every few
+    seconds would have been flagged stale for no reason. ``dispatched_at``
+    answers "how long has this run" — a question the docstring never asked;
+    "is it doing anything" is answered by the agent's own output-silence
+    gap, ``last_output_at`` (#1632), which is exactly the signal the
+    original incident was diagnosed with by hand.
+
+    ``max_silence_secs`` defaults to :data:`coord.notifier.baseline.
+    SILENCE_CAP_SECS` (45 minutes) — the same ceiling the notifier's own
+    output-silence probe uses for every assignment type, cold or warmed up
+    (`silence_threshold` is clamped into ``[SILENCE_FLOOR_SECS,
+    SILENCE_CAP_SECS]`` regardless of stratum). Reusing it rather than
+    inventing a second constant means "how long is too long to be silent"
+    has one answer in this codebase, not two that can drift apart.
+
+    Falls back to ``dispatched_at`` only when the agent has never published
+    ANY output for this assignment at all (fresh dispatch, unreachable
+    agent, or a log-less session) — using the same threshold — so a session
+    that just started a second ago is not misread as instantly stale.
+    """
+    if max_silence_secs is None:
+        from coord.notifier.baseline import SILENCE_CAP_SECS  # noqa: PLC0415
+
+        max_silence_secs = SILENCE_CAP_SECS
+
+    last_output = _last_output_at(assignment, config)
+    if last_output is not None:
+        return (time.time() - last_output) > max_silence_secs
     if not assignment.dispatched_at:
         return False
-    return (time.time() - assignment.dispatched_at) > max_age_hours * 3600.0
+    return (time.time() - assignment.dispatched_at) > max_silence_secs
 
 
 # ── #2536: fleet-wide phantom-row self-heal sweep ───────────────────────────
