@@ -103,6 +103,18 @@ class CIFailureDetail:
     underlying data wasn't available (no job matched the check, the log
     fetch failed/was throttled, ...) — a caller must treat an all-empty
     instance the same as "no detail", not as evidence of anything.
+
+    ``log_excerpt`` (#3245) is extracted BY RELEVANCE, not position — see
+    :func:`coord.ci_github._extract_relevant_log_lines`. ``truncated``
+    means the same thing it always has ("the cut is visible, don't treat
+    this as the full log"), just computed over relevance-ranked lines
+    instead of the raw tail now. ``no_diagnostics_matched`` (new field,
+    default ``False`` so every pre-#3245 stored ``ci_fix_detail_json`` row
+    — and any hand-built ``CIFailureDetail(...)`` missing this kwarg —
+    keeps decoding/constructing unchanged) is ``True`` iff a log was
+    fetched (non-empty) but nothing in any priority tier matched it —
+    distinct from ``log_excerpt == ""`` meaning "no log was fetched at
+    all", which says nothing either way.
     """
 
     check_name: str
@@ -111,6 +123,7 @@ class CIFailureDetail:
     log_excerpt: str = ""
     run_url: str = ""
     truncated: bool = False
+    no_diagnostics_matched: bool = False
 
 
 def ci_failure_detail_to_json(detail: "CIFailureDetail | None") -> str:

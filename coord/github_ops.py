@@ -2699,8 +2699,10 @@ def get_job_log(repo: str, job_id: str) -> str:
     never called from the polling path, only once at CI-fix dispatch time.
 
     No server-side tail: this downloads the job's ENTIRE log before
-    :func:`coord.ci_github._bound_log_excerpt` truncates it client-side. A
-    GitHub Actions job log can run to many MB, and this call shares
+    :func:`coord.ci_github._extract_relevant_log_lines` (#3245; formerly a
+    plain tail-truncate via ``_bound_log_excerpt``) selects the
+    diagnostic-relevant lines client-side. A GitHub Actions job log can run
+    to many MB, and this call shares
     :func:`_gh`'s single subprocess timeout with every other ``gh``
     invocation — so a very verbose job's log can time out this fetch
     outright (fails soft to no detail, same as any other raise here, but

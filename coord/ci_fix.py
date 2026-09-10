@@ -85,7 +85,8 @@ def _detail_has_content(detail: CIFailureDetail) -> bool:
     noise. Treated identically to ``detail is None``.
     """
     return bool(
-        detail.job_name or detail.step_name or detail.run_url or detail.log_excerpt
+        detail.job_name or detail.step_name or detail.run_url
+        or detail.log_excerpt or detail.no_diagnostics_matched
     )
 
 
@@ -99,6 +100,17 @@ def _format_ci_failure_detail(detail: CIFailureDetail) -> list[str]:
     coordinator, so a ci-fix worker doesn't have to spend a whole session
     rediscovering it from scratch (see the issue's evidence: 82 turns/$2.55
     to re-find a one-line fix this data already pointed at).
+
+    #3245: ``detail.log_excerpt`` is now diagnostic lines selected BY
+    RELEVANCE (``##[error]`` annotations, then Rust ``error[E...]:``/
+    ``-->`` pairs, then ``warning:`` lines if budget remains) rather than
+    the raw tail — a script-final job's tail is the runner echoing its own
+    script source plus cleanup, never the error. When the fetched log had
+    NOTHING matching any tier, ``detail.no_diagnostics_matched`` is set and
+    the briefing says so explicitly instead of silently handing over an
+    empty/misleading excerpt (see the issue: a briefing that looks
+    substantive but carries no signal costs a worker a full round trusting
+    it).
     """
     lines: list[str] = ["## CI failure detail", ""]
     if detail.job_name:
@@ -109,15 +121,25 @@ def _format_ci_failure_detail(detail: CIFailureDetail) -> list[str]:
         lines.append(f"Run: {detail.run_url}")
     if detail.log_excerpt:
         lines.append("")
-        # #3114 acceptance: truncation must be visible in the text itself,
-        # never a silent cut.
+        # #3114/#3245 acceptance: truncation must be visible in the text
+        # itself, never a silent cut.
         lines.append(
-            "Log excerpt (truncated — showing the tail only):"
-            if detail.truncated else "Log excerpt:"
+            "Log excerpt (diagnostic lines extracted by relevance, not "
+            "position — truncated further by the excerpt budget):"
+            if detail.truncated
+            else "Log excerpt (diagnostic lines extracted by relevance, not position):"
         )
         lines.append("```")
         lines.append(detail.log_excerpt)
         lines.append("```")
+    elif detail.no_diagnostics_matched:
+        lines.append("")
+        if detail.run_url:
+            lines.append(
+                f"No diagnostic lines matched; full log at {detail.run_url}"
+            )
+        else:
+            lines.append("No diagnostic lines matched.")
     lines.append("")
     return lines
 
