@@ -71,7 +71,13 @@ import httpx
 from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
-from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
+from coord.models import (
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Machine,
+)
 # #2170: the SAME marker/exit-code convention `scripts/coord-test-runner.sh`
 # and `coord.revalidate` use for a red baseline — imported (not re-literalled)
 # so the dispatched smoke agent's instructions can never drift from what the
@@ -1916,14 +1922,31 @@ def _dispatch_smoke_single_leg(
         # `test_command`) — see `pick_smoke_machine`, which treats an empty
         # `required_caps` as "any capable-for-repo machine".
         #
-        # `mock-author`/`test-author` (#930/#1176) keep the OLD skip-on-miss
-        # behavior: #1076/#1152 established that a rule miss for THOSE types
-        # means "genuinely nothing to smoke-test" (a Gate-A contract/fixture-
-        # only diff), and `dispatch_pending_reviews` back-fills
-        # `test_state="skipped"` for them — dispatching a real suite run
-        # here would duplicate that and burn a full test run on a diff that
-        # never touches source.
-        if completed.type != "work" or smoke_command is None:
+        # `mock-author`/`test-author` (#930/#1176, `SEALED_PATH_AUTHOR_TYPES`)
+        # keep the OLD skip-on-miss behavior: #1076/#1152 established that a
+        # rule miss for THOSE types means "genuinely nothing to smoke-test"
+        # (a Gate-A contract/fixture-only diff), and `dispatch_pending_
+        # reviews` back-fills `test_state="skipped"` for them — dispatching a
+        # real suite run here would duplicate that and burn a full test run
+        # on a diff that never touches source.
+        #
+        # #3239: this used to read `completed.type != "work"`, which silently
+        # folded `epic-decompose` (added to `WORK_LIKE_TYPES` by #3132, after
+        # this line was written) into the same skip-on-miss bucket as
+        # mock-author/test-author — even though an epic-decompose leg is a
+        # REAL implementation diff against ordinary source (the epic's first
+        # slice; see `CLOSES_ISSUE_TYPES`'s docstring), not a sealed-path
+        # contract/fixture. A capability-rule miss on a plain repo like this
+        # one (no `tui/`/`coord/dashboard/webapp/`-style rule ever matches
+        # `coord/**`) meant the Test stage never dispatched at all for that
+        # leg — `coord drive` then polled the completed `done` row forever,
+        # since nothing downstream ever resolves `test_state` from `""`
+        # (claude-coordinator#3226/#3239: 8h burned on an already-finished
+        # leg). The correct predicate is `SEALED_PATH_AUTHOR_TYPES`
+        # membership, not `!= "work"` — every WORK_LIKE_TYPES member that
+        # ISN'T a sealed-path author still dispatches a real Test-stage run
+        # on a miss, exactly like `"work"` always has.
+        if completed.type in SEALED_PATH_AUTHOR_TYPES or smoke_command is None:
             return None
 
     if smoke_command is None:

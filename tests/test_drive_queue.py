@@ -1998,6 +1998,38 @@ def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():
     assert plan.launch is not None and plan.launch.issue == 1650
 
 
+def test_prior_done_work_does_not_get_the_widened_backoff():
+    """claude-coordinator#3239: the retry-pacing sibling of
+    `test_exhausted_prior_done_work_does_not_get_the_dispatch_note` below —
+    `_retry_backoff_reason` and `_reconcile_running` both call the same
+    `_is_dispatch_only_failure` now, so a relaunch that found a PRIOR
+    attempt's work already `done` must not get the widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` floor here either, for the
+    identical reason the give-up wording must not name a dispatch failure:
+    nothing about this death is a dispatch-layer problem."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            # Same 90s elapsed as the widened-backoff test above: clears the
+            # plain RETRY_BACKOFF_SECONDS[0] (60s) but not the widened 660s
+            # floor (#3145) — so this only launches if the floor correctly
+            # does NOT apply.
+            retry_backoff_at=NOW - 90.0,
+            last_reason="drive exited for claude-coordinator#1650 "
+            "(exit_code=3): deadline of 240m exceeded",
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open", work_done=True)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
 def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
     """The counterpart: a launch that DID dispatch (an assignment exists,
     created after `launched_at`) is NOT treated as a pure dispatch failure —
@@ -2146,6 +2178,52 @@ def test_exhausted_checks_failed_does_not_get_the_dispatch_note():
     assert plan.reconciles[0].outcome == "exhausted"
     reason = plan.blocked[0].reason
     assert "no assignment was ever created" not in reason
+
+
+def test_exhausted_prior_done_work_does_not_get_the_dispatch_note():
+    """claude-coordinator#3239/#3226: a FOURTH false-positive shape, the same
+    class as #2424/#2334/#2442 above but not keyed off `own_reason` text at
+    all — the real incident died on a bare `"deadline of 240m exceeded"`,
+    which none of those three classifiers can match, while a `done`, pushed,
+    unreviewed `epic-decompose` work row plainly sat on the board (`coord
+    gates` showed `status=done` with a real `branch`, `test_state=None`,
+    `review_state=None`) for the entire 8-hour window this cost.
+
+    `facts.work_done=True` is the positive, independent witness that a PRIOR
+    attempt's dispatch reached `coord assign` and ran the work to
+    completion — so attempt 2 correctly dispatched nothing more (there was
+    nothing left to dispatch), and `_dispatch_produced_nothing`'s bare
+    timestamp comparison must not be read as evidence of a dispatch-layer
+    failure. Getting this backwards is worse than a wasted retry: the
+    "likely an infrastructure/dispatch-layer failure, not a code defect"
+    wording actively misdirects an operator away from the real, complete,
+    reviewable implementation already sitting on the branch."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=3): deadline "
+        "of 240m exceeded"
+    )
+    # No assignment dispatched AFTER `launched_at` (attempt 2 dispatched
+    # nothing — the work was already done), but `work_done=True` witnesses
+    # that an EARLIER attempt's dispatch plainly succeeded.
+    facts = IssueFacts(known=True, issue_state="open", work_done=True)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
 
 
 def test_exhausted_checks_absent_does_not_get_the_dispatch_note():
