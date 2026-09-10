@@ -2086,7 +2086,18 @@ def is_ci_absent_reason(reason: str | None) -> bool:
     """True when *reason* names a PR whose CI was expected to run but never
     reported a single check (#1904) — as opposed to one that ran and failed
     (``checks_failed``), is still running (:func:`is_ci_pending_reason`), or
-    ran stale (``CI_STALE_PREFIX``)."""
+    ran stale (``CI_STALE_PREFIX``).
+
+    #3254: UNLIKE its four siblings above (`is_ci_pending_reason`,
+    `is_ci_infra_reason`, `is_ci_flaky_reason`, `is_ci_unreadable_reason`),
+    this condition is NOT self-refreshing — no amount of waiting or
+    retrying ever makes GitHub build a check suite retroactively for the
+    SAME head; only a new commit re-fires the `pull_request` webhook that
+    creates one. `coord.drive_queue` consumes this (via
+    `IssueFacts.merge_ci_absent`) to fail fast — block without spending a
+    launch attempt — rather than parking on a reading that can never
+    resolve itself.
+    """
     return (reason or "").startswith(CI_ABSENT_PREFIX)
 
 
@@ -5205,7 +5216,8 @@ def _entry_gate_status(
                 return (
                     PLAN_BLOCKED,
                     f"{CI_ABSENT_PREFIX} no checks reported for PR #{entry.pr_number} "
-                    "though this repo declares CI — merging would run untested code",
+                    "though this repo declares CI — merging would run untested code; "
+                    "push a new commit — no amount of retrying clears this (#3254)",
                 )
         failed = failed_checks(checks)
         if failed:
@@ -7378,7 +7390,8 @@ def process(
                         msg = (
                             f"{CI_ABSENT_PREFIX} no checks reported for PR "
                             f"#{entry.pr_number} though this repo declares CI "
-                            "— merging would run untested code"
+                            "— merging would run untested code; push a new "
+                            "commit — no amount of retrying clears this (#3254)"
                         )
                         entry.error = msg
                         events.append(MergeEvent(entry, "checks_absent", msg))

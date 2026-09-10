@@ -116,9 +116,12 @@ def board(
     sessions: tuple[int, ...] = (),
     ci_pending: tuple[int, ...] = (),
     ci_pending_live: tuple[int, ...] = (),
+    ci_absent: tuple[int, ...] = (),
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
-    for issue in {*merged, *closed, *open_, *active, *ci_pending, *ci_pending_live}:
+    for issue in {
+        *merged, *closed, *open_, *active, *ci_pending, *ci_pending_live, *ci_absent,
+    }:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
             issue_state=(
@@ -138,6 +141,16 @@ def board(
             merge_ci_pending_reason=(
                 "CI running: test (3.12)"
                 if issue in ci_pending or issue in ci_pending_live
+                else ""
+            ),
+            # #3254: the board's current read of this issue's merge gate
+            # names #1904's `checks_absent` — deliberately a SEPARATE fact
+            # from `merge_ci_pending` above; see `IssueFacts.merge_ci_absent`.
+            merge_ci_absent=issue in ci_absent,
+            merge_ci_absent_reason=(
+                "CI never ran: no checks reported for PR #99 though this "
+                "repo declares CI — merging would run untested code"
+                if issue in ci_absent
                 else ""
             ),
         )
@@ -317,6 +330,74 @@ def test_build_board_view_ci_pending_is_false_with_no_merge_sections_at_all():
     never raises."""
     view = build_board_view({"assignments": [], "issues": []}, [])
     assert not view.facts(entry_key(REPO, 1650)).merge_ci_pending
+
+
+# ── #3254: `checks_absent` — terminal, NOT self-refreshing ─────────────────
+
+
+def test_build_board_view_reads_merge_ci_absent_from_the_live_plan_reason():
+    """#3254: `_entry_gate_status` (board-render time) computes #1904's
+    `checks_absent` classification directly — no extra `gh` call needed,
+    unlike #1892's infra classification — so the live `merge_plan` reason
+    already carries it whenever it applies."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 3254,
+                    "reason": (
+                        "CI never ran: no checks reported for PR #99 though "
+                        "this repo declares CI — merging would run untested "
+                        "code"
+                    ),
+                },
+                {
+                    "repo_name": REPO, "issue_number": 3255,
+                    "reason": "CI running: build, lint",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 3254, "error": None},
+                {"repo_name": REPO, "issue_number": 3255, "error": None},
+            ],
+        },
+        [],
+    )
+    absent = view.facts(entry_key(REPO, 3254))
+    assert absent.merge_ci_absent
+    assert absent.merge_ci_absent_reason.startswith("CI never ran:")
+    # `merge_ci_pending` must NOT also read True for this entry — the two
+    # facts are mutually exclusive and get OPPOSITE treatment downstream.
+    assert not absent.merge_ci_pending
+
+    pending = view.facts(entry_key(REPO, 3255))
+    assert pending.merge_ci_pending
+    assert not pending.merge_ci_absent
+
+
+def test_build_board_view_ci_absent_is_false_with_no_merge_sections_at_all():
+    view = build_board_view({"assignments": [], "issues": []}, [])
+    assert not view.facts(entry_key(REPO, 1650)).merge_ci_absent
+
+
+def test_build_board_view_does_not_flag_a_genuine_checks_failed_entry_as_absent():
+    """Regression: a plain 'checks failed' reason must not be misread as
+    `checks_absent` — the two are distinct #1904/#1892 classifications."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 3256,
+                    "reason": "checks failed: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 3256, "error": None},
+            ],
+        },
+        [],
+    )
+    assert not view.facts(entry_key(REPO, 3256)).merge_ci_absent
 
 
 # ── #1892: the sibling trigger — a verdictless CI failure ──────────────────
@@ -2649,6 +2730,75 @@ def test_a_parked_entry_never_reaches_blocked_even_deep_into_the_attempt_budget(
     assert plan.reconciles[0].outcome == "parked"
     assert plan.blocked == ()
     assert plan.alert is None
+
+
+# ── #3254: `checks_absent` blocks (not parks), and never spends an attempt ─
+
+
+def test_a_dead_drive_ci_absent_blocks_without_spending_an_attempt():
+    """Acceptance (#3254): unlike `ci_pending`, `checks_absent` cannot
+    self-refresh — parking on it would be an indefinite livelock — so a dead
+    drive on such an entry goes straight to `blocked`, exactly like
+    `refused`/`dead_end`, without spending a launch attempt."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "ci_absent"
+    assert reconcile.occupies is False
+    # Mirrors the `refused`/`dead_end` contract exactly: NOT `retry`/
+    # `exhausted` — no attempt spent, checked on both the reconcile and the
+    # paired `Blocked` (a bare `0` would also satisfy "attempts == 0" but
+    # wrongly imply a write happened).
+    assert "attempts" not in reconcile.updates
+    assert [b.key for b in plan.blocked] == [entry_key(REPO, 1650)]
+    blocked = plan.blocked[0]
+    assert "attempts" not in blocked.updates
+    assert blocked.updates["state"] == STATE_BLOCKED
+    assert "CI never ran" in blocked.reason
+    assert "push a new commit" in blocked.reason
+    assert blocked.reason == blocked.updates["last_reason"]
+
+
+def test_a_ci_absent_block_never_reaches_exhausted_even_deep_into_the_budget():
+    """Mirrors the #1891 CI-pending park's own equivalent test: an entry
+    that would have exhausted retries (attempts already at
+    max_attempts - 1) still blocks via the dedicated `ci_absent` branch, not
+    the generic `retry`/`exhausted` path — attempts genuinely never move."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    assert plan.reconciles[0].outcome == "ci_absent"
+    assert plan.blocked[0].updates.get("attempts") is None
+
+
+def test_a_ci_absent_block_is_not_permanent_and_resumes_once_the_gate_clears():
+    """Unlike `refused`/`dead_end` (#1844/#2019), a `checks_absent` block is
+    NOT tagged with a `_PERMANENT_BLOCK_MARKERS` marker — a new commit can
+    genuinely clear the gate, so the entry must still get the ordinary
+    #2230 `_reconcile_blocked` live-gate recheck and resume automatically,
+    the same generic mechanism any other re-evaluable `blocked` entry gets."""
+    from coord.drive_queue import is_permanent_block_reason
+
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    reason = plan.blocked[0].reason
+    assert not is_permanent_block_reason(reason)
+
+    # A LATER tick: the entry is now persisted `blocked` (with that reason),
+    # and a fresh commit has cleared the board's merge gate — the ordinary
+    # #2230 resume path must fire, exactly like any other re-evaluable
+    # `blocked` entry (no bespoke `checks_absent` resume logic needed).
+    blocked_entries = [
+        entry(1650, position=3, state=STATE_BLOCKED, attempts=0, last_reason=reason)
+    ]
+    cleared_board = BoardView(
+        issues={entry_key(REPO, 1650): IssueFacts(known=True, merge_gate_status="READY")}
+    )
+    plan2 = plan_tick(blocked_entries, cleared_board, capacity=1)
+    resumed = [r for r in plan2.reconciles if r.key == entry_key(REPO, 1650)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
 
 
 # ═══════════════════════════════════════════════════════════════════════════

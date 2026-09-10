@@ -7700,6 +7700,10 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "CI never ran" in (plan[0].reason or "")
         assert mq.is_ci_absent_reason(plan[0].reason)
+        # #3254: names the actual remedy — retrying cannot clear this gate,
+        # only a new commit can — instead of leaving an operator to infer it
+        # from the generic "merge attempted N times without landing".
+        assert "push a new commit" in plan[0].reason
 
     def test_ready_when_no_workflows_declared_and_checks_empty(self, coord_db) -> None:
         """Companion regression: a repo with no CI configured at all
@@ -8958,6 +8962,9 @@ class TestProcessConflictedEmptyChecks:
             assert "conflict" not in kinds, verdict
             assert items[0].state == PENDING, verdict
             assert mq.is_ci_absent_reason(items[0].error), verdict
+            # #3254: the live `process()` path names the same remedy the
+            # board-render path does.
+            assert "push a new commit" in items[0].error, verdict
 
     def test_failing_checks_still_block_regardless_of_mergeability(self) -> None:
         """Acceptance criterion: a PR with genuinely failing (non-empty)

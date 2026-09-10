@@ -4761,6 +4761,82 @@ def test_a_confirmed_failure_after_the_recheck_walks_the_bounded_retry_path():
     assert counters.merge_attempts == 1
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #3254: the FIFTH CI-outcome case — #1904's `checks_absent`
+# (`is_ci_absent_reason`): this repo declares CI but reported ZERO checks for
+# the PR. Unlike #1891/#1892/#2252/#2347 above, this is NOT self-refreshing —
+# no amount of waiting or re-polling ever makes GitHub build a check suite
+# retroactively for the SAME head, so the drive must die immediately
+# (never spending `counters.merge_attempts`) instead of looping forever on a
+# reading that can never change.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_ci_absent_dies_immediately_regardless_of_which_status_the_board_shows(
+    status,
+):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason=(
+                "CI never ran: no checks reported for PR #42 though this "
+                "repo declares CI — merging would run untested code"
+            ),
+        )
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "push a new commit" in action.message
+    assert "CI never ran" in action.message
+
+
+def test_ci_absent_never_spends_a_merge_attempt():
+    """Acceptance (#3254): unlike its four self-refreshing siblings, this
+    dies on the FIRST poll rather than retrying — but `counters.
+    merge_attempts` still reads 0, the same guarantee the other four give by
+    looping instead."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason=(
+            "CI never ran: no checks reported for PR #42 though this repo "
+            "declares CI — merging would run untested code"
+        ),
+    )
+
+    action = step(s, opts, counters=counters)
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert counters.merge_attempts == 0
+
+
+def test_a_genuinely_absent_check_never_dispatches_a_retry():
+    """Regression guard: this must not be readable as "keep polling, like the
+    other four" — no RUN action, no `coord merge --only` dispatched at all,
+    since nothing a re-check could observe would ever change without a new
+    commit."""
+    action = step(
+        approved_work(
+            merge_status="",
+            merge_reason="CI never ran: no checks reported for PR #42",
+        )
+    )
+    assert action.kind != RUN
+
+
+def test_ci_absent_reason_is_recognised_via_the_shared_predicate_not_ad_hoc_text():
+    from coord.merge_queue import CI_ABSENT_PREFIX, is_ci_absent_reason
+
+    assert is_ci_absent_reason(f"{CI_ABSENT_PREFIX} no checks reported for PR #42")
+    assert not is_ci_absent_reason("checks failed: build (failure)")
+    assert not is_ci_absent_reason("CI running: build")
+    assert not is_ci_absent_reason("CI infra: build (cancelled)")
+    assert not is_ci_absent_reason("")
+    assert not is_ci_absent_reason(None)
+
+
 # ── #1505: escalate on a status retrying can't fix ──────────────────────────
 
 
