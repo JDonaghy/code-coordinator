@@ -8620,6 +8620,10 @@ def build_app(
                     # key (a client predating this feature) means "no
                     # passthrough", same as `bool(None)`.
                     no_acceptance=bool(body.get("no_acceptance")),
+                    # #3236: per-entry destroy/replace-plan declaration.
+                    # Absent key (a client predating this feature) means
+                    # "not destructive", same as `bool(None)`.
+                    plan_destructive=bool(body.get("plan_destructive")),
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":

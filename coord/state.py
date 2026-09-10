@@ -7266,7 +7266,8 @@ _DRIVE_QUEUE_COLUMNS = (
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
     "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
-    "max_fix_rounds, no_acceptance"
+    "max_fix_rounds, no_acceptance, plan_destructive, apply_verdict, "
+    "apply_verdict_reason, apply_verdict_at"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -7296,6 +7297,15 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         "launch_host",
         "resumes",
         "retry_backoff_at",
+        # #3236: the apply-verdict gate extension — written by `coord
+        # drive-queue apply-verdict`, the same generic `update` path
+        # `resume` already uses for `hold_state`/`hold_probes`. Deliberately
+        # NOT `plan_destructive` — that is operator-declared at `add` time,
+        # same provenance split as `hold_after`/`hold_reason`/`resume_when`
+        # above it.
+        "apply_verdict",
+        "apply_verdict_reason",
+        "apply_verdict_at",
     }
 )
 
@@ -7350,6 +7360,7 @@ def enqueue_drive_queue(
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
     no_acceptance: bool = False,
+    plan_destructive: bool = False,
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -7388,6 +7399,13 @@ def enqueue_drive_queue(
     posture as ``max_fix_rounds``: a later `add` that omits `--no-acceptance`
     clears a previously-set one rather than leaving it in place.
 
+    ``plan_destructive`` (#3236) declares this gate as carrying a
+    destroy/replace terraform plan — see
+    ``coord.drive_queue.validate_apply_gate``/``plan_is_destructive`` for
+    what enforces the hard rule this unlocks ("a destroy/replace plan never
+    auto-resumes via ``resume_when``"). Same replace-on-every-`add` posture
+    as ``max_fix_rounds``/``no_acceptance``.
+
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
     routed.
@@ -7410,6 +7428,7 @@ def enqueue_drive_queue(
             "hold_scope": normalized_scope,
             "max_fix_rounds": max_fix_rounds,
             "no_acceptance": bool(no_acceptance),
+            "plan_destructive": bool(plan_destructive),
         },
     )
     if resp is not None:
@@ -7426,6 +7445,7 @@ def enqueue_drive_queue(
         hold_scope=normalized_scope,
         max_fix_rounds=max_fix_rounds,
         no_acceptance=no_acceptance,
+        plan_destructive=plan_destructive,
     )
 
 
@@ -7442,6 +7462,7 @@ def _enqueue_drive_queue_local(
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
     no_acceptance: bool = False,
+    plan_destructive: bool = False,
 ) -> int:
     now = time.time()
     after_json = json.dumps([str(a) for a in (after or [])])
@@ -7465,6 +7486,7 @@ def _enqueue_drive_queue_local(
     if max_fix_rounds is not None and int(max_fix_rounds) < 1:
         max_fix_rounds = None
     no_acceptance_int = 1 if no_acceptance else 0
+    plan_destructive_int = 1 if plan_destructive else 0
 
     # #2846: wrapped in retry_on_locked like every other write in this
     # module — this upsert is idempotent by natural key (repo_name,
@@ -7491,7 +7513,8 @@ def _enqueue_drive_queue_local(
             sql.execute(conn,
                 "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
                 "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
-                "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
+                "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ?, "
+                "plan_destructive = ? WHERE id = ?",
                 (
                     machine,
                     after_json,
@@ -7502,6 +7525,7 @@ def _enqueue_drive_queue_local(
                     hold_scope,
                     max_fix_rounds,
                     no_acceptance_int,
+                    plan_destructive_int,
                     existing["id"],
                 ),
             )
@@ -7516,8 +7540,8 @@ def _enqueue_drive_queue_local(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
             " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
-            " max_fix_rounds, no_acceptance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " max_fix_rounds, no_acceptance, plan_destructive) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -7532,6 +7556,7 @@ def _enqueue_drive_queue_local(
                 hold_scope,
                 max_fix_rounds,
                 no_acceptance_int,
+                plan_destructive_int,
             ),
             pk_column="id",
         )

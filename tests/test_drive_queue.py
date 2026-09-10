@@ -5407,6 +5407,187 @@ def test_only_an_already_fired_gate_is_offered_for_probing():
     assert [e.issue for e in pending_probe_targets(entries)] == [2]
 
 
+# ── apply-verdict gate (#3236) ────────────────────────────────────────────────
+#
+# "merged is not applied", the deploy gate's terraform-flavored extension:
+# a fired gate now carries an OBSERVED apply_verdict, distinct from
+# hold_state; and a `plan_destructive` entry must NEVER auto-resume via
+# `resume_when`, no matter what a probe reports — checked both at the
+# probe-offering boundary (`pending_probe_targets`) and again at resolution
+# (`_resolve_holds`/`plan_tick`), so neither enforcement point alone is load
+# bearing.
+
+
+def test_a_destructive_fired_gate_is_never_offered_for_probing():
+    from coord.drive_queue import pending_probe_targets
+
+    entries = [held(1, resume_when="curl -sf x", plan_destructive=True)]
+    assert pending_probe_targets(entries) == []
+
+
+def test_a_destructive_fired_gate_ignores_a_passing_probe_and_stays_held():
+    """THE #3236 hard rule, pinned at the point that matters most: even a
+    `ProbeResult(ok=True)` handed straight to `plan_tick` — the shape
+    `pending_probe_targets` excluding the entry cannot itself prevent, if
+    some other caller built the mapping by hand — must not release a
+    destructive gate. Contrast with `test_a_passing_probe_releases_and_
+    launches_in_the_same_tick` above, the identical setup minus
+    `plan_destructive`, which DOES release."""
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [
+            held(1, resume_when="curl -sf x", plan_destructive=True),
+            entry(2, after=(key,)),
+        ],
+        board(),
+        capacity=4,
+        probes={key: ProbeResult(key, True, "exit 0")},
+    )
+    assert plan.launch is None
+    assert plan.held is not None
+    assert plan.held.outcome == "held"
+    assert "destroy/replace" in plan.held.reason
+    assert "apply-verdict" in plan.held.reason
+    writes = dict(plan.writes())
+    # No hold_state write at all — a destructive gate's probe result never
+    # touches the row, matching the fail-closed "no probe declared" shape.
+    assert key not in writes or writes[key].get("hold_state") != HOLD_RELEASED
+
+
+def test_a_non_destructive_fired_gate_still_releases_on_a_passing_probe():
+    """Same setup, `plan_destructive=False` (the default) — #3236 must not
+    have widened the hard rule to entries that never opted into it."""
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [held(1, resume_when="curl -sf x"), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+        probes={key: ProbeResult(key, True, "exit 0")},
+    )
+    assert plan.held is None
+    assert plan.launch is not None and plan.launch.issue == 2
+    assert dict(plan.writes())[key]["hold_state"] == HOLD_RELEASED
+
+
+def test_plan_is_destructive_detects_a_bare_delete():
+    from coord.drive_queue import plan_is_destructive
+
+    plan = {
+        "resource_changes": [
+            {"change": {"actions": ["update"]}},
+            {"change": {"actions": ["delete"]}},
+        ]
+    }
+    assert plan_is_destructive(plan) is True
+
+
+def test_plan_is_destructive_detects_both_replace_orderings():
+    from coord.drive_queue import plan_is_destructive
+
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": ["delete", "create"]}}]}
+    ) is True
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": ["create", "delete"]}}]}
+    ) is True
+
+
+def test_plan_is_destructive_false_for_purely_additive_changes():
+    from coord.drive_queue import plan_is_destructive
+
+    plan = {
+        "resource_changes": [
+            {"change": {"actions": ["no-op"]}},
+            {"change": {"actions": ["create"]}},
+            {"change": {"actions": ["update"]}},
+        ]
+    }
+    assert plan_is_destructive(plan) is False
+
+
+def test_plan_is_destructive_fails_closed_on_unparseable_shapes():
+    """#3236: "cannot confirm this is safe" reads as destructive, never as
+    additive — the same fail-closed posture `ProbeResult`'s own docstring
+    already requires of the ordinary resume-when probe."""
+    from coord.drive_queue import plan_is_destructive
+
+    assert plan_is_destructive({}) is True
+    assert plan_is_destructive({"resource_changes": "not-a-list"}) is True
+    assert plan_is_destructive({"resource_changes": [{"change": "nope"}]}) is True
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": "nope"}}]}
+    ) is True
+
+
+def test_validate_apply_gate_refuses_resume_when_with_a_destructive_plan():
+    from coord.drive_queue import QueueError, validate_apply_gate
+
+    with pytest.raises(QueueError, match="resume-when"):
+        validate_apply_gate("curl -sf x", True)
+
+
+def test_validate_apply_gate_allows_resume_when_without_a_destructive_plan():
+    from coord.drive_queue import validate_apply_gate
+
+    validate_apply_gate("curl -sf x", False)  # must not raise
+    validate_apply_gate("", True)  # no resume_when at all — nothing to refuse
+
+
+def test_apply_gate_status_no_gate_declared():
+    from coord.drive_queue import apply_gate_status
+
+    assert apply_gate_status(entry(1)) == ("", "")
+
+
+def test_apply_gate_status_armed_but_not_fired():
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(
+        entry(1, hold_after=True, hold_state=HOLD_ARMED)
+    )
+    assert state == "pending"
+    assert "not yet merged" in detail
+
+
+def test_apply_gate_status_merged_not_applied():
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(held(1))
+    assert state == "merged_not_applied"
+    assert "not yet applied" in detail
+
+
+def test_apply_gate_status_released_without_a_verdict_still_reads_unapplied():
+    """The #2096 fix in one assertion: a bare `coord drive-queue resume`
+    must never be read as "applied" — that is the exact unconfirmed-success
+    shape #3236 exists to close."""
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(held(1, hold_state=HOLD_RELEASED))
+    assert state == "merged_not_applied"
+    assert "without a recorded apply verdict" in detail
+
+
+def test_apply_gate_status_applied():
+    from coord.drive_queue import APPLY_APPLIED, apply_gate_status
+
+    state, detail = apply_gate_status(
+        held(1, apply_verdict=APPLY_APPLIED, apply_verdict_reason="ran clean")
+    )
+    assert state == "applied"
+    assert "ran clean" in detail
+
+
+def test_apply_gate_status_apply_failed():
+    from coord.drive_queue import APPLY_FAILED, apply_gate_status
+
+    state, detail = apply_gate_status(
+        held(1, apply_verdict=APPLY_FAILED, apply_verdict_reason="state lock timeout")
+    )
+    assert state == "apply_failed"
+    assert "state lock timeout" in detail
+
+
 def test_render_plan_says_why_a_fleet_scoped_hold_stopped_everything():
     plan = plan_tick(
         [held(1, hold_scope=HOLD_SCOPE_FLEET), entry(2)],

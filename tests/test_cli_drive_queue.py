@@ -302,6 +302,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "overlap-report", "block-log", "diagnose", "log-intervention",
         # #2607: the roll-pending marker's operator escape hatch.
         "cancel-roll",
+        # #3236: the apply-verdict gate's accountable-release verb.
+        "apply-verdict",
     }
 
 
@@ -4464,6 +4466,166 @@ def test_dry_run_does_not_run_the_probe(cli, seed, launches, probes):
     assert result.exit_code == 0, result.output
     assert probes.calls == []
     assert "--dry-run" in result.output
+
+
+# ── apply-verdict gate (#3236) ────────────────────────────────────────────────
+#
+# "merged is not applied": the drive-queue's --hold-after primitive, extended
+# with an OBSERVED apply verdict so `coord gates`/`list`/`status` can tell
+# merged-not-applied apart from applied apart from apply-failed — and a
+# destroy/replace terraform plan is refused --resume-when outright, no
+# exceptions.
+
+
+def test_add_refuses_resume_when_with_a_manually_declared_destructive_plan(cli):
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-destructive", "--resume-when", "true",
+    )
+    assert result.exit_code != 0
+    assert "resume-when" in result.output
+    assert "destructive" in result.output.lower()
+
+
+def test_add_stores_the_destructive_flag_and_list_renders_it(cli):
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--terraform-destructive",
+    )
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["plan_destructive"] == 1
+
+    listed = cli("list")
+    assert listed.exit_code == 0, listed.output
+    assert "DESTRUCTIVE" in listed.output
+    assert "apply-verdict" in listed.output
+
+
+def test_add_refuses_resume_when_with_a_destructive_plan_json(cli, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "resource_changes": [{"change": {"actions": ["delete"]}}]
+    }))
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-plan-json", str(plan_path),
+        "--resume-when", "true",
+    )
+    assert result.exit_code != 0
+    assert "resume-when" in result.output
+    assert queued(1753) is None  # refused before the write
+
+
+def test_add_accepts_resume_when_with_a_purely_additive_plan_json(cli, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "resource_changes": [{"change": {"actions": ["create"]}}]
+    }))
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-plan-json", str(plan_path), "--resume-when", "true",
+    )
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["plan_destructive"] == 0
+    assert queued(1753)["resume_when"] == "true"
+
+
+def test_a_destructive_gate_ignores_a_passing_resume_when_probe(
+    cli, seed, launches, probes
+):
+    """THE #3236 acceptance test, driven through the real tick: a
+    destructive gate must stay held even though its probe reports success —
+    contrast with the ordinary `--resume-when` auto-release tests above,
+    which DO launch on the very same probe outcome."""
+    key = f"{REPO}#1753"
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--terraform-destructive",
+    )
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    probes.outcomes[key] = True
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["state"] == "done"
+    assert entry["hold_state"] == "fired"
+    # The probe was never even run for a destructive entry.
+    assert probes.calls == []
+
+
+def test_apply_verdict_applied_records_and_releases_the_gate(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+    assert queued(1753)["hold_state"] == "fired"
+
+    result = cli("apply-verdict", REPO, "1753", "--applied", "--reason", "clean run")
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["apply_verdict"] == "applied"
+    assert entry["apply_verdict_reason"] == "clean run"
+    assert entry["apply_verdict_at"] is not None
+    assert entry["hold_state"] == "released"
+
+
+def test_apply_verdict_apply_failed_records_but_does_not_release(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli(
+        "apply-verdict", REPO, "1753", "--apply-failed", "--reason", "state locked"
+    )
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["apply_verdict"] == "apply_failed"
+    assert entry["apply_verdict_reason"] == "state locked"
+    # The gate stays held — a failed apply is not a deploy.
+    assert entry["hold_state"] == "fired"
+
+    # And the queue really does stay held: the dependent does not launch.
+    cli("add", REPO, "1754", "--after", "1753")
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+
+
+def test_apply_verdict_requires_a_verdict_flag(cli):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    result = cli("apply-verdict", REPO, "1753")
+    assert result.exit_code != 0
+    assert "--applied" in result.output
+
+
+def test_apply_verdict_refuses_an_entry_with_no_gate_declared(cli):
+    cli("add", REPO, "1753")
+    result = cli("apply-verdict", REPO, "1753", "--applied")
+    assert result.exit_code != 0
+    assert "no deploy gate" in result.output
+
+
+def test_apply_verdict_refuses_an_entry_not_in_the_queue(cli):
+    result = cli("apply-verdict", REPO, "9999", "--applied")
+    assert result.exit_code != 0
+    assert "not in the drive queue" in result.output
+
+
+def test_status_reports_merged_not_applied_before_any_verdict(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "merged, not yet applied" in result.output
 
 
 # ── the gate never doubles up with the escalation path ───────────────────────
