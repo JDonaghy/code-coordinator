@@ -8607,15 +8607,22 @@ class TestProcessCiStaleness:
     both the live path and the `--dry-run` preview — named distinctly
     (`checks_stale`) from `checks_failed`/`checks_pending`.
 
-    #2197: the live path no longer blocks on the FIRST stale reading — it
-    auto-reruns CI first (mirroring #1892's verdictless-failure arm, same
-    `CiStore.rerun_for_pr` call), parking as `checks_stale_rerun`
-    (`CI_PENDING_PREFIX` wording, so `coord drive`'s #1891 "wait, don't
-    spend an attempt" logic applies) up to `MAX_CI_STALE_RERUNS` times.
-    Only once that budget is exhausted does it report the terminal
-    `checks_stale` block a human has to act on. `--dry-run` is unaffected —
-    it only ever previews, never mutates, so it keeps reporting
-    `checks_stale` on the very first pass and never calls `rerun_for_pr`.
+    #2197 used to auto-rerun CI first (mirroring #1892's verdictless-failure
+    arm, same `CiStore.rerun_for_pr` call), parking as `checks_stale_rerun`
+    up to `MAX_CI_STALE_RERUNS` times before reporting the terminal
+    `checks_stale` block.
+
+    #3266: that auto-rerun could never clear the block it was answering — a
+    staleness reading means the base moved, and `CiStore.rerun_for_pr`
+    replays the SAME Actions run against the SAME event payload, so it
+    lands against the SAME base the stale checks already used. Two
+    guaranteed-no-op re-runs (claude-coordinator#2972: ~2 hours of runner
+    time) later, it parked anyway. The live path now reports the terminal
+    `checks_stale` block on the FIRST stale reading — same outcome, no
+    wasted CI cycle, no `checks_stale_rerun` state at all — exactly
+    matching what `--dry-run` already did (it never mutated, so it always
+    previewed `checks_stale` on the first pass and never called
+    `rerun_for_pr`).
     """
 
     @staticmethod
@@ -8649,46 +8656,59 @@ class TestProcessCiStaleness:
         def get_branch_commit_timestamp(self, repo, branch):
             return self.ts
 
-    def test_first_stale_reading_auto_reruns_instead_of_blocking(self) -> None:
-        """The exact #2170 regression: a docs-only base move stales an
-        otherwise-green PR. The first live pass must not escalate — it
-        triggers a CI re-run and parks, unattended."""
+    def test_first_stale_reading_blocks_immediately_without_rerunning(self) -> None:
+        """The exact #2170 regression shape — a docs-only base move stales
+        an otherwise-green PR — but per #3266 the first (and every) live
+        pass must report the terminal block right away: no `rerun_for_pr`
+        call, since a same-base replay can never see the moved base."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
         events = process(items, gh, ci_store=ci)
         assert items[0].state == PENDING
         assert gh.merge_calls == []
-        assert ci.rerun_calls == [("acme/api", 99)]
-        assert items[0].ci_stale_reruns == 1
+        assert ci.rerun_calls == []
+        assert items[0].ci_stale_reruns == 0
         kinds = [e.kind for e in events]
-        assert "checks_stale_rerun" in kinds
-        assert "checks_stale" not in kinds
+        assert "checks_stale" in kinds
+        assert "checks_stale_rerun" not in kinds
         assert "checks_failed" not in kinds
         assert "checks_pending" not in kinds
-        # #1891: CI_PENDING_PREFIX wording — `coord drive` waits rather
-        # than spending a merge attempt on this.
-        assert items[0].error.startswith("CI running:")
+        stale = [e for e in events if e.kind == "checks_stale"]
+        assert stale[0].message.startswith(mq.CI_STALE_PREFIX)
+        assert items[0].error == stale[0].message
 
-    def test_merges_on_a_later_pass_once_the_rerun_reports_green(self) -> None:
-        """Full #2170 lifecycle, end to end: stale → auto-rerun → a LATER
-        `process()` tick (the re-run having reported back fresh and green,
-        no operator involved) actually merges it. Acceptance criterion,
-        verbatim from #2197: "process() triggers a CI re-run and the entry
-        parks as checks_pending without spending an attempt, then merges on
-        a later pass once green.\""""
+    def test_repeated_ticks_never_call_rerun_for_pr(self) -> None:
+        """#3266's core claim: a same-base rerun can never clear this block,
+        so `process()` must not spend one — not on the first tick, and not
+        on any later tick either, for as long as the base stays stale."""
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        ci = self._ci(started_at=500.0)
+        for _ in range(3):
+            events = process(items, gh, ci_store=ci)
+            assert items[0].state == PENDING
+            assert "checks_stale" in [e.kind for e in events]
+        assert ci.rerun_calls == []
+        assert items[0].ci_stale_reruns == 0
+
+    def test_merges_on_a_later_pass_once_a_manual_rebase_lands(self) -> None:
+        """The only thing #3266 says can actually clear this: a human
+        rebases and pushes, producing a genuinely fresh check — not a
+        `process()`-triggered re-run. Simulated here as the check list
+        simply reporting fresh on a later tick, the same way a real rebase's
+        new run would."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
 
         first = process(items, gh, ci_store=ci)
         assert items[0].state == PENDING
-        assert "checks_stale_rerun" in [e.kind for e in first]
-        assert ci.rerun_calls == [("acme/api", 99)]
+        assert "checks_stale" in [e.kind for e in first]
+        assert ci.rerun_calls == []
 
-        # The re-run GitHub was asked to trigger has now reported back: a
-        # fresh, green check — the same `ci` object, no new `coord merge`
-        # flag involved.
+        # A human rebased the branch onto current main and pushed — a real
+        # new run, fresh and green.
         from types import SimpleNamespace
         ci.checks = [SimpleNamespace(
             name="build", status="completed", conclusion="success",
@@ -8697,33 +8717,11 @@ class TestProcessCiStaleness:
 
         second = process(items, gh, ci_store=ci)
         assert items[0].state == MERGED
-        assert ci.rerun_calls == [("acme/api", 99)]  # unchanged — no 2nd rerun
+        assert ci.rerun_calls == []
         kinds = [e.kind for e in second]
         assert "merged" in kinds
         assert "checks_stale" not in kinds
         assert "checks_stale_rerun" not in kinds
-
-    def test_reruns_stop_at_the_cap_and_then_reports_checks_stale(self) -> None:
-        from coord.merge_queue import MAX_CI_STALE_RERUNS
-
-        items = [_q("w1", pr=99)]
-        gh = self._Gh()
-        ci = self._ci(started_at=500.0)
-        for expected in range(1, MAX_CI_STALE_RERUNS + 1):
-            events = process(items, gh, ci_store=ci)
-            assert items[0].ci_stale_reruns == expected
-            assert "checks_stale_rerun" in [e.kind for e in events]
-        assert len(ci.rerun_calls) == MAX_CI_STALE_RERUNS
-
-        # Budget exhausted — the next pass reports the terminal block and
-        # triggers no further rerun.
-        events = process(items, gh, ci_store=ci)
-        assert len(ci.rerun_calls) == MAX_CI_STALE_RERUNS  # unchanged
-        assert items[0].ci_stale_reruns == MAX_CI_STALE_RERUNS  # unchanged
-        kinds = [e.kind for e in events]
-        assert "checks_stale" in kinds
-        assert "checks_stale_rerun" not in kinds
-        assert items[0].state == PENDING
 
     def test_live_merge_proceeds_when_checks_fresh(self) -> None:
         items = [_q("w1", pr=99)]
@@ -8736,10 +8734,12 @@ class TestProcessCiStaleness:
         assert "checks_stale" not in kinds
         assert "checks_stale_rerun" not in kinds
 
-    def test_resets_after_a_clean_pass_so_a_later_staleness_starts_fresh(self) -> None:
-        """Mirrors `ci_infra_reruns`'s own reset test (#1892): a later,
-        unrelated base move must not inherit a budget already spent on an
-        earlier staleness streak."""
+    def test_resets_after_a_clean_pass_for_a_row_predating_the_3266_fix(self) -> None:
+        """#3266: `process()` never writes a nonzero `ci_stale_reruns`
+        anymore, but a row persisted before this fix can still carry one
+        from the old auto-rerun behaviour. A genuinely fresh pass must
+        converge it back to 0 rather than leaving a stale count sitting on
+        the entry forever — mirrors `ci_infra_reruns`'s own reset (#1892)."""
         from coord.merge_queue import MAX_CI_STALE_RERUNS
 
         items = [_q("w1", pr=99)]
@@ -8840,11 +8840,13 @@ class TestProcessCiStaleness:
         #1479's Test-verdict staleness" — which names what the verdict was
         recorded against AND what the anchor is now (`coord.gates`'
         "recorded against base X, base is now Y"). The CI anchor is a run
-        timestamp rather than a SHA, but the sentence is the same."""
+        timestamp rather than a SHA, but the sentence is the same.
+
+        #3266: reported on the very first stale reading now — there is no
+        rerun budget left to skip past."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
-        items[0].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS  # skip to the block
         events = process(items, gh, ci_store=ci)
         stale = [e for e in events if e.kind == "checks_stale"]
         assert stale
@@ -8852,8 +8854,15 @@ class TestProcessCiStaleness:
         assert msg.startswith(mq.CI_STALE_PREFIX)
         assert "ran against main as of 1970-01-01T00:08:20Z" in msg
         assert "main now 1970-01-01T00:16:40Z" in msg
-        # The remedy stays the last thing an operator reads (#1826).
-        assert msg.endswith("re-run CI (`coord merge --revalidate`) before merging")
+        # #3266: the remedy must not point at `--revalidate` — its CI arm is
+        # the exact same-base `rerun_for_pr` replay that cannot clear this.
+        assert "--revalidate" not in msg
+        # The remedy stays the last thing an operator reads (#1826), and now
+        # names the thing that actually works.
+        assert msg.endswith(
+            "rebase onto main and push (`git push --force-with-lease`); "
+            "a CI re-run against the same base cannot see a moved base"
+        )
 
     def test_dry_run_previews_checks_stale_without_rerunning(self) -> None:
         items = [_q("w1", pr=99)]
@@ -8879,11 +8888,12 @@ class TestTwoGreenBranchesOneBaseMove:
     could merge and a release was structurally impossible.
 
     The sequence, exactly: A and B are both green against base X; A merges,
-    making the base Y; B must NOT merge on its X-based checks. It doesn't
-    matter for this test *which* of the two non-merging outcomes B lands in
-    (#2197's unattended auto-rerun, or the terminal block once that budget is
-    spent) — what #1826 is about is that B does not reach `gh pr merge` on
-    evidence that predates the base it would be merging into.
+    making the base Y; B must NOT merge on its X-based checks. #3266: B
+    lands directly in the terminal `checks_stale` block on the very first
+    reading — no unattended auto-rerun in between anymore, since a same-base
+    rerun could never see base Y anyway — what #1826 is about is that B
+    does not reach `gh pr merge` on evidence that predates the base it
+    would be merging into.
     """
 
     @staticmethod
@@ -8927,6 +8937,9 @@ class TestTwoGreenBranchesOneBaseMove:
         ]
 
     def test_the_second_branch_does_not_merge_on_pre_move_checks(self) -> None:
+        """#3266: B blocks terminally on the very first reading — no
+        unattended re-run in between, since a same-base rerun could never
+        see base Y anyway."""
         items = self._items()
         gh = self._MovingBaseGh()
         ci = self._ci(started_at=1500.0)  # green against base X (1000), not Y (2000)
@@ -8939,33 +8952,16 @@ class TestTwoGreenBranchesOneBaseMove:
         # B did NOT merge, and never reached `gh pr merge` at all.
         assert b.state == PENDING
         assert [c[1] for c in gh.merge_calls] == [101]
+        assert ci.rerun_calls == []  # #3266: no wasted re-run for B
         # ...and it is B's CI that is named, not its review/test gates.
         b_events = [e for e in events if e.entry.assignment_id == "B"]
-        assert [e.kind for e in b_events] == ["checks_stale_rerun"]
+        assert [e.kind for e in b_events] == ["checks_stale"]
         assert "predate the current base" in (b.error or "")
-
-    def test_b_blocks_terminally_once_the_rerun_budget_is_spent(self) -> None:
-        """Same sequence, B having already spent #2197's unattended re-runs:
-        the refusal is terminal, names STALE CI, and carries the remedy."""
-        items = self._items()
-        items[1].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS
-        gh = self._MovingBaseGh()
-        ci = self._ci(started_at=1500.0)
-
-        events = process(items, gh, ci_store=ci)
-
-        assert items[0].state == MERGED
-        assert items[1].state == PENDING
-        assert [c[1] for c in gh.merge_calls] == [101]
-        assert ci.rerun_calls == []  # budget spent — no more unattended re-runs
-        stale = [
-            e for e in events
-            if e.entry.assignment_id == "B" and e.kind == "checks_stale"
-        ]
-        assert stale
-        assert stale[0].message.startswith(mq.CI_STALE_PREFIX)
-        # #1826: an actionable remedy, not just a refusal.
-        assert "coord merge --revalidate" in stale[0].message
+        assert b_events[0].message.startswith(mq.CI_STALE_PREFIX)
+        # #1826/#3266: an actionable remedy, not just a refusal — and it
+        # names the thing that actually works, not the `--revalidate` no-op.
+        assert "rebase onto" in b_events[0].message
+        assert "--revalidate" not in b_events[0].message
 
     def test_plan_reports_the_same_block_for_b(self, coord_db) -> None:
         """The board/plan render must agree with the live attempt — an
