@@ -21,6 +21,16 @@ Attention signals (``needs_you`` field):
 ``stalled``
     Has a work order, nothing is ready or in-flight, and the milestone is not
     done.  A dependency is blocking everything and may need attention.
+
+``--lint-epics`` (#3227) is a separate, orthogonal read-only scan: it does
+not touch milestones or GitHub at all, only the locally-cached ``issues``
+table (:func:`coord.plans.find_unlabelled_epics`). It flags open issues whose
+title reads like an epic (``"Epic:"``, ``"[tag] Epic:"``, ``"[epic]"``) but
+whose cached labels don't include ``"epic"`` — such an issue is invisible to
+this command's own milestone aggregation *and* to
+``coord.drive_queue.dispatch_type_for_labels``'s WORK-stage dispatch-type
+pick (#3132), so it silently dispatches as plain ``type="work"`` instead.
+This lint only reports; it never labels anything itself.
 """
 
 from __future__ import annotations
@@ -33,6 +43,47 @@ import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.plans import aggregate_repo_plans
+
+
+def _local_cached_open_issues(repo_names: set[str]) -> list[dict]:
+    """Open issues for *repo_names*, straight off the local ``issues`` table
+    (#3227's ``--lint-epics``).
+
+    Deliberately **not** :class:`coord.dao.SqliteStore`: that class opens its
+    own read-only connection off a ``DB_PATH`` captured at
+    ``coord.dao`` import time (a plain ``from coord.db import DB_PATH``),
+    which does not track ``$COORD_DIR`` changes a test fixture makes *after*
+    that first import (see ``coord.db``'s PEP 562 lazy-constant module
+    docstring / ``tests/conftest.py``'s ``_no_frozen_coord_dir_constants``).
+    ``coord.db.get_connection()`` — the same singleton
+    ``coord.state``'s ``_upsert_open_issues_local``/``_upsert_issue_local``
+    write through — resolves its target fresh on every call, so a read
+    through it always lands on the same DB the most recent sync wrote to.
+    Mirrors ``coord.reports._default_completed_source``'s identical
+    local-table-read posture.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from coord import sql  # noqa: PLC0415
+    from coord.db import get_connection  # noqa: PLC0415
+
+    conn = get_connection()
+    rows = [
+        dict(r)
+        for r in sql.execute(
+            conn, "SELECT repo_name, number, title, state, labels FROM issues"
+        ).fetchall()
+    ]
+    out: list[dict] = []
+    for row in rows:
+        if row.get("repo_name") not in repo_names:
+            continue
+        try:
+            row["labels"] = _json.loads(row.get("labels") or "[]")
+        except (TypeError, ValueError):
+            row["labels"] = []
+        out.append(row)
+    return out
 
 
 @click.command(
@@ -61,8 +112,20 @@ from coord.plans import aggregate_repo_plans
     is_flag=True,
     help="Emit machine-readable JSON (array of plan objects).",
 )
+@click.option(
+    "--lint-epics",
+    is_flag=True,
+    help=(
+        "Also scan the local issue cache (no GitHub/network call) for open "
+        "issues whose title reads like an epic (\"Epic:\", \"EPIC:\", "
+        "\"[tag] Epic:\", \"[epic]\") but aren't labelled \"epic\" (#3227). "
+        "Read-only — flags only, never writes a label."
+    ),
+)
 @_CONFIG_OPTION
-def plans_cmd(repo: str | None, json_out: bool, config_path: Path) -> None:
+def plans_cmd(
+    repo: str | None, json_out: bool, lint_epics: bool, config_path: Path
+) -> None:
     from coord import board_service, github_ops  # noqa: PLC0415
 
     cfg = _load_config(config_path)
@@ -121,36 +184,80 @@ def plans_cmd(repo: str | None, json_out: bool, config_path: Path) -> None:
         )
         all_entries.extend(entries)
 
+    # #3227: a separate, orthogonal read-only scan over the locally-cached
+    # `issues` table — no GitHub call, no dependency on the milestone loop
+    # above (so it still runs even when a repo has zero open milestones).
+    unlabelled_epics: list[dict] = []
+    if lint_epics:
+        from coord.plans import find_unlabelled_epics  # noqa: PLC0415
+
+        target_repo_names = {r.name for r in target_repos}
+        cached_issues = _local_cached_open_issues(target_repo_names)
+        unlabelled_epics = sorted(
+            find_unlabelled_epics(cached_issues),
+            key=lambda i: (i.get("repo_name", ""), i.get("number", 0)),
+        )
+
     # Emit warnings regardless of output mode.
     for msg in errors:
         click.echo(msg, err=True)
 
     if json_out:
-        click.echo(json.dumps([e.to_dict() for e in all_entries], indent=2))
+        payload = [e.to_dict() for e in all_entries]
+        if lint_epics:
+            click.echo(
+                json.dumps(
+                    {
+                        "plans": payload,
+                        "unlabelled_epics": [
+                            {
+                                "repo": i.get("repo_name"),
+                                "number": i.get("number"),
+                                "title": i.get("title"),
+                            }
+                            for i in unlabelled_epics
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            click.echo(json.dumps(payload, indent=2))
         return
 
     # Human-readable table.
     if not all_entries:
         click.echo("No open milestones found.")
-        return
+    else:
+        for entry in all_entries:
+            status_parts: list[str] = []
+            if entry.has_work_order:
+                status_parts.append(
+                    f"ready={entry.ready_frontier} "
+                    f"in-flight={entry.in_flight} "
+                    f"blocked={entry.blocked} "
+                    f"done={entry.done}/{entry.total}"
+                )
+            else:
+                status_parts.append("no work order")
 
-    for entry in all_entries:
-        status_parts: list[str] = []
-        if entry.has_work_order:
-            status_parts.append(
-                f"ready={entry.ready_frontier} "
-                f"in-flight={entry.in_flight} "
-                f"blocked={entry.blocked} "
-                f"done={entry.done}/{entry.total}"
+            if entry.needs_you:
+                status_parts.append(f"[{', '.join(entry.needs_you)}]")
+
+            tracking = f"#{entry.tracking_issue}" if entry.tracking_issue else "—"
+            click.echo(
+                f"{entry.repo}  #{entry.milestone_number}  {entry.title!r}  "
+                f"epic:{tracking}  {' '.join(status_parts)}"
             )
+
+    if lint_epics:
+        click.echo("")
+        if unlabelled_epics:
+            click.echo(
+                "Unlabelled epics (title reads as epic, no `epic` label — "
+                "add the label; this lint never writes one itself):"
+            )
+            for i in unlabelled_epics:
+                click.echo(f"  {i.get('repo_name')}  #{i.get('number')}  {i.get('title')!r}")
         else:
-            status_parts.append("no work order")
-
-        if entry.needs_you:
-            status_parts.append(f"[{', '.join(entry.needs_you)}]")
-
-        tracking = f"#{entry.tracking_issue}" if entry.tracking_issue else "—"
-        click.echo(
-            f"{entry.repo}  #{entry.milestone_number}  {entry.title!r}  "
-            f"epic:{tracking}  {' '.join(status_parts)}"
-        )
+            click.echo("No unlabelled epics found.")
