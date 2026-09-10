@@ -199,15 +199,32 @@ A `baseline-red` verdict has no `coord test` flag — print the marker only.
 # ── Rule matching ───────────────────────────────────────────────────────────
 
 
+def _pattern_matches(path: str, pattern: str) -> bool:
+    """Does `path` hit one `rule.files` pattern?
+
+    Two forms: a bare `*.ext` suffix wildcard (#3233 — terraform `.tf` files
+    live at arbitrary depth in a repo, so no single directory prefix can
+    route them the way `src/gtk/` routes GTK work) matches by file
+    extension regardless of directory; anything else is the original
+    path-prefix match (`src/gtk/` matches `src/gtk/foo.c`). A pattern of
+    just `"*"` or empty is never treated as a suffix wildcard — `pattern[1:]`
+    would be empty and match every path, which is never the intent of an
+    explicit rule.
+    """
+    if pattern.startswith("*.") and len(pattern) > 2:
+        return path.endswith(pattern[1:])
+    return path.startswith(pattern)
+
+
 def _rule_matches(touched_files: list[str], rule: SmokeRule) -> bool:
-    """Does any touched path start with any of `rule.files`'s prefixes?
+    """Does any touched path hit any of `rule.files`'s patterns?
 
     The one "does this rule apply" test, shared by `match_rules` and
     `partition_capability_requirements` so the two matchers can't silently
     drift apart (e.g. one growing a case-insensitive or glob match the other
     doesn't) — see the #3177 review note this was factored out to satisfy.
     """
-    return any(path.startswith(pattern) for path in touched_files for pattern in rule.files)
+    return any(_pattern_matches(path, pattern) for path in touched_files for pattern in rule.files)
 
 
 def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
@@ -216,7 +233,11 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
     Matching is path-prefix: a rule with `files=["src/gtk/"]` matches
     `src/gtk/foo.c` but not `src/cli.py`. A rule with `files=["src/gtk"]`
     (no slash) catches both `src/gtk/foo.c` and `src/gtk_helpers.c` — use
-    the trailing slash form to be strict.
+    the trailing slash form to be strict. A pattern of the form `"*.ext"`
+    (#3233) is instead a suffix wildcard matching by file extension at any
+    depth — `files=["*.tf"]` matches `infra/net/main.tf` the same as a
+    root-level `main.tf`, which no directory prefix could express for files
+    scattered across a repo the way terraform's are.
 
     Returns capabilities in deterministic order (first-seen across rules).
 
@@ -997,11 +1018,15 @@ def resolve_rule_command(
     for i, rule in enumerate(rules):
         if not rule.command:
             continue
-        if any(
-            path.startswith(pattern)
-            for path in touched_files
-            for pattern in rule.files
-        ):
+        # #3233: reuses `_rule_matches` rather than re-deriving the same
+        # "does this rule apply" test inline — this file used to carry TWO
+        # independent copies of the plain prefix check (this one and
+        # `_rule_matches`, which `match_rules`/`partition_capability_
+        # requirements` share), which is exactly the split-brain #2096 warns
+        # against: adding the `*.ext` suffix wildcard to only one of them
+        # would have made a `.tf` rule that also declares `command` route
+        # correctly but pick no override command, silently.
+        if _rule_matches(touched_files, rule):
             return SmokeCommand(
                 rule.command,
                 f"smoke_tests.capability_rules[{i}] (files={rule.files!r})",

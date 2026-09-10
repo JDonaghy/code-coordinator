@@ -699,6 +699,133 @@ class TestWindowsCapabilityManifest:
         assert "windows" in prereqs.ALL_CAPABILITY_NAMES
 
 
+class TestAzureCapabilityManifest:
+    """#3233: `azure` (epic #3230 — routing terraform `.tf` work to a
+    machine that actually holds Azure credentials) is backed by a single
+    `az` prereq whose probe checks credential *validity*, not just that the
+    CLI binary exists on PATH — see `_probe_azure_credentials`'s module
+    comment for why a bare `az --version` would be a false green."""
+
+    def _azure_prereqs(self):
+        return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "azure"]
+
+    def test_backed_by_az(self) -> None:
+        assert {p.tool for p in self._azure_prereqs()} == {"az"}
+
+    def test_probe_is_a_custom_probe_not_a_binary_check(self) -> None:
+        """A plain `--version` probe cannot answer "are the cached
+        credentials still valid" — this prereq must delegate entirely to a
+        custom probe, never fall through to the generic binary-probe path
+        (which would report `found=True` for an `az` that has never been
+        logged into, or whose login has since expired)."""
+        az_prereq = next(p for p in self._azure_prereqs() if p.tool == "az")
+        assert az_prereq.custom_probe is not None
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["azure"])
+        assert "az" in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "az" not in probes_undeclared
+
+    def test_missing_az_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+        assert "not found on PATH" in probes["az"].what_breaks
+
+    def test_account_show_failure_reports_credentials_absent_or_expired(self) -> None:
+        """The #3233 crux: `az` installed but either never logged into, or
+        with a login whose refresh token has since expired, must both
+        surface as UNMET — `az account show`'s own token-refresh call is
+        what fails closed on the expired case, no separate expiry check
+        needed."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stderr="ERROR: Please run 'az login' to setup account.\n",
+                     returncode=1,
+                 ),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+        assert "az login" in probes["az"].what_breaks
+
+    def test_account_show_hang_degrades_to_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 side_effect=subprocess.TimeoutExpired(cmd="az", timeout=10),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+
+    def test_account_show_success_reports_found_and_names_the_subscription(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stdout='{"id": "sub-123", "name": "acme-dev-platform"}\n',
+                     returncode=0,
+                 ),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is True
+        assert probes["az"].ok is True
+        assert probes["az"].version == "acme-dev-platform"
+
+    def test_account_show_success_with_unparsable_json_still_reports_found(self) -> None:
+        """An unparsable response body still proves `az account show`
+        exited 0 — that's the whole signal; the subscription name is only
+        ever a best-effort label on top of it, never a reason to flip
+        found=False."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="not json", returncode=0),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is True
+        assert probes["az"].ok is True
+        assert probes["az"].version is None
+
+    def test_unmet_when_az_missing(self) -> None:
+        probes = {
+            "az": prereqs.ToolProbe(
+                tool="az", capability="azure", found=False, version=None,
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["azure"], probes)
+        assert "azure" in unmet
+        assert "az not found" in unmet["azure"][0]
+
+    def test_met_when_az_probe_passes(self) -> None:
+        probes = {
+            "az": prereqs.ToolProbe(
+                tool="az", capability="azure", found=True, version="acme-dev-platform",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["azure"], probes) == {}
+
+    def test_all_capability_names_includes_azure(self) -> None:
+        """#3233 acceptance: `ALL_CAPABILITY_NAMES` is derived from
+        `CAPABILITY_PREREQS`, so adding this entry must pick `azure` up
+        automatically — no separate registration needed for a config-free
+        agent to probe it too (see TestAllCapabilityNames), and no separate
+        wiring needed for `coord doctor` to report it UNMET (it already
+        cross-references every declared capability's probes via the same
+        `unmet_capabilities` this class exercises above)."""
+        assert "azure" in prereqs.ALL_CAPABILITY_NAMES
+
+
 class TestGhFloorIsSingleSourceOfTruth:
     def test_baseline_gh_prereq_imports_the_floor(self) -> None:
         """#1564's constant stays the single source of truth — this module
