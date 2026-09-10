@@ -293,7 +293,13 @@ def drive_queue_group() -> None:
         "unattended fix round that goes nowhere costs a queue slot for "
         "hours, not a human a few minutes of noticing). Re-adding an "
         "already-queued entry WITHOUT this flag reverts it to the fleet "
-        "default — it does not leave a previous override in place."
+        "default — it does not leave a previous override in place. NOTE "
+        "(#2972): the ceiling this budgets against is scoped to the ISSUE, "
+        "all-time across every past drive session for it — `remove` + `add` "
+        "resets the queue ROW (attempts=0) but NOT that history, so a "
+        "remove+add on an entry that already burned its budget can still "
+        "land back at the ceiling on its very next relaunch. Pass a larger "
+        "--max-fix-rounds here to actually give it a clean slate."
     ),
 )
 @click.option(
@@ -3501,12 +3507,26 @@ def _fetch_board_view() -> BoardView:
 
     #2972: also folds in #3060's ``coord.state.leg_counts()`` — the all-time,
     archive-spanning per-issue leg count `_reconcile_running`'s fix-round
-    ceiling needs (see `IssueFacts.work_leg_count`). Best-effort: a failure
-    here (lock contention, a DB the daemon can't reach) must not abort a tick
-    that would otherwise succeed — it degrades to every `IssueFacts` reading
-    `work_leg_count=0`, i.e. the ceiling simply does not fire this tick,
-    same fail-soft posture `effective_max_fix_rounds` already takes for an
-    unreadable `pipeline.max_fix_rounds`.
+    ceiling needs (see `IssueFacts.work_leg_count`). A read failure here must
+    not abort a tick that would otherwise succeed, but (2972 review) it must
+    ALSO not be swallowed so quietly that the ceiling silently stops firing:
+
+    - Lock contention (:func:`_is_db_locked_error` — the same signature
+      :func:`_fetch_board_view_with_retry` already retries the whole read
+      for) is deliberately NOT caught here. Catching it at this layer would
+      hand back ``work_leg_count=0`` for the rest of the tick instead of
+      letting the retry wrapper one level up actually retry the read — one
+      layer too early for that machinery to help, per the review. Letting it
+      propagate means a transient lock is either recovered by the existing
+      retry, or (if retries are exhausted) fails the tick closed, same as
+      every other board-read failure — never a silent zero.
+    - Anything else (daemon unreachable, a corrupt table, ...) a retry can't
+      fix, so that part degrades to every `IssueFacts` reading
+      `work_leg_count=0` — same fail-soft posture `effective_max_fix_rounds`
+      already takes for an unreadable `pipeline.max_fix_rounds` — but it
+      logs a visible warning first, so a persistent failure here reads as
+      "ceiling data unreadable" rather than being indistinguishable from
+      "this entry's budget is untouched".
     """
     from coord.drive import list_drive_sessions  # noqa: PLC0415
     from coord.state import leg_counts  # noqa: PLC0415
@@ -3514,7 +3534,15 @@ def _fetch_board_view() -> BoardView:
     payload = _fetch_board_payload()
     try:
         counts = leg_counts()
-    except Exception:  # noqa: BLE001 — advisory read, see docstring
+    except Exception as exc:  # noqa: BLE001 — advisory read, see docstring
+        if _is_db_locked_error(exc):
+            raise
+        click.echo(
+            f"warning: could not read drive-queue leg counts ({exc}) — "
+            "work_leg_count defaulting to 0 this tick, so the #2972 "
+            "fix-round ceiling cannot fire for any entry until this clears",
+            err=True,
+        )
         counts = {}
     return build_board_view(payload, list_drive_sessions(), leg_counts=counts)
 
@@ -4781,6 +4809,15 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     remove+add IS the reset (a fresh row is ``waiting`` with ``attempts=0``
     and no ``after``).  Re-adding without the bad ``--after`` is also the fix
     for an unsatisfiable pre-req.
+
+    #2972 NOTE: this resets the queue ROW, not the fix-round ceiling — that
+    budget is tracked against ``coord.state.leg_counts()``, which is scoped
+    to the ISSUE and spans every past drive session for it (``assignments``
+    + ``assignments_archive``), never reset by a remove+add cycle. An entry
+    that previously exhausted its budget comes back looking fresh
+    (``attempts=0``) but can still land on the ceiling on its first
+    relaunch; ``coord drive-queue add --max-fix-rounds`` is the actual reset
+    for that case.
     """
     parsed = parse_key(key)
     if parsed is None:

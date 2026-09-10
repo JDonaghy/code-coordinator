@@ -3821,6 +3821,77 @@ def test_a_board_read_still_locked_past_the_retry_budget_aborts_as_before(
     assert state._list_drive_queue_local() == before
 
 
+# ── #2972 review: a `leg_counts()` failure must not silently defeat the
+#    fix-round ceiling — lock contention retries, anything else warns loudly
+#    (rather than defaulting `work_leg_count` to 0 indistinguishably from
+#    "this entry's budget is untouched").
+
+
+def test_leg_counts_lock_contention_retries_via_the_board_read_retry_wrapper(
+    cli, seed, launches, monkeypatch
+):
+    """A `database is locked` failure from `leg_counts()` — not just from the
+    rest of the board read — must propagate out of `_fetch_board_view` so
+    `_fetch_board_view_with_retry`'s existing bounded retry actually sees and
+    retries it, instead of being swallowed one layer too early into a
+    default `work_leg_count=0` for the tick (the #2972 review finding)."""
+    import sqlite3
+
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650", "--machine", "dellserver")
+
+    real_leg_counts = state.leg_counts
+    calls = {"n": 0}
+
+    def flaky_leg_counts():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_leg_counts()
+
+    monkeypatch.setattr(state, "leg_counts", flaky_leg_counts)
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", lambda _s: None)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 3
+    assert "recovered after 2 retry" in result.output
+    assert "launched" in result.output
+    assert queued(1650)["state"] == "running"
+
+
+def test_leg_counts_non_lock_failure_warns_and_degrades_to_zero_not_silence(
+    cli, seed, launches, monkeypatch
+):
+    """A `leg_counts()` failure that ISN'T lock contention (e.g. the daemon
+    unreachable on a thin client) can't be fixed by a retry, so the tick
+    still proceeds with `work_leg_count` defaulted to 0 — but it must print a
+    visible warning, so a persistent failure here reads as "ceiling data
+    unreadable" rather than being indistinguishable from a genuinely fresh
+    entry (the #2972 review finding)."""
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650", "--machine", "dellserver")
+
+    def broken_leg_counts():
+        raise RuntimeError("board daemon unreachable")
+
+    monkeypatch.setattr(state, "leg_counts", broken_leg_counts)
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", lambda _s: None)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "warning: could not read drive-queue leg counts" in result.output
+    assert "board daemon unreachable" in result.output
+    assert "work_leg_count defaulting to 0" in result.output
+    # The tick still did real work — the degrade is fail-soft, not fail-closed.
+    assert "launched" in result.output
+    assert queued(1650)["state"] == "running"
+
+
 def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
     cli, seed, launches
 ):
