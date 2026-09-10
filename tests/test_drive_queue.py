@@ -2148,6 +2148,53 @@ def test_exhausted_checks_failed_does_not_get_the_dispatch_note():
     assert "no assignment was ever created" not in reason
 
 
+def test_exhausted_checks_absent_does_not_get_the_dispatch_note():
+    """#3254 fix: `own_reason` names the FIFTH merge-gate-block shape —
+    `coord/drive.py`'s `_decide_merge` dying immediately on
+    `is_ci_absent_reason(state.merge_reason)` (``checks_absent``: this repo
+    declares CI but the PR reported zero checks). This is exactly the #2424
+    incident class reproduced for that fifth shape: `_reconcile_running`
+    only takes the dedicated zero-attempt `merge_ci_absent` fast path when
+    the BOARD's own read of that fact has already caught up (laggy by this
+    file's own repeated warnings elsewhere, e.g. #2808/#2814/#2858); absent
+    that, this generic `dispatch_only`/`exhausted` path is what actually
+    runs, and `own_reason` — which already names the real cause — must not
+    get the misleading dispatch-failure note layered on top of it."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): CI never "
+        "ran: no checks reported for PR #3250 though this repo declares CI "
+        "— merging would run untested code — push a new commit; this gate "
+        "cannot clear on retry (#3254). No number of `coord merge` attempts "
+        "re-fires the `pull_request` webhook that creates a check suite for "
+        "this branch; only a new commit does. Investigate why CI never "
+        "triggered for this PR, then push a fix (even a trivial commit) for "
+        "a fresh check suite — or, once you have confirmed it is safe: "
+        "coord merge --only claude-coordinator#1650 --force-merge"
+    )
+    # No `merge_ci_absent` fact on this read — mirrors the race where the
+    # board hasn't caught up to the die yet, so only `own_reason` text is
+    # available to classify the death correctly.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
 def test_exhausted_immediate_escalation_merge_status_does_not_get_the_dispatch_note():
     """#2424's fourth documented shape: `_escalate_merge`'s #1505
     immediate-escalation path (`coord/drive.py:2809`), whose `Action.message`
@@ -6357,6 +6404,27 @@ def test_merge_gate_remedy_command_falls_back_to_inspect_for_opaque_merge_status
     reason = "merge_status=NEEDS_ATTENTION — no number of retries changes this"
     assert is_merge_gate_block_reason(reason) is True
     assert merge_gate_remedy_command(reason, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_checks_absent():
+    """#3254's fifth shape: `checks_absent` (zero checks ever reported for
+    the PR) is a merge-gate block — `is_merge_gate_block_reason` must
+    recognize it — but has no single command that is always both correct
+    and safe to run blind (pushing a commit is a code change, not a `coord`
+    command, and `--force-merge` skips CI outright). Falls back to the same
+    read-only inspect command as the other unresolvable shapes."""
+    reason = (
+        "CI never ran: no checks reported for PR #3250 though this repo "
+        "declares CI — merging would run untested code — push a new "
+        "commit; this gate cannot clear on retry (#3254). No number of "
+        "`coord merge` attempts re-fires the `pull_request` webhook that "
+        "creates a check suite for this branch; only a new commit does."
+    )
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 1650)
+    assert command == merge_plan_inspect_command(REPO)
+    assert "revalidate" not in command
+    assert "drive-queue remove" not in command
 
 
 def test_merge_gate_remedy_command_is_the_safe_inspect_fallback_for_none_and_non_block_reasons():
