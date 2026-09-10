@@ -836,6 +836,56 @@ acceptance:
         report = ro.evaluate(ro.RepoFacts(name="ghost", configured=False))
         assert "oracle.no_driver" not in _checks(report)
 
+    def test_terraform_flags_the_plan_only_verdict(self):
+        """#3230 child 1: `terraform` proves the config parses, not that the
+        infrastructure does what was asked — a different gap from
+        `fixture_server_dependent` (that one waits on #1538; this one waits
+        on #3230 child 6, the ephemeral-apply probe)."""
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["terraform"], plan_only=True,
+            ),
+        )
+        report = ro.evaluate(facts)
+        f = next(f for f in report.findings if f.check == "oracle.plan_only_verdict")
+        assert f.severity == ro.WARN
+        assert "3230" in f.summary
+        assert report.ok  # a smoke net is a WARN, not a hard gate
+
+    def test_cli_pytest_does_not_flag_a_plan_only_dependency(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(configured=True, kinds=["cli-pytest"]),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.plan_only_verdict" not in _checks(report)
+        assert "oracle.plan_only_not_applicable" in _checks(report)
+
+    def test_gather_acceptance_facts_derives_plan_only_from_kind(self, tmp_path):
+        """`plan_only` must be DERIVED from the driver's `kind` (via
+        `coord.acceptance_drivers.PLAN_ONLY_KINDS`) by
+        `gather_acceptance_facts`, not left for every caller to guess."""
+        config = SEEDED_CONFIG + """\
+
+acceptance:
+  drivers:
+    newrepo:
+      kind: terraform
+      run: "terraform validate"
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(config)
+        cfg = load_config(p)
+
+        facts = ro.gather_facts(cfg, "newrepo", statuses=[], probe_github=False)
+        assert facts.acceptance.plan_only is True
+
+        report = ro.evaluate(facts)
+        assert "oracle.plan_only_verdict" in _checks(report)
+
 
 class TestDoctorFolding:
     """``coord doctor`` folds in the LIVE layer only — see

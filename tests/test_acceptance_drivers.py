@@ -62,6 +62,7 @@ project; nothing here depends on a live worktree or a real browser install.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -71,9 +72,11 @@ from coord.acceptance import build_verdict
 from coord.acceptance_drivers import (
     DriverError,
     FIXTURE_SERVER_DEPENDENT_KINDS,
+    PLAN_ONLY_KINDS,
     SUPPORTED_KINDS,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
+    parse_terraform_validate_json,
     parse_test_output,
     render_run_command,
     run_driver,
@@ -215,6 +218,208 @@ class TestFixtureServerDependentKinds:
         # no external fixture dependency to flag.
         assert "tui-tuidriver" not in FIXTURE_SERVER_DEPENDENT_KINDS
         assert "cli-pytest" not in FIXTURE_SERVER_DEPENDENT_KINDS
+
+
+class TestPlanOnlyKinds:
+    """#3230 child 1: `coord.repo_onboard`'s oracle-readiness layer reads
+    this set the same way it already reads FIXTURE_SERVER_DEPENDENT_KINDS —
+    to report "this verdict is real but not yet a deterministic oracle"
+    explicitly instead of a driver-present repo silently reading as fully
+    oracle-ready."""
+
+    def test_terraform_is_plan_only(self) -> None:
+        assert "terraform" in PLAN_ONLY_KINDS
+
+    def test_only_kinds_this_module_actually_supports_are_listed(self) -> None:
+        assert PLAN_ONLY_KINDS <= set(SUPPORTED_KINDS)
+
+    def test_deterministic_kinds_are_not_flagged(self) -> None:
+        assert "tui-tuidriver" not in PLAN_ONLY_KINDS
+        assert "cli-pytest" not in PLAN_ONLY_KINDS
+        assert "web-playwright" not in PLAN_ONLY_KINDS
+
+
+def _write_fake_terraform(bin_dir: Path, script: str) -> None:
+    """Write an executable ``terraform`` shim into *bin_dir* — this
+    environment has no real ``terraform`` binary, and #3230 child 1's own
+    scope is explicit that this driver kind must be runnable and testable
+    with none: "no credentials, no cloud, no plan"."""
+    path = bin_dir / "terraform"
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+class TestRunDriverTerraform:
+    """#3230 child 1: the fixed `terraform init -backend=false` step, then
+    `terraform validate -json` with its structured report parsed."""
+
+    def test_supported_kinds_tuple_has_terraform(self) -> None:
+        assert "terraform" in SUPPORTED_KINDS
+
+    def test_init_runs_before_validate_and_parses_clean_report(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "initialized"
+        _write_fake_terraform(bin_dir, f"""#!/bin/sh
+if [ "$1" = "init" ]; then
+  touch {marker}
+  echo "Terraform has been successfully initialized!"
+  exit 0
+elif [ "$1" = "validate" ]; then
+  if [ ! -f {marker} ]; then
+    echo "validate ran before init" 1>&2
+    exit 1
+  fi
+  echo '{{"format_version":"1.0","valid":true,"error_count":0,"warning_count":0,"diagnostics":[]}}'
+  exit 0
+fi
+exit 1
+""")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        result = run_driver(
+            "terraform", "terraform validate", cwd=str(tmp_path),
+        )
+        assert result.exit_code == 0
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+        ]
+
+    def test_init_failure_raises_before_validate_runs(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        never = tmp_path / "validate-should-not-run"
+        _write_fake_terraform(bin_dir, f"""#!/bin/sh
+if [ "$1" = "init" ]; then
+  echo "boom: no such provider" 1>&2
+  exit 1
+fi
+touch {never}
+exit 0
+""")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        with pytest.raises(DriverError, match="terraform init failed") as exc_info:
+            run_driver("terraform", "terraform validate", cwd=str(tmp_path))
+        assert "boom: no such provider" in str(exc_info.value)
+        assert not never.exists()
+
+    def test_missing_terraform_binary_raises_init_failure(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        # An empty PATH means the shell's own "command not found" (exit
+        # 127) is what init failure looks like before #3230 child 2 gives
+        # this kind a routed capability lane with the binary guaranteed
+        # present.
+        monkeypatch.setenv("PATH", "/nonexistent")
+        with pytest.raises(DriverError, match="terraform init failed"):
+            run_driver("terraform", "terraform validate", cwd=str(tmp_path))
+
+    def test_error_diagnostics_surface_as_fail(self, tmp_path, monkeypatch) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        report = json.dumps({
+            "format_version": "1.0",
+            "valid": False,
+            "error_count": 1,
+            "warning_count": 0,
+            "diagnostics": [{
+                "severity": "error",
+                "summary": "Unsupported argument",
+                "detail": "An argument named \"bogus\" is not expected here.",
+                "range": {"filename": "main.tf", "start": {"line": 7}},
+            }],
+        })
+        _write_fake_terraform(bin_dir, f"""#!/bin/sh
+if [ "$1" = "init" ]; then
+  exit 0
+fi
+echo '{report}'
+exit 1
+""")
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        result = run_driver("terraform", "terraform validate", cwd=str(tmp_path))
+        assert result.exit_code == 1
+        assert result.tests == [{
+            "id": "main.tf:7",
+            "status": "fail",
+            "message": "Unsupported argument: An argument named \"bogus\" is not expected here.",
+        }]
+
+
+class TestParseTerraformValidateJson:
+    def test_valid_with_no_diagnostics_is_a_single_synthetic_pass(self) -> None:
+        report = json.dumps({
+            "format_version": "1.0", "valid": True,
+            "error_count": 0, "warning_count": 0, "diagnostics": [],
+        })
+        assert parse_terraform_validate_json(report) == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+        ]
+
+    def test_error_diagnostic_maps_to_fail_with_range_id(self) -> None:
+        report = json.dumps({
+            "format_version": "1.0", "valid": False,
+            "error_count": 1, "warning_count": 0,
+            "diagnostics": [{
+                "severity": "error", "summary": "boom", "detail": "detail text",
+                "range": {"filename": "main.tf", "start": {"line": 3}},
+            }],
+        })
+        tests = parse_terraform_validate_json(report)
+        assert tests == [
+            {"id": "main.tf:3", "status": "fail", "message": "boom: detail text"},
+        ]
+
+    def test_warning_diagnostic_is_a_pass_but_keeps_the_message(self) -> None:
+        report = json.dumps({
+            "format_version": "1.0", "valid": True,
+            "error_count": 0, "warning_count": 1,
+            "diagnostics": [{
+                "severity": "warning", "summary": "deprecated argument",
+                "detail": "", "range": {"filename": "main.tf", "start": {"line": 1}},
+            }],
+        })
+        tests = parse_terraform_validate_json(report)
+        assert tests == [
+            {"id": "main.tf:1", "status": "pass", "message": "deprecated argument"},
+        ]
+
+    def test_diagnostic_without_range_uses_generic_id(self) -> None:
+        report = json.dumps({
+            "format_version": "1.0", "valid": False,
+            "error_count": 1, "warning_count": 0,
+            "diagnostics": [{"severity": "error", "summary": "boom", "detail": ""}],
+        })
+        tests = parse_terraform_validate_json(report)
+        assert tests == [{"id": "terraform validate", "status": "fail", "message": "boom"}]
+
+    def test_invalid_with_no_diagnostics_is_a_single_synthetic_fail(self) -> None:
+        # Defensive edge case — real terraform always emits a diagnostic
+        # alongside `valid: false`, but the parser must not silently report
+        # green if that ever isn't true.
+        report = json.dumps({
+            "format_version": "1.0", "valid": False,
+            "error_count": 0, "warning_count": 0, "diagnostics": [],
+        })
+        tests = parse_terraform_validate_json(report)
+        assert len(tests) == 1
+        assert tests[0]["id"] == "terraform validate"
+        assert tests[0]["status"] == "fail"
+
+    def test_empty_input_raises(self) -> None:
+        with pytest.raises(DriverError, match="empty"):
+            parse_terraform_validate_json("")
+
+    def test_invalid_json_raises(self) -> None:
+        with pytest.raises(DriverError, match="not valid JSON"):
+            parse_terraform_validate_json("{not json")
+
+    def test_missing_valid_key_raises(self) -> None:
+        with pytest.raises(DriverError, match="unrecognized shape"):
+            parse_terraform_validate_json(json.dumps({"format_version": "1.0"}))
 
 
 class TestRunDriverSetup:

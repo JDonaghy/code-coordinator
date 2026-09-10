@@ -8,10 +8,11 @@ repo's declared acceptance suite and *parse* its raw output into a
 normalized list of ``{"id": str, "status": "pass"|"fail"|"skip", "message":
 str}`` dicts (``cli-pytest`` additionally carries ``"expected"``/``"got"``
 on a failing test — see :func:`parse_pytest_junit_xml`). ``tui-tuidriver``,
-``cli-pytest`` (#1125), and ``web-playwright`` (#1539) are implemented;
-other ``kind`` values are declared in ``coordinator.yml`` (see
-:class:`coord.config.AcceptanceConfig`) but rejected here with a clear "not
-yet implemented" error until their issues land (native).
+``cli-pytest`` (#1125), ``web-playwright`` (#1539), and ``terraform`` (#3230
+child 1) are implemented; other ``kind`` values are declared in
+``coordinator.yml`` (see :class:`coord.config.AcceptanceConfig`) but
+rejected here with a clear "not yet implemented" error until their issues
+land (native).
 
 ``cli-pytest`` parses pytest's built-in ``--junit-xml`` report (a core
 pytest flag, not a plugin — no extra dependency required in the driven
@@ -31,6 +32,17 @@ command (#1733, ``AcceptanceDriverConfig.setup``) once before its suite —
 e.g. ``npm ci`` for ``web-playwright``, which otherwise fails with a bare
 ``exit 127`` (playwright not found) the first time it runs against ``coord
 acceptance record``'s throwaway, dependency-less worktree.
+
+``terraform`` (#3230 child 1, epic: infrastructure-as-code as a work
+target) is sliced deliberately small: a fixed ``terraform init
+-backend=false`` runs first (no credentials, no cloud, no state backend),
+then ``terraform validate -json`` is parsed by
+:func:`parse_terraform_validate_json`. This is a **compile check, not an
+acceptance test** — it proves the config parses and providers resolve, not
+that the infrastructure does what was asked. See :data:`PLAN_ONLY_KINDS`
+for how that caveat is surfaced to ``coord.repo_onboard``'s oracle-readiness
+layer, and #3230's own child 6 for what eventually promotes this kind to a
+real oracle.
 """
 
 from __future__ import annotations
@@ -47,7 +59,7 @@ from pathlib import Path
 # Driver kinds this module knows how to run. Keep in sync with the adapters
 # implemented below — a kind can be *declared* in coordinator.yml ahead of its
 # adapter landing, but running it must fail loudly rather than silently no-op.
-SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
+SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright", "terraform")
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
 # but NOT yet a deterministic one, because an input they depend on hasn't
@@ -62,6 +74,20 @@ SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
 # because it is exactly the kind of "which medium behaves how" fact this
 # module already owns — see the module docstring.
 FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
+
+# #3230 (epic: infrastructure-as-code as a work target), child 1: driver
+# kinds whose `run` produces a real pass/fail verdict but is a *compile*
+# check, not an acceptance test — distinct from FIXTURE_SERVER_DEPENDENT_KINDS
+# above, whose gap is "the deterministic fixture server hasn't shipped yet".
+# `terraform` here proves the config parses and providers resolve; it does
+# NOT prove the infrastructure does what was asked, and (per this child's
+# own scope) never even runs `terraform plan` — that needs cloud credentials
+# (#3230 child 2). This caveat expires only once the ephemeral-apply probe
+# (#3230 child 6) lands and gives this kind a real, live-result oracle.
+# `coord.repo_onboard`'s oracle-readiness layer reads this the same way it
+# reads FIXTURE_SERVER_DEPENDENT_KINDS: to report the gap explicitly instead
+# of a driver-present repo silently reading as fully oracle-ready.
+PLAN_ONLY_KINDS = frozenset({"terraform"})
 
 # libtest's ``--format json`` per-line test-event stream (`cargo test -- -Z
 # unstable-options --format json`) event -> our normalized status.
@@ -177,6 +203,8 @@ def run_driver(
         return _run_cli_pytest(run_command, cwd, timeout=timeout)
     if kind == "web-playwright":
         return _run_web_playwright(run_command, cwd, timeout=timeout)
+    if kind == "terraform":
+        return _run_terraform(run_command, cwd, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
 
 
@@ -333,6 +361,88 @@ def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverRe
             exit_code=proc.returncode,
             tests=tests,
             raw_output=(proc.stdout or "") + (proc.stderr or ""),
+        )
+
+
+def _run_terraform(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+    """The ``terraform`` shape (#3230 child 1): a fixed, hardcoded
+    ``terraform init -backend=false`` runs first — **no credentials, no
+    cloud, no state backend** — then *run_command* (expected to be
+    ``terraform validate``, or a variant scoped to a module subdirectory)
+    with ``-json`` appended, the same "force a structured reporter" trick
+    :func:`_run_cli_pytest` plays with ``--junit-xml`` and
+    :func:`_run_web_playwright` plays with ``--reporter=json``.
+
+    ``-backend=false`` is not configurable here — this driver kind's entire
+    point (per the epic) is to be runnable on any machine with the
+    ``terraform`` binary, with no cloud account and no credentials. A
+    backend-initialized, plan-capable variant is a later child (#3230 child
+    2), not this one.
+
+    Unlike ``run_command`` failing in :func:`_run_generic` (folded into the
+    returned :class:`DriverResult` so callers can inspect it), ``terraform
+    init`` failing raises :class:`DriverError` immediately — mirrors
+    :func:`_run_setup`: a provisioning failure, not a validate verdict, and
+    must not be mistaken for one.
+    """
+    _run_terraform_init(cwd, timeout=timeout)
+
+    full_command = f"{run_command} -json"
+    try:
+        proc = subprocess.run(
+            full_command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DriverError(
+            f"acceptance run command timed out after {timeout}s: {full_command!r}"
+        ) from e
+    except OSError as e:
+        raise DriverError(f"acceptance run command failed to start: {e}") from e
+
+    tests = parse_terraform_validate_json(proc.stdout)
+    return DriverResult(
+        exit_code=proc.returncode,
+        tests=tests,
+        raw_output=(proc.stdout or "") + (proc.stderr or ""),
+    )
+
+
+def _run_terraform_init(cwd: str, *, timeout: int) -> None:
+    """Run the fixed ``terraform init -backend=false`` step (#3230 child 1)
+    once, before ``terraform validate`` ever runs. Raises
+    :class:`DriverError` — worded as an init failure, not a validate
+    failure — on a non-zero exit, a timeout, or the ``terraform`` binary not
+    being found at all (the expected failure mode on a machine that hasn't
+    installed it yet, before #3230 child 2 gives this kind its own routed
+    capability lane).
+    """
+    init_command = "terraform init -backend=false"
+    try:
+        proc = subprocess.run(
+            init_command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DriverError(
+            f"terraform init timed out after {timeout}s: {init_command!r}"
+        ) from e
+    except OSError as e:
+        raise DriverError(f"terraform init failed to start: {e}") from e
+
+    if proc.returncode != 0:
+        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-20:])
+        raise DriverError(
+            f"terraform init failed (exit {proc.returncode}): {init_command!r}\n"
+            f"{stderr_tail}"
         )
 
 
@@ -633,6 +743,90 @@ def _playwright_skip_reason(annotations: list) -> str:
         if isinstance(a, dict) and a.get("type") in ("skip", "fixme") and a.get("description"):
             return str(a["description"])
     return ""
+
+
+def parse_terraform_validate_json(json_text: str) -> list[dict]:
+    """Parse ``terraform validate -json``'s built-in structured report
+    (#3230 child 1) into normalized ``{"id", "status", "message"}`` dicts.
+
+    ``terraform validate`` is a single check, not a suite — there is no
+    natural per-test granularity the way pytest/Playwright have one. This
+    emits one normalized entry **per diagnostic** (so a caller can see each
+    error/warning individually), plus, when the config is valid with zero
+    diagnostics, a single synthetic ``"terraform validate"`` pass entry —
+    deliberately never a bare empty list for a clean run. That mirrors
+    :func:`parse_playwright_json_report`'s reasoning: a zero-length list is
+    already how :func:`coord.acceptance.build_verdict` recognizes "the run
+    crashed / matched nothing" as not-green, so a genuinely clean validate
+    must not render identically to that.
+
+    A diagnostic's ``severity`` maps ``"error"`` -> ``"fail"`` (config does
+    not parse), anything else (``"warning"``) -> ``"pass"`` with the
+    warning text kept in ``message`` rather than dropped — ``valid: true``
+    with warnings present is still a real pass, but the warning is signal a
+    caller may want to see, the same spirit as a Playwright "flaky" pass
+    keeping its failure text.
+
+    **Never silently empty on a crash** — mirrors
+    :func:`parse_playwright_json_report`: empty/whitespace-only input or
+    invalid JSON means the run died before ``terraform validate`` ever
+    wrote its report (killed process, ``terraform`` not on PATH producing
+    no stdout, a shell error before the binary even ran), and must surface
+    as a :class:`DriverError`, never an empty (indistinguishable from
+    "nothing to validate") pass list.
+    """
+    text = (json_text or "").strip()
+    if not text:
+        raise DriverError(
+            "terraform validate report is empty — the run crashed before "
+            "writing a report"
+        )
+    try:
+        report = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise DriverError(
+            f"terraform validate report is not valid JSON (truncated or "
+            f"corrupted run?): {e}"
+        ) from e
+    if not isinstance(report, dict) or "valid" not in report:
+        raise DriverError(
+            "terraform validate report has an unrecognized shape (missing "
+            "a 'valid' key) — this terraform version's -json output may be "
+            "incompatible"
+        )
+
+    diagnostics = report.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+
+    tests: list[dict] = []
+    for diag in diagnostics:
+        if not isinstance(diag, dict):
+            continue
+        severity = diag.get("severity")
+        status = "fail" if severity == "error" else "pass"
+        summary = str(diag.get("summary", "")) or "terraform validate"
+        detail = str(diag.get("detail", ""))
+        message = f"{summary}: {detail}" if detail else summary
+
+        rng = diag.get("range") if isinstance(diag.get("range"), dict) else None
+        if rng and rng.get("filename"):
+            start = rng.get("start") if isinstance(rng.get("start"), dict) else {}
+            line = start.get("line")
+            node_id = f"{rng['filename']}:{line}" if line else str(rng["filename"])
+        else:
+            node_id = "terraform validate"
+
+        tests.append({"id": node_id, "status": status, "message": message})
+
+    if not tests:
+        tests.append({
+            "id": "terraform validate",
+            "status": "pass" if report.get("valid") else "fail",
+            "message": "" if report.get("valid") else "terraform validate reported invalid with no diagnostics",
+        })
+
+    return tests
 
 
 def _strip_ansi(text: str) -> str:

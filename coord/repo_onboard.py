@@ -307,6 +307,13 @@ class AcceptanceFacts:
     # deterministic seeded-board fixture server it needs (#1538) has not,
     # so a run against a live fleet is a smoke net, not a pinned oracle.
     fixture_server_dependent: bool = False
+    # True when ANY kind in play is a compile-check-only kind (today, just
+    # `terraform` — see `coord.acceptance_drivers.PLAN_ONLY_KINDS`, #3230
+    # child 1): the driver proves the config parses, not that the
+    # infrastructure does what was asked — a different gap from
+    # `fixture_server_dependent` above (nothing to ship makes this one
+    # deterministic; it needs the ephemeral-apply probe, #3230 child 6).
+    plan_only: bool = False
 
 
 @dataclass
@@ -803,7 +810,10 @@ def gather_acceptance_facts(
     proven-clean pass, mirroring :func:`gather_graph_facts`'s own
     ``probed`` convention.
     """
-    from coord.acceptance_drivers import FIXTURE_SERVER_DEPENDENT_KINDS  # noqa: PLC0415
+    from coord.acceptance_drivers import (  # noqa: PLC0415
+        FIXTURE_SERVER_DEPENDENT_KINDS,
+        PLAN_ONLY_KINDS,
+    )
 
     drivers = getattr(acceptance_cfg, "drivers", None) or {}
     entry = drivers.get(repo_name)
@@ -834,6 +844,7 @@ def gather_acceptance_facts(
         entrypoints=entrypoints,
         entrypoints_missing=missing,
         fixture_server_dependent=any(k in FIXTURE_SERVER_DEPENDENT_KINDS for k in kinds),
+        plan_only=any(k in PLAN_ONLY_KINDS for k in kinds),
     )
 
 
@@ -1696,6 +1707,28 @@ def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
         out.append(Finding(
             layer="oracle", check="oracle.fixture_server_not_needed", severity=OK,
             summary=f"{kinds_str} run deterministically — no unshipped fixture-server dependency",
+        ))
+
+    if acc.plan_only:
+        out.append(Finding(
+            layer="oracle", check="oracle.plan_only_verdict", severity=WARN,
+            summary=(
+                f"{kinds_str} is a compile check, not an acceptance test — it "
+                "proves the config parses and providers resolve, not that the "
+                "infrastructure does what was asked. A smoke net, not a "
+                "pinned oracle, until the ephemeral-apply probe lands (#3230 "
+                "child 6, epic: infrastructure-as-code as a work target)"
+            ),
+            fix=(
+                "none available yet — #3230 child 6 is the ephemeral-apply "
+                "probe work; until it lands, treat this driver's verdicts as "
+                "advisory, not a trust gate"
+            ),
+        ))
+    else:
+        out.append(Finding(
+            layer="oracle", check="oracle.plan_only_not_applicable", severity=OK,
+            summary=f"{kinds_str} carries no compile-check-only (plan-only) dependency",
         ))
 
     return out
