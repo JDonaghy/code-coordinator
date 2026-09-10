@@ -157,6 +157,7 @@ from coord.worker_events import is_usage_limit_reason
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
     UNKNOWN_BRANCH_HEAD_REASON as _mq_unknown_branch_head_reason,
+    is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
@@ -4429,6 +4430,38 @@ def _decide_merge(
                 "poll"
             ),
             serialize_merge=True,
+        )
+
+    # #3254: the FIFTH CI-outcome case, checked right after the four
+    # self-refreshing siblings above — `coord.merge_queue.is_ci_absent_reason`
+    # (#1904's `checks_absent`: this repo declares CI but reported ZERO
+    # checks for the PR, most commonly because the `pull_request` webhook
+    # that would have created a check suite never fired). This is the
+    # OPPOSITE of the four blocks above: NOTHING about waiting or re-polling
+    # can ever resolve it — a merge retry does not re-fire a `pull_request`
+    # event, and that event is the only thing that creates a check suite for
+    # a feature branch (rebasing onto a fresh commit and force-pushing
+    # produces one within seconds; polling the SAME head never does — see
+    # the issue). So this does not dispatch another bounded re-check the way
+    # the four siblings do (there is nothing for a re-check to observe
+    # changing); it dies immediately instead, WITHOUT touching
+    # `counters.merge_attempts` — costing zero of the `--max-merge-attempts`
+    # budget, same guarantee as the four siblings, but by exiting rather
+    # than by looping forever on a reading that will never change. The exit
+    # message is read back verbatim by `coord.drive_queue`'s
+    # `IssueFacts.merge_ci_absent` (sourced independently from the board,
+    # not from this exit text) to block the queue entry without spending a
+    # launch attempt either — see that module's own #3254 comment.
+    if is_ci_absent_reason(state.merge_reason):
+        return _die(
+            f"{state.merge_reason} — push a new commit; this gate cannot "
+            "clear on retry (#3254). No number of `coord merge` attempts "
+            "re-fires the `pull_request` webhook that creates a check suite "
+            "for this branch; only a new commit does. Investigate why CI "
+            "never triggered for this PR, then push a fix (even a trivial "
+            "commit) for a fresh check suite — or, once you have "
+            "confirmed it is safe: coord merge --only "
+            f"{state.merge_aid or state.work_aid} --force-merge"
         )
 
     status = state.merge_status

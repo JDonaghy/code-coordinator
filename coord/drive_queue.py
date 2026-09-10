@@ -97,6 +97,7 @@ from coord.merge_queue import (
     CI_STALE_PREFIX,
     PLAN_READY,
     ci_rollup_all_clear,
+    is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_terminal_reason,
@@ -1224,6 +1225,23 @@ class IssueFacts:
     # A `False` reading cannot refresh itself at all, so `plan_tick` ages it
     # out (:data:`PARK_STALE_SECONDS`) rather than trusting it forever.
     merge_ci_pending_live: bool = False
+    # #3254: this issue's CURRENT merge-queue entry is refused for nothing
+    # stronger than #1904's `checks_absent` (`coord.merge_queue.
+    # is_ci_absent_reason`) — a repo that declares CI reported ZERO checks
+    # for the PR, most commonly because the `pull_request` webhook that would
+    # have created a check suite never fired. Computed the SAME way as
+    # `merge_ci_pending` (the board's own current read of this entry's merge
+    # gate) but deliberately kept SEPARATE from it: `merge_ci_pending`'s four
+    # siblings are self-refreshing (more real time resolves them), so they
+    # park; `checks_absent` cannot self-refresh at all — a merge retry never
+    # re-fires the `pull_request` webhook, only a new commit does — so
+    # `_reconcile_running` gives this fact the OPPOSITE queue-level
+    # treatment (block, not park). See that function's own comment for the
+    # full reasoning.
+    merge_ci_absent: bool = False
+    # The actual board/queue reason text `merge_ci_absent` was derived from —
+    # same purpose as `merge_ci_pending_reason` above.
+    merge_ci_absent_reason: str = ""
     # #2230: this issue's merge-plan STATUS — `coord.merge_queue.PLAN_READY`/
     # `PLAN_BLOCKED`/`PLAN_MERGING`/`PLAN_MERGED`/`PLAN_NEEDS_ATTENTION` — as
     # of the LIVE `merge_plan` section of a `/board` fetch, i.e. served off
@@ -1488,6 +1506,27 @@ def build_board_view(
         # board-build time. `plan_reason` already carries it whenever it
         # applies; the live plan reading and a live `coord merge` attempt's
         # raw reading can never disagree about this one.
+        #
+        # #3254: `checks_absent` (`is_ci_absent_reason`), checked here,
+        # BEFORE the generic `is_ci_terminal_reason` fall-through just below.
+        # `_entry_gate_status` computes this directly too (no extra `gh api
+        # .../jobs` call needed — see that function's own #1904 comment), so
+        # `plan_reason` already carries it whenever it applies; no raw-row
+        # recovery needed, same as the #2347 unreadable case above.
+        # `is_ci_terminal_reason` correctly classifies this as terminal (it
+        # is none of the four self-refreshing siblings), which is exactly
+        # why it must be caught HERE rather than being allowed to fall into
+        # `merge_ci_pending` below: that fact's whole contract is "more real
+        # time resolves this on its own", and nothing about waiting can ever
+        # make a `pull_request` webhook that never fired create a check
+        # suite retroactively. Recorded as its own fact instead, so
+        # `_reconcile_running` can give it the opposite treatment (fail
+        # fast, block, never park) — see `IssueFacts.merge_ci_absent`.
+        if is_ci_absent_reason(reason):
+            got = slot(key)
+            got["merge_ci_absent"] = True
+            got["merge_ci_absent_reason"] = reason
+            continue
         if is_ci_terminal_reason(reason):
             continue
         # #2158: the same plan row that came back with NO reason of its own
@@ -1599,6 +1638,16 @@ class Reconcile:
       every tick by the pre-pass in :func:`plan_tick`, which flips it back
       to ``waiting`` — no human, no escalation — the moment the board shows
       the gate has cleared.
+    * ``ci_absent`` — #3254: no session, no active work, nothing landed —
+      same evidence as ``retry``/``parked`` — but the board's OWN current
+      read of this entry's merge gate names #1904's `checks_absent`
+      (``IssueFacts.merge_ci_absent``). Unlike ``parked``, this is NOT
+      self-refreshing (no amount of waiting re-fires the ``pull_request``
+      webhook that creates a check suite), so it goes straight to
+      ``blocked`` instead — costs NO attempt, pairs with a :class:`Blocked`
+      — but, unlike ``refused``/``dead_end``, is not marked PERMANENT:
+      ``_reconcile_blocked``'s ordinary live-gate recheck still resumes it
+      automatically once a new commit clears the gate.
     * ``reparked``  — #2347: an ALREADY-``parked`` entry, still CONFIRMED
       blocked by this tick's own fresh re-check — but that fresh check found
       the real cause has become "GitHub could not be reached", distinct from
@@ -1626,7 +1675,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
+    outcome: str  # alive | starting | held | unknown | done | refused | dead_end | parked | ci_absent | reparked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -4053,6 +4102,54 @@ def _reconcile_running(
                 },
             ),
             None,
+        )
+
+    # #3254: the `checks_absent` counterpart to the `merge_ci_pending` park
+    # just above — same evidence source (the board's OWN current read of
+    # this entry's merge gate, independent of `own_reason`/`exit_refused`),
+    # OPPOSITE disposition. The four `merge_ci_pending` siblings are
+    # self-refreshing: relaunching right now would just observe the
+    # identical silence and wait again, so those park — no attempt spent,
+    # and the queue resumes them automatically once CI reports.
+    # `checks_absent` cannot self-refresh at all — a merge retry (or a fresh
+    # `coord drive` launch) never re-fires the `pull_request` webhook that
+    # creates a check suite for a feature branch; only a NEW COMMIT does
+    # (see the issue for the proof: a rebase + force-push produced a check
+    # suite within seconds, on the same branch, same workflow, same
+    # machine). Parking on it would be an indefinite livelock — waiting
+    # forever for an event nothing here can trigger — so this blocks
+    # instead, exactly like `refused`/`dead_end` above: no attempt spent,
+    # `Reconcile.updates` stays empty (the paired `Blocked` carries the
+    # write), and the message names the actual remedy instead of the
+    # generic "merge attempted N times without landing" wording a fall-
+    # through to `retry`/`exhausted` would have produced.
+    #
+    # Unlike `refused`/`dead_end`, this is deliberately NOT tagged with a
+    # `_PERMANENT_BLOCK_MARKERS` marker: those two causes can NEVER change
+    # on retry, full stop, so `_reconcile_blocked`'s sweep must never waste
+    # a live gate probe on them. `checks_absent` genuinely can change — the
+    # moment a human (or anything else) pushes a new commit, the board's own
+    # `merge_gate_status` reads differently on the very next build — so the
+    # entry should still get `_reconcile_blocked`'s ordinary, generic
+    # live-gate recheck every tick, the SAME mechanism that already resumes
+    # any other re-evaluable `blocked` entry. No bespoke resume path needed.
+    if facts.merge_ci_absent:
+        reason = (
+            f"{facts.merge_ci_absent_reason or 'CI never ran for this PR'}"
+            f"{launched} — push a new commit; this gate cannot clear on "
+            "retry (#3254); blocking without spending an attempt"
+        )
+        return (
+            Reconcile(entry.key, "ci_absent", reason, occupies=False),
+            Blocked(
+                entry.key,
+                reason,
+                updates={
+                    "state": STATE_BLOCKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
         )
 
     # #2858: the board's `issues` cache row behind `facts.landed`'s negative
