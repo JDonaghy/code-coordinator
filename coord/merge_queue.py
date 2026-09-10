@@ -2316,17 +2316,23 @@ def _ci_check_shrinkage_message(missing: "Iterable[str]") -> str:
 # standing breakage.
 MAX_CI_INFRA_RERUNS = 2
 
-# #2197: same shape as MAX_CI_INFRA_RERUNS above, but for the OTHER CI
-# auto-rerun trigger `process()` supports — a PASSING check recorded against
-# a base that has since moved (:data:`CI_STALE_PREFIX`, #1851's staleness
-# signal), not a failure. Deliberately a SEPARATE constant/counter from
-# `ci_infra_reruns`: the two triggers answer opposite readings of CI ("this
-# failed and needs to prove itself again" vs. "this passed but predates the
-# base and needs a fresh answer") and must be independently capped and
-# independently legible in the audit trail. A base that keeps moving out
-# from under one PR (a busy queue, or a genuinely wedged branch) would
-# otherwise auto-rerun forever; two tries rides out an ordinary busy tick
-# without masking a PR that just isn't going to catch up unattended.
+# #2197: originally the same shape as MAX_CI_INFRA_RERUNS above, but for a
+# PASSING check recorded against a base that has since moved
+# (:data:`CI_STALE_PREFIX`, #1851's staleness signal) rather than a failure.
+#
+# #3266: `process()` no longer spends this budget — a same-run
+# `CiStore.rerun_for_pr` replays the SAME event payload against the SAME
+# base the stale checks already used, so it can never answer a "has the base
+# moved" question, on a busy tick or a quiet one. Unlike the sibling
+# `ci_infra_reruns`/`ci_flaky_reruns` triggers, where "run the identical
+# thing again and see" genuinely is the remedy, staleness has no re-run
+# remedy at all; `process()` now parks on the FIRST stale reading (see the
+# `_ci_checks_are_stale` block in `process()` and `ci_stale_reason`'s
+# rebase-and-push wording). Kept defined — rather than deleted — only
+# because `QueuedMerge.ci_stale_reruns` and `coord.commands.drive_queue
+# ._run_auto_revalidate_checks_stale` still reference it; the latter shares
+# this module's exact same broken primitive from a second call site and is
+# a known follow-up, not something this fix's file scope covers.
 MAX_CI_STALE_RERUNS = 2
 
 # #2252: at most one auto-rerun per failure streak before a genuinely-
@@ -2637,24 +2643,31 @@ def ci_stale_reason(
     gh_ops: "GhOps | None",
     repo_github: str | None,
     target_branch: str | None,
-    *,
-    suffix: str = "",
 ) -> str:
     """The single rendering of a CI-stale refusal (#1826).
 
-    ``_entry_gate_status`` (board/plan render) and ``process()`` (the live
-    merge attempt) both call this, so the two can never print different prose
-    for the same condition — the #1141 lesson :data:`CI_STALE_PREFIX` already
-    encodes for the machine-readable half, applied to the human half too.
+    ``_entry_gate_status`` (board/plan render), the dry-run preview, and
+    ``process()`` (the live merge attempt) all call this, so none of the
+    three can ever print different prose for the same condition — the #1141
+    lesson :data:`CI_STALE_PREFIX` already encodes for the machine-readable
+    half, applied to the human half too.
 
-    *suffix* is the extra clause the live path adds once its #2197 auto-rerun
-    budget is spent; it lands before the remedy so the remedy stays the last
-    thing an operator reads.
+    #3266: the remedy used to be ``coord merge --revalidate``, whose CI arm
+    is :meth:`coord.ci_store.CiStore.rerun_for_pr` — a same-run ``gh run
+    rerun`` that replays the SAME event payload against the SAME base the
+    stale checks already used. A staleness reading is *defined* by the base
+    having moved, so that replay cannot, even in principle, produce a check
+    against the new base; recommending it here was pointing an operator at a
+    guaranteed no-op. The only thing that actually re-tests against the
+    current base is a rebase (``git push --force-with-lease`` after
+    rebasing onto *target_branch*) — that's what this now says.
     """
     note = ci_staleness_note(checks, gh_ops, repo_github, target_branch)
+    branch = target_branch or "the target branch"
     return (
-        f"{CI_STALE_PREFIX} checks predate the current base{note}{suffix} — "
-        "re-run CI (`coord merge --revalidate`) before merging"
+        f"{CI_STALE_PREFIX} checks predate the current base{note} — rebase "
+        f"onto {branch} and push (`git push --force-with-lease`); a CI "
+        "re-run against the same base cannot see a moved base"
     )
 
 
@@ -3445,6 +3458,19 @@ def ci_revalidation_candidates(
     :class:`RevalidationCandidate`, there is no local verdict to re-record —
     the remedy is :meth:`coord.ci_store.CiStore.rerun_for_pr`, keyed off
     ``entry.repo_github``/``entry.pr_number`` alone).
+
+    #3266: that remedy is a known no-op for exactly the condition this
+    selects candidates for — a staleness reading means the base moved, and
+    `rerun_for_pr` replays the same run against the same base it already
+    used, so it can never see the new one. `process()`'s OWN #2197
+    auto-rerun for this trigger was dropped for that reason (see
+    `MAX_CI_STALE_RERUNS`'s comment); the two remaining callers of this
+    function — `coord.commands.merge._apply_ci_revalidation` (the
+    ``--revalidate`` CI arm) and `coord.commands.drive_queue
+    ._run_auto_revalidate_checks_stale` (the unattended periodic rerun) —
+    still call `rerun_for_pr` on what this returns and are equally unable to
+    clear the block. Left as-is here: fixing either is a change to those
+    modules, out of this function's/file's scope, and a known follow-up.
     """
     if ci_store is None or not ci_store.is_available:
         return []
@@ -3667,14 +3693,21 @@ class QueuedMerge:
     # forever. 0 for every entry that has never hit a verdictless failure,
     # and for rows predating this column.
     ci_infra_reruns: int = 0
-    # #2197: count of automatic `CiStore.rerun_for_pr` calls `process()` has
-    # issued for this entry's CURRENT run of CI staleness (#1851) — a
-    # PASSING check recorded against a base that has since moved. Kept
-    # separate from `ci_infra_reruns` above on purpose (see
-    # `MAX_CI_STALE_RERUNS`'s comment): the two triggers must be
-    # independently capped and independently legible in the audit trail.
-    # Capped at `MAX_CI_STALE_RERUNS`. 0 for every entry that has never gone
-    # CI-stale, and for rows predating this column.
+    # #2197: originally a count of automatic `CiStore.rerun_for_pr` calls
+    # `process()` had issued for this entry's CURRENT run of CI staleness
+    # (#1851) — a PASSING check recorded against a base that has since
+    # moved, capped at `MAX_CI_STALE_RERUNS`.
+    #
+    # #3266: `process()` no longer increments this — see
+    # `MAX_CI_STALE_RERUNS`'s comment for why a same-run re-run can never
+    # answer a staleness reading, so `process()` now parks on the FIRST
+    # stale reading instead of spending this budget. Left in place (rather
+    # than dropped from the schema) so a row written before this fix, still
+    # carrying a nonzero count from the old behaviour, has somewhere to
+    # decode it — `process()`'s "genuinely fresh" reset still zeroes it, so
+    # it converges to 0 and stays there. 0 for every entry that has never
+    # gone CI-stale under the old behaviour, and for rows predating this
+    # column.
     ci_stale_reruns: int = 0
     # #2252: count of automatic `CiStore.rerun_failed_for_pr` calls
     # `process()` has issued for this entry's CURRENT streak of genuinely-
@@ -7817,73 +7850,52 @@ def process(
                 # #1851: a green CI result can itself be stale relative to the
                 # base — see `_ci_checks_are_stale`'s docstring. Named
                 # distinctly (`checks_stale`) from checks_failed/
-                # checks_pending above so an operator (and `coord merge
-                # --revalidate`, the remedy) can tell the three apart.
+                # checks_pending above so an operator can tell the three
+                # apart and reach for `ci_stale_reason`'s actual remedy
+                # (#3266: a rebase, not `--revalidate`) rather than one of
+                # the other two's.
                 #
-                # #2197: this used to always block here, escalating to a
-                # human (or, via `coord drive`, spending a merge attempt)
-                # for a condition a re-run resolves on its own — the exact
-                # #2170 regression (a docs-only base move stales a
-                # perfectly good green PR). Mirror #1892's shape exactly:
-                # auto-rerun via the SAME `CiStore.rerun_for_pr` this
-                # module already calls unattended for verdictless
-                # failures, up to `MAX_CI_STALE_RERUNS` — but track it
-                # with its OWN counter (`ci_stale_reruns`), never
-                # `ci_infra_reruns`, so a failed-then-stale (or
-                # stale-then-failed) PR does not have one trigger silently
-                # spend the other's budget, and so the audit trail can
-                # always tell which condition an auto-rerun was answering.
+                # #2197 used to auto-rerun here, mirroring #1892's
+                # verdictless-failure arm exactly: `CiStore.rerun_for_pr`, up
+                # to `MAX_CI_STALE_RERUNS` tries, before escalating.
+                #
+                # #3266: that can never work for THIS trigger. A staleness
+                # reading is defined by the base having moved (see
+                # `_ci_checks_are_stale`'s docstring); `rerun_for_pr` is a
+                # `gh run rerun`, which replays the SAME Actions run against
+                # the SAME event payload — so the re-run lands against the
+                # SAME base the stale checks already used. It cannot, even in
+                # principle, produce a check against the new base. Unlike the
+                # `ci_infra_reruns`/`ci_flaky_reruns` triggers above — where
+                # "run the identical thing again and see" is exactly the
+                # right remedy for a verdictless or suspected-flaky failure
+                # — this trigger's question ("is this fresh against the NEW
+                # base?") is never answered by that primitive. Two guaranteed
+                # no-op re-runs just spent a full CI cycle each
+                # (claude-coordinator#2972: ~2 hours of runner time) with no
+                # chance of ever clearing the block. Park immediately
+                # instead — same terminal outcome, cheaper and sooner.
+                # `ci_stale_reason`'s remedy names the thing that actually
+                # works: rebase onto the current base and push.
                 if checks and _ci_checks_are_stale(
                     checks, gh_ops, entry.repo_github, entry.target_branch, smoke,
                 ):
-                    if entry.ci_stale_reruns < MAX_CI_STALE_RERUNS:
-                        entry.ci_stale_reruns += 1
-                        reran = ci.rerun_for_pr(entry.repo_github, entry.pr_number)
-                        _log.info(
-                            "#2197 auto-rerun %d/%d for stale CI on %s#%d "
-                            "(PR #%s) (rerun_for_pr %s)",
-                            entry.ci_stale_reruns, MAX_CI_STALE_RERUNS,
-                            entry.repo_name, entry.issue_number,
-                            entry.pr_number,
-                            "triggered" if reran else "FAILED",
-                        )
-                        # #1891: same `CI_PENDING_PREFIX` wording the
-                        # genuinely-still-running case uses above — this is
-                        # what lets `coord drive`'s `is_ci_pending_reason`
-                        # check (coord/drive.py) treat a re-run THIS auto-
-                        # trigger just kicked off exactly like any other
-                        # in-flight CI: a bare wait, never a spent merge
-                        # attempt. The queue resumes it automatically once
-                        # the re-run reports, no operator needed.
-                        msg = (
-                            f"{CI_PENDING_PREFIX} re-run triggered for CI "
-                            "checks that predate the current base (#2197 "
-                            f"auto-rerun {entry.ci_stale_reruns}/"
-                            f"{MAX_CI_STALE_RERUNS} "
-                            f"{'triggered' if reran else 'failed to trigger'})"
-                        )
-                        entry.error = msg
-                        events.append(MergeEvent(entry, "checks_stale_rerun", msg))
-                        continue  # #292: skip, don't halt the group
-                    # #1826: same renderer the plan path uses, so the two
-                    # surfaces can never describe this condition differently.
+                    # #1826: same renderer the plan/dry-run paths use, so all
+                    # three surfaces can never describe this condition
+                    # differently.
                     msg = ci_stale_reason(
                         checks, gh_ops, entry.repo_github, entry.target_branch,
-                        suffix=(
-                            f"; auto-rerun budget exhausted "
-                            f"({entry.ci_stale_reruns}/{MAX_CI_STALE_RERUNS})"
-                        ),
                     )
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_stale", msg))
                     continue  # #292: skip, don't halt the group
-                # #2197: reached only once the checks are genuinely fresh
-                # (or the smoke-side #1738/#1778/#1847 base-move exemption
-                # spared them) — mirrors the `ci_infra_reruns = 0` reset
-                # above and for the identical reason: whatever staleness
-                # streak the budget was tracking has now actually resolved,
-                # so a LATER base move starts its own budget from zero
-                # rather than inheriting an unrelated exhausted count.
+                # #2197/#3266: reached only once the checks are genuinely
+                # fresh (or the smoke-side #1738/#1778/#1847 base-move
+                # exemption spared them). `ci_stale_reruns` is no longer
+                # incremented anywhere (#3266 dropped the auto-rerun it
+                # counted) — this reset now only converges a row that
+                # predates the fix, and still carries a nonzero count from
+                # the old behaviour, back to 0.
                 entry.ci_stale_reruns = 0
             elif force_merge and ci.is_available:
                 # #1826: the override still overrides — but it says so. A

@@ -531,10 +531,20 @@ class GitHubCi:
         or a third-party check with no Actions run behind it at all) is
         skipped rather than failing the whole call, and any individual
         ``gh run rerun`` failure is logged into the return value rather than
-        raised — this is the remedy side of a fail-closed *reading*
-        (:func:`coord.ci_store.checks_are_stale`), not itself required to be
-        fail-closed: a rerun that only partially succeeds still helps, but
-        the caller must not be told it fully worked.
+        raised — a rerun that only partially succeeds still helps, but the
+        caller must not be told it fully worked.
+
+        #3266: ``gh run rerun`` replays the SAME run against the SAME event
+        payload it originally fired against — including the SAME base SHA.
+        That makes this the right remedy for "this run's verdict doesn't
+        mean anything" questions (:func:`coord.merge_queue._ci_infra_reason`'s
+        verdictless-failure case, or a suspected flake) where re-observing
+        the identical run is the whole point, but the WRONG one for
+        :func:`coord.ci_store.checks_are_stale`'s base-moved reading: a
+        same-base replay can never produce a check against a base that has
+        since moved, so calling this to "fix" staleness is a guaranteed
+        no-op. See ``coord.merge_queue.MAX_CI_STALE_RERUNS``'s comment for
+        the caller-side fix (park and ask for a rebase instead).
 
         Returns ``True`` only when at least one run id was found *and* every
         rerun call it issued exited zero. Returns ``False`` when there was
