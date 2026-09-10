@@ -1381,9 +1381,16 @@ def dispatch_stalled_pipeline_action(
         reset_res = DiagnoseResult(
             repo_name=work.repo_name, issue_number=work.issue_number, stage="review",
         )
+        # #3223: `assignment_id` is the FK target (the WORK row the review
+        # points at); `live_assignment` is the row whose SESSION might still
+        # be running — here that's always the review leg itself. Passing
+        # `review` (not `work`) is what lets `_reset_review_stage` cancel a
+        # still-live headless review through the agent BEFORE deleting the
+        # only board row `coord stop` could find it by.
         _reset_review_stage(
             config, work.repo_name, work.issue_number, reset_res,
             dry_run=False, assignment_id=work.assignment_id,
+            live_assignment=review,
         )
         if not reset_res.reset_performed:
             return StalledDispatchAction(
