@@ -394,18 +394,44 @@ def _probe_windows_msvc_target(prereq: Prereq, timeout: float) -> ToolProbe:
 # has ever run `az login` (or the cached login has since expired), which is
 # a false green worse than no probe at all.
 #
-# `az account show` is the cheapest call that fails closed on both cases:
-# it requires a cached login to answer at all, and its automatic token
-# refresh only succeeds while the cached refresh token is itself still
-# valid — an expired one surfaces as a nonzero exit here exactly as loudly
-# as a missing one, no separate expiry-math needed.
+# `az account show` is NOT the right probe here, even though it looks like
+# it should be: it reads the locally cached account profile
+# (`~/.azure/azureProfile.json`) and answers from that cache without making
+# any network call or forcing a token refresh. It only errors when there is
+# no cached account at all (never logged in, or explicitly `az logout`-ed).
+# `docs/DISASTER_RECOVERY.md` already documents the exact failure mode that
+# makes this the wrong command for these fleet boxes: "The az token on
+# these boxes expires often (90 days idle). `az account show` still
+# answers from cache while every ARM call 401s." A box whose cached login
+# expired 91 days ago still has a subscription entry on disk, so
+# `az account show` would report found=True while every real Azure call
+# fails — exactly the silent-false-green the #1678 lesson (below) warns
+# against.
+#
+# `az account get-access-token` is the cheapest call that actually forces
+# real token acquisition/validation against Azure AD: it must either reuse
+# a still-valid cached access token or use the cached refresh token to get
+# a new one, and an expired refresh token fails that exchange with
+# `AADSTS700082` (nonzero exit), exactly as loudly as never having logged
+# in at all. That is the credential-validity signal this probe needs.
+#
+# The #1678 lesson this exists to not repeat: `browser` sat UNMET for
+# months with `dispatch_smoke` silently refusing to route and nothing ever
+# saying so. So this must fail LOUDLY and visibly in `coord doctor` (via
+# `unmet_capabilities`, same as every other capability here) whenever
+# credentials are absent OR expired — a bare `az --version` probe would
+# report the capability met on a box where `az` is installed but nobody
+# has ever run `az login` (or the cached login has since expired), which is
+# a false green worse than no probe at all.
 def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
     """`custom_probe` backing the `azure` capability (#3233).
 
     Two independent ways this can be unmet: the `az` CLI missing from PATH
-    at all, or present but with no valid (unexpired) cached login. Never
-    raises — degrades to `found=False` with a `what_breaks` naming which of
-    the two failed, same contract as every other probe in this module.
+    at all, or present but unable to actually acquire a valid access token
+    (never logged in, or a cached login whose refresh token has since
+    expired). Never raises — degrades to `found=False` with a
+    `what_breaks` naming which of the two failed, same contract as every
+    other probe in this module.
     """
     if shutil.which(prereq.binary) is None:
         return ToolProbe(
@@ -415,7 +441,7 @@ def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
         )
     try:
         result = subprocess.run(
-            [prereq.binary, "account", "show", "--output", "json"],
+            [prereq.binary, "account", "get-access-token", "--output", "json"],
             capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -423,7 +449,8 @@ def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
             tool=prereq.tool, capability=prereq.capability, found=False,
             version=None, min_version=prereq.min_version, meets_floor=None,
             what_breaks=(
-                f"`az account show` hung or could not run — {prereq.what_breaks}"
+                "`az account get-access-token` hung or could not run — "
+                f"{prereq.what_breaks}"
             ),
         )
     if result.returncode != 0:
@@ -431,19 +458,21 @@ def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
             tool=prereq.tool, capability=prereq.capability, found=False,
             version=None, min_version=prereq.min_version, meets_floor=None,
             what_breaks=(
-                "`az account show` failed — credentials absent or expired, "
-                f"run `az login` on this machine ({prereq.what_breaks})"
+                "`az account get-access-token` failed — credentials absent "
+                "or expired, run `az login` on this machine "
+                f"({prereq.what_breaks})"
             ),
         )
     # Best-effort: name the active subscription so `coord doctor` shows
     # WHICH account is live, not just that credentials are present. Never a
     # reason to report found=False — an unparsable response still proves
-    # `az account show` succeeded, which is the whole signal.
+    # `az account get-access-token` succeeded (a real token was acquired),
+    # which is the whole signal.
     subscription: str | None = None
     try:
         payload = json.loads(result.stdout or "{}")
         if isinstance(payload, dict):
-            subscription = payload.get("name") or payload.get("id")
+            subscription = payload.get("subscription") or payload.get("tenant")
     except ValueError:
         pass
     return ToolProbe(

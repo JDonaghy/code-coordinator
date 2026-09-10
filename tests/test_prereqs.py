@@ -704,7 +704,11 @@ class TestAzureCapabilityManifest:
     machine that actually holds Azure credentials) is backed by a single
     `az` prereq whose probe checks credential *validity*, not just that the
     CLI binary exists on PATH — see `_probe_azure_credentials`'s module
-    comment for why a bare `az --version` would be a false green."""
+    comment for why a bare `az --version` would be a false green, and for
+    why the probe must be `az account get-access-token` (forces real token
+    acquisition against Azure AD) rather than `az account show` (answers
+    from the local cache and never re-validates, so it cannot detect an
+    expired-but-still-cached login — `docs/DISASTER_RECOVERY.md:74-77`)."""
 
     def _azure_prereqs(self):
         return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "azure"]
@@ -737,17 +741,37 @@ class TestAzureCapabilityManifest:
         assert probes["az"].ok is False
         assert "not found on PATH" in probes["az"].what_breaks
 
-    def test_account_show_failure_reports_credentials_absent_or_expired(self) -> None:
+    def test_get_access_token_uses_correct_command(self) -> None:
+        """`az account show` reads the locally cached profile and never
+        forces a token refresh, so it cannot detect an expired-but-still-
+        cached login (`docs/DISASTER_RECOVERY.md:74-77`). The probe must
+        invoke `az account get-access-token`, which forces real token
+        acquisition against Azure AD and so actually fails when the cached
+        refresh token itself has expired."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="{}", returncode=0),
+             ) as mock_run:
+            prereqs.probe_all(["azure"])
+        args = mock_run.call_args[0][0]
+        assert args[:3] == ["az", "account", "get-access-token"]
+
+    def test_get_access_token_failure_reports_credentials_absent_or_expired(self) -> None:
         """The #3233 crux: `az` installed but either never logged into, or
         with a login whose refresh token has since expired, must both
-        surface as UNMET — `az account show`'s own token-refresh call is
-        what fails closed on the expired case, no separate expiry check
-        needed."""
+        surface as UNMET — `az account get-access-token` forces a real
+        token acquisition against Azure AD, which is what actually fails
+        (`AADSTS700082`) on the expired case, unlike `az account show`
+        which only reads the local cache and never re-validates."""
         with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
              patch(
                  "coord.prereqs.subprocess.run",
                  return_value=_Result(
-                     stderr="ERROR: Please run 'az login' to setup account.\n",
+                     stderr=(
+                         "ERROR: AADSTS700082: The refresh token has "
+                         "expired due to inactivity.\n"
+                     ),
                      returncode=1,
                  ),
              ):
@@ -756,7 +780,7 @@ class TestAzureCapabilityManifest:
         assert probes["az"].ok is False
         assert "az login" in probes["az"].what_breaks
 
-    def test_account_show_hang_degrades_to_not_found(self) -> None:
+    def test_get_access_token_hang_degrades_to_not_found(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
              patch(
                  "coord.prereqs.subprocess.run",
@@ -766,25 +790,28 @@ class TestAzureCapabilityManifest:
         assert probes["az"].found is False
         assert probes["az"].ok is False
 
-    def test_account_show_success_reports_found_and_names_the_subscription(self) -> None:
+    def test_get_access_token_success_reports_found_and_names_the_subscription(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
              patch(
                  "coord.prereqs.subprocess.run",
                  return_value=_Result(
-                     stdout='{"id": "sub-123", "name": "acme-dev-platform"}\n',
+                     stdout=(
+                         '{"accessToken": "redacted", "subscription": '
+                         '"sub-123", "tenant": "tenant-456"}\n'
+                     ),
                      returncode=0,
                  ),
              ):
             probes = prereqs.probe_all(["azure"])
         assert probes["az"].found is True
         assert probes["az"].ok is True
-        assert probes["az"].version == "acme-dev-platform"
+        assert probes["az"].version == "sub-123"
 
-    def test_account_show_success_with_unparsable_json_still_reports_found(self) -> None:
-        """An unparsable response body still proves `az account show`
-        exited 0 — that's the whole signal; the subscription name is only
-        ever a best-effort label on top of it, never a reason to flip
-        found=False."""
+    def test_get_access_token_success_with_unparsable_json_still_reports_found(self) -> None:
+        """An unparsable response body still proves `az account
+        get-access-token` exited 0 — that's the whole signal (a real token
+        was acquired); the subscription id is only ever a best-effort
+        label on top of it, never a reason to flip found=False."""
         with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
              patch(
                  "coord.prereqs.subprocess.run",
