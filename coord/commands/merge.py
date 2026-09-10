@@ -180,6 +180,28 @@ def _apply_ci_revalidation(
     as "come back shortly", never as "checks failed" (#1925's acceptance:
     an ``unknown`` this command caused must not be presented identically to
     an ``unknown`` from genuinely broken CI).
+
+    #3266 — KNOWN FOLLOW-UP, not fixed here: every candidate this selects
+    (via :func:`coord.merge_queue.ci_revalidation_candidates`) is blocked
+    *solely* on CI staleness, and the ``rerun_for_pr`` call below is a
+    same-base ``gh run rerun`` that a staleness reading, by definition,
+    can never satisfy — see ``MAX_CI_STALE_RERUNS``'s comment in
+    ``coord/merge_queue.py``, which #3266 fixed identically at
+    ``merge_queue.process()`` and at ``coord.commands.drive_queue.
+    _run_auto_revalidate_checks_stale`` (the unattended periodic call
+    site). This CLI arm is the one remaining caller still spending a real
+    CI cycle on that guaranteed no-op. Left unfixed here on purpose for
+    this round — it is opt-in and human-invoked, unlike the unattended
+    drive-queue path, and the misleading ``ci_stale_reason`` remedy text
+    that used to point an operator at ``--revalidate`` *for this specific
+    condition* was already removed by #3266 — but an operator who runs
+    ``--revalidate`` for an unrelated reason (a genuine infra-failure
+    retry) on a PR that also happens to be ``checks_stale`` still silently
+    burns a no-op CI cycle for that PR. Tracked as a follow-up: the fix
+    would be to drop this entry from *candidates* (or from what gets
+    rerun) whenever the ONLY reason it is here is staleness, so
+    ``--revalidate`` never fires `rerun_for_pr` for a condition it cannot
+    clear.
     """
     from coord import merge_queue as _mq  # noqa: PLC0415
     from coord.ci_store import wait_for_ci_settle  # noqa: PLC0415

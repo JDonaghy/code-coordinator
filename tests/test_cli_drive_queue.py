@@ -3170,46 +3170,49 @@ def stale_ci_backend(monkeypatch):
     return rerun_calls
 
 
-def test_auto_revalidate_fires_a_ci_rerun_for_an_entry_blocked_solely_on_stale_checks(
+def test_auto_revalidate_surfaces_but_never_reruns_an_entry_blocked_on_stale_checks(
     cli_no_gates, coord_db, stale_ci_backend,
 ):
     """The #2530/#2534 shape, unattended: a PENDING entry with a PR, review
     already satisfied (`cli_no_gates` disables the review requirement —
     the same minimal "sole blocker is CI" shape
     `TestCiRevalidationCandidates` uses in tests/test_merge_queue.py), and
-    CI checks that are green but predate the current base. The tick fires
-    the re-run itself — no drive-queue row, no operator running
-    `coord merge --revalidate` by hand.
+    CI checks that are green but predate the current base.
+
+    #3266: the tick used to fire a `gh run rerun` for this shape — a
+    same-base replay that can never clear a staleness reading (see
+    `MAX_CI_STALE_RERUNS`'s comment in `coord/merge_queue.py`). It now only
+    records the block for an operator to see; no rerun, no queue mutation.
     """
     _seed_pending_merge_row(coord_db, 2534, pr_number=42)
 
     result = cli_no_gates("tick")
     assert result.exit_code == 0, result.output
 
-    assert stale_ci_backend == [("john/claude-coordinator", 42)]
+    assert stale_ci_backend == []  # #3266: never reruns for staleness
     row = coord_db.execute(
         "SELECT ci_stale_reruns, error FROM merge_queue WHERE issue_number = ?",
         (2534,),
     ).fetchone()
-    assert row["ci_stale_reruns"] == 1
-    assert row["error"].startswith("CI running:")
-    assert "#2535" in row["error"]
+    assert row["ci_stale_reruns"] == 0  # never touched by this call site any more
+    assert row["error"] is None  # never mutated — reporting only, see docstring
 
     from coord.audit import query_audit_log
 
-    entries = query_audit_log(event_type="merge_checks_stale_auto_revalidate")["entries"]
+    entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
     assert entries[0]["repo"] == REPO
 
 
-def test_auto_revalidate_never_exceeds_the_shared_budget(
+def test_auto_revalidate_keeps_surfacing_an_already_exhausted_entry(
     cli_no_gates, coord_db, stale_ci_backend,
 ):
-    """Budget already spent (whether by a prior tick or a prior live
-    `coord merge` attempt makes no difference — it's the same counter): no
-    NEW rerun fires, but the exhaustion is still recorded so a human
-    watching the audit trail sees it."""
+    """A row that carries a nonzero `ci_stale_reruns` from before #3266
+    (or from a live `process()` attempt on an old build) must still get
+    reported every tick — this call site no longer reads that counter at
+    all, so a pre-existing nonzero value neither blocks nor changes its
+    (always rerun-free) behaviour."""
     from coord.merge_queue import MAX_CI_STALE_RERUNS
 
     _seed_pending_merge_row(
@@ -3219,18 +3222,16 @@ def test_auto_revalidate_never_exceeds_the_shared_budget(
     result = cli_no_gates("tick")
     assert result.exit_code == 0, result.output
 
-    assert stale_ci_backend == []  # no new rerun triggered
+    assert stale_ci_backend == []  # no rerun triggered
     row = coord_db.execute(
         "SELECT ci_stale_reruns FROM merge_queue WHERE issue_number = ?",
         (2534,),
     ).fetchone()
-    assert row["ci_stale_reruns"] == MAX_CI_STALE_RERUNS  # unchanged
+    assert row["ci_stale_reruns"] == MAX_CI_STALE_RERUNS  # unchanged, unread
 
     from coord.audit import query_audit_log
 
-    entries = query_audit_log(
-        event_type="merge_checks_stale_auto_revalidate_exhausted"
-    )["entries"]
+    entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
 
