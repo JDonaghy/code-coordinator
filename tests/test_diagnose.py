@@ -1070,6 +1070,96 @@ def test_reset_review_failed_stop_leaves_row_intact(monkeypatch, config) -> None
     )
 
 
+def _reset_row_stubs(monkeypatch) -> dict:
+    """Stub the four DB writes `_reset_review_stage` performs, recording them."""
+    seen: dict = {}
+    monkeypatch.setattr(
+        "coord.state.delete_assignments_for_issue",
+        lambda repo, issue, *, types, review_of_assignment_id=None: seen.setdefault(
+            "delete", (repo, issue, types, review_of_assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr("coord.state.count_review_rows_for_reset", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        "coord.state.reset_work_review_state",
+        lambda repo, issue, *, assignment_id=None: seen.setdefault(
+            "reset_state", (repo, issue, assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(
+        "coord.state.clear_issue_context_by_source",
+        lambda repo, issue, source: seen.setdefault("purge", (repo, issue, source)) or 1,
+    )
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", lambda *a, **k: None)
+    return seen
+
+
+def test_reset_review_terminal_leg_is_never_probed_or_stopped(
+    monkeypatch, config
+) -> None:
+    """#3223 follow-up: the stop-before-delete guard must NOT fire for a leg
+    whose row is ALREADY TERMINAL. `notify`'s `review_done_no_verdict` sweep
+    calls `_reset_review_stage` directly on a `status="done"` review, on a
+    schedule, specifically to avoid paying a liveness probe per tick — and an
+    unreachable machine probes `"unknown"`, which the guard treats as "might
+    be live", so probing a finished review would refuse the very reset the
+    sweep exists to perform for as long as that machine stayed down."""
+    probed: list[str] = []
+    killed: list[str] = []
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: (
+        probed.append(a.assignment_id) or "unknown"
+    ))
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: (
+        killed.append(a.assignment_id) or False
+    ))
+    seen = _reset_row_stubs(monkeypatch)
+
+    rv = _assign(aid="rv1", typ="review", status="done", review_of="w1")
+    res = diagnose.DiagnoseResult(repo_name="api", issue_number=42, stage="review")
+    diagnose._reset_review_stage(
+        config, "api", 42, res,
+        dry_run=False, assignment_id="w1", live_assignment=rv,
+    )
+
+    assert probed == []  # terminal row → short-circuit, no ssh/HTTP round trip
+    assert killed == []
+    assert res.reset_performed is True
+    assert seen["delete"] == ("api", 42, ("review",), "w1")
+
+
+def test_reset_review_unknown_liveness_counts_as_possibly_live(
+    monkeypatch, config
+) -> None:
+    """The other half of the same gate: for a NON-terminal leg, an
+    unconfirmed probe (`"unknown"` — agent unreachable) must be treated as
+    "might still be running", so the row survives as `coord stop`'s handle.
+    Without this the gate could only ever pass, since `"unknown"` is what a
+    down machine reports (#2096: a gate must be able to fail)."""
+    probed: list[str] = []
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: (
+        probed.append(a.assignment_id) or "unknown"
+    ))
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: False)
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("must not touch rows when liveness is unconfirmed")
+
+    monkeypatch.setattr("coord.state.delete_assignments_for_issue", _boom)
+
+    rv = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    res = diagnose.DiagnoseResult(repo_name="api", issue_number=42, stage="review")
+    diagnose._reset_review_stage(
+        config, "api", 42, res,
+        dry_run=False, assignment_id="w1", live_assignment=rv,
+    )
+
+    assert probed == ["rv1"]
+    assert res.reset_performed is False
+    assert res.needs_reset is True
+
+
 def test_kill_session_cancels_headless_leg_via_agent(monkeypatch, config) -> None:
     """Unit-level #3223 regression on `_kill_session` itself: when tmux has
     no session at all for the assignment (the headless shape), it must fall

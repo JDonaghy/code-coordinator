@@ -2200,6 +2200,51 @@ class TestSweepStalledPipeline:
         notified = state_mod.load_notified()
         assert "work-1:stalled" in notified
 
+    def test_review_done_no_verdict_reset_targets_the_review_leg(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """#3223: `_reset_review_stage` takes TWO ids that mean different
+        things — `assignment_id` is the FK to the WORK row the review points
+        at, and `live_assignment` is the row whose SESSION might still be
+        running. This sweep must pass the REVIEW leg as `live_assignment`;
+        passing `work` would aim the stop-before-delete guard at a row that
+        finished long ago and can never be the thing holding the slot."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        state_mod.save_board(board)
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "coord.review.dispatch_review",
+            MagicMock(return_value=_review(
+                "work-1", aid="review-99", status="pending", review_verdict=None,
+            )),
+        )
+
+        import coord.diagnose as diagnose_mod
+
+        seen: dict = {}
+        real_reset = diagnose_mod._reset_review_stage
+
+        def _spy(cfg, repo, issue, res, **kwargs):  # noqa: ANN001, ANN003
+            seen["assignment_id"] = kwargs["assignment_id"]
+            seen["live"] = kwargs["live_assignment"]
+            return real_reset(cfg, repo, issue, res, **kwargs)
+
+        monkeypatch.setattr("coord.diagnose._reset_review_stage", _spy)
+
+        with patch("coord.notify.github_ops.post_issue_comment"):
+            notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert seen["assignment_id"] == "work-1"
+        assert seen["live"].assignment_id == "review-1"
+        assert seen["live"].type == "review"
+
 
 # ── #2679: `ignore_notified` — the notified ledger must be bypassable ──────
 #

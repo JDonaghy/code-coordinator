@@ -1526,6 +1526,42 @@ def _do_reset(
     res.actions_taken.append("branch preserved — stage is re-dispatchable")
 
 
+def _session_may_be_live(assignment: "Assignment", config: "Config") -> bool:
+    """Whether *assignment* might still have a running session, asked the way
+    a DESTRUCTIVE reset needs it asked (#3223).
+
+    Deliberately the single implementation both the dry-run preview and the
+    real reset call, so the preview can never describe a different decision
+    than the one that actually runs (#2085: one question, one answer).
+
+    Two-step, in this order:
+
+    1. A row whose ``status`` is already terminal (``dao.TERMINAL_STATUSES``
+       — the canonical set, not a local re-list) has **no session to
+       strand**: its finish was recorded by the agent, or by a reaper that
+       had already confirmed the process was gone. Answer ``False`` without
+       probing. This matters beyond tidiness — ``notify``'s
+       ``review_done_no_verdict`` sweep resets a ``status="done"`` review on
+       a schedule, and calls ``_reset_review_stage`` directly precisely to
+       avoid paying an ssh/HTTP liveness probe per tick. Probing there would
+       also *wedge that recovery*: an unreachable agent probes ``"unknown"``,
+       and step 2 treats ``"unknown"`` as "might be live", so an
+       already-finished review would refuse to reset for as long as its
+       machine stayed down.
+    2. Otherwise probe (:func:`_session_state`, which already covers the
+       headless shape via the agent's own ``/status`` — #1658) and treat
+       anything that is not a confirmed ``"dead"`` as possibly live.
+       ``"unknown"`` counts as possibly-live on purpose: the caller is about
+       to delete the only row ``coord stop`` could find this assignment by,
+       and an unconfirmed guess is not grounds for that (#2096).
+    """
+    from coord.dao import TERMINAL_STATUSES  # noqa: PLC0415
+
+    if assignment.status in TERMINAL_STATUSES:
+        return False
+    return _session_state(assignment, config) != "dead"
+
+
 def _reset_review_stage(
     config, repo_name: str, issue_number: int, res: DiagnoseResult, *,
     dry_run: bool, assignment_id: str, live_assignment: "Assignment",
@@ -1565,6 +1601,10 @@ def _reset_review_stage(
     a visible stall into an invisible orphan holding a worker slot forever.
     When the stop can't be confirmed, this reports why and returns WITHOUT
     deleting anything, leaving the row as the recovery handle it has to be.
+    An ALREADY-TERMINAL ``live_assignment`` skips the stop (and its probe)
+    entirely — see :func:`_session_may_be_live` for why that short-circuit
+    is load-bearing for ``notify``'s ``review_done_no_verdict`` sweep, not
+    merely an optimization.
     """
     from coord import state  # noqa: PLC0415
 
@@ -1573,7 +1613,7 @@ def _reset_review_stage(
             "DELETE the review rows, reset work review_state → pending, "
             "and purge #603 review notes (box → grey, re-reviewable)"
         )
-        if _session_state(live_assignment, config) != "dead":
+        if _session_may_be_live(live_assignment, config):
             msg = (
                 f"(dry-run) would first stop {live_assignment.assignment_id}'s "
                 f"live session, then {tail}"
@@ -1584,7 +1624,7 @@ def _reset_review_stage(
         res.needs_reset = True
         return
 
-    if _session_state(live_assignment, config) != "dead":
+    if _session_may_be_live(live_assignment, config):
         if _kill_session(live_assignment, config):
             res.actions_taken.append(
                 f"stopped the live review session ({live_assignment.assignment_id})"
