@@ -39,6 +39,7 @@ from coord.ci_store import (
     in_flight_checks,
     is_unreadable_check,
     is_verdictless_job,
+    shrunk_check_names,
     summarize,
     summarize_counts,
 )
@@ -2225,6 +2226,87 @@ def ci_rollup_all_clear(summary: Any) -> bool:
     return running == 0 and failed == 0 and passed > 0
 
 
+# ── Check-set shrinkage guard (#3263) ────────────────────────────────────────
+#
+# See `coord.ci_store.shrunk_check_names`'s module-level comment for the full
+# incident. This is the persistence half: `QueuedMerge.ci_seen_checks_sha`/
+# `ci_seen_check_names_json`, scoped to `entry.branch_head_sha`.
+def _ci_seen_check_names(entry: "QueuedMerge") -> frozenset[str]:
+    """The cumulative check-run name set previously observed for *entry*'s
+    CURRENT ``branch_head_sha`` (#3263) — empty when nothing has been
+    recorded yet for this commit (a fresh push, or the very first live CI
+    read this entry has ever had; see :func:`coord.ci_store.
+    shrunk_check_names`'s docstring for why that read can't be caught by
+    this guard alone).
+
+    Read-only: never mutates *entry*. Safe to call from every CI-check call
+    site — the live merge path, the ``--dry-run`` preview, and
+    :func:`_entry_gate_status` — so all three ask the identical question
+    over the identical persisted state; only the live path
+    (:func:`_ci_record_seen_check_names`) ever writes it, mirroring every
+    other CI-tracking mutation in this module.
+    """
+    sha = entry.branch_head_sha or ""
+    if not sha or entry.ci_seen_checks_sha != sha or not entry.ci_seen_check_names_json:
+        return frozenset()
+    try:
+        names = json.loads(entry.ci_seen_check_names_json)
+    except (TypeError, ValueError):
+        return frozenset()
+    if not isinstance(names, list):
+        return frozenset()
+    return frozenset(str(n) for n in names)
+
+
+def _ci_record_seen_check_names(entry: "QueuedMerge", checks: list[CheckRun]) -> None:
+    """Persist *checks*' names onto *entry* for its CURRENT
+    ``branch_head_sha`` (#3263) — the write half of the shrinkage guard.
+
+    Only ever called from the LIVE merge path in :func:`process` — mirrors
+    every other CI-tracking mutation in this module (``ci_infra_reruns``,
+    ``ci_flaky_pending``, ...), which likewise only ever changes on a real
+    attempt, never on a ``--dry-run`` preview or a board-render
+    ``_entry_gate_status`` call (:mod:`coord.gate_snapshot`'s Invariant 1:
+    the read path performs no mutation either).
+
+    Resets to exactly *checks*' own names — discarding any prior commit's
+    tracking — when ``branch_head_sha`` has changed since the last recorded
+    read; otherwise unions with whatever was already recorded, so a name
+    that disappears for more than one consecutive tick keeps being flagged
+    rather than being silently dropped from the record the moment it first
+    vanishes.
+    """
+    sha = entry.branch_head_sha or ""
+    current_names = {c.name for c in checks}
+    if entry.ci_seen_checks_sha != sha:
+        entry.ci_seen_checks_sha = sha
+        entry.ci_seen_check_names_json = json.dumps(sorted(current_names))
+        return
+    seen = set(_ci_seen_check_names(entry))
+    entry.ci_seen_check_names_json = json.dumps(sorted(seen | current_names))
+
+
+def _ci_check_shrinkage_message(missing: "Iterable[str]") -> str:
+    """The shared #3263 message for a read that dropped a previously-observed
+    check name.
+
+    Reuses :data:`CI_PENDING_PREFIX` — not a new prefix — so
+    :mod:`coord.drive_queue`'s "self-refreshing, no attempt spent" park
+    handling (keyed on :func:`is_ci_pending_reason`) extends to this reading
+    for free: a read that just lost track of a check it already knew about
+    answers exactly as little as one that is genuinely still running, and
+    should be waited out the same way, not treated as a resolved verdict of
+    any kind.
+    """
+    names = ", ".join(sorted(missing))
+    return (
+        f"{CI_PENDING_PREFIX} check(s) {names} were previously observed for "
+        "this commit but are missing from the latest read — likely a "
+        "partial CI re-run still registering (#3263); treating the read as "
+        "incomplete rather than resolved"
+    )
+
+
 # #1892: auto-reruns `process()` will trigger for a single entry's verdictless
 # CI failure (via `CiStore.rerun_for_pr`) before giving up and parking it for
 # a human instead of the queue's own #1891 machinery. A workflow genuinely
@@ -3701,6 +3783,33 @@ class QueuedMerge:
     # CURRENT `branch_head_sha` — a stale cache entry from a since-moved
     # SHA is simply refetched, never served.
     ci_fix_detail_json: str | None = None
+    # #3263: `branch_head_sha` (see the field above) that `ci_seen_check_
+    # names_json` was last recorded against, together with the JSON-encoded
+    # (sorted list) cumulative set of CI check-run NAMES observed for that
+    # commit across every live `process()` read so far. Mirrors the
+    # `ci_fix_detail_sha`/`ci_fix_detail_json` pairing immediately above:
+    # trusted only when this matches the CURRENT `branch_head_sha` — a new
+    # push resets tracking to that push's own first read rather than
+    # comparing against a since-superseded commit's check set, which a
+    # legitimate workflow edit (a split/renamed/added job) would otherwise
+    # misread as a vanished check forever.
+    #
+    # This is the persisted half of the #3263 check-set shrinkage guard: a
+    # partial GitHub Actions re-run ("Re-run failed jobs") briefly drops
+    # the re-running check's OWN record out of `list_checks_for_pr` while
+    # leaving its already-green siblings untouched, so the read stays
+    # non-empty and entirely-passing — vacuously satisfying every gate
+    # predicate exactly the way #1904's EMPTY list used to. Comparing each
+    # read's check names against this cumulative record (never just the
+    # immediately-prior read — see `coord.ci_store.shrunk_check_names`'s
+    # docstring) catches a name that disappears for one tick or several.
+    #
+    # '' / `None` for every entry that has never had a live CI read for its
+    # current commit, and for rows predating this migration — read
+    # identically to "nothing observed yet", which is exactly right: there
+    # is nothing to contradict on the very first read of a fresh SHA.
+    ci_seen_checks_sha: str = ""
+    ci_seen_check_names_json: str | None = None
 
 
 class GhOps(Protocol):
@@ -4095,6 +4204,10 @@ def load_queue() -> list[QueuedMerge]:
             # as a fresh entry's own defaults.
             ci_fix_detail_sha=row["ci_fix_detail_sha"] or "",
             ci_fix_detail_json=row["ci_fix_detail_json"],
+            # #3263: same NULL-to-''/None decoding as ci_fix_detail_sha/
+            # ci_fix_detail_json above, for rows predating this migration.
+            ci_seen_checks_sha=row["ci_seen_checks_sha"] or "",
+            ci_seen_check_names_json=row["ci_seen_check_names_json"],
         )
         for row in rows
     ]
@@ -4118,8 +4231,9 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
                         ci_unreadable_reruns, ci_fix_dispatches,
                         ci_fix_head_sha, ci_fix_noop_streak,
-                        ci_fix_detail_sha, ci_fix_detail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ci_fix_detail_sha, ci_fix_detail_json,
+                        ci_seen_checks_sha, ci_seen_check_names_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         item.assignment_id, item.repo_name, item.repo_github,
                         item.branch, item.target_branch, item.issue_number,
@@ -4131,6 +4245,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         item.ci_unreadable_reruns, item.ci_fix_dispatches,
                         item.ci_fix_head_sha, item.ci_fix_noop_streak,
                         item.ci_fix_detail_sha, item.ci_fix_detail_json,
+                        item.ci_seen_checks_sha, item.ci_seen_check_names_json,
                     ),
                 )
 
@@ -5207,6 +5322,15 @@ def _entry_gate_status(
                     f"{CI_ABSENT_PREFIX} no checks reported for PR #{entry.pr_number} "
                     "though this repo declares CI — merging would run untested code",
                 )
+        # #3263: a previously-observed check missing from THIS non-empty
+        # read — the partial-re-run window's signature (see
+        # `coord.ci_store.shrunk_check_names`'s docstring). Read-only here
+        # (never records — see `_ci_seen_check_names`'s docstring); the live
+        # merge path below is the only writer.
+        if checks:
+            missing = shrunk_check_names(_ci_seen_check_names(entry), checks)
+            if missing:
+                return PLAN_BLOCKED, _ci_check_shrinkage_message(missing)
         failed = failed_checks(checks)
         if failed:
             # #2347: classify a bare check-list FETCH failure (GitHub
@@ -6949,6 +7073,21 @@ def process(
                                 "this repo declares CI",
                             ))
                             continue
+                        # #3263: same shrinkage guard the live path applies
+                        # below — preview-only, never records (the live path
+                        # is the sole writer; see `_ci_seen_check_names`'s
+                        # docstring).
+                        if checks:
+                            missing = shrunk_check_names(
+                                _ci_seen_check_names(entry), checks
+                            )
+                            if missing:
+                                events.append(MergeEvent(
+                                    entry, "checks_pending",
+                                    f"(dry run) would be blocked: "
+                                    f"{_ci_check_shrinkage_message(missing)}",
+                                ))
+                                continue
                         failed = failed_checks(checks)
                         if failed:
                             # #1892/#2347: preview-only — never mutates,
@@ -7382,6 +7521,23 @@ def process(
                         )
                         entry.error = msg
                         events.append(MergeEvent(entry, "checks_absent", msg))
+                        continue  # #292: skip, don't halt the group
+                # #3263: check-set shrinkage guard. Compute against what was
+                # recorded BEFORE this read, then record this read's names —
+                # in that order, so `missing` reflects an actual regression
+                # (a name seen before, gone now) rather than being emptied by
+                # the very update meant to detect it next time. This is the
+                # ONLY call site that writes `ci_seen_checks_sha`/
+                # `ci_seen_check_names_json` — see `_ci_record_seen_check_
+                # names`'s docstring for why the preview/board-render sites
+                # only ever read it.
+                if checks:
+                    missing = shrunk_check_names(_ci_seen_check_names(entry), checks)
+                    _ci_record_seen_check_names(entry, checks)
+                    if missing:
+                        msg = _ci_check_shrinkage_message(missing)
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "checks_pending", msg))
                         continue  # #292: skip, don't halt the group
                 failed = failed_checks(checks)
                 if failed:

@@ -404,6 +404,53 @@ def in_flight_checks(checks: list[CheckRun]) -> list[CheckRun]:
     return [c for c in checks if c.status != "completed"]
 
 
+# ── Check-set shrinkage guard (#3263) ────────────────────────────────────────
+#
+# coord-tui#83 merged 1.3s into a PARTIAL re-run ("Re-run failed jobs") of a
+# failing required check: the re-run invalidates only that ONE check-run's
+# record on GitHub's side, which can briefly (~seconds) disappear from
+# `list_checks_for_pr`'s result entirely while it re-registers — the
+# untouched, already-green siblings stay right where they were. That leaves
+# the read non-empty and entirely completed+success, which satisfies
+# `failed_checks`/`in_flight_checks`/`checks_are_stale` vacuously, same as
+# #1904's empty-list hole but on the NON-empty side: nothing in the read
+# itself says "incomplete", because the check that would say so is exactly
+# the one missing.
+#
+# A FULL re-run (or the #1925 freshly-triggered-rerun window `wait_for_ci_
+# settle` guards) empties the WHOLE list, which #1904's `checks_absent`
+# handling already fails closed on. This is that case's non-empty sibling:
+# `checks != []` but still not the complete picture.
+#
+# The fix has nothing to do with WHY a check vanished — a partial re-run, a
+# transient API omission, GitHub's own eventual consistency — only that it
+# WAS observed for this exact commit and is no longer there. `shrunk_check_
+# names` is the pure comparison; the caller (`coord.merge_queue`) is
+# responsible for persisting the "previously observed" set per (PR, head
+# SHA) across reads — see `QueuedMerge.ci_seen_checks_sha`/`ci_seen_check_
+# names_json` and `_ci_record_seen_check_names`/`_ci_shrunk_check_names`.
+def shrunk_check_names(
+    seen_names: "Iterable[str]", checks: list[CheckRun]
+) -> frozenset[str]:
+    """Names in *seen_names* that are no longer present in *checks* (#3263).
+
+    Pure set difference — no notion of "previously observed" lives here;
+    that is the caller's persisted state (see this section's header
+    comment). An empty *checks* is deliberately not special-cased: a caller
+    that has already special-cased "no checks at all" (#1904's own
+    ambiguity, or a legitimate fall-through like #1877's conflicted-PR
+    routing) should not call this at all for that read, since "everything
+    vanished" and "nothing was ever expected" are exactly the distinction
+    #1904 exists to make and this function has no way to tell them apart.
+
+    Returns an empty ``frozenset`` (nothing missing) when *seen_names* is
+    empty — the "first observation of this commit, nothing to compare
+    against yet" case; see the caller's reset-on-new-SHA behaviour.
+    """
+    current = {c.name for c in checks}
+    return frozenset(name for name in seen_names if name not in current)
+
+
 # ── Post-rerun settle wait (#1925) ──────────────────────────────────────────
 #
 # `coord merge --revalidate`'s CI arm (`_apply_ci_revalidation` in

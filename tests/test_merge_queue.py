@@ -216,6 +216,25 @@ class TestPersistence:
             "b": ("", None),
         }
 
+    def test_roundtrip_preserves_ci_seen_check_names(self, coord_db) -> None:
+        # #3263: the persisted half of the check-set shrinkage guard —
+        # same durability requirement as ci_fix_detail_sha/_json above: a
+        # `coord merge` invocation is a fresh CLI process each tick, so
+        # this MUST survive a save/load cycle or the guard could never
+        # compare across ticks at all.
+        a = _q("a")
+        a.ci_seen_checks_sha = "deadbeef"
+        a.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        save_queue([a, _q("b")])
+        again = {
+            x.assignment_id: (x.ci_seen_checks_sha, x.ci_seen_check_names_json)
+            for x in load_queue()
+        }
+        assert again == {
+            "a": ("deadbeef", json.dumps(["cargo-test", "cargo-test-gtk"])),
+            "b": ("", None),
+        }
+
 
 class TestSaveQueueLockContention:
     """#2802: `save_queue`'s DELETE+re-INSERT rewrite must ride out
@@ -8403,6 +8422,92 @@ class TestPlanCiStaleness:
         assert not (plan[0].reason or "").startswith(mq.CI_STALE_PREFIX)
 
 
+class TestEntryGateStatusCiCheckShrinkage:
+    """#3263: `_entry_gate_status` (the board/plan render path, via
+    `entry_gate_status`/`plan()`) applies the same check-set shrinkage
+    guard the live merge path does — read-only, since this path must never
+    mutate persisted state (mirrors every other CI predicate here — see
+    `_ci_seen_check_names`'s docstring).
+
+    Called directly with an already live-anchored `entry` (``branch_head_
+    sha`` set), mirroring `coord.drive_queue._fetch_live_ci_gate`'s real
+    call shape (per `entry_gate_status`'s own docstring) — `plan()`'s own
+    `load_queue()` never populates the transient `branch_head_sha` field
+    itself (see that field's docstring), so a `plan()`-level round trip
+    would just exercise "no SHA available" every time, the same limitation
+    every other SHA-scoped predicate in this function already has from that
+    call site (e.g. the review gate's #821 commit-bound check).
+    """
+
+    @staticmethod
+    def _ci(checks):
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return checks
+        return _Ci()
+
+    class _Gh(FakeGh):
+        """A fixed, current base timestamp so #1851's staleness gate never
+        fires once shrinkage clears — every check below has `started_at`
+        safely after it."""
+
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return 1000.0
+
+    @staticmethod
+    def _check(name: str, conclusion: str) -> CheckRun:
+        return CheckRun(
+            name=name, status="completed", conclusion=conclusion,
+            url=f"https://gh/runs/{name}", run_id=name,
+            started_at=1500.0, completed_at=None,
+        )
+
+    def test_blocked_when_a_previously_seen_check_is_missing(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_BLOCKED
+        assert reason.startswith(mq.CI_PENDING_PREFIX)
+        assert "cargo-test-gtk" in reason
+
+    def test_never_mutates_the_persisted_seen_set(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert entry.ci_seen_check_names_json == json.dumps(
+            ["cargo-test", "cargo-test-gtk"]
+        )
+
+    def test_ready_when_nothing_previously_observed_has_vanished(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_READY
+        assert reason is None
+
+    def test_ready_when_seen_sha_differs_from_current(self) -> None:
+        """Tracking recorded against an OLD commit must never gate a NEW
+        one — a fresh push legitimately changes the check set."""
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha2"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_READY
+        assert reason is None
+
+
 class TestCiRevalidationCandidates:
     """#1851: the eligibility policy for `coord merge --revalidate`'s CI
     re-run arm — the CI analogue of `revalidation_candidates`."""
@@ -9147,6 +9252,179 @@ class TestCiInfraReason:
         ]})
         self._fn(ci, "acme/api", 1, checks)
         assert ci.calls == [("acme/api", "999")]
+
+
+class TestProcessCiCheckShrinkage:
+    """#3263: coord-tui#83 merged 1.3s into a PARTIAL GitHub Actions re-run
+    ("Re-run failed jobs") of its one failing required check
+    (`cargo-test-gtk`). The re-run briefly dropped that check's OWN
+    check-run record out of `list_checks_for_pr` while its already-green
+    siblings (`cargo-test`) stayed put — a non-empty, entirely-passing read
+    that satisfied `failed_checks`/`in_flight_checks` vacuously, #1904's
+    hole on the non-empty side. `process()` now persists the check-run NAME
+    set it has observed per (PR, head SHA) and refuses to treat a read that
+    dropped a previously-seen name as a genuine, resolved answer.
+    """
+
+    class _Gh(FakeGh):
+        """A fixed, current base timestamp so #1851's staleness gate never
+        fires in these tests — every check below is given a `started_at`
+        safely after it (see `_c`)."""
+
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return 1000.0
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, checks):
+            self.checks = checks
+            self.rerun_calls: list = []
+
+        def list_checks_for_pr(self, repo, number):
+            return self.checks
+
+        def rerun_for_pr(self, repo, number):
+            self.rerun_calls.append((repo, number))
+            return True
+
+    @staticmethod
+    def _c(name: str, conclusion: str) -> CheckRun:
+        return CheckRun(
+            name=name, status="completed", conclusion=conclusion,
+            url=f"https://gh/runs/{name}", run_id=name,
+            started_at=1500.0, completed_at=None,
+        )
+
+    def test_first_read_with_a_real_failure_is_not_treated_as_shrinkage(self) -> None:
+        """Nothing has been observed yet for this commit — a genuinely
+        failing check on the very FIRST read is `checks_failed`, not
+        shrinkage (there is nothing to have shrunk FROM). This is #3263's
+        own documented gap: the guard needs a prior observation to compare
+        against."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        events = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "checks_pending" not in kinds
+        assert items[0].state == PENDING
+
+    def test_a_previously_seen_check_vanishing_parks_as_pending_not_green(self) -> None:
+        """The #3263 incident, reproduced: a check observed failing on one
+        read is simply ABSENT (not resolved, not failed again) from the
+        next read — the partial-rerun registration window. Must park as
+        `checks_pending`, never fall through to a vacuous merge."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        first = process(items, gh, ci_store=ci)
+        assert "checks_failed" in [e.kind for e in first]
+        assert items[0].state == PENDING
+
+        # The partial re-run's registration window: `cargo-test-gtk`'s own
+        # check-run record has vanished; `cargo-test` (untouched by the
+        # partial re-run) is still there and still green — exactly the
+        # incident's "non-empty, entirely-passing" reading.
+        ci.checks = [self._c("cargo-test", "success")]
+        second = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in second]
+        assert "checks_pending" in kinds
+        assert "merged" not in kinds
+        assert items[0].state == PENDING
+        assert items[0].error.startswith(mq.CI_PENDING_PREFIX)
+        assert "cargo-test-gtk" in items[0].error
+
+    def test_merges_once_the_vanished_check_resolves_green(self) -> None:
+        """End to end: failed -> vanished (parked, no attempt spent) ->
+        reappears green -> merges. The union-tracking must not get stuck
+        blocking forever once the check is genuinely back and resolved."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        ci.checks = [self._c("cargo-test", "success")]
+        process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+
+        ci.checks = [
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "success"),
+        ]
+        third = process(items, gh, ci_store=ci)
+        assert items[0].state == MERGED
+        assert "merged" in [e.kind for e in third]
+
+    def test_new_commit_resets_tracking(self) -> None:
+        """A fresh push (a new `branch_head_sha`) must not compare against
+        the previous commit's check set — a workflow legitimately dropping
+        a job on a new commit is not #3263's shrinkage."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha-1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+
+        items[0].branch_head_sha = "sha-2"
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci)
+        assert items[0].state == MERGED
+        assert "checks_pending" not in [e.kind for e in events]
+
+    def test_dry_run_preview_reports_shrinkage_without_recording(self) -> None:
+        """The `--dry-run` preview must warn about the same condition the
+        live path would block on, but never mutate the persisted seen-set —
+        only a live attempt writes it (see `_ci_record_seen_check_names`)."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)  # live: records cargo-test-gtk as seen
+        before = items[0].ci_seen_check_names_json
+        assert before is not None
+
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci, dry_run=True)
+        kinds = [e.kind for e in events]
+        assert "checks_pending" in kinds
+        # Read-only: the dry run must not have changed the persisted record.
+        assert items[0].ci_seen_check_names_json == before
+
+    def test_force_merge_overrides_shrinkage(self) -> None:
+        """`--force-merge` still skips the whole CI gate, shrinkage included —
+        same override as every other CI block (#240)."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci, force_merge=True)
+        assert items[0].state == MERGED
+        assert "checks_pending" not in [e.kind for e in events]
 
 
 class TestProcessCiInfraAutoRerun:
