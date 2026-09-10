@@ -49,6 +49,18 @@ Design decisions (#974):
   local ``issues`` table shape — ``labels`` as a plain ``list[str]``, not
   GitHub's ``[{"name": ...}]``) and does no I/O of its own. The CLI command
   (``coord plans --lint-epics``) is what reads the local cache.
+- **Stale-tracker lint (#3228)**.  :func:`find_stale_epics` is the sibling of
+  :func:`find_unlabelled_epics` above — same locally-cached ``issues`` shape,
+  same read-only "flag, don't fix" posture (out of scope per #3226) — but it
+  looks the other direction: instead of an epic missing its label, it flags an
+  open, correctly ``"epic"``-labelled epic whose declared scope has already
+  shipped (every child closed) or was never registered (zero children). It
+  resolves children via :class:`coord.parentage.MarkdownParentage` against the
+  epic's own cached ``body`` (no GitHub round trip) and cross-references each
+  child's REAL state in the same cached ``issues`` rows rather than trusting
+  the ``## Sub-issues``/``## Work order`` checklist's own ``[x]``/``[ ]`` box,
+  which #1061 stopped keeping in sync with reality. The CLI command
+  (``coord plans --lint-stale-epics``) is what reads the local cache.
 """
 
 from __future__ import annotations
@@ -65,6 +77,7 @@ from coord.milestone_order import (
     ready_frontier,
 )
 from coord.models import Board
+from coord.parentage import MarkdownParentage
 
 
 __all__ = [
@@ -73,6 +86,7 @@ __all__ = [
     "PlanEntry",
     "find_tracking_issue",
     "find_unlabelled_epics",
+    "find_stale_epics",
     "aggregate_plan",
     "aggregate_repo_plans",
 ]
@@ -258,6 +272,100 @@ def find_unlabelled_epics(issues: list[dict]) -> list[dict]:
         if TRACKING_ISSUE_LABEL in label_names:
             continue
         hits.append(issue)
+    return hits
+
+
+# ── Stale-tracker lint (#3228) ──────────────────────────────────────────────
+
+
+def find_stale_epics(issues: list[dict]) -> list[dict]:
+    """Return open, ``TRACKING_ISSUE_LABEL``-labelled issues whose declared
+    scope has already shipped, or was never registered (#3228).
+
+    An epic is flagged when its children — parsed from its OWN cached
+    ``body`` via :class:`coord.parentage.MarkdownParentage.children`
+    (``fallback_to_work_order=True``, so an epic with only a ``## Work
+    order`` block and no separate ``## Sub-issues`` checklist isn't reported
+    as childless just because it predates the #1008 checklist convention) —
+    are either:
+
+    * absent entirely (zero registered children), or
+    * all resolved to ``"closed"``.
+
+    Each child's real state is looked up by ``(repo_name, number)`` in
+    *issues* itself — the SAME already-cached rows this function scans for
+    epics — rather than trusted from the checklist's own ``[x]``/``[ ]`` box.
+    That box is not a live signal: #1061 deliberately stopped keeping it in
+    sync once the checkbox-free ``## Work order`` grammar shipped, so an
+    unchecked box no longer means "still open" (see
+    :mod:`coord.milestone_order`'s ``parse_work_order``/``render_work_order``
+    docstrings). A child not present in *issues* at all (a different repo,
+    or not yet synced into the local cache) is unresolvable and counted as
+    ``"open"`` — the conservative default, so an incomplete cache under-flags
+    rather than over-flags a still-live epic.
+
+    ``issues`` is the same local-cache shape :func:`find_unlabelled_epics`
+    consumes, PLUS a ``"body"`` field (:func:`coord.state.cached_open_issues`
+    carries it since #3228) — the epic's own tracking-issue body, needed to
+    parse its declared children. Closed epics are skipped — a closed tracker
+    with no open children isn't drift, it's just done.
+
+    Read-only, like :func:`find_unlabelled_epics`: this never mutates
+    ``issues``, closes anything, or edits a checklist (out of scope per
+    #3226). Each hit is the original issue dict with three extra keys
+    layered in: ``child_total``, ``child_open``, ``child_closed``.
+    """
+    state_by_key: dict[tuple[str, int], str] = {}
+    for issue in issues:
+        number = issue.get("number")
+        if number is None:
+            continue
+        state_by_key[(issue.get("repo_name", ""), int(number))] = (
+            issue.get("state") or "open"
+        ).lower()
+
+    parentage = MarkdownParentage()
+    hits: list[dict] = []
+    for issue in issues:
+        state = (issue.get("state") or "open").lower()
+        if state != "open":
+            continue
+        raw_labels = issue.get("labels") or []
+        label_names = {
+            lbl["name"] if isinstance(lbl, dict) else str(lbl) for lbl in raw_labels
+        }
+        if TRACKING_ISSUE_LABEL not in label_names:
+            continue
+        number = issue.get("number")
+        if number is None:
+            continue
+
+        repo_name = issue.get("repo_name", "")
+        children = parentage.children(
+            repo_name,
+            int(number),
+            body=issue.get("body") or "",
+            fallback_to_work_order=True,
+        )
+
+        child_open = 0
+        child_closed = 0
+        for child in children:
+            real_state = state_by_key.get((repo_name, child.number), "open")
+            if real_state == "closed":
+                child_closed += 1
+            else:
+                child_open += 1
+
+        if not children or child_open == 0:
+            hits.append(
+                {
+                    **issue,
+                    "child_total": len(children),
+                    "child_open": child_open,
+                    "child_closed": child_closed,
+                }
+            )
     return hits
 
 
