@@ -122,7 +122,7 @@ from coord.interactive import (
     tmux_session_alive,
 )
 from coord.dead_end import DeadEnd, detect_dead_end
-from coord.drive_queue import dispatch_type_for_labels
+from coord.drive_queue import dispatch_type_for_labels, entries_from_rows, entry_key
 from coord.failure_class import (
     classify_failure,
     environmental_backoff_secs,
@@ -130,6 +130,7 @@ from coord.failure_class import (
 )
 from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
+    EPIC_DECOMPOSE_TYPE,
     MERGE_LANDED_MARKER,
     POLICY_REFUSAL_MARKER,
     PREMISE_REFUSAL_MARKER,
@@ -1624,6 +1625,46 @@ def _acceptance_message(message: str, state: IssueState) -> str:
 # ── merge verification ───────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class EpicChildStatus:
+    """One node off the epic's own ``## Sub-issues`` checklist (#3246).
+
+    ``closed`` and ``after`` are exactly what :func:`_epic_decompose_batch`
+    needs to decide "unstarted" without re-deriving GitHub state itself:
+    ``closed`` is the child issue's OWN live state (never the checklist's
+    decorative ``[x]``, per ``coord.milestone_order``'s own comment on why
+    that box isn't read for readiness), and ``after`` is the child's
+    declared ``{after: #N}`` targets, letting an epic author mark a child
+    conditional on something else finishing — the same mechanism that let
+    the claude-coordinator#3230 leg correctly skip a conditional child by
+    hand — without this function having to parse free-form epic prose.
+    """
+
+    issue_number: int
+    closed: bool = False
+    after: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class EpicChecklistSnapshot:
+    """Live inputs to #3246's coordinator-side epic-decompose follow-up.
+
+    ``children`` is the epic's ``## Sub-issues`` checklist, in declared
+    order — the durable, re-observable record of the worker's own step 1
+    (``coord milestone add-child``), read fresh off GitHub rather than
+    trusted from the worker's final message (the whole premise of #3246).
+    ``queued_keys`` is every ``"repo#N"`` key already present in the drive
+    queue, and ``epic_after`` is the epic's OWN current queue row's
+    declared ``after=`` edges (``()`` when the epic isn't queued, or is
+    queued with no edge) — both needed to tell "already handled" apart from
+    "still to do" without re-adding something that's already there.
+    """
+
+    children: tuple[EpicChildStatus, ...] = ()
+    queued_keys: frozenset[str] = frozenset()
+    epic_after: tuple[str, ...] = ()
+
+
 class MergeVerifier(Protocol):
     """The git/GitHub questions the state machine cannot answer itself."""
 
@@ -1632,6 +1673,10 @@ class MergeVerifier(Protocol):
     def verify_merged(self, state: IssueState) -> bool: ...
 
     def branch_head_sha(self, state: IssueState) -> str | None: ...
+
+    def epic_checklist_snapshot(
+        self, state: IssueState
+    ) -> EpicChecklistSnapshot | None: ...
 
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
@@ -1845,6 +1890,67 @@ class GitMergeVerifier:
 
         return github_ops.get_branch_sha(state.repo_github, state.work_branch)
 
+    def epic_checklist_snapshot(
+        self, state: IssueState
+    ) -> EpicChecklistSnapshot | None:
+        """Fresh GitHub + drive-queue read behind #3246's coordinator-side
+        epic-decompose follow-up (see :func:`_epic_decompose_batch`).
+
+        Deliberately re-fetches the epic's own issue body rather than
+        trusting anything cached on *state* — the whole point of #3246 is
+        that a worker's report of having filed/queued children is not
+        evidence any of it actually happened; only an OBSERVATION taken
+        after the fact is. Returns ``None`` (never raises) on any fetch
+        failure, INCLUDING a malformed ``## Sub-issues`` checklist that
+        won't parse — the caller (:func:`_decide_epic_decompose_followup`)
+        treats that identically to "try again next poll"; a checklist that
+        never becomes parseable eventually surfaces through the ordinary
+        dead-end escalation the rest of this state machine already relies
+        on for every other kind of silent stall (#1386), rather than a
+        second bespoke retry budget just for this.
+        """
+        if not state.repo_github:
+            return None
+        from coord import github_ops  # noqa: PLC0415
+        from coord.milestone_order import WorkOrderError, parse_sub_issues  # noqa: PLC0415
+        from coord.state import list_drive_queue  # noqa: PLC0415
+
+        try:
+            epic_data = github_ops.get_issue(state.repo_github, state.issue)
+        except RuntimeError:
+            return None
+        try:
+            work_order = parse_sub_issues(epic_data.get("body") or "")
+        except WorkOrderError as exc:
+            self.warn(
+                f"epic #{state.issue}'s ## Sub-issues checklist is malformed "
+                f"({exc}) — cannot plan the #3246 batch until it's fixed by hand"
+            )
+            return None
+
+        children: list[EpicChildStatus] = []
+        for node in work_order.nodes:
+            try:
+                child_data = github_ops.get_issue(state.repo_github, node.issue_number)
+            except RuntimeError:
+                return None
+            closed = str(child_data.get("state") or "").upper() == "CLOSED"
+            children.append(EpicChildStatus(node.issue_number, closed, node.after))
+
+        try:
+            rows = list_drive_queue()
+        except Exception:  # noqa: BLE001 — local DB / daemon read failure: retry later
+            return None
+        entries = entries_from_rows(rows)
+        queued_keys = frozenset(e.key for e in entries)
+        epic_key = entry_key(state.repo, state.issue)
+        epic_entry = next((e for e in entries if e.key == epic_key), None)
+        epic_after = epic_entry.after if epic_entry is not None else ()
+
+        return EpicChecklistSnapshot(
+            children=tuple(children), queued_keys=queued_keys, epic_after=epic_after,
+        )
+
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
 
@@ -2022,6 +2128,123 @@ def _escalate_dead_end(state: IssueState, dead_end: DeadEnd) -> Action:
             f"anyway — resolve by hand: {dead_end.recovery})"
         ),
     )
+
+
+# ── #3246: epic-decompose's steps 2/3, coordinator-side ─────────────────────
+#
+# `coord.dispatch.EPIC_DECOMPOSE_CONTRACT` used to ask the epic-decompose
+# worker itself to queue the first batch of newly-filed children (chained
+# serially) and re-queue the epic behind them (steps 2/3 of that contract).
+# Across the only two `epic-decompose` legs that have ever run, that worked
+# exactly once: claude-coordinator#3230 chained six children and re-queued
+# the epic correctly; claude-coordinator#3226 reported the identical two
+# steps done in its final message, and NEITHER queue row ever existed. A
+# one-shot worker's own report of a coordinator-state write is not evidence
+# the write happened — only re-observing the state is — so this reads the
+# epic's live `## Sub-issues` checklist (the durable trace of the worker's
+# step 1, `coord milestone add-child`) and the live drive queue, and issues
+# whatever `coord drive-queue add` call is still missing, one per poll,
+# until the batch and the epic's own re-queue both exist. Idempotent by
+# construction (every `add` upserts by (repo, issue)), so re-running this on
+# every poll while nothing is missing is a no-op that just falls through.
+
+_EPIC_DECOMPOSE_BATCH_SIZE = 6
+
+
+def _epic_decompose_batch(
+    state: IssueState, snapshot: EpicChecklistSnapshot
+) -> Action | None:
+    """Pure planner: given the epic's checklist + queue snapshot, what's the
+    next `coord drive-queue add` (if any) still needed to finish steps 2/3?
+
+    "Unstarted" mirrors what the contract always meant a worker to queue:
+    not itself closed, and not blocked by an `{after: #N}` edge onto
+    something that isn't closed yet — the SAME mechanism an epic author
+    already had for marking a child conditional (see
+    claude-coordinator#3230, which correctly skipped one this way), so this
+    never has to parse free-form epic prose to find a "conditional" child.
+    The eligible set is capped at :data:`_EPIC_DECOMPOSE_BATCH_SIZE` in
+    checklist order and is stable across polls (it does not depend on what's
+    already queued), so re-deriving it every poll always converges on the
+    same batch rather than drifting.
+
+    Returns ``None`` when there is nothing left to queue — either every
+    eligible child (and the epic's own re-queue) is already there, or the
+    checklist has no eligible child at all (e.g. step 1 never filed
+    anything; that is a DIFFERENT defect than the one this function exists
+    to close, and is left to surface on its own rather than `_die()`-ing
+    here on a case this function was never asked to police).
+    """
+    terminal = {c.issue_number for c in snapshot.children if c.closed}
+    eligible = [
+        c for c in snapshot.children
+        if c.issue_number not in terminal and set(c.after) <= terminal
+    ]
+    batch = eligible[:_EPIC_DECOMPOSE_BATCH_SIZE]
+    if not batch:
+        return None
+
+    for i, child in enumerate(batch):
+        key = entry_key(state.repo, child.issue_number)
+        if key in snapshot.queued_keys:
+            continue
+        command = ["drive-queue", "add", state.repo, str(child.issue_number)]
+        if i > 0:
+            command += ["--after", entry_key(state.repo, batch[i - 1].issue_number)]
+        return Action(
+            kind=RUN,
+            label=(
+                f"EPIC-DECOMPOSE #{state.issue}: queueing batch child "
+                f"{key} ({i + 1}/{len(batch)}, #3246)"
+            ),
+            command=tuple(command),
+            error_message=(
+                f"coord drive-queue add failed for {key} while queuing "
+                f"epic #{state.issue}'s first batch (#3246)"
+            ),
+        )
+
+    last_key = entry_key(state.repo, batch[-1].issue_number)
+    if snapshot.epic_after == (last_key,):
+        return None
+    epic_command = [
+        "drive-queue", "add", state.repo, str(state.issue), "--after", last_key,
+    ]
+    return Action(
+        kind=RUN,
+        label=(
+            f"EPIC-DECOMPOSE #{state.issue}: re-queueing epic behind "
+            f"{last_key} (#3246)"
+        ),
+        command=tuple(epic_command),
+        error_message=(
+            f"coord drive-queue add failed while re-queueing epic "
+            f"#{state.issue} behind {last_key} (#3246)"
+        ),
+    )
+
+
+def _decide_epic_decompose_followup(
+    state: IssueState, verifier: MergeVerifier
+) -> Action | None:
+    """Wrapper around :func:`_epic_decompose_batch`: fetch the live snapshot,
+    then plan against it. A fetch failure (bad checklist included — see
+    :meth:`GitMergeVerifier.epic_checklist_snapshot`) waits for the next
+    poll rather than guessing; a no-op plan (``None``) falls through to the
+    ordinary Test/Review/Merge machinery exactly like every other
+    `_decide_*` helper `decide()` calls.
+    """
+    if state.work_type != EPIC_DECOMPOSE_TYPE:
+        return None
+    snapshot = verifier.epic_checklist_snapshot(state)
+    if snapshot is None:
+        return _wait(
+            label=(
+                f"EPIC-DECOMPOSE #{state.issue}: could not read the epic's "
+                "checklist/queue state yet, retrying (#3246)"
+            )
+        )
+    return _epic_decompose_batch(state, snapshot)
 
 
 def decide(
@@ -2404,6 +2627,20 @@ def decide(
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}"
         )
+
+    # #3246: an epic-decompose leg's steps 2/3 (queue the first batch of
+    # newly-filed children, re-queue the epic behind them) are coordinator-
+    # side now, not worker-reported — see `_decide_epic_decompose_followup`.
+    # Positioned here, right after the branch check and before the dead-end
+    # predicate, so a batch still being queued (one `coord drive-queue add`
+    # per poll) can never be mistaken for a stalled Test/Review stage. Runs
+    # for both the `done` and the accepted-`advisory` (commits-present) shape
+    # above — `_decide_epic_decompose_followup` itself is the type gate
+    # (`state.work_type != EPIC_DECOMPOSE_TYPE` short-circuits everything
+    # else for the overwhelming majority of rows, which are plain `work`).
+    epic_followup = _decide_epic_decompose_followup(state, verifier)
+    if epic_followup is not None:
+        return replace(epic_followup, warnings=warnings + epic_followup.warnings)
 
     # ---- the dead-end predicate (#2019) ------------------------------------
     #
