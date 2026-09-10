@@ -2322,6 +2322,105 @@ class TestLegCounts:
         assert leg_counts() == {"api#7": {"work": 3}}
 
 
+class TestCachedOpenIssues:
+    """`coord.state.cached_open_issues` / `_cached_open_issues_local` (#3227).
+
+    Backs `coord plans --lint-epics`'s scan over the locally-cached `issues`
+    table (`coord/commands/plans.py`) — routes to the daemon when
+    `board_service` is set, exactly like `get_issue_titles`/`leg_counts`, so
+    a thin client's lint doesn't silently report "clean" against an empty
+    local table it never had (review finding on #3227's first iteration).
+    """
+
+    def test_local_read_scoped_to_repo_names(self, coord_db) -> None:
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [{"number": 1, "title": "Epic: foo", "body": "", "labels": []}],
+        )
+        upsert_open_issues(
+            "other-repo",
+            [{"number": 2, "title": "Epic: bar", "body": "", "labels": []}],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert [(i["repo_name"], i["number"]) for i in issues] == [("api", 1)]
+
+    def test_labels_decoded_to_plain_list(self, coord_db) -> None:
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1,
+                    "title": "Epic: foo",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                }
+            ],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert issues[0]["labels"] == ["epic"]
+
+    def test_empty_repo_names_short_circuits_to_empty_list(self, coord_db) -> None:
+        from coord.state import cached_open_issues
+
+        assert cached_open_issues(set()) == []
+        assert cached_open_issues([]) == []
+
+    def test_unreadable_db_degrades_to_empty_list_rather_than_raising(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Mirrors `coord.reports._default_completed_source`'s "an unreadable
+        board is an empty report" posture — a corrupt/unreadable local DB
+        must not turn `coord plans --lint-epics` into a traceback."""
+        from coord import state
+
+        def _boom(*_a, **_k):
+            raise sqlite3.OperationalError("no such table: issues")
+
+        monkeypatch.setattr(state.sql, "execute", _boom)
+
+        assert state.cached_open_issues({"api"}) == []
+
+    def test_routes_to_daemon_when_board_service_set(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.state import cached_open_issues
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc,
+            "fetch_cached_issues",
+            lambda svc, names, **kw: [
+                {
+                    "repo_name": "api",
+                    "number": 1,
+                    "title": "Epic: x",
+                    "state": "open",
+                    "labels": [],
+                }
+            ],
+        )
+
+        assert cached_open_issues({"api"}) == [
+            {
+                "repo_name": "api",
+                "number": 1,
+                "title": "Epic: x",
+                "state": "open",
+                "labels": [],
+            }
+        ]
+
+
 class TestTestVerdictStalenessAnchor:
     """#1479: `record_test_verdict` best-effort captures test_head_sha /
     test_patch_id / test_base_sha alongside a terminal (passed/skipped)

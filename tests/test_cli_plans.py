@@ -844,8 +844,8 @@ class TestFindUnlabelledEpics:
         assert find_unlabelled_epics(issues) == []
 
     def test_word_epic_mid_title_does_not_false_positive(self) -> None:
-        """"Epic" appearing later in a title, or without a colon
-        immediately after it, must not trip the lint."""
+        """ "Epic" appearing later in a title, or without a colon immediately
+        after it, must not trip the lint."""
         issues = [
             _cached_issue(3, "Epicurious recipe importer"),
             _cached_issue(4, "Make the onboarding flow more epic"),

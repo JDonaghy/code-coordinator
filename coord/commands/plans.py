@@ -24,7 +24,9 @@ Attention signals (``needs_you`` field):
 
 ``--lint-epics`` (#3227) is a separate, orthogonal read-only scan: it does
 not touch milestones or GitHub at all, only the locally-cached ``issues``
-table (:func:`coord.plans.find_unlabelled_epics`). It flags open issues whose
+table via :func:`coord.state.cached_open_issues` (which routes to the
+daemon on a thin client, same as ``board_service.read_board()`` above) and
+:func:`coord.plans.find_unlabelled_epics`. It flags open issues whose
 title reads like an epic (``"Epic:"``, ``"[tag] Epic:"``, ``"[epic]"``) but
 whose cached labels don't include ``"epic"`` — such an issue is invisible to
 this command's own milestone aggregation *and* to
@@ -43,47 +45,6 @@ import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.plans import aggregate_repo_plans
-
-
-def _local_cached_open_issues(repo_names: set[str]) -> list[dict]:
-    """Open issues for *repo_names*, straight off the local ``issues`` table
-    (#3227's ``--lint-epics``).
-
-    Deliberately **not** :class:`coord.dao.SqliteStore`: that class opens its
-    own read-only connection off a ``DB_PATH`` captured at
-    ``coord.dao`` import time (a plain ``from coord.db import DB_PATH``),
-    which does not track ``$COORD_DIR`` changes a test fixture makes *after*
-    that first import (see ``coord.db``'s PEP 562 lazy-constant module
-    docstring / ``tests/conftest.py``'s ``_no_frozen_coord_dir_constants``).
-    ``coord.db.get_connection()`` — the same singleton
-    ``coord.state``'s ``_upsert_open_issues_local``/``_upsert_issue_local``
-    write through — resolves its target fresh on every call, so a read
-    through it always lands on the same DB the most recent sync wrote to.
-    Mirrors ``coord.reports._default_completed_source``'s identical
-    local-table-read posture.
-    """
-    import json as _json  # noqa: PLC0415
-
-    from coord import sql  # noqa: PLC0415
-    from coord.db import get_connection  # noqa: PLC0415
-
-    conn = get_connection()
-    rows = [
-        dict(r)
-        for r in sql.execute(
-            conn, "SELECT repo_name, number, title, state, labels FROM issues"
-        ).fetchall()
-    ]
-    out: list[dict] = []
-    for row in rows:
-        if row.get("repo_name") not in repo_names:
-            continue
-        try:
-            row["labels"] = _json.loads(row.get("labels") or "[]")
-        except (TypeError, ValueError):
-            row["labels"] = []
-        out.append(row)
-    return out
 
 
 @click.command(
@@ -189,10 +150,11 @@ def plans_cmd(
     # above (so it still runs even when a repo has zero open milestones).
     unlabelled_epics: list[dict] = []
     if lint_epics:
+        from coord import state  # noqa: PLC0415
         from coord.plans import find_unlabelled_epics  # noqa: PLC0415
 
         target_repo_names = {r.name for r in target_repos}
-        cached_issues = _local_cached_open_issues(target_repo_names)
+        cached_issues = state.cached_open_issues(target_repo_names)
         unlabelled_epics = sorted(
             find_unlabelled_epics(cached_issues),
             key=lambda i: (i.get("repo_name", ""), i.get("number", 0)),
