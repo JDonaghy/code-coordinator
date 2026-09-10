@@ -9,6 +9,7 @@ import pytest
 
 from coord.config import (
     ConfigError,
+    KNOWN_GATE_NAMES,
     PipelineConfig,
     ProviderDef,
     ProvidersConfig,
@@ -1126,9 +1127,21 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
 # ── #3269: gate-name registry (S-1 of #3261) ────────────────────────────────
 
 
+def test_known_gate_names_seed_set() -> None:
+    """The seed registry is exactly the four gates in use fleet-wide today,
+    in pipeline order — growing this set is a deliberate, reviewed act, not
+    an accident. The order matters beyond documentation: it is what the
+    ``(known: ...)`` half of the ConfigError below reads out, and ``GateSpec``
+    (``coord/pipeline.py``, #3261 S-2) names this constant as the vocabulary
+    its registry keys off."""
+    assert KNOWN_GATE_NAMES == ("test", "review", "uat", "merge")
+
+
 def test_pipeline_default_gates_rejects_unknown_name(tmp_path: Path) -> None:
-    """A typo'd gate name in default_gates fails config load rather than
-    parsing clean and silently dropping that gate fleet-wide (#3269)."""
+    """A typo'd gate name in default_gates (e.g. 'reveiw' for 'review') used
+    to parse clean and silently drop the intended gate fleet-wide. It must
+    now fail config load instead — and the error must name the offending
+    gate, not just the field it came from (#3269)."""
     p = tmp_path / "coordinator.yml"
     p.write_text(
         "repos:\n"
@@ -1138,13 +1151,15 @@ def test_pipeline_default_gates_rejects_unknown_name(tmp_path: Path) -> None:
         "pipeline:\n"
         "  default_gates: [test, reveiw, merge]\n"
     )
-    with pytest.raises(ConfigError, match="default_gates"):
+    with pytest.raises(ConfigError, match=r"default_gates.*unknown gate name.*reveiw"):
         load(p)
 
 
 def test_pipeline_labels_rejects_unknown_gate_name(tmp_path: Path) -> None:
-    """An unknown gate name in a label's gate list fails config load and
-    names which label it came from (#3269)."""
+    """An unknown gate name in a label's gate list fails config load, and the
+    error names both which label it came from and which gate was unknown
+    (#3269) — a fleet config can carry many label overrides, so 'somewhere in
+    pipeline.labels' is not an actionable diagnostic."""
     p = tmp_path / "coordinator.yml"
     p.write_text(
         "repos:\n"
@@ -1155,13 +1170,17 @@ def test_pipeline_labels_rejects_unknown_gate_name(tmp_path: Path) -> None:
         "  labels:\n"
         "    hotfix: [merge, uatt]\n"
     )
-    with pytest.raises(ConfigError, match="hotfix"):
+    with pytest.raises(
+        ConfigError, match=r"labels\['hotfix'\].*unknown gate name.*uatt"
+    ):
         load(p)
 
 
 def test_pipeline_all_known_gate_names_still_load(tmp_path: Path) -> None:
     """Every currently-known gate name (test/review/uat/merge), in both
-    default_gates and labels, still loads exactly as before (#3269)."""
+    default_gates and labels, still loads exactly as before (#3269) — the
+    registry is a typo guard, not a narrowing of what a valid config may
+    say."""
     p = tmp_path / "coordinator.yml"
     p.write_text(
         "repos:\n"
@@ -1173,11 +1192,15 @@ def test_pipeline_all_known_gate_names_still_load(tmp_path: Path) -> None:
         "  labels:\n"
         "    hotfix: [test, merge]\n"
         "    full: [test, review, uat, merge]\n"
+        "    uatonly: [uat, merge]\n"
     )
     cfg = load(p)
     assert cfg.pipeline.default_gates == ["test", "review", "uat", "merge"]
     assert cfg.pipeline.gates_for_label("hotfix") == ["test", "merge"]
     assert cfg.pipeline.gates_for_label("full") == ["test", "review", "uat", "merge"]
+    # A label list that both omits gates and leads with "uat" — the shape the
+    # #2687 UAT gate is actually configured with — is still valid.
+    assert cfg.pipeline.gates_for_label("uatonly") == ["uat", "merge"]
 
 
 # ── #846: attention_thresholds / convergence_rounds ─────────────────────────
