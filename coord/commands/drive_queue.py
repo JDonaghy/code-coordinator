@@ -67,6 +67,7 @@ from coord.drive_queue import (
     STATE_WAITING,
     TERMINAL_QUEUE_STATES,
     BoardView,
+    IssueFacts,
     ProbeResult,
     QueueEntry,
     QueueError,
@@ -95,7 +96,9 @@ from coord.drive_queue import (
     pending_probe_targets,
     plan_is_destructive,
     plan_tick,
+    remaining_fix_rounds,
     render_plan,
+    total_fix_round_budget,
     unreachable_wait_alert,
     validate_apply_gate,
     validate_enqueue,
@@ -1179,6 +1182,20 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     now = time.time()
     entries = entries_from_rows(rows)
 
+    # #2972: all-time per-issue leg counts (#3060) so an operator can see the
+    # fix-round ceiling's own count directly on the row — "diagnosable from
+    # the queue rather than from `coord gates`" is the issue's own acceptance
+    # bar. Best-effort, same posture as every other advisory board/DB read in
+    # this command: a failure here must never turn a working `list` into a
+    # broken one, it just leaves `fix_rounds=` off every row.
+    try:
+        from coord.state import leg_counts as _leg_counts  # noqa: PLC0415
+
+        all_leg_counts = _leg_counts()
+    except Exception:  # noqa: BLE001 — advisory read, see comment above
+        all_leg_counts = {}
+    fix_round_config_default = _pipeline_max_fix_rounds_default(config_path)
+
     # #2183: a `blocked`/`failed` row's `after=` graph needs to be re-checked
     # against the FULL queue (cross-repo pre-reqs), not just whatever `--repo`
     # filtered down to — otherwise a `--repo` view would misdiagnose an
@@ -1280,6 +1297,20 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
             bits.append(f"deferrals={entry.deferrals}")
+        # #2972: the fix-round ceiling's OWN count — total work legs (work +
+        # every fix round) this entry has run across every relaunch, against
+        # the budget `_reconcile_running` actually enforces. Only shown once
+        # at least one leg has been dispatched — a `waiting` entry that has
+        # never launched has nothing to report, same as `attempts`/
+        # `deferrals` above being suppressed at 0.
+        work_legs = sum(
+            count
+            for kind, count in all_leg_counts.get(entry.key, {}).items()
+            if kind in WORK_LIKE
+        )
+        if work_legs:
+            budget = total_fix_round_budget(entry, fix_round_config_default)
+            bits.append(f"fix_rounds={min(work_legs, budget)}/{budget}")
         if entry.resumes:
             # #2230: how many times the merge-gate sweep has auto-resumed
             # THIS row from `blocked` — the churn signal the issue asks to be
@@ -3467,11 +3498,25 @@ def _fetch_board_view() -> BoardView:
     abort.  ``list_drive_sessions()`` is deliberately NOT allowed to fail the
     tick: it returns ``[]`` when tmux is unavailable, and the board's
     ``active_work`` signal still holds the capacity line in that case.
+
+    #2972: also folds in #3060's ``coord.state.leg_counts()`` — the all-time,
+    archive-spanning per-issue leg count `_reconcile_running`'s fix-round
+    ceiling needs (see `IssueFacts.work_leg_count`). Best-effort: a failure
+    here (lock contention, a DB the daemon can't reach) must not abort a tick
+    that would otherwise succeed — it degrades to every `IssueFacts` reading
+    `work_leg_count=0`, i.e. the ceiling simply does not fire this tick,
+    same fail-soft posture `effective_max_fix_rounds` already takes for an
+    unreadable `pipeline.max_fix_rounds`.
     """
     from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.state import leg_counts  # noqa: PLC0415
 
     payload = _fetch_board_payload()
-    return build_board_view(payload, list_drive_sessions())
+    try:
+        counts = leg_counts()
+    except Exception:  # noqa: BLE001 — advisory read, see docstring
+        counts = {}
+    return build_board_view(payload, list_drive_sessions(), leg_counts=counts)
 
 
 def _fetch_exit_reasons(
@@ -4262,7 +4307,28 @@ def _fetch_merge_only_ready(
     return ready
 
 
-def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
+def _pipeline_max_fix_rounds_default(config_path: Path | None) -> int | None:
+    """``pipeline.max_fix_rounds`` off *config_path*, or ``None`` on any read
+    failure (unreadable file, bad YAML) — the fail-soft advisory-read posture
+    every other config peek in this module takes.
+
+    #2972: the ONE place this reads — used by both :func:`_launch_argv` (to
+    build the subprocess's own ``--max-fix-rounds``) and the tick's
+    `plan_tick` call (to give `_reconcile_running`'s fix-round ceiling the
+    identical number) — so a launch and the ceiling that gated it can never
+    read two different config snapshots.
+    """
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        return _load_config(config_path).pipeline.max_fix_rounds
+    except Exception:  # noqa: BLE001 — advisory read, see docstring
+        return None
+
+
+def _launch_argv(
+    entry: QueueEntry, config_path: Path | None, facts: IssueFacts | None = None
+) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
     #1809: this is the argv the tick actually spawns as a subprocess (below,
@@ -4299,24 +4365,29 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     stores. Unlike ``--max-fix-rounds`` this has no fleet-config fallback:
     it is opt-in-only, so an entry that never set it launches exactly as
     before this column existed.
+
+    #2972: *facts* — when given, THIS entry's :class:`IssueFacts` off the
+    same board read the tick's `plan_tick` call already used — narrows
+    ``--max-fix-rounds`` further, from :func:`effective_max_fix_rounds`'s
+    per-drive figure down to :func:`remaining_fix_rounds`'s REMAINING one:
+    the whole point of #2972 is that a relaunch must get a SMALLER budget
+    than the first launch got, not the same fresh one every time. ``None``
+    (every caller predating this parameter, and any call site with no board
+    read on hand) falls back to the plain per-drive figure — the exact
+    pre-#2972 behaviour.
     """
     from coord.drive import coord_argv  # noqa: PLC0415
 
-    config_default: int | None = None
-    try:
-        from coord.commands._common import _load_config  # noqa: PLC0415
-
-        config_default = _load_config(config_path).pipeline.max_fix_rounds
-    except Exception:  # noqa: BLE001 — advisory read, see docstring
-        config_default = None
-
+    config_default = _pipeline_max_fix_rounds_default(config_path)
+    fix_rounds = (
+        remaining_fix_rounds(entry, facts, config_default)
+        if facts is not None
+        else effective_max_fix_rounds(entry, config_default)
+    )
     argv = coord_argv() + ["drive", entry.repo, str(entry.issue), "--tmux"]
     if entry.machine:
         argv += ["--machine", entry.machine]
-    argv += [
-        "--max-fix-rounds",
-        str(effective_max_fix_rounds(entry, config_default)),
-    ]
+    argv += ["--max-fix-rounds", str(fix_rounds)]
     if entry.no_acceptance:
         argv += ["--no-acceptance"]
     if config_path:
@@ -5096,6 +5167,11 @@ def drive_queue_tick(
             merge_only_ready=merge_only_ready,
             roll_pending_reason=roll_pending.describe() if roll_pending is not None else "",
             live_prereq_terminal=live_prereq_terminal,
+            # #2972: the SAME `pipeline.max_fix_rounds` reading `_launch_argv`
+            # uses below (see `_pipeline_max_fix_rounds_default`'s docstring)
+            # — so `_reconcile_running`'s fix-round ceiling and the launch it
+            # gates never disagree about the budget.
+            fix_round_config_default=_pipeline_max_fix_rounds_default(config_path),
         )
 
         if roll_pending is not None:
@@ -5392,7 +5468,11 @@ def drive_queue_tick(
         if target is None:
             return
 
-        argv = _launch_argv(target, config_path)
+        # #2972: pass this entry's own board facts so a relaunch's
+        # `--max-fix-rounds` is narrowed to what's actually left (see
+        # `_launch_argv`'s docstring) — `board` is this SAME tick's read, the
+        # one `plan_tick` above already reconciled against.
+        argv = _launch_argv(target, config_path, board.facts(target.key))
         try:
             result = subprocess.run(  # noqa: S603 — argv built from coord_argv + typed row
                 argv,

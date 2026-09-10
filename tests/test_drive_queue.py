@@ -19,6 +19,7 @@ import pytest
 
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TICK_MAX_FIX_ROUNDS,
     DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
     DRIVE_STARTUP_GRACE_SECONDS,
     EMPTY_BRANCH_MAX_ATTEMPTS,
@@ -45,6 +46,7 @@ from coord.drive_queue import (
     detect_unreachable_waits,
     compute_leg_counts,
     dispatch_type_for_labels,
+    effective_max_fix_rounds,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -55,7 +57,9 @@ from coord.drive_queue import (
     parse_after_spec,
     parse_key,
     plan_tick,
+    remaining_fix_rounds,
     render_plan,
+    total_fix_round_budget,
     unreachable_wait_alert,
     validate_enqueue,
 )
@@ -784,6 +788,188 @@ def test_compute_leg_counts_treats_falsy_type_as_work():
     `coord.models.Assignment.type` both carry."""
     counts = compute_leg_counts([(REPO, 1, ""), (REPO, 1, None)])
     assert counts == {entry_key(REPO, 1): {"work": 2}}
+
+
+# ── #2972: a relaunch resumes the fix-round budget, never restarts it ───────
+#
+# quadraui#625: a drive-queue entry's session died, was relaunched, died
+# again, was relaunched again — and EACH relaunch's `coord drive
+# --max-fix-rounds` was computed from `pipeline.max_fix_rounds` alone, with
+# no memory of what a prior (dead) session had already spent. Four `[work]`
+# legs ran against a nominal budget of `work + 2 fixes = 3`, and the queue
+# row read `running attempts=1` the entire time — nothing about it looked
+# wrong. These tests pin the fix: `IssueFacts.work_leg_count` (fed by #3060's
+# all-time, archive-spanning `leg_counts()`) makes the budget a property of
+# the ENTRY's whole history, not of whichever drive session happens to be
+# running right now.
+
+
+def test_remaining_fix_rounds_is_unchanged_for_a_fresh_entry():
+    """Zero legs ever run — `remaining_fix_rounds` must read back exactly
+    `effective_max_fix_rounds`, the pre-#2972 number, or every entry's FIRST
+    launch would get a narrower budget than it used to."""
+    e = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, work_leg_count=0)
+    assert remaining_fix_rounds(e, facts, None) == effective_max_fix_rounds(e, None) == 2
+
+
+def test_remaining_fix_rounds_shrinks_as_legs_accumulate():
+    """`max_fix_rounds=2` ⇒ total budget 3 (1 work + 2 fixes). The one
+    unconditional work leg costs nothing; each leg after that is a spent fix
+    round."""
+    e = entry(1650, max_fix_rounds=2)
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=1), None) == 2
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=2), None) == 1
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=3), None) == 0
+
+
+def test_remaining_fix_rounds_never_negative():
+    """A count that has overshot the budget (a stale re-add against an
+    issue's old history, a hand-edited row) still reads `0`, never negative —
+    `_reconcile_running` treats `<= 0` as the ceiling, not `== 0` alone."""
+    e = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, work_leg_count=50)
+    assert remaining_fix_rounds(e, facts, None) == 0
+
+
+def test_total_fix_round_budget_is_work_plus_fix_rounds():
+    e = entry(1650, max_fix_rounds=2)
+    assert total_fix_round_budget(e, None) == 3
+    default_e = entry(1650)
+    assert total_fix_round_budget(default_e, None) == DEFAULT_TICK_MAX_FIX_ROUNDS + 1
+
+
+def test_build_board_view_folds_leg_counts_into_work_leg_count():
+    """Only WORK_LIKE types count as a work leg — a `review`/`smoke` leg on
+    the SAME issue must never inflate the fix-round budget's own count."""
+    key = entry_key(REPO, 1650)
+    view = build_board_view(
+        {},
+        leg_counts={key: {"work": 3, "review": 5, "smoke": 2}},
+    )
+    assert view.facts(key).work_leg_count == 3
+
+
+def test_build_board_view_leg_counts_default_leaves_work_leg_count_at_zero():
+    """No *leg_counts* at all (every pre-#2972 caller) — the field defaults
+    to 0, which `remaining_fix_rounds` reads as "budget untouched"."""
+    view = build_board_view({"assignments": [
+        {"repo_name": REPO, "issue_number": 1650, "type": "work", "status": "running"},
+    ]})
+    assert view.facts(entry_key(REPO, 1650)).work_leg_count == 0
+
+
+def test_build_board_view_leg_counts_covers_an_issue_absent_from_the_rest_of_the_payload():
+    """An issue whose entire history has aged into `assignments_archive`
+    (#3060) — nothing about it in `issues`/`assignments`/`merge_plan` — still
+    gets a slot, so a long-lived entry never loses the ceiling that matters
+    most for it."""
+    key = entry_key(REPO, 1650)
+    view = build_board_view({}, leg_counts={key: {"work": 4}})
+    facts = view.facts(key)
+    assert facts.work_leg_count == 4
+    assert facts.known is True
+
+
+def _dead_running_entry(*, max_fix_rounds: int = 2, attempts: int = 0) -> QueueEntry:
+    return entry(
+        1650,
+        state=STATE_RUNNING,
+        attempts=attempts,
+        max_fix_rounds=max_fix_rounds,
+        launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+    )
+
+
+def test_a_relaunch_within_budget_still_retries_normally():
+    """1 leg spent (the initial work) against a 3-leg budget — comfortably
+    under the ceiling, so the ordinary attempts-based retry fires unchanged."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=1)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick([_dead_running_entry()], view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.reconciles[0].updates["attempts"] == 1
+
+
+def test_a_relaunch_at_the_ceiling_blocks_instead_of_retrying():
+    """3 legs already run against a `max_fix_rounds=2` (budget 3) entry — the
+    ceiling fires BEFORE the ordinary attempts check ever runs, even though
+    `attempts` (0) is nowhere near `max_attempts`."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        [_dead_running_entry(attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert plan.reconciles[0].updates == {}  # attempts left untouched
+    assert len(plan.blocked) == 1
+    blocked = plan.blocked[0]
+    assert blocked.updates["state"] == STATE_BLOCKED
+    assert "fix-round ceiling" in blocked.reason
+    assert "3 work leg(s)" in blocked.reason
+    assert "budget of 3" in blocked.reason
+
+
+def test_a_relaunch_past_the_ceiling_also_blocks():
+    """Comfortably over budget (a stale re-add, a hand-edited count) still
+    blocks — the check is `<=`, not `==`."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=9)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick([_dead_running_entry()], view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "exhausted"
+
+
+def test_the_fix_round_ceiling_reads_pipeline_max_fix_rounds_when_the_entry_has_no_override():
+    """`fix_round_config_default` (the shell's `pipeline.max_fix_rounds`
+    read) resolves the SAME way `effective_max_fix_rounds` always has — an
+    entry with no override and a fleet default of 1 has a 2-leg budget."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=2)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    e = entry(
+        1650,
+        state=STATE_RUNNING,
+        launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+    )
+    plan = plan_tick([e], view, capacity=1, now=NOW, fix_round_config_default=1)
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert "budget of 2" in plan.blocked[0].reason
+
+
+def test_a_relaunched_entry_never_exceeds_its_total_fix_round_budget():
+    """The issue's own acceptance criterion: an entry with `max_fix_rounds=2`
+    (budget 3) that is relaunched twice runs AT MOST 3 work legs total —
+    simulated as three successive tick/death cycles, each seeing one more
+    board-confirmed leg than the last.
+
+    `max_attempts` is generous (5) here so the ordinary attempts ceiling
+    never interferes — this test is isolating the SEPARATE #2972 budget, not
+    re-testing #2273's attempts machinery.
+    """
+    key = entry_key(REPO, 1650)
+    attempts_spent = 0
+    retries = 0
+    outcome = None
+    for legs_so_far in (1, 2, 3):
+        facts = IssueFacts(known=True, issue_state="open", work_leg_count=legs_so_far)
+        view = BoardView(issues={key: facts})
+        e = _dead_running_entry(attempts=attempts_spent)
+        plan = plan_tick([e], view, capacity=1, now=NOW, max_attempts=5)
+        outcome = plan.reconciles[0].outcome
+        if outcome == "retry":
+            retries += 1
+            attempts_spent = plan.reconciles[0].updates["attempts"]
+        else:
+            break
+    # Two legitimate relaunches (legs_so_far=1 and 2), then the third death —
+    # now sitting at the full 3-leg budget — blocks instead of relaunching a
+    # fourth time.
+    assert retries == 2
+    assert outcome == "exhausted"
+    assert plan.blocked[0].updates["state"] == STATE_BLOCKED
 
 
 # ── plan_tick: the launch decision ───────────────────────────────────────────
