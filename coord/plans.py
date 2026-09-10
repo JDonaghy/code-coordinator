@@ -341,12 +341,27 @@ def find_stale_epics(issues: list[dict]) -> list[dict]:
             continue
 
         repo_name = issue.get("repo_name", "")
-        children = parentage.children(
-            repo_name,
-            int(number),
-            body=issue.get("body") or "",
-            fallback_to_work_order=True,
-        )
+        try:
+            children = parentage.children(
+                repo_name,
+                int(number),
+                body=issue.get("body") or "",
+                fallback_to_work_order=True,
+            )
+        except Exception:  # noqa: BLE001 — malformed checklist: skip this epic
+            # `children()` parses the epic's own hand-edited body via
+            # `parse_sub_issues`/`parse_work_order` (`coord.milestone_order`),
+            # which raise `WorkOrderError` for a realistic range of malformed
+            # checklists (a duplicate `#N` entry, an unknown annotation key, a
+            # malformed/undeclared `after:` target, a dependency cycle) — and
+            # `int(number)` above is defensively covered too, though `number`
+            # is a SQLite INTEGER column so that branch is unreachable in
+            # practice. One bad epic body must never blank the whole
+            # `--lint-stale-epics` scan (nor its `--lint-epics` sibling output
+            # sharing this command invocation) — same posture as
+            # `MarkdownParentage.parent()` above and
+            # `milestone_work_order_membership` in `coord.milestone_order`.
+            continue
 
         child_open = 0
         child_closed = 0

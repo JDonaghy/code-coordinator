@@ -960,6 +960,25 @@ class TestFindStaleEpics:
         issues = [_epic_with_sub_issues(600, "Epic: partially synced", [601])]
         assert find_stale_epics(issues) == []
 
+    def test_malformed_checklist_is_skipped_not_raised(self) -> None:
+        """A hand-edited checklist with a duplicate ``#N`` entry makes
+        ``parse_sub_issues`` raise ``WorkOrderError`` — that must not blow up
+        the whole scan (one bad epic body must never blank the rest of
+        ``--lint-stale-epics``'s output, matching
+        ``MarkdownParentage.parent()``'s and
+        ``milestone_work_order_membership``'s posture for the same parse
+        call). The malformed epic is silently skipped, not flagged, and a
+        well-formed epic elsewhere in the same batch is still reported."""
+        malformed = _cached_issue(
+            100,
+            "Epic: malformed checklist",
+            labels=["epic"],
+            body="## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+        )
+        healthy = _epic_with_sub_issues(700, "Epic: nothing registered", [])
+        hits = find_stale_epics([malformed, healthy])
+        assert [h["number"] for h in hits] == [700]
+
 
 # ── coord plans --lint-epics CLI integration (#3227) ────────────────────────
 
