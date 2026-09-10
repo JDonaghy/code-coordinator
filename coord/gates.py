@@ -110,6 +110,12 @@ class GateDecision:
     # dispatched review — re-dispatching just re-derives a conclusion that
     # already exists in the log, per #1956's "Not the fix" section.
     verdict_unparseable: bool = False
+    # #3236: populated ONLY for gate="apply" — the apply-verdict tri-state
+    # (plus "pending") `coord.drive_queue.apply_gate_status` returns:
+    # "" (no gate) / "pending" / "merged_not_applied" / "applied" /
+    # "apply_failed". `None` for every other gate, and for "apply" itself
+    # when there is no deploy gate on this (repo, issue) at all.
+    state: str | None = None
     # #2024: WHICH assignment supplied this gate's verdict. Populated for the
     # "test" gate, where the merge gate is deliberately branch-scoped (a Test
     # run measures the (branch, base) pair, #1819) and so is routinely
@@ -422,6 +428,53 @@ def _exempt_dependency_notes_for_winner(
         return []
 
 
+def _apply_gate_decision(repo_name: str, issue_number: int) -> GateDecision | None:
+    """The ``"apply"`` :class:`GateDecision` for *(repo_name, issue_number)*,
+    or ``None`` when there is no ``--hold-after`` deploy-gate entry for it in
+    the drive queue at all (#3236).
+
+    Reads the drive_queue row the same way ``coord drive-queue list``/
+    ``status`` do (:func:`coord.state.list_drive_queue` +
+    :func:`coord.drive_queue.entries_from_rows`) and renders its tri-state
+    through the exact same :func:`coord.drive_queue.apply_gate_status`
+    ``coord drive-queue``'s own ``_hold_lines`` calls — one function
+    answering "what is this gate's apply status", never two that could
+    silently drift apart (#2096).
+
+    Fail-open, mirroring :func:`_backfill_is_interactive` immediately above:
+    an unreachable board/DB (or a thin client with no local drive_queue
+    table) degrades to "no apply gate reported" rather than failing the
+    whole ``coord gates`` read — advisory only, exactly like every other
+    best-effort enrichment in this module.
+    """
+    try:
+        from coord.drive_queue import apply_gate_status, entries_from_rows, entry_key  # noqa: PLC0415
+        from coord.state import list_drive_queue  # noqa: PLC0415
+
+        entries = entries_from_rows(list_drive_queue(repo_name))
+        wanted = entry_key(repo_name, issue_number)
+        entry = next((e for e in entries if e.key == wanted), None)
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    if entry is None or not entry.hold_after:
+        return None
+
+    state, detail = apply_gate_status(entry)
+    if state in ("", "pending"):
+        # "pending" (armed, not yet fired — nothing has merged yet) has
+        # nothing new to say beyond the review/test/merge decisions already
+        # printed: the apply question only becomes meaningful once the gate
+        # has actually fired. Staying silent here keeps every ORDINARY
+        # `--hold-after` deploy gate (a release/restart note with no
+        # apply-verdict use at all — the overwhelming common case, see the
+        # existing hold-after tests) rendering exactly as it did before
+        # #3236, instead of growing a "not yet merged" line that only
+        # restates what "hold-after" already said.
+        return None
+    ok = state == "applied"
+    return GateDecision(gate="apply", required=True, ok=ok, reason=detail or None, state=state)
+
+
 def build_gate_report(
     board: "Board",
     config: "Config",
@@ -643,6 +696,16 @@ def build_gate_report(
             "`coord merge --plan`, not by `coord gates`."
         )
 
+    # #3236: the apply-verdict gate, appended ONLY when a --hold-after entry
+    # actually exists for this (repo, issue) in the drive queue — the
+    # overwhelming common case has no deploy gate at all, and the review/
+    # test/merge decisions above are unconditional per-repo concerns while
+    # this one is opt-in per-entry, so it stays silent rather than printing
+    # a "not required" line on every issue that never used it.
+    apply_decision = _apply_gate_decision(repo_name, issue_number)
+    if apply_decision is not None:
+        report.decisions.append(apply_decision)
+
     return report
 
 
@@ -750,6 +813,23 @@ def format_gate_report(report: GateReport) -> str:
             lines.append(
                 "  merge  : READY" if merge.ok else f"  merge  : BLOCKED — {merge.reason}"
             )
+        # #3236: only printed when a --hold-after deploy gate actually
+        # exists for this (repo, issue) — see `_apply_gate_decision`.
+        apply_ = by_gate.get("apply")
+        if apply_ is not None:
+            # `apply_.reason` is `apply_gate_status`'s own detail string
+            # ("applied", "applied — <note>", "apply failed[: <note>]",
+            # "merged, not yet applied[...]", "not yet merged — gate
+            # armed") — already legible on its own, so these labels only
+            # add the at-a-glance severity, never repeat its content.
+            if apply_.ok:
+                lines.append(f"  apply  : {apply_.reason}")
+            elif apply_.state == "apply_failed":
+                lines.append(f"  apply  : FAILED — {apply_.reason}")
+            elif apply_.state == "merged_not_applied":
+                lines.append(f"  apply  : MERGED, NOT APPLIED — {apply_.reason}")
+            else:
+                lines.append(f"  apply  : PENDING — {apply_.reason}")
 
     for note in report.notes:
         lines.append(f"  note: {note}")

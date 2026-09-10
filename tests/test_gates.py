@@ -510,6 +510,144 @@ class TestDecision:
         assert by_gate["review"].verdict_unparseable is False
 
 
+# ── apply-verdict gate (#3236) ──────────────────────────────────────────────
+#
+# `coord gates` must be able to tell "merged, not yet applied" apart from
+# "applied" apart from "apply-failed" for a terraform-flavored --hold-after
+# entry — reading through the SAME `coord.drive_queue.apply_gate_status`
+# `coord drive-queue list`/`status` renders through (#2096: one question,
+# one answer), never a second, independently-derived reading.
+
+class TestApplyGate:
+    def test_no_drive_queue_entry_means_no_apply_decision_at_all(
+        self, config: Config, coord_db,
+    ) -> None:
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "apply" not in by_gate
+
+    def test_a_non_gated_drive_queue_entry_reports_no_apply_decision(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.state import enqueue_drive_queue
+
+        enqueue_drive_queue("api", 42, hold_after=False)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "apply" not in by_gate
+
+    def test_a_fired_gate_with_no_verdict_reports_merged_not_applied(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.drive_queue import HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue(
+            "api", 42, hold_after=True, hold_reason="terraform apply",
+        )
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].required is True
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "merged_not_applied"
+        assert "not yet applied" in by_gate["apply"].reason
+
+    def test_a_bare_release_with_no_verdict_still_reads_unapplied(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#2096: a bare `coord drive-queue resume` (no recorded verdict)
+        must NOT be reported as "applied" — that would be exactly the
+        unconfirmed-success shape #3236 exists to close."""
+        from coord.drive_queue import HOLD_RELEASED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_RELEASED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "merged_not_applied"
+        assert "without a recorded apply verdict" in by_gate["apply"].reason
+
+    def test_an_applied_verdict_reports_ok(self, config: Config, coord_db) -> None:
+        from coord.drive_queue import APPLY_APPLIED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_APPLIED, apply_verdict_reason="clean run",
+        )
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is True
+        assert by_gate["apply"].state == "applied"
+        assert "clean run" in by_gate["apply"].reason
+
+    def test_an_apply_failed_verdict_reports_not_ok(self, config: Config, coord_db) -> None:
+        from coord.drive_queue import APPLY_FAILED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_FAILED, apply_verdict_reason="state locked",
+        )
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "apply_failed"
+        assert "state locked" in by_gate["apply"].reason
+
+    def test_format_renders_merged_not_applied_apply_failed_and_applied(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.drive_queue import APPLY_APPLIED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+        text = format_gate_report(report)
+        assert "apply  : MERGED, NOT APPLIED" in text
+
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_APPLIED, apply_verdict_reason="ok",
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+        text = format_gate_report(report)
+        assert "apply  : applied" in text
+        assert "MERGED, NOT APPLIED" not in text
+
+
 # ── is_interactive enrichment (#748/#632: not an Assignment dataclass field) ─
 
 class TestIsInteractive:

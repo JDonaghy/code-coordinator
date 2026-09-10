@@ -43,8 +43,11 @@ from coord.block_log import INTERVENTION_CATEGORIES, STALL_STATES
 from coord.commands._common import _CONFIG_OPTION, apply_pipeline_track_labels_best_effort
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
+    APPLY_APPLIED,
+    APPLY_FAILED,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_PARALLEL_PER_REPO,
+    HOLD_FIRED,
     HOLD_RELEASED,
     HOLD_SCOPE_ENTRY,
     HOLD_SCOPE_FLEET,
@@ -71,6 +74,7 @@ from coord.drive_queue import (
     RollPending,
     TickPlan,
     add_preflight_notice,
+    apply_gate_status,
     build_board_view,
     detect_unreachable_waits,
     diagnose_blocked_after,
@@ -89,9 +93,11 @@ from coord.drive_queue import (
     parse_after_spec,
     parse_key,
     pending_probe_targets,
+    plan_is_destructive,
     plan_tick,
     render_plan,
     unreachable_wait_alert,
+    validate_apply_gate,
     validate_enqueue,
 )
 from coord.overlap_predict import (
@@ -304,6 +310,34 @@ def drive_queue_group() -> None:
         "does not leave a previous passthrough in place."
     ),
 )
+@click.option(
+    "--terraform-plan-json",
+    "plan_json_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help=(
+        "#3236: path to a `terraform show -json <planfile>` capture for "
+        "this entry's deploy gate. Parsed for destroy/replace "
+        "resource_changes — a plan containing either makes this gate "
+        "destructive (same effect as --terraform-destructive) and refuses "
+        "--resume-when outright; a plan containing neither is stored as "
+        "non-destructive."
+    ),
+)
+@click.option(
+    "--terraform-destructive",
+    "force_destructive",
+    is_flag=True,
+    default=False,
+    help=(
+        "#3236: manually declare this deploy gate as carrying a "
+        "destroy/replace terraform plan (e.g. reviewed by hand, no JSON "
+        "capture available). Refuses --resume-when the same way a parsed "
+        "destructive --terraform-plan-json does — releasing this gate then "
+        "requires a human, via `coord drive-queue apply-verdict --applied` "
+        "or `coord drive-queue resume`, never an automated probe."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -319,6 +353,8 @@ def drive_queue_add(
     hold_scope: str,
     max_fix_rounds: int | None,
     no_acceptance: bool,
+    plan_json_path: str | None,
+    force_destructive: bool,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -359,6 +395,30 @@ def drive_queue_add(
         cfg = validate_config_repo(config_path, repo)
         validate_hold_flags(hold_after, hold_reason, resume_when, hold_scope)
         validate_enqueue(existing_entries, repo, issue, after)
+    except QueueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    # #3236: resolve destructiveness BEFORE the write — a parsed plan wins
+    # over (i.e. ORs with) --terraform-destructive, never overrides it, so a
+    # human's manual declaration can never be silently relaxed by a plan
+    # JSON that happens to parse as additive-only.
+    plan_destructive = bool(force_destructive)
+    if plan_json_path:
+        try:
+            plan_data = _json.loads(Path(plan_json_path).read_text())
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                f"could not parse --terraform-plan-json {plan_json_path}: {exc}"
+            ) from None
+        if not isinstance(plan_data, dict):
+            raise click.ClickException(
+                f"--terraform-plan-json {plan_json_path} is not a JSON object "
+                "(expected `terraform show -json <planfile>` output)"
+            )
+        if plan_is_destructive(plan_data):
+            plan_destructive = True
+    try:
+        validate_apply_gate(resume_when, plan_destructive)
     except QueueError as exc:
         raise click.ClickException(str(exc)) from None
 
@@ -417,6 +477,7 @@ def drive_queue_add(
         hold_scope=hold_scope,
         max_fix_rounds=max_fix_rounds,
         no_acceptance=no_acceptance,
+        plan_destructive=plan_destructive,
     )
     # #2839: queueing a drive is a strictly STRONGER statement than "send to
     # Pipeline" (`coord track`), so it must never leave the issue in a
@@ -444,7 +505,13 @@ def drive_queue_add(
         gate = " · holds the queue when done"
         if hold_scope == HOLD_SCOPE_FLEET:
             gate += " (fleet-wide — nothing anywhere launches)"
-        if resume_when:
+        if plan_destructive:
+            gate += (
+                " · DESTRUCTIVE (destroy/replace) — human release only, via "
+                "`coord drive-queue apply-verdict --applied` or `coord "
+                "drive-queue resume` (#3236)"
+            )
+        elif resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
     # #2601: the reason (if an edge was actually applied), any high-fanout
     # directory-token warning (independent of whether the edge stuck — a
@@ -1295,11 +1362,26 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
         else ""
     )
     lines = [f"      hold-after: {entry.gate_reason}{scope_suffix}"]
+    if entry.plan_destructive:
+        lines.append(
+            "      DESTRUCTIVE (destroy/replace) — resume-when is never "
+            "honored here; release with `coord drive-queue apply-verdict "
+            "--applied` or `coord drive-queue resume` (#3236)"
+        )
     if entry.resume_when:
         probe = f"      resume-when: {entry.resume_when}"
         if entry.hold_probes:
             probe += f"  (failed {entry.hold_probes}×)"
         lines.append(probe)
+    # #3236: the apply-verdict tri-state — the SAME function `coord gates`
+    # renders through (`coord.drive_queue.apply_gate_status`), so the two
+    # surfaces can never disagree about merged-not-applied vs applied vs
+    # apply-failed (#2096). Suppressed for "pending" (armed, not fired) —
+    # nothing has merged yet, so it would only restate the "hold-after:"
+    # line above for every ORDINARY (non-apply-verdict) --hold-after entry.
+    apply_state, apply_detail = apply_gate_status(entry)
+    if apply_state and apply_state != "pending":
+        lines.append(f"      apply: {apply_detail}")
     return lines
 
 
@@ -2310,6 +2392,91 @@ def drive_queue_resume(repo: str | None, issue: int | None, config_path: Path) -
         click.echo(f"released the deploy gate on {entry.key}")
     _clear_queue_alert()
     click.echo("the next tick will launch the next eligible entry")
+
+
+@drive_queue_group.command("apply-verdict")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--applied", "verdict", flag_value=APPLY_APPLIED,
+    help="Record that `terraform apply` ran and completed — releases the held gate.",
+)
+@click.option(
+    "--apply-failed", "verdict", flag_value=APPLY_FAILED,
+    help="Record that `terraform apply` was attempted and failed — the gate stays held.",
+)
+@click.option(
+    "--reason", default="",
+    help="What happened. Required in spirit for --apply-failed; optional for --applied.",
+)
+@_CONFIG_OPTION
+def drive_queue_apply_verdict(
+    repo: str, issue: int, verdict: str | None, reason: str, config_path: Path
+) -> None:
+    """Record the OBSERVED outcome of a `terraform apply` for a deploy gate (#3236).
+
+    Extends `--hold-after`'s deploy gate with the one thing `hold_state`
+    alone cannot say: whether the apply actually ran. A bare `coord
+    drive-queue resume` releases the gate on an operator's say-so with no
+    evidence attached — this command is the accountable path: `--applied`
+    records a real, after-the-fact observation AND releases the gate in the
+    same write, so a release is never again indistinguishable from a mere
+    "merged". `--apply-failed` records the attempt without releasing
+    anything — the gate stays held until a human fixes it and tries again.
+
+    `coord gates <repo> <issue>` and `coord drive-queue list`/`status` both
+    read this verdict through the SAME function
+    (`coord.drive_queue.apply_gate_status`), so they can never disagree
+    about whether this entry is merged-not-applied, applied, or
+    apply-failed.
+    """
+    if verdict is None:
+        raise click.ClickException("specify --applied or --apply-failed")
+
+    from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
+
+    entries = entries_from_rows(list_drive_queue(repo))
+    wanted = entry_key(repo, issue)
+    entry = next((e for e in entries if e.key == wanted), None)
+    if entry is None:
+        raise click.ClickException(f"{wanted} is not in the drive queue")
+    if not entry.hold_after:
+        raise click.ClickException(
+            f"{wanted} has no deploy gate declared (--hold-after) — nothing "
+            "to record an apply verdict against"
+        )
+
+    fields: dict[str, Any] = {
+        "apply_verdict": verdict,
+        "apply_verdict_reason": reason,
+        "apply_verdict_at": time.time(),
+    }
+    released = False
+    if verdict == APPLY_APPLIED and entry.hold_state == HOLD_FIRED:
+        # The accountable release: this IS the observation #3236 asks for,
+        # so it stands in for a separate `coord drive-queue resume` call —
+        # same `hold_state`/`hold_probes` write that command makes, never a
+        # second, drifting implementation of "how a gate releases" (#2096).
+        fields["hold_state"] = HOLD_RELEASED
+        fields["hold_probes"] = 0
+        released = True
+
+    update_drive_queue_entry(entry.repo, entry.issue, **fields)
+
+    if released:
+        _clear_queue_alert()
+        click.echo(f"{wanted}: recorded apply verdict=applied — gate released")
+        click.echo("the next tick will launch the next eligible entry")
+    elif verdict == APPLY_APPLIED:
+        click.echo(
+            f"{wanted}: recorded apply verdict=applied (gate was not currently "
+            f"fired — hold_state={entry.hold_state or 'none'}, nothing to release)"
+        )
+    else:
+        click.echo(
+            f"{wanted}: recorded apply verdict=apply_failed — gate stays held"
+            + (f" ({reason})" if reason else "")
+        )
 
 
 def _clear_queue_alert() -> None:

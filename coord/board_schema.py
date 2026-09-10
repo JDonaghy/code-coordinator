@@ -269,6 +269,12 @@ class BoardDriveQueueEntry:
     retry_backoff_at: float | None = None
     max_fix_rounds: int | None = None
     no_acceptance: int  # 0/1 flag — INTEGER on the wire, never a JSON bool (#1849)
+    # #3236: the apply-verdict gate extension of #1757's --hold-after —
+    # see coord.drive_queue.apply_gate_status / plan_is_destructive.
+    plan_destructive: int  # 0/1 flag — INTEGER on the wire, never a JSON bool (#1849)
+    apply_verdict: str
+    apply_verdict_reason: str
+    apply_verdict_at: float | None = None
 
 
 
@@ -297,7 +303,7 @@ BOARD_PROJECTIONS: dict[str, type] = {
 #: text-scraping check is retired as of #2897 (docs/ADR_COORD_TUI_CI.md) —
 #: this assertion is now the sole remaining guard.
 INTEGER_BACKED_BOOLEANS: frozenset[str] = frozenset(
-    {"is_interactive", "review_scoped", "hold_after", "no_acceptance"}
+    {"is_interactive", "review_scoped", "hold_after", "no_acceptance", "plan_destructive"}
 )
 
 

@@ -817,7 +817,11 @@ def retry_on_locked(
 # #3188: bumped 12 -> 13 for `assignments.uat_actor`, `assignments.
 # uat_prior`, and the two `portal_sync_state.preview_verdict_watermark_*`
 # columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 13
+#
+# #3236: bumped 13 -> 14 for the four `drive_queue.plan_destructive`/
+# `apply_verdict`/`apply_verdict_reason`/`apply_verdict_at` columns appended
+# to `_migrate_add_columns` below.
+_DB_SCHEMA_VERSION = 14
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1326,6 +1330,29 @@ _SCHEMA_SQL = """
             -- and for any entry enqueued without --no-acceptance, read
             -- identically to "no passthrough" by _launch_argv.
             no_acceptance INTEGER NOT NULL DEFAULT 0,
+            -- #3236: operator-declared (or `--terraform-plan-json`-derived)
+            -- flag that THIS entry's terraform plan carries a destroy or
+            -- replace action — see coord.drive_queue.plan_is_destructive.
+            -- Makes `resume_when` unconditionally ineligible to auto-release
+            -- the gate (coord.drive_queue._resolve_holds /
+            -- pending_probe_targets), no exceptions. 0 for every row
+            -- predating this column and for any entry not declared
+            -- destructive — unchanged pre-#3236 behaviour.
+            plan_destructive INTEGER NOT NULL DEFAULT 0,
+            -- #3236: the OBSERVED outcome of a `terraform apply` against
+            -- this entry's fired gate — '' (unset) / 'applied' /
+            -- 'apply_failed'. Written only by `coord drive-queue
+            -- apply-verdict`, never inferred from hold_state — see
+            -- coord.drive_queue.apply_gate_status for why collapsing
+            -- hold_state=='released' into "applied" would be an
+            -- unconfirmed-success bug (#2096). '' for every row predating
+            -- this column.
+            apply_verdict TEXT NOT NULL DEFAULT '',
+            apply_verdict_reason TEXT NOT NULL DEFAULT '',
+            -- Wall-clock capture time of apply_verdict, same "stamp a
+            -- point-in-time observation" discipline #2133's reason_at
+            -- established for last_reason. NULL until a verdict is recorded.
+            apply_verdict_at REAL,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -2163,6 +2190,14 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # `coord.portal_sync._consume_preview_verdicts`.
     "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_at REAL",
     "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_rowid TEXT",
+    # #3236: see the CREATE TABLE comment above — the apply-verdict gate
+    # extension of #1757's --hold-after deploy gate. 0/'' for every row
+    # predating this migration, read identically to "not a destructive
+    # entry" / "no verdict recorded yet" by coord.drive_queue.
+    "ALTER TABLE drive_queue ADD COLUMN plan_destructive INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict_at REAL",
 ]
 
 

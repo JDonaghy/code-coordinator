@@ -2384,7 +2384,9 @@ class TestUatStateAndReasonColumns:
 # #3188 bumped this to (13, 87): `assignments.uat_actor`,
 # `assignments.uat_prior`, and the two
 # `portal_sync_state.preview_verdict_watermark_*` columns.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (13, 87)
+# #3236 bumped this to (14, 91): `drive_queue.plan_destructive` /
+# `apply_verdict` / `apply_verdict_reason` / `apply_verdict_at`.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (14, 91)
 
 
 class TestMigrateAddColumnsVersionGuard:

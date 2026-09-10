@@ -344,6 +344,36 @@ HOLD_RELEASED = "released"
 HOLD_SCOPE_ENTRY = "entry"
 HOLD_SCOPE_FLEET = "fleet"
 
+# ── apply-verdict (#3236) ────────────────────────────────────────────────────
+#
+# `hold_state` says WHETHER a gate is closed; `apply_verdict` says WHAT
+# happened the ONE time it was fired for a terraform-flavored entry —
+# specifically, whether `terraform apply` actually ran. Before this, the only
+# signal a fired gate carried was `hold_state`, and `hold_state == "released"`
+# meant nothing more than "something told the queue to keep going" — a bare
+# `coord drive-queue resume` releases the SAME gate a confirmed, successful
+# apply does, so "merged" and "applied" were indistinguishable from the board
+# alone (the exact #2096 "unconfirmed success" shape: a release inferred from
+# an operator's say-so, never from an observation taken AFTER the apply
+# actually ran). `apply_verdict` is that missing observation, recorded
+# explicitly by `coord drive-queue apply-verdict --applied|--apply-failed`
+# (see `coord.commands.drive_queue.drive_queue_apply_verdict`) — never
+# inferred from `hold_state` alone. `''` (unset) is the default for every row
+# predating this column and for a gate nobody has recorded a verdict against
+# yet; see :func:`apply_gate_status` for the tri-state (plus "not yet merged")
+# reading every surface renders through.
+APPLY_NONE = ""
+APPLY_APPLIED = "applied"
+APPLY_FAILED = "apply_failed"
+
+# Apply-gate tri-state codes `apply_gate_status` returns — distinct from
+# `APPLY_*` above (which are the STORED verdict values): these also cover
+# "no gate at all" and "armed but not fired yet", neither of which is a real
+# verdict.
+APPLY_STATUS_NONE = ""
+APPLY_STATUS_PENDING = "pending"
+APPLY_STATUS_MERGED_NOT_APPLIED = "merged_not_applied"
+
 # Wall-clock ceiling for one `resume_when` run.  The shell enforces it; it
 # lives here so the CLI's help text, the alert prose and the test all quote one
 # number.  A wedged probe must never wedge the tick (a tick that stops running
@@ -767,6 +797,33 @@ class QueueEntry:
     # enqueued without `--no-acceptance` — reads identically to "no
     # override", the tick's pre-#2589 behaviour exactly.
     no_acceptance: bool = False
+    # #3236: operator-declared at `add` time (or derived from a
+    # `--terraform-plan-json` capture — see `plan_is_destructive`), same
+    # provenance as `hold_after`/`hold_reason`/`resume_when`. `True` means
+    # THIS entry's terraform plan carries a destroy or replace action, which
+    # makes `resume_when` unconditionally ineligible to auto-release the
+    # gate — see `_resolve_holds` and `pending_probe_targets`, the two
+    # enforcement points (belt-and-suspenders: `add`-time validation already
+    # refuses to store `resume_when` alongside this, but a row that reaches
+    # this state some other way — a hand-edited DB row, a daemon `update`
+    # call — must still never auto-release). `False` for every row predating
+    # this column and for any entry not declared as carrying a destructive
+    # plan — unchanged, pre-#3236 behaviour for every non-terraform
+    # `--hold-after` use of this queue.
+    plan_destructive: bool = False
+    # #3236: the observed outcome of a `terraform apply` against THIS
+    # entry's fired gate — `""` (unset) / `"applied"` / `"apply_failed"`, see
+    # the `APPLY_*` constants above. Written ONLY by `coord drive-queue
+    # apply-verdict`, never inferred from `hold_state` — see that constant
+    # block's comment for why. `""` for every row predating this column and
+    # for a fired gate nobody has recorded a verdict against yet.
+    apply_verdict: str = APPLY_NONE
+    apply_verdict_reason: str = ""
+    # Wall-clock capture time of `apply_verdict`, same "point-in-time
+    # observation, stamp it" discipline #2133's `reason_at` established for
+    # `last_reason`. `None` for a row predating this column or one whose
+    # `apply_verdict` is still unset.
+    apply_verdict_at: float | None = None
 
     @property
     def key(self) -> str:
@@ -856,6 +913,17 @@ class QueueEntry:
             # as `hold_after` above; absent (a row predating this column)
             # reads `False` — no passthrough, the pre-#2589 behaviour.
             no_acceptance=bool(row.get("no_acceptance") or 0),
+            # #3236: same 0/1-or-real-bool acceptance as `hold_after`/
+            # `no_acceptance` above; absent (a row predating this column)
+            # reads `False` — never a silent destructive gate.
+            plan_destructive=bool(row.get("plan_destructive") or 0),
+            apply_verdict=str(row.get("apply_verdict") or APPLY_NONE),
+            apply_verdict_reason=str(row.get("apply_verdict_reason") or ""),
+            apply_verdict_at=(
+                None
+                if row.get("apply_verdict_at") is None
+                else float(row.get("apply_verdict_at"))
+            ),
         )
 
 
@@ -4359,7 +4427,120 @@ def _reconcile_blocked(
     )
 
 
-# ── deploy gates (#1757) ─────────────────────────────────────────────────────
+# ── deploy gates (#1757, apply-verdict #3236) ────────────────────────────────
+
+
+def plan_is_destructive(plan: Mapping[str, Any]) -> bool:
+    """``True`` if a ``terraform show -json <planfile>`` document contains any
+    destroy or replace resource change (#3236).
+
+    Terraform's own structured-plan vocabulary (``resource_changes[].
+    change.actions``) is a list drawn from ``"no-op"``, ``"create"``,
+    ``"read"``, ``"update"``, ``"delete"``, or the two-element replace forms
+    ``["delete", "create"]`` / ``["create", "delete"]``. Every one of those
+    replace forms contains ``"delete"`` — so checking for that single token
+    covers both a pure destroy AND a replace without needing to special-case
+    the two orderings terraform emits depending on ``create_before_destroy``.
+
+    Fails CLOSED, not open: any shape this cannot positively parse as
+    containing zero destroy/replace actions — a missing/malformed
+    ``resource_changes`` list, a change with no ``actions`` — is treated as
+    "cannot confirm this is safe" and returns ``True``. A plan JSON is the
+    ONLY mechanical evidence this module ever sees for "is a human required"
+    (#3236's hard rule); trusting an unparseable shape as safe would be
+    exactly the "gate that releases because its probe blew up" failure
+    :class:`ProbeResult`'s own docstring already rejects for the ordinary
+    resume-when probe.
+    """
+    changes = plan.get("resource_changes")
+    if not isinstance(changes, list):
+        return True
+    for rc in changes:
+        if not isinstance(rc, Mapping):
+            return True
+        change = rc.get("change")
+        if not isinstance(change, Mapping):
+            return True
+        actions = change.get("actions")
+        if not isinstance(actions, list):
+            return True
+        if "delete" in actions:
+            return True
+    return False
+
+
+def validate_apply_gate(resume_when: str, plan_destructive: bool) -> None:
+    """#3236 hard rule: a destroy/replace terraform plan is NEVER auto-
+    resumed via ``--resume-when`` — refuse to even PERSIST that combination,
+    rather than silently storing a probe that :func:`pending_probe_targets`/
+    :func:`_resolve_holds` will simply never honor.
+
+    This is the fail-FAST half, called from ``coord drive-queue add`` before
+    the write; the "no exceptions" half lives in those two functions, which
+    re-check ``plan_destructive`` independently at resolution time so a row
+    that reaches this combination some other way (a hand-edited DB row, a
+    daemon ``/drive-queue`` ``update`` call that bypasses this CLI-level
+    check) still can never auto-release. Two enforcement points answering
+    the SAME question, never one that could silently drift from the other
+    (#2096).
+    """
+    if resume_when and plan_destructive:
+        raise QueueError(
+            "--resume-when is refused together with a destructive "
+            "(destroy/replace) terraform plan (#3236): that gate must always "
+            "be released by a human — `coord drive-queue apply-verdict "
+            "--applied` (after confirming the apply) or `coord drive-queue "
+            "resume` — never an automated probe."
+        )
+
+
+def apply_gate_status(entry: QueueEntry) -> tuple[str, str]:
+    """The apply-verdict tri-state (plus "not yet merged") for *entry*'s
+    deploy gate (#3236) — ``(state, detail)``.
+
+    ``state`` is one of:
+
+    * ``""``                    — no deploy gate declared on this entry at all
+    * ``"pending"``              — gate armed, not yet fired (not merged yet)
+    * ``"merged_not_applied"``   — fired; no apply verdict recorded yet
+    * ``"applied"``              — a ``--applied`` verdict is on record
+    * ``"apply_failed"``         — an ``--apply-failed`` verdict is on record
+
+    The ONE function every apply-verdict-reading surface calls —
+    ``coord drive-queue list``/``status`` (:func:`_hold_lines` in
+    ``coord.commands.drive_queue``) and ``coord gates``
+    (``coord.gates.build_gate_report``) both render through this, so the two
+    can never disagree about whether a terraform change is merged-not-
+    applied, applied, or apply-failed (#2096: one question, one answer).
+
+    Deliberately does NOT treat ``hold_state == "released"`` as "applied" —
+    a bare ``coord drive-queue resume`` releases the gate with no apply
+    verdict at all, and collapsing that into "applied" would be exactly the
+    unconfirmed-success shape #3236 exists to close. A gate released without
+    a recorded verdict still reads ``merged_not_applied``, with a detail
+    string that says so.
+    """
+    if not entry.hold_after:
+        return APPLY_STATUS_NONE, ""
+    if entry.apply_verdict == APPLY_APPLIED:
+        detail = "applied"
+        if entry.apply_verdict_reason:
+            detail += f" — {entry.apply_verdict_reason}"
+        return APPLY_APPLIED, detail
+    if entry.apply_verdict == APPLY_FAILED:
+        detail = "apply failed"
+        if entry.apply_verdict_reason:
+            detail += f": {entry.apply_verdict_reason}"
+        return APPLY_FAILED, detail
+    if entry.hold_state in (HOLD_FIRED, HOLD_RELEASED):
+        detail = "merged, not yet applied"
+        if entry.hold_state == HOLD_RELEASED:
+            detail += (
+                " (gate released without a recorded apply verdict — confirm "
+                "with `coord drive-queue apply-verdict`)"
+            )
+        return APPLY_STATUS_MERGED_NOT_APPLIED, detail
+    return APPLY_STATUS_PENDING, "not yet merged — gate armed"
 
 
 def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
@@ -4371,6 +4552,12 @@ def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
     command") and also the honest one — the deploy cannot have happened in the
     microseconds since the merge was observed.
 
+    #3236: a ``plan_destructive`` entry is excluded even when it somehow
+    carries a ``resume_when`` (``add``-time validation refuses to store that
+    combination, but this is the belt to that braces — see
+    :func:`validate_apply_gate`) — the shell must not even SPAWN the probe
+    command for a destroy/replace gate, let alone honor its result.
+
     Pure and position-ordered, so the shell has no decision left to make: it
     runs exactly this list, in this order, and hands the results back to
     :func:`plan_tick`.
@@ -4378,7 +4565,7 @@ def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
     return [
         e
         for e in sorted(entries, key=lambda e: (e.position, e.key))
-        if e.hold_state == HOLD_FIRED and e.resume_when
+        if e.hold_state == HOLD_FIRED and e.resume_when and not e.plan_destructive
     ]
 
 
@@ -4440,15 +4627,34 @@ def _resolve_holds(
             continue
 
         probe = probes.get(entry.key)
+        # #3236 hard rule, enforced here independently of `add`-time
+        # validation and `pending_probe_targets` excluding this entry from
+        # ever being probed in the first place: a destroy/replace plan is
+        # NEVER released by ANYTHING a probe reports. If a `ProbeResult` for
+        # this key somehow arrived anyway (a hand-built caller, a future
+        # code path that stops routing through `pending_probe_targets`),
+        # discard it — this entry is treated exactly as "no probe declared",
+        # i.e. manual-only, no exceptions.
+        if entry.plan_destructive:
+            probe = None
         if probe is None:
-            # No probe declared, or the shell did not run one.  Manual resume
-            # only; the count does not move, so a hold that nobody probes
-            # never grows a fake attempt number.
+            # No probe declared, or the shell did not run one — OR (#3236)
+            # this entry carries a destroy/replace plan, so the probe (if
+            # any) was discarded above. Manual resume only; the count does
+            # not move, so a hold that nobody probes never grows a fake
+            # attempt number.
+            reason = entry.gate_reason
+            if entry.plan_destructive:
+                reason += (
+                    " (destroy/replace plan — #3236 requires a human release: "
+                    "`coord drive-queue apply-verdict --applied` or `coord "
+                    "drive-queue resume`, resume-when is never honored here)"
+                )
             holds.append(
                 Hold(
                     key=entry.key,
                     outcome="held",
-                    reason=entry.gate_reason,
+                    reason=reason,
                     resume_when=entry.resume_when,
                     probes=entry.hold_probes,
                     scope=entry.hold_scope,
