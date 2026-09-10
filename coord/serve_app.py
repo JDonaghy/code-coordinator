@@ -19,10 +19,11 @@ Endpoints:
 * ``GET /assignment/{id}`` — single-assignment detail: the complete row
   (briefing + full free-text fields).  Point lookups get point endpoints.
 * ``GET /issue/{repo_name}/{number}`` — single-issue detail (full body).
-* ``GET /issues``   — cached ``issues`` rows (labels decoded), optionally
-  scoped by repeated ``?repo_name=`` params (#3227); backs
-  ``coord.state.cached_open_issues``/``coord plans --lint-epics`` on a thin
-  client. Not part of ``/board`` — the ``Board`` model carries no issues field.
+* ``GET /issues``   — cached ``issues`` rows (labels decoded, body included),
+  optionally scoped by repeated ``?repo_name=`` params (#3227/#3228); backs
+  ``coord.state.cached_open_issues``/``coord plans --lint-epics``/
+  ``--lint-stale-epics`` on a thin client. Not part of ``/board`` — the
+  ``Board`` model carries no issues field.
 * ``GET /audit``    — paginated, newest-first read over the append-only
   ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
 * ``GET /leg-counts`` — all-time per-issue assignment leg counts by type,
@@ -4903,11 +4904,12 @@ def openapi_spec() -> dict:
         "/issues": {
             "get": {
                 "summary": (
-                    "#3227: cached `issues` rows (labels decoded), optionally "
-                    "scoped by repeated `?repo_name=` params. Backs "
-                    "`coord.state.cached_open_issues` / "
-                    "`coord plans --lint-epics` on a thin client. NOT part "
-                    "of `/board` — the `Board` model carries no issues field."
+                    "#3227/#3228: cached `issues` rows (labels decoded, body "
+                    "included), optionally scoped by repeated `?repo_name=` "
+                    "params. Backs `coord.state.cached_open_issues` / "
+                    "`coord plans --lint-epics`/`--lint-stale-epics` on a "
+                    "thin client. NOT part of `/board` — the `Board` model "
+                    "carries no issues field."
                 ),
                 "parameters": [
                     {

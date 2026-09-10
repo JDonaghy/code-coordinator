@@ -7840,11 +7840,13 @@ def get_issue_titles(keys: Iterable[tuple[str, int]]) -> dict[str, str]:
 
 
 def cached_open_issues(repo_names: Iterable[str]) -> list[dict]:
-    """Cached issue rows (``repo_name``, ``number``, ``title``, ``state``,
-    ``labels`` — ``labels`` decoded to a plain ``list[str]``) for every
-    ``repo_names`` entry, straight off the locally-cached ``issues`` table —
-    backs ``coord plans --lint-epics``' :func:`coord.plans.find_unlabelled_epics`
-    scan (#3227).
+    """Cached issue rows (``repo_name``, ``number``, ``title``, ``body``,
+    ``state``, ``labels`` — ``labels`` decoded to a plain ``list[str]``) for
+    every ``repo_names`` entry, straight off the locally-cached ``issues``
+    table — backs ``coord plans --lint-epics``'
+    :func:`coord.plans.find_unlabelled_epics` scan (#3227) and
+    ``--lint-stale-epics``' :func:`coord.plans.find_stale_epics` scan
+    (#3228), which needs ``body`` to parse each epic's declared children.
 
     Routes to the daemon when ``board_service`` is set, else reads the local
     ``issues`` table directly — the same split as :func:`get_issue_titles`,
@@ -7880,13 +7882,13 @@ def _cached_open_issues_local(repo_names: list[str] | None = None) -> list[dict]
             placeholders = ",".join("?" for _ in repo_names)
             rows = sql.execute(
                 conn,
-                "SELECT repo_name, number, title, state, labels FROM issues "  # noqa: S608 — placeholders only
+                "SELECT repo_name, number, title, body, state, labels FROM issues "  # noqa: S608 — placeholders only
                 f"WHERE repo_name IN ({placeholders})",
                 tuple(repo_names),
             ).fetchall()
         else:
             rows = sql.execute(
-                conn, "SELECT repo_name, number, title, state, labels FROM issues"
+                conn, "SELECT repo_name, number, title, body, state, labels FROM issues"
             ).fetchall()
     except Exception:  # noqa: BLE001 — an unreadable cache is an empty scan
         return []

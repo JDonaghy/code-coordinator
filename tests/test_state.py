@@ -2367,6 +2367,28 @@ class TestCachedOpenIssues:
 
         assert issues[0]["labels"] == ["epic"]
 
+    def test_body_field_is_carried_through(self, coord_db) -> None:
+        """#3228: `coord plans --lint-stale-epics` needs each epic's own
+        cached body to parse its declared children — the row must carry it,
+        not just the title/state/labels #3227 originally needed."""
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1,
+                    "title": "Epic: foo",
+                    "body": "## Sub-issues\n- [ ] #2\n",
+                    "labels": [],
+                }
+            ],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert issues[0]["body"] == "## Sub-issues\n- [ ] #2\n"
+
     def test_empty_repo_names_short_circuits_to_empty_list(self, coord_db) -> None:
         from coord.state import cached_open_issues
 
