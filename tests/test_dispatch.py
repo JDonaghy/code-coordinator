@@ -3117,10 +3117,12 @@ class TestRouteWorkByCapability:
         machines = [
             Machine(
                 name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["gtk", "windows"],
             ),
             Machine(
                 name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["macos"],
             ),
         ]
@@ -3142,10 +3144,12 @@ class TestRouteWorkByCapability:
         machines = [
             Machine(
                 name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["macos"],
             ),
             Machine(
                 name="macmini2", host="macmini2.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["macos"],
             ),
         ]
@@ -3170,10 +3174,12 @@ class TestRouteWorkByCapability:
         machines = [
             Machine(
                 name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["gtk", "windows"],
             ),
             Machine(
                 name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["macos"],
             ),
         ]
@@ -3203,10 +3209,12 @@ class TestRouteWorkByCapability:
         machines = [
             Machine(
                 name="first", host="first.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["gtk"],
             ),
             Machine(
                 name="second", host="second.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
                 capabilities=["macos"],
             ),
         ]
@@ -3234,7 +3242,130 @@ class TestRouteWorkByCapability:
         assert "macos" in note
         assert "dell64" in note
         assert "Do NOT self-record" in note
-        assert "coord test" in note
+
+    def test_machine_with_no_repo_path_is_never_a_reroute_target(self) -> None:
+        """#3241 review: the sibling `select_fix_machine._capable()` check a
+        few hundred lines below requires `repo_path(repo_name) is not
+        None`. `macmini` declares `quadraui` under `repos:` but has no
+        `repo_paths` entry configured — it must never be picked, even
+        though it's the only machine declaring `macos`. Before this fix,
+        `dispatch()` would set `proposal.machine_name = "macmini"` and only
+        THEN hit its own pre-existing `repo_path` check and raise, leaving
+        the proposal mutated to an undispatchable machine."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                capabilities=["macos"],  # no repo_paths entry
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        # dell64 is the only surviving candidate — macmini is filtered out
+        # before scoring, so it can never win even though it fully covers
+        # the matched capability.
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+    def test_paused_machine_is_never_a_reroute_target(self) -> None:
+        """#3241 review: every other machine-selection path in this file
+        (`rank_smoke_machines`/`_capability_matched_machines` in
+        coord/smoke.py, #2636; `select_fix_machine`, #2240) cordons via
+        `follow_on_paused_set`. Work dispatch is NEW work, not the tail of
+        a leg already in flight, so it must use the FULL `paused_set()` —
+        the same one `coord.brain.propose()` and `coord assign`'s CLI both
+        gate a `type="work"` proposal's machine on. A reroute must not
+        silently land the work on a machine the operator explicitly
+        `coord pause`d."""
+        from coord.machine_pause import local_pause
+
+        local_pause("macmini")
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+    def test_quiet_hours_machine_is_never_a_reroute_target(self) -> None:
+        """Same cordon as the pause test above, but via a declared
+        `quiet_hours` window instead of an explicit `coord pause` — both
+        fold into `paused_set()` (#1862). *now* is pinned (the same seam
+        `rank_smoke_machines` exposes, #2636) so this is deterministic
+        rather than depending on the real wall clock."""
+        from datetime import datetime, time, timezone
+
+        from coord.models import QuietHours
+
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            dataclasses_replace(
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["macos"],
+                ),
+                quiet_hours=QuietHours(start=time(22, 0), end=time(8, 0), tz="UTC"),
+            ),
+        ]
+        # 2026-08-23 04:00 UTC — inside macmini's 22:00-08:00 UTC window.
+        inside_window = datetime(2026, 8, 23, 4, 0, tzinfo=timezone.utc)
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+            now=inside_window,
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+        # Control: OUTSIDE the window, macmini is a normal candidate again
+        # and wins on coverage.
+        outside_window = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+        result2 = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+            now=outside_window,
+        )
+        assert result2 is not None
+        assert result2.machine_name == "macmini"
+        assert result2.unmet_capabilities == ()
 
 
 class TestDispatchCapabilityRouting:

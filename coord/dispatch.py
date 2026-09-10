@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import httpx
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 from coord import github_ops
 from coord.comments import (
@@ -645,6 +648,11 @@ def dispatch(
                     f"Unknown machine: {capability_routing.machine_name!r}"
                 )
 
+    # #3241 review: a rerouted machine can never fail this —
+    # `route_work_by_capability`'s candidate filter already requires
+    # `repo_path(repo_name) is not None` before a machine is eligible to be
+    # named, so this only ever fires for the ORIGINALLY proposed machine
+    # (no reroute happened, e.g. no capability rule matched at all).
     repo_path = machine.repo_path(proposal.repo_name)
     if repo_path is None:
         raise ValueError(
@@ -1212,6 +1220,7 @@ def route_work_by_capability(
     files_likely: list[str],
     machines: list[Machine],
     capability_rules: list[SmokeRule],
+    now: "datetime | None" = None,
 ) -> CapabilityRouting | None:
     """Pick the machine for a `type="work"` dispatch whose declared `##
     Files` (`files_likely`) match `smoke_tests.capability_rules` (#3241).
@@ -1225,16 +1234,47 @@ def route_work_by_capability(
     import here would be circular.
 
     Returns `None` when `files_likely` matches no capability rule at all
-    (the overwhelmingly common case) or when no configured machine can work
-    on `repo_name` at all — both are the caller's signal to leave
+    (the overwhelmingly common case) or when no machine survives the
+    candidate filter below — both are the caller's signal to leave
     `proposal.machine_name` exactly as proposed; `dispatch()`'s own
     unresolved-machine/repo_path checks are the right place for THAT
     refusal, not a second one here.
 
-    Otherwise, scores every machine that `can_work_on(repo_name)` by how
-    many of the matched capabilities it declares. The proposed machine wins
-    ties (no pointless reroute — and its build cache is warm, same reasoning
-    as `coord.smoke.rank_smoke_machines`'s worker preference); otherwise the
+    A candidate must satisfy every one of (#3241 review):
+
+    - `can_work_on(repo_name)` — declares the repo at all;
+    - `repo_path(repo_name) is not None` — the SAME check
+      `select_fix_machine`'s `_capable()` applies a few hundred lines below.
+      Without it, a machine that lists the repo under `repos:` but has no
+      `repo_paths` entry configured could be chosen as the reroute target;
+      `dispatch()` sets `proposal.machine_name` from this function's result
+      BEFORE its own pre-existing `repo_path` check runs, so an unfiltered
+      pick here would mutate the proposal to an undispatchable machine
+      before the caller ever sees the `ValueError`;
+    - not in `paused_set(machines)` — the FULL cordon-inclusive set, the
+      same one `coord.brain.propose()` and `coord assign`'s CLI both gate a
+      `type="work"` proposal's machine on before it is ever chosen. This is
+      new work, not the tail of a leg already in flight, so this
+      deliberately does NOT use `follow_on_paused_set()` — that one exists
+      for `select_fix_machine`/`rank_smoke_machines`, which finish work
+      that already started elsewhere (#2240, #2636). A reroute here must
+      not land a `type="work"` leg on a machine the operator explicitly
+      `coord pause`d or that is inside its declared `quiet_hours` window —
+      `dispatch()` itself has no other pause/quiet-hours check anywhere in
+      its body, since that filtering has always been done upstream, and
+      this new gate runs strictly after `coord plan` already did it once.
+
+    *now* is forwarded to `paused_set()` untouched, exactly like
+    `rank_smoke_machines`'s own *now* parameter — `None` (the default, and
+    every production call site) evaluates quiet hours against the real
+    clock; the seam exists purely so a test can pin a specific wall-clock
+    moment instead of depending on whatever instant the suite happens to
+    run at.
+
+    Otherwise, scores every surviving candidate by how many of the matched
+    capabilities it declares. The proposed machine wins ties (no pointless
+    reroute — and its build cache is warm, same reasoning as
+    `coord.smoke.rank_smoke_machines`'s worker preference); otherwise the
     highest-scoring machine wins, ties broken by `machines` list order
     (`coordinator.yml` declaration order — deterministic, never dict/set
     iteration order). A single-capability-rule diff with any fully-capable
@@ -1242,13 +1282,20 @@ def route_work_by_capability(
     `CapabilityRouting`'s docstring for the multi-capability case where no
     one machine fully covers it.
     """
+    from coord.machine_pause import paused_set  # noqa: PLC0415
     from coord.smoke import match_rules  # noqa: PLC0415
 
     required = match_rules(files_likely, capability_rules)
     if not required:
         return None
 
-    candidates = [m for m in machines if m.can_work_on(repo_name)]
+    paused = paused_set(machines, now=now)
+    candidates = [
+        m for m in machines
+        if m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+        and m.name not in paused
+    ]
     if not candidates:
         return None
 
