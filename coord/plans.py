@@ -36,11 +36,25 @@ Design decisions (#974):
   ``lambda *_: []`` here — a background aggregate over many milestones should
   not spawn N ``gh`` calls for branch checks.  ``in_flight`` is derived purely
   from the board's active assignments.
+- **Unlabelled-epic lint (#3227)**.  :data:`EPIC_TITLE_RE` /
+  :func:`find_unlabelled_epics` are a *separate* read-only lint, not part of
+  the milestone-aggregation pipeline above: an issue whose title reads as an
+  epic (``"Epic:"``, ``"EPIC:"``, a ``"[tag] Epic:"``/``"[epic]"`` bracket
+  prefix) but whose cached ``labels`` don't carry ``TRACKING_ISSUE_LABEL`` is
+  invisible to :func:`find_tracking_issue` (and, since #3132, to
+  ``coord.drive_queue.dispatch_type_for_labels``) — it silently dispatches as
+  plain ``type="work"`` instead of the epic-aware type. This lint only
+  *flags* the mismatch; it never writes a label (out of scope per #3226).
+  Pure, like the rest of this module: it takes already-cached issue dicts (the
+  local ``issues`` table shape — ``labels`` as a plain ``list[str]``, not
+  GitHub's ``[{"name": ...}]``) and does no I/O of its own. The CLI command
+  (``coord plans --lint-epics``) is what reads the local cache.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 from coord.issue_store import diff_audit_goals
@@ -55,11 +69,28 @@ from coord.models import Board
 
 __all__ = [
     "TRACKING_ISSUE_LABEL",
+    "EPIC_TITLE_RE",
     "PlanEntry",
     "find_tracking_issue",
+    "find_unlabelled_epics",
     "aggregate_plan",
     "aggregate_repo_plans",
 ]
+
+
+# ── Unlabelled-epic lint (#3227) ────────────────────────────────────────────
+
+# Base pattern on the five real-world titles the issue cited:
+#   "[platform] Epic: ..."                 (bracket tag + "Epic:")
+#   "Epic: goal-driven autonomous planner"  (bare "Epic:")
+#   "EPIC: coordinator<->vimcode integration" (bare, upper-case)
+#   "Epic: pluggable CI/CD store"           (bare)
+#   "Epic: pluggable issue store"           (bare)
+# plus the "[epic]" bracket-tag-alone style the issue also calls out.
+EPIC_TITLE_RE = re.compile(
+    r"^(?:\[[^\]]*\]\s*)?epic\s*:|^\[epic\]",
+    re.IGNORECASE,
+)
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -192,6 +223,42 @@ def find_tracking_issue(
         if TRACKING_ISSUE_LABEL in labels:
             return issue
     return None
+
+
+def find_unlabelled_epics(issues: list[dict]) -> list[dict]:
+    """Return open issues whose title reads like an epic but whose cached
+    labels don't include ``TRACKING_ISSUE_LABEL`` (#3227).
+
+    ``issues`` is expected in the **local cache** shape — each item has at
+    least ``"number"``, ``"title"``, ``"state"``, and ``"labels"`` — matching
+    the rows :func:`coord.dao.SqliteStore.list_issues` decodes from the
+    ``issues`` table (``labels`` as a plain ``list[str]``). A GitHub-shaped
+    ``labels`` list (``[{"name": ...}]``, as :func:`find_tracking_issue`
+    above consumes) is also accepted for convenience — each entry is
+    normalised to its name either way.
+
+    Closed issues are skipped: a closed epic missing the label is no longer
+    actionable the way an open one is. Order is preserved from the input.
+    This is read-only — it never mutates anything; the caller decides what,
+    if anything, to do with the hits (this lint deliberately does not
+    auto-label, per #3226).
+    """
+    hits: list[dict] = []
+    for issue in issues:
+        state = (issue.get("state") or "open").lower()
+        if state != "open":
+            continue
+        title = issue.get("title") or ""
+        if not EPIC_TITLE_RE.match(title):
+            continue
+        raw_labels = issue.get("labels") or []
+        label_names = {
+            lbl["name"] if isinstance(lbl, dict) else str(lbl) for lbl in raw_labels
+        }
+        if TRACKING_ISSUE_LABEL in label_names:
+            continue
+        hits.append(issue)
+    return hits
 
 
 def _has_pending_chat(

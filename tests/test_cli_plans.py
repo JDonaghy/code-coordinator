@@ -26,7 +26,9 @@ from coord.plans import (
     aggregate_plan,
     aggregate_repo_plans,
     find_tracking_issue,
+    find_unlabelled_epics,
 )
+from coord.state import upsert_open_issues
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -780,3 +782,187 @@ class TestPlansCli:
         # Confirm it's JSON-serialisable.
         round_tripped = json.loads(json.dumps(d))
         assert round_tripped == d
+
+
+# ── find_unlabelled_epics (#3227) ────────────────────────────────────────────
+
+
+def _cached_issue(
+    number: int,
+    title: str,
+    *,
+    repo_name: str = "api",
+    state: str = "open",
+    labels: list[str] | None = None,
+) -> dict:
+    """A local-cache-shaped issue dict, matching what
+    :func:`coord.dao.SqliteStore.list_issues` decodes from the ``issues``
+    table (``labels`` as a plain ``list[str]``, unlike GitHub's raw
+    ``[{"name": ...}]`` shape that :func:`_issue` above builds)."""
+    return {
+        "repo_name": repo_name,
+        "number": number,
+        "title": title,
+        "state": state,
+        "labels": labels or [],
+    }
+
+
+class TestFindUnlabelledEpics:
+    def test_title_matches_but_unlabelled_is_flagged(self) -> None:
+        issues = [_cached_issue(837, "[platform] Epic: multi-tenant billing")]
+        hits = find_unlabelled_epics(issues)
+        assert [h["number"] for h in hits] == [837]
+
+    def test_title_matches_and_labelled_is_not_flagged(self) -> None:
+        issues = [
+            _cached_issue(
+                836, "[platform] Epic: something already fixed", labels=["epic"]
+            )
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_title_doesnt_match_is_not_flagged(self) -> None:
+        issues = [_cached_issue(1, "Fix flaky test in reconcile loop")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_matches_bare_epic_prefix_case_insensitive(self) -> None:
+        issues = [
+            _cached_issue(380, "Epic: goal-driven autonomous planner"),
+            _cached_issue(531, "EPIC: coordinator<->vimcode integration"),
+        ]
+        hits = find_unlabelled_epics(issues)
+        assert {h["number"] for h in hits} == {380, 531}
+
+    def test_matches_bare_bracket_epic_tag(self) -> None:
+        issues = [_cached_issue(1, "[epic] some big initiative")]
+        hits = find_unlabelled_epics(issues)
+        assert [h["number"] for h in hits] == [1]
+
+    def test_closed_issue_is_not_flagged(self) -> None:
+        issues = [_cached_issue(2, "Epic: dead epic", state="closed")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_word_epic_mid_title_does_not_false_positive(self) -> None:
+        """"Epic" appearing later in a title, or without a colon
+        immediately after it, must not trip the lint."""
+        issues = [
+            _cached_issue(3, "Epicurious recipe importer"),
+            _cached_issue(4, "Make the onboarding flow more epic"),
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_accepts_github_shaped_labels_too(self) -> None:
+        """A GitHub-raw ``[{"name": ...}]`` labels list (as
+        :func:`find_tracking_issue` consumes) is also tolerated."""
+        issues = [
+            _cached_issue(5, "Epic: labelled via github shape")
+            | {"labels": [{"name": "epic"}]}
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+
+# ── coord plans --lint-epics CLI integration (#3227) ────────────────────────
+
+
+class TestLintEpicsCli:
+    def test_flags_unlabelled_epic_from_local_cache(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 837,
+                    "title": "[platform] Epic: multi-tenant billing",
+                    "body": "",
+                    "labels": [],
+                },
+                {
+                    "number": 836,
+                    "title": "[platform] Epic: already labelled",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                },
+                {
+                    "number": 1,
+                    "title": "Fix flaky test",
+                    "body": "",
+                    "labels": [],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#837" in result.output
+        assert "already labelled" not in result.output
+        assert "Fix flaky test" not in result.output
+        # No GitHub calls happened for the lint itself — get_open_issues was
+        # only ever called with [] (no milestones), confirming the lint read
+        # came from the local cache, not a network fetch.
+
+    def test_no_hits_prints_clean_message(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [{"number": 1, "title": "Fix flaky test", "body": "", "labels": []}],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "No unlabelled epics found." in result.output
+
+    def test_json_output_carries_unlabelled_epics_key(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 380,
+                    "title": "Epic: goal-driven autonomous planner",
+                    "body": "",
+                    "labels": [],
+                }
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--json", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["plans"] == []
+        assert data["unlabelled_epics"] == [
+            {"repo": "api", "number": 380, "title": "Epic: goal-driven autonomous planner"}
+        ]
+
+    def test_without_flag_json_stays_a_plain_array(self, config_file: Path) -> None:
+        """Backward compatibility: omitting --lint-epics keeps --json's
+        historical shape (a bare array), unaffected by the new flag."""
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main, ["plans", "--json", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data == []
