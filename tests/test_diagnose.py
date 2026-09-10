@@ -710,6 +710,57 @@ def test_is_stale_falls_back_to_dispatched_at_when_output_unknown(monkeypatch, c
     assert diagnose._is_stale(old, config) is True
 
 
+def test_is_stale_reachable_agent_missing_id_uses_conservative_fallback(
+    monkeypatch, config,
+) -> None:
+    """#3222 review iteration 1: a REACHABLE agent whose own `/status`
+    `active` list simply doesn't carry this id — the everyday shape of an
+    interactive `--review-of`/`--fix-of`/`--rework-of` tmux pane
+    (coord/interactive.py), which never goes through `AgentServer.assign()`
+    and so can NEVER appear there — must not be judged against the tight
+    45-minute review silence threshold the way a confirmed-unreachable probe
+    or a fresh dispatch is. It falls back to the old, conservative
+    dispatched-at bound instead, so a human actively working such a pane for
+    under 12h is not told it is stale."""
+    from coord.network import StatusResult
+
+    now = time.time()
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(data={"active": []}),
+    )
+
+    fifty_min_old = _assign(aid="interactive-1", dispatched_at=now - 50 * 60.0)
+    assert diagnose._is_stale(fifty_min_old, config) is False
+
+    thirteen_hours_old = _assign(aid="interactive-2", dispatched_at=now - 13 * 3600.0)
+    assert diagnose._is_stale(thirteen_hours_old, config) is True
+
+
+def test_stale_check_healthy_for_reachable_agent_without_this_id(monkeypatch, config) -> None:
+    """Integration-level version of the above through `diagnose_stage`:
+    tmux (or the stubbed `_session_state`) says the review session is live,
+    the assignment's own agent answers `/status` fine, but its `active`
+    list never lists this id at all (the interactive-pane shape). Dispatched
+    50 minutes ago must be reported healthy, not stale — before #3222 review
+    iteration 1 this false-positived at the tight 45-minute threshold."""
+    from coord.network import StatusResult
+
+    _stub(monkeypatch, session="live")
+    now = time.time()
+    a = _assign(
+        aid="rv-interactive", typ="review", status="running", dispatched_at=now - 50 * 60.0,
+    )
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(data={"active": []}),
+    )
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review")
+    assert res.needs_reset is False
+    assert any("looks healthy" in f for f in res.findings)
+
+
 # ── merge reconcile ──────────────────────────────────────────────────────────
 
 

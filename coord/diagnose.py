@@ -1655,33 +1655,60 @@ def _cleanup_issue(
             res.actions_taken.append(f"cleanup: marked phantom row {a.assignment_id} terminal ({exc})")
 
 
-def _last_output_at(assignment: "Assignment", config: "Config") -> float | None:
+@dataclass(frozen=True)
+class _OutputSignal:
+    """What :func:`_last_output_at` was able to learn, and — crucially — WHY
+    it came back empty when it did. A bare ``float | None`` can't carry that
+    distinction, and #3222 review iteration 1 found that collapsing it lets a
+    tight, review-oriented silence threshold misfire on a case it was never
+    meant to judge (see :func:`_is_stale`)."""
+
+    last_output_at: float | None
+    # True  = the assignment's own agent answered `/status` and we could read
+    #         its `active` list (whether or not this id was in it).
+    # False = we affirmatively know the agent could NOT be asked (unreachable,
+    #         no machine to resolve, or no assignment id at all).
+    agent_reachable: bool
+
+
+def _last_output_at(assignment: "Assignment", config: "Config") -> _OutputSignal:
     """The Unix timestamp of *assignment*'s most recent output, per its own
     agent's ``/status`` (``last_output_at`` — the agent stats its own log
     file's mtime, #1632; the same field :mod:`coord.notifier` reads for its
-    output-silence probe). ``None`` when the machine can't be resolved, the
+    output-silence probe), plus whether the agent could be reached at all.
+
+    ``last_output_at`` is ``None`` when the machine can't be resolved, the
     agent is unreachable, or the agent's ``active`` list doesn't carry this
-    id (already finished, or never produced a byte of output yet) — the
-    caller must not read ``None`` as "silent", only as "unknown"."""
+    id (already finished, never produced a byte of output yet, or — commonly
+    — an interactive ``--review-of``/``--fix-of``/``--rework-of`` tmux pane
+    that never went through ``AgentServer.assign()`` at all and so can
+    NEVER appear there, see :mod:`coord.interactive`). The caller must not
+    read a bare ``None`` as "silent" — :func:`_is_stale` uses
+    ``agent_reachable`` to tell a confirmed-unreachable agent (where "unknown"
+    is the only signal available) from a healthy, reachable one that simply
+    never registered this id (where "unknown" means nothing at all) — the
+    same distinction :mod:`coord.notifier.predicate` already draws for this
+    exact question (``agent_reachable`` there, ``quiet_for is None``)."""
     if not assignment.assignment_id:
-        return None
+        return _OutputSignal(None, agent_reachable=False)
     machine = _resolve_machine(config, assignment.machine_name)
     if machine is None:
-        return None
+        return _OutputSignal(None, agent_reachable=False)
     from coord.network import fetch_status  # noqa: PLC0415
 
     result = fetch_status(machine)
     if not result.ok or result.data is None:
-        return None
+        return _OutputSignal(None, agent_reachable=False)
     active = result.data.get("active") or []
     for entry in active:
         if isinstance(entry, dict) and entry.get("id") == assignment.assignment_id:
             value = entry.get("last_output_at")
             try:
-                return None if value is None else float(value)
+                last_output_at = None if value is None else float(value)
             except (TypeError, ValueError):
-                return None
-    return None
+                last_output_at = None
+            return _OutputSignal(last_output_at, agent_reachable=True)
+    return _OutputSignal(None, agent_reachable=True)
 
 
 def _is_stale(
@@ -1689,6 +1716,7 @@ def _is_stale(
     config: "Config",
     *,
     max_silence_secs: float | None = None,
+    max_dispatch_age_hours: float = 12.0,
 ) -> bool:
     """A still-``live`` session that has gone SILENT for *max_silence_secs* is
     stale (wedged) — recovery can't safely finalize a live session, so these
@@ -1712,24 +1740,45 @@ def _is_stale(
     (`silence_threshold` is clamped into ``[SILENCE_FLOOR_SECS,
     SILENCE_CAP_SECS]`` regardless of stratum). Reusing it rather than
     inventing a second constant means "how long is too long to be silent"
-    has one answer in this codebase, not two that can drift apart.
+    has one answer in this codebase, not two that can drift apart — but that
+    is ONLY the threshold for a session whose output gap is actually known.
 
-    Falls back to ``dispatched_at`` only when the agent has never published
-    ANY output for this assignment at all (fresh dispatch, unreachable
-    agent, or a log-less session) — using the same threshold — so a session
-    that just started a second ago is not misread as instantly stale.
+    #3222 review iteration 1: when the output gap is unknown
+    (``last_output_at is None``), that tight 45-minute threshold must NOT be
+    reused for the ``dispatched_at`` fallback below, because ``None`` covers
+    two very different cases and only one of them is evidence of anything:
+
+    * The agent is confirmed unreachable (probe error, no machine, no id) —
+      genuinely no signal, same as a fresh dispatch that hasn't posted status
+      yet.
+    * The agent is reachable and answered fine, but its ``active`` list
+      simply doesn't list this id — which is the everyday shape of an
+      interactive ``--review-of``/``--fix-of``/``--rework-of`` tmux pane
+      (:mod:`coord.interactive`): those sessions never go through
+      ``AgentServer.assign()``, so they can never appear in any agent's
+      ``/status`` output, permanently, not transiently. Per the same
+      distinction :mod:`coord.notifier.predicate` (#2609/#2657) already
+      draws for this exact question, this is "unknown == fine", not
+      "unknown == silent" — a healthy, reachable agent has told us nothing
+      bad, it just isn't the one tracking this session.
+
+    Both fall back to comparing ``dispatched_at`` against
+    *max_dispatch_age_hours* (12h, the old default) rather than
+    *max_silence_secs* — a human actively working a ``--review-of``/
+    ``--fix-of`` pane for an hour must not be told it is "stale" just
+    because the review-oriented silence threshold is short.
     """
     if max_silence_secs is None:
         from coord.notifier.baseline import SILENCE_CAP_SECS  # noqa: PLC0415
 
         max_silence_secs = SILENCE_CAP_SECS
 
-    last_output = _last_output_at(assignment, config)
-    if last_output is not None:
-        return (time.time() - last_output) > max_silence_secs
+    signal = _last_output_at(assignment, config)
+    if signal.last_output_at is not None:
+        return (time.time() - signal.last_output_at) > max_silence_secs
     if not assignment.dispatched_at:
         return False
-    return (time.time() - assignment.dispatched_at) > max_silence_secs
+    return (time.time() - assignment.dispatched_at) > max_dispatch_age_hours * 3600.0
 
 
 # ── #2536: fleet-wide phantom-row self-heal sweep ───────────────────────────
