@@ -8,7 +8,12 @@ Covers:
 - `coord.ci_github.build_ci_failure_detail` — the pure-ish orchestration
   that turns a `CiStore` + repo/PR into a `CIFailureDetail`, fetching the
   job's log exactly once and failing soft on any error
-- `coord.ci_github._bound_log_excerpt` — the truncation bound itself
+- `coord.ci_github._bound_log_excerpt` — the position-based (tail) bound,
+  still used as a last-resort fallback (#3245)
+- `coord.ci_github._extract_relevant_log_lines` (#3245) — the relevance-
+  based extraction that replaced tail-truncation as the primary path: for
+  a script-final job, the tail is the runner echoing its own script source
+  and post-job cleanup, not the error (quadraui#913 evidence in #3245)
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from coord.ci_github import (
     CI_FIX_LOG_MAX_LINES,
     GitHubCi,
     _bound_log_excerpt,
+    _extract_relevant_log_lines,
     build_ci_failure_detail,
 )
 from coord.ci_store import CheckRun, JobRun, JobStep
@@ -127,6 +133,114 @@ class TestBoundLogExcerpt:
         assert excerpt == text[-len(excerpt):]
 
 
+# ── _extract_relevant_log_lines (#3245) ──────────────────────────────────────
+
+
+class TestExtractRelevantLogLines:
+    def test_no_match_reports_unmatched(self) -> None:
+        text = "running...\nsetup complete\ncleaning up...\n"
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is False
+        assert truncated is False
+        assert excerpt == ""
+
+    def test_empty_text_reports_unmatched(self) -> None:
+        excerpt, truncated, matched = _extract_relevant_log_lines("")
+        assert (excerpt, truncated, matched) == ("", False, False)
+
+    def test_annotation_error_line_is_selected(self) -> None:
+        text = (
+            "warning: use of deprecated function `foo`\n"
+            "##[error]coord-tui fails to compile against this PR's quadraui\n"
+            "Cleaning up orphan processes\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert truncated is False
+        assert "##[error]coord-tui fails to compile" in excerpt
+
+    def test_rust_error_is_paired_with_its_location(self) -> None:
+        text = (
+            "Compiling coord-tui v0.1.0\n"
+            "error[E0433]: failed to resolve: use of undeclared crate `foo`\n"
+            " --> src/lib.rs:12:5\n"
+            "  |\n"
+            "12 | use foo::bar;\n"
+            "  |     ^^^ use of undeclared crate `foo`\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert excerpt == (
+            "error[E0433]: failed to resolve: use of undeclared crate `foo`\n"
+            " --> src/lib.rs:12:5"
+        )
+
+    def test_never_includes_runner_echo_of_step_script_or_cleanup(self) -> None:
+        """quadraui#913, leg `453bc22c` (#3245's motivating evidence): the
+        excerpt must contain the `##[error]` line and NOT the gate's own
+        echoed bash source or the post-job git-config cleanup around it."""
+        text = "\n".join([
+            "warning: use of deprecated function `old_api` (edition 2024)",
+            "warning: use of deprecated function `old_api2` (edition 2024)",
+            'if [ "failure" = "failure" ]; then',
+            '  echo "downstream consumer broke"',
+            "fi",
+            "##[error]coord-tui fails to compile against this PR's quadraui "
+            "but builds fine against develop's tip",
+            "Post job cleanup.",
+            "/usr/bin/git config --local --unset-all http.https://github.com/.extraheader",
+            "Node.js 16 actions are deprecated.",
+        ])
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert "##[error]coord-tui fails to compile" in excerpt
+        assert 'if [ "failure" = "failure" ]' not in excerpt
+        assert "echo " not in excerpt
+        assert "git config" not in excerpt
+        assert "Post job cleanup" not in excerpt
+
+    def test_warnings_included_only_when_budget_remains(self) -> None:
+        text = (
+            "##[error]top priority line\n"
+            "warning: this should still fit under budget\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert truncated is False
+        assert "top priority line" in excerpt
+        assert "this should still fit under budget" in excerpt
+
+    def test_warnings_dropped_before_higher_priority_lines_when_over_budget(self) -> None:
+        # A rust diagnostic pair (2 lines, higher priority) plus enough
+        # `warning:` units to blow the line-count budget on their own —
+        # the diagnostic pair must survive intact and the LATEST warnings
+        # (lowest priority, added last) are what gets cut, never the pair.
+        warnings = [f"warning: noise line {i}" for i in range(CI_FIX_LOG_MAX_LINES + 10)]
+        text = (
+            "error[E0433]: unresolved import `foo`\n"
+            " --> src/lib.rs:1:1\n" + "\n".join(warnings)
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert truncated is True
+        assert "error[E0433]: unresolved import `foo`" in excerpt
+        assert " --> src/lib.rs:1:1" in excerpt
+        result_lines = excerpt.split("\n")
+        assert len(result_lines) <= CI_FIX_LOG_MAX_LINES
+        # The pair survives whole; some tail-of-priority-list warnings do
+        # NOT survive (budget was deliberately blown).
+        assert "noise line 0" in excerpt
+        assert f"noise line {CI_FIX_LOG_MAX_LINES + 9}" not in excerpt
+
+    def test_oversized_single_unit_falls_back_to_bounded_slice(self) -> None:
+        text = "##[error]" + ("x" * (CI_FIX_LOG_MAX_BYTES * 2))
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert truncated is True
+        assert excerpt != ""
+        assert len(excerpt.encode("utf-8")) <= CI_FIX_LOG_MAX_BYTES
+
+
 # ── build_ci_failure_detail ──────────────────────────────────────────────────
 
 
@@ -162,7 +276,15 @@ class TestBuildCiFailureDetail:
     def test_names_failing_job_and_step_and_carries_bounded_log(self) -> None:
         """#3114 black-box acceptance: the built detail names the failing
         test/job the CI-fix worker needs, straight from a fixture failed
-        run — no `gh` rediscovery required."""
+        run — no `gh` rediscovery required.
+
+        #3245: the log fixture uses a `##[error]` annotation line — exactly
+        what GitHub Actions itself always appends to a failing step's log
+        (at minimum `##[error]Process completed with exit code 1.`) — since
+        `log_excerpt` is now extracted BY RELEVANCE rather than by tail
+        position; plain unstructured text (the old fixture) would no
+        longer surface at all.
+        """
         check = _failed_check()
         job = JobRun(
             name=check.name, conclusion="failure", runner_name="GitHub Actions 1",
@@ -176,7 +298,10 @@ class TestBuildCiFailureDetail:
 
         with patch(
             "coord.ci_github.github_ops.get_job_log",
-            return_value="running...\nFAIL: test_i_0_ctrl_d_keys_off_last_keystroke\n",
+            return_value=(
+                "running...\n"
+                "##[error]FAIL: test_i_0_ctrl_d_keys_off_last_keystroke\n"
+            ),
         ) as get_log:
             detail = build_ci_failure_detail(store, "acme/api", 42)
 
@@ -188,6 +313,7 @@ class TestBuildCiFailureDetail:
         assert "test_i_0_ctrl_d_keys_off_last_keystroke" in detail.log_excerpt
         assert detail.run_url == f"https://github.com/acme/api/actions/runs/999"
         assert detail.truncated is False
+        assert detail.no_diagnostics_matched is False
 
     def test_no_matching_job_leaves_job_and_step_empty(self) -> None:
         check = _failed_check()
@@ -198,6 +324,38 @@ class TestBuildCiFailureDetail:
         assert detail.job_name == ""
         assert detail.step_name == ""
         assert detail.log_excerpt == ""
+
+    def test_no_diagnostics_matched_set_when_fetched_log_has_no_diagnostics(self) -> None:
+        """#3245 acceptance: a log with no matching diagnostics produces an
+        explicit signal the briefing renders as a "no diagnostics" note,
+        rather than silently falling back to a tail excerpt."""
+        check = _failed_check()
+        job = JobRun(
+            name=check.name, conclusion="failure", runner_name="GitHub Actions 1",
+            steps=[JobStep(name="Run tests", conclusion="failure")],
+            job_id="456",
+        )
+        store = _StubCiStore(checks=[check], jobs_by_run={"999": [job]})
+
+        with patch(
+            "coord.ci_github.github_ops.get_job_log",
+            return_value="Set up job\nRun tests\nCleaning up orphan processes\n",
+        ):
+            detail = build_ci_failure_detail(store, "acme/api", 42)
+
+        assert detail is not None
+        assert detail.log_excerpt == ""
+        assert detail.no_diagnostics_matched is True
+
+    def test_no_diagnostics_matched_false_when_log_never_fetched(self) -> None:
+        """Distinct from the above: no job/job_id means no fetch was even
+        attempted, which is "no log available", not "log had nothing"."""
+        check = _failed_check()
+        store = _StubCiStore(checks=[check], jobs_by_run={"999": []})
+        detail = build_ci_failure_detail(store, "acme/api", 42)
+        assert detail is not None
+        assert detail.log_excerpt == ""
+        assert detail.no_diagnostics_matched is False
 
     def test_log_fetch_failure_degrades_to_none_not_partial(self) -> None:
         """#3114's documented fail-soft contract: a throttled/rate-limited
