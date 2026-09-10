@@ -1195,6 +1195,17 @@ class IssueFacts:
     issue_synced_at: float | None = None
     merged: bool = False  # a work-like assignment with status == 'merged'
     active_work: bool = False  # a NON-terminal work-like assignment
+    # #3239: a work-like assignment with status == 'done' — completed
+    # successfully but not yet merged (still owed Test/Review/Merge). Unlike
+    # `merged`/`landed`, `True` here does NOT mean the issue is finished; it
+    # means a PRIOR attempt's dispatch definitely reached `coord assign` and
+    # ran the work to completion. See `_dispatch_produced_nothing`'s
+    # docstring for why that is exactly the fact its own timestamp
+    # comparison cannot see: a relaunch after a `done` leg dispatches no NEW
+    # assignment by design (there is nothing left to dispatch), which reads
+    # identically to a genuine pre-`coord assign` crash unless this is
+    # checked separately.
+    work_done: bool = False
     # #1891: this issue's CURRENT merge-queue entry is refused for nothing
     # stronger than "CI checks have not reported yet" — see
     # `build_board_view`'s population of this field for exactly which board
@@ -1388,6 +1399,11 @@ def build_board_view(
         status = row.get("status") or ""
         if status == "merged":
             entry["merged"] = True
+        if status == "done":
+            # #3239: at least one dispatch for this issue definitely reached
+            # `coord assign` and ran the work to completion — see
+            # `IssueFacts.work_done`'s docstring.
+            entry["work_done"] = True
         if status not in TERMINAL_STATUSES:
             entry["active_work"] = True
         # #2273: high-water mark of `dispatched_at`, regardless of `status` —
@@ -3428,6 +3444,44 @@ def add_preflight_notice(
     return "\n".join(lines)
 
 
+def _is_dispatch_only_failure(
+    entry: QueueEntry, facts: IssueFacts, own_reason: str | None
+) -> bool:
+    """The full "was this actually a dispatch failure" verdict (#3239) used
+    by `_reconcile_running`'s give-up/retry wording: did THIS relaunch's own
+    dispatch fail — as opposed to a later stage (merge) blocking, a
+    deliberate zero-commit decline (#2334), or a relaunch that correctly
+    dispatched nothing because a PRIOR attempt already ran the work to
+    completion (#3239)?
+
+    Deliberately NOT reused by `_retry_backoff_reason`'s narrower backoff-
+    widening check below — that check excludes only the #2424 merge-gate
+    and #3239 `work_done` shapes, not the #2334 empty-branch one. An
+    empty-branch death gets its own WIDENED retry-*count* budget
+    (`EMPTY_BRANCH_MAX_ATTEMPTS`) specifically because the failure mode can
+    need several attempts to clear, and (see
+    `test_the_real_death_cause_survives_multiple_backoff_ticks_2411`) that
+    same shape has always also gotten the widened *backoff* floor between
+    those attempts — a deliberate, tested pairing, not an oversight, so
+    folding this classifier's empty-branch exclusion into the backoff check
+    would change already-relied-upon spacing behaviour that no part of
+    #3239 asks to touch.
+
+    See `_dispatch_produced_nothing` for the base timestamp comparison this
+    starts from, and `_is_merge_gate_block_reason` /
+    `_is_empty_branch_death_reason` / `IssueFacts.work_done` for the three
+    positive-evidence exclusions layered on top of it — each names a shape
+    where the comparison reads exactly like a dispatch failure even though
+    real, evidenced work happened.
+    """
+    return (
+        _dispatch_produced_nothing(entry, facts)
+        and not _is_merge_gate_block_reason(own_reason)
+        and not _is_empty_branch_death_reason(own_reason)
+        and not facts.work_done
+    )
+
+
 def _retry_backoff_reason(
     entry: QueueEntry,
     facts: IssueFacts,
@@ -3478,21 +3532,23 @@ def _retry_backoff_reason(
 
     *own_reason* (#2424 follow-up): the same text the launch-side dispatch
     note is gated on (see the comment above `dispatch_only` in
-    `_reconcile_running`'s retry/exhausted branches). Passed through so the
-    widened `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` spacing below answers the
-    identical "was this actually a dispatch failure" question the launch-side
-    note already answers, rather than recomputing it from
-    `_dispatch_produced_nothing` alone — which, like the note before #2424,
-    cannot tell a genuine pre-`coord assign` crash from a merge-only relaunch
-    that dispatches no new assignment by design. Once `own_reason` already
-    names a merge-gate block (`_is_merge_gate_block_reason`), the widened
-    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` floor would be pure mispacing:
-    the rationale for widening it ("a transient dispatch failure cannot
-    spend the whole retry budget inside one tick cadence") does not apply
-    once the cause is known to be a merge-gate block, not a dispatch
-    failure. ``None`` (the default) degrades to the
-    pre-#2424-follow-up behaviour exactly, for callers that have not been
-    updated to pass it.
+    `_reconcile_running`'s retry/exhausted branches, and
+    `_is_dispatch_only_failure`'s docstring for exactly how this check's own
+    exclusions differ from that one). Passed through so the widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` spacing below answers the same
+    "was this actually a dispatch failure" question, for the same two
+    reasons `_reconcile_running`'s wording does: once `own_reason` already
+    names a merge-gate block (`_is_merge_gate_block_reason`), OR *facts*
+    shows a prior attempt's work already reached `status == "done"`
+    (`IssueFacts.work_done`, #3239), the widened floor would be pure
+    mispacing — the rationale for widening it ("a transient dispatch
+    failure cannot spend the whole retry budget inside one tick cadence")
+    does not apply once the cause is known to be something other than a
+    dispatch failure. Deliberately does NOT also exclude the #2334
+    empty-branch shape here — see `_is_dispatch_only_failure`'s docstring
+    for why that shape keeps the widened floor on purpose. ``None`` (the
+    default) degrades to the pre-#2424-follow-up behaviour exactly, for
+    callers that have not been updated to pass it.
     """
     if now is None or attempts <= 0 or retry_backoff_at is None:
         return ""
@@ -3501,8 +3557,10 @@ def _retry_backoff_reason(
         return ""
     idx = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
     backoff = RETRY_BACKOFF_SECONDS[idx]
-    if _dispatch_produced_nothing(entry, facts) and not _is_merge_gate_block_reason(
-        own_reason
+    if (
+        _dispatch_produced_nothing(entry, facts)
+        and not _is_merge_gate_block_reason(own_reason)
+        and not facts.work_done
     ):
         backoff = max(backoff, DISPATCH_FAILURE_MIN_BACKOFF_SECONDS)
     if age >= backoff:
@@ -4251,11 +4309,36 @@ def _reconcile_running(
     # itself pointing an operator at `coord retry`/`coord acceptance
     # author`, immediately followed by this note contradicting it with
     # "likely an infrastructure/dispatch-layer failure, not a code defect".
-    dispatch_only = (
-        _dispatch_produced_nothing(entry, facts)
-        and not _is_merge_gate_block_reason(own_reason)
-        and not _is_empty_branch_death_reason(own_reason)
-    )
+    #
+    # #3239: a FOURTH shape, the same class again — `facts.work_done` is
+    # `True` (some past dispatch for this issue reached `coord assign` and
+    # ran a work-like assignment to `status == "done"`). Unlike the three
+    # guards above, this one is NOT keyed off `own_reason` text at all: the
+    # live incident this closes (claude-coordinator#3226) died on
+    # `own_reason="deadline of 240m exceeded"` — a bare timeout with no
+    # reason text any of #2424/#2334/#2442's classifiers could ever match —
+    # while a `done`, pushed, unreviewed work row plainly sat on the board
+    # the entire time. `_dispatch_produced_nothing`'s
+    # `facts.last_dispatched_at < entry.launched_at` comparison cannot tell
+    # "this relaunch's own dispatch crashed" apart from "an EARLIER attempt
+    # already finished the work, so this relaunch correctly dispatched
+    # nothing more" — only a positive, independent witness (a `done` row
+    # existing at all) resolves that ambiguity, the same way `facts.merged`/
+    # `facts.landed` already resolve the analogous "already fully finished"
+    # case elsewhere in this function. Net effect: the note this produces
+    # must never send an operator toward `drive-queue remove && add` (which
+    # would discard a complete, reviewable implementation to re-run it from
+    # scratch) when the real, cheaper fix is running the Test/Review/Merge
+    # gates against the work that already exists — see
+    # `coord/drive.py`'s Work→Test advance for why that work can stall
+    # rather than reaching those gates on its own.
+    #
+    # All four guards now live in one place — `_is_dispatch_only_failure`
+    # (#3239) — so this wording can never drift from itself across future
+    # edits. `_retry_backoff_reason`'s narrower widened-backoff check
+    # answers a related but not identical question; see its own docstring
+    # for exactly how (and why) it diverges.
+    dispatch_only = _is_dispatch_only_failure(entry, facts, own_reason)
     if not dispatch_only:
         dispatch_note = ""
     elif own_reason:

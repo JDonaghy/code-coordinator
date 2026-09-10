@@ -1180,6 +1180,37 @@ def test_dispatch_smoke_dispatches_for_mock_author_type(
     assert result.review_of_assignment_id == "ma1"
 
 
+def test_dispatch_smoke_dispatches_for_epic_decompose_when_no_rule_matches(
+    gtk_and_server_config: Config,
+) -> None:
+    """claude-coordinator#3239/#3226: an `epic-decompose` completion is a
+    REAL implementation diff against ordinary source (the epic's first
+    slice — see `coord.models.CLOSES_ISSUE_TYPES`'s docstring), not a
+    sealed-path contract/fixture like mock-author/test-author. Before this
+    fix, `dispatch_smoke`'s capability-rule-miss branch read
+    `completed.type != "work"` and silently folded `epic-decompose` (added
+    to `WORK_LIKE_TYPES` by #3132, after that line was written) into the
+    SAME skip-on-miss bucket as mock-author/test-author — so a repo like
+    this one, where no `capability_rules` entry ever matches plain
+    `coord/**`-style source, never dispatched a Test-stage leg for an
+    epic-decompose completion at all. `test_state` then sat at `""`
+    forever: nothing downstream resolves it, so `coord drive` polled the
+    already-`done`, pushed, unreviewed work row for a full 240-minute
+    deadline (twice) before giving up. `epic-decompose` must dispatch here
+    exactly like `type="work"` already does."""
+    epic_decompose = replace(
+        _completed(), type="epic-decompose", assignment_id="ed1",
+    )
+    result = dispatch_smoke(
+        epic_decompose, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-ed"}),
+        diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+    assert result.review_of_assignment_id == "ed1"
+
+
 def test_dispatch_smoke_sends_to_capable_different_machine(
     gtk_and_server_config: Config,
 ) -> None:
