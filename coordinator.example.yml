@@ -317,6 +317,44 @@ pipeline:
   #   timeout_seconds: 30
   #   # claude_bin: claude      # override the `claude` binary path/name
 
+# reviews.repo_overrides: project-specific patterns layered onto the generic
+# review checklist (see this repo's own CLAUDE.md, "Review Prompt Assembly").
+# Each entry is a plain list of strings, keyed by repo NAME (validated
+# against `repos:` above — an unknown key is a config error at load time,
+# not a silent no-op).
+#
+# #3112: this SAME list is rendered into both the reviewer's prompt AND the
+# worker's own work briefing (`coord.review.repo_focus_lines`, shared by
+# `build_review_briefing` and `coord.dispatch.dispatch`'s work-briefing
+# chokepoint) — a worker is only ever graded on a rule it was shown up
+# front, never surprised by one at review time.
+#
+# #3235 (epic #3230 child 4): the terraform lane's JUDGMENT half. The
+# deterministic tflint/conftest/`terraform validate` policy gate (#3234,
+# coord/acceptance_drivers.py) already owns everything mechanically
+# checkable — pinned provider versions, no plaintext secrets, required
+# tags, no `local-exec`, no `prevent_destroy` removal. A rule that COULD be
+# a linter/OPA check belongs there, not duplicated here as reviewer prose —
+# these three are the calls a linter structurally can't make: they need the
+# issue's stated intent, a felt sense of proportion, and the diff's actual
+# effect on state, none of which a `.tf` file states about itself.
+reviews:
+  repo_overrides:
+    code-coordinator:
+      - "Does the diff match what the issue actually asked for? A resource
+        rename and a widened security-group range can both leave `terraform
+        validate`/tflint/conftest clean — only the issue's stated intent
+        distinguishes a passing diff from a wrong one."
+      - "Is the blast radius proportionate to the ask? A one-resource fix
+        that also touches unrelated modules, drops or widens a
+        `count`/`for_each`, or removes a `target`/scoping the issue implied
+        is a request-changes even when every policy check is green."
+      - "Is remote state handled correctly? If the diff touches backend
+        config (bucket/key/region), state locking, or workspace selection,
+        confirm that was the actual ask, not an accidental side effect of
+        an unrelated resource edit — and that nothing in the diff could
+        orphan or double-manage existing state."
+
 concurrency:
   max_workers: 2          # max simultaneous claude -p sessions across all machines
   stagger_seconds: 30     # delay between starting workers
