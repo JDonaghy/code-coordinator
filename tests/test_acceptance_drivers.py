@@ -62,6 +62,7 @@ project; nothing here depends on a live worktree or a real browser install.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -72,8 +73,10 @@ from coord.acceptance_drivers import (
     DriverError,
     FIXTURE_SERVER_DEPENDENT_KINDS,
     SUPPORTED_KINDS,
+    VALIDATE_ONLY_KINDS,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
+    parse_terraform_validate_json,
     parse_test_output,
     render_run_command,
     run_driver,
@@ -718,3 +721,245 @@ class TestZeroTestPlaywrightRunIsAFailureNotAPass:
         run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
         with pytest.raises(DriverError, match="top-level error"):
             run_driver("web-playwright", run_command, cwd=str(tmp_path))
+
+
+class TestValidateOnlyKinds:
+    """#3232: `coord.repo_onboard`'s oracle-readiness layer reads this set to
+    flag a driver that produces a real, deterministic verdict but is
+    intrinsically scoped to a compile/syntax check, not a full oracle —
+    distinct from `FIXTURE_SERVER_DEPENDENT_KINDS`'s "missing shared
+    dependency" gap."""
+
+    def test_terraform_is_validate_only(self) -> None:
+        assert "terraform" in VALIDATE_ONLY_KINDS
+
+    def test_only_kinds_this_module_actually_supports_are_listed(self) -> None:
+        # Mirrors TestFixtureServerDependentKinds's equivalent check — a kind
+        # declared here but not in SUPPORTED_KINDS would be an unreachable
+        # warning.
+        assert VALIDATE_ONLY_KINDS <= set(SUPPORTED_KINDS)
+
+    def test_other_kinds_are_not_flagged(self) -> None:
+        assert "tui-tuidriver" not in VALIDATE_ONLY_KINDS
+        assert "cli-pytest" not in VALIDATE_ONLY_KINDS
+        assert "web-playwright" not in VALIDATE_ONLY_KINDS
+
+    def test_disjoint_from_fixture_server_dependent_kinds(self) -> None:
+        # Two distinct questions -- a missing *shared* dependency (the
+        # fixture server) vs. an adapter *intrinsically* narrower in scope
+        # -- so no kind should ever answer both at once.
+        assert not (VALIDATE_ONLY_KINDS & FIXTURE_SERVER_DEPENDENT_KINDS)
+
+
+def _fake_terraform(*, init_exit: int = 0, validate_json: str = "", validate_exit: int = 0) -> str:
+    """A shell function standing in for the real ``terraform`` binary (not
+    installed in this test environment — same trick
+    ``TestRunDriverWebPlaywright``'s ``pw()`` fake uses for ``npx
+    playwright``). Only understands ``init``/``validate``; ``validate`` only
+    ever prints *validate_json* when invoked with ``-json`` as its second
+    arg, so a test using this fails loudly if ``_run_terraform`` ever stops
+    forcing that flag onto the trailing ``terraform validate``.
+
+    Uses ``return``, not ``exit``, inside the function body — ``exit``
+    inside a shell function terminates the whole script/subshell, not just
+    that call, which would make ``terraform init && terraform validate``
+    stop at ``init`` regardless of its exit code and never reach
+    ``validate`` at all.
+    """
+    return (
+        "terraform() { "
+        f'if [ "$1" = init ]; then return {init_exit}; '
+        'elif [ "$1" = validate ]; then '
+        'if [ "$2" = -json ]; then '
+        f"echo {shlex.quote(validate_json)}; return {validate_exit}; "
+        "else return 9; fi; "
+        "fi; }; "
+        "terraform init -backend=false && terraform validate"
+    )
+
+
+class TestRunDriverTerraform:
+    """#3232: `terraform init -backend=false` + `terraform validate` only —
+    no credentials, no state backend, no `terraform plan`. Runnable on any
+    machine with the `terraform` binary, which this test environment does
+    not have — so, like TestRunDriverWebPlaywright, these fake the binary
+    with a shell function rather than skipping the coverage entirely."""
+
+    def test_supported_kinds_tuple_has_terraform(self) -> None:
+        assert "terraform" in SUPPORTED_KINDS
+
+    def test_appends_json_flag_and_parses_clean_pass(self, tmp_path) -> None:
+        # If `_run_terraform` ever stopped appending `-json`, the fake's
+        # `$2 != -json` branch would `exit 9` with empty stdout instead —
+        # this test fails loudly rather than silently accepting either.
+        validate_json = json.dumps(
+            {"valid": True, "error_count": 0, "warning_count": 0, "diagnostics": []}
+        )
+        run_command = _fake_terraform(validate_json=validate_json)
+        result = run_driver("terraform", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 0
+        assert result.ok is True
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+        ]
+
+    def test_reports_fail_entry_per_error_diagnostic(self, tmp_path) -> None:
+        validate_json = json.dumps({
+            "valid": False, "error_count": 1, "warning_count": 0,
+            "diagnostics": [{
+                "severity": "error",
+                "summary": "Unsupported argument",
+                "detail": 'An argument named "foo" is not expected here.',
+                "range": {"filename": "main.tf"},
+            }],
+        })
+        run_command = _fake_terraform(validate_json=validate_json, validate_exit=1)
+        result = run_driver("terraform", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 1
+        assert result.ok is False
+        assert result.tests == [{
+            "id": "main.tf: Unsupported argument",
+            "status": "fail",
+            "message": 'An argument named "foo" is not expected here.',
+        }]
+
+    def test_warnings_do_not_fail_validation_or_produce_their_own_entries(
+        self, tmp_path
+    ) -> None:
+        validate_json = json.dumps({
+            "valid": True, "error_count": 0, "warning_count": 2,
+            "diagnostics": [
+                {"severity": "warning", "summary": "deprecated attribute", "detail": "..."},
+            ],
+        })
+        run_command = _fake_terraform(validate_json=validate_json)
+        result = run_driver("terraform", run_command, cwd=str(tmp_path))
+        assert result.tests == [
+            {"id": "terraform validate", "status": "pass", "message": "2 warning(s)"},
+        ]
+
+    def test_init_failure_short_circuits_validate(self, tmp_path) -> None:
+        # A provider version constraint that can't resolve fails at `init`,
+        # before `validate` ever runs — the shell `&&` must never call
+        # `validate` in that case, and this driver must report it as a real
+        # failure rather than an empty "0 tests found".
+        marker = tmp_path / "validate-ran"
+        run_command = (
+            "terraform() { "
+            'if [ "$1" = init ]; then return 1; '
+            f'elif [ "$1" = validate ]; then touch {marker}; return 0; '
+            "fi; }; "
+            "terraform init -backend=false && terraform validate"
+        )
+        result = run_driver("terraform", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 1
+        assert not marker.exists()
+        assert len(result.tests) == 1
+        assert result.tests[0]["status"] == "fail"
+        assert result.tests[0]["id"] == "terraform init"
+
+    def test_timeout_raises_driver_error(self, tmp_path) -> None:
+        # Trailing "#" comments out coord's own appended `-json` (mirrors
+        # TestRunDriverWebPlaywright.test_timeout_raises_driver_error's
+        # `sleep 5 #` — an un-commented `-json` arg would make `sleep`
+        # itself error out instantly instead of actually sleeping).
+        with pytest.raises(DriverError, match="timed out"):
+            run_driver("terraform", "sleep 5 #", cwd=str(tmp_path), timeout=1)
+
+    def test_never_runs_terraform_plan(self, tmp_path) -> None:
+        # #3232 scope guard: this v1 slice must never invoke `plan` (needs
+        # provider credentials -- #3230 child 2). A fake that only responds
+        # to init/validate and `return 9`s on anything else proves `plan` is
+        # never attempted, since an attempt would surface as that exit code.
+        validate_json = json.dumps(
+            {"valid": True, "error_count": 0, "warning_count": 0, "diagnostics": []}
+        )
+        run_command = (
+            "terraform() { "
+            'if [ "$1" = init ]; then return 0; '
+            'elif [ "$1" = validate ] && [ "$2" = -json ]; then '
+            f"echo {shlex.quote(validate_json)}; return 0; "
+            "else return 9; fi; "
+            "}; terraform init -backend=false && terraform validate"
+        )
+        result = run_driver("terraform", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 0
+        assert result.tests[0]["status"] == "pass"
+
+
+class TestParseTerraformValidateJson:
+    def test_clean_pass_no_warnings(self) -> None:
+        stdout = json.dumps(
+            {"valid": True, "error_count": 0, "warning_count": 0, "diagnostics": []}
+        )
+        assert parse_terraform_validate_json(stdout) == [
+            {"id": "terraform validate", "status": "pass", "message": ""},
+        ]
+
+    def test_clean_pass_notes_warning_count(self) -> None:
+        stdout = json.dumps({
+            "valid": True, "error_count": 0, "warning_count": 3,
+            "diagnostics": [{"severity": "warning", "summary": "x", "detail": "y"}],
+        })
+        tests = parse_terraform_validate_json(stdout)
+        assert tests == [
+            {"id": "terraform validate", "status": "pass", "message": "3 warning(s)"},
+        ]
+
+    def test_single_error_diagnostic_id_prefixed_with_filename(self) -> None:
+        stdout = json.dumps({
+            "valid": False, "error_count": 1, "warning_count": 0,
+            "diagnostics": [{
+                "severity": "error", "summary": "Missing required argument",
+                "detail": "The argument \"ami\" is required.",
+                "range": {"filename": "main.tf"},
+            }],
+        })
+        tests = parse_terraform_validate_json(stdout)
+        assert tests == [{
+            "id": "main.tf: Missing required argument",
+            "status": "fail",
+            "message": 'The argument "ami" is required.',
+        }]
+
+    def test_multiple_error_diagnostics_each_become_an_entry(self) -> None:
+        stdout = json.dumps({
+            "valid": False, "error_count": 2, "warning_count": 0,
+            "diagnostics": [
+                {"severity": "error", "summary": "bad a", "detail": "detail a",
+                 "range": {"filename": "a.tf"}},
+                {"severity": "error", "summary": "bad b", "detail": "detail b",
+                 "range": {"filename": "b.tf"}},
+            ],
+        })
+        tests = parse_terraform_validate_json(stdout)
+        assert [t["id"] for t in tests] == ["a.tf: bad a", "b.tf: bad b"]
+        assert all(t["status"] == "fail" for t in tests)
+
+    def test_invalid_with_no_parseable_diagnostics_still_fails(self) -> None:
+        # `"valid": false` must never silently fall through to an empty
+        # list -- build_verdict would read that as "nothing to check"
+        # rather than "invalid".
+        stdout = json.dumps({"valid": False, "error_count": 1, "warning_count": 0, "diagnostics": []})
+        tests = parse_terraform_validate_json(stdout)
+        assert len(tests) == 1
+        assert tests[0]["status"] == "fail"
+
+    def test_empty_stdout_reports_terraform_init_failure(self) -> None:
+        tests = parse_terraform_validate_json("", exit_code=1, stderr="Error: no terraform binary\nboom")
+        assert len(tests) == 1
+        assert tests[0]["id"] == "terraform init"
+        assert tests[0]["status"] == "fail"
+        assert "no terraform binary" in tests[0]["message"]
+        assert "exit 1" in tests[0]["message"]
+
+    def test_non_json_stdout_reports_terraform_validate_failure(self) -> None:
+        tests = parse_terraform_validate_json("not json at all", exit_code=1)
+        assert len(tests) == 1
+        assert tests[0]["id"] == "terraform validate"
+        assert tests[0]["status"] == "fail"
+
+    def test_missing_valid_key_treated_as_unrecognized(self) -> None:
+        tests = parse_terraform_validate_json(json.dumps({"foo": "bar"}))
+        assert len(tests) == 1
+        assert tests[0]["status"] == "fail"

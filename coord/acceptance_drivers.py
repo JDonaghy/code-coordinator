@@ -3,15 +3,16 @@ docs/ORACLE_LOOP.md).
 
 ``coord acceptance`` is a thin, framework-agnostic orchestrator; this module
 is the one seam that varies per medium — TUI (quadraui ``TuiDriver``), CLI
-(pytest), web (Playwright), native, etc. Each driver knows how to *run* a
-repo's declared acceptance suite and *parse* its raw output into a
+(pytest), web (Playwright), Terraform, native, etc. Each driver knows how to
+*run* a repo's declared acceptance suite and *parse* its raw output into a
 normalized list of ``{"id": str, "status": "pass"|"fail"|"skip", "message":
 str}`` dicts (``cli-pytest`` additionally carries ``"expected"``/``"got"``
 on a failing test — see :func:`parse_pytest_junit_xml`). ``tui-tuidriver``,
-``cli-pytest`` (#1125), and ``web-playwright`` (#1539) are implemented;
-other ``kind`` values are declared in ``coordinator.yml`` (see
-:class:`coord.config.AcceptanceConfig`) but rejected here with a clear "not
-yet implemented" error until their issues land (native).
+``cli-pytest`` (#1125), ``web-playwright`` (#1539), and ``terraform``
+(#3232) are implemented; other ``kind`` values are declared in
+``coordinator.yml`` (see :class:`coord.config.AcceptanceConfig`) but
+rejected here with a clear "not yet implemented" error until their issues
+land (native).
 
 ``cli-pytest`` parses pytest's built-in ``--junit-xml`` report (a core
 pytest flag, not a plugin — no extra dependency required in the driven
@@ -31,6 +32,18 @@ command (#1733, ``AcceptanceDriverConfig.setup``) once before its suite —
 e.g. ``npm ci`` for ``web-playwright``, which otherwise fails with a bare
 ``exit 127`` (playwright not found) the first time it runs against ``coord
 acceptance record``'s throwaway, dependency-less worktree.
+
+``terraform`` (#3232, epic #3230's "no cloud account, no credentials, no new
+machine capability" v1 slice) runs *exactly* ``terraform init
+-backend=false`` then ``terraform validate`` — no state backend, no
+provider auth, no ``terraform plan``. It forces terraform validate's own
+built-in ``-json`` structured-diagnostics report the same way
+``_run_cli_pytest``/``_run_web_playwright`` force ``--junit-xml``/
+``--reporter=json``, so a normalized ``tests`` list (one entry per
+diagnostic, or a single failing entry when ``init`` itself never gets far
+enough to run ``validate`` at all) comes out regardless of what the driven
+repo's own terraform version prints to plain stdout. This is a compile
+check, not an acceptance oracle — see :data:`VALIDATE_ONLY_KINDS`.
 """
 
 from __future__ import annotations
@@ -47,7 +60,7 @@ from pathlib import Path
 # Driver kinds this module knows how to run. Keep in sync with the adapters
 # implemented below — a kind can be *declared* in coordinator.yml ahead of its
 # adapter landing, but running it must fail loudly rather than silently no-op.
-SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
+SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright", "terraform")
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
 # but NOT yet a deterministic one, because an input they depend on hasn't
@@ -62,6 +75,22 @@ SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
 # because it is exactly the kind of "which medium behaves how" fact this
 # module already owns — see the module docstring.
 FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
+
+# #3232: driver kinds whose adapter produces a real, deterministic pass/fail
+# verdict — this is NOT "not yet implemented", `run_driver` runs it for real
+# — but one that is intentionally scoped narrower than a full acceptance
+# oracle by design, not by a missing shared dependency. `terraform` runs
+# `init -backend=false` + `validate` only: a compile check that proves the
+# config parses and providers resolve syntactically, not that the
+# infrastructure does what was asked (no `terraform plan`, no credentials,
+# no apply — epic #3230's later children). Distinct from
+# FIXTURE_SERVER_DEPENDENT_KINDS above — that gap closes once a *shared*
+# dependency (the fixture server, #1538) ships; this one closes only when a
+# *later child issue* widens what this adapter itself runs.
+# `coord.repo_onboard`'s oracle-readiness layer reads this the same way it
+# reads FIXTURE_SERVER_DEPENDENT_KINDS, so a driver-present repo doesn't
+# silently read as fully oracle-ready.
+VALIDATE_ONLY_KINDS = frozenset({"terraform"})
 
 # libtest's ``--format json`` per-line test-event stream (`cargo test -- -Z
 # unstable-options --format json`) event -> our normalized status.
@@ -177,6 +206,8 @@ def run_driver(
         return _run_cli_pytest(run_command, cwd, timeout=timeout)
     if kind == "web-playwright":
         return _run_web_playwright(run_command, cwd, timeout=timeout)
+    if kind == "terraform":
+        return _run_terraform(run_command, cwd, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
 
 
@@ -334,6 +365,54 @@ def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverRe
             tests=tests,
             raw_output=(proc.stdout or "") + (proc.stderr or ""),
         )
+
+
+def _run_terraform(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+    """The ``terraform`` shape (#3232): *run_command* is this driver's
+    contract fixed to exactly ``terraform init -backend=false && terraform
+    validate`` (no state backend, no provider credentials, no ``terraform
+    plan`` — epic #3230's v1 slice). Forces terraform validate's own
+    built-in ``-json`` structured-diagnostics report by appending ``-json``
+    to *run_command* — the terraform-native analogue of
+    :func:`_run_cli_pytest`'s ``--junit-xml``/:func:`_run_web_playwright`'s
+    ``--reporter=json`` — so a normalized verdict comes out regardless of
+    what a bare ``terraform validate`` would otherwise print to stdout.
+    Since ``&&`` chains ``init`` before ``validate``, the appended flag
+    always lands on the trailing ``validate`` invocation.
+
+    An ``init`` that never gets far enough to run ``validate`` at all (an
+    unresolvable provider version constraint, a missing ``terraform``
+    binary on this machine — the one thing this v1 slice requires be
+    installed, see the module docstring) leaves stdout with no parseable
+    JSON; :func:`parse_terraform_validate_json` turns that into a single
+    explicit failing entry rather than a silent empty list, so a broken
+    ``init`` is never confused with "0 tests, nothing to report".
+    """
+    full_command = f"{run_command} -json"
+    try:
+        proc = subprocess.run(
+            full_command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DriverError(
+            f"acceptance run command timed out after {timeout}s: {full_command!r}"
+        ) from e
+    except OSError as e:
+        raise DriverError(f"acceptance run command failed to start: {e}") from e
+
+    tests = parse_terraform_validate_json(
+        proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+    )
+    return DriverResult(
+        exit_code=proc.returncode,
+        tests=tests,
+        raw_output=(proc.stdout or "") + (proc.stderr or ""),
+    )
 
 
 def parse_test_output(output: str) -> list[dict]:
@@ -633,6 +712,96 @@ def _playwright_skip_reason(annotations: list) -> str:
         if isinstance(a, dict) and a.get("type") in ("skip", "fixme") and a.get("description"):
             return str(a["description"])
     return ""
+
+
+def parse_terraform_validate_json(
+    stdout: str, *, exit_code: int = 0, stderr: str = "",
+) -> list[dict]:
+    """Parse ``terraform validate -json``'s built-in structured-diagnostics
+    report (a core terraform flag, not a plugin) into normalized ``{"id",
+    "status", "message"}`` dicts — the same shape :func:`parse_test_output`
+    and :func:`parse_pytest_junit_xml` already produce, so
+    :func:`coord.acceptance.build_verdict` works unchanged regardless of
+    which driver kind produced the verdicts.
+
+    The report is a single JSON object: ``{"valid": bool, "error_count":
+    int, "warning_count": int, "diagnostics": [{"severity": "error"|
+    "warning", "summary": str, "detail": str, "range": {"filename": str,
+    ...}}, ...]}``. One entry per ``"error"``-severity diagnostic
+    (``status="fail"``, ``id`` prefixed with the offending file when the
+    report carries a ``range``); a clean ``"valid": true`` run collapses to
+    one ``status="pass"`` entry (noting any warnings in its message, since
+    those don't block validity). Warnings are not surfaced as their own
+    entries — they don't fail ``terraform validate`` and this v1 slice's
+    verdict is a pass/fail gate, not a lint report (#3230 child 3 is the
+    dedicated lint/policy gate).
+
+    Never returns ``[]`` on a crash — a *``terraform init``* that never got
+    far enough for ``validate`` to run at all (missing binary, unresolvable
+    provider constraint, no network for an uncached provider) leaves
+    *stdout* empty or non-JSON; that surfaces as a single explicit failing
+    ``"terraform init"`` entry (with ``stderr``'s tail as the reason) rather
+    than a silent "0 tests found" that a `-backend=false`-only smoke net
+    could otherwise be mistaken for. This mirrors
+    :func:`parse_playwright_json_report`'s "a crashed run must surface as a
+    failure, never as an empty pass list" rule — the shape a bare
+    ``build_verdict`` (``green = failed == 0 and len(tests) > 0``) would
+    otherwise treat identically to "legitimately nothing to check".
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "terraform init",
+            "status": "fail",
+            "message": (
+                f"terraform init/validate produced no output (exit "
+                f"{exit_code}): {tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, dict) or "valid" not in report:
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "terraform validate",
+            "status": "fail",
+            "message": f"unrecognized `terraform validate -json` output: {tail}",
+        }]
+
+    diagnostics = report.get("diagnostics") or []
+    errors = [
+        d for d in diagnostics
+        if isinstance(d, dict) and d.get("severity") == "error"
+    ]
+
+    if report.get("valid") and not errors:
+        warning_count = report.get("warning_count", 0) or 0
+        message = f"{warning_count} warning(s)" if warning_count else ""
+        return [{"id": "terraform validate", "status": "pass", "message": message}]
+
+    tests = []
+    for d in errors:
+        summary = str(d.get("summary", "") or "")
+        detail = str(d.get("detail", "") or "")
+        rng = d.get("range") if isinstance(d.get("range"), dict) else {}
+        filename = str(rng.get("filename", "")) if rng else ""
+        node_id = f"{filename}: {summary}" if filename and summary else (
+            summary or filename or f"terraform validate diagnostic {len(tests)}"
+        )
+        tests.append({"id": node_id, "status": "fail", "message": detail or summary})
+
+    if not tests:
+        # `"valid": false` with no parseable error-severity diagnostic —
+        # still a real failure, so report it rather than falling through to
+        # an empty list that `build_verdict` would read as "nothing to
+        # check" instead of "invalid".
+        tests.append({
+            "id": "terraform validate",
+            "status": "fail",
+            "message": "terraform validate reported invalid with no parseable diagnostics",
+        })
+    return tests
 
 
 def _strip_ansi(text: str) -> str:
