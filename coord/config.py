@@ -272,7 +272,10 @@ class SmokeRule:
     `gh pr view --json files`. A trailing `/` makes the prefix explicit; bare
     paths match if the touched path starts with the rule path (so `src/gtk`
     catches `src/gtk/foo.c` and `src/gtk_helpers.c`). Use `src/gtk/` to scope
-    strictly to the directory.
+    strictly to the directory. A `"*.ext"` pattern (#3233) is a suffix
+    wildcard instead — matches by file extension at any depth (`"*.tf"`
+    catches both `main.tf` and `infra/net/main.tf`) — for files that, unlike
+    GTK/browser sources, aren't confined to one directory tree.
 
     `command` (#3056) is an optional override of the Test-stage command for
     a diff this rule matches — routing to the one machine with a capability

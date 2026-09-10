@@ -26,6 +26,7 @@ A prereq's `min_version` is `None` until a floor has actually been confirmed
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -374,6 +375,84 @@ def _probe_windows_msvc_target(prereq: Prereq, timeout: float) -> ToolProbe:
     )
 
 
+# --- `azure` capability: credential availability, not just the CLI (#3233) --
+#
+# #3230 (epic: infrastructure-as-code as a work target) v1 targets Azure
+# only — the fleet already holds an Azure subscription (Key Vault + the
+# restic backup storage account). This backs the `capability_rules` route
+# for `**/*.tf` (the `terraform` driver kind, #3230 child 1) so the Test
+# stage has somewhere to send `.tf` diffs. Deliberately does NOT probe
+# `terraform` itself or attempt `terraform plan` — that's explicitly out of
+# scope for this child (credential *availability*, not driving a plan).
+#
+# The #1678 lesson this exists to not repeat: `browser` sat UNMET for
+# months with `dispatch_smoke` silently refusing to route and nothing ever
+# saying so. So this must fail LOUDLY and visibly in `coord doctor` (via
+# `unmet_capabilities`, same as every other capability here) whenever
+# credentials are absent OR expired — a bare `az --version` probe would
+# report the capability met on a box where `az` is installed but nobody
+# has ever run `az login` (or the cached login has since expired), which is
+# a false green worse than no probe at all.
+#
+# `az account show` is the cheapest call that fails closed on both cases:
+# it requires a cached login to answer at all, and its automatic token
+# refresh only succeeds while the cached refresh token is itself still
+# valid — an expired one surfaces as a nonzero exit here exactly as loudly
+# as a missing one, no separate expiry-math needed.
+def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `azure` capability (#3233).
+
+    Two independent ways this can be unmet: the `az` CLI missing from PATH
+    at all, or present but with no valid (unexpired) cached login. Never
+    raises — degrades to `found=False` with a `what_breaks` naming which of
+    the two failed, same contract as every other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=f"az CLI not found on PATH — {prereq.what_breaks}",
+        )
+    try:
+        result = subprocess.run(
+            [prereq.binary, "account", "show", "--output", "json"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"`az account show` hung or could not run — {prereq.what_breaks}"
+            ),
+        )
+    if result.returncode != 0:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                "`az account show` failed — credentials absent or expired, "
+                f"run `az login` on this machine ({prereq.what_breaks})"
+            ),
+        )
+    # Best-effort: name the active subscription so `coord doctor` shows
+    # WHICH account is live, not just that credentials are present. Never a
+    # reason to report found=False — an unparsable response still proves
+    # `az account show` succeeded, which is the whole signal.
+    subscription: str | None = None
+    try:
+        payload = json.loads(result.stdout or "{}")
+        if isinstance(payload, dict):
+            subscription = payload.get("name") or payload.get("id")
+    except ValueError:
+        pass
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=subscription, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -500,6 +579,19 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "toolchain (#2952)"
         ),
         custom_probe=_probe_windows_msvc_target,
+    ),
+    # #3233: backs the `azure` capability routing `**/*.tf` (terraform
+    # driver, #3230 child 1). See the module comment above
+    # `_probe_azure_credentials` for why this cannot be a plain
+    # `az --version` binary probe.
+    Prereq(
+        tool="az", binary="az", version_args=(), version_re="",
+        min_version=None, capability="azure",
+        what_breaks=(
+            "terraform-lane (.tf) work routed to this machine cannot "
+            "authenticate against Azure"
+        ),
+        custom_probe=_probe_azure_credentials,
     ),
 )
 

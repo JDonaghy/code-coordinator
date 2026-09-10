@@ -127,6 +127,28 @@ def test_match_rules_no_trailing_slash_matches_files_too() -> None:
     assert match_rules(["src/gtk_helpers.c"], rules) == ["gtk"]
 
 
+def test_match_rules_suffix_wildcard_matches_at_any_depth() -> None:
+    """#3233: `*.tf` is a suffix wildcard, not a directory prefix — terraform
+    files aren't confined to one directory tree the way GTK/browser sources
+    are, so a root-level and a deeply-nested `.tf` file must both match."""
+    rules = [SmokeRule(files=["*.tf"], requires=["azure"])]
+    caps = match_rules(["main.tf", "infra/network/subnet.tf"], rules)
+    assert caps == ["azure"]
+
+
+def test_match_rules_suffix_wildcard_does_not_match_other_extensions() -> None:
+    rules = [SmokeRule(files=["*.tf"], requires=["azure"])]
+    assert match_rules(["main.tfvars", "src/cli.py"], rules) == []
+
+
+def test_match_rules_bare_star_is_never_a_suffix_wildcard() -> None:
+    """A pattern of exactly `"*"` isn't treated specially — `pattern[1:]`
+    would be empty and match everything, which is never what an explicit
+    rule author meant."""
+    rules = [SmokeRule(files=["*"], requires=["azure"])]
+    assert match_rules(["anything.py"], rules) == []
+
+
 # ── Partitioning (#3177) ─────────────────────────────────────────────────────
 #
 # The quadraui shape from the issue: `precision` has gtk, `dell64` has
@@ -291,6 +313,20 @@ def test_resolve_rule_command_first_declared_match_wins() -> None:
     resolved2 = resolve_rule_command(touched, rules_reordered)
     assert resolved2 is not None
     assert resolved2.command == "cargo xwin test"
+
+
+def test_resolve_rule_command_honours_the_suffix_wildcard_too() -> None:
+    """#3233: `resolve_rule_command` used to re-derive its own prefix-only
+    match instead of calling `_rule_matches` — a second implementation of
+    the same "does this rule apply" question (#2096's split-brain shape).
+    Now that they share one function, a `*.tf` rule with a `command`
+    override must route through here exactly like `match_rules` does."""
+    rules = [
+        SmokeRule(files=["*.tf"], requires=["azure"], command="terraform validate"),
+    ]
+    resolved = resolve_rule_command(["infra/network/subnet.tf"], rules)
+    assert resolved is not None
+    assert resolved.command == "terraform validate"
 
 
 def test_resolve_rule_command_skips_a_matching_rule_with_no_command() -> None:

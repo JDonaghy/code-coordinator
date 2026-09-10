@@ -187,10 +187,15 @@ machines:
       quadraui: ~/src/quadraui
       code-coordinator: ~/src/claude-coordinator
 
-  # Azure VM — lightweight, small tasks only (needs Claude CLI setup)
+  # Azure VM — lightweight, small tasks only (needs Claude CLI setup).
+  # #3233: this box already carries an `az login` for the fleet's own Azure
+  # subscription (Key Vault + the restic backup storage account), so it's
+  # the natural place to declare the `azure` capability that routes
+  # terraform-lane (`**/*.tf`) work below — see the `capability_rules` entry
+  # and `coord/prereqs.py`'s `_probe_azure_credentials` for what backs it.
   - name: azure-vm
     host: vm-acme-dev-platform
-    capabilities: [python]
+    capabilities: [python, azure]
     repos: [code-coordinator]
     repo_paths:
       code-coordinator: ~/src/claude-coordinator
@@ -268,6 +273,17 @@ smoke_tests:
   capability_rules:
     - files: [Cargo.toml, Cargo.lock, src/app/]
       requires: [rust]
+    # #3233 (epic #3230 child 2): route the terraform lane's `.tf` diffs to
+    # a machine that actually holds Azure credentials — `azure-vm` above —
+    # instead of any capable-for-repo machine at random. `"*.tf"` is a
+    # suffix wildcard (coord.smoke._pattern_matches, #3233) matching at any
+    # depth, not a directory prefix — terraform files aren't confined to
+    # one directory tree the way GTK/browser sources are. A rule only ever
+    # NARROWS the candidate set (#1426: a miss falls back to "any capable
+    # machine", never "skip"), so this is safe even before every repo that
+    # might carry `.tf` files declares one.
+    - files: ["*.tf"]
+      requires: [azure]
     # Worked example for a browser-driven suite in ANOTHER repo — the shape
     # `coord-web` needs now that the webapp is its own repo (#2009). Note the
     # same path-prefix caveat: `src/` here would also match coord-tui.
