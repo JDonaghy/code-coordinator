@@ -961,6 +961,56 @@ def effective_max_fix_rounds(
     return DEFAULT_TICK_MAX_FIX_ROUNDS
 
 
+def total_fix_round_budget(entry: QueueEntry, config_default: int | None) -> int:
+    """#2972: the TOTAL work legs *entry* is allowed across its whole life —
+    one unconditional initial work leg plus :func:`effective_max_fix_rounds`
+    fix rounds — regardless of how many times its drive session has died and
+    been relaunched.
+
+    This is the number the bug report's evidence table is measured against:
+    "one drive should yield at most work + 2 fixes = 3 legs". Kept as its own
+    tiny function (rather than inlining ``+ 1`` at each call site) so
+    :func:`remaining_fix_rounds` and :func:`_reconcile_running`'s ceiling
+    check are provably reading the SAME number — see this module's "one
+    question, one answer" posture elsewhere (`effective_max_fix_rounds`
+    itself is the sole resolver of the per-drive figure this builds on).
+    """
+    return effective_max_fix_rounds(entry, config_default) + 1
+
+
+def remaining_fix_rounds(
+    entry: QueueEntry, facts: IssueFacts, config_default: int | None
+) -> int:
+    """#2972: fix rounds still available to *entry* — the budget a relaunch
+    resumes rather than restarts.
+
+    ``facts.work_leg_count`` is every work-like assignment `build_board_view`
+    has EVER seen for this issue, across every drive session this entry has
+    had — not just the one that just died. Subtracting the one unconditional
+    initial work leg turns that into "fix rounds already spent"; subtracting
+    THAT from :func:`effective_max_fix_rounds`'s plain per-drive allowance
+    (NOT :func:`total_fix_round_budget` — that figure already has the
+    initial work leg folded in, and folding it in a second time here would
+    hand a brand-new entry, with zero legs spent, a budget one round wider
+    than `coord drive`'s own interactive default ever allows) is what makes
+    a second (or third, or fourth) relaunch get a SMALLER budget than the
+    first, instead of the same fresh one every time — the exact defect
+    quadraui#625 reported: four work legs dispatched against a
+    ``pipeline.max_fix_rounds`` of 2 (budget 3), because each relaunch's
+    ``coord drive --max-fix-rounds`` was computed from `entry` alone, blind
+    to what prior sessions had already spent. A fresh entry (``work_leg_count
+    == 0``) reads back exactly :func:`effective_max_fix_rounds` — unchanged
+    from every pre-#2972 launch.
+
+    Never negative — an entry that has already met or exceeded
+    :func:`total_fix_round_budget` reads ``0`` (no more fix rounds), the
+    signal `_reconcile_running` uses to stop relaunching altogether rather
+    than pass a session a budget it cannot spend down further.
+    """
+    fix_rounds_spent = max(facts.work_leg_count - 1, 0)
+    return max(effective_max_fix_rounds(entry, config_default) - fix_rounds_spent, 0)
+
+
 # ── aggregate summary (#2428 DQW-1) ───────────────────────────────────────────
 #
 # Ported field-for-field from `tui/src/app/drive_queue.rs`'s
@@ -1201,6 +1251,23 @@ class IssueFacts:
     # assignment carrying a `dispatched_at` at all (never dispatched, or
     # every row predates that column).
     last_dispatched_at: float | None = None
+    # #2972: total WORK_LIKE assignment count for this issue, ALL TIME —
+    # across EVERY drive session a relaunched entry has had, not just the one
+    # that just died. Sourced from #3060's `coord.state.leg_counts()` (see
+    # `build_board_view`'s *leg_counts* parameter), the SAME all-time,
+    # archive-spanning count `compute_leg_counts` already builds — not a
+    # fresh count of this function's own kept so there is exactly one
+    # implementation of "how many legs has this issue had" for a caller to
+    # get wrong twice. This is what lets `remaining_fix_rounds` cap an
+    # entry's TOTAL work legs: the bug this closes is that a relaunch after
+    # "session gone, work still active on the board" used to get a FRESH
+    # `--max-fix-rounds` budget every time, so `pipeline.max_fix_rounds`
+    # capped a single drive's fix rounds but never the entry's total —
+    # quadraui#625 ran 4 work legs against a budget of 3. `0` when
+    # *leg_counts* is omitted (every pre-#2972 caller) or names nothing for
+    # this issue (never dispatched) — reads as "budget untouched", never as a
+    # false ceiling trip.
+    work_leg_count: int = 0
 
     @property
     def open(self) -> bool:
@@ -1262,6 +1329,7 @@ class BoardView:
 def build_board_view(
     payload: Mapping[str, Any],
     live_sessions: Iterable[Mapping[str, Any] | str] = (),
+    leg_counts: Mapping[str, Mapping[str, int]] | None = None,
 ) -> BoardView:
     """Reduce a ``/board`` payload + ``drive-sessions --json`` to a :class:`BoardView`.
 
@@ -1269,6 +1337,18 @@ def build_board_view(
     returned and *live_sessions* is whatever ``coord.drive.list_drive_sessions()``
     returned (dicts with ``repo``/``issue``), or a plain iterable of
     ``"repo#N"`` keys for tests.
+
+    *leg_counts* (#3060/#2972) is whatever ``coord.state.leg_counts()``
+    returned — the ALL-TIME, ``assignments`` + ``assignments_archive``-
+    spanning ``"repo#N" -> {assignment_type: count}`` map :func:`compute_leg_counts`
+    builds. Deliberately a SEPARATE parameter rather than folded out of
+    *payload*'s own ``assignments`` list: that list is whatever ``/board``'s
+    live query currently returns, which for a long-lived entry can already
+    have lost its early legs to ``coord housekeeping``'s archive move — see
+    ``coord.state.leg_counts``'s own docstring. ``None`` (the default, and
+    every pre-#2972 caller) leaves every :attr:`IssueFacts.work_leg_count` at
+    its ``0`` default, which reads as "budget untouched" — the exact
+    pre-#2972 behaviour for a caller that never learned about this field.
     """
     facts: dict[str, dict[str, Any]] = {}
 
@@ -1453,6 +1533,21 @@ def build_board_view(
         number = item.get("issue")
         if repo and number is not None:
             sessions.add(entry_key(repo, int(number)))
+
+    # #2972: fold *leg_counts* into `work_leg_count` — WORK_LIKE types only
+    # (a "work" leg is the unconditional initial dispatch or a fix round;
+    # "review"/"smoke"/every other dispatched type is not one, the same
+    # scoping `active_work`/`merged` above already apply). A key present
+    # ONLY in `leg_counts` (every assignment for the issue has aged into
+    # `assignments_archive` and dropped off the live board's own `issues`/
+    # `merge_plan` sections) still gets a slot — an entry whose whole history
+    # is archived is the LONGEST-lived case this ceiling exists to catch,
+    # not one it can afford to lose sight of.
+    for key, by_type in (leg_counts or {}).items():
+        got = slot(key)
+        got["work_leg_count"] = sum(
+            count for kind, count in by_type.items() if kind in WORK_LIKE
+        )
 
     return BoardView(
         issues={key: IssueFacts(**value) for key, value in facts.items()},
@@ -3408,6 +3503,7 @@ def _reconcile_running(
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    fix_round_config_default: int | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -3528,6 +3624,18 @@ def _reconcile_running(
       and this tick). Re-checking before ANY requeue — not only the
       literal MERGED-exit-text case — is what makes the class safe rather
       than patching just the one reported instance.
+
+    #2972: right before the ``retry``/``exhausted`` attempts decision below,
+    a SEPARATE ceiling is checked first — :func:`remaining_fix_rounds`
+    against ``facts.work_leg_count``, the entry's TOTAL work legs across
+    every past drive session, not just this one. A relaunch that would push
+    the entry past its fix-round budget goes straight to ``exhausted`` /
+    ``blocked``, ``attempts`` untouched (the same posture ``refused``/
+    ``dead_end`` above take: nothing about spending another attempt can make
+    more budget appear). *fix_round_config_default* is ``pipeline.
+    max_fix_rounds`` — the same value :func:`effective_max_fix_rounds`
+    resolves against for the entry actually being launched, so this check
+    and the launch it gates read the identical number.
     """
     facts = board.facts(entry.key)
 
@@ -4076,6 +4184,41 @@ def _reconcile_running(
         if empty_branch
         else ""
     )
+
+    # #2972: the fix-round ceiling is a SEPARATE budget from `max_attempts`
+    # above, checked first — see the docstring's #2972 paragraph. A relaunch
+    # this entry has already earned on the `attempts` count (it may be well
+    # under `effective_max_attempts`) still must not fire once its work legs,
+    # summed across every past drive session, have already spent the whole
+    # `pipeline.max_fix_rounds` budget: giving it another fresh
+    # `--max-fix-rounds` allowance is exactly the silent-reset bug quadraui#625
+    # reported. `attempts` is left UNCHANGED, same posture as `refused`/
+    # `dead_end` above — nothing about spending another attempt can make more
+    # budget appear, so counting one here would only make `blocked
+    # attempts=N` under-report how many drive sessions this entry actually
+    # ran.
+    budget = total_fix_round_budget(entry, fix_round_config_default)
+    if remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0:
+        reason = (
+            f"fix-round ceiling reached across relaunches (#2972): "
+            f"{facts.work_leg_count} work leg(s) already run against a "
+            f"budget of {budget} (1 work dispatch + "
+            f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
+            f"round(s)) — giving up rather than relaunching with a fresh "
+            f"budget{dispatch_note}"
+        )
+        return (
+            Reconcile(entry.key, "exhausted", reason, occupies=False),
+            Blocked(
+                entry.key,
+                reason,
+                updates={
+                    "state": STATE_BLOCKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+        )
 
     attempts = entry.attempts + 1
     if attempts < effective_max_attempts:
@@ -4829,6 +4972,7 @@ def plan_tick(
     merge_only_ready: Mapping[str, bool] | None = None,
     roll_pending_reason: str = "",
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    fix_round_config_default: int | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -5125,6 +5269,14 @@ def plan_tick(
     2026-08-22). A dep ABSENT here (the shell's bounded live check never ran
     for it, or ran and came back inconclusive) leaves both call sites to
     their pre-#2602 behaviour — never a false "satisfied".
+
+    *fix_round_config_default* (#2972) is ``pipeline.max_fix_rounds`` — the
+    SAME value the shell also hands ``_launch_argv`` to compute the actual
+    ``coord drive --max-fix-rounds`` this tick launches. Threaded straight
+    through to :func:`_reconcile_running`'s fix-round ceiling check, so a
+    relaunch decision and the launch it gates always agree on the budget.
+    ``None`` (the default) falls back to :data:`DEFAULT_TICK_MAX_FIX_ROUNDS`,
+    same as every other caller of :func:`effective_max_fix_rounds`.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -5192,6 +5344,7 @@ def plan_tick(
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
             live_prereq_terminal=live_prereq_terminal,
+            fix_round_config_default=fix_round_config_default,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:
